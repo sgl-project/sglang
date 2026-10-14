@@ -38,26 +38,30 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         batch = self._build_batch(debug_mode=False)
         scheduler.prepare_rollout(batch)
 
-        def _raise_if_called(*args, **kwargs):
-            raise AssertionError("ODE path should not call _rollout_variance_noise")
-
-        scheduler._rollout_variance_noise = _raise_if_called  # type: ignore[method-assign]
+        generator = torch.Generator().manual_seed(1)
+        generator_state = generator.get_state()
 
         sample = torch.randn(2, 4, 8, 8, dtype=torch.float32)
         model_output = torch.randn_like(sample)
         current_sigma = torch.tensor(0.6, dtype=torch.float32)
         next_sigma = torch.tensor(0.4, dtype=torch.float32)
 
-        prev_sample = scheduler.flow_sde_sampling(
+        prev_sample = SchedulerRLMixin.flow_sde_sampling(
+            batch._rollout_session_data,
             batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
-            generator=torch.Generator(device=sample.device).manual_seed(1),
+            generator=generator,
+            step_index=2,
         )
+        # The ODE path must not draw variance noise from the request generator.
+        self.assertTrue(torch.equal(generator.get_state(), generator_state))
         log_prob_local_sum, local_elem_count = (
-            scheduler.consume_local_rollout_log_probs(batch)
+            SchedulerRLMixin.consume_local_rollout_log_probs(
+                batch._rollout_session_data
+            )
         )
         log_prob_local_sum = log_prob_local_sum.squeeze(-1)
         local_elem_count = local_elem_count.squeeze(-1)
@@ -89,13 +93,15 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         next_sigma = torch.tensor(0.4, dtype=torch.float32)
         dt = next_sigma - current_sigma
 
-        rollout_prev = scheduler.flow_sde_sampling(
+        rollout_prev = SchedulerRLMixin.flow_sde_sampling(
+            batch._rollout_session_data,
             batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
             generator=torch.Generator(device=sample.device).manual_seed(0),
+            step_index=2,
         )
         # Exact expression used by the non-rollout branch at
         # scheduling_flow_match_euler_discrete.py `prev_sample = sample +
@@ -132,13 +138,15 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         current_sigma = torch.tensor(0.6, dtype=torch.float32)
         next_sigma = torch.tensor(0.4, dtype=torch.float32)
 
-        scheduler.flow_sde_sampling(
+        SchedulerRLMixin.flow_sde_sampling(
+            batch._rollout_session_data,
             batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
             generator=torch.Generator(device=sample.device).manual_seed(2),
+            step_index=2,
         )
 
         (
@@ -146,7 +154,9 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             prev_sample_means,
             noise_std_devs,
             model_outputs,
-        ) = scheduler.consume_local_rollout_debug_tensors(batch)
+        ) = SchedulerRLMixin.consume_local_rollout_debug_tensors(
+            batch._rollout_session_data
+        )
 
         # [B, T, ...] with one step in this test.
         self.assertEqual(tuple(variance_noises.shape), (2, 1, 4, 8, 8))
@@ -253,7 +263,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         shape = (1, 16, 1, 32, 32)
         atol = 1e-6
         pipeline_config = types.SimpleNamespace(
-            shard_latents_for_sp=lambda _batch, latents: (latents, False)
+            shard_latents_for_sp=lambda batch, latents: (latents, False)
         )
 
         for sde_type in ("sde", "cps"):
@@ -265,32 +275,29 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 g = torch.Generator(device="cpu").manual_seed(seed)
                 model_output = torch.randn(shape, generator=g, dtype=torch.float32)
                 sample = torch.randn(shape, generator=g, dtype=torch.float32)
-                variance_noise = torch.randn(shape, generator=g, dtype=torch.float32)
-
-                def _mock_rollout_variance_noise(_batch, *_args, **_kwargs):
-                    # flow_sde_sampling reads the full pre-shard noise from
-                    # rollout_session_data.noise_buffer to compute log_prob, so
-                    # the mock must populate it alongside returning the
-                    # (single-GPU trivially-sharded) noise.
-                    scheduler._get_rollout_session_data(  # type: ignore[attr-defined]
-                        _batch
-                    ).noise_buffer = variance_noise
-                    return variance_noise
-
-                scheduler._rollout_variance_noise = (  # type: ignore[method-assign]
-                    _mock_rollout_variance_noise
+                # The controller draws its variance noise from the request
+                # generator; a twin generator reproduces it for the reference.
+                noise_generator = torch.Generator(device="cpu").manual_seed(seed + 100)
+                variance_noise = torch.randn(
+                    shape,
+                    generator=torch.Generator(device="cpu").manual_seed(seed + 100),
+                    dtype=torch.float32,
                 )
 
-                prev_sgl = scheduler.flow_sde_sampling(
+                prev_sgl = SchedulerRLMixin.flow_sde_sampling(
+                    batch._rollout_session_data,
                     batch,
                     model_output=model_output,
                     sample=sample,
                     current_sigma=current_sigma,
                     next_sigma=next_sigma,
-                    generator=g,
+                    generator=noise_generator,
+                    step_index=2,
                 )
-                log_prob_sum, elem_count = scheduler.consume_local_rollout_log_probs(
-                    batch
+                log_prob_sum, elem_count = (
+                    SchedulerRLMixin.consume_local_rollout_log_probs(
+                        batch._rollout_session_data
+                    )
                 )
                 log_prob_sum = log_prob_sum.squeeze(-1)
                 elem_count = elem_count.squeeze(-1)
@@ -299,7 +306,9 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     prev_sample_means,
                     noise_std_devs,
                     _model_outputs,
-                ) = scheduler.consume_local_rollout_debug_tensors(batch)
+                ) = SchedulerRLMixin.consume_local_rollout_debug_tensors(
+                    batch._rollout_session_data
+                )
 
                 prev_ref, log_prob_ref, prev_mean_ref, noise_std_ref = (
                     _flowgrpo_sde_step_with_logprob(
@@ -369,21 +378,25 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             # propagates from the (original) model_output.dtype into the
             # noise buffer. If flow_sde_sampling fails to cast to fp32 at
             # entry, the buffer is bf16 → log_prob becomes bf16.
-            scheduler.flow_sde_sampling(
+            SchedulerRLMixin.flow_sde_sampling(
+                batch._rollout_session_data,
                 batch,
                 model_output=model_output,
                 sample=sample,
                 current_sigma=current_sigma,
                 next_sigma=next_sigma,
                 generator=g,
+                step_index=2,
             )
-            log_prob_sum, _count = scheduler.consume_local_rollout_log_probs(batch)
+            log_prob_sum, _count = SchedulerRLMixin.consume_local_rollout_log_probs(
+                batch._rollout_session_data
+            )
             self.assertEqual(
                 log_prob_sum.dtype,
                 torch.float32,
                 msg=f"{sde_type}: log_prob_sum must be fp32 with bf16 model_output",
             )
-            noise_buffer = scheduler._get_rollout_session_data(batch).noise_buffer
+            noise_buffer = batch._rollout_session_data.noise_buffer
             self.assertEqual(
                 noise_buffer.dtype,
                 torch.float32,
@@ -403,7 +416,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         scheduler = _DummyScheduler()
         shape = (1, 4, 8, 8)
         pipeline_config = types.SimpleNamespace(
-            shard_latents_for_sp=lambda _batch, latents: (latents, False)
+            shard_latents_for_sp=lambda batch, latents: (latents, False)
         )
         batch = types.SimpleNamespace(
             rollout_log_prob_no_const=False,
@@ -422,48 +435,40 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         current_sigma = torch.tensor(0.6, dtype=torch.float32)
         next_sigma = torch.tensor(0.4, dtype=torch.float32)
 
-        variance_noise_ref = torch.randn(shape, generator=g, dtype=torch.float32)
-        variance_noise_call_count = {"n": 0}
-
-        def _mock_variance_noise(_batch, *_args, **_kwargs):
-            variance_noise_call_count["n"] += 1
-            scheduler._get_rollout_session_data(
-                _batch
-            ).noise_buffer = variance_noise_ref
-            return variance_noise_ref
-
-        scheduler._rollout_variance_noise = (  # type: ignore[method-assign]
-            _mock_variance_noise
-        )
+        generator_state = g.get_state()
 
         # Step 0: not in filter → deterministic ODE transition, no noise draw.
-        batch._rollout_loop_step_index = 0
-        prev_0 = scheduler.flow_sde_sampling(
+        prev_0 = SchedulerRLMixin.flow_sde_sampling(
+            batch._rollout_session_data,
             batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
             generator=g,
+            step_index=0,
         )
-        self.assertEqual(variance_noise_call_count["n"], 0)
+        self.assertTrue(torch.equal(g.get_state(), generator_state))
         expected_ode = sample + (next_sigma - current_sigma) * model_output
         self.assertTrue(torch.allclose(prev_0, expected_ode, atol=1e-6))
 
         # Step 1: in filter → real SDE, noise drawn, prev differs from ODE form.
-        batch._rollout_loop_step_index = 1
-        prev_1 = scheduler.flow_sde_sampling(
+        prev_1 = SchedulerRLMixin.flow_sde_sampling(
+            batch._rollout_session_data,
             batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
             generator=g,
+            step_index=1,
         )
-        self.assertEqual(variance_noise_call_count["n"], 1)
+        self.assertFalse(torch.equal(g.get_state(), generator_state))
         self.assertFalse(torch.allclose(prev_1, expected_ode, atol=1e-3))
 
-        log_prob_sum, elem_count = scheduler.consume_local_rollout_log_probs(batch)
+        log_prob_sum, elem_count = SchedulerRLMixin.consume_local_rollout_log_probs(
+            batch._rollout_session_data
+        )
         self.assertEqual(tuple(log_prob_sum.shape), (shape[0], 2))
         # Filtered step contributes zero log-prob; real SDE step does not.
         self.assertTrue(
