@@ -194,7 +194,7 @@ class TestGraphPoolBorrow(CustomTestCase):
         )
         sampling_info = SimpleNamespace(
             logit_penalties=lambda: (None, None),
-            commit_sampled_tokens=lambda token_ids, accept_mask=None: None,
+            penalties=None,
             logit_bias=None,
             is_all_greedy=False,
             temperatures=torch.ones((1, 1)),
