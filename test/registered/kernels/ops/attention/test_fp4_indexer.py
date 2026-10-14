@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    fp4_index_logits_candidates,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
     quantize_fp4_indexer_tensor,
@@ -590,6 +591,81 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 )
 
 
+def _candidate_block_mask(blocks: torch.Tensor, width: int) -> torch.Tensor:
+    """[rows, width] bool mask of the positions in each row's 8-wide blocks."""
+    num_blocks = (width + 7) // 8
+    keep = torch.zeros(
+        (blocks.shape[0], num_blocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(-1, blocks.long().masked_fill(blocks < 0, num_blocks), True)
+    return keep[:, :num_blocks].repeat_interleave(8, dim=-1)[:, :width]
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize(
+    "batch,heads,ratio,width,capacity",
+    [
+        (6, 32, 1, 193, None),
+        (6, 64, 2, 8193, None),
+        (4, 64, 1, 32769, None),
+        (64, 64, 1, 32769, 1048580),
+    ],
+)
+def test_fp4_candidate_logits_match_masked_scan(batch, heads, ratio, width, capacity):
+    q, weights, slots, lens, table = _make_logits_case(batch, heads, width)
+    # Non-dyadic queries and weights: equality must not depend on exact sums.
+    q, weights = torch.randn_like(q), torch.randn_like(weights)
+    capacity = capacity or 2 * width + 64
+    req = torch.arange(batch, device=q.device, dtype=torch.int32)
+    req_table = torch.full(
+        (batch, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+    lengths = lens.to(torch.int32)
+    nblocks = (width + 7) // 8
+    num_candidates = min(2048, (nblocks + 1) // 2)
+
+    def sample_blocks():
+        ids = torch.stack(
+            [
+                torch.randperm(nblocks, device=q.device)[:num_candidates]
+                for _ in range(batch)
+            ]
+        ).to(torch.int32)
+        ids[:, -3:] = -1  # padding
+        ids[0] = -1  # a row without candidates
+        return ids
+
+    blocks = sample_blocks()
+
+    def run():
+        mask = _candidate_block_mask(blocks, capacity)
+        args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
+        masked = fp4_index_logits_paged(*args, mask)
+        candidates = fp4_index_logits_candidates(*args, blocks)
+        return masked, candidates
+
+    for _ in range(2):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        masked, candidates = run()
+    for visible in [width, 0, 1, 63, 64, 65, width // 2]:
+        lens.copy_((visible - torch.arange(batch, device=q.device)).clamp_min(0))
+        lengths.copy_(lens)
+        blocks.copy_(sample_blocks())
+        q.neg_()
+        candidates.fill_(torch.nan)
+        graph.replay()
+        vis = torch.arange(capacity, device=q.device)[None, :] < lens[:, None]
+        assert torch.equal(
+            masked[vis].view(torch.int32), candidates[vis].view(torch.int32)
+        )
+        if visible == width:
+            finite = torch.isfinite(candidates[vis])
+            assert finite.any() and not finite.all()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="Hopper paged indexer dispatch",
@@ -654,13 +730,15 @@ def test_hopper_indexer_backends_replay(ratio):
         for i, out in enumerate(outputs)
     ]
     captured_scores = []
-    captured_masks = []
+    scorers = []
 
-    def record_scores(*args, **kwargs):
-        result = fp4_index_logits_paged(*args, **kwargs)
-        captured_scores.append(result)
-        captured_masks.append(args[-1])
-        return result
+    def recorded(name, scorer):
+        def run_scorer(*args):
+            captured_scores.append(scorer(*args))
+            scorers.append(name)
+            return captured_scores[-1]
+
+        return run_scorer
 
     def run():
         full.topk_decode(decode_inputs[0])
@@ -671,15 +749,21 @@ def test_hopper_indexer_backends_replay(ratio):
     for _ in range(3):
         run()
     graph = torch.cuda.CUDAGraph()
-    with patch.object(scoring, "fp4_index_logits_paged", side_effect=record_scores):
-        with torch.cuda.graph(graph):
-            published = run()
-    assert (
-        len(captured_scores) == 3
-    )  # all three runtime entrypoints took the paged path
-    mask = published.decode_mask
-    assert captured_masks[:2] == [None, None]
-    assert captured_masks[2] is mask
+    with (
+        patch.object(
+            scoring,
+            "fp4_index_logits_paged",
+            recorded("paged", scoring.fp4_index_logits_paged),
+        ),
+        patch.object(
+            scoring,
+            "fp4_index_logits_candidates",
+            recorded("candidates", scoring.fp4_index_logits_candidates),
+        ),
+        torch.cuda.graph(graph),
+    ):
+        published = run()
+    assert scorers == ["paged", "paged", "candidates"]
     for step, visible in enumerate([193, 0, 1, 7, 8, 9, 65, 193]):
         # -1 positions exercise zero-length padded rows, also for ratio 1.
         lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
@@ -715,7 +799,6 @@ def test_hopper_indexer_backends_replay(ratio):
                     maxima.topk(min(4, nblocks)).values.sort().values,
                 )
             keep = torch.isin(torch.arange(width, device=q.device) // 8, blocks)
-            torch.testing.assert_close(mask[row, :width], keep)
             consumer_scores[row].masked_fill_(~keep, -torch.inf)
             for out, scores in zip(
                 outputs, (source_scores, source_scores, consumer_scores)

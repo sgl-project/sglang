@@ -12,6 +12,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    fp4_index_logits_candidates,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -356,8 +357,9 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     """Paged decode scores with graph-stable capacity ``lmax``.
 
     Only positions below each device-side ``lens`` are initialized. Top-k
-    consumers must respect those lengths. With ``has_candidate_mask``, masked
-    positions have -inf scores and must be discarded during selection writeback.
+    consumers must respect those lengths. With ``has_candidate_mask``, visible
+    positions outside the candidate blocks have -inf scores and must be discarded
+    during selection writeback.
     """
 
     bs: int
@@ -376,9 +378,10 @@ def decode_scores(
     inputs: DecodeInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
-    candidate_mask: Optional[torch.Tensor] = None,
+    candidate_blocks: Optional[torch.Tensor] = None,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
-    """None when there is no row, or nothing visible yet."""
+    """None when there is no row, or nothing visible yet. The paged path scores
+    only ``candidate_blocks`` when given; the dense path ignores them."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -406,18 +409,12 @@ def decode_scores(
         lens = lens.to(torch.int32)
         # Prepare the device-side plan before scoring, away from its top-k consumer.
         plan = plan_topk_v2(lens)
-        scores = fp4_index_logits_paged(
-            q,
-            weights,
-            req,
-            req_to_token,
-            lens,
-            table,
-            table.shape[1] // 68,
-            lmax,
-            ratio,
-            candidate_mask,
-        )
+        page_size = table.shape[1] // 68
+        args = (q, weights, req, req_to_token, lens, table, page_size, lmax, ratio)
+        if candidate_blocks is None:
+            scores = fp4_index_logits_paged(*args)
+        else:
+            scores = fp4_index_logits_candidates(*args, candidate_blocks)
         return PagedDecodeScores(
             bs=bs,
             lmax=lmax,
@@ -427,7 +424,7 @@ def decode_scores(
             req_to_token=req_to_token,
             ratio=ratio,
             plan=plan,
-            has_candidate_mask=candidate_mask is not None,
+            has_candidate_mask=candidate_blocks is not None,
         )
     inputs.reset_outputs()
     j = torch.arange(lmax, device=pos.device)
