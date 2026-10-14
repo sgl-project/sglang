@@ -1,17 +1,18 @@
+import numpy as np
 import pytest
 import torch
+from pydantic import ValidationError
 
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentVideoURL
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors import glm4v as glm4v_module
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.glm4v import (
     Glm4vImageProcessor,
-    _glm_video_config_for_decode,
     _merge_glm_video_configs,
-    glm_budget_kwargs,
     glm_decode_frames_at,
-    glm_max_image_tokens_from_configs,
-    glm_sample_frame_indices,
+    glm_processor_video_config,
+    glm_sample_and_decode_sync,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -106,244 +107,172 @@ def test_glm4v_uses_default_offsets_when_token_ids_are_distinct():
     ]
 
 
-def test_glm_video_merge_leaves_omitted_knobs_unset():
-    defaults = {"max_image_tokens": 16384, "_presize_budget": {"max_pixels": 1}}
-    merged = _merge_glm_video_configs(defaults, [{}])[0]
-    assert merged == defaults
-    assert "fps" not in merged
-    assert "max_frames" not in merged
+class _Glm5NextLikeVideoProcessor:
+    fps = 2
+    max_frames = 2048
+    max_duration = 0
+    max_image_tokens = 16384
+    patch_size = 14
+    merge_size = 2
+    temporal_patch_size = 2
 
 
-def test_glm_video_merge_clamps_attack_sample_count():
-    defaults = {"max_image_tokens": 16384}
-    attack = _merge_glm_video_configs(defaults, [{"fps": 60, "max_frames": 1_000_000}])[
-        0
-    ]
-    baseline = _merge_glm_video_configs(defaults, [{"fps": 2, "max_frames": 2048}])[0]
-    assert attack["fps"] == 2.0
-    assert attack["max_frames"] == 2048
-    attack_indices = glm_sample_frame_indices(
-        7200,
-        fps=60.0,
-        duration=120.0,
-        target_fps=attack["fps"],
-        max_frame_count=attack["max_frames"],
-    )
-    baseline_indices = glm_sample_frame_indices(
-        7200,
-        fps=60.0,
-        duration=120.0,
-        target_fps=baseline["fps"],
-        max_frame_count=baseline["max_frames"],
-    )
-    assert len(attack_indices) == len(baseline_indices)
-    assert len(attack_indices) <= 240
+class _Glm4vLikeVideoProcessor:
+    """GLM-4.1V/4.6V shape: no max_frames, HF sampler stops at max_duration * fps."""
+
+    fps = 2
+    max_duration = 300
+
+    def sample_frames(self, metadata, fps=None):
+        duration = min(metadata.duration, self.max_duration)
+        count = int(duration * (fps or self.fps))
+        return np.linspace(0, metadata.total_num_frames - 1, count, dtype=int)
+
+
+class _FakeVideoReader:
+    avg_fps = 30.0
+
+    def __init__(self, seconds):
+        self._num_frames = int(seconds * self.avg_fps)
+
+    def __len__(self):
+        return self._num_frames
+
+    def get_frames_at(self, indices):
+        return np.zeros((len(indices), 2, 2, 3), dtype=np.uint8)
+
+
+def _video_defaults(processor, **server_video_config):
+    return {**glm_processor_video_config(processor), **server_video_config}
+
+
+def _merge_one(defaults, request):
+    return _merge_glm_video_configs(defaults, [request])[0]
+
+
+def test_glm_video_merge_does_not_inject_omitted_max_frames():
+    """Any max_frames bypasses the HF sampler, so an fps-only request must not gain one."""
+    defaults = _video_defaults(_Glm4vLikeVideoProcessor())
+    assert _merge_one(defaults, {}) == defaults
+    assert "max_frames" not in _merge_one(defaults, {"fps": 1})
+
+
+@pytest.mark.parametrize(
+    "server, request_config, key, expected",
+    [
+        ({}, {"fps": 60}, "fps", 2.0),
+        ({}, {"max_frames": 1_000_000}, "max_frames", 2048),
+        ({}, {"max_frames": 10**400}, "max_frames", 2048),
+        ({}, {"max_image_tokens": 10**9}, "max_image_tokens", 16384),
+        ({"max_frames": 4096}, {"max_frames": 10**6}, "max_frames", 4096),
+        (
+            {"max_tokens_per_frame": 512},
+            {"max_tokens_per_frame": 10**6},
+            "max_tokens_per_frame",
+            512,
+        ),
+    ],
+)
+def test_glm_video_merge_clamps_request_to_deployment_limit(
+    server, request_config, key, expected
+):
+    defaults = _video_defaults(_Glm5NextLikeVideoProcessor(), **server)
+    assert _merge_one(defaults, request_config)[key] == expected
 
 
 def test_glm_video_merge_keeps_tighter_request():
-    defaults = {"max_image_tokens": 16384}
+    defaults = _video_defaults(_Glm5NextLikeVideoProcessor())
     request = {
         "fps": 1,
         "max_frames": 8,
         "max_image_tokens": 1000,
         "max_tokens_per_frame": 100,
     }
-    merged = _merge_glm_video_configs(defaults, [request])[0]
-    assert merged["fps"] == 1.0
-    assert merged["max_frames"] == 8
-    assert merged["max_image_tokens"] == 1000
-    assert merged["max_tokens_per_frame"] == 100
+    merged = _merge_one(defaults, request)
+    assert {key: merged[key] for key in request} == request
 
 
-def test_glm_video_merge_clamps_huge_max_tokens_per_frame():
-    """A cap above the video token ceiling is clamped, then dropped for a longer clip."""
-    pixels_per_token = 784
-    defaults = {
-        "max_image_tokens": 16384,
-        "_presize_budget": {
-            "max_pixels": 16384 * pixels_per_token,
-            "pixels_per_token": pixels_per_token,
-        },
-    }
-    merged = _merge_glm_video_configs(
-        defaults, [{"max_tokens_per_frame": 1_000_000_000}]
-    )[0]
-    assert merged["max_tokens_per_frame"] == 16384
-    assert "max_tokens_per_frame" not in _glm_video_config_for_decode(
-        merged, frame_count=2
-    )
+@pytest.mark.parametrize("server", [{}, {"fps": 3}])
+def test_glm4v_request_cannot_sample_more_frames_than_default(server):
+    """A request max_frames switches to the fallback sampler; it must not exceed the HF default count."""
+    processor = _Glm4vLikeVideoProcessor()
+    defaults = _video_defaults(processor, **server)
+    video = _FakeVideoReader(seconds=3600)
 
-    defaults_with_cap = {
-        "max_image_tokens": 16384,
-        "max_tokens_per_frame": 512,
-    }
-    restored = _merge_glm_video_configs(
-        defaults_with_cap, [{"max_tokens_per_frame": 1_000_000_000}]
-    )[0]
-    assert restored["max_tokens_per_frame"] == 512
+    def frame_count(request):
+        frames, _ = glm_sample_and_decode_sync(
+            video, _merge_one(defaults, request), processor
+        )
+        return len(frames)
 
-
-def test_glm_video_merge_clamps_max_image_tokens_for_budget():
-    class FakeProcessor:
-        max_image_tokens = 16384
-
-    defaults = {"max_image_tokens": 16384}
-    merged = _merge_glm_video_configs(defaults, [{"max_image_tokens": 1_000_000_000}])[
-        0
-    ]
-    assert merged["max_image_tokens"] == 16384
-    assert glm_max_image_tokens_from_configs([merged]) == 16384
-    assert glm_budget_kwargs(
-        FakeProcessor(),
-        user_max_image_tokens=glm_max_image_tokens_from_configs([merged]),
-        count=1,
-        split=True,
-    ) == {"max_image_tokens": 16384}
-
-
-def test_glm_video_merge_uses_server_max_frames_ceiling():
-    lowered = _merge_glm_video_configs(
-        {"max_frames": 512}, [{"max_frames": 1_000_000}]
-    )[0]
-    assert lowered["max_frames"] == 512
-
-    raised = _merge_glm_video_configs(
-        {"max_frames": 4096}, [{"max_frames": 1_000_000}]
-    )[0]
-    assert raised["max_frames"] == 4096
-
-
-def test_glm_video_merge_clamps_fps_without_injecting_max_frames():
-    merged = _merge_glm_video_configs({"max_image_tokens": 16384}, [{"fps": 60}])[0]
-    assert merged["fps"] == 2.0
-    assert "max_frames" not in merged
-
-
-def test_glm_video_decode_drops_per_frame_cap_over_shared_budget():
-    """A cap equal to the video budget stays for one frame and is removed for two."""
-    pixels_per_token = 784
-    defaults = {
-        "max_image_tokens": 16384,
-        "_presize_budget": {
-            "max_pixels": 16384 * pixels_per_token,
-            "pixels_per_token": pixels_per_token,
-        },
-    }
-    merged = _merge_glm_video_configs(defaults, [{"max_tokens_per_frame": 16384}])[0]
-    assert merged["max_tokens_per_frame"] == 16384
-    assert (
-        _glm_video_config_for_decode(merged, frame_count=1)["max_tokens_per_frame"]
-        == 16384
-    )
-    assert "max_tokens_per_frame" not in _glm_video_config_for_decode(
-        merged, frame_count=2
-    )
-
-    tight = _merge_glm_video_configs(defaults, [{"max_tokens_per_frame": 100}])[0]
-    assert (
-        _glm_video_config_for_decode(tight, frame_count=4)["max_tokens_per_frame"]
-        == 100
-    )
-    assert "max_tokens_per_frame" not in _glm_video_config_for_decode(
-        tight, frame_count=200
-    )
-
-
-def test_glm_video_decode_keeps_server_per_frame_cap():
-    pixels_per_token = 784
-    defaults = {
-        "max_image_tokens": 16384,
-        "max_tokens_per_frame": 512,
-        "_presize_budget": {
-            "max_pixels": 16384 * pixels_per_token,
-            "pixels_per_token": pixels_per_token,
-        },
-    }
-    merged = _merge_glm_video_configs(defaults, [{"max_tokens_per_frame": 1_000_000}])[
-        0
-    ]
-    assert merged["max_tokens_per_frame"] == 512
-    decoded = _glm_video_config_for_decode(merged, frame_count=2048)
-    assert decoded["max_tokens_per_frame"] == 512
-
-
-def _presize_defaults(max_image_tokens=16384, **extra):
-    pixels_per_token = 784
-    return {
-        "max_image_tokens": max_image_tokens,
-        "_presize_budget": {
-            "max_pixels": max_image_tokens * pixels_per_token,
-            "pixels_per_token": pixels_per_token,
-        },
-        **extra,
-    }
-
-
-class _FakeVideo:
-    def get_frames_at(self, indices):
-        return indices
+    default_count = frame_count({})
+    assert frame_count({"fps": 60, "max_frames": 1_000_000}) <= default_count
 
 
 def _patch_glm_resizers(monkeypatch):
-    def per_frame(frames, max_tokens_per_frame):
-        return ("per_frame", max_tokens_per_frame)
+    monkeypatch.setattr(
+        glm4v_module,
+        "_resize_frames_to_max_tokens",
+        lambda frames, max_tokens_per_frame: ("per_frame", max_tokens_per_frame),
+    )
+    monkeypatch.setattr(
+        glm4v_module,
+        "_pre_resize_frames_for_processor",
+        lambda frames, **budget: ("presize",),
+    )
 
-    def presize(frames, **budget):
-        return ("presize",)
 
-    monkeypatch.setattr(glm4v_module, "_resize_frames_to_max_tokens", per_frame)
-    monkeypatch.setattr(glm4v_module, "_pre_resize_frames_for_processor", presize)
+def test_glm_decode_drops_request_per_frame_cap_over_pixel_budget(monkeypatch):
+    """A request per-frame cap is kept only while its total pixels fit the shared budget.
 
-
-def test_glm_decode_frames_at_uses_shared_budget_for_request_caps(monkeypatch):
-    """A per-frame cap that fits one frame skips presize; the same cap on a longer clip does not.
-
-    A one-frame shard still uses the full clip length when budget_frame_count is set.
+    Per-frame resize counts 784 px per token and presize counts 1568, so 16384 tokens
+    x 2 frames fits a 16384-token video budget exactly.
     """
     _patch_glm_resizers(monkeypatch)
-    merged = _merge_glm_video_configs(
-        _presize_defaults(), [{"max_tokens_per_frame": 16384}]
-    )[0]
-    video = _FakeVideo()
+    defaults = _video_defaults(_Glm5NextLikeVideoProcessor())
+    config = _merge_one(defaults, {"max_tokens_per_frame": 16384})
+    video = _FakeVideoReader(seconds=1)
 
-    assert glm_decode_frames_at(video, [0], merged) == ("per_frame", 16384)
-    assert glm_decode_frames_at(video, [0, 1], merged) == ("presize",)
-    assert glm_decode_frames_at(video, [0], merged, budget_frame_count=2) == (
+    assert glm_decode_frames_at(video, [0, 1], config) == ("per_frame", 16384)
+    assert glm_decode_frames_at(video, [0, 1, 2], config) == ("presize",)
+    # A DP shard decides on the full clip length, not its own slice.
+    assert glm_decode_frames_at(video, [0], config, budget_frame_count=3) == (
         "presize",
     )
 
 
-def test_glm_decode_frames_at_keeps_tighter_request_under_server_cap(monkeypatch):
-    """A server per-frame setting keeps per-frame mode, so a tighter request cap stays even when cap times frame count exceeds the shared budget."""
+def test_glm_decode_keeps_server_per_frame_mode(monkeypatch):
     _patch_glm_resizers(monkeypatch)
-    merged = _merge_glm_video_configs(
-        _presize_defaults(max_tokens_per_frame=512),
-        [{"max_tokens_per_frame": 100}],
-    )[0]
-    assert merged["max_tokens_per_frame"] == 100
-    assert glm_decode_frames_at(_FakeVideo(), list(range(200)), merged) == (
-        "per_frame",
-        100,
-    )
+    defaults = _video_defaults(_Glm5NextLikeVideoProcessor(), max_tokens_per_frame=512)
+    config = _merge_one(defaults, {"max_tokens_per_frame": 100})
+    frames = glm_decode_frames_at(_FakeVideoReader(seconds=1), range(200), config)
+    assert frames == ("per_frame", 100)
 
 
-def test_glm_video_merge_clamps_oversized_int_max_frames():
-    """An int above the float range is clamped to the deployment ceiling."""
-    merged = _merge_glm_video_configs({}, [{"max_frames": 10**400}])[0]
-    assert merged["max_frames"] == 2048
+@pytest.mark.parametrize(
+    "request_config",
+    [
+        {"fps": 0},
+        {"fps": "fast"},
+        {"fps": float("inf")},
+        {"fps": float("nan")},
+        {"max_frames": -1},
+        {"max_frames": float("inf")},
+    ],
+)
+def test_glm_video_merge_rejects_invalid_knobs(request_config):
+    (key,) = request_config
+    with pytest.raises(ValueError, match=key):
+        _merge_glm_video_configs({}, [request_config])
 
 
-def test_glm_video_merge_rejects_non_positive_knobs():
-    with pytest.raises(ValueError, match="fps"):
-        _merge_glm_video_configs({}, [{"fps": 0}])
-    with pytest.raises(ValueError, match="fps"):
-        _merge_glm_video_configs({}, [{"fps": "fast"}])
-    with pytest.raises(ValueError, match="fps"):
-        _merge_glm_video_configs({}, [{"fps": float("inf")}])
-    with pytest.raises(ValueError, match="fps"):
-        _merge_glm_video_configs({}, [{"fps": float("nan")}])
-    with pytest.raises(ValueError, match="max_frames"):
-        _merge_glm_video_configs({}, [{"max_frames": -1}])
+@pytest.mark.parametrize(
+    "field, value",
+    [("fps", 0), ("fps", float("inf")), ("max_frames", 0), ("max_image_tokens", -1)],
+)
+def test_video_url_rejects_non_positive_knobs(field, value):
+    with pytest.raises(ValidationError):
+        ChatCompletionMessageContentVideoURL(url="video.mp4", **{field: value})
 
 
 if __name__ == "__main__":
