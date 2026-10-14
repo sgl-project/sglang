@@ -519,6 +519,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self._is_full_backend = _is_full_graph_backend(self.backend)
         if self._is_full_backend:
+            if (
+                getattr(model_runner, "attention_chunk_size", None) is not None
+                or getattr(model_runner.attn_backend, "attention_chunk_size", None)
+                is not None
+            ):
+                raise ValueError(
+                    "Full prefill CUDA/XPU graph does not support models with "
+                    "attention_chunk_size (chunked local attention / iRoPE)"
+                )
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req

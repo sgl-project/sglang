@@ -1828,6 +1828,11 @@ class XPUAttentionBackend(AttentionBackend):
           sampling + integer division, matching decode metadata.
         """
         bs = forward_batch.batch_size
+        if self.attention_chunk_size is not None:
+            raise ValueError(
+                "Full prefill graph does not support models with "
+                f"attention_chunk_size ({self.attention_chunk_size})."
+            )
         if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
             device = forward_batch.seq_lens.device
             max_num_pages = (
@@ -1874,21 +1879,23 @@ class XPUAttentionBackend(AttentionBackend):
 
         if max_seq_len_k > 0:
             num_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
-            raw_page = self.req_to_token[
+            token_slots = self.req_to_token[
                 forward_batch.req_pool_indices[:bs][:, None],
                 self.full_cg_prefill_strided_indices[:num_pages][None, :],
             ]
-            if self.page_size > 1:
-                raw_page = raw_page // self.page_size
-            m.page_table[:, :num_pages].copy_(raw_page.to(torch.int32))
+            page_table_slice = (
+                token_slots // self.page_size if self.page_size > 1 else token_slots
+            )
+            m.page_table[:, :num_pages].copy_(page_table_slice.to(torch.int32))
             m.page_table[:, num_pages:].zero_()
             if self.use_sliding_window_kv_pool:
                 swa_starts = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    raw_page
+                    token_slots
                 )
-                if self.page_size > 1:
-                    swa_starts = swa_starts // self.page_size
-                m.swa_page_table[:, :num_pages].copy_(swa_starts.to(torch.int32))
+                swa_page_slice = (
+                    swa_starts // self.page_size if self.page_size > 1 else swa_starts
+                )
+                m.swa_page_table[:, :num_pages].copy_(swa_page_slice.to(torch.int32))
                 m.swa_page_table[:, num_pages:].zero_()
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
