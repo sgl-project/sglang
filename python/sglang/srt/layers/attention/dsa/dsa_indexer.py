@@ -235,6 +235,14 @@ def _make_eager_idle_topk_result(
     )
 
 
+def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
+    """(index-K buffer, token slots, selected token rows or None) to write."""
+    shard_pool = get_kv_shard_pool(pool)
+    if shard_pool is None:
+        return ((pool.get_index_k_with_scale_buffer(layer_id=layer_id), loc, None),)
+    return shard_pool.index_key_cache.write_targets(layer_id, loc)
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
@@ -1008,21 +1016,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return
         if (
             not _is_fp8_fnuz
-            and get_kv_shard_pool(pool) is None
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
-            fused_k_indexer_norm_rope_store(
-                key_raw,
-                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
-                out_cache_loc,
-                self.k_norm.weight,
-                self.k_norm.bias,
-                self.k_norm.variance_epsilon,
-                self._indexer_cos_sin_cache,
-                positions,
-                page_size,
-            )
+            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+                fused_k_indexer_norm_rope_store(
+                    key_raw if rows is None else key_raw.index_select(0, rows),
+                    buf,
+                    loc,
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                    self._indexer_cos_sin_cache,
+                    positions if rows is None else positions.index_select(0, rows),
+                    page_size,
+                )
             return
 
         # Fallback: separate K kernel + store kernel.
@@ -1807,9 +1815,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
-            # A sharded pool writes through set_index_k_scale_buffer, which
-            # stages scratch and keeps only owner-local rows.
-            and get_kv_shard_pool(pool) is None
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
@@ -1817,13 +1822,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            fused_store_index_k_cache(
-                key,
-                buf,
-                out_cache_loc,
-                pool.page_size,
-            )
+            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+                fused_store_index_k_cache(
+                    key if rows is None else key.index_select(0, rows),
+                    buf,
+                    loc,
+                    pool.page_size,
+                )
             return
 
         # Fast path: AITER fused quant + cache store

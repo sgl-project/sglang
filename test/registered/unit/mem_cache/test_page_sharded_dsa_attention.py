@@ -30,7 +30,7 @@ register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestShardedDSAIndexerWrite(unittest.TestCase):
-    def test_indexer_writers_store_through_sharded_pool(self):
+    def test_cuda_writers_match_unsharded_bytes(self):
         from sglang.srt.layers.attention.dsa import dsa_indexer
 
         if not dsa_indexer._is_cuda:
@@ -42,6 +42,10 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             PageShardSpec,
         )
 
+        self.assertTrue(
+            dsa_indexer.can_use_dsa_fused_store(torch.bfloat16, torch.int64, 64),
+            "both pools must take the CUDA fused writers",
+        )
         device = "cuda"
         generator = torch.Generator(device=device).manual_seed(20261013)
         num_tokens, num_pages, page_size = 2305, 80, 64
@@ -110,28 +114,18 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             with self.subTest(fused_prepare=fused_prepare):
                 for buffer in (reference_buffer, local_buffer, scratch):
                     buffer.zero_()
-                stored_key = key
-                if fused_prepare:
-                    stored_key = dsa_indexer.fused_k_indexer_norm_rope(
-                        key,
-                        indexer.k_norm.weight,
-                        indexer.k_norm.bias,
-                        indexer.k_norm.variance_epsilon,
-                        indexer._indexer_cos_sin_cache,
-                        positions,
-                    )
-                reference.set_index_k_scale_buffer(
-                    0, locations, *act_quant(stored_key, 128, "ue8m0")
-                )
-                with patch.object(
-                    dsa_indexer, "get_token_to_kv_pool", return_value=sharded
-                ):
-                    if fused_prepare:
-                        dsa_indexer.Indexer._fused_k_prepare_and_store(
-                            indexer, key, positions, batch, 0, act_quant
-                        )
-                    else:
-                        indexer._store_index_k_cache(batch, 0, key, act_quant=act_quant)
+                for pool in (reference, sharded):
+                    with patch.object(
+                        dsa_indexer, "get_token_to_kv_pool", return_value=pool
+                    ):
+                        if fused_prepare:
+                            dsa_indexer.Indexer._fused_k_prepare_and_store(
+                                indexer, key, positions, batch, 0, act_quant
+                            )
+                        else:
+                            indexer._store_index_k_cache(
+                                batch, 0, key, act_quant=act_quant
+                            )
                 # Every key is staged at its scratch row; rank 0 keeps even pages.
                 torch.testing.assert_close(
                     scratch[sharded._page_pos.long()], reference_buffer, rtol=0, atol=0
