@@ -62,12 +62,18 @@ class BaseDeviceCache:
 
 class BaseHostCache:
     def __init__(
-        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
+        self,
+        num_tokens: int,
+        num_layers: int,
+        topk_size: int,
+        name: str,
+        device: str,
+        dtype: torch.dtype = torch.int32,
     ):
         alloc = ALLOC_MEMORY_FUNCS[device]
         self.buffer = alloc(
             (num_tokens, num_layers, topk_size),
-            dtype=torch.int32,
+            dtype=dtype,
             device="cpu",
             pin_memory=True,
             allocator=HostTensorAllocator(),
@@ -128,16 +134,23 @@ class BaseTopkCapturer:
         device: str,
         name: str,
         device_topk_size: Optional[int] = None,
+        host_dtype: torch.dtype = torch.int32,
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
         are dropped before writing to host_cache via [:topk_size] truncation.
+        host_dtype narrows the host cache; _canonicalize_rows must then emit it.
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
 
         self.host_cache = BaseHostCache(
-            num_tokens, num_layers, topk_size, name=name, device=device
+            num_tokens,
+            num_layers,
+            topk_size,
+            name=name,
+            device=device,
+            dtype=host_dtype,
         )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
@@ -169,6 +182,11 @@ class BaseTopkCapturer:
         del can_run_graph, cuda_graph_batch  # reserved for subclass override
         num_tokens = forward_batch.out_cache_loc.shape[0]
         return self.device_cache.buffer[:num_tokens, :, : self.topk_size]
+
+    def _canonicalize_rows(self, slice_gpu: torch.Tensor) -> torch.Tensor:
+        """Hook applied to the per-forward device slice before the D2H copy; returns
+        the host cache dtype, either the slice itself or a freshly allocated tensor."""
+        return slice_gpu
 
     def get_topk(
         self,
@@ -210,13 +228,15 @@ class BaseTopkCapturer:
             # Kernel batches may be padded; only real request tokens are stored.
             slice_gpu = slice_gpu[: out_cache_loc.shape[0]]
         out_cache_loc = out_cache_loc[: slice_gpu.shape[0]]
+        rows = self._canonicalize_rows(slice_gpu)
         if no_copy_to_cpu:
-            # Clone before the next overlapping forward reuses these buffers.
+            # Clone before the next overlapping forward reuses these buffers; a hook
+            # that already returned a fresh tensor needs no second copy.
             return TopkCaptureOutput(
                 out_cache_loc=out_cache_loc.clone(),
-                topk=slice_gpu.clone(),
+                topk=rows.clone() if rows is slice_gpu else rows,
                 host_cache=self.host_cache,
             )
         out_cache_loc_cpu = out_cache_loc.cpu()
-        self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
+        self.host_cache.buffer[out_cache_loc_cpu] = rows.cpu()
         return None

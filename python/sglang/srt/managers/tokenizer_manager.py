@@ -160,6 +160,7 @@ from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
 )
+from sglang.srt.state_capturer.routed_experts_codec import RoutedExpertsEncoder
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -532,6 +533,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init running status
         self.init_running_status()
+        self.init_routed_experts_encoder()
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -699,6 +701,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and not self.gracefully_exit
             and self.server_status == ServerStatus.Up
         )
+
+    def init_routed_experts_encoder(self):
+        self.routed_experts_encoder = RoutedExpertsEncoder()
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -2576,8 +2581,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if val is not None:
                     # BatchStrOutput is pre-encoded by the detokenizer;
                     # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    if not isinstance(val, str):
+                        val = self.routed_experts_encoder.encode(val)
                     meta_info["routed_experts"] = val
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
