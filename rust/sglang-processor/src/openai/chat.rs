@@ -106,6 +106,7 @@ struct ChatRequest {
     chat_template_kwargs: Option<Map<String, Value>>,
     custom_logit_processor: Option<OneOrList<Option<String>>>,
     custom_params: Option<Map<String, Value>>,
+    watermark: Option<Map<String, Value>>,
     images_config: Option<Map<String, Value>>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
@@ -366,6 +367,7 @@ pub fn lower_chat(
         continuous_usage_stats,
         settings: settings.clone(),
         tokenizer,
+        created: now(),
         stream: StreamState::default(),
         roles_sent: HashSet::new(),
         detectors: HashMap::new(),
@@ -720,6 +722,7 @@ fn generate_body(
         "custom_params": request.custom_params,
         "sampling_seed": request.seed,
         "spaces_between_special_tokens": kwargs.get("spaces_between_special_tokens").cloned().unwrap_or(json!(true)),
+        "watermark": request.watermark,
     });
     if let Ok(Some(schema)) =
         format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())
@@ -789,6 +792,8 @@ pub struct ChatResponder {
     continuous_usage_stats: bool,
     settings: OpenAiSettings,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
+    /// The stream's `created`, which every chunk repeats.
+    created: u64,
     stream: StreamState,
     roles_sent: HashSet<u64>,
     detectors: HashMap<u64, ThinkDetector>,
@@ -843,14 +848,18 @@ impl ChatResponder {
                 }
             }
             let finish_reason = &finish_reason;
+            let mut message = json!({
+                "role": "assistant",
+                "content": text,
+                "reasoning_content": (!reasoning.is_empty()).then_some(reasoning),
+            });
+            // `ChatMessage._serialize` omits absent tool calls.
+            if !tool_calls.is_null() {
+                message["tool_calls"] = tool_calls;
+            }
             choices.push(json!({
                 "index": index,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                    "reasoning_content": (!reasoning.is_empty()).then_some(reasoning),
-                    "tool_calls": tool_calls,
-                },
+                "message": message,
                 "logprobs": logprobs,
                 "finish_reason": finish_reason.get("type"),
                 "matched_stop": finish_reason.get("matched"),
@@ -988,10 +997,17 @@ impl ChatResponder {
             });
             let (normal, calls) = detector.parse_stream(&delta, flush);
             let usage = self.chunk_usage(index).unwrap_or(Value::Null);
-            let delta = |content: Value, tool_calls: Value| json!({"role": null, "content": content, "reasoning_content": null, "tool_calls": tool_calls});
+            // `ChatCompletionResponseStreamChoice._serialize` omits absent tool calls.
+            let delta = |content: Value, tool_calls: Option<Value>| {
+                let mut delta =
+                    json!({"role": null, "content": content, "reasoning_content": null});
+                if let Some(tool_calls) = tool_calls {
+                    delta["tool_calls"] = tool_calls;
+                }
+                delta
+            };
             if !normal.is_empty() {
-                let mut chunk =
-                    self.chunk_json(index, delta(normal.into(), Value::Null), None, None);
+                let mut chunk = self.chunk_json(index, delta(normal.into(), None), None, None);
                 chunk["usage"] = usage.clone();
                 events.push(format!("data: {chunk}\n\n"));
             }
@@ -1004,7 +1020,7 @@ impl ChatResponder {
                     tool_call["function"]["name"] = Value::Null;
                 }
                 let calls = json!([tool_call]);
-                let mut chunk = self.chunk_json(index, delta(Value::Null, calls), None, None);
+                let mut chunk = self.chunk_json(index, delta(Value::Null, Some(calls)), None, None);
                 chunk["usage"] = usage.clone();
                 events.push(format!("data: {chunk}\n\n"));
             }
@@ -1051,7 +1067,7 @@ impl ChatResponder {
                 let chunk = json!({
                     "id": self.stream.last_id,
                     "object": "chat.completion.chunk",
-                    "created": now(),
+                    "created": self.created,
                     "model": self.model,
                     "choices": [],
                     "usage": self.stream.total_usage(self.n, self.settings.enable_cache_report),
@@ -1113,7 +1129,7 @@ impl ChatResponder {
         let mut chunk = json!({
             "id": self.stream.last_id,
             "object": "chat.completion.chunk",
-            "created": now(),
+            "created": self.created,
             "model": self.model,
             "choices": [{
                 "index": index,
