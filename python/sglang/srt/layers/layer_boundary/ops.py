@@ -28,6 +28,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.cp.utils import (
+    cp_gather_full_sequence_states,
+    cp_shard_hidden_states,
+)
 from sglang.srt.layers.dp_attention import (
     attn_cp_reduce_scatter_tensor,
     attn_tp_all_gather_into_tensor,
@@ -52,6 +56,7 @@ from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     TokenAxis,
     _cp_shard_token_rows,
+    _sum_group,
     moe_cp_gathered_rows,
 )
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
@@ -177,6 +182,28 @@ def moe_cp_gather(
     )
     moe_cp_all_gather_into_tensor(output, hidden_states)
     return output
+
+
+def cp_gather_in_token_order(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """This rank's CP shard to the whole sequence in token order, without the
+    shards' padding."""
+    return cp_gather_full_sequence_states(hidden_states, forward_batch)
+
+
+def cp_take_back_in_token_order(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    *,
+    group: Optional[SumGroup],
+):
+    """The whole sequence in token order back to this rank's CP shard,
+    completing the sum it owes over ``group`` first."""
+    if group is not None:
+        hidden_states = _sum_group(group).all_reduce(hidden_states)
+    return cp_shard_hidden_states(hidden_states, forward_batch), residual
 
 
 def attn_tp_all_reduce(
@@ -335,7 +362,6 @@ def keep_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    **kwargs,
 ):
     return hidden_states, residual
 
@@ -346,7 +372,6 @@ def update_attn_tp_gather_output(
     forward_batch: ForwardBatch,
     update: ResidualUpdate = PLAIN_ADD,
     gather: Optional[Callable] = None,
-    **kwargs,
 ):
     """Write the output into the residual on this rank's slice, then gather it
     over attention TP (see attn_tp_gather_with)."""
@@ -371,7 +396,6 @@ def residual_slice_output(
     sums: bool,
     gathers_back: bool,
     update: ResidualUpdate,
-    **kwargs,
 ):
     """Bring the FFN output onto the slice of the rows the residual is on:
     a reduce-scatter that also completes its sum when ``sums``, else this
@@ -405,7 +429,6 @@ def attn_cp_take_back_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    **kwargs,
 ):
     """DSA and MLA CP: this rank's shard of a complete output gathered in
     equal shards over the attention-CP group."""
@@ -418,7 +441,6 @@ def attn_cp_reduce_scatter_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    **kwargs,
 ):
     """DSA and MLA CP: sum the FFN output over the attention-CP group and
     keep this rank's shard."""
@@ -429,7 +451,6 @@ def dp_cp_take_back_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    **kwargs,
 ):
     """This rank's CP shard of the rows the DP gather put in its DP group's
     slot, at the shard's padded length with the padding zeroed."""
@@ -450,7 +471,6 @@ def moe_cp_take_back_output(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     forward_batch: ForwardBatch,
-    **kwargs,
 ):
     """Return a MoE output computed on the MoE-CP-gathered rows to this rank's attention rows.
 
