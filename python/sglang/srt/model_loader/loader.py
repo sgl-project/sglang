@@ -365,7 +365,19 @@ def _validate_default_loader_extra_config(
         # options, so newer versions can add parameters without a SGLang update.
         return
 
-    allowed_keys = {"enable_multithread_load", "num_threads"}
+    allowed_keys = {
+        "enable_multithread_load",
+        "num_threads",
+        "dsv41_weight_cache",
+        "dsv41_host_table_backend",
+    }
+    from sglang.srt.weight_cache.model_state import host_table_backend
+
+    host_table_backend(extra_config)
+    if "dsv41_weight_cache" in extra_config and not isinstance(
+        extra_config["dsv41_weight_cache"], bool
+    ):
+        raise ValueError("dsv41_weight_cache must be a boolean")
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
         if "enable_gds" in extra_config and not isinstance(

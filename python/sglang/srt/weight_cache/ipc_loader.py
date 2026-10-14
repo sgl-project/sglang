@@ -102,6 +102,9 @@ class IpcModelLoader(BaseModelLoader):
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
         quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
+        from .model_state import model_state_contract
+
+        model_state_contract(model_config, self.load_config.model_loader_extra_config)
         check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
@@ -293,6 +296,9 @@ class IpcModelLoader(BaseModelLoader):
             # requires_grad=False: the IPC memory is shared/read-only and SGLang
             # is inference-only, so autograd must never write into it.
             new_param = nn.Parameter(tensor, requires_grad=False)
+            old_param = obj._parameters.get(leaf_name)
+            if old_param is not None:
+                new_param.__dict__.update(old_param.__dict__)
             setattr(obj, leaf_name, new_param)
         else:
             # register_buffer raises KeyError if the name already exists as a
@@ -341,11 +347,35 @@ class IpcModelLoader(BaseModelLoader):
         # remove_duplicate=False mirrors the daemon's export (which keys tied
         # weights under every name) so a tied parameter is recognized under all
         # of its names here too.
+        from .model_state import (
+            STATE_ENTRY,
+            TENSOR_PREFIX,
+            model_state_contract,
+            validate_model_state,
+        )
+
+        state_entry = entries.get(STATE_ENTRY)
+        manifest = state_entry["model_state"] if state_entry else None
+        contract = model_state_contract(
+            model_config, self.load_config.model_loader_extra_config
+        )
+        if bool(manifest) != bool(contract):
+            raise ValueError("IPC cache is missing the required model post-load state")
+        if manifest is not None:
+            validate_model_state(model, manifest)
+            expected = set(manifest["schema"]) | set(manifest["extras"]) | {STATE_ENTRY}
+            if set(entries) != expected:
+                raise ValueError(
+                    "V4.1 IPC exported tensor set does not match its manifest"
+                )
+
         existing_params = {
             name: param
             for name, param in model.named_parameters(remove_duplicate=False)
         }
-        existing_buffers = {name: buf for name, buf in model.named_buffers()}
+        existing_buffers = {
+            name: buf for name, buf in model.named_buffers(remove_duplicate=False)
+        }
         existing_names = set(existing_params) | set(existing_buffers)
 
         imported_refs = []
@@ -357,9 +387,34 @@ class IpcModelLoader(BaseModelLoader):
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
+        extra_tensors = {}
         for name, entry in entries.items():
+            if name == STATE_ENTRY:
+                continue
             imported_tensor = self._transport_backend.import_tensor(entry)
+            if name.startswith(TENSOR_PREFIX):
+                if manifest is None:
+                    raise ValueError("Unexpected model-state tensor in IPC cache")
+                shape, dtype = manifest["extras"][name]
+                if (
+                    list(imported_tensor.shape) != shape
+                    or str(imported_tensor.dtype) != dtype
+                ):
+                    raise ValueError(f"V4.1 IPC derived tensor schema mismatch: {name}")
+                extra_tensors[name] = imported_tensor
+                imported_refs.append(imported_tensor)
+                continue
             is_param = entry.get("is_param", True)
+            if manifest is not None:
+                shape, dtype, kind = manifest["schema"][name]
+                if (
+                    list(imported_tensor.shape) != shape
+                    or str(imported_tensor.dtype) != dtype
+                    or is_param != kind
+                ):
+                    raise ValueError(
+                        f"V4.1 IPC processed tensor schema mismatch: {name}"
+                    )
 
             if name in existing_names:
                 # Existing parameter/buffer — validate shape/dtype
@@ -367,7 +422,7 @@ class IpcModelLoader(BaseModelLoader):
                     ref_param = existing_params[name]
                 else:
                     ref_param = existing_buffers[name]
-                if (
+                if manifest is None and (
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
                 ):
@@ -396,6 +451,9 @@ class IpcModelLoader(BaseModelLoader):
                 f"incomplete or the daemon/client configs drifted (a bug to fix), "
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
+
+        if manifest is not None and any("host_table" in e for e in entries.values()):
+            self._transport_backend.bind_host_tables(model, entries)
 
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would
@@ -431,6 +489,11 @@ class IpcModelLoader(BaseModelLoader):
                 f"  buffers: {still_on_meta_buffers[:10]}"
                 f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
             )
+
+        if manifest is not None:
+            from .model_state import restore_model_state
+
+            restore_model_state(model, manifest, extra_tensors)
 
         map_elapsed = time.perf_counter() - map_tic
 
@@ -517,6 +580,13 @@ class IpcModelLoader(BaseModelLoader):
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
+            from sglang.srt.runtime_context import get_server_args
+
+            from .model_state import layout_fingerprint, model_state_contract
+
+            contract = model_state_contract(
+                model_config, self.load_config.model_loader_extra_config
+            )
             engine_config = CacheConfig(
                 model_path=model_config.model_path,
                 model_arch=(
@@ -542,6 +612,12 @@ class IpcModelLoader(BaseModelLoader):
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
+                model_state_contract=contract,
+                weight_layout_hash=(
+                    layout_fingerprint(model_config, get_server_args())
+                    if contract
+                    else ""
+                ),
                 **compute_env_stamp(),
             )
 

@@ -291,17 +291,17 @@ class WeightCacheDaemon:
         from sglang.srt.layers.moe import initialize_moe_config
 
         initialize_moe_config()
+        # Scheduler normally initializes these before creating ModelRunner.
+        # The daemon has no Scheduler, but must select identical weight
+        # transforms (notably V4.1 block-FP8 served by MXFP8 dense GEMMs).
+        _initialize_gemm_configs()
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
         # Build model config first, then init distributed
-        model_config = ModelConfig(
-            model_path=self.model_path,
-            trust_remote_code=self.trust_remote_code,
-            revision=self.revision,
-            dtype=self.dtype,
-            quantization=self.quantization,
-        )
+        # Resolve the same model overrides as the engine (e.g. V4.1's vision
+        # layer count). A hand-maintained subset silently builds another model.
+        model_config = ModelConfig.from_server_args(server_args)
 
         # Build cache config fingerprint before loading the model.
         # Loading may mutate hf_config.quantization_config (e.g. via
@@ -318,6 +318,9 @@ class WeightCacheDaemon:
 
         # Refuse unsupported quant methods before creating distributed groups
         # or touching model weights.
+        from .model_state import layout_fingerprint, model_state_contract
+
+        contract = model_state_contract(model_config, self.model_loader_extra_config)
         check_ipc_quant_support(quant_method, quant_config, where="daemon")
 
         # The initialized groups are the authority for rank identity. This
@@ -351,6 +354,10 @@ class WeightCacheDaemon:
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
             revision=self.revision or "",
+            model_state_contract=contract,
+            weight_layout_hash=(
+                layout_fingerprint(model_config, server_args) if contract else ""
+            ),
             **compute_env_stamp(),
         )
 
@@ -447,13 +454,32 @@ class WeightCacheDaemon:
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
+        # Shared non-persistent buffers need every module path too: replacing
+        # one meta buffer does not update its aliases in other modules.
+        for name, buf in self.model.named_buffers(remove_duplicate=False):
             if name not in state_dict_names:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
+        manifest = None
+        if self.config.model_state_contract:
+            from .model_state import export_model_state
+
+            manifest = export_model_state(self.model, state_tensors)
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
+        if manifest is not None:
+            from .model_state import host_table_exports
+
+            host_entries, host_fds = host_table_exports(self.model, state_tensors)
+            if host_entries:
+                self.transport_backend.configure_host_table_exports(
+                    host_entries, host_fds
+                )
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        if manifest is not None:
+            from .model_state import STATE_ENTRY
+
+            self.state_entries[STATE_ENTRY] = {"model_state": manifest}
 
         # Log approximate serialized metadata size (not payload-backed bytes).
         # Only the handle blob carries real weight, so measure it directly:
@@ -886,10 +912,25 @@ def launch_weight_cache_daemons(
         )
 
 
-if __name__ == "__main__":
-    worker_parser = argparse.ArgumentParser(add_help=False)
+def _initialize_gemm_configs():
+    from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+    from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+    from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+
+    initialize_fp8_gemm_config()
+    initialize_fp4_gemm_config()
+    initialize_bf16_gemm_config()
+
+
+def _parse_worker_cli_args(argv=None):
+    # --tp is a server alias, not an abbreviation of the worker's --tp-rank.
+    worker_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     WeightCacheDaemonArgs.add_cli_args(worker_parser)
-    worker_ns, server_argv = worker_parser.parse_known_args()
+    return worker_parser.parse_known_args(argv)
+
+
+if __name__ == "__main__":
+    worker_ns, server_argv = _parse_worker_cli_args()
 
     from sglang.srt.server_args import prepare_server_args
 
