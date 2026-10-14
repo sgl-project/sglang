@@ -21,7 +21,8 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
+use sglang_processor::openai::OpenAiSettings;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -73,18 +74,24 @@ fn build_ctx(url: String) -> Arc<AppContext> {
 }
 
 fn build_ctx_with_config(url: String, cfg: Config) -> Arc<AppContext> {
+    build_ctx_with_profile(url, cfg, WireProtocol::default().into())
+}
+
+/// [`build_ctx_with_config`] whose worker introspected as `profile`.
+fn build_ctx_with_profile(url: String, cfg: Config, profile: EngineProfile) -> Arc<AppContext> {
     // The handler tokenizes via the AppContext's registry (which carries the V4
     // encoder); the RoundRobin policy itself needs no tokenizer.
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     assert!(tokenizers.has_chat_formatter(MODEL));
     let registry = Arc::new(WorkerRegistry::default());
-    let _ = registry.add(WorkerSpec {
+    let spec = WorkerSpec {
         id: WorkerId(url.clone()),
         url,
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         ..Default::default()
-    });
+    };
+    let _ = registry.add_with_cb(spec, None, profile);
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
@@ -486,4 +493,45 @@ async fn kimi_ids_forward_with_engine_rendering_fallback() {
         }
         assert_eq!(without_minted_rid(captured(&mock)), request);
     }
+}
+
+/// With the workers' OpenAI settings and K3's parsers, a Kimi-K3 chat is
+/// lowered to `/generate` on the router's ids, with K3's OpenAI-layer rules.
+#[tokio::test]
+async fn kimi_chat_lowers_to_generate() {
+    let mock = MockWorker::start(vec![]).await;
+    let fixture = kimi_fixture::tokenizer();
+    let mut cfg = config();
+    let path = fixture.path().join("tiktoken.model");
+    cfg.model.tokenizer_path = Some(path.display().to_string());
+    let settings = OpenAiSettings {
+        reasoning_parser: Some("kimi_k3".into()),
+        tool_call_parser: Some("kimi_k3".into()),
+        context_length: Some(1 << 20),
+        ..Default::default()
+    };
+    let profile = EngineProfile {
+        openai: Some(Arc::new(settings)),
+        ..WireProtocol::default().into()
+    };
+    let ctx = build_ctx_with_profile(mock.url.clone(), cfg, profile);
+    let tool = json!({"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}});
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool],
+        "stop": "END",
+        "max_tokens": 8,
+    });
+    let ids = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+    send(ctx.clone(), request).await;
+    let body = captured(&mock);
+    assert_eq!(body["input_ids"], json!(ids));
+    assert_eq!(body["require_reasoning"], true);
+    let sampling = &body["sampling_params"];
+    assert_eq!(sampling["skip_special_tokens"], false);
+    assert_eq!(sampling["stop"], json!(["END", "<|close|>tools<|sep|>"]));
+    assert!(ctx.metrics.render().contains(&format!(
+        "sgl_router_input_ids_forwarding_total{{model_id=\"{MODEL}\",outcome=\"forwarded\"}} 1"
+    )));
 }
