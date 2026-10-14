@@ -5491,6 +5491,69 @@ class InklingTokenOutputTest(CustomTestCase):
                 with self.subTest(case=name, mode=mode):
                     self.assertEqual(result, expected)
 
+    def test_constrained_continuation_stays_in_the_open_text_block(self):
+        """Bug regression: a constrained continue_final_message request had to open
+        a new message header inside the prompt's text block, which leaked as text."""
+        from types import SimpleNamespace
+
+        from xgrammar import TokenizerInfo, VocabType
+
+        from sglang.srt.constrained.reasoner_grammar_backend import (
+            ReasonerGrammarBackend,
+        )
+        from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+        from sglang.srt.parser.reasoning_parser import InklingDetector
+
+        tokenizer = load_tml_renderers().tokenizer
+        special = tokenizer.encode_special
+        eos = special("content_model_end_sampling")
+        vocab = []
+        for token_id in range(201088):
+            try:
+                vocab.append(tokenizer.decode_bytes([token_id]))
+            except ValueError:
+                vocab.append(b"")
+        info = TokenizerInfo(vocab, VocabType.RAW, stop_token_ids=[eos])
+        backend = XGrammarGrammarBackend(
+            SimpleNamespace(init_xgrammar=lambda: (info, None)), len(vocab)
+        )
+        reasoner = ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=InklingDetector()), None
+        )
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "Answer yes."},
+                {"role": "assistant", "content": "Answer: "},
+            ],
+            continue_final_message=True,
+            regex="yes",
+        )
+        prompt_ids = self.inkling.encode_messages(
+            messages=[message.model_dump() for message in request.messages],
+            request=request,
+            tools=None,
+        )
+        key = reasoner.get_request_grammar_key(("regex", "yes"), prompt_ids)
+        grammar = reasoner._init_value_dispatch(key, reasoning=True)
+        output_ids = [*tokenizer.encode_ordinary("yes"), special("end_message"), eos]
+        mask = backend.allocate_vocab_mask(len(vocab), 1, "cpu")
+        for token_id in [special("message_model"), *output_ids]:
+            grammar.fill_vocab_mask(mask, 0)
+            allowed = bool(int(mask[0, token_id // 32]) >> (token_id % 32) & 1)
+            self.assertEqual(allowed, token_id != special("message_model"))
+            if allowed:
+                grammar.accept_token(token_id)
+        self.assertTrue(grammar.is_terminated())
+
+        results = self._reasoning_and_content(
+            request, output_ids, {"type": "stop", "matched": eos}, split=1
+        )
+        for mode, result in results.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(result, ("", "yes"))
+
 
 class TestRequestChatTemplateTrustGate(CustomTestCase):
     def setUp(self):

@@ -146,6 +146,9 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         )
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
+        mgr.grammar_backend.get_request_grammar_key.side_effect = (
+            lambda key, input_ids: key
+        )
         return mgr
 
     def test_no_constraint_returns_false(self):

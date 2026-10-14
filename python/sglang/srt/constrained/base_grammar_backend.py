@@ -18,7 +18,7 @@ import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -223,8 +223,17 @@ class BaseGrammarBackend:
     def enable_strict_thinking(self):
         return self._enable_strict_thinking
 
-    def get_structural_tag_content(self, grammar: BaseGrammarObject) -> Optional[dict]:
-        """Embed a compiled grammar as XGrammar structural-tag content; None if unsupported."""
+    def get_request_grammar_key(
+        self, key: Tuple[str, str], input_ids: Sequence[int]
+    ) -> Tuple[str, str]:
+        """Cache key for this request's grammar; may depend on how the prompt ends."""
+        return key
+
+    def compile_framed_grammar(
+        self, grammar: BaseGrammarObject, frame: Callable[[dict], dict]
+    ) -> Optional[BaseGrammarObject]:
+        """Compile ``frame(content)``, an XGrammar structural tag embedding ``grammar``
+        as content; None if the backend cannot embed it."""
         return None
 
     @property

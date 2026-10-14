@@ -168,6 +168,9 @@ class GrammarManager:
                     key = (key_type, req.sampling_params.ebnf)
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
+                key = self.grammar_backend.get_request_grammar_key(
+                    key, req.origin_input_ids
+                )
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
                     key, req.require_reasoning

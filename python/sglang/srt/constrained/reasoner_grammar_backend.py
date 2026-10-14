@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 _canonical_inkling_auto_tool_schema: Optional[dict] = None
 _INKLING_FRAMED_KEY_TYPES = ("json", "regex", "ebnf")
+_INKLING_OPEN_TEXT_KEY_SUFFIX = ":inkling_open_text"
 
 
 def _get_canonical_inkling_auto_tool_schema() -> dict:
@@ -63,35 +64,45 @@ def _get_canonical_inkling_auto_tool_schema() -> dict:
     return _canonical_inkling_auto_tool_schema
 
 
-def _inkling_answer_structural_tag(content: dict) -> dict:
+def _inkling_answer_structural_tag(content: dict, start: str) -> dict:
+    # "turn" may think first; "text_block" continues a block the prompt opened.
+
     def token(name: str) -> dict:
         return {"type": "token", "token": INKLING_SPECIAL_TOKEN_IDS[name]}
 
-    thinking_message = {
-        "type": "sequence",
-        "elements": [
-            token(MESSAGE_MODEL),
-            token(CONTENT_THINKING),
-            {
-                "type": "any_tokens",
-                "exclude_tokens": [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
-            },
-            token(END_MESSAGE),
-        ],
-    }
-    return {
-        "type": "structural_tag",
-        "format": {
+    elements = [content, token(END_MESSAGE)]
+    if start != "text_block":
+        elements = [token(MESSAGE_MODEL), token(CONTENT_TEXT), *elements]
+    if start == "turn":
+        thinking_message = {
             "type": "sequence",
             "elements": [
-                {"type": "optional", "content": thinking_message},
                 token(MESSAGE_MODEL),
-                token(CONTENT_TEXT),
-                content,
+                token(CONTENT_THINKING),
+                {
+                    "type": "any_tokens",
+                    "exclude_tokens": [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
+                },
                 token(END_MESSAGE),
             ],
-        },
+        }
+        elements = [{"type": "optional", "content": thinking_message}, *elements]
+    return {
+        "type": "structural_tag",
+        "format": {"type": "sequence", "elements": elements},
     }
+
+
+def _ends_in_open_inkling_text_block(input_ids: Sequence[int]) -> bool:
+    end_message = INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]
+    last_end = next(
+        (i for i in range(len(input_ids) - 1, -1, -1) if input_ids[i] == end_message),
+        -1,
+    )
+    return list(input_ids[last_end + 1 : last_end + 3]) == [
+        INKLING_SPECIAL_TOKEN_IDS[MESSAGE_MODEL],
+        INKLING_SPECIAL_TOKEN_IDS[CONTENT_TEXT],
+    ]
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
@@ -409,21 +420,42 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             return None
         return self._make_grammar_object(None, reasoning)
 
+    def get_request_grammar_key(
+        self, key: Tuple[str, str], input_ids: Sequence[int]
+    ) -> Tuple[str, str]:
+        if (
+            self._is_inkling_detector
+            and key[0] in _INKLING_FRAMED_KEY_TYPES
+            and _ends_in_open_inkling_text_block(input_ids)
+        ):
+            return (key[0] + _INKLING_OPEN_TEXT_KEY_SUFFIX, key[1])
+        return key
+
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool
     ) -> Optional[BaseGrammarObject]:
+        key_type, key_string = key
+        in_text_block = key_type.endswith(_INKLING_OPEN_TEXT_KEY_SUFFIX)
+        if in_text_block:
+            key = (key_type.removesuffix(_INKLING_OPEN_TEXT_KEY_SUFFIX), key_string)
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         if key[0] == "full_assistant_ebnf":
             return ret
         if self._is_inkling_detector and key[0] in _INKLING_FRAMED_KEY_TYPES:
-            framed = self._frame_inkling_answer(ret, reasoning)
+            if in_text_block:
+                start = "text_block"
+            elif self.enable_strict_thinking:
+                # The strict wrapper owns thinking; after it ends only the answer may follow.
+                start = "answer"
+            else:
+                start = "turn"
+            framed = self._frame_inkling_answer(ret, start)
             if framed is not None:
-                if not self.enable_strict_thinking:
-                    # The frame admits the thinking message itself, so it owns the turn.
-                    return framed
-                ret = framed
+                if start == "answer":
+                    return self._make_grammar_object(framed, reasoning)
+                return framed
         if (
             not self.enable_strict_thinking
             and key[0] == "structural_tag"
@@ -435,12 +467,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         return self._make_grammar_object(ret, reasoning)
 
     def _frame_inkling_answer(
-        self, grammar: BaseGrammarObject, reasoning: bool
+        self, grammar: BaseGrammarObject, start: str
     ) -> Optional[BaseGrammarObject]:
-        content = self.grammar_backend.get_structural_tag_content(grammar)
-        if content is None:
-            return None
-        tag = _inkling_answer_structural_tag(content)
-        return self.grammar_backend._init_value_dispatch(
-            ("structural_tag", json.dumps(tag)), reasoning
+        return self.grammar_backend.compile_framed_grammar(
+            grammar, lambda content: _inkling_answer_structural_tag(content, start)
         )

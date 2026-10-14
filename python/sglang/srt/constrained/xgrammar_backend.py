@@ -16,7 +16,7 @@
 import dataclasses
 import json
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from xgrammar import (
@@ -242,6 +242,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 )
 
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        # The cache mixes up token-level structural tags of different shapes, so
+        # framed grammars compile uncached (seen on xgrammar 0.2.1 through 0.2.7).
+        self._framing_compiler = GrammarCompiler(
+            tokenizer_info=tokenizer_info, cache_enabled=False
+        )
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
@@ -251,8 +256,16 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def is_support_token_filter(self):
         return True
 
-    def get_structural_tag_content(self, grammar: XGrammarGrammar) -> dict:
-        return {"type": "grammar", "grammar": str(grammar.ctx.grammar)}
+    def compile_framed_grammar(
+        self, grammar: XGrammarGrammar, frame: Callable[[dict], dict]
+    ) -> XGrammarGrammar:
+        tag = json.dumps(
+            frame({"type": "grammar", "grammar": str(grammar.ctx.grammar)})
+        )
+        ctx = self._framing_compiler.compile_structural_tag(tag)
+        return self._from_context(
+            ctx, tag, GrammarStats(dispatch_type="structural_tag")
+        )
 
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
