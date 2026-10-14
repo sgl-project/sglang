@@ -279,6 +279,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import (
+    DriverOps,
     ModeStages,
     ScheduleSlot,
 )
@@ -2073,13 +2074,15 @@ class Scheduler:
             stages=self.stages,
             pending=self.pending,
             recv_skipper=self.recv_skipper,
-            ingest_requests=self.ingest_requests,
-            launch_step=self.launch_step,
-            commit_step=self.commit_step,
-            run_batch=self.run_batch,
-            on_idle=self.on_idle,
+            ops=DriverOps(
+                ingest_requests=self.ingest_requests,
+                launch_step=self.launch_step,
+                commit_step=self.commit_step,
+                run_batch=self.run_batch,
+                on_idle=self.on_idle,
+                mark_idle=self.mark_sched_idled,
+            ),
             counters=self.counters,
-            mark_idle=self.mark_sched_idled,
             pp_spec_forward=self.pp_spec_forward,
             pp_group=self.pp_group,
             device=self.device,

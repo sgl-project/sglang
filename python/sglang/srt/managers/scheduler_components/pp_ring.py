@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from collections import deque
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -39,7 +39,10 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
-    from sglang.srt.managers.scheduler_components.mode_stages import ModeStages
+    from sglang.srt.managers.scheduler_components.mode_stages import (
+        DriverOps,
+        ModeStages,
+    )
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.pp_channel import PPChannel
     from sglang.srt.managers.scheduler_components.pp_spec_forward import (
@@ -105,13 +108,8 @@ class PPRing:
         stages: ModeStages,
         pending: PendingSteps,
         recv_skipper,
-        ingest_requests: Callable[[], List],
-        launch_step: Callable[..., PendingStep],
-        commit_step: Callable[[PendingStep], None],
-        run_batch: Callable[..., GenerationBatchResult],
-        on_idle: Callable[[], None],
+        ops: DriverOps,
         counters: LaunchCounters,
-        mark_idle: Callable[[], None],
         pp_spec_forward: Optional[PPSpecForward],
         pp_group,
         device,
@@ -129,13 +127,8 @@ class PPRing:
         self.stages = stages
         self.pending = pending
         self.recv_skipper = recv_skipper
-        self.ingest_requests = ingest_requests
-        self.launch_step = launch_step
-        self.commit_step = commit_step
-        self.run_batch = run_batch
-        self.on_idle = on_idle
+        self.ops = ops
         self.counters = counters
-        self.mark_idle = mark_idle
         # What the forward and the output relay read.
         self.pp_group = pp_group
         self.device = device
@@ -188,7 +181,7 @@ class PPRing:
                 # Receive requests; plain PP relays them on right away, PD
                 # after this slot's consensus messages.
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.ingest_requests()
+                    recv_reqs = self.ops.ingest_requests()
                 if not self.pp_group.is_last_rank:
                     self.channel.commit(self.send_req_work)
                     if pd is None:
@@ -233,7 +226,7 @@ class PPRing:
                     )
                 self.channel.commit_proxy_send()
                 self.slots[mb_id].record = (
-                    self.launch_step(step, slot, pp_proxy_tensors=pp_proxy_tensors)
+                    self.ops.launch_step(step, slot, pp_proxy_tensors=pp_proxy_tensors)
                     if step
                     else None
                 )
@@ -258,7 +251,7 @@ class PPRing:
                     assert popped is due, "the ring commits slots in launch order"
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
-                        self.commit_step(
+                        self.ops.commit_step(
                             dataclasses.replace(due, result=next_batch_result)
                         )
                 if pd is not None:
@@ -279,9 +272,9 @@ class PPRing:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.mark_idle()
+                self.ops.mark_idle()
                 if pd is None or pd.is_drained():
-                    self.on_idle()
+                    self.ops.on_idle()
 
     def _commit_send_output_work_and_preprocess_output_tensors(
         self,
@@ -820,7 +813,7 @@ class PPRing:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(step, pp_proxy_tensors)
+                result = self.ops.run_batch(step, pp_proxy_tensors)
                 set_time_batch(
                     step.reqs,
                     "set_run_batch_cpu_end_time",
