@@ -121,6 +121,9 @@ def layout_fingerprint(model_config, server_args) -> str:
     root = Path(__file__).resolve().parents[1]
     paths = (
         "weight_cache/model_state.py",
+        "weight_cache/daemon.py",
+        "weight_cache/ipc_loader.py",
+        "model_executor/model_runner_components/load_model_utils.py",
         "models/deepseek_v4.py",
         "layers/engram.py",
         "weight_cache/transport.py",
@@ -128,6 +131,8 @@ def layout_fingerprint(model_config, server_args) -> str:
         "layers/attention/dsv4/compressor.py",
         "layers/quantization/fp8.py",
         "layers/quantization/fp8_utils.py",
+        "layers/quantization/fp4_utils.py",
+        "layers/quantization/unquant.py",
         "layers/quantization/mxfp4_flashinfer_trtllm_moe.py",
         "layers/moe/mega_moe.py",
     )

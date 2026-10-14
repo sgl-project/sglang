@@ -95,6 +95,12 @@ Host descriptors validate logical size, padded allocation size, NUMA placement,
 and tensor bounds. Host-table objects own imported mappings, CUDA handles and
 FDs; retire tensor/kernel users before closing these objects.
 
+When upgrading this implementation, restart the weight daemon before importing
+its cache with upgraded clients. The compatibility fingerprint includes the
+daemon, IPC loader, model-load orchestration and weight-processing source files;
+a client rejects a cache produced by different recovery code. This intentionally
+requires a fresh daemon load after source changes.
+
 ## Prewarmed standby workers
 
 `python -m sglang.srt.weight_cache.standby --config config.json` manages two

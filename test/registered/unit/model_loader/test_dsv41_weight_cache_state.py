@@ -253,6 +253,37 @@ class TestDsv41WeightCacheState(CustomTestCase):
         )
         self.assertNotEqual(a, b)
 
+    def test_weight_layout_fingerprint_rejects_recovery_source_drift(self):
+        from pathlib import Path
+
+        from sglang.srt.weight_cache.model_state import layout_fingerprint
+
+        cfg = SimpleNamespace(
+            hf_config=SimpleNamespace(to_dict=lambda: {"model_type": "deepseek_v41"})
+        )
+        args = SimpleNamespace()
+        baseline = layout_fingerprint(cfg, args)
+        read_bytes = Path.read_bytes
+        for source in (
+            "weight_cache/daemon.py",
+            "weight_cache/ipc_loader.py",
+            "model_executor/model_runner_components/load_model_utils.py",
+            "layers/quantization/fp4_utils.py",
+            "layers/quantization/unquant.py",
+        ):
+            with self.subTest(source=source):
+
+                def changed_source(path):
+                    data = read_bytes(path)
+                    return (
+                        data + b"\n# different checkout\n"
+                        if path.as_posix().endswith(source)
+                        else data
+                    )
+
+                with patch.object(Path, "read_bytes", changed_source):
+                    self.assertNotEqual(baseline, layout_fingerprint(cfg, args))
+
     def test_daemon_parser_does_not_consume_tp_alias(self):
         from sglang.srt.weight_cache.daemon import _parse_worker_cli_args
 
