@@ -60,6 +60,7 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 - On H200, enable `SGLANG_ENABLE_FP8_BLOCK_GEMV=1` and `SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1`. Both are included in the generated commands; they are no-ops on GB300 (SM10x).
 - Leave `--mem-fraction-static` at its default. SGLang auto-selects the `ling3` reasoning and tool-call parsers for this architecture; you can change the parser settings in the Playground.
 - **NEXTN:** add `--speculative-algorithm NEXTN` for built-in MTP speculative decoding. Measured acceptance length is 2.61 on random tokens and 2.13 on real-text probes.
+- **Long context:** the checkpoint supports 262,144 tokens natively. For up to 1,048,576 tokens, add the YaRN override from §3.4.
 - For prefix-heavy, multi-turn workloads, select **Cache fork and tail** in the Playground. It combines `--mamba-radix-cache-strategy extra_buffer`, `--chunked-prefill-size 4096`, and `SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK=1`. GPU checks confirmed both fork and tail states are cached, saving about 576 tokens per subsequent turn in the measured workload.
 
 ### Playground support
@@ -307,6 +308,18 @@ The weather in Hangzhou right now is sunny with a temperature of 22°C. It's a p
 The first line is `reasoning_content`; the second is `content`. `finish_reason` is `stop`.
 
 </Accordion>
+
+### 3.4 Long context with YaRN (up to 1M tokens)
+
+The model's native context is 262,144 tokens. Verified on H200 and GB300, YaRN extrapolation serves up to **1,048,576 tokens**:
+
+```bash Command
+--json-model-override-args '{"rope_scaling": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144, "rope_theta": 6000000, "partial_rotary_factor": 0.5}, "max_position_embeddings": 1048576}'
+```
+
+Add it to the Low-Latency serve command. All four keys are required: the override replaces the checkpoint's RoPE parameters, so omitting `rope_theta` or `partial_rotary_factor` silently changes the RoPE base, and omitting `max_position_embeddings` keeps the 262,144 limit. Only enable it for prompts beyond 256K.
+
+Verification on the current checkpoint: a fact planted at token 700,023 of a 900,022-token prompt is retrieved exactly, NEXTN acceptance stays about 2.1 at 900K, and a 300,101-token prompt is answered correctly (H200 TTFT 15.4 s, GB300 12.6 s). One 1M-token request fits alongside normal serving traffic on both platforms.
 
 ### 3.3 HiCache with Mooncake
 
