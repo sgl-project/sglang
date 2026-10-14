@@ -497,7 +497,7 @@ class RadixCache(BasePrefixCache):
                         key=prompt_key,
                         value=values[: len(prompt_key)],
                         inserted_len=len(prompt_key),
-                        priority=priority + 1,
+                        priority=min(priority + 1, torch.iinfo(torch.int64).max),
                     )
                 )
 
