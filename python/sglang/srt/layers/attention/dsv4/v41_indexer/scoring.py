@@ -24,7 +24,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
-from .types import DecodeInputs, PrefillInputs
+from .types import DecodeInputs, PrefillInputs, RowShard
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
@@ -212,13 +212,16 @@ def score_tiles(
     kv: Tuple[torch.Tensor, torch.Tensor],
     *,
     width_align: int,
+    rows: Optional[slice] = None,
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
+    """Tiles of ``rows`` (all by default); a tile slice is relative to ``rows``."""
+    rows = slice(0, data.num_rows) if rows is None else rows
     yield from flat_index_logits_tiles(
-        q=(data.q_fp4, data.q_sf),
+        q=(data.q_fp4[rows], data.q_sf[rows]),
         kv=kv,
-        weights=data.weights,
-        starts=data.request_starts,
-        lengths=data.compress_lens,
+        weights=data.weights[rows],
+        starts=data.request_starts[rows],
+        lengths=data.compress_lens[rows],
         context_lengths=data.lens_per_request,
         budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
         width_align=width_align,
@@ -230,21 +233,40 @@ def dense_prefill_topk(
     kv: Tuple[torch.Tensor, torch.Tensor],
     *,
     out: torch.Tensor,
+    rows: Optional[slice] = None,
 ) -> None:
-    """Request-local compressed positions into ``out``, ``-1`` padded, unordered."""
+    """Request-local compressed positions of ``rows`` (all by default) into
+    ``out``, one ``out`` row per scored row, ``-1`` padded, unordered."""
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
+    rows = slice(0, data.num_rows) if rows is None else rows
+    lens = data.compress_lens[rows]
     # Score columns are request-relative, so a zero offset emits request-local positions.
-    zero_offsets = torch.zeros_like(data.request_starts)
-    for tile, logits in score_tiles(data, kv, width_align=4):
+    zero_offsets = torch.zeros_like(lens)
+    for tile, logits in score_tiles(data, kv, width_align=4, rows=rows):
         topk_transform_ragged_v2(
             logits,
-            data.compress_lens[tile],
+            lens[tile],
             out_offsets=zero_offsets[tile],
             out_indices=out[tile],
         )
         # Free this tile's logits before the generator scores the next one.
         del logits
+
+
+def sharded_dense_prefill_topk(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    out: torch.Tensor,
+    shard: RowShard,
+) -> None:
+    """``dense_prefill_topk`` over this rank's share of the rows, all-gathered
+    into ``out`` for every row."""
+    num_rows = data.num_rows
+    local = out.new_full((shard.rows_per_rank(num_rows), out.shape[1]), -1)
+    dense_prefill_topk(data, kv, out=local, rows=shard.local_rows(num_rows))
+    out.copy_(shard.gather(local, num_rows))
 
 
 # ---------- torch ----------

@@ -44,6 +44,7 @@ from .types import (
     CandidateMetadata,
     DecodeInputs,
     PrefillInputs,
+    RowShard,
     get_tail_row_indices,
 )
 
@@ -140,6 +141,7 @@ class SparseTableBackend:
             index_page_size=index_page_size,
             topk_blocks=self.topk_blocks,
             out_positions=inputs.out_raw_indices[: data.num_rows],
+            row_shard=inputs.row_shard,
         )
         data.write_page_indices(inputs)
         return table
@@ -384,27 +386,23 @@ def _row_pair_ids(rows_per_request: List[int], *, device: torch.device) -> torch
     return (row - ((row - first_row[request]) & 1)).to(torch.int32)
 
 
-# TODO(dark): support fusion of publish + topk of publish layer
-def publish_prefill_table(
+def select_prefill_rows(
     *,
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
-    index_page_table: torch.Tensor,
-    index_page_size: int,
-    topk_blocks: int,
+    rows: slice,
+    nblocks: torch.Tensor,
     out_positions: torch.Tensor,
-) -> _SparsePrefillTable:
-    """The source's own top-k into ``out_positions`` (request-local compressed
-    positions) and the chunk's table, from one pass over its dense scores;
-    ``index_page_table`` is at ``index_page_size`` slots."""
-    rows = data.num_rows
-    device = data.q_fp4.device
-    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
-    blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
-    zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
+    out_blocks: torch.Tensor,
+) -> None:
+    """The source's own top-k (request-local compressed positions) and its top
+    blocks for ``rows``, from one pass over their dense scores; one row of each
+    output per scored row, ``nblocks`` already sliced to ``rows``."""
+    lens_all = data.compress_lens[rows]
+    zero_offsets = torch.zeros_like(lens_all)
     # the block keys read the score rows through 32-byte vectors
-    for tile, logits in score_tiles(data, kv, width_align=8):
-        lens = data.compress_lens[tile]
+    for tile, logits in score_tiles(data, kv, width_align=8, rows=rows):
+        lens = lens_all[tile]
         topk_transform_ragged_v2(
             logits,
             lens,
@@ -422,8 +420,54 @@ def publish_prefill_table(
             keys,
             nblocks[tile],
             out_offsets=zero_offsets[: logits.shape[0]],
-            out_indices=blocks[tile],
+            out_indices=out_blocks[tile],
         )
+
+
+# TODO(dark): support fusion of publish + topk of publish layer
+def publish_prefill_table(
+    *,
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    index_page_table: torch.Tensor,
+    index_page_size: int,
+    topk_blocks: int,
+    out_positions: torch.Tensor,
+    row_shard: Optional[RowShard] = None,
+) -> _SparsePrefillTable:
+    """The source's own top-k into ``out_positions`` (request-local compressed
+    positions) and the chunk's table, from one pass over its dense scores;
+    ``index_page_table`` is at ``index_page_size`` slots. With ``row_shard`` the
+    scores are this rank's share and the selections are all-gathered; the table
+    is then built over every row, because its schedule cannot be sliced."""
+    rows = data.num_rows
+    device = data.q_fp4.device
+    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
+    if row_shard is None:
+        blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
+        select_prefill_rows(
+            data=data,
+            kv=kv,
+            rows=slice(0, rows),
+            nblocks=nblocks,
+            out_positions=out_positions,
+            out_blocks=blocks,
+        )
+    else:
+        local = row_shard.local_rows(rows)
+        per = row_shard.rows_per_rank(rows)
+        local_positions = out_positions.new_full((per, out_positions.shape[1]), -1)
+        local_blocks = torch.empty(per, topk_blocks, dtype=torch.int32, device=device)
+        select_prefill_rows(
+            data=data,
+            kv=kv,
+            rows=local,
+            nblocks=nblocks[local],
+            out_positions=local_positions,
+            out_blocks=local_blocks,
+        )
+        out_positions.copy_(row_shard.gather(local_positions, rows))
+        blocks = row_shard.gather(local_blocks, rows).contiguous()
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,

@@ -23,6 +23,8 @@ HEADS, DIM = 32, 128
 TOPK_BLOCKS, BLOCK, TOPK = 2048, 8, 512
 PAGE = 128  # index-K pool page size under DeepGEMM's paged sparse logits
 CASES = [(256, 40000), (64, 3000)]  # (query rows, context): above and below 2048 blocks
+# (query rows, context, ranks): a padded last share, an even split, an empty share
+SHARD_CASES = [(250, 40000, 4), (256, 3000, 2), (10, 3000, 4)]
 
 # The sparse kernel scores with bf16 weights and accumulation, the dense one in
 # fp32; picks a few bf16 ulps from the selection floor can go either way.
@@ -206,7 +208,7 @@ def reference_blocks(case: Case) -> torch.Tensor:
     return keep[:, :num_blocks]
 
 
-def publish_sparse(case: Case):
+def publish_sparse(case: Case, row_shard=None):
     """(the DeepGEMM sparse table, the source layer's own top-k)."""
     from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
         publish_prefill_table,
@@ -220,8 +222,63 @@ def publish_sparse(case: Case):
         index_page_size=PAGE,
         topk_blocks=TOPK_BLOCKS,
         out_positions=own,
+        row_shard=row_shard,
     )
     return table, own
+
+
+class _CaptureShares:
+    """Pass one of an in-process all-gather: records, in call order, the share
+    this rank contributes to each gather. It returns the replicated result,
+    keyed by width, because the code after a gather relies on real values: the
+    table build wants ascending, distinct block ids, and crashes on zeros."""
+
+    def __init__(self, replicated):
+        self.replicated = replicated
+        self.shares = []
+
+    def all_gather_into_tensor(self, out, local):
+        self.shares.append(local.clone())
+        full = self.replicated[local.shape[1]]
+        out.zero_()
+        out[: full.shape[0]].copy_(full)
+
+
+class _ReplayShares:
+    """Pass two: every gather returns all ranks' recorded shares in rank order,
+    which is what the attention-TP all-gather returns."""
+
+    def __init__(self, captures):
+        self.captures = captures
+        self.calls = 0
+
+    def all_gather_into_tensor(self, out, local):
+        out.copy_(torch.cat([c.shares[self.calls] for c in self.captures]))
+        self.calls += 1
+
+
+def on_every_rank(world: int, num_rows: int, run, replicated):
+    """``run(row_shard)`` as each rank of a ``world``-rank attention-TP group
+    sees it, every rank's share scored by the code under test; ``replicated``
+    maps a gathered width to its unsharded result. The returned results derive
+    from the recorded shares only, never from ``replicated``."""
+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import RowShard
+
+    def shard(rank, group):
+        return RowShard(group=group, rank=rank, world=world, row_align=128 // HEADS)
+
+    # Rows a broken partition leaves out reach the table build uninitialized and
+    # crash it, which poisons the CUDA context for every later test; fail first.
+    covered = []
+    for rank in range(world):
+        rows = shard(rank, None).local_rows(num_rows)
+        covered.extend(range(rows.start, rows.stop))
+    assert covered == list(range(num_rows)), "row shares must tile the rows in order"
+
+    captures = [_CaptureShares(replicated) for _ in range(world)]
+    for rank in range(world):
+        run(shard(rank, captures[rank]))
+    return [run(shard(rank, _ReplayShares(captures))) for rank in range(world)]
 
 
 def select_sparse(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
@@ -279,6 +336,14 @@ def logits_of(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
         table.schedule,
         table.blocks.shape[1],
     )
+
+
+def valid_scores(table, case: Case) -> torch.Tensor:
+    """The paged sparse scores ``table`` drives, at every row's valid positions
+    only; the logits past a row's length are never written."""
+    logits = logits_of(table, case.data, case.k_cache)
+    cols = torch.arange(logits.shape[1], device=logits.device)
+    return logits[cols[None, :] < table.valid_lens[:, None]]
 
 
 def picks(positions: torch.Tensor, row: int) -> set:
@@ -426,6 +491,78 @@ class TestPrefillSparseIndexer(CustomTestCase):
             torch.cuda.set_sync_debug_mode("default")
         rows = [3, 4, 12, 13, 14, 15, 16, 17, 18, 19]
         torch.testing.assert_close(tail.blocks, blocks[rows])
+
+    @torch.inference_mode()
+    def test_row_shards_publish_the_replicated_table(self):
+        """Each attention-TP rank scoring only its share of the rows and
+        all-gathering the selections publishes, on every rank, the replicated
+        path's own top-k and table bit for bit, and a schedule that drives the
+        same scores: shares that pad, come out empty, or cut a request in two
+        included."""
+        cases = [
+            (make_case(rows, ctx, seed=rows + ctx), world)
+            for rows, ctx, world in SHARD_CASES
+        ]
+        cases.append((make_multi_case([100, 37, 120], 40000, seed=7), 4))
+        for case, world in cases:
+            with self.subTest(rows=case.data.num_rows, world=world):
+                table, own = publish_sparse(case)
+                ranks = on_every_rank(
+                    world,
+                    case.data.num_rows,
+                    lambda s: publish_sparse(case, s),
+                    {TOPK: own, TOPK_BLOCKS: table.blocks},
+                )
+                for rank, (got_table, got_own) in enumerate(ranks):
+                    # the own top-k is unordered within a row
+                    self.assertTrue(
+                        torch.equal(got_own.sort(-1).values, own.sort(-1).values),
+                        f"rank {rank}: own top-k",
+                    )
+                    for field in ("blocks", "phys_blocks", "valid_lens"):
+                        self.assertTrue(
+                            torch.equal(
+                                getattr(got_table, field), getattr(table, field)
+                            ),
+                            f"rank {rank}: {field}",
+                        )
+                    # The schedule buffer holds bytes its build never writes, so
+                    # two replicated builds of one input already differ byte for
+                    # byte; what it must reproduce is the scores it drives.
+                    self.assertTrue(
+                        torch.equal(
+                            valid_scores(got_table, case), valid_scores(table, case)
+                        ),
+                        f"rank {rank}: schedule",
+                    )
+
+    @torch.inference_mode()
+    def test_row_shards_select_the_replicated_full_topk(self):
+        """An index layer outside the candidate scheme selects the replicated
+        full top-k when its rows are scored by shares and all-gathered."""
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            dense_prefill_topk,
+            sharded_dense_prefill_topk,
+        )
+
+        for rows, ctx, world in SHARD_CASES:
+            with self.subTest(rows=rows, world=world):
+                case = make_case(rows, ctx, seed=rows * 5 + ctx)
+                expected = case.data.empty_selection(TOPK)
+                dense_prefill_topk(case.data, case.kv, out=expected)
+
+                def run(shard):
+                    out = case.data.empty_selection(TOPK)
+                    sharded_dense_prefill_topk(case.data, case.kv, out=out, shard=shard)
+                    return out
+
+                for rank, got in enumerate(
+                    on_every_rank(world, rows, run, {TOPK: expected})
+                ):
+                    self.assertTrue(
+                        torch.equal(got.sort(-1).values, expected.sort(-1).values),
+                        f"rank {rank}",
+                    )
 
 
 if __name__ == "__main__":
