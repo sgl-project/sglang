@@ -11,9 +11,6 @@ on every rank and stable across runs.
 
 from __future__ import annotations
 
-from typing import Sequence
-
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -28,16 +25,6 @@ _TRITON_DTYPE = {
 }
 
 SUPPORTED_DTYPES = tuple(_TRITON_DTYPE)
-
-
-def pack_peer_ptrs(buffer_ptrs: Sequence[int], device: torch.device) -> torch.Tensor:
-    """Pack peer buffer addresses into an int64 device tensor for Triton.
-
-    Intel USM device pointers have the high bit set, so they are reinterpreted
-    from uint64: ``torch.tensor(buffer_ptrs, dtype=torch.int64)`` overflows.
-    """
-    packed = np.array(list(buffer_ptrs), dtype=np.uint64).view(np.int64)
-    return torch.from_numpy(packed).to(device)
 
 
 @triton.jit
