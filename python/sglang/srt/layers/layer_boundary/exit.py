@@ -16,9 +16,8 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
-import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
@@ -56,7 +55,6 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
-    post_experts_sum_is_one_all_reduce,
     should_use_dp_reduce_scatterv,
 )
 from sglang.srt.layers.moe.utils import (
@@ -125,7 +123,7 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
             or (path.returns_over_dp and not output.update.applied_at_exit)
         )
     )
-    single_sum = may_defer_sum and post_experts_sum_is_one_all_reduce()
+    single_sum = False
     return ExitFacts(
         may_defer_sum=may_defer_sum,
         sum_in_reduce_scatter=sum_in_reduce_scatter,
@@ -436,7 +434,7 @@ def _batch_allows_deferred_sum(
     return residual is not None and aiter_ar_fusion_applies(residual, forward_batch)
 
 
-class ExitDecision(msgspec.Struct, frozen=True):
+class ExitDecision(NamedTuple):
     """One decision for an FFN output, made before compute runs.
 
     Fields:
