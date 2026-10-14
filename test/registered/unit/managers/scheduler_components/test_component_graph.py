@@ -92,9 +92,7 @@ _DECLARED = {
         "KvResources",
         "KvCapacity",
         "Streams",
-        "OutputStreamer",
-        "MetricsSink",
-        "StageMetrics",
+        "SchedulerServices",
         "BatchResultProcessor",
         "LaunchCounters",
         "RequestRetirer",
@@ -350,6 +348,7 @@ _BUILT = {
     ),
     "StepBuilder": ("managers/scheduler_components/step_builder.py", "StepBuilder"),
     "DisaggDecode": ("disaggregation/decode.py", "DisaggDecode"),
+    "DisaggPrefill": ("disaggregation/prefill.py", "DisaggPrefill"),
 }
 
 # The modules whose classes sit below ModeOwners.
