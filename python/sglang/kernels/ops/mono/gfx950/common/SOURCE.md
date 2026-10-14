@@ -17,3 +17,8 @@ are not vendored until a family here uses them.
   cleared between steps); a raw address (no `Addr`) is accepted as device-scope scratch (`plan.trace.note_unnamed`).
 - `device/ops.py` `ld_i32`: optional cache policy `cm` (default 0 = the previous load); `kernel_symbol` demangles to
   `sglang::<stem>_<params>`.
+
+## Families using it
+
+- `minimax_m3/`: every device helper but `release_stores` and `ar_pack_sumsq` (its `device.py`), the `select` stage
+  helpers, and the `Mailbox` with a step-epoch tag (see its SOURCE.md).

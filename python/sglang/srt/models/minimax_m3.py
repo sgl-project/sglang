@@ -101,7 +101,13 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -1598,6 +1604,99 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        mono_route=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if mono_route is not None:
+            return self._forward_mono(
+                mono_route,
+                positions,
+                hidden_states,
+                forward_batch,
+                captured_last_layer_outputs,
+                **kwargs,
+            )
+        return self._forward_modules(
+            positions,
+            hidden_states,
+            forward_batch,
+            captured_last_layer_outputs=captured_last_layer_outputs,
+            **kwargs,
+        )
+
+    def _forward_mono(
+        self,
+        route,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator],
+        **kwargs,
+    ) -> torch.Tensor:
+        """The whole layer as one mono launch. It takes the previous layer's output
+        with its residual add still pending (the kernel applies it with the input
+        norm) and returns its own MLP output, already all-reduced, the same way."""
+        stream = residual_batch.stream_of(forward_batch)
+        hidden_states, residual = stream.export(hidden_states)
+        if route.checker is not None:
+            output, residual = self._mono_checked(
+                route, positions, hidden_states, residual, forward_batch, **kwargs
+            )
+        else:
+            output, residual = route.kernel.launch(
+                route.step,
+                self.layer_id,
+                positions,
+                hidden_states,
+                residual,
+                forward_batch,
+                route.cache,
+            )
+        if captured_last_layer_outputs is not None:
+            # the collector copies this reused kernel buffer
+            captured_last_layer_outputs.capture(route.kernel.capture_input())
+        stream.write(residual)
+        return stream.record(output, self.ffn_boundary.declaration.update)
+
+    def _mono_checked(
+        self, route, positions, hidden_states, residual, forward_batch, **kwargs
+    ):
+        """Check mode: the modules on copies of the layer's input pair, then the
+        launch; logs both outputs' max |diff|."""
+        from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+        original = residual_batch.stream_of(forward_batch)
+        ref_input, ref_stream = ResidualStream.from_handoff(
+            hidden_states.clone(), residual.clone(), original.pending.update
+        )
+        forward_batch.residual_stream = ref_stream
+        try:
+            ref_h = self._forward_modules(positions, ref_input, forward_batch, **kwargs)
+            ref_h, ref_r = residual_batch.stream_of(forward_batch).export(ref_h)
+        finally:
+            forward_batch.residual_stream = original
+        out_h, out_r = route.kernel.launch(
+            route.step,
+            self.layer_id,
+            positions,
+            hidden_states,
+            residual,
+            forward_batch,
+            route.cache,
+        )
+        route.checker.compare(
+            self.layer_id,
+            route.step.rows,
+            {"hidden": (out_h, ref_h), "residual": (out_r, ref_r)},
+        )
+        return out_h, out_r
+
+    def _forward_modules(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(
@@ -1677,8 +1776,39 @@ class MiniMaxM3Model(nn.Module):
 
         self.layers_to_capture = []
 
+        from sglang.srt.layers.mono.guards import mono_enabled
+
+        self.config = config
+        self.mono = (
+            None  # sglang.srt.layers.mono runtime, attached on the first forward
+        )
+        # attach waits for the first forward: the loader shuffles the MoE weights
+        # after load_weights, and the kernels bind the KV pool there
+        self.mono_pending = mono_enabled(get_server_args())
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
+
+    def _attach_mono(self) -> None:
+        from sglang.srt.layers.mono.layer import attach_spec
+        from sglang.srt.models.minimax_m3_mono.spec import MONO_SPEC
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mono: first forward reached inside a CUDA graph capture"
+            )
+        self.mono_pending = False
+        tp = get_parallel().tp_group
+        self.mono = attach_spec(
+            self,
+            MONO_SPEC,
+            server_args=get_server_args(),
+            hf_config=self.config,
+            tp_rank=tp.rank_in_group,
+            tp_size=tp.world_size,
+            cpu_group=tp.cpu_group,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
 
     def forward(
         self,
@@ -1700,6 +1830,10 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
+        if self.mono_pending:
+            self._attach_mono()
+        if self.mono is not None:
+            self.mono.begin_step(forward_batch)
 
         aux_hidden_states = AuxHiddenStateList()
         if forward_batch.can_run_tbo:
@@ -1727,6 +1861,7 @@ class MiniMaxM3Model(nn.Module):
                         captured_last_layer_outputs=aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
                         else None,
+                        mono_route=None if self.mono is None else self.mono.routed(i),
                     )
 
         if not self.pp_group.is_last_rank:

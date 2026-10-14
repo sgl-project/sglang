@@ -7,7 +7,10 @@ from typing import Optional
 
 from sglang.srt.layers.mono.spec import MonoSpec
 
-_SPECS: dict[str, str] = {}
+_SPECS = {
+    "MiniMaxM3SparseForCausalLM": "sglang.srt.models.minimax_m3_mono.spec:MONO_SPEC",
+    "MiniMaxM3SparseForConditionalGeneration": "sglang.srt.models.minimax_m3_mono.spec:MONO_SPEC",
+}
 
 
 def spec_path(architecture: str) -> Optional[str]:
