@@ -2464,7 +2464,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
             swa_window_size=SWA_WINDOW,
-            swa_page_size=self.token_to_kv_pool.swa_kv_pool.page_size,
+            swa_page_size=self.token_to_kv_pool.get_swa_kv_page_size(),
             num_qo_tokens=num_qo_tokens,
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
@@ -3730,7 +3730,7 @@ class DeepseekV4AttnBackend(
                     compress_ratio
                 )
 
-            swa_kv_page_size = token_to_kv_pool.swa_kv_pool.page_size
+            swa_kv_page_size = token_to_kv_pool.get_swa_kv_page_size()
             assert swa_k_cache.ndim == 2
             # The kernel detects each cache's format from the last dim of this
             # view: 584 (V4), 528 (V4.1 fp8) or 288 (V4.1 fp4, extra cache only).
@@ -3923,6 +3923,11 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
+                    **(
+                        {"kv_format": "V41"}
+                        if token_to_kv_pool.kv_layout is KVLayout.V41
+                        else {}
+                    ),
                 )[0]
 
             o = o.squeeze(1)

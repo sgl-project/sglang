@@ -231,7 +231,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         token_to_kv_pool = self.token_to_kv_pool
         swa_buf = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
-        swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
+        swa_page_size = token_to_kv_pool.get_swa_kv_page_size()
         swa_kv_cache = swa_buf.view(swa_buf.shape[0], 1, swa_page_size, 512)
         if compress_ratio == 0:
             compressed_kv_cache = swa_kv_cache

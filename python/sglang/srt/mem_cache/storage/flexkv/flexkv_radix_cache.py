@@ -242,6 +242,9 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         Both synchronous and layerwise modes defer H2D until admission.
         """
         key = params.key
+        if params.req is not None:
+            # A rematch supersedes the previous lookup even if it misses.
+            self._release_load_marker(params.req.cache_request_handle)
         if self.disable or not key:
             return super().match_prefix(params)
         if params.req is not None and self.has_uncommitted_restore(params.req):
@@ -249,19 +252,11 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                 f"FlexKV prefix rematch before restore commit: rid={_request_key(params.req.cache_request_handle)}"
             )
 
-        # FlexKV operates at page granularity — round the lookup query
-        # down to a multiple of ``page_size`` so the hit count we report
-        # back to sglang matches what FlexKV can actually serve.
-        if self.page_size != 1:
-            aligned_len = (len(key) // self.page_size) * self.page_size
-            key = key[:aligned_len]
+        # FlexKV operates at page granularity
+        key = key.page_aligned(self.page_size)
 
         base_res = super().match_prefix(params)
-        if (
-            len(key) == 0
-            or _namespace_kwargs(self.flexkv_connector, key.extra_key, key.cache_salt)
-            is None
-        ):
+        if len(key) == 0:
             return base_res
 
         device_value: torch.Tensor = base_res.device_indices
@@ -355,7 +350,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         marker = self._load_markers.get(_request_key(req.cache_request_handle))
         if marker is None:
             return False
-        end = min(marker.value_numel + req.host_hit_length, len(marker.key))
+        end = marker.value_numel + req.host_hit_length
         key = self._restore_prefix_key(marker.key, end)
         owner = self._restoring_host_prefixes.get(key)
         if owner is None or owner == _request_key(req.cache_request_handle):
@@ -521,7 +516,9 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             self.evict(EvictParams(num_tokens=uncached_len))
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None:
-            return (reused_indices, last_node) if reused_indices.numel() > 0 else None
+            # The reused prefix stays tree-owned. Return None so init_load_back
+            # releases the held task a refreshed lookup may have re-stashed.
+            return None
 
         # The FlexKV ``launch`` interface takes the slot indices for the
         # tokens it will write — no leading ``-1`` padding (FlexKV has
@@ -624,6 +621,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             )
         super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
         self._commit_restore(req)
+        self._release_load_marker(req.cache_request_handle)
         # Late cleanup of an aborted Req must not release a new producer
         # that reused its rid while the old allocation was retained.
         if not self.has_uncommitted_restore(req):
@@ -636,7 +634,6 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             else None
         )
         if namespace_kwargs is None:
-            self._load_markers.pop(_request_key(req.cache_request_handle), None)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]

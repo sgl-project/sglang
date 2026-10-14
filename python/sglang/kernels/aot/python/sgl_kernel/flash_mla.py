@@ -31,6 +31,7 @@ class FlashMLASchedMeta:
         topk: Optional[int]
         extra_page_block_size: Optional[int]
         extra_topk: Optional[int]
+        kv_format: Optional[str] = None
 
     have_initialized: bool = False
     config: Optional[Config] = None
@@ -103,6 +104,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    kv_format: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -119,6 +121,9 @@ def flash_mla_with_kvcache(
         descale_k: (batch_size), torch.float32. Descaling factors for K, used for fp8 quantization.
         is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format. For the format of FP8 KV cache, please refer to README.md
         indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
+        kv_format: "V41" for SGLANG_DSV4_KV_LAYOUT=v41: SWA=528 B/token.
+            Compressed KV B/token (SGLANG_DSV4_COMPRESSED_KV_LAYOUT):
+            fp4=288; fp8=528; auto=288 for C1/C2, 528 otherwise.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -147,8 +152,10 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
+            kv_format=kv_format,
         )
 
+    assert kv_format is None, "kv_format requires FlashMLASchedMeta"
     assert num_splits is not None
     assert block_table is not None
     assert cache_seqlens is not None
@@ -216,6 +223,7 @@ def _flash_mla_with_kvcache_sched_meta(
     extra_indices_in_kvcache: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    kv_format: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -242,6 +250,7 @@ def _flash_mla_with_kvcache_sched_meta(
             topk=topk,
             extra_page_block_size=extra_page_block_size,
             extra_topk=extra_topk,
+            kv_format=kv_format,
         )
     else:
         helper_msg = (
@@ -261,6 +270,7 @@ def _flash_mla_with_kvcache_sched_meta(
             helper_msg
         )
         assert sched_meta.config.extra_topk == extra_topk, helper_msg
+        assert sched_meta.config.kv_format == kv_format, helper_msg
 
     if topk is not None:
         assert not causal, "causal must be False when sparse attention is enabled"
@@ -279,9 +289,11 @@ def _flash_mla_with_kvcache_sched_meta(
                 extra_topk_length,
                 head_dim_v,
                 softmax_scale,
+                **({"kv_format": kv_format} if kv_format is not None else {}),
             )
         )
     else:
+        assert kv_format is None, "kv_format is only supported for sparse attention"
         assert block_table is not None and cache_seqlens is not None
         assert attn_sink is None
         assert extra_k_cache is None

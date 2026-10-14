@@ -413,6 +413,59 @@ def test_supported_namespace_prefetch_keeps_full_chain(chunked, extra_key, cache
         assert call.kwargs["candidate_start_token"] == 2
 
 
+class _ForwardingPrefetchConnector:
+    """FlexKV main connector shape: an explicit ``namespace=None`` parameter
+    forwarded verbatim to the KV manager (taco-project/FlexKV b77b125)."""
+
+    supports_cache_namespace = True
+
+    def __init__(self, chunked):
+        self._chunked_prefetch = chunked
+        self.kv_manager = Mock()
+
+    def prefetch_async(
+        self,
+        rid,
+        token_ids,
+        sglang_req_id=None,
+        namespace=None,
+        *,
+        candidate_start_token=0,
+    ):
+        if self._chunked_prefetch:
+            return self.kv_manager.start_prefetch(
+                token_ids, candidate_start_token, namespace=namespace
+            )
+        return self.kv_manager.prefetch_async(token_ids=token_ids, namespace=namespace)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_forwarding_connector_scopes_prefetch_per_tenant(chunked):
+    forwarded = {}
+    for cache_salt in ("tenant-a", "tenant-b", None):
+        connector = _ForwardingPrefetchConnector(chunked)
+        method(SOURCE, "FlexKVRadixCache", "prefetch_from_storage")(
+            NS(flexkv_connector=connector, page_size=2),
+            CacheRequestHandle("r", 0),
+            token_ids=[1, 2, 3, 4],
+            cache_salt=cache_salt,
+        )
+        manager_call = (
+            connector.kv_manager.start_prefetch
+            if chunked
+            else connector.kv_manager.prefetch_async
+        )
+        manager_call.assert_called_once()
+        forwarded[cache_salt] = manager_call.call_args.kwargs["namespace"]
+        assert forwarded[cache_salt] == _namespace_kwargs(
+            connector, None, cache_salt
+        ).get("namespace")
+
+    assert forwarded["tenant-a"] != forwarded["tenant-b"]
+    assert None not in (forwarded["tenant-a"], forwarded["tenant-b"])
+    assert forwarded[None] is None
+
+
 def test_namespace_encoding_is_unambiguous_and_default_is_unchanged():
     connector = NS(supports_cache_namespace=True)
     identities = [

@@ -78,6 +78,14 @@ class FlexKVCacheLifecycleMixin:
     def has_uncommitted_restore(self, req: Req) -> bool:
         return _request_key(req.cache_request_handle) in self._restore_leases
 
+    def _release_load_marker(self, handle: CacheRequestHandle) -> None:
+        # A held lookup pins its matched host prefix until init_load_back or an
+        # explicit release. The connector only cancels it when a later lookup
+        # for the same rid hits, so rematch and completion release it here.
+        rid = _request_key(handle)
+        if self._load_markers.pop(rid, None) is not None:
+            self.flexkv_connector.release_pending(rid)
+
     @staticmethod
     def _restore_lease_matches_req(req: Req, lease: _RestoreLease) -> bool:
         return (

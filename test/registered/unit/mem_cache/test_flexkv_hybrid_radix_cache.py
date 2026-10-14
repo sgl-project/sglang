@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
+    CacheRequestOutcome,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
@@ -115,6 +116,39 @@ def test_pool_accounting_delegates_to_inner_cache():
     assert cache.protected_size() == 640
     assert cache.full_protected_size() == 512
     assert cache.swa_protected_size() == 128
+
+
+@pytest.mark.parametrize(
+    "method, args",
+    [
+        ("resolve_node_handle", (17,)),
+        ("root_node_handle", ("tenant",)),
+        ("is_root", (17,)),
+        ("is_backuped", (17,)),
+        ("get_last_hash_value", (17,)),
+        ("get_prefix_hash_values", (17,)),
+        ("rotation_base_of", (17,)),
+        ("dfs_weight_order", ([17, 23],)),
+        ("evict_for_alloc", (object(),)),
+        ("swa_transient_size", ()),
+        ("swa_retain_floor", (object(),)),
+    ],
+)
+def test_unified_node_and_allocator_protocols_delegate_to_inner_cache(method, args):
+    # BasePrefixCache defaults would shadow __getattr__ forwarding to the
+    # NodeId-based UnifiedRadixCache.
+    inner = MagicMock()
+    expected = object()
+    getattr(inner, method).return_value = expected
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = inner
+    cache.flexkv_connector = MagicMock()
+
+    assert getattr(cache, method)(*args) is expected
+
+    getattr(inner, method).assert_called_once_with(*args)
+    inner.evict.assert_not_called()
+    cache.flexkv_connector.check_completed_stores.assert_not_called()
 
 
 def test_evict_does_not_poll_cross_rank_store_completion():
@@ -234,7 +268,7 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
         cache.match_prefix(params)
     inner.match_prefix.assert_called_once_with(params)
     connector.lookup_kv.assert_called_once()
-    assert req.rid not in cache._load_markers
+    assert _tracking_key(req.rid) not in cache._load_markers
 
     # init_load_back still fails loud: it allocates and starts a DMA, so a
     # second restore would leave two writers on one region.
@@ -438,6 +472,71 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key(salt):
         ).get("namespace")
 
 
+def _forwarding_connector():
+    """FlexKV main connector shape: an explicit ``namespace=None`` parameter
+    forwarded verbatim to the KV manager (taco-project/FlexKV b77b125)."""
+    connector = MagicMock(spec=["kv_manager", "release_pending"])
+    connector.kv_manager = MagicMock()
+    connector.supports_cache_namespace = True
+    kv_manager = connector.kv_manager
+
+    def lookup_kv(token_ids, token_mask, rid=None, sglang_req_id=None, namespace=None):
+        kv_manager.get_match(
+            token_ids=token_ids, token_mask=token_mask, namespace=namespace
+        )
+        return 17, int(token_mask.sum())
+
+    def store_kv(rid, token_ids, kv_indices, sglang_req_id=None, namespace=None):
+        kv_manager.put_match(token_ids=token_ids, namespace=namespace)
+        return 18
+
+    connector.lookup_kv = lookup_kv
+    connector.store_kv = store_kv
+    return connector
+
+
+@pytest.mark.parametrize(
+    "extra_key,cache_salt", [(None, "tenant-a"), (None, "tenant-b"), ("lora", None)]
+)
+def test_forwarding_connector_scopes_hybrid_lookup_and_store(extra_key, cache_salt):
+    cache, req, _, _ = _make_layerwise_restore()
+    connector = _forwarding_connector()
+    cache.flexkv_connector = connector
+    cache.page_size = 4
+    cache._store_generation = 0
+    req.extra_key, req.cache_salt = extra_key, cache_salt
+    expected = _namespace_kwargs(connector, extra_key, cache_salt)["namespace"]
+    inner = cache._inner_cache
+    inner.is_root.return_value = False
+    inner.is_eagle = False
+    inner.match_prefix.side_effect = [
+        MatchResult(
+            device_indices=torch.empty(0, dtype=torch.int64),
+            last_device_node=req.last_node,
+            last_host_node=req.last_node,
+            best_match_node=req.last_node,
+        ),
+        SimpleNamespace(
+            last_device_node=object(),
+            device_indices=torch.tensor([8, 9, 10, 11], dtype=torch.int64),
+        ),
+    ]
+    inner.inc_lock_ref.return_value = SimpleNamespace(to_dec_params=lambda: None)
+    key = RadixKey(array("q", range(4)), extra_key, cache_salt=cache_salt)
+
+    assert cache.match_prefix(MatchPrefixParams(key=key, req=req)).host_hit_length == 4
+    with (
+        patch("torch.cuda.current_stream", return_value=MagicMock()),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+    ):
+        cache._store_prefix(req, [0, 1, 2, 3])
+
+    lookup = connector.kv_manager.get_match.call_args.kwargs["namespace"]
+    store = connector.kv_manager.put_match.call_args.kwargs["namespace"]
+    assert lookup == store == expected
+    assert expected is not None
+
+
 def test_reset_drains_flexkv_before_releasing_inner_slots():
     calls = MagicMock()
     connector = MagicMock()
@@ -568,6 +667,56 @@ def _make_layerwise_restore(loaded=4):
         best_match_node=req.last_node, host_hit_length=4, req=req
     )
     return cache, req, params, restored
+
+
+@pytest.mark.parametrize("entry", ["release_aborted_request", "finish"])
+def test_hybrid_abort_retains_store_source_until_transfer_completion(entry):
+    cache, req, _, _ = _make_layerwise_restore()
+    handle = req.cache_request_handle
+    store_key = _tracking_key(req.rid) + ":flexkv-store:0"
+    node, dec_params = object(), object()
+    cache._inflight_store_nodes[store_key] = (node, dec_params)
+
+    if entry == "finish":
+        cache.finish(handle, CacheRequestOutcome.ABORT)
+    else:
+        cache.release_aborted_request(handle)
+
+    # A launched D2H still reads the source slots: abort must not unlock them.
+    cache._inner_cache.dec_lock_ref.assert_not_called()
+    assert cache._inflight_store_nodes[store_key] == (node, dec_params)
+    cache.flexkv_connector.check_completed_stores.return_value = [store_key]
+    cache._drain_completed_stores()
+    cache._inner_cache.dec_lock_ref.assert_called_once_with(node, dec_params)
+    assert store_key not in cache._inflight_store_nodes
+
+
+def test_stale_hybrid_abort_does_not_cancel_a_new_request_attempt():
+    cache, previous, params, _ = _make_layerwise_restore()
+    cache.init_load_back(params)
+    cache.release_aborted_request(previous.cache_request_handle)
+    current = SimpleNamespace(**vars(previous))
+    current.kv = SimpleNamespace(**vars(previous.kv))
+    current.cache_request_handle = CacheRequestHandle(previous.rid, 1)
+    cache._load_markers[_tracking_key(previous.rid, 1)] = SimpleNamespace(
+        device_length=0
+    )
+    cache._alloc_restore_slots.return_value = torch.arange(40, 44, dtype=torch.int64)
+    cache.init_load_back(
+        InitLoadBackParams(
+            best_match_node=current.last_node, host_hit_length=4, req=current
+        )
+    )
+
+    # A late abort for the retired attempt must not touch the retry's lease.
+    cache.release_aborted_request(previous.cache_request_handle)
+
+    assert cache.has_uncommitted_restore(current)
+    assert cache._restore_leases[_tracking_key(previous.rid, 1)].req is current
+    cache.flexkv_connector.cancel_prefetch.assert_called_with(
+        _tracking_key(previous.rid, 0)
+    )
+    cache.token_to_kv_pool_allocator.free.assert_not_called()
 
 
 @pytest.mark.parametrize("loaded", [2, 5])

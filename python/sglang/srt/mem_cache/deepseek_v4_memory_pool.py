@@ -1847,6 +1847,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # swa_kv_pool is None under the request window and unified_kv.
         return self.kv_layout
 
+    def get_swa_kv_page_size(self) -> int:
+        """Physical SWA page size used to view packed KV rows.
+
+        Encoder bounded replay has no paged ``swa_kv_pool``; the request
+        window is allocated at ``swa_page_size``.
+        """
+        if self.request_window is not None:
+            return int(self.request_window.page_size)
+        if self.swa_kv_pool is not None:
+            return int(self.swa_kv_pool.page_size)
+        return int(self.swa_page_size)
+
     def get_swa_key_bytes_per_token(self) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
         kernel detects the SWA cache's format from."""

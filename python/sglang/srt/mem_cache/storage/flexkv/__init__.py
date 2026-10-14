@@ -88,7 +88,9 @@ def _flexkv_factory(ctx):
     # fall back to 0 for single-rank dims.
     pp_rank = pp_group.rank_in_group if pp_group is not None else 0
     attn_cp_rank = attn_cp_group.rank_in_group if attn_cp_group is not None else 0
-    parallel_state = getattr(ctx.tp_worker, "ps", None)
+    # TpModelWorker no longer carries a ParallelState; ranks are published to
+    # the runtime context before the tree cache is built.
+    parallel_state = get_parallel()
     if server_args.enable_dp_attention:
         dp_rank = getattr(parallel_state, "attn_dp_rank", 0)
     else:

@@ -57,6 +57,34 @@ def _load_flexkv_radix_cache_class():
 FlexKVRadixCache = _load_flexkv_radix_cache_class()
 
 
+def _forwarding_connector():
+    """FlexKV main connector shape: an explicit ``namespace=None`` parameter
+    forwarded verbatim to the KV manager (taco-project/FlexKV b77b125)."""
+    connector = MagicMock()
+    connector.supports_cache_namespace = True
+    connector.is_store_sync_leader = True
+    connector.sync_ready_store_rids.side_effect = lambda rids: list(rids)
+    kv_manager = connector.kv_manager
+
+    def lookup_kv(token_ids, token_mask, rid=None, sglang_req_id=None, namespace=None):
+        kv_manager.get_match(
+            token_ids=token_ids, token_mask=token_mask, namespace=namespace
+        )
+        return 17, int(token_mask.sum())
+
+    def store_kv(rid, token_ids, kv_indices, sglang_req_id=None, namespace=None):
+        kv_manager.put_match(token_ids=token_ids, namespace=namespace)
+        return 18
+
+    connector.lookup_kv = lookup_kv
+    connector.store_kv = store_kv
+    return connector
+
+
+def _forwarded_namespaces(calls):
+    return [c.kwargs["namespace"] for c in calls]
+
+
 @pytest.mark.parametrize("supported", [False, True])
 @pytest.mark.parametrize("extra_key,cache_salt", [("lora-a", None), (None, "tenant-a")])
 def test_namespaced_lookup_requires_connector_support(extra_key, cache_salt, supported):
@@ -401,22 +429,106 @@ def test_partial_duplicate_restore_relooks_up_only_missing_suffix():
     assert torch.equal(match.device_indices, restored_indices)
 
 
-def test_partial_duplicate_restore_keeps_reused_prefix_when_alloc_fails():
+@pytest.mark.parametrize(
+    "extra_key,cache_salt", [(None, "tenant-a"), (None, "tenant-b"), ("lora", None)]
+)
+def test_forwarding_connector_scopes_lookup_relookup_and_store(extra_key, cache_salt):
     cache, allocator = _make_cache()
-    first_page = RadixKey(array("q", range(4)))
-    full_key = RadixKey(array("q", range(8)))
+    connector = _forwarding_connector()
+    cache.flexkv_connector = connector
+    request_row = torch.tensor([[0] * 8], dtype=torch.int64)
+    cache.req_to_token_pool = SimpleNamespace(req_to_token=request_row)
+    expected = _namespace_kwargs(connector, extra_key, cache_salt)["namespace"]
+    first_page = RadixKey(array("q", range(4)), extra_key, cache_salt=cache_salt)
+    full_key = RadixKey(array("q", range(8)), extra_key, cache_salt=cache_salt)
+    req = SimpleNamespace(
+        rid="scoped", cache_request_handle=CacheRequestHandle("scoped", 0)
+    )
 
-    (first_indices, first_node), _ = _load(cache, first_page, 0, 4, "first")
+    # Lookup: the namespace reaches the manager, not just the connector call.
+    assert cache.match_prefix(
+        MatchPrefixParams(key=full_key, req=req)
+    ).host_hit_length == (8)
+    # Partial duplicate re-lookup of the missing suffix keeps the same scope.
+    _load(cache, first_page, 0, 4, "first")
+    _load(cache, full_key, 0, 8, "second")
+    # Store of a finished request.
+    finished = SimpleNamespace(
+        rid="finished",
+        cache_request_handle=CacheRequestHandle("finished", 0),
+        origin_input_ids=array("q", range(8)),
+        output_ids=array("q"),
+        kv=SimpleNamespace(kv_committed_len=8, req_pool_idx=0, cache_protected_len=0),
+        extra_key=extra_key,
+        cache_salt=cache_salt,
+        last_node=cache.root_node,
+        _flexkv_uncached_restore=False,
+    )
+    request_row[0] = torch.arange(200, 208)
+    with (
+        patch.dict(
+            FlexKVRadixCache.cache_finished_req.__globals__,
+            {"get_spec": lambda: SimpleNamespace(speculative_eagle_topk=None)},
+        ),
+        patch("torch.cuda.current_stream", return_value=MagicMock()),
+        patch(
+            "torch.cuda.stream", side_effect=lambda _stream: contextlib.nullcontext()
+        ),
+    ):
+        cache.cache_finished_req(finished, owned_kv_len=8)
+
+    lookups = _forwarded_namespaces(connector.kv_manager.get_match.call_args_list)
+    assert lookups == [expected, expected]
+    stores = _forwarded_namespaces(connector.kv_manager.put_match.call_args_list)
+    assert stores == [expected]
+    assert all(namespace is not None for namespace in lookups + stores)
+
+
+def test_forwarding_connector_keeps_tenants_apart_and_unscoped_unchanged():
+    namespaces = {}
+    for cache_salt in ("tenant-a", "tenant-b", None):
+        cache, _ = _make_cache()
+        connector = _forwarding_connector()
+        cache.flexkv_connector = connector
+        key = RadixKey(array("q", range(4)), cache_salt=cache_salt)
+        req = SimpleNamespace(
+            rid="same", cache_request_handle=CacheRequestHandle("same", 0)
+        )
+        cache.match_prefix(MatchPrefixParams(key=key, req=req))
+        namespaces[cache_salt] = connector.kv_manager.get_match.call_args.kwargs[
+            "namespace"
+        ]
+
+    assert namespaces["tenant-a"] != namespaces["tenant-b"]
+    assert None not in (namespaces["tenant-a"], namespaces["tenant-b"])
+    # Unscoped requests keep the historical (namespace-free) host identity.
+    assert namespaces[None] is None
+
+
+def test_partial_duplicate_restore_releases_relookup_when_alloc_fails():
+    """A refreshed lookup re-stashes a held task that pins its host prefix;
+    an allocation failure must release it, not leave it until abort or reset."""
+    cache, allocator = _make_cache()
+    full_key = RadixKey(array("q", range(8)))
+    _load(cache, full_key[:4], 0, 4, "first")
+    rid = _tracking_key("second")
+    cache._load_markers[rid] = SimpleNamespace(key=full_key, value_numel=0)
+    req = SimpleNamespace(
+        rid="second", cache_request_handle=CacheRequestHandle("second", 0)
+    )
+    cache.flexkv_connector.reset_mock()
     cache.flexkv_connector.lookup_kv.return_value = (17, 4)
     allocator.alloc.side_effect = None
     allocator.alloc.return_value = None
 
-    (restored_indices, last_node), second_load = _load(cache, full_key, 0, 8, "second")
+    indices, node = cache.init_load_back(
+        InitLoadBackParams(best_match_node=cache.root_node, host_hit_length=8, req=req)
+    )
 
-    second_load.assert_not_called()
-    assert torch.equal(restored_indices, first_indices)
-    assert last_node is first_node
-    assert cache.evictable_leaves == {first_node}
+    assert indices.numel() == 0
+    assert node is cache.root_node
+    cache.flexkv_connector.start_load_kv_layerwise.assert_not_called()
+    assert cache.flexkv_connector.mock_calls[-1] == call.release_pending(rid)
     assert cache.evictable_size() == 4
 
 
@@ -549,6 +661,8 @@ def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared(salt
     assert stored.get("namespace") == _namespace_kwargs(
         cache.flexkv_connector, None, salt
     ).get("namespace")
+    assert stored["rid"] == _tracking_key("finished-request")
+    assert stored["sglang_req_id"] == "finished-request"
     assert stored["token_ids"] == [1, 2, 3, 4]
     assert stored["kv_indices"].tolist() == [4, 5, 6, 7]
     cache.store_stream.wait_stream.assert_called_once_with(producer_stream)
@@ -614,6 +728,8 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping(salt):
     assert stored.get("namespace") == _namespace_kwargs(
         cache.flexkv_connector, None, salt
     ).get("namespace")
+    assert stored["rid"] == _tracking_key("async-store")
+    assert stored["sglang_req_id"] == "async-store"
     assert stored["kv_indices"] is cpu_mapping
     assert cache._pending_store_copies == {}
     assert _tracking_key("async-store") in cache._inflight_store_nodes
@@ -764,10 +880,10 @@ class _TestReq(SimpleNamespace):
     __hash__ = object.__hash__
 
 
-def _restore_request(cache, *, rid="ip-request", length=4, load_fn=None):
+def _restore_request(cache, *, rid="ip-request", length=4, load_fn=None, attempt_id=0):
     req = _TestReq(
         rid=rid,
-        cache_request_handle=CacheRequestHandle(rid, 0),
+        cache_request_handle=CacheRequestHandle(rid, attempt_id),
         origin_input_ids=array("q", range(length)),
         output_ids=array("q"),
         kv=SimpleNamespace(
@@ -785,7 +901,7 @@ def _restore_request(cache, *, rid="ip-request", length=4, load_fn=None):
         value_numel=0,
         uncached_len=length,
         last_node=cache.root_node,
-        tracking_rid=_tracking_key(rid),
+        tracking_rid=_tracking_key(rid, attempt_id),
         sglang_req_id=rid,
         load_fn=load_fn or (lambda slots: int(slots.numel())),
         request_owned_req=req,
@@ -799,6 +915,23 @@ def _restore_request(cache, *, rid="ip-request", length=4, load_fn=None):
             write=lambda index, value: row.__setitem__(index, value),
         )
     return req
+
+
+def test_stale_abort_does_not_cancel_a_new_request_attempt():
+    cache, allocator = _make_cache()
+    previous = _restore_request(cache)
+    cache.release_aborted_request(previous.cache_request_handle)
+    current = _restore_request(cache, rid=previous.rid, attempt_id=1)
+
+    # A late abort for the retired attempt must not touch the retry's lease.
+    cache.release_aborted_request(previous.cache_request_handle)
+
+    assert cache.has_uncommitted_restore(current)
+    assert cache._restore_leases[_tracking_key(current.rid, 1)].req is current
+    cache.flexkv_connector.cancel_prefetch.assert_called_with(
+        _tracking_key(previous.rid, 0)
+    )
+    allocator.free.assert_not_called()
 
 
 @pytest.mark.parametrize("completion", ["insert", "discard", "chunk"])
