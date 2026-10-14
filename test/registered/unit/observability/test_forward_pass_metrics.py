@@ -1,4 +1,9 @@
-from sglang.srt.runtime_context import get_context, get_observability, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_disagg,
+    get_observability,
+    get_parallel,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -20,6 +25,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
     SchedulerMetricsCollector,
@@ -131,7 +137,31 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
         metrics_collector=None,
         device=getattr(scheduler, "device", ""),
     )
-    return SchedulerMetricsReporter(scheduler=scheduler, metrics_sink=metrics_sink)
+    if hasattr(scheduler, "disaggregation_mode"):
+        _set_disaggregation_mode(test, scheduler.disaggregation_mode)
+    return SchedulerMetricsReporter(
+        metrics_sink=metrics_sink,
+        request_registry=getattr(scheduler, "request_registry", None),
+        core_lists=getattr(scheduler, "lists", None),
+        counters=None,
+        pool_stats_observer=getattr(scheduler, "pool_stats_observer", None),
+        grammar_manager=getattr(scheduler, "grammar_manager", None),
+        mm_receiver=None,
+        kv_events_publisher=scheduler.kv_events_publisher,
+        mode_owners=ModeOwners(),
+        kv=None,
+        capacity=None,
+        tp_worker=scheduler.tp_worker,
+        draft_worker=scheduler.draft_worker,
+        model_config=None,
+        spec_algorithm=None,
+        device=getattr(scheduler, "device", ""),
+    )
+
+
+def _set_disaggregation_mode(test, mode: DisaggregationMode) -> None:
+    """The reporter reads the live mode from config."""
+    enter_scope(test, get_disagg().override(disaggregation_mode=mode.value))
 
 
 class TestForwardPassMetrics(unittest.TestCase):
@@ -257,9 +287,9 @@ class TestForwardPassMetrics(unittest.TestCase):
         )
 
     def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
-        self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        self.scheduler.request_registry = types.SimpleNamespace()
-        self.scheduler.request_registry.request_lists = lambda: {
+        _set_disaggregation_mode(self, DisaggregationMode.PREFILL)
+        self.reporter.request_registry = types.SimpleNamespace()
+        self.reporter.request_registry.request_lists = lambda: {
             "bootstrap": RequestList(name="bootstrap", reqs=[_FakeReq(100)])
         }
         self.scheduler.lists.waiting_queue = [_FakeReq(200), _FakeReq(50)]
@@ -277,9 +307,9 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metrics.queued_requests.num_decode_requests, 0)
 
     def test_disagg_decode_queued_metrics(self):
-        self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        self.scheduler.request_registry = types.SimpleNamespace()
-        self.scheduler.request_registry.request_lists = lambda: {
+        _set_disaggregation_mode(self, DisaggregationMode.DECODE)
+        self.reporter.request_registry = types.SimpleNamespace()
+        self.reporter.request_registry.request_lists = lambda: {
             "prealloc": RequestList(
                 name="prealloc",
                 reqs=[_FakeReq(10, output_len=5), _FakeReq(20, output_len=10)],
@@ -551,7 +581,6 @@ class TestIdleMetrics(CustomTestCase):
             )
         self.reporter.metrics_sink.metrics_collector = collector
         self.reporter.metrics_sink.current_scheduler_metrics_enabled = True
-        self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
         host_reqs = [
             types.SimpleNamespace(host_staged=True, priority=priority)
             for priority in (1, 2)
@@ -560,7 +589,7 @@ class TestIdleMetrics(CustomTestCase):
             queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)],
             num_pending_deferred_releases=lambda: 0,
         )
-        self.scheduler.disagg_decode = types.SimpleNamespace(
+        self.reporter.mode_owners.disagg_decode = types.SimpleNamespace(
             transfer_queue=transfer_queue
         )
         self.scheduler.request_registry.request_lists = lambda: {
@@ -571,6 +600,7 @@ class TestIdleMetrics(CustomTestCase):
             collector.increment_decode_host_receive_reqs()
 
         with get_context().override_server_args(
+            disaggregation_mode=DisaggregationMode.DECODE.value,
             disaggregation_decode_host_receive_threshold=0.8,
             enable_priority_scheduling=True,
         ):

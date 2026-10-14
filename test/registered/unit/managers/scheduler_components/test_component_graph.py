@@ -295,6 +295,7 @@ _PARAM = {
     "DllmManager": ("dllm",),
     "GrammarManager": ("grammar_manager",),
     "MMReceiver": ("mm_receiver",),
+    "KvEventsPublisher": ("kv_events_publisher",),
     "OutputStreamer": ("output_streamer",),
     "BeamCoordinator": ("beam_coordinator",),
     "FutureMap": ("future_map",),
@@ -340,6 +341,10 @@ _BUILT = {
         "SchedulerLoadPublisher",
     ),
     "MetricsSink": ("managers/scheduler_components/metrics_reporter.py", "MetricsSink"),
+    "MetricsReporter": (
+        "managers/scheduler_components/metrics_reporter.py",
+        "SchedulerMetricsReporter",
+    ),
     "KvResources": ("managers/scheduler_components/bundles.py", "KvResources"),
     "KvCapacity": ("managers/scheduler_components/bundles.py", "KvCapacity"),
     "Streams": ("managers/scheduler_components/bundles.py", "Streams"),
@@ -392,13 +397,6 @@ _SCHEDULER_REFS = {
     ("disaggregation/role_switch.py", "teardown_disaggregation", "annotation"): 1,
     # The actor process that hosts a scheduler.
     ("ray/scheduler_actor.py", "SchedulerActor.__init__", "import"): 1,
-    # To be removed.
-    ("managers/scheduler_components/metrics_reporter.py", "", "import"): 1,
-    (
-        "managers/scheduler_components/metrics_reporter.py",
-        "SchedulerMetricsReporter",
-        "annotation",
-    ): 1,
 }
 
 # R2: (Scheduler method, callee, keyword, kind).
@@ -438,7 +436,6 @@ _CALLBACK_SITES = {
         _LAMBDA,
     ): 1,
     ("init_flush_wrapper", "SchedulerFlushWrapper", "flush_cache", _BOUND): 1,
-    ("init_metrics_reporter", "SchedulerMetricsReporter", "scheduler", _SELF): 1,
 }
 
 # R4: (module under srt/, class, parameter).

@@ -604,7 +604,6 @@ class Scheduler:
         self.maybe_init_dynamic_chunk_sizer()
 
         self.init_metrics_sink()
-        self.init_metrics_reporter()
         self.scheduler_stage_metrics = self.metrics_sink.scheduler_stage_metrics
         self.enable_fpm = self.metrics_sink.enable_fpm
 
@@ -703,6 +702,7 @@ class Scheduler:
 
         self.init_step_counters()
         self.init_load_inquirer()
+        self.init_metrics_reporter()
 
         self.init_rank_consensus_checker()
 
@@ -1409,7 +1409,22 @@ class Scheduler:
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
         self.metrics_reporter = SchedulerMetricsReporter(
-            scheduler=self, metrics_sink=self.metrics_sink
+            metrics_sink=self.metrics_sink,
+            request_registry=self.request_registry,
+            core_lists=self.lists,
+            counters=self.counters,
+            pool_stats_observer=self.pool_stats_observer,
+            grammar_manager=self.grammar_manager,
+            mm_receiver=self.mm_receiver,
+            kv_events_publisher=self.kv_events_publisher,
+            mode_owners=self.mode_owners,
+            kv=self.kv,
+            capacity=self.capacity,
+            tp_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            model_config=self.model_config,
+            spec_algorithm=self.spec_algorithm,
+            device=self.device,
         )
 
     def init_schedule_policy(self):

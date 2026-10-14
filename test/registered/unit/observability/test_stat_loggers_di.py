@@ -32,6 +32,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     MetricsSink,
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -292,23 +293,22 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue._deferred_releases = [object(), object(), object()]
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
-        reporter.scheduler = SimpleNamespace(
-            disaggregation_mode=DisaggregationMode.DECODE,
+        reporter.mode_owners = ModeOwners(
             disagg_decode=SimpleNamespace(
                 transfer_queue=queue, prealloc_queue=SimpleNamespace(queue=[])
+            )
+        )
+        reporter.core_lists = SimpleNamespace(decoding=[], waiting_queue=[])
+        reporter.request_registry = SimpleNamespace(
+            request_lists=_empty_decode_lists, queued_reqs=lambda: []
+        )
+        reporter.grammar_manager = []
+        reporter.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                update_scheduler_stats=lambda stats: None,
             ),
-            lists=SimpleNamespace(decoding=[], waiting_queue=[]),
-            request_registry=SimpleNamespace(
-                request_lists=_empty_decode_lists, queued_reqs=lambda: []
-            ),
-            grammar_manager=[],
-            pool_stats_observer=SimpleNamespace(
-                get_pool_stats=lambda: SimpleNamespace(
-                    update_scheduler_stats=lambda stats: None,
-                ),
-                streaming_session_count=lambda: 0,
-                session_held_tokens=lambda: 0,
-            ),
+            streaming_session_count=lambda: 0,
+            session_held_tokens=lambda: 0,
         )
         reporter.metrics_sink.stats = SchedulerStats()
         reporter.metrics_sink.current_scheduler_metrics_enabled = True
@@ -334,7 +334,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_host_receive_threshold=1
+                    disaggregation_mode=DisaggregationMode.DECODE.value,
+                    disaggregation_decode_host_receive_threshold=1,
                 ),
             ),
             patch(
@@ -372,32 +373,31 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         )
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
-        reporter.scheduler = SimpleNamespace(
-            disaggregation_mode=DisaggregationMode.DECODE,
+        reporter.mode_owners = ModeOwners(
             disagg_decode=SimpleNamespace(
                 transfer_queue=queue,
                 prealloc_queue=SimpleNamespace(
                     queue=[], retracted_queue=[], num_tokens_pre_allocated=0
                 ),
+            )
+        )
+        reporter.core_lists = SimpleNamespace(decoding=batch.reqs, waiting_queue=[])
+        reporter.request_registry = SimpleNamespace(
+            request_lists=_empty_decode_lists, queued_reqs=lambda: []
+        )
+        reporter.grammar_manager = []
+        reporter.capacity = SimpleNamespace(max_total_num_tokens=1)
+        reporter.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        reporter.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                get_decode_usage_msg_parts=lambda: [],
+                update_scheduler_stats=lambda stats: None,
             ),
-            lists=SimpleNamespace(decoding=batch.reqs, waiting_queue=[]),
-            request_registry=SimpleNamespace(
-                request_lists=_empty_decode_lists, queued_reqs=lambda: []
-            ),
-            grammar_manager=[],
-            max_total_num_tokens=1,
-            spec_algorithm=SimpleNamespace(is_none=lambda: True),
-            pool_stats_observer=SimpleNamespace(
-                get_pool_stats=lambda: SimpleNamespace(
-                    get_decode_usage_msg_parts=lambda: [],
-                    update_scheduler_stats=lambda stats: None,
-                ),
-                streaming_session_count=lambda: 0,
-                session_held_tokens=lambda: 0,
-            ),
-            kv_events_publisher=SimpleNamespace(
-                emit_kv_metrics=lambda: None, publish_kv_events=lambda: None
-            ),
+            streaming_session_count=lambda: 0,
+            session_held_tokens=lambda: 0,
+        )
+        reporter.kv_events_publisher = SimpleNamespace(
+            emit_kv_metrics=lambda: None, publish_kv_events=lambda: None
         )
         reporter.metrics_sink.stats = SchedulerStats()
         reporter.metrics_sink.current_scheduler_metrics_enabled = True
@@ -440,6 +440,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
+                    disaggregation_mode=DisaggregationMode.DECODE.value,
                     disaggregation_decode_host_receive_threshold=1,
                     language_only=False,
                 ),
