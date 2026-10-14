@@ -13,7 +13,7 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 import msgspec
 import torch
@@ -23,7 +23,7 @@ from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedO
 from sglang.srt.layers.layer_boundary.residual import ResidualUpdate
 
 
-class DeclaredSum(msgspec.Struct, frozen=True):
+class DeclaredSum(NamedTuple):
     """A sum every output of this producer owes to its declared input edge."""
 
     group: SumGroup
@@ -32,7 +32,7 @@ class DeclaredSum(msgspec.Struct, frozen=True):
         return _sum_group(self.group).all_reduce(value)
 
 
-class Contribution(msgspec.Struct):
+class Contribution:
     """Own a producer's output, residual update and outstanding completion.
 
     Fields:
@@ -47,7 +47,19 @@ class Contribution(msgspec.Struct):
 
     value: Optional[torch.Tensor]
     update: ResidualUpdate
-    owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None] = None
+    owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None]
+
+    __slots__ = ("value", "update", "owed")
+
+    def __init__(
+        self,
+        value: Optional[torch.Tensor],
+        update: ResidualUpdate,
+        owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None] = None,
+    ):
+        self.value = value
+        self.update = update
+        self.owed = owed
 
     def for_boundary(self):
         # These forms are private inputs to the existing fused-kernel adapters.
@@ -71,7 +83,7 @@ class Contribution(msgspec.Struct):
         self.owed = None
 
 
-class OwedOutput(msgspec.Struct, frozen=True):
+class OwedOutput(NamedTuple):
     """Opaque model-facing handle. Only its boundary may read the contribution."""
 
     contribution: Contribution
