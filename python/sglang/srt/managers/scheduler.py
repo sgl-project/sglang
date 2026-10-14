@@ -736,6 +736,7 @@ class Scheduler:
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
+                self.processor = None
                 self.tokenizer = get_tokenizer(
                     get_serving().tokenizer_path,
                     tokenizer_mode=get_serving().tokenizer_mode,
