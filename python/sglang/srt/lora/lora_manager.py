@@ -75,8 +75,6 @@ class LoRAManager:
         dtype: torch.dtype,
         server_args: ServerArgs,
         lora_backend: str = "triton",
-        tp_size: int = 1,
-        tp_rank: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
@@ -90,8 +88,6 @@ class LoRAManager:
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
         self.device: torch.device = next(self.base_model.parameters()).device
-        self.tp_size: int = tp_size
-        self.tp_rank: int = tp_rank
         # Attention projections shard on the attn-TP group; extracted once
         # here (parallel groups are frozen after init_torch_distributed).
         self.attn_tp_size: int = get_parallel().attn_tp_size
@@ -1004,9 +1000,6 @@ class LoRAManager:
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,
             dtype=self.dtype,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            attn_tp_size=self.attn_tp_size,
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
@@ -1092,6 +1085,25 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
+            # Routed banks live outside `model.layers.`, so the gate below drops
+            # them before the FusedMoE branch can reject them.
+            if (
+                module_name.startswith("model.meta_mlp.")
+                and isinstance(module, (FusedMoE, InklingBatchDenseMLP))
+                and all(x in self.target_modules for x in ["gate_up_proj", "down_proj"])
+                and get_layer_id(module_name) is None
+            ):
+                raise ValueError(
+                    "LoRA on Intern-S2-Mobius model.meta_mlp routed banks "
+                    "is not supported by the baseline; remove routed-expert "
+                    "targets or use a future bank-aware LoRA implementation."
+                )
+
+            if getattr(
+                self.base_model, "should_apply_lora", None
+            ) and not self.base_model.should_apply_lora(module_name):
+                continue
+
             # Handle DeepSeek MLA fused projection: set the boundary
             # between q_a and kv_a output partitions so the LoRA layer
             # can apply separate B projections for each.
@@ -1130,12 +1142,6 @@ class LoRAManager:
             ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
-                    if module_name.startswith("model.meta_mlp."):
-                        raise ValueError(
-                            "LoRA on Intern-S2-Mobius model.meta_mlp routed banks "
-                            "is not supported by the baseline; remove routed-expert "
-                            "targets or use a future bank-aware LoRA implementation."
-                        )
                     # FusedMoE submodules outside the decoder layer hierarchy
                     # (e.g. nested helpers under non-".layers." prefixes) have
                     # no resolvable layer id; skip them so we don't index

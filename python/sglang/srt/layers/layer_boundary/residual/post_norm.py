@@ -26,6 +26,8 @@ class PostNormAdd:
 
     is_plain_add = False
     outlives_layer = True
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, norm, *, applied_at_exit: bool = False):
         self.norm = norm
@@ -45,7 +47,10 @@ class PlainReadout:
     """The input is the residual itself; the stage's norm is not applied."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def init_residual(self, hidden_states):
         return hidden_states

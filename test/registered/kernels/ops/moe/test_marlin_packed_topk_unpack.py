@@ -27,7 +27,7 @@ def _torch_unpack(packed: torch.Tensor):
 
 
 def _torch_pack(ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    # inverse of the unpack, matching trtllm_lora_temp/topk_pack._pack_topk_kernel
+    # inverse of the unpack, matching ops/lora/moe/trtllm_lora_temp/topk_pack._pack_topk_kernel
     wbits = weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     return (ids.to(torch.int32) << 16) | wbits
 

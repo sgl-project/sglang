@@ -45,6 +45,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=None,
+            contains_mm_inputs=lambda: False,
             forward_mode=mode,
             global_forward_mode=None,
             _original_forward_mode=None,

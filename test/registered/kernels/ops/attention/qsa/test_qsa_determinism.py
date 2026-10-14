@@ -57,7 +57,12 @@ def test_qsa_topk_ragged_ties_and_graph(topk: int) -> None:
 def test_qsa_decode_topk_repeatability(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(42)
     logits = torch.randn(16, 2048, device="cuda").round()
-    monkeypatch.setattr(qsa_indexer_module, "qsa_mqa_decode", lambda *args: logits)
+
+    def mock_mqa_decode(*args: object, min_scored_len: int) -> torch.Tensor:
+        assert min_scored_len == 0
+        return logits
+
+    monkeypatch.setattr(qsa_indexer_module, "qsa_mqa_decode", mock_mqa_decode)
     indexer = SimpleNamespace(block_topk=512)
     lengths = torch.full((16,), 2048, dtype=torch.int32, device="cuda")
     results = [

@@ -263,6 +263,25 @@ impl RouterInflightLoadRegistry {
         prefill_load: usize,
         decode_load: usize,
     ) -> RouterInflightLoadGuard {
+        self.register_aged(
+            worker,
+            worker_url,
+            prefill_load,
+            decode_load,
+            Duration::ZERO,
+        )
+    }
+
+    /// [`Self::register`] for a request that has already been in flight for
+    /// `age`, so a retry keeps the request's original stale deadline.
+    pub fn register_aged(
+        self: &Arc<Self>,
+        worker: WorkerId,
+        worker_url: impl Into<String>,
+        prefill_load: usize,
+        decode_load: usize,
+        age: Duration,
+    ) -> RouterInflightLoadGuard {
         let worker_url = worker_url.into();
         let request_id = RequestId::new_v4();
         let counters = self
@@ -287,7 +306,11 @@ impl RouterInflightLoadRegistry {
                 counters,
                 prefill_load,
                 decode_load,
-                registered_at: self.clock.now(),
+                registered_at: self
+                    .clock
+                    .now()
+                    .checked_sub(age)
+                    .unwrap_or(self.clock.now()),
                 cancel: cancel.clone(),
             },
         );
@@ -297,6 +320,11 @@ impl RouterInflightLoadRegistry {
             worker,
             cancel,
         }
+    }
+
+    /// How long a request may stay in flight before the janitor expires it.
+    pub fn stale_request_timeout(&self) -> Duration {
+        self.stale_request_timeout
     }
 
     /// Drop a worker's per-worker counters entry. Called from
