@@ -8,6 +8,7 @@ import logging
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -184,6 +185,7 @@ class GluonFAv3Impl(AttentionImpl):
             key,
             value,
             softmax_scale=self.softmax_scale,
+            wan_fixed_shift=envs.SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT,
         )
 
 

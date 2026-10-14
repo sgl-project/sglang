@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
     gluon_fav3_attention,
     select_fav3_launch_config,
 )
+from sglang.multimodal_gen import envs
 
 PRESETS = {
     "reference": (1, 8192, 8192, 16),
@@ -55,6 +56,7 @@ def parse_args():
         choices=("auto", "pipeline", "pingpong"),
     )
     parser.add_argument("--scheduler")
+    parser.add_argument("--wan-fixed-shift", action="store_true")
     return parser.parse_args()
 
 
@@ -85,7 +87,14 @@ def main():
     )
     value = torch.randn_like(key)
 
-    config = select_fav3_launch_config(batch, num_heads, seqlen_q, seqlen_k=seqlen_k)
+    wan_fixed_shift = args.wan_fixed_shift or envs.SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT
+    config = select_fav3_launch_config(
+        batch,
+        num_heads,
+        seqlen_q,
+        seqlen_k=seqlen_k,
+        wan_fixed_shift=wan_fixed_shift,
+    )
     if args.schedule not in (None, "auto"):
         schedule_configs = {
             "pipeline": FAv3LaunchConfig("pipeline", 128, 64, 4, False, ""),
@@ -106,6 +115,7 @@ def main():
             key,
             value,
             launch_config=config,
+            wan_fixed_shift=wan_fixed_shift,
         )
 
     if args.trace_provider is not None:

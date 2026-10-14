@@ -15,12 +15,11 @@ def _is_gfx1250() -> bool:
     return "gfx1250" in arch
 
 
-def test_wan_cross_launch_selection_cpu(monkeypatch):
+def test_wan_cross_launch_selection_cpu():
     from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
         select_fav3_launch_config,
     )
 
-    monkeypatch.delenv("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", raising=False)
     config = select_fav3_launch_config(
         2,
         40,
@@ -57,13 +56,13 @@ def test_wan_cross_launch_selection_cpu(monkeypatch):
     )
     assert stable_self_config.schedule == "pingpong"
 
-    monkeypatch.setenv("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "1")
     self_config = select_fav3_launch_config(
         2,
         40,
         176_400,
         seqlen_k=176_400,
         num_cus=256,
+        wan_fixed_shift=True,
     )
     assert self_config.schedule == "wan_self"
     assert self_config.llvm_fn_attrs == (
@@ -78,6 +77,7 @@ def test_wan_cross_launch_selection_cpu(monkeypatch):
         (1, 129, 65, 8, "pipeline"),
         (1, 300, 513, 8, "pipeline"),
         (1, 2050, 512, 40, "pingpong"),
+        (4, 176_400, 512, 40, "pingpong"),
         (2, 176_400, 512, 40, "wan_cross"),
         (2, 176_400, 176_400, 40, "wan_self"),
     ],
@@ -85,6 +85,7 @@ def test_wan_cross_launch_selection_cpu(monkeypatch):
         "short-k-tail",
         "partial-rectangular-pipeline",
         "wide-pingpong-tdm",
+        "wan-b4-large-batch-offset",
         "wan-cross-specialized-large-offset",
         "wan-self-fixed-shift",
     ],
@@ -150,7 +151,13 @@ def test_gluon_fav3_matches_aiter(
         actual = attention(query, key, value)
     torch.cuda.synchronize()
 
-    config = select_fav3_launch_config(batch, num_heads, seqlen_q, seqlen_k=seqlen_k)
+    config = select_fav3_launch_config(
+        batch,
+        num_heads,
+        seqlen_q,
+        seqlen_k=seqlen_k,
+        wan_fixed_shift=expected_schedule == "wan_self",
+    )
     assert config.schedule == expected_schedule
     assert config.tdm_output is (
         expected_schedule in ("pingpong", "wan_cross", "wan_self")
@@ -169,6 +176,29 @@ def test_gluon_fav3_matches_aiter(
         rtol=0.04,
         atol=0.04,
     )
+    if expected_schedule == "wan_self":
+        query.fill_(1.0)
+        key.zero_()
+        key[:, 128, :, :].fill_(16.0)
+        expected_outlier = aiter.flash_attn_func(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            causal=False,
+            return_attn_probs=False,
+            return_lse=False,
+        )
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            actual_outlier = attention(query, key, value)
+        torch.cuda.synchronize()
+        assert torch.isfinite(actual_outlier).all()
+        torch.testing.assert_close(
+            actual_outlier.float(),
+            expected_outlier.float(),
+            rtol=0.04,
+            atol=0.04,
+        )
 
 
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")

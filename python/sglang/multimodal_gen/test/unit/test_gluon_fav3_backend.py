@@ -52,6 +52,34 @@ def test_forward_calls_gluon_kernel_for_supported_contract():
         key,
         value,
         softmax_scale=impl.softmax_scale,
+        wan_fixed_shift=False,
+    )
+
+
+def test_forwards_registered_wan_fixed_shift_opt_in():
+    impl = _impl()
+    query = torch.empty(1, 2, 8, 128)
+    key = torch.empty(1, 3, 8, 128)
+    value = torch.empty_like(key)
+    kernel = mock.Mock(return_value=torch.empty(1))
+
+    with (
+        mock.patch.object(impl, "_unsupported_reason", return_value=None),
+        mock.patch.object(
+            gluon_fav3.envs,
+            "SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT",
+            True,
+        ),
+        mock.patch.object(gluon_fav3, "_load_gluon_fav3", return_value=(kernel, None)),
+    ):
+        impl.forward(query, key, value)
+
+    kernel.assert_called_once_with(
+        query,
+        key,
+        value,
+        softmax_scale=impl.softmax_scale,
+        wan_fixed_shift=True,
     )
 
 
@@ -178,12 +206,11 @@ def test_rocm_resolver_selects_gluon_only_for_exact_static_contract():
         )
 
 
-def test_server_args_select_device_specific_rocm_default(monkeypatch):
+def test_server_args_keep_aiter_as_rocm_default():
     args = object.__new__(ServerArgs)
     platform_path = (
         "sglang.multimodal_gen.runtime.server_args.server_args.current_platform"
     )
-    monkeypatch.delenv("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", raising=False)
     with (
         mock.patch(f"{platform_path}.is_rocm", return_value=True),
         mock.patch(
@@ -193,17 +220,6 @@ def test_server_args_select_device_specific_rocm_default(monkeypatch):
     ):
         args._set_default_attention_backend()
     assert args.attention_backend == "aiter"
-
-    monkeypatch.setenv("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "1")
-    with (
-        mock.patch(f"{platform_path}.is_rocm", return_value=True),
-        mock.patch(
-            f"{platform_path}.get_device_capability",
-            return_value=DeviceCapability(12, 5),
-        ),
-    ):
-        args._set_default_attention_backend()
-    assert args.attention_backend == "gluon_fav3"
 
     with (
         mock.patch(f"{platform_path}.is_rocm", return_value=True),
