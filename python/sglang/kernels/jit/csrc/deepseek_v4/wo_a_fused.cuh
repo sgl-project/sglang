@@ -317,7 +317,8 @@ struct WoATrait {
     uint64_t tmem_ld_done;
     uint32_t taddr;
   };
-  // 2 CTAs/SM needs <= 113 KiB each; the 32-cluster (TP4) wave depends on it.
+  // 2 CTAs/SM needs <= 113 KiB each; the single-wave TP4 grid (32 clusters) depends on it.
+  // TP2 launches 64 clusters / 512 CTAs, ~1.7 waves at 2 CTAs/SM, which likely bounds its WO-A gain.
   static_assert(sizeof(Smem) <= 115712, "smem would drop the kernel to 1 CTA/SM");
 };
 
@@ -379,6 +380,7 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
   constexpr int kHeadsPerCta = Trait::kHeadsPerCta;
   constexpr int kRopeDim = Trait::kRopeDim;
   constexpr int kNOut = Trait::kNOut;
+  constexpr int kGroupN = Trait::kGroupN;
   constexpr int kWarps = Trait::kWarps;
   constexpr int kThreads = Trait::kThreads;
   constexpr int kDrainWarps = Trait::kDrainWarps;
@@ -403,8 +405,8 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
   const uint32_t lane_id = tx % kWarpThreads;
   const uint32_t rank = ptx::cluster_ctarank();  // == the head this CTA owns
   const uint32_t work_id = blockIdx.x / kSplitK;
-  const uint32_t group = work_id / (1024 / kNTile);
-  const uint32_t n0 = (work_id % (1024 / kNTile)) * kNTile;
+  const uint32_t group = work_id / (kGroupN / kNTile);
+  const uint32_t n0 = (work_id % (kGroupN / kNTile)) * kNTile;
   const uint32_t k0 = rank * kKSlab;
 
   // Before anything else: the descriptor fetch is serial with the first tile's
@@ -449,7 +451,7 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
 #pragma unroll
       for (int s = 0; s < kStages; ++s) {
         ptx::cp_async_bulk_tensor_2d(
-            ptx::to_shared(smem.w[s]), &w_map, k0 + s * kBlockK, group * 1024 + n0, &smem.w_ready[s]);
+            ptx::to_shared(smem.w[s]), &w_map, k0 + s * kBlockK, group * kGroupN + n0, &smem.w_ready[s]);
         ptx::mbar_arrive_expect_tx(&smem.w_ready[s], kWTile);
       }
     }
@@ -584,7 +586,7 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
 
     // Only the first kEpiWarps warps own a token; inbox's middle dim is
     // kTokPerRank, and t would otherwise collide with the next rank's tokens.
-    const auto col0 = group * 1024 + n0;
+    const auto col0 = group * kGroupN + n0;
     const auto t = rank * kTokPerRank + warp_id;
     // Unconditional, and before the guard: this is what keeps the CTA alive
     // until every peer's st.async into our inbox has landed. A rank whose tokens
