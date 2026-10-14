@@ -4,7 +4,7 @@ memory budget), the paged pool, or the published blocks of a sparse table."""
 
 from __future__ import annotations
 
-from typing import Iterator, Tuple
+from typing import Callable, Iterator, Tuple
 
 import torch
 
@@ -18,15 +18,24 @@ from .candidate_table import CANDIDATE_BLOCK_SIZE
 
 
 def flat_index_logits_rows_per_tile(
-    rows: int, width: int, *, heads: int, budget_bytes: int
+    rows: int,
+    width: int,
+    *,
+    heads: int,
+    budget_bytes: int,
+    scratch_row_bytes: int = 0,
+    scratch_tile_bytes: int = 0,
 ) -> int:
-    """Rows per fp32 logits tile within ``budget_bytes``, at the kernel's row
-    alignment."""
+    """Rows per tile so that a tile's fp32 logits, as DeepGEMM allocates them,
+    plus its consumer's scratch, ``scratch_row_bytes`` a row and
+    ``scratch_tile_bytes`` a tile, stay within ``budget_bytes``: ``rows`` when all
+    fit, else a multiple of the kernel's row group, at least one row group even
+    when that exceeds the budget."""
     row_alignment = 128 // heads
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
-        budget_bytes=budget_bytes,
+        row_bytes=mqa_logits_row_bytes(width) + scratch_row_bytes,
+        budget_bytes=max(1, budget_bytes - scratch_tile_bytes),
     )
     if rows_per_chunk is None:
         return rows
@@ -43,19 +52,29 @@ def flat_index_logits_tiles(
     context_lengths: list[int],
     budget_bytes: int,
     width_align: int = 4,
+    scratch_bytes: Callable[[int], Tuple[int, int]] = lambda width: (0, 0),
 ) -> Iterator[tuple[slice, torch.Tensor]]:
-    """``(rows, logits)`` per row tile, each fp32 tile within ``budget_bytes``:
-    ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
-    garbage past the row's ``lengths``; the width is ``max(context_lengths)``
-    aligned to ``width_align``."""
+    """``(rows, logits)`` per row tile: ``logits[i, j]`` scores query row
+    ``rows.start + i`` against ``kv[starts + j]``, garbage past the row's
+    ``lengths``; the width is ``max(context_lengths)`` aligned to ``width_align``.
+    A tile's logits plus the caller's scratch, ``scratch_bytes(width)`` as bytes
+    a row and bytes a tile, stay within ``budget_bytes``, subject to the
+    one-row-group minimum. The caller must drop a
+    tile before taking the next one, or two tiles are alive at once."""
     from deep_gemm import fp8_fp4_mqa_logits
 
     rows = q[0].shape[0]
     width = ceil_align(max(context_lengths, default=0), width_align)
     if rows == 0 or width == 0:
         return
+    scratch_row_bytes, scratch_tile_bytes = scratch_bytes(width)
     rows_per_chunk = flat_index_logits_rows_per_tile(
-        rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
+        rows,
+        width,
+        heads=q[0].shape[1],
+        budget_bytes=budget_bytes,
+        scratch_row_bytes=scratch_row_bytes,
+        scratch_tile_bytes=scratch_tile_bytes,
     )
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))

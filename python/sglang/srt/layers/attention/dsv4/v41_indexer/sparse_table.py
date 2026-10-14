@@ -384,6 +384,11 @@ def _row_pair_ids(rows_per_request: List[int], *, device: torch.device) -> torch
     return (row - ((row - first_row[request]) & 1)).to(torch.int32)
 
 
+def _block_keys_row_bytes(width: int) -> int:
+    width_blocks = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    return 4 * ((width_blocks + 3) // 4 * 4)
+
+
 # TODO(dark): support fusion of publish + topk of publish layer
 def publish_prefill_table(
     *,
@@ -403,7 +408,9 @@ def publish_prefill_table(
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
     zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
     # the block keys read the score rows through 32-byte vectors
-    for tile, logits in score_tiles(data, kv, width_align=8):
+    for tile, logits in score_tiles(
+        data, kv, width_align=8, scratch_bytes=lambda w: (_block_keys_row_bytes(w), 0)
+    ):
         lens = data.compress_lens[tile]
         topk_transform_ragged_v2(
             logits,
@@ -424,6 +431,8 @@ def publish_prefill_table(
             out_offsets=zero_offsets[: logits.shape[0]],
             out_indices=blocks[tile],
         )
+        # Free this tile before the generator scores the next one.
+        del logits, keys
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,
