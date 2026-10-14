@@ -121,8 +121,6 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
-from sglang.srt.lora.lora_drainer import LoRADrainer
-from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -267,6 +265,7 @@ from sglang.srt.managers.scheduler_components.load_publisher import (
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.lora_admission import LoraAdmission
 from sglang.srt.managers.scheduler_components.memory_usage import (
     combine_graph_memory_usage,
 )
@@ -635,11 +634,8 @@ class Scheduler:
         self.init_dsa_kpool_truncation_align()
         self.check_truncation_align_fits_chunk()
 
-        # Init LoRA drainer for fair scheduling
-        self.init_lora_drainer()
-
-        # Init LoRA overlap loader
-        self.init_lora_overlap_loader()
+        # Init LoRA admission: the drainer and the overlap loader
+        self.init_lora_admission()
 
         # Init the grammar backend for constrained generation
         self.init_grammar_manager()
@@ -1575,7 +1571,7 @@ class Scheduler:
             kv_cache_dtype_str=self.tp_worker.model_runner.kv_cache_dtype_str,
             sliding_window_size=self.sliding_window_size,
             hisparse_coordinator=self.hisparse_coordinator,
-            can_schedule_lora_req=self.can_schedule_lora_req,
+            lora_admission=self.lora_admission,
             pool_stats_observer=self.pool_stats_observer,
             decode_offload_manager=self.decode_offload_manager,
             request_retirer=self.request_retirer,
@@ -2572,20 +2568,8 @@ class Scheduler:
             ipc_channels=self.ipc_channels,
         )
 
-    def init_lora_drainer(self) -> None:
-        if get_lora().lora_drain_wait_threshold > 0.0:
-            self.lora_drainer = LoRADrainer(
-                get_lora().max_loras_per_batch,
-                get_lora().lora_drain_wait_threshold,
-            )
-        else:
-            self.lora_drainer = None
-
-    def init_lora_overlap_loader(self) -> None:
-        if get_lora().enable_lora_overlap_loading:
-            self.lora_overlap_loader = LoRAOverlapLoader(
-                self.tp_worker.model_runner.lora_manager
-            )
+    def init_lora_admission(self) -> None:
+        self.lora_admission = LoraAdmission(tp_worker=self.tp_worker)
 
     def init_grammar_manager(self) -> None:
         self.grammar_manager = GrammarManager(
@@ -4226,8 +4210,8 @@ class Scheduler:
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
-            if self.lora_drainer:
-                self.lora_drainer.update_draining_state(
+            if self.lora_admission.lora_drainer:
+                self.lora_admission.lora_drainer.update_draining_state(
                     self.lists.waiting_queue,
                     self.lists.decoding,
                 )
@@ -4238,7 +4222,7 @@ class Scheduler:
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.lists.waiting_queue:
-            if get_lora().enable_lora and not self.can_schedule_lora_req(
+            if get_lora().enable_lora and not self.lora_admission.can_schedule_lora_req(
                 req, running_loras
             ):
                 continue
@@ -4419,34 +4403,6 @@ class Scheduler:
 
         new_batch.sampling_info = self.step_builder.build_sampling_info(new_batch.reqs)
         return new_batch
-
-    def can_schedule_lora_req(
-        self, req: Req, running_loras: set[Optional[str]]
-    ) -> bool:
-        """
-        Check if a LoRA request can be scheduled.
-
-        This method checks two conditions:
-        1. The drainer allows scheduling (based on draining state)
-        2. The LoRA adapter can be loaded (either already running or can be added)
-        """
-        if self.lora_drainer and not self.lora_drainer.can_schedule(req):
-            return False
-
-        if req.lora_id in running_loras:
-            return True
-
-        if get_lora().enable_lora_overlap_loading:
-            # For overlapping loading of LoRA weights with computation, we will load each
-            # adapter one at a time, as opposed to loading them in one batch
-            return self.lora_overlap_loader.try_overlap_load_lora(
-                req.lora_id, running_loras
-            )
-        else:
-            new_lora_set = {req.lora_id} | running_loras
-            return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
-                new_lora_set
-            )
 
     def _select_decode_reqs(self, slot: ScheduleSlot) -> List[Req]:
         """The decoding requests one decode step (or a mixed step's decode

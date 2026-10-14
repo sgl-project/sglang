@@ -161,6 +161,9 @@ if TYPE_CHECKING:
         Streams,
     )
     from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
+    from sglang.srt.managers.scheduler_components.lora_admission import (
+        LoraAdmission,
+    )
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
     )
@@ -3154,7 +3157,7 @@ class DisaggDecode:
         kv_cache_dtype_str: str,
         sliding_window_size: Optional[int],
         hisparse_coordinator: Optional[HiSparseCoordinator],
-        can_schedule_lora_req: Callable[[Req, Set[Optional[str]]], bool],
+        lora_admission: LoraAdmission,
         pool_stats_observer: SchedulerPoolStatsObserver,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         request_retirer: RequestRetirer,
@@ -3297,7 +3300,7 @@ class DisaggDecode:
             hisparse_coordinator=hisparse_coordinator,
             enable_decode_hicache=enable_decode_hicache,
             enable_lora=enable_lora,
-            can_schedule_lora_req=can_schedule_lora_req,
+            can_schedule_lora_req=lora_admission.can_schedule_lora_req,
             enable_priority_scheduling=enable_priority_scheduling,
             schedule_low_priority_values_first=schedule_low_priority_values_first,
             metrics_sink=metrics_sink,

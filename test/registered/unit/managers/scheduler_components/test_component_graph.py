@@ -103,6 +103,7 @@ _DECLARED = {
         "Streams",
         "SchedulerServices",
         "HiSparse",
+        "LoraAdmission",
         "SchedulePolicy",
         "PoolStatsObserver",
         "DecodeOffloadManager",
@@ -314,6 +315,7 @@ _PARAM = {
     "StepCounters": ("step_counters",),
     "ProfilerManager": ("profiler_manager",),
     "PPSpecForward": ("pp_spec_forward",),
+    "LoraAdmission": ("lora_admission",),
 }
 
 # Components in their final form: node -> (module under srt/, class).
@@ -363,6 +365,10 @@ _BUILT = {
     "StepLauncher": (
         "managers/scheduler_components/step_launcher.py",
         "StepLauncher",
+    ),
+    "LoraAdmission": (
+        "managers/scheduler_components/lora_admission.py",
+        "LoraAdmission",
     ),
     "DisaggDecode": ("disaggregation/decode.py", "DisaggDecode"),
     "DisaggPrefill": ("disaggregation/prefill.py", "DisaggPrefill"),
@@ -431,7 +437,6 @@ _CALLBACK_SITES = {
         _SELF,
     ): 1,
     # To be removed.
-    ("maybe_init_disagg_decode", "DisaggDecode", "can_schedule_lora_req", _BOUND): 1,
     ("init_weight_updater", "SchedulerWeightUpdaterManager", "flush_cache", _BOUND): 1,
     ("init_request_receiver", "SchedulerRequestReceiver", "stream_output", _LAMBDA): 1,
     (

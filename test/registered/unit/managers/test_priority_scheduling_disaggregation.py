@@ -27,6 +27,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E40
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.lora_admission import LoraAdmission
 from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
     ModeOwners,
 )
@@ -603,14 +604,16 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.get_ready = lambda: [waiting.req]
         queue.enable_decode_hicache = False
         queue.enable_lora = True
-        scheduler = MagicMock()
         get_context().override("test", enable_lora_overlap_loading=False)
-        scheduler.lora_drainer = None
         manager = LoRAManager.__new__(LoRAManager)
         manager.max_loras_per_batch = 5
         manager.num_pinned_loras = 0
-        scheduler.tp_worker.model_runner.lora_manager = manager
-        queue.can_schedule_lora_req = Scheduler.can_schedule_lora_req.__get__(scheduler)
+        lora_admission = LoraAdmission.__new__(LoraAdmission)
+        lora_admission.lora_drainer = None
+        lora_admission.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(lora_manager=manager)
+        )
+        queue.can_schedule_lora_req = lora_admission.can_schedule_lora_req
 
         preallocated, failed = queue.pop_preallocated([])
 
