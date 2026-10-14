@@ -78,6 +78,9 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+# flashinfer's XQA decode keeps its multi-block semaphores in the first 8 MiB
+# of the workspace and needs them zero at every launch.
+_XQA_SEMAPHORE_BYTES = 8 * 1024 * 1024
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 
@@ -161,6 +164,11 @@ class TRTLLMMHAMetadata:
     # Prefix before trailing one-token requests in an extend-shaped batch.
     mixed_prefill_reqs: int = 0
     mixed_prefill_tokens: int = 0
+    # fmha_v2 prefill: the (row, column) of each page-table entry the batch
+    # reads, in copy order, and the block table over that copy.
+    fmha_v2_copy_rows: torch.Tensor = None
+    fmha_v2_copy_cols: torch.Tensor = None
+    fmha_v2_block_table: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -295,15 +303,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
+        semaphore_bytes = _XQA_SEMAPHORE_BYTES if self.is_xqa_impl else 0
         # Allocate buffers
         self.workspace_buffer = get_buffer(
             "trtllm_mha_zero_workspace",
             lambda: torch.zeros(
-                self.workspace_size,
+                semaphore_bytes + self.workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,
             ),
         )
+        self.fmha_v2_workspace_buffer = self.workspace_buffer[semaphore_bytes:]
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -1282,13 +1292,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
+            if self.use_fmha_v2 and not forward_batch.forward_mode.is_draft_extend_v2():
+                self._init_fmha_v2_batch_pages(metadata, forward_batch)
 
         kv_view = self.kv_index_translator.read_table(
             forward_batch.kv_loc_plan, rows=forward_batch.batch_size
         )
         if kv_view.is_translated:
-            # No fill kernel: the kernels take the tensor's own width/stride
-            # and bound their reads by cache_seqlens.
+            # No fill kernel: the kernels bound their reads by cache_seqlens.
             metadata.page_table = kv_view.ids
             metadata.swa_page_table = (
                 self.kv_index_translator.read_table(
@@ -1299,6 +1310,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 if self.kv_index_translator.space(IdSpaceKind.SLIDING_WINDOW)
                 is not None
                 else None
+            )
+            # XQA and fmha_v2 take a page table's row length from its width and
+            # ignore its strides, so a view into a wider table would be misread.
+            assert metadata.page_table.is_contiguous() and (
+                metadata.swa_page_table is None
+                or metadata.swa_page_table.is_contiguous()
+            ), (
+                "trtllm_mha reads its page tables as packed rows, but the plan's "
+                "table is a strided view of a wider buffer"
             )
         else:
             has_swa = self._swa_kv_pool is not None
@@ -1333,6 +1353,63 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         self.forward_metadata = metadata
+
+    def _init_fmha_v2_batch_pages(
+        self, metadata: TRTLLMMHAMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        """Index the pages this batch reads, for the fmha_v2 prefill copy.
+
+        Sized by the host seq_lens, which are live only alongside seq_lens_sum
+        (a GPU-only batch keeps a stale seq_lens_cpu); without them the prefill
+        copies the whole pool.
+        """
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if (
+            forward_batch.seq_lens_sum is None
+            or seq_lens_cpu is None
+            or seq_lens_cpu.numel() == 0
+        ):
+            return
+        host_pages = (seq_lens_cpu + self.page_size - 1) // self.page_size
+        total_pages = int(host_pages.sum())
+        if total_pages == 0:
+            return
+        num_pages = (
+            (metadata.cache_seqlens_int32 + self.page_size - 1) // self.page_size
+        ).to(torch.int64)
+        device = num_pages.device
+        # Row r's pages land in copy rows [first[r], first[r] + num_pages[r]).
+        first = torch.cumsum(num_pages, 0) - num_pages
+        rows = torch.repeat_interleave(num_pages, output_size=total_pages)
+        metadata.fmha_v2_copy_rows = rows
+        metadata.fmha_v2_copy_cols = (
+            torch.arange(total_pages, device=device) - first[rows]
+        )
+        # Past a row's last page, entries only need to stay in range.
+        metadata.fmha_v2_block_table = (
+            (first[:, None] + torch.arange(int(host_pages.max()), device=device))
+            .clamp_(max=total_pages - 1)
+            .to(torch.int32)
+        )
+
+    def _fmha_v2_paged_kv(
+        self, k_cache: torch.Tensor, v_cache: torch.Tensor, page_table: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """K and V as the [pages, 2, page_size, heads, head_dim] tensor fmha_v2
+        takes, and the block table that addresses it.
+
+        fmha_v2 derives strides from shapes, so this is a copy: of the batch's
+        pages only, unless they are no fewer than the pool's.
+        """
+        metadata = self.forward_metadata
+        rows = metadata.fmha_v2_copy_rows
+        if rows is None or rows.numel() >= k_cache.shape[0]:
+            return torch.stack([k_cache, v_cache], dim=1), page_table
+        pages = page_table[rows, metadata.fmha_v2_copy_cols]
+        paged_kv = k_cache.new_empty((rows.numel(), 2, *k_cache.shape[1:]))
+        torch.index_select(k_cache, 0, pages, out=paged_kv[:, 0])
+        torch.index_select(v_cache, 0, pages, out=paged_kv[:, 1])
+        return paged_kv, metadata.fmha_v2_block_table
 
     def _reshape_paged_kv_cache(
         self,
@@ -1760,12 +1837,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
-            paged_kv = torch.stack([k_cache, v_cache], dim=1)
+            paged_kv, block_tables = self._fmha_v2_paged_kv(
+                k_cache, v_cache, page_table
+            )
             out = forward_batch._attn_output
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 (q, paged_kv),
                 input_layout="Q_PAGED_KV_NHD",
-                workspace_buffer=self.workspace_buffer,
+                workspace_buffer=self.fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,
@@ -1774,7 +1853,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 batch_size=forward_batch.batch_size,
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                block_tables=page_table,
+                block_tables=block_tables,
                 out=None if out is None else out.view_as(q),
                 out_dtype=self.q_data_type,
                 mask_mode=(

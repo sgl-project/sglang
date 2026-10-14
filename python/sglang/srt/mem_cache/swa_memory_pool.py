@@ -213,11 +213,12 @@ class SWAKVPool(BaseSWAKVPool):
     def get_v_head_dim(self):
         # The FULL side's dim, as HybridLinearKVPool.get_v_head_dim(): a caller
         # asking a pool for "the" v_head_dim wants the full-attention geometry.
+        # A window-only pool (a sliding-window MTP depth) has no full side;
+        # its swa side is the only geometry there is.
         # `start_layer`, not 0, so pipeline parallelism (start_layer > 0) works,
         # and because layer 0 need not be a full-attention layer.
-        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
-            -1
-        ]
+        lead = self.full_kv_pool if self.full_layer_nums > 0 else self.swa_kv_pool
+        return lead.get_value_buffer(lead.start_layer).shape[-1]
 
     def get_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)

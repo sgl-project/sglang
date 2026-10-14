@@ -6,10 +6,14 @@ cu_seqlens_q (all 3 q-modes) / page_table / swa_page_table / swa_out_cache_loc,
 with the SWA -1 sentinel guard.
 """
 
+import contextlib
+import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils import _pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import sglang.srt.layers.attention.trtllm_mha_backend as trtllm_mha_backend
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
@@ -18,6 +22,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_STRIDED,
     update_trtllm_mha_graph_metadata,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -203,6 +208,249 @@ def test_decode_mode_query_dtype_with_fp8_kv(
 
 
 @pytest.mark.parametrize(
+    "explicit_bytes", [None, 8 * 1024 * 1024], ids=["default", "explicit_8MiB"]
+)
+def test_fmha_v2_prefill_workspace_skips_xqa_semaphores(
+    make_xqa_backend, monkeypatch, explicit_bytes
+):
+    # XQA decode keeps its multi-block semaphores in the first 8 MiB of the
+    # workspace and needs them zero at launch; fmha_v2 prefill, sharing the
+    # buffer, leaves its tile counters at the base of what it is handed.
+    monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 16)
+    configured = explicit_bytes or 16 * 1024 * 1024
+    with (
+        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.override(explicit_bytes)
+        if explicit_bytes is not None
+        else contextlib.nullcontext()
+    ):
+        backend = make_xqa_backend(None)
+    heads, head_dim, bs = 2, 4, 2
+    seq_lens = torch.tensor([30, 10], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 30, 40], dtype=torch.int32)
+    backend.forward_metadata = trtllm_mha_backend.TRTLLMMHAMetadata(
+        cache_seqlens_int32=seq_lens,
+        max_seq_len_q=30,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        page_table=torch.arange(bs, dtype=torch.int32)[:, None],
+    )
+    kv = torch.zeros(bs * backend.page_size, heads, head_dim, dtype=torch.bfloat16)
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    workspaces = {}
+
+    def decode(**kwargs):
+        workspaces["xqa"] = kwargs["workspace_buffer"]
+        return torch.zeros_like(kwargs["query"])
+
+    def prefill(qkv, **kwargs):
+        workspaces["fmha_v2"] = kwargs["workspace_buffer"]
+        return torch.zeros_like(qkv[0])
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache=decode),
+            prefill=SimpleNamespace(trtllm_fmha_v2_prefill=prefill),
+        ),
+        raising=False,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=heads,
+        tp_k_head_num=heads,
+        tp_v_head_num=heads,
+        head_dim=head_dim,
+        scaling=1.0,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    q = torch.zeros(40, heads * head_dim, dtype=torch.bfloat16)
+    extend = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND, batch_size=bs, _attn_output=None
+    )
+    backend.forward_extend(q, None, None, layer, extend, save_kv_cache=False)
+    decode_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, batch_size=bs)
+    backend.forward_decode(q[:bs], None, None, layer, decode_batch, save_kv_cache=False)
+
+    semaphores = workspaces["xqa"].data_ptr()
+    fmha_v2 = workspaces["fmha_v2"]
+    start = fmha_v2.data_ptr()
+    end = start + fmha_v2.numel() * fmha_v2.element_size()
+    # The semaphores come on top of the configured size, so fmha_v2 keeps all of it.
+    assert end - start == configured
+    assert end <= semaphores or start >= semaphores + 8 * 1024 * 1024, (
+        f"fmha_v2 workspace [{start - semaphores}, {end - semaphores}) overlaps "
+        "XQA's semaphores [0, 8 MiB)"
+    )
+
+
+@pytest.mark.parametrize(
+    "host_lens_live,pool_pages,copied_pages",
+    [
+        # The rows' own 3 + 1 pages, not the pool.
+        (True, 64, 4),
+        # No live host lens (seq_lens_sum is None): the whole pool.
+        (False, 64, 64),
+        # The batch's pages are no fewer than the pool's: the whole pool.
+        (True, 4, 4),
+    ],
+)
+def test_fmha_v2_prefill_copies_only_the_batch_pages(
+    make_xqa_backend, monkeypatch, host_lens_live, pool_pages, copied_pages
+):
+    backend = make_xqa_backend(None)
+    page_size, heads, head_dim = backend.page_size, 2, 4
+    seq_lens = torch.tensor([70, 20], dtype=torch.int32)
+    row_pages = [[3, 1, 0], [2]]
+    # Past each row's last page the table is unwritten.
+    page_table = torch.full((2, 4), 1 << 20, dtype=torch.int32)
+    for row, pages in enumerate(row_pages):
+        page_table[row, : len(pages)] = torch.tensor(pages)
+    k = torch.randn(pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
+    v = torch.randn_like(k)
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
+
+    backend.kv_index_translator = SimpleNamespace(
+        read_table=lambda plan, rows: SimpleNamespace(
+            ids=page_table, is_translated=True
+        ),
+        space=lambda kind: None,
+    )
+    backend.use_sliding_window_kv_pool = False
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    calls = []
+
+    def prefill(qkv, **kwargs):
+        calls.append((qkv[1], kwargs["block_tables"]))
+        return torch.zeros_like(qkv[0])
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(prefill=SimpleNamespace(trtllm_fmha_v2_prefill=prefill)),
+        raising=False,
+    )
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=2,
+        spec_info=None,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.long(),
+        seq_lens_sum=int(seq_lens.sum()) if host_lens_live else None,
+        extend_seq_lens_cpu=seq_lens.tolist(),
+        extend_prefix_lens_cpu=[0, 0],
+        req_pool_indices=torch.arange(2),
+        kv_loc_plan=None,
+        _attn_output=None,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=heads,
+        tp_k_head_num=heads,
+        tp_v_head_num=heads,
+        head_dim=head_dim,
+        scaling=1.0,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    backend.init_forward_metadata(fb)
+    q = torch.zeros(int(seq_lens.sum()), heads * head_dim, dtype=torch.bfloat16)
+    backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
+
+    assert len(calls) == 1
+    paged_kv, block_tables = calls[0]
+    assert paged_kv.shape == (copied_pages, 2, page_size, heads, head_dim)
+    if copied_pages < pool_pages:
+        # A compact copy's table addresses the copy, past a row's last page too.
+        assert int(block_tables.max()) < copied_pages
+    k_pages = k.view(pool_pages, page_size, heads, head_dim)
+    v_pages = v.view(pool_pages, page_size, heads, head_dim)
+    for row, pages in enumerate(row_pages):
+        for col, page in enumerate(pages):
+            block = block_tables[row, col]
+            assert torch.equal(paged_kv[block, 0], k_pages[page])
+            assert torch.equal(paged_kv[block, 1], v_pages[page])
+
+
+class _LiveBytes(TorchDispatchMode):
+    """Peak bytes held by the tensors the dispatched ops allocate."""
+
+    def __init__(self):
+        super().__init__()
+        self.live = self.peak = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        given = {
+            t.untyped_storage().data_ptr()
+            for t in pytree.tree_leaves((args, kwargs))
+            if isinstance(t, torch.Tensor)
+        }
+        out = func(*args, **kwargs)
+        for t in pytree.tree_leaves(out):
+            if (
+                isinstance(t, torch.Tensor)
+                and t.untyped_storage().data_ptr() not in given
+            ):
+                nbytes = t.untyped_storage().nbytes()
+                self.live += nbytes
+                self.peak = max(self.peak, self.live)
+                weakref.finalize(t, self._release, nbytes)
+        return out
+
+    def _release(self, nbytes):
+        self.live -= nbytes
+
+
+@pytest.mark.parametrize("strided", [False, True], ids=["packed_pool", "strided_pool"])
+@pytest.mark.parametrize("pool_fraction", [0.5, 0.75, 0.97])
+def test_fmha_v2_prefill_copy_peaks_at_its_own_size(
+    make_xqa_backend, strided, pool_fraction
+):
+    """Bug regression: gathering K and V apart and then stacking them held the
+    batch's pages twice, more than the whole-pool copy once they pass half of it."""
+    backend = make_xqa_backend(None)
+    page_size, heads, head_dim, pool_pages = backend.page_size, 2, 16, 64
+    batch_pages = int(pool_pages * pool_fraction)
+    row_lens = [batch_pages // 2, batch_pages - batch_pages // 2]
+    perm = torch.randperm(pool_pages)
+    row_pages = [perm[: row_lens[0]], perm[row_lens[0] : batch_pages]]
+    page_table = torch.full((2, max(row_lens)), 1 << 20, dtype=torch.int32)
+    for row, pages in enumerate(row_pages):
+        page_table[row, : len(pages)] = pages.to(torch.int32)
+    shape = (pool_pages, page_size, heads, head_dim)
+    if strided:
+        kv = torch.randn(pool_pages, 2, *shape[1:]).to(torch.bfloat16)
+        k, v = kv[:, 0], kv[:, 1]
+    else:
+        k = torch.randn(shape).to(torch.bfloat16)
+        v = torch.randn_like(k)
+    # A partial last page still counts whole.
+    seq_lens = torch.tensor([n * page_size - 3 for n in row_lens], dtype=torch.int32)
+    metadata = trtllm_mha_backend.TRTLLMMHAMetadata(cache_seqlens_int32=seq_lens)
+    backend._init_fmha_v2_batch_pages(
+        metadata,
+        SimpleNamespace(seq_lens_cpu=seq_lens.long(), seq_lens_sum=int(seq_lens.sum())),
+    )
+    backend.forward_metadata = metadata
+
+    with _LiveBytes() as live:
+        paged_kv, block_table = backend._fmha_v2_paged_kv(k, v, page_table)
+
+    copy_bytes = paged_kv.numel() * paged_kv.element_size()
+    page_bytes = copy_bytes // (2 * batch_pages)
+    assert paged_kv.shape[0] == batch_pages
+    assert live.peak < copy_bytes + page_bytes
+    assert live.peak < 2 * k.numel() * k.element_size()
+    for row, pages in enumerate(row_pages):
+        blocks = block_table[row, : len(pages)].long()
+        assert torch.equal(paged_kv[blocks, 0], k[pages])
+        assert torch.equal(paged_kv[blocks, 1], v[pages])
+
+
+@pytest.mark.parametrize(
     "max_running_requests,max_draft_tokens,max_cuda_graph_bs,expected",
     [
         (32, None, None, 32),
@@ -251,6 +499,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.max_num_pages = 8
     backend.req_to_token = torch.zeros(4, 1024, dtype=torch.int32)
     backend.use_sliding_window_kv_pool = False
+    backend.use_fmha_v2 = False
     backend._swa_kv_pool = None
     backend._swa_full_to_swa_mapping = None
     backend.speculative_step_id = 0
@@ -365,6 +614,252 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["q_mode"] == Q_MODE_STRIDED
     assert calls[0]["q_stride"] == 4
+
+
+def _translate_through_a_moving_page_map(backend):
+    """Give the backend a translating pool whose virtual->physical page map the
+    test rewrites before every replay, so a page-table column the refill missed
+    still holds an earlier replay's page."""
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+
+    rows, width = backend.req_to_token.shape
+    # Row r holds virtual pages r * width / PAGE_SIZE + 1, ...; page 0 is the sink.
+    backend.req_to_token.copy_(
+        torch.arange(rows * width, dtype=torch.int32).view(rows, width) + PAGE_SIZE
+    )
+    v2p = torch.zeros(rows * width // PAGE_SIZE + 1, dtype=torch.int64)
+    translator = KVIndexTranslator.__new__(KVIndexTranslator)
+    translator.req_to_token = backend.req_to_token
+    translator.page_size = PAGE_SIZE
+    translator.device = "cpu"
+    translator.is_translating = True
+    translator.defer_read_translate = False
+    translator._capture_page_size = PAGE_SIZE
+    translator._full_v2p_table = v2p
+    translator._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"), write=lambda ids: ids, read_v2p=v2p
+        )
+    }
+    translator._rows = torch.arange(rows, dtype=torch.int64)
+    backend.kv_index_translator = translator
+    return v2p
+
+
+def _move_every_page(v2p, replay):
+    v2p[1:] = torch.arange(1, v2p.numel()) + 1000 * replay
+
+
+def _assert_reads_only_current_pages(backend, v2p, bs=2):
+    metadata = backend.forward_metadata
+    for row, length in enumerate(metadata.cache_seqlens_int32[:bs].tolist()):
+        pages = -(-length // PAGE_SIZE)
+        first_tokens = backend.req_to_token[row, : pages * PAGE_SIZE : PAGE_SIZE]
+        expected = v2p[first_tokens.long() // PAGE_SIZE].to(torch.int32)
+        stale = (metadata.page_table[row, :pages] != expected).nonzero().flatten()
+        assert stale.numel() == 0, (
+            f"row {row} reads {length} tokens ({pages} pages), but page-table "
+            f"columns {stale.tolist()} hold another replay's pages"
+        )
+
+
+def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
+    seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    bs = seq_lens.numel()
+    return SimpleNamespace(
+        batch_size=bs,
+        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        positions=torch.arange(bs * tokens_per_req, dtype=torch.int64),
+        # The window it writes; the reads under test do not depend on its ids.
+        out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+    )
+
+
+def _replay_and_check_every_read(
+    monkeypatch,
+    backend,
+    batch,
+    bind_plan,
+    replays=([5, 9], [300, 3], [129, 700]),
+):
+    # The recorded kernel writes cache_seqlens = seq_lens + offset only when the
+    # graph runs, which is after replay-prep has refilled the page table.
+    def recorded_kernel(**kwargs):
+        bs = kwargs["bs"]
+        kwargs["cache_seqlens"][:bs].copy_(
+            kwargs["seq_lens"][:bs] + kwargs["seqlen_offset"]
+        )
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", recorded_kernel
+    )
+    v2p = _translate_through_a_moving_page_map(backend)
+    capture = batch([1, 1])
+    bind_plan(backend.kv_index_translator, capture)
+    backend.init_forward_metadata_out_graph(capture, in_capture=True)
+    backend.init_forward_metadata_in_graph(capture)
+    # Rows grow across page boundaries and trade lengths between replays.
+    for n, seq_lens in enumerate(replays, start=1):
+        _move_every_page(v2p, n)
+        replay = batch(seq_lens)
+        bind_plan(backend.kv_index_translator, replay)
+        backend.init_forward_metadata_out_graph(replay)
+        backend.init_forward_metadata_in_graph(replay)
+        _assert_reads_only_current_pages(backend, v2p)
+
+
+def test_unified_decode_replay_reads_only_this_replays_pages(monkeypatch):
+    """A decode replay's page table is the plan of its own batch: the replay
+    reads no page an earlier replay refilled."""
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, ForwardMode.DECODE, None, 1)
+
+    _replay_and_check_every_read(
+        monkeypatch,
+        _make_backend_for_hook_test(),
+        batch,
+        lambda translator, fb: translator.bind_own_plan(fb),
+    )
+
+
+def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
+    seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    bs = seq_lens.numel()
+    return SimpleNamespace(
+        batch_size=bs,
+        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        input_ids=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+        out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+        extend_seq_lens=seq_lens,
+        extend_seq_lens_cpu=seq_lens.tolist(),
+        extend_prefix_lens_cpu=[0] * bs,
+    )
+
+
+def test_unified_eager_table_must_be_packed():
+    """XQA and fmha_v2 index a page table as packed rows (row length = width,
+    strides ignored). A plan whose table an earlier captured reader had built in
+    its own wider buffer hands a graphs-off reader a strided view, which they
+    would misread for every row after the first."""
+    backend = _make_backend_for_hook_test()
+    v2p = _translate_through_a_moving_page_map(backend)
+    _move_every_page(v2p, 1)
+    translator = backend.kv_index_translator
+
+    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
+    translator.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    assert backend.forward_metadata.page_table.is_contiguous()
+    _assert_reads_only_current_pages(backend, v2p)
+
+    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
+    translator.bind_own_plan(forward_batch)
+    captured = torch.zeros((8, backend.max_num_pages), dtype=torch.int32)
+    translator.copy_page_table(forward_batch.kv_loc_plan, out=captured[:2])
+    with pytest.raises(AssertionError, match="packed rows"):
+        backend.init_forward_metadata(forward_batch)
+
+
+def _bind_iteration_plan(translator, forward_batch, window=4):
+    """The plan a speculative worker builds once per iteration: its reads reach
+    the whole draft window past the committed lengths."""
+    translator.plan(
+        req_pool_indices=forward_batch.req_pool_indices,
+        seq_lens=forward_batch.seq_lens,
+        seq_lens_cpu=forward_batch.seq_lens_cpu,
+        write_virtual=forward_batch.out_cache_loc,
+        read_extent=window,
+    ).bind(forward_batch, translator)
+
+
+@pytest.mark.parametrize(
+    "forward_mode,spec_info,step_id,tokens_per_req",
+    [
+        (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.DRAFT_EXTEND_V2, SimpleNamespace(num_tokens_per_req=4), 0, 4),
+    ],
+    ids=["draft_decode", "target_verify", "draft_extend"],
+)
+def test_unified_spec_replay_reads_only_this_replays_pages(
+    monkeypatch, forward_mode, spec_info, step_id, tokens_per_req
+):
+    """A speculative replay reads past seq_lens: a draft step reads back its
+    earlier steps, a verify the drafts it scores."""
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.speculative_step_id = step_id
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req)
+
+    # 127 committed tokens plus the drafts reach a page the prefix does not.
+    _replay_and_check_every_read(
+        monkeypatch,
+        backend,
+        batch,
+        _bind_iteration_plan,
+        replays=([5, 9], [127, 300], [129, 700]),
+    )
+
+
+def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
+    # Ragged verify writes per-row lengths before the refill; its geometry needs
+    # GPU kernels, so this stand-in writes the same lengths the real one does.
+    verify_lens = torch.tensor([1, 7], dtype=torch.int32)
+
+    def write_ragged(metadata, forward_batch, ragged_layout, bs, in_capture=False):
+        metadata.cache_seqlens_int32[:bs].copy_(
+            forward_batch.seq_lens[:bs] + verify_lens
+        )
+
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.is_xqa_impl = False
+    monkeypatch.setattr(backend, "_write_ragged_verify_graph_metadata", write_ragged)
+    spec_info = SimpleNamespace(ragged_verify_layout=object())
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, spec_info, 8)
+
+    # 123 + 7 crosses a page boundary that 123 plus the uniform draft width does not.
+    _replay_and_check_every_read(
+        monkeypatch,
+        backend,
+        batch,
+        lambda translator, fb: _bind_iteration_plan(translator, fb, window=8),
+        replays=([5, 123], [300, 3]),
+    )
+
+
+@pytest.mark.parametrize(
+    "forward_mode,spec_info,step_id,tokens_per_req",
+    [
+        (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+    ],
+    ids=["draft_decode", "target_verify"],
+)
+def test_unified_eager_spec_table_covers_every_page_read(
+    forward_mode, spec_info, step_id, tokens_per_req
+):
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.speculative_step_id = step_id
+    v2p = _translate_through_a_moving_page_map(backend)
+    _move_every_page(v2p, 1)
+    # 127 committed tokens plus the drafts reach a page the prefix does not.
+    forward_batch = _eager_batch([127, 3], forward_mode, spec_info, tokens_per_req)
+    _bind_iteration_plan(backend.kv_index_translator, forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    _assert_reads_only_current_pages(backend, v2p)
 
 
 def test_hybrid_wrappers_forward_in_graph_hook():
