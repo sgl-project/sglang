@@ -9,6 +9,7 @@ from available GPU memory using a unified coeff+bias model:
 from __future__ import annotations
 
 import logging
+import math
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -559,6 +560,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
+        elif memory_config.enable_hisparse_v2:
+            from sglang.srt.mem_cache.sparsity.hisparse_v2_config import (
+                parse_hisparse_v2_config,
+            )
+
+            indexer_ratio = (
+                1
+                + parse_hisparse_v2_config(
+                    model_top_k=kvc.model_config.hf_text_config.index_topk
+                ).expansion_ratio
+            )
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
@@ -605,8 +617,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
                 )
 
-        return int(
+        cell_size = (
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
+        )
+        return (
+            math.ceil(cell_size) if memory_config.enable_hisparse_v2 else int(cell_size)
         )
 
     def calculate_pool_sizes(

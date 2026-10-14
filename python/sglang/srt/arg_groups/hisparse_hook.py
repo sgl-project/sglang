@@ -84,10 +84,78 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
 
 
+def validate_hisparse_v2(server_args: ServerArgs) -> None:
+    from sglang.srt.configs.model_config import (
+        get_dsa_index_kpool,
+        is_deepseek_dsa,
+        is_hybrid_swa_model,
+    )
+
+    cfg = resolving_view(server_args)
+    hf_config = model_config_of(server_args).hf_config
+    if cfg.enable_hisparse:
+        raise ValueError(
+            "--enable-hisparse and --enable-hisparse-v2 are mutually exclusive"
+        )
+    if (
+        not is_deepseek_dsa(hf_config)
+        or get_dsa_index_kpool(hf_config) != 1
+        or is_hybrid_swa_model(hf_config.architectures, hf_config)
+    ):
+        raise ValueError(
+            "--enable-hisparse-v2 currently supports unpooled DSA models without hybrid SWA only"
+        )
+    required = (
+        (cfg.enable_hierarchical_cache, "--enable-hierarchical-cache"),
+        (not cfg.disable_radix_cache, "radix cache enabled"),
+        (cfg.hicache_write_policy == "write_back", "--hicache-write-policy write_back"),
+        (cfg.hicache_mem_layout == "page_first", "--hicache-mem-layout page_first"),
+        (cfg.hicache_host_memory_mode == "cache", "--hicache-host-memory-mode cache"),
+        (cfg.page_size == 64, "--page-size 64"),
+    )
+    for valid, requirement in required:
+        if not valid:
+            raise ValueError(f"--enable-hisparse-v2 requires {requirement}")
+    unsupported = (
+        (get_platform().is_hip or cfg.device != "cuda", "non-CUDA devices"),
+        (cfg.speculative_algorithm is not None, "speculative decoding"),
+        (cfg.enable_mixed_chunk, "mixed prefill/decode batches"),
+        (cfg.enable_session_radix_cache or cfg.enable_streaming_session, "sessions"),
+        (cfg.disaggregation_mode != "null", "PD disaggregation"),
+        (cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1, "PP or CP"),
+        (cfg.enable_two_batch_overlap, "two-batch overlap"),
+        (cfg.prefill_only_disable_kv_cache, "prefill without KV allocation"),
+        (cfg.enable_unified_memory, "unified memory pools"),
+        (cfg.enable_return_routed_experts, "routed-expert recording"),
+    )
+    for enabled, feature in unsupported:
+        if enabled:
+            raise ValueError(f"--enable-hisparse-v2 does not support {feature} yet")
+    validate_hisparse_kv_cache_dtype(server_args)
+    from sglang.srt.configs.model_config import get_dsa_index_topk
+    from sglang.srt.mem_cache.sparsity.hisparse_v2_config import (
+        resolve_hisparse_v2_config,
+    )
+
+    resolve_hisparse_v2_config(
+        config=cfg.hisparse_config,
+        model_top_k=get_dsa_index_topk(hf_config),
+        hicache_ratio=cfg.hicache_ratio,
+        page_size=cfg.page_size,
+    )
+    for attr, label in (
+        ("dsa_prefill_backend", "prefill"),
+        ("dsa_decode_backend", "decode"),
+    ):
+        validate_hisparse_dsa_backend(server_args, attr, label)
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
     cfg = resolving_view(server_args)
+    if cfg.enable_hisparse_v2:
+        validate_hisparse_v2(server_args)
     if not cfg.enable_hisparse:
         return
 
