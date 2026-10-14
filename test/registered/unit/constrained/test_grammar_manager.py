@@ -14,9 +14,13 @@ Usage:
     python -m pytest test_grammar_manager.py -v
 """
 
+import os
 import unittest
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from xgrammar import TokenizerInfo
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -24,8 +28,20 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
-from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
+from sglang.srt.constrained.reasoner_grammar_backend import (
+    ReasonerGrammarBackend,
+    ReasonerGrammarObject,
+)
+from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_MODEL_END_SAMPLING,
+    CONTENT_THINKING,
+    END_MESSAGE,
+    INKLING_SPECIAL_TOKEN_IDS,
+    MESSAGE_MODEL,
+)
+from sglang.srt.parser.reasoning_parser import InklingDetector
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_context,
@@ -104,6 +120,34 @@ def _make_req(
     return req
 
 
+_INKLING_VOCAB_SIZE = max(INKLING_SPECIAL_TOKEN_IDS.values()) + 1
+
+
+def _make_strict_inkling_backend(max_think_tokens):
+    vocab = [""] * _INKLING_VOCAB_SIZE
+    for token_id in range(128):
+        vocab[token_id] = chr(token_id)
+    for token, token_id in INKLING_SPECIAL_TOKEN_IDS.items():
+        vocab[token_id] = token
+    info = TokenizerInfo(
+        vocab, stop_token_ids=[INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING]]
+    )
+    tokenizer = SimpleNamespace(init_xgrammar=lambda: (info, None))
+    with patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": str(max_think_tokens)}):
+        return ReasonerGrammarBackend(
+            XGrammarGrammarBackend(tokenizer, _INKLING_VOCAB_SIZE),
+            SimpleNamespace(detector=InklingDetector()),
+            tokenizer,
+            enable_strict_thinking=True,
+        )
+
+
+def _token_allowed(grammar, token_id):
+    mask = grammar.allocate_vocab_mask(_INKLING_VOCAB_SIZE, 1, "cpu")
+    grammar.fill_vocab_mask(mask, 0)
+    return bool((int(mask[0, token_id // 32]) >> (token_id % 32)) & 1)
+
+
 class TestGrammarManagerInit(unittest.TestCase):
     def setUp(self):
         reset_context()
@@ -146,9 +190,7 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         )
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
-        mgr.grammar_backend.get_request_grammar_key.side_effect = (
-            lambda key, input_ids: key
-        )
+        mgr.grammar_backend.get_request_grammar_key.side_effect = lambda key, **_: key
         return mgr
 
     def test_no_constraint_returns_false(self):
@@ -181,21 +223,22 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(req.grammar_key, ("regex", "[a-z]+"))
 
-    def test_backend_specializes_the_key_from_the_prompt(self):
-        """The backend may pick a prompt-dependent grammar variant; that key, not
-        the sampling-param key, is what gets looked up and cached."""
+    def test_backend_specializes_the_key_from_the_request(self):
+        """The backend may pick a grammar variant from the prompt and the thinking
+        budget; that key, not the sampling-param key, is looked up and cached."""
         mgr = self._make_mgr()
-        mgr.grammar_backend.get_request_grammar_key.side_effect = (
-            lambda key, input_ids: (key[0] + ":variant", key[1])
+        mgr.grammar_backend.get_request_grammar_key.side_effect = lambda key, **_: (
+            key[0] + ":variant",
+            key[1],
         )
         mgr.grammar_backend.get_cached_or_future_value.return_value = (Future(), False)
 
-        req = _make_req(regex="[a-z]+")
+        req = _make_req(regex="[a-z]+", custom_params={"thinking_budget": 3})
         req.origin_input_ids = [1, 2, 3]
         mgr.process_req_with_grammar(req)
 
         mgr.grammar_backend.get_request_grammar_key.assert_called_once_with(
-            ("regex", "[a-z]+"), [1, 2, 3]
+            ("regex", "[a-z]+"), input_ids=[1, 2, 3], thinking_budget=3
         )
         mgr.grammar_backend.get_cached_or_future_value.assert_called_once_with(
             ("regex:variant", "[a-z]+"), False
@@ -884,6 +927,31 @@ class TestStrictReasoningPaths(unittest.TestCase):
         mgr.process_req_with_grammar(req)
 
         self.assertIsNone(req.grammar)
+
+    def test_inkling_constraint_caps_thinking_at_the_request_budget(self):
+        """An Inkling constraint compiles to a framed grammar, not a reasoning
+        wrapper; the request's thinking budget must still cap its thinking message,
+        both when compiled for the request and when served from the cache."""
+        mgr = self._make_mgr()
+        mgr.grammar_backend = _make_strict_inkling_backend(max_think_tokens=10)
+        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        queued = []
+        for budget in (3, 3, 5):
+            req = _make_req(regex="yes", custom_params={"thinking_budget": budget})
+            req.require_reasoning = True
+            req.origin_input_ids = []
+            queued.append(mgr.process_req_with_grammar(req))
+            if queued[-1]:
+                mgr.get_ready_grammar_requests()
+            for token_id in [ids[MESSAGE_MODEL], ids[CONTENT_THINKING]]:
+                req.grammar.accept_token(token_id)
+            for _ in range(budget):
+                self.assertTrue(_token_allowed(req.grammar, ord("x")))
+                req.grammar.accept_token(ord("x"))
+            self.assertFalse(_token_allowed(req.grammar, ord("x")))
+            self.assertTrue(_token_allowed(req.grammar, ids[END_MESSAGE]))
+        self.assertEqual(queued, [True, False, True])
 
     def test_strict_constrained_request_uses_normal_dispatch(self):
         """Request with json_schema should go through normal dispatch, not strict path."""

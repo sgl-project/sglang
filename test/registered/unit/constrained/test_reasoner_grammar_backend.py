@@ -550,7 +550,12 @@ class TestReasonerGrammarBackend(CustomTestCase):
         user_turn = [ids[MESSAGE_MODEL], *tokenizer.encode("hi"), ids[END_MESSAGE]]
         open_block = [*user_turn, ids[MESSAGE_MODEL], ids[CONTENT_TEXT]]
         key = ("regex", "yes")
-        self.assertEqual(reasoner.get_request_grammar_key(key, user_turn), key)
+        self.assertEqual(
+            reasoner.get_request_grammar_key(
+                key, input_ids=user_turn, thinking_budget=None
+            ),
+            key,
+        )
         turn = reasoner._init_value_dispatch(key, reasoning=True)
         self._accept_allowed_tokens(
             turn,
@@ -560,7 +565,9 @@ class TestReasonerGrammarBackend(CustomTestCase):
             backend.vocab_size,
         )
 
-        block_key = reasoner.get_request_grammar_key(key, open_block)
+        block_key = reasoner.get_request_grammar_key(
+            key, input_ids=open_block, thinking_budget=None
+        )
         self.assertNotEqual(block_key, key)
         grammar = reasoner._init_value_dispatch(block_key, reasoning=True)
         mask = self._vocab_mask(grammar, backend.vocab_size)

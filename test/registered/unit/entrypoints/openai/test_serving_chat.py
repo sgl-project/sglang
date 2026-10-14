@@ -5708,7 +5708,9 @@ class InklingTokenOutputTest(CustomTestCase):
             request=request,
             tools=None,
         )
-        key = reasoner.get_request_grammar_key(("regex", "yes"), prompt_ids)
+        key = reasoner.get_request_grammar_key(
+            ("regex", "yes"), input_ids=prompt_ids, thinking_budget=None
+        )
         grammar = reasoner._init_value_dispatch(key, reasoning=True)
         output_ids = [*tokenizer.encode_ordinary("yes"), special("end_message"), eos]
         mask = backend.allocate_vocab_mask(len(vocab), 1, "cpu")

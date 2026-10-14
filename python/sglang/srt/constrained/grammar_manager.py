@@ -169,7 +169,9 @@ class GrammarManager:
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
                 key = self.grammar_backend.get_request_grammar_key(
-                    key, req.origin_input_ids
+                    key,
+                    input_ids=req.origin_input_ids,
+                    thinking_budget=self._get_request_thinking_budget(req),
                 )
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(

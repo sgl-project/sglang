@@ -224,9 +224,14 @@ class BaseGrammarBackend:
         return self._enable_strict_thinking
 
     def get_request_grammar_key(
-        self, key: Tuple[str, str], input_ids: Sequence[int]
+        self,
+        key: Tuple[str, str],
+        *,
+        input_ids: Sequence[int],
+        thinking_budget: Optional[int],
     ) -> Tuple[str, str]:
-        """Cache key for this request's grammar; may depend on how the prompt ends."""
+        """Cache key for this request's grammar; may depend on how the prompt ends
+        and on the request's thinking budget."""
         return key
 
     def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:

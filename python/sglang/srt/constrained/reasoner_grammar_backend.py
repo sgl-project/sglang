@@ -47,7 +47,8 @@ logger = logging.getLogger(__name__)
 
 _canonical_inkling_auto_tool_schema: Optional[dict] = None
 _INKLING_FRAMED_KEY_TYPES = ("json", "regex", "ebnf")
-_INKLING_OPEN_TEXT_KEY_SUFFIX = ":inkling_open_text"
+_INKLING_OPEN_TEXT_VARIANT = "inkling_open_text"
+_INKLING_THINK_BUDGET_VARIANT = "inkling_think_budget="
 
 
 def _get_canonical_inkling_auto_tool_schema() -> dict:
@@ -442,23 +443,28 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         return self._make_grammar_object(None, reasoning)
 
     def get_request_grammar_key(
-        self, key: Tuple[str, str], input_ids: Sequence[int]
+        self,
+        key: Tuple[str, str],
+        *,
+        input_ids: Sequence[int],
+        thinking_budget: Optional[int],
     ) -> Tuple[str, str]:
-        if (
-            self._is_inkling_detector
-            and key[0] in _INKLING_FRAMED_KEY_TYPES
-            and _ends_in_open_inkling_text_block(input_ids)
-        ):
-            return (key[0] + _INKLING_OPEN_TEXT_KEY_SUFFIX, key[1])
+        key_type, key_string = key
+        if not (self._is_inkling_detector and key_type in _INKLING_FRAMED_KEY_TYPES):
+            return key
+        if _ends_in_open_inkling_text_block(input_ids):
+            return (f"{key_type}:{_INKLING_OPEN_TEXT_VARIANT}", key_string)
+        # Mirrors the strict wrapper, which applies a request budget only while filtering.
+        if self.enable_token_filter and thinking_budget is not None:
+            variant = f"{_INKLING_THINK_BUDGET_VARIANT}{thinking_budget}"
+            return (f"{key_type}:{variant}", key_string)
         return key
 
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool
     ) -> Optional[BaseGrammarObject]:
-        key_type, key_string = key
-        in_text_block = key_type.endswith(_INKLING_OPEN_TEXT_KEY_SUFFIX)
-        if in_text_block:
-            key = (key_type.removesuffix(_INKLING_OPEN_TEXT_KEY_SUFFIX), key_string)
+        key_type, _, variant = key[0].partition(":")
+        key = (key_type, key[1])
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
@@ -467,7 +473,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         if self._is_inkling_detector and key[0] in _INKLING_FRAMED_KEY_TYPES:
             # The frame delimits thinking by message kind, so it owns the whole
             # turn; strict thinking only caps the thinking message.
-            framed = self._frame_inkling_answer(ret, in_text_block)
+            framed = self._frame_inkling_answer(ret, variant)
             if framed is not None:
                 return framed
         if (
@@ -481,9 +487,15 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         return self._make_grammar_object(ret, reasoning)
 
     def _frame_inkling_answer(
-        self, grammar: BaseGrammarObject, in_text_block: bool
+        self, grammar: BaseGrammarObject, variant: str
     ) -> Optional[BaseGrammarObject]:
-        max_think_tokens = self.max_think_tokens if self.enable_strict_thinking else -1
+        in_text_block = variant == _INKLING_OPEN_TEXT_VARIANT
+        if variant.startswith(_INKLING_THINK_BUDGET_VARIANT):
+            max_think_tokens = int(variant.removeprefix(_INKLING_THINK_BUDGET_VARIANT))
+        elif self.enable_strict_thinking:
+            max_think_tokens = self.max_think_tokens
+        else:
+            max_think_tokens = -1
         return self.grammar_backend.compile_framed_grammar(
             grammar,
             lambda content: _inkling_answer_structural_tag(
