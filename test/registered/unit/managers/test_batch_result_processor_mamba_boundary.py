@@ -24,7 +24,7 @@ from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingSteps,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.forward_batch_view import worker_forward_batch
@@ -82,7 +82,7 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     return req, batch
 
 
-def _make_processor() -> SchedulerBatchResultProcessor:
+def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
     metrics_reporter = MagicMock()
     metrics_reporter.num_generated_tokens = 0
     metrics_reporter.forward_ct_decode = 0
@@ -91,7 +91,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         enable_overlap=True,
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
-        tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
+        tree_cache=tree_cache or SimpleNamespace(page_size=TRACK_INTERVAL),
         hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
         req_to_token_pool=None,
@@ -487,6 +487,91 @@ class TestMambaLazyFinishDonation(unittest.TestCase):
                     donated,
                 )
                 self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+
+class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
+    """Under overlap a prefill commits after the request's first decode
+    launched. When that decode tracks in place into the slot of the prefill's
+    checkpoint, the commit publishes no checkpoint of that slot."""
+
+    def _commit_prefill(self, max_new_tokens: int, pending_tracks: bool):
+        sampling_params = SamplingParams(max_new_tokens=max_new_tokens)
+        sampling_params.normalize(None)
+        req = Req(
+            rid="req",
+            origin_input_text="",
+            origin_input_ids=array("q", range(2 * TRACK_INTERVAL - 1)),
+            sampling_params=sampling_params,
+            vocab_size=128,
+        )
+        req.prefix_len = 0
+        req.extend_end = 2 * TRACK_INTERVAL - 1
+        # The first decode, at length 2 * TRACK_INTERVAL, crosses a boundary
+        # and finds no free slot: it plans the checkpoint slot.
+        decode_step = _make_lazy_step(req, spec=False)
+        decode_step.mamba_track_mask_cpu = [pending_tracks]
+        decode_step.mamba_track_buffer_indices = [0]
+        processor = _make_processor(tree_cache=MagicMock())
+        processor.pending.push(
+            PendingStep(
+                step=decode_step,
+                result=None,
+                slot=ScheduleSlot(),
+                launch_ts=0.0,
+                after_idle_gap=False,
+            )
+        )
+        prefill_step = SimpleNamespace(
+            reqs=[req],
+            chunked_req=None,
+            num_decode_rows=0,
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            extend_lens=[req.extend_end],
+            extend_logprob_start_lens=None,
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=None,
+            next_token_ids=torch.tensor([5]),
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+        )
+        with (
+            _lazy_overrides(),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.release_kv_cache"
+            ) as release,
+        ):
+            processor.process_batch_result_prefill(prefill_step, result)
+        return req, processor.tree_cache, release
+
+    def test_running_request_checkpoint(self):
+        for pending_tracks in (True, False):
+            with self.subTest(pending_tracks=pending_tracks):
+                req, tree_cache, release = self._commit_prefill(32, pending_tracks)
+                self.assertFalse(req.finished())
+                release.assert_not_called()
+                self.assertEqual(tree_cache.checkpoint.called, not pending_tracks)
+                self.assertEqual(req.prefix_len, req.extend_end)
+
+    def test_request_finishing_at_prefill(self):
+        for pending_tracks in (True, False):
+            with self.subTest(pending_tracks=pending_tracks):
+                req, _, release = self._commit_prefill(1, pending_tracks)
+                self.assertTrue(req.finished())
+                release.assert_called_once()
+                self.assertEqual(
+                    release.call_args.kwargs["checkpoint"], not pending_tracks
+                )
 
 
 class TestMambaExtendAdmission(unittest.TestCase):

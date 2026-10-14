@@ -250,13 +250,15 @@ def match_kv_cache(
     return match_result
 
 
-def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+def checkpoint_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, publish: bool = True
+) -> None:
     """Publish what the running request has computed so far, unless it is
-    barred from the tree."""
+    barred from the tree or the caller withholds it (``publish=False``)."""
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
-    if not req.skip_radix_cache_insert:
+    if publish and not req.skip_radix_cache_insert:
         tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end

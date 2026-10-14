@@ -3439,8 +3439,8 @@ class ScheduleBatch:
         checkpoint in the first slot stays intact until the host commit
         promotes the new one (mamba_lazy_post_decode_at_boundary). A row that
         cannot get a slot tracks in place into the slot of its checkpoint; the
-        host commit names the new checkpoint, and until then a finishing
-        request does not donate that slot (PendingSteps.plans_mamba_track_write).
+        host commit names the new checkpoint, and until then the tree does not
+        take that slot's checkpoint (PendingSteps.plans_mamba_track_write).
         """
         pool = self.req_to_token_pool
         positions: List[int] = []

@@ -80,8 +80,7 @@ class PendingSteps:
 
     def plans_mamba_track_write(self, req: Req, position: int) -> bool:
         """Whether a pending step's forward may write req's mamba ping-pong
-        slot at position; the tree does not take such a slot from a finishing
-        request."""
+        slot at position; the tree does not take that slot's checkpoint."""
         for record in self._records:
             step = record.step
             for i, row_req in enumerate(step.reqs):

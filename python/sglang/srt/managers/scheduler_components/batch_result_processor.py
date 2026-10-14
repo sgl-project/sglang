@@ -464,11 +464,17 @@ class SchedulerBatchResultProcessor:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
                         self.release_finished_req(
-                            req, checkpoint=discard_finish_reason is None
+                            req,
+                            checkpoint=discard_finish_reason is None
+                            and not self._mamba_lazy_keep_pending_write(req),
                         )
                         req.time_stats.set_completion_time()
                     elif not is_decode_row:
-                        checkpoint_kv_cache(req, self.tree_cache)
+                        checkpoint_kv_cache(
+                            req,
+                            self.tree_cache,
+                            publish=not self._mamba_lazy_keep_pending_write(req),
+                        )
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -1502,7 +1508,17 @@ class SchedulerBatchResultProcessor:
             and self._mamba_check_track_boundary(req, batch, result, i)[0]
         ):
             return True
-        return self.pending.plans_mamba_track_write(req, keep_idx)
+        return self._mamba_lazy_keep_pending_write(req)
+
+    def _mamba_lazy_keep_pending_write(self, req: Req) -> bool:
+        """Whether a pending step's forward may write a lazy request's
+        checkpoint slot in place. Until that step commits, the slot holds no
+        state its tracked length names, so the checkpoint is not published."""
+        return (
+            get_exec().mamba.enable_mamba_extra_buffer_lazy
+            and req.kv.mamba_ping_pong_track_buffer is not None
+            and self.pending.plans_mamba_track_write(req, req.kv.mamba_last_track_idx)
+        )
 
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
