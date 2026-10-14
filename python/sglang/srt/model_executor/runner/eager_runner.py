@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Tuple, Union
 
 import torch
 
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -320,6 +321,8 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+            if prefill_mbo.enabled(model_runner):
+                prefill_mbo.maybe_split(forward_batch)
             model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
                 forward_batch,
                 num_qo_tokens=len(forward_batch.input_ids),

@@ -3,7 +3,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.batch_overlap import operations
+from sglang.srt.batch_overlap import operations, prefill_mbo
 from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -63,6 +63,21 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        elif (
+            layer_name == "Glm5NextDecoderLayer"
+            and prefill_mbo.active_child_backends() is not None
+        ):
+            # Only prefill microbatches; GLM-5-Next has no two-batch overlap.
+            ops: List[Operation] = []
+            for layer in layers:
+                ops += [
+                    layer.op_mbo_attn,
+                    operations.YieldOperation(),
+                    layer.op_mbo_ffn,
+                    operations.YieldOperation(),
+                ]
+            ops.append(layers[-1].op_mbo_finish)
+            return OperationsStrategy(operations=ops, tbo_delta_stages=0)
         elif layer_name == "DeepseekV4DecoderLayer":
             return OperationsStrategy.concat(
                 [

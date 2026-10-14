@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
 
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.batch_overlap.operations import (
     execute_operations,
     execute_overlapped_operations,
@@ -952,7 +953,7 @@ def model_forward_stages(
 ):
     """Run stage operations with an independent residual stream per microbatch."""
     strategy = OperationsStrategy.init_new_tbo(
-        layers, forward_batch.global_forward_mode
+        layers, forward_batch.global_forward_mode or forward_batch.forward_mode
     )
     inputs = dict(
         positions=positions,
@@ -989,12 +990,15 @@ def model_forward_stages(
         if _is_hip
         else deep_gemm_wrapper.configure_deep_gemm_num_sms(strategy.deep_gemm_num_sms)
     )
-    with context:
-        outputs = execute_overlapped_operations(
-            inputs_arr=parts,
-            operations_arr=[strategy.operations] * 2,
-            delta_stages=[0, strategy.tbo_delta_stages],
-        )
+    try:
+        with context:
+            outputs = execute_overlapped_operations(
+                inputs_arr=parts,
+                operations_arr=[strategy.operations] * 2,
+                delta_stages=[0, strategy.tbo_delta_stages],
+            )
+    finally:
+        prefill_mbo.end_forward()
     for output in outputs:
         output["residual"] = residual_batch.stream_of(output["forward_batch"])
     hidden_states, forward_batch.residual_stream = _model_forward_tbo_merge_outputs(

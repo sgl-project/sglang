@@ -11,11 +11,12 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_stages,
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -810,6 +811,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 is_last_layer=terminal,
             ).residual_ops()
+        self._ffn_update = mhc.ffn_update if mhc is not None else None
         attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
@@ -942,6 +944,69 @@ class Glm5NextDecoderLayer(nn.Module):
             h_res=h_res,
             hc_mult=self.config.hc_mult,
         )
+
+    def op_mbo_attn(
+        self,
+        state,
+        hidden_states,
+        positions,
+        forward_batch,
+        zero_allocator=None,
+        ffn_sum=None,
+        **kwargs,
+    ):
+        """Prefill microbatch stage 1: write the previous FFN output, run the
+        attention and start its all-reduce."""
+        if ffn_sum is not None:
+            hidden_states = self._mbo_write_ffn(ffn_sum, forward_batch)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+            input_on_attn_tp_slices=self.attn_boundary.input_on_attn_tp_slices,
+            prev_topk_indices=None,
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        get_attn_tp_context().clear_attn_inputs()
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        prefill_mbo.start_pending_sum(residual_batch.stream_of(forward_batch))
+        return dict(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+            **kwargs,
+        )
+
+    def op_mbo_ffn(self, state, hidden_states, forward_batch, **kwargs):
+        """Prefill microbatch stage 2: join the attention sum, run the FFN and
+        start its all-reduce."""
+        hidden_states = residual_batch.stream_of(forward_batch).complete(hidden_states)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.mlp(hidden_states, forward_batch, None)
+        # Under the model gate (EP1, attention TP equal to TP) the FFN's
+        # declared sum group is the TP group.
+        return dict(
+            hidden_states=None,
+            ffn_sum=(prefill_mbo.InFlightSum(hidden_states), self._ffn_update),
+            forward_batch=forward_batch,
+            **kwargs,
+        )
+
+    def op_mbo_finish(self, state, ffn_sum, forward_batch, **kwargs):
+        return dict(
+            hidden_states=self._mbo_write_ffn(ffn_sum, forward_batch),
+            forward_batch=forward_batch,
+        )
+
+    @staticmethod
+    def _mbo_write_ffn(ffn_sum, forward_batch):
+        in_flight, update = ffn_sum
+        stream = residual_batch.stream_of(forward_batch)
+        return stream.write(update.update(in_flight.complete(), stream.residual))
 
     @staticmethod
     def _is_layer_sparse(config, layer_id: int, is_nextn: bool) -> bool:
@@ -1557,6 +1622,29 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.model.dflash_capture = True
         # Capturing before layer k + 1 gives the completed output of layer k.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def supports_prefill_mbo(self) -> bool:
+        # The microbatch stages assume mHC layers whose attention and FFN each
+        # end in one all-reduce over the whole TP group. They do not capture
+        # auxiliary hidden states or carry DSA top-k indices between layers.
+        parallel = get_parallel()
+        return (
+            self.model is not None
+            and bool(self.config.mhc)
+            and not self.capture_aux_hidden_states
+            and not (
+                self.use_dsa
+                and any(
+                    dsa_layer_skips_topk(self.config, layer_id)
+                    for layer_id in range(self.config.num_hidden_layers)
+                )
+            )
+            and self.model.first_k_dense_replace < self.model.end_layer
+            and parallel.pp_size == 1
+            and parallel.attn_tp_size == parallel.tp_size
+            and parallel.attn_dcp_size == 1
+            and parallel.moe_ep_size == 1
+        )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

@@ -13,12 +13,13 @@
 # ==============================================================================
 """Hyper-connection residual streams."""
 
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
 
 import torch
 
 from sglang.kernels.ops.layernorm.mhc import hc_contract, hc_expand
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.layers.layer_boundary.facts import ReadFacts, UpdateFacts
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
@@ -42,8 +43,26 @@ class MHCState:
     # The last layer's write-back also contracts the streams into the hidden
     # states the layer stack hands on.
     is_last_layer: bool = False
-    h_res: Optional[torch.Tensor] = None
-    h_post: Optional[torch.Tensor] = None
+    # h_res and h_post per prefill microbatch, which interleave within a layer.
+    _coefficients: List[List[Optional[torch.Tensor]]] = field(
+        default_factory=lambda: [[None, None], [None, None]]
+    )
+
+    @property
+    def h_res(self) -> Optional[torch.Tensor]:
+        return self._coefficients[prefill_mbo.current_microbatch()][0]
+
+    @h_res.setter
+    def h_res(self, value: Optional[torch.Tensor]) -> None:
+        self._coefficients[prefill_mbo.current_microbatch()][0] = value
+
+    @property
+    def h_post(self) -> Optional[torch.Tensor]:
+        return self._coefficients[prefill_mbo.current_microbatch()][1]
+
+    @h_post.setter
+    def h_post(self, value: Optional[torch.Tensor]) -> None:
+        self._coefficients[prefill_mbo.current_microbatch()][1] = value
 
     @staticmethod
     def _resolve_out_norm(out_norm):

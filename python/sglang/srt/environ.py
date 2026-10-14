@@ -1746,6 +1746,10 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Split large single-request extends into two microbatches whose TP
+    # all-reduces overlap the other's compute (GLM-5-Next).
+    SGLANG_PREFILL_MBO = EnvBool(False)
+    SGLANG_PREFILL_MBO_MIN_TOKENS = EnvInt(4096)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.

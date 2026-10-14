@@ -14,6 +14,7 @@ from typing import (
     Union,
 )
 
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
 from sglang.srt.model_executor.forward_context import (
     forward_context,
@@ -54,8 +55,12 @@ def execute_overlapped_operations(
 
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
-    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a)
-    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b)
+    executor_a = _StageExecutor(
+        "a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a, microbatch=0
+    )
+    executor_b = _StageExecutor(
+        "b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b, microbatch=1
+    )
 
     for _ in range(delta_stage):
         executor_a.next()
@@ -80,6 +85,9 @@ def _resolve_tbo_child_contexts():
     from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
     ctx = get_forward_context()
+    mbo_children = prefill_mbo.active_child_backends()
+    if mbo_children is not None:
+        return tuple(replace(ctx, attn_backend=child) for child in mbo_children)
     backend = ctx.attn_backend
     if not isinstance(backend, TboAttnBackend):
         return None, None
@@ -111,8 +119,10 @@ class _StageExecutor:
         stages: List[Stage],
         inputs: dict,
         child_ctx: Optional[ForwardContext] = None,
+        microbatch: int = 0,
     ):
         self._debug_name = debug_name
+        self._microbatch = microbatch
         self._stages = stages
         self._index = 0
         self._stage_state = _StateDict()
@@ -128,7 +138,10 @@ class _StageExecutor:
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.tbo_padded_len
         self._global_num_tokens = forward_batch.global_num_tokens_cpu
-        self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
+        self._is_dp_max_padding = (
+            forward_batch.dp_padding_mode is not None
+            and forward_batch.dp_padding_mode.is_max_len()
+        )
 
     def next(self):
         assert not self.done
@@ -138,12 +151,14 @@ class _StageExecutor:
         # TODO: We currently always call set_dp_buffer_len here because sub-batches
         # may have different padded lengths. It can likely be removed after TBO slice &
         # pad logic is refactored.
-        set_dp_buffer_len(
-            self._global_dp_buffer_len,
-            self._local_dp_buffer_len,
-            self._is_dp_max_padding,
-            self._global_num_tokens,
-        )
+        if self._global_dp_buffer_len is not None:
+            set_dp_buffer_len(
+                self._global_dp_buffer_len,
+                self._local_dp_buffer_len,
+                self._is_dp_max_padding,
+                self._global_num_tokens,
+            )
+        prefill_mbo.set_microbatch(self._microbatch)
 
         ctx_mgr = (
             forward_context(self._child_ctx)
