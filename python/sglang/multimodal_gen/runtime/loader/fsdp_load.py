@@ -907,6 +907,25 @@ def load_model_from_full_model_state_dict(
         )
 
     if skipped_checkpoint_keys:
+        # ModelSlim FP8/MXFP4 attention is calibrated with the exported Q/K
+        # rotations, so silently skipping them skews every attention score.
+        # The legacy MXFP8 path may skip exported rotations (any orthogonal
+        # matrix preserves scores), so it keeps the warning below.
+        skipped_rotations = [
+            key for key in skipped_checkpoint_keys if key.endswith(("q_rot", "k_rot"))
+        ]
+        if skipped_rotations and any(
+            getattr(module, "attention_quant_scheme", None) in ("FP8", "MXFP4")
+            for module in model.modules()
+        ):
+            raise ValueError(
+                f"Checkpoint exports offline Q/K rotation tensors that the "
+                f"model did not register: {skipped_rotations[:4]}"
+                f"{' ...' if len(skipped_rotations) > 4 else ''}. The quant "
+                "description must declare them FLOAT at "
+                "blocks.<i>.attn1.to_q_rot/to_k_rot (or q_rot/k_rot) so the "
+                "attention blocks register the q_rot/k_rot buffers."
+            )
         logger.warning(
             "Checkpoint keys not loaded (no matching model parameter) %s",
             (

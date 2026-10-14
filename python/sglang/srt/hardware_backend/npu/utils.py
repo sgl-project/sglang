@@ -318,6 +318,48 @@ def npu_format_cast(
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
+def cast_packed_fp4_weight_to_nz(
+    weight: torch.Tensor, *, w4a8: bool = False, force_nz: bool = False
+) -> torch.Tensor:
+    """Prepare mode-specific NZ when requested or required by the operator."""
+    if not force_nz and not envs.SGLANG_NPU_ENABLE_MXFP4_NZ.get():
+        return weight
+    if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
+        raise ValueError(
+            "MXFP4 NZ conversion conflicts with SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"
+        )
+    if weight.device.type != "npu":
+        raise ValueError("MXFP4 NZ conversion requires weights on NPU")
+    if w4a8:
+        import torch_npu
+
+        # FP8-target packing uses 16 bytes per block of 32 logical FP4 values.
+        converted = npu_format_cast(
+            weight.view(torch.int8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        )
+    else:
+        converted = npu_format_cast(
+            weight.view(torch.int8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.int8,
+            input_dtype=torch.int8,
+        )
+    # ACLNN exposes packed W4A8's C0=32 logical FP4 tile as C0=16 bytes.
+    expected_format = 50 if w4a8 else int(NPUACLFormat.ACL_FORMAT_FRACTAL_NZ)
+    actual_format = torch.ops.npu.get_npu_format(converted)
+    if actual_format != expected_format:
+        raise RuntimeError(
+            f"MXFP4 {'W4A8' if w4a8 else 'W4A4'} NZ conversion returned "
+            f"format {actual_format}, expected {expected_format}. "
+            "Check the installed torch_npu/CANN format-cast support, or set "
+            "SGLANG_NPU_ENABLE_MXFP4_NZ=0 to use ND."
+        )
+    return converted
+
+
 def get_indexer_weight_stream():
     global indexer_weight_stream
     if indexer_weight_stream is None:

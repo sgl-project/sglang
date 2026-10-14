@@ -61,6 +61,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2 import (
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     WanAnimate2TransformerBlock,
 )
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformerBlock
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multistep import (
     DPMSolverMultistepScheduler,
 )
@@ -314,10 +315,13 @@ def test_validate_server_args_rejects_mxfp8_offline_qk_rotation(monkeypatch):
 class _RotatedQuantConfig:
     """A quantized checkpoint that ships offline Q/K rotation matrices for one block."""
 
-    def __init__(self, prefix: str) -> None:
+    def __init__(
+        self, prefix: str, names: tuple[str, str] = ("q_rot", "k_rot")
+    ) -> None:
+        q_name, k_name = names
         self.quant_description = {
-            f"{prefix}.attn1.q_rot": "FLOAT",
-            f"{prefix}.attn1.k_rot": "FLOAT",
+            f"{prefix}.attn1.{q_name}": "FLOAT",
+            f"{prefix}.attn1.{k_name}": "FLOAT",
         }
 
     def get_quant_method(self, layer, prefix: str) -> UnquantizedLinearMethod:
@@ -341,6 +345,71 @@ def test_block_refuses_a_checkpoint_with_offline_qk_rotation(monkeypatch):
             {AttentionBackendEnum.TORCH_SDPA},
             prefix="blocks.0",
             quant_config=_RotatedQuantConfig("blocks.0"),
+        )
+
+
+def test_block_registers_offline_qk_rotation_from_to_prefixed_descriptors():
+    """msmodelslim names the exported rotations `to_q_rot`/`to_k_rot` after the
+    to_q/to_k projections; the block used to look up only `q_rot`/`k_rot`, so the
+    rotation buffers never registered and the tensors were skipped at load."""
+    _ensure_single_process_parallel_runtime()
+    with torch.device("meta"):
+        block = WanTransformerBlock(
+            64,
+            128,
+            2,
+            "rms_norm",
+            True,
+            1e-6,
+            None,
+            {AttentionBackendEnum.TORCH_SDPA},
+            prefix="blocks.0",
+            quant_config=_RotatedQuantConfig(
+                "blocks.0", names=("to_q_rot", "to_k_rot")
+            ),
+        )
+    assert block.use_offline_qk_rotation
+    buffers = dict(block.named_buffers())
+    assert buffers["q_rot"].shape == (32, 32)
+    assert buffers["k_rot"].shape == (32, 32)
+
+
+def test_block_accepts_legacy_bare_rotation_descriptor_names():
+    _ensure_single_process_parallel_runtime()
+    with torch.device("meta"):
+        block = WanTransformerBlock(
+            64,
+            128,
+            2,
+            "rms_norm",
+            True,
+            1e-6,
+            None,
+            {AttentionBackendEnum.TORCH_SDPA},
+            prefix="blocks.0",
+            quant_config=_RotatedQuantConfig("blocks.0"),
+        )
+    assert block.use_offline_qk_rotation
+
+
+def test_block_rejects_a_q_rotation_exported_without_k():
+    # Rotating Q but not K changes every attention score; half an export must
+    # fail loudly instead of loading.
+    config = _RotatedQuantConfig("blocks.0", names=("to_q_rot", "to_k_rot"))
+    config.quant_description.pop("blocks.0.attn1.to_k_rot")
+    _ensure_single_process_parallel_runtime()
+    with torch.device("meta"), pytest.raises(ValueError, match="both Q/K rotation"):
+        WanTransformerBlock(
+            64,
+            128,
+            2,
+            "rms_norm",
+            True,
+            1e-6,
+            None,
+            {AttentionBackendEnum.TORCH_SDPA},
+            prefix="blocks.0",
+            quant_config=config,
         )
 
 

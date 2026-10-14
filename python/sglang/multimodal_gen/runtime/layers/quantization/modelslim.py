@@ -63,6 +63,25 @@ class ModelSlimConfig(QuantizationConfig):
     def get_linear_method(self) -> ModelSlimLinearMethod:
         return ModelSlimLinearMethod(self)
 
+    def get_attention_scheme(self, prefix: str) -> str | None:
+        prefix = prefix.removesuffix(".impl")
+        descriptor = next(
+            (
+                self.quant_description[key]
+                for key in (prefix, prefix + ".quant_type", prefix + ".fa_q.scale")
+                if key in self.quant_description
+            ),
+            None,
+        )
+        if descriptor is None or descriptor == "FLOAT":
+            return descriptor
+        schemes = {"FP8_DYNAMIC": "FP8", "MXFP4_DYNAMIC": "MXFP4"}
+        if descriptor not in schemes:
+            raise ValueError(
+                f"Unsupported ModelSlim attention descriptor for {prefix}: {descriptor}"
+            )
+        return schemes[descriptor]
+
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.int8, torch.float16, torch.bfloat16]
@@ -138,8 +157,10 @@ class ModelSlimConfig(QuantizationConfig):
                 ModelSlimMXFP8Scheme,
             )
 
-            return ModelSlimMXFP8Scheme()
-        elif quant_type in ("W4A4_MXFP4", "W4A4_MXFP4_DUALSCALE"):
+            return ModelSlimMXFP8Scheme(
+                quant_config=self.quant_description, prefix=prefix
+            )
+        elif quant_type in ("W4A4_MXFP4", "W4A4_MXFP4_DYNAMIC", "W4A4_MXFP4_DUALSCALE"):
             from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp4_scheme import (
                 ModelSlimMXFP4Scheme,
             )
