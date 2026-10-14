@@ -1125,6 +1125,42 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
 
+    def test_batch_list_length_mismatch_is_rejected(self):
+        """A per-request list of the wrong length used to pass normalization and
+        fail later with IndexError in __getitem__, which the server reports as a
+        500 instead of a 400."""
+        per_request_lists = {
+            "sampling_params": {"max_new_tokens": 3},
+            "return_logprob": True,
+            "logprob_start_len": 0,
+            "top_logprobs_num": 2,
+            "return_sampling_mask": True,
+            "sampling_logprobs_mode": "raw",
+            "token_ids_logprob": [1],
+            "lora_path": "adapter",
+            "custom_logit_processor": "processor",
+            "video_data": "video.mp4",
+            "audio_data": "audio.mp3",
+            "bootstrap_host": "host",
+            "bootstrap_port": 1,
+            "bootstrap_room": 1,
+            "bootstrap_pair_key": "key",
+            "decode_tp_size": 1,
+        }
+        for field, value in per_request_lists.items():
+            for length in (1, 3):
+                with self.subTest(field=field, length=length):
+                    req = GenerateReqInput(
+                        text=["Hello", "World"], **{field: [value] * length}
+                    )
+                    with self.assertRaisesRegex(ValueError, "batch size"):
+                        req.normalize_batch_and_arguments()
+                    req = GenerateReqInput(
+                        text=["Hello", "World"], **{field: [value] * 2}
+                    )
+                    req.normalize_batch_and_arguments()
+                    self.assertEqual(getattr(req[1], field), value)
+
     def test_error_cases(self):
         """Test various error cases."""
         # Test when neither text, input_ids, nor input_embeds is provided
@@ -1343,6 +1379,13 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
                     [(req[i].lora_path, req[i].lora_id) for i in range(2)],
                     [("adapter", "id-0"), ("adapter", "id-1")],
                 )
+
+    def test_rid_and_sampling_params_count_must_match_embedding_batch(self):
+        for field, value in (("rid", "r"), ("sampling_params", {})):
+            with self.subTest(field=field):
+                req = EmbeddingReqInput(text=["a", "b"], **{field: [value]})
+                with self.assertRaisesRegex(ValueError, "batch size"):
+                    req.normalize_batch_and_arguments()
 
     def test_lora_path_count_must_match_embedding_batch(self):
         """A partial adapter list must not silently route remaining items to base."""
