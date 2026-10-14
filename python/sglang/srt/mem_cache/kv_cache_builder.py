@@ -405,6 +405,17 @@ def build_kv_cache(
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
+    if get_memory().enable_hierarchical_cache:
+        cache_controller = tree_cache.cache_controller
+        if cache_controller is not None:
+            cache_controller.load_fence_stream = tp_worker.model_runner.forward_stream
+            if get_memory().enable_unified_memory:
+                # Keep device rows stable until host transfers are acknowledged.
+                # Queue reads and relocation both run on the scheduler thread.
+                token_to_kv_pool_allocator.set_host_transfer_move_gate(
+                    lambda c=cache_controller: not c.has_inflight_device_transfers()
+                )
+
     return KVCacheBuildResult(
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,

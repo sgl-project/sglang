@@ -86,7 +86,10 @@ from sglang.srt.disaggregation.encoder.receiver import (
     MMSchedulerSide,
     create_mm_receiver,
 )
-from sglang.srt.disaggregation.kv_events import uses_dynamo_format
+from sglang.srt.disaggregation.kv_events import (
+    is_kv_publisher_rank,
+    uses_dynamo_format,
+)
 from sglang.srt.disaggregation.pd_pp_consensus import (
     _DisaggDecodeRing,
     _DisaggPrefillRing,
@@ -384,9 +387,6 @@ _is_hip = is_hip()
 class Scheduler:
     """A scheduler that manages a tensor parallel GPU worker."""
 
-    # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
-    kv_shard_widening: int = 1
-
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
@@ -462,80 +462,16 @@ class Scheduler:
 
         # Init cache and memory pool
         self.init_kv_event_lora_names()
-        result = kv_cache_builder.build_kv_cache(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            tp_worker=self.tp_worker,
-            page_size=get_schedule().page_size,
-            spec_algorithm=self.spec_algorithm,
-            enable_metrics=get_observability().enable_metrics,
-            enable_kv_cache_events=bool(
-                get_observability().kv_events_config
-                and get_parallel().pp_rank == 0
-                and get_parallel().attn_tp_rank == 0
-                and get_parallel().attn_cp_rank == 0
-            ),
-            dynamo_kv_event_format=uses_dynamo_format(
-                get_observability().kv_events_config
-            ),
-            kv_event_lora_names=self.kv_event_lora_names,
-            enable_hierarchical_cache=get_memory().enable_hierarchical_cache,
-            hicache_draft_plan=(
-                self.draft_worker.hicache_draft_plan
-                if self.draft_worker is not None
-                else None
-            ),
-        )
-        self.is_hybrid_swa = result.is_hybrid_swa
-        self.is_hybrid_ssm = result.is_hybrid_ssm
-        self.sliding_window_size = result.sliding_window_size
-        self.full_tokens_per_layer = result.full_tokens_per_layer
-        self.swa_tokens_per_layer = result.swa_tokens_per_layer
-        self.req_to_token_pool = result.req_to_token_pool
-        self.penalty_store = PenaltyStore(
-            self.model_config.vocab_size, self.req_to_token_pool.device
-        )
-        self.req_to_token_pool.register_on_free_slot(self.penalty_store.free)
-        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
-        self.kv_shard_widening = page_interleave_shard_size(
-            self.token_to_kv_pool_allocator
-        )
-        self.disable_radix_cache = result.disable_radix_cache
-        self.tree_cache = result.tree_cache
-        if get_memory().enable_hierarchical_cache:
-            cache_controller = self.tree_cache.cache_controller
-            if cache_controller is not None:
-                cache_controller.load_fence_stream = (
-                    self.tp_worker.model_runner.forward_stream
-                )
-                if get_memory().enable_unified_memory:
-                    # Keep device rows stable until host transfers are acknowledged.
-                    # Queue reads and relocation both run on the scheduler thread.
-                    self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
-                        lambda c=cache_controller: not c.has_inflight_device_transfers()
-                    )
+        self.init_kv_cache()
+        self.init_penalty_store()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
         self.init_kv_bundles()
-
-        if (c := self.tp_worker.model_runner.canary_manager) is not None:
-            c.attach_radix_cache(self.tree_cache)
+        self.init_kv_canary()
 
         self.init_mode_owners()
         self.init_hisparse_coordinator()
-
-        if (
-            get_disagg().disaggregation_mode == "decode"
-            and get_disagg().disaggregation_decode_enable_offload_kvcache
-        ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=self.dp_tp_cpu_group,
-                tree_cache=self.tree_cache,
-            )
-        else:
-            self.decode_offload_manager = None
+        self.maybe_init_decode_offload_manager()
 
         # Init running status
         self.init_running_status()
@@ -1057,6 +993,62 @@ class Scheduler:
             context_len=self.model_config.context_len,
         )
 
+    def init_kv_cache(self) -> None:
+        result = kv_cache_builder.build_kv_cache(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            tp_worker=self.tp_worker,
+            page_size=get_schedule().page_size,
+            spec_algorithm=self.spec_algorithm,
+            enable_metrics=get_observability().enable_metrics,
+            enable_kv_cache_events=is_kv_publisher_rank(
+                get_observability().kv_events_config
+            ),
+            dynamo_kv_event_format=uses_dynamo_format(
+                get_observability().kv_events_config
+            ),
+            kv_event_lora_names=self.kv_event_lora_names,
+            enable_hierarchical_cache=get_memory().enable_hierarchical_cache,
+            hicache_draft_plan=(
+                self.draft_worker.hicache_draft_plan
+                if self.draft_worker is not None
+                else None
+            ),
+        )
+        self.is_hybrid_swa = result.is_hybrid_swa
+        self.is_hybrid_ssm = result.is_hybrid_ssm
+        self.sliding_window_size = result.sliding_window_size
+        self.full_tokens_per_layer = result.full_tokens_per_layer
+        self.swa_tokens_per_layer = result.swa_tokens_per_layer
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.disable_radix_cache = result.disable_radix_cache
+        self.tree_cache = result.tree_cache
+
+    def init_penalty_store(self) -> None:
+        self.penalty_store = PenaltyStore(
+            self.model_config.vocab_size, self.req_to_token_pool.device
+        )
+        self.req_to_token_pool.register_on_free_slot(self.penalty_store.free)
+
+    def init_kv_canary(self) -> None:
+        if (c := self.tp_worker.model_runner.canary_manager) is not None:
+            c.attach_radix_cache(self.tree_cache)
+
+    def maybe_init_decode_offload_manager(self) -> None:
+        if (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_offload_kvcache
+        ):
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=self.dp_tp_cpu_group,
+                tree_cache=self.tree_cache,
+            )
+        else:
+            self.decode_offload_manager = None
+
     def emit_metrics_constants(self) -> None:
         if not get_observability().enable_metrics:
             return
@@ -1100,7 +1092,9 @@ class Scheduler:
         )
         self.capacity = KvCapacity(
             max_total_num_tokens=self.max_total_num_tokens,
-            kv_shard_widening=self.kv_shard_widening,
+            kv_shard_widening=page_interleave_shard_size(
+                self.token_to_kv_pool_allocator
+            ),
             effective_max_total_num_tokens=(
                 model_runner.effective_logical_max_total_num_tokens
             ),
