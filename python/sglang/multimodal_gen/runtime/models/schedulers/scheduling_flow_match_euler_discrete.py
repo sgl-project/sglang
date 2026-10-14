@@ -538,8 +538,7 @@ class FlowMatchEulerDiscreteScheduler(
         if batch is not None and batch.rollout:
             if not self.already_prepared_rollout(batch):
                 raise RuntimeError("Rollout not prepared before step")
-            prev_sample = SchedulerRLMixin.flow_sde_sampling(
-                self._get_rollout_session_data(batch),
+            prev_sample = self._get_rollout_session_data(batch).flow_sde_sampling(
                 batch,
                 model_output,
                 sample,
