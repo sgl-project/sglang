@@ -501,3 +501,7 @@ def test_glm_dispatch_rejects_uncovered_shapes(total_tp, ep_size, is_nextn, m):
 
     with pytest.raises(RuntimeError, match="no specialization"):
         _kernel_name(total_tp, ep_size, is_nextn, m)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
