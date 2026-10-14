@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SchedulerStageMetricsRecorder,
@@ -307,6 +308,13 @@ class SchedulerInvariantChecker:
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
 
+        if (
+            isinstance(self.tree_cache, UnifiedRadixCache)
+            and self.tree_cache.hisparse_v2_coordinator is not None
+        ):
+            full_uncached += (
+                self.tree_cache.hisparse_v2_coordinator.reserved_temp_tokens()
+            )
         return full_uncached, swa_uncached
 
     @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)

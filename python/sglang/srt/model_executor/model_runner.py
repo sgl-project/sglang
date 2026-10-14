@@ -486,6 +486,7 @@ class ModelRunner:
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        self.hisparse_v2_coordinator = None
 
         # The native overlap path replaces this during load_model(). Keep the
         # no-pending-work invariant for lightweight backends that override the
@@ -1004,6 +1005,7 @@ class ModelRunner:
         self.maybe_init_watermark_state()
 
         self.maybe_init_hisparse_coordinator()
+        self.maybe_init_hisparse_v2_coordinator()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
@@ -1014,6 +1016,22 @@ class ModelRunner:
         self.decode_cuda_graph_captured = False
         # Captured decode bs; exposed via /get_server_info for role-switch queries.
         self.decode_cuda_graph_capture_bs: list[int] = []
+
+    def maybe_init_hisparse_v2_coordinator(self):
+        """Build the DSA HiCache coordinator before graph capture."""
+        if not get_memory().enable_hisparse_v2 or self.is_draft_worker:
+            return
+        from sglang.srt.managers.hisparse_v2_coordinator import (
+            build_hisparse_v2_coordinator,
+        )
+
+        self.hisparse_v2_coordinator = build_hisparse_v2_coordinator(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            allocator=self.token_to_kv_pool_allocator,
+            model_config=self.model_config,
+            device=self.device,
+        )
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
@@ -1747,6 +1765,8 @@ class ModelRunner:
             )
 
         # Hisparse coordinator — backends now read it from self.model_runner.
+        if self.hisparse_v2_coordinator is not None:
+            self.hisparse_v2_coordinator.prepare_forward(forward_batch)
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
@@ -1986,6 +2006,8 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
 
+            if self.hisparse_v2_coordinator is not None:
+                self.hisparse_v2_coordinator.prepare_forward(forward_batch)
             if (
                 forward_batch.forward_mode.is_decode()
                 and self.hisparse_coordinator is not None

@@ -2149,6 +2149,21 @@ class KVCacheConfigurator:
             pool_kwargs["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
+        elif get_memory().enable_hisparse_v2:
+            from sglang.srt.mem_cache.sparsity.hisparse_v2_config import (
+                parse_hisparse_v2_config,
+            )
+
+            config = parse_hisparse_v2_config(
+                model_top_k=self.model_config.hf_text_config.index_topk
+            )
+            PoolCls = dsa_pool_class
+            pool_kwargs["index_buf_size"] = (
+                max_total_num_tokens
+                + int(max_total_num_tokens * config.expansion_ratio)
+                // self.pool_page_size
+                * self.pool_page_size
+            )
         elif dsa_cp_layer_shard_rank is not None:
             reject_out_of_tree_path(
                 current_platform, subsystem="the CP layer-split DSA KV pool"
