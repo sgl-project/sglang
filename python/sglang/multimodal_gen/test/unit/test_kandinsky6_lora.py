@@ -65,6 +65,7 @@ def test_peft_adapter_maps_to_native_layers(tmp_path, prefix, source, target):
     pipeline.device = torch.device("cpu")
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {}
+    pipeline.loaded_adapter_files = {}
     pipeline.loaded_adapter_alphas = {}
     values = {
         "lora_A": torch.arange(16, dtype=torch.float32).reshape(2, 8),

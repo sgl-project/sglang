@@ -106,3 +106,45 @@ def test_diffusers_adapter_metadata_supplies_transformer_peft_config(tmp_path):
     (tmp_path / "adapter_config.json").write_text(json.dumps({"lora_alpha": 4}))
     with pytest.raises(ValueError, match="conflicts with safetensors metadata"):
         load_peft_config(str(weight_path))
+
+
+def test_rslora_and_alpha_pattern_accept_keys_without_weight_suffix():
+    from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
+        apply_peft_config,
+        lora_rank,
+    )
+
+    lora_b = torch.ones(8, 4)
+    out = apply_peft_config(
+        {"blocks.0.attn.lora_A": torch.ones(4, 8), "blocks.0.attn.lora_B": lora_b},
+        {"use_rslora": True, "alpha_pattern": {"attn": 8}},
+    )
+    torch.testing.assert_close(out["blocks.0.attn.lora_B"], lora_b * 2.0)
+    assert out["blocks.0.attn.alpha"].item() == 8
+    assert lora_rank((4, 8)) == lora_rank((2, 4, 8)) == lora_rank((4, 8, 3, 3)) == 4
+
+
+def test_ai_toolkit_flux_alpha_follows_renamed_modules():
+    from sglang.multimodal_gen.runtime.pipelines_core.lora import format_adapter
+
+    state = {}
+    for module, rows in (
+        ("double_blocks.0.img_attn.qkv", 12),
+        ("double_blocks.0.img_attn.proj", 4),
+        ("single_blocks.0.linear1", 20),
+        ("single_blocks.0.linear2", 4),
+    ):
+        state[f"{module}.lora_A.weight"] = torch.randn(2, 4)
+        state[f"{module}.lora_B.weight"] = torch.randn(rows, 2)
+        state[f"{module}.alpha"] = torch.tensor(1.0)
+    out = format_adapter._convert_ai_toolkit_flux_lora(state, format_adapter.logger)
+    for target in (
+        "transformer_blocks.0.attn.to_q",
+        "transformer_blocks.0.attn.to_k",
+        "transformer_blocks.0.attn.to_v",
+        "transformer_blocks.0.attn.to_out.0",
+        "single_transformer_blocks.0.attn.to_qkv_mlp_proj",
+        "single_transformer_blocks.0.attn.to_out",
+    ):
+        assert out[f"{target}.alpha"].item() == 1.0
+    assert not [k for k in out if k.startswith(("double_blocks", "single_blocks"))]

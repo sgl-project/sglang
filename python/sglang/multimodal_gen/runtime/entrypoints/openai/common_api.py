@@ -147,7 +147,7 @@ async def set_lora(
 @router.post("/merge_lora_weights")
 async def merge_lora_weights(
     target: str = Body("all", embed=True),
-    strength: float = Body(1.0, embed=True),
+    strength: Optional[float] = Body(None, embed=True),
 ):
     """
     Merge LoRA weights into the base model.
@@ -155,8 +155,9 @@ async def merge_lora_weights(
     Args:
         target: Which transformer(s) to merge. One of "all", "transformer",
                 "transformer_2", "critic".
-        strength: LoRA strength for merge, default 1.0. Values < 1.0 reduce the effect,
-            values > 1.0 amplify the effect.
+        strength: Optional override applied to every adapter. Omit to keep each
+            adapter's own strength. Values < 1.0 reduce the effect, values > 1.0
+            amplify the effect.
     """
     req = MergeLoraWeightsReq(target=target, strength=strength)
     return await _handle_lora_request(

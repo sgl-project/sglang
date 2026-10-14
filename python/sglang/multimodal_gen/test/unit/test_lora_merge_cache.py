@@ -6,6 +6,8 @@ disk shortage returns None instead of raising, and the key separates
 combinations that must not share files.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -75,3 +77,79 @@ def test_the_key_separates_combinations(tmp_path):
         ["/models/h3", "transformer_2"], [(str(lora), 1.0, None)]
     )
     assert k == lora_merge_cache_key(base, [(str(lora), 1.0, None)])
+
+
+def test_key_tracks_file_content_identity_and_ignores_cwd(tmp_path, monkeypatch):
+    lora = tmp_path / "adapter.safetensors"
+    lora.write_bytes(b"x" * 128)
+    base = ["org/model", "transformer"]
+    k = lora_merge_cache_key(base, [(str(lora), 1.0, None)])
+    # Same size, rewritten in place: mtime must change the key.
+    os.utime(lora, ns=(1, 1))
+    assert k != lora_merge_cache_key(base, [(str(lora), 1.0, None)])
+    # A repo id and module name are not paths; the cwd must not leak in.
+    key_a = lora_merge_cache_key(base, [(str(lora), 1.0, None)])
+    cwd_with_dirs = tmp_path / "cwd"
+    (cwd_with_dirs / "transformer").mkdir(parents=True)
+    monkeypatch.chdir(cwd_with_dirs)
+    assert lora_merge_cache_key(base, [(str(lora), 1.0, None)]) == key_a
+    # Two files from one repo are told apart.
+    other = tmp_path / "low_noise.safetensors"
+    other.write_bytes(b"x" * 128)
+    os.utime(other, ns=(1, 1))
+    assert lora_merge_cache_key(base, [(str(lora), 1.0, None)]) != (
+        lora_merge_cache_key(base, [(str(other), 1.0, None)])
+    )
+
+
+def test_failed_put_removes_only_the_temp_file(monkeypatch):
+    cache = LoraMergeCache("k5", expected_bytes=1)
+    good = cache.put("a", torch.randn(2, 2))
+    assert good is not None
+    final = os.path.join(cache.root, os.listdir(cache.root)[0])
+
+    def boom(tensors, path):
+        with open(path, "wb") as handle:
+            handle.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache."
+        "safetensors_save_file",
+        boom,
+    )
+    assert cache.put("a", torch.randn(2, 2)) is None
+    assert os.path.exists(final)
+    assert sorted(os.listdir(cache.root)) == [os.path.basename(final)]
+
+
+def test_old_stores_are_evicted(monkeypatch):
+    stores = []
+    for i in range(6):
+        cache = LoraMergeCache(f"s{i}", expected_bytes=1)
+        assert cache.put("a", torch.randn(2, 2)) is not None
+        cache.finalize()
+        os.utime(cache.root, (100 + i, 100 + i))
+        stores.append(cache.root)
+    assert [os.path.isdir(r) for r in stores] == [False, False, True, True, True, True]
+
+
+def test_adopting_a_store_protects_it_from_eviction():
+    first = LoraMergeCache("keep", expected_bytes=1)
+    assert first.put("a", torch.randn(2, 2)) is not None
+    first.finalize()
+    os.utime(first.root, (1, 1))
+    assert LoraMergeCache("keep", expected_bytes=1).is_complete()
+    assert os.path.getmtime(first.root) > 1000
+
+
+def test_get_returns_none_when_store_vanished(tmp_path):
+    cache = LoraMergeCache("gone", expected_bytes=1)
+    assert cache.put("a", torch.randn(2, 2)) is not None
+    cache.finalize()
+    adopted = LoraMergeCache("gone", expected_bytes=1)
+    assert adopted.is_complete()
+    import shutil
+
+    shutil.rmtree(adopted.root)
+    assert adopted.get("a", torch.Size([2, 2]), torch.float32) is None

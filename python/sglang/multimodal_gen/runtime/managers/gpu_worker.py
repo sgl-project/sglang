@@ -1673,14 +1673,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return OutputBatch()
 
     def merge_lora_weights(
-        self, target: str = "all", strength: float = 1.0
+        self, target: str = "all", strength: float | None = None
     ) -> OutputBatch:
         """
         Merge LoRA weights.
 
         Args:
             target: Which transformer(s) to merge.
-            strength: LoRA strength for merge, default 1.0.
+            strength: Optional override for every adapter; None keeps their own.
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")

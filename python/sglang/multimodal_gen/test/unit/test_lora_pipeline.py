@@ -43,6 +43,7 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_initialized = True
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {"adapter": "/adapter"}
+    pipeline.loaded_adapter_files = {}
     pipeline.loaded_adapter_alphas = {"adapter": None}
     pipeline.cur_adapter_name = {}
     pipeline.cur_adapter_path = {}
@@ -118,12 +119,14 @@ def test_lora_mutations_preserve_independent_conditioning(operation):
     assert cache.misses == 3
 
 
-def test_merge_cache_only_accepts_cpu_backed_weights():
+def test_merge_cache_only_accepts_cpu_backed_weights(tmp_path):
+    adapter = tmp_path / "adapter.safetensors"
+    adapter.write_bytes(b"x")
     pipeline = _make_pipeline(_make_layer())
     cpu_cache = pipeline._merge_cache_for(
         "transformer",
         pipeline.lora_layers,
-        ["/adapter"],
+        [str(adapter)],
         [1.0],
         enabled=True,
     )
@@ -135,7 +138,7 @@ def test_merge_cache_only_accepts_cpu_backed_weights():
     resident_cache = pipeline._merge_cache_for(
         "transformer",
         {"linear": resident_layer},
-        ["/adapter"],
+        [str(adapter)],
         [1.0],
         enabled=True,
     )
@@ -402,3 +405,216 @@ def test_cached_merge_restores_untouched_base_view():
     layer.merge_lora_weights(strength=0.5)
     layer.unmerge_lora_weights()
     torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+
+
+def _two_layer_pipeline():
+    layers = {
+        "attn": wrap_with_lora_layer(
+            torch.nn.Linear(4, 4, bias=False), lora_rank=1, lora_alpha=1
+        ),
+        "ffn": wrap_with_lora_layer(
+            torch.nn.Linear(4, 4, bias=False), lora_rank=1, lora_alpha=1
+        ),
+    }
+    pipeline = _make_pipeline(layers["attn"])
+    pipeline.lora_layers = layers
+    pipeline.loaded_adapter_alphas = {"a": None, "b": None, "c": None}
+    ad = pipeline.lora_adapters
+    # "a" covers attn + ffn, "b" covers attn only, "c" covers ffn only.
+    for nick, names in (("a", ["attn", "ffn"]), ("b", ["attn"]), ("c", ["ffn"])):
+        for n in names:
+            ad[nick][f"{n}.lora_A"] = torch.ones(1, 4)
+            ad[nick][f"{n}.lora_B"] = torch.ones(4, 1)
+    return pipeline, layers
+
+
+def _apply(pipeline, nicks, **kw):
+    with patch(_RANK_PATCH, return_value=0):
+        return pipeline._apply_lora_to_layers(
+            pipeline.lora_layers,
+            nicks,
+            [f"/{n}" for n in nicks],
+            0,
+            [1.0] * len(nicks),
+            **kw,
+        )
+
+
+def test_switching_adapter_unmerges_layers_the_new_adapter_skips():
+    pipeline, layers = _two_layer_pipeline()
+    base = {k: v.base_layer.weight.detach().clone() for k, v in layers.items()}
+    _apply(pipeline, ["a"], clear_existing=True)
+    assert layers["ffn"].merged
+    _apply(pipeline, ["b"], clear_existing=True)
+    # ffn is not covered by "b": its old delta must be gone, not baked in.
+    assert not layers["ffn"].merged
+    torch.testing.assert_close(layers["ffn"].base_layer.weight, base["ffn"])
+    assert not layers["ffn"].lora_weights_list
+    assert layers["ffn"].lora_A is None
+    assert layers["ffn"].disable_lora
+    assert len(layers["attn"].lora_weights_list) == 1
+
+
+def test_clear_existing_follows_first_covering_adapter_not_index_zero():
+    pipeline, layers = _two_layer_pipeline()
+    _apply(pipeline, ["a"], clear_existing=True, merge_weights=False)
+    # "b" misses ffn but "c" covers it: old "a" entry must not survive.
+    _apply(pipeline, ["b", "c"], clear_existing=True, merge_weights=False)
+    assert [e[2] for e in layers["ffn"].lora_weights_list] == ["/c"]
+
+
+def test_fractional_alpha_is_not_truncated():
+    pipeline, layers = _two_layer_pipeline()
+    pipeline.lora_adapters["a"]["attn.alpha"] = torch.tensor(0.5)
+    _apply(pipeline, ["a"], clear_existing=True, merge_weights=False)
+    assert layers["attn"].lora_alpha == 0.5
+
+
+def test_failed_adapter_load_keeps_previous_adapter():
+    from sglang.multimodal_gen.test.unit.test_fused_lora_compose import (
+        _load_adapter,
+        _make_loader_pipeline,
+    )
+
+    pipeline = _make_loader_pipeline()
+    pipeline.loaded_adapter_files = {}
+    good = {
+        "mlp.gate.lora_A.weight": torch.randn(2, 4),
+        "mlp.gate.lora_B.weight": torch.randn(4, 2),
+        "mlp.up.lora_A.weight": torch.randn(2, 4),
+        "mlp.up.lora_B.weight": torch.randn(4, 2),
+    }
+    _load_adapter(pipeline, good)
+    before = dict(pipeline.lora_adapters["adapter"])
+    assert before
+    # Fail after parsing has started; the previous adapter must survive.
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+            "_store_fused_lora_groups",
+            side_effect=RuntimeError("boom"),
+        ),
+        pytest.raises(RuntimeError),
+    ):
+        _load_adapter(pipeline, good)
+    assert pipeline.lora_adapters["adapter"].keys() == before.keys()
+
+
+def test_cache_merge_covers_layer_the_last_adapter_misses(tmp_path):
+    pipeline, layers = _two_layer_pipeline()
+    merged = []
+
+    class _Cache:
+        def get(self, name, shape, dtype):
+            return None
+
+        def put(self, name, tensor):
+            merged.append((name, len(layers[name].lora_weights_list)))
+            return None
+
+    pipeline._merge_via_cache = lambda name, layer, cache: merged.append(
+        (name, len(layer.lora_weights_list))
+    )
+    # "b" covers attn only, "c" ffn only, "a" both; last adapter is "b".
+    _apply(pipeline, ["a", "c", "b"], clear_existing=True, merge_cache=_Cache())
+    assert sorted(merged) == [("attn", 2), ("ffn", 2)]
+
+
+def test_critic_offload_lookup_uses_fake_score_transformer():
+    pipeline, _ = _two_layer_pipeline()
+    critic = torch.nn.Module()
+    pipeline.modules["fake_score_transformer"] = critic
+    assert pipeline._lora_module("critic") is critic
+    assert pipeline._lora_module("transformer") is pipeline.modules["transformer"]
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+        "is_layerwise_offloaded_module",
+        side_effect=lambda module: module is critic,
+    ):
+        assert pipeline._has_layerwise_offload([("critic", {})])
+
+
+def test_set_lora_skip_requires_every_target_module_to_match():
+    pipeline, layers = _two_layer_pipeline()
+    pipeline.lora_layers_transformer_2 = {"attn": layers["attn"]}
+    pipeline.modules["transformer_2"] = torch.nn.Module()
+    pipeline.lora_adapters["hi"]["attn.lora_A"] = torch.ones(1, 4)
+    pipeline.lora_adapters["hi"]["attn.lora_B"] = torch.ones(4, 1)
+    pipeline.lora_adapters["lo"] = dict(pipeline.lora_adapters["hi"])
+    pipeline.loaded_adapter_paths.update({"hi": "/hi", "lo": "/lo"})
+    pipeline.loaded_adapter_alphas.update({"hi": None, "lo": None})
+    pipeline._temporarily_disable_offload = lambda *a, **k: nullcontext([])
+    pipeline.server_args.lora_merge_mode = "dynamic"
+    pipeline.lora_layers_transformer_2 = {
+        "attn": wrap_with_lora_layer(
+            torch.nn.Linear(4, 4, bias=False), lora_rank=1, lora_alpha=1
+        )
+    }
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("hi", "/hi", target="transformer", merge_mode="dynamic")
+        pipeline.set_lora("lo", "/lo", target="transformer_2", merge_mode="dynamic")
+        pipeline.set_lora("hi", "/hi", target="all", merge_mode="dynamic")
+    assert pipeline.cur_adapter_name["transformer_2"] == "hi"
+
+
+def test_merge_without_strength_keeps_per_adapter_strengths():
+    pipeline, layers = _two_layer_pipeline()
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline._apply_lora_to_layers(
+            pipeline.lora_layers,
+            ["a", "b"],
+            ["/a", "/b"],
+            0,
+            [0.25, 0.75],
+            clear_existing=True,
+            merge_weights=False,
+        )
+    pipeline.is_lora_merged["transformer"] = False
+    pipeline.cur_adapter_config["transformer"] = (["a", "b"], [0.25, 0.75])
+    pipeline._temporarily_disable_offload = lambda *a, **k: nullcontext([])
+    pipeline.merge_lora_weights("transformer")
+    assert [e[3] for e in layers["attn"].lora_weights_list] == [0.25, 0.75]
+    assert pipeline.cur_adapter_config["transformer"][1] == [0.25, 0.75]
+    pipeline.merge_lora_weights("transformer", strength=0.5)
+    assert pipeline.cur_adapter_config["transformer"][1] == [0.5, 0.5]
+
+
+def test_deactivate_clears_adapter_identity():
+    pipeline, _ = _two_layer_pipeline()
+    pipeline._temporarily_disable_offload = lambda *a, **k: nullcontext([])
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("a", merge_mode="dynamic")
+        assert pipeline.is_lora_set()
+        pipeline.deactivate_lora_weights()
+    assert not pipeline.is_lora_set()
+
+
+def test_unmerge_enters_weight_update_context_once():
+    pipeline, layers = _two_layer_pipeline()
+    pipeline.lora_layers_transformer_2 = {"x": layers["ffn"]}
+    pipeline.modules["transformer_2"] = torch.nn.Module()
+    pipeline.is_lora_merged = {"transformer": True, "transformer_2": True}
+    for layer in layers.values():
+        layer.merged = True
+        layer.disable_lora = False
+    calls = []
+
+    @contextmanager
+    def counted(target_modules=None):
+        calls.append(len(target_modules))
+        yield
+
+    pipeline._weight_update_context = counted
+    with patch.object(BaseLayerWithLoRA, "unmerge_lora_weights", lambda self: None):
+        pipeline.unmerge_lora_weights("all")
+    assert calls == [2]
+
+
+def test_reactivation_fast_path_survives_uncovered_layers():
+    pipeline, layers = _two_layer_pipeline()
+    _apply(pipeline, ["b"], clear_existing=True, merge_weights=False)
+    assert not layers["ffn"].lora_weights_list
+    count = pipeline._reactivate_cached_dynamic_lora_layers(
+        pipeline.lora_layers, ["b"], ["/b"], [1.0]
+    )
+    assert count == 1
