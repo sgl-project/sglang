@@ -15,12 +15,14 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dspark_components import dspark_draft, dspark_verify
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
+    draft_tp_rng_sites,
     resolve_draft_params,
     sample_draft_block,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     DsparkDraftSampler,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -77,6 +79,16 @@ class TestDsparkDraftOverrides(unittest.TestCase):
             tp_sync=_tp_sync(),
             greedy_draft=False,
         )
+
+    def test_cutoff_redraw_declares_the_draft_an_rng_site(self):
+        # The fused kernel's Philox noise matches across ranks; the cutoff
+        # redraw does not, so it must join the rng sync preset.
+        self.assertEqual(draft_tp_rng_sites(greedy_draft=False), frozenset())
+        self.spec.speculative_draft_top_p = 0.5
+        self.assertEqual(
+            draft_tp_rng_sites(greedy_draft=False), {SpecTpSyncSite.DSPARK_DRAFT}
+        )
+        self.assertEqual(draft_tp_rng_sites(greedy_draft=True), frozenset())
 
     def test_default_draft_keeps_the_fused_sample_and_no_cutoffs(self):
         with mock.patch.object(

@@ -162,16 +162,19 @@ def sample_draft_proposal(
     this exact q, so callers hand it to the verify rather than a recomputed one.
 
     A greedy row (``top_k == 1``) proposes its argmax: sampling a sharp q still
-    leaves the argmax often enough to cost accept length. Its q need not be
-    one-hot because eagle_sample renormalises the target by the same ``top_ks``,
-    so p is one-hot there: the target argmax accepts, anything else rejects onto
-    the residual (p - q)+, which is p itself. Drop that renorm and this fails.
+    leaves the argmax often enough to cost accept length. Its q is the point
+    mass at that argmax, the distribution X came from: a row made greedy only by
+    the draft temperature override meets the target's full p at the verify, and
+    handing it the softmax would over-accept the argmax.
     """
     probs = build_draft_probs(next_token_logits, sampling_params)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
     greedy = sampling_params.greedy_mask.view(-1, 1)
     topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
     topk_p = probs.gather(1, topk_index)
+    topk_p = torch.where(greedy, torch.ones_like(topk_p), topk_p)
+    probs.masked_fill_(greedy, 0.0)
+    probs.scatter_(1, topk_index, topk_p)
     return probs, topk_p, topk_index
 
 

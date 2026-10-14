@@ -30,6 +30,10 @@ class DraftOverrides(msgspec.Struct, frozen=True):
     top_k: Optional[int]
     top_p: Optional[float]
 
+    @property
+    def has_cutoff(self) -> bool:
+        return self.top_k is not None or self.top_p is not None
+
     @classmethod
     def from_spec(cls) -> DraftOverrides:
         from sglang.srt.runtime_context import get_spec

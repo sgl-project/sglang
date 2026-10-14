@@ -101,11 +101,30 @@ class TestDraftSampling(unittest.TestCase):
         q, sampled_probs, tokens = sample_draft_proposal(
             logits, params([1.0, 1.0], [1, 1], [1.0, 1.0], cutoffs=False)
         )
-        # q stays the softmax: the verify's one-hot target makes the accept
-        # test exact for a greedy row whatever q says.
+        # q is the point mass the row proposed from, not the softmax.
         self.assertEqual(tokens.flatten().tolist(), [0, 1])
-        torch.testing.assert_close(q, torch.softmax(logits, dim=-1))
-        torch.testing.assert_close(sampled_probs, q.gather(1, tokens))
+        torch.testing.assert_close(q, torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
+        torch.testing.assert_close(sampled_probs, torch.ones(2, 1))
+
+    def test_draft_temperature_zero_hands_verify_a_point_mass(self):
+        """A sampling request drafted greedily by the temperature override keeps
+        the target's full p at the verify, so a softmax q there over-accepted
+        the argmax; q must be the point mass X was drawn from."""
+        info = SimpleNamespace(
+            temperatures=torch.tensor([[1.0], [0.7]]),
+            top_ks=torch.tensor([TOP_K_ALL, 5], dtype=torch.int32),
+            top_ps=torch.tensor([1.0, 0.9]),
+        )
+        with patch(
+            "sglang.srt.runtime_context.get_spec", return_value=_spec(temperature=0.0)
+        ):
+            draft = DraftSamplingParams.from_sampling_info(info)
+        self.assertFalse(draft.apply_top_k)
+        logits = torch.tensor([[0.5, 2.0, 1.0], [3.0, 0.0, 1.0]])
+        q, sampled_probs, tokens = sample_draft_proposal(logits, draft)
+        self.assertEqual(tokens.flatten().tolist(), [1, 0])
+        torch.testing.assert_close(q, torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]))
+        torch.testing.assert_close(sampled_probs, torch.ones(2, 1))
 
     def test_sample_frequencies_match_returned_truncated_q(self):
         torch.manual_seed(100)

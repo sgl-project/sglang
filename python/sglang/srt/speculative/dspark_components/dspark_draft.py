@@ -143,7 +143,7 @@ class DraftParams(NamedTuple):
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
         overrides = DraftOverrides.from_spec()
         cutoffs = None
-        if overrides.top_k is not None or overrides.top_p is not None:
+        if overrides.has_cutoff:
             cutoffs = DraftSamplingParams(
                 temperatures=temperatures,
                 top_ks=torch.ones(bs, dtype=torch.int32, device=device),
@@ -165,6 +165,15 @@ class DraftParams(NamedTuple):
             step_temperatures=self.step_temperatures[:bs],
             cutoffs=None if self.cutoffs is None else self.cutoffs.slice(bs),
         )
+
+
+def draft_tp_rng_sites(*, greedy_draft: bool) -> frozenset[SpecTpSyncSite]:
+    """The draft site draws from the torch RNG only when a cutoff override
+    redraws outside the fused kernel; the kernel's Philox noise matches across
+    ranks, so the ``rng`` sync preset leaves the site out otherwise."""
+    if greedy_draft or not DraftOverrides.from_spec().has_cutoff:
+        return frozenset()
+    return frozenset({SpecTpSyncSite.DSPARK_DRAFT})
 
 
 @functools.cache

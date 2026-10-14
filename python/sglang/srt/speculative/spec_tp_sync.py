@@ -82,9 +82,11 @@ _RETIRED = {
 assert not _RETIRED.keys() & (_BY_SLUG.keys() | _BY_NUMBER.keys())
 
 
-def _resolve(name: str) -> frozenset[SpecTpSyncSite]:
-    if name in _PRESETS:
-        return _PRESETS[name]
+def _resolve(
+    name: str, presets: dict[str, frozenset[SpecTpSyncSite]]
+) -> frozenset[SpecTpSyncSite]:
+    if name in presets:
+        return presets[name]
     if name in _RETIRED:
         site = _RETIRED[name]
         logger.warning(
@@ -103,14 +105,21 @@ def _resolve(name: str) -> frozenset[SpecTpSyncSite]:
     return frozenset({site})
 
 
-def parse_spec_tp_sync(spec: str) -> frozenset[SpecTpSyncSite]:
-    """Parse ``SGLANG_SPEC_TP_SYNC``; see its comment in environ.py for the syntax."""
+def parse_spec_tp_sync(
+    spec: str, *, rng_sites: frozenset[SpecTpSyncSite] = frozenset()
+) -> frozenset[SpecTpSyncSite]:
+    """Parse ``SGLANG_SPEC_TP_SYNC``; see its comment in environ.py for the syntax.
+    ``rng_sites`` are the sites this worker draws from the torch RNG at beyond
+    the static set, so the ``rng`` preset covers them too."""
+    presets = (
+        _PRESETS if not rng_sites else {**_PRESETS, "rng": _PRESETS["rng"] | rng_sites}
+    )
     sites: frozenset[SpecTpSyncSite] = frozenset()
     for token in spec.replace(" ", "").replace("_", "-").lower().split(","):
         if not token:
             continue
         negate = token.startswith("-")
-        value = _resolve(token[1:] if negate else token)
+        value = _resolve(token[1:] if negate else token, presets)
         sites = sites - value if negate else sites | value
     return sites
 
@@ -118,10 +127,12 @@ def parse_spec_tp_sync(spec: str) -> frozenset[SpecTpSyncSite]:
 class SpecTpSync:
     """Broadcasts a speculative decision from rank 0 to its TP group."""
 
-    def __init__(self, tp_group) -> None:
+    def __init__(
+        self, tp_group, *, rng_sites: frozenset[SpecTpSyncSite] = frozenset()
+    ) -> None:
         self._tp_group = tp_group
         # Parsed even on a single rank so a typo fails on every deployment.
-        sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
+        sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get(), rng_sites=rng_sites)
         self._sites = sites if tp_group.world_size > 1 else frozenset()
         if sites != _ALL and tp_group.world_size > 1 and tp_group.rank_in_group == 0:
             logger.warning(

@@ -25,6 +25,16 @@ class TestParseSpecTpSync(CustomTestCase):
         self.assertNotIn(DRAFT, parse_spec_tp_sync("rng"))
         self.assertIn(DRAFT, parse_spec_tp_sync("dspark-draft"))
 
+    def test_rng_preset_takes_the_sites_a_worker_declares(self):
+        # A draft cutoff override redraws from the torch RNG; the worker then
+        # declares the draft site and the rng preset must cover it.
+        declared = frozenset({DRAFT})
+        self.assertIn(DRAFT, parse_spec_tp_sync("rng", rng_sites=declared))
+        self.assertNotIn(
+            DRAFT, parse_spec_tp_sync("rng,-dspark-draft", rng_sites=declared)
+        )
+        self.assertNotIn(DRAFT, parse_spec_tp_sync("init", rng_sites=declared))
+
 
 if __name__ == "__main__":
     unittest.main()
