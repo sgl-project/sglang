@@ -3268,6 +3268,8 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rmpv",
+ "serde",
+ "sha2",
  "tokio",
  "tonic",
  "tonic-prost",

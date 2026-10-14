@@ -25,6 +25,8 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -50,6 +52,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -601,6 +604,7 @@ def _aux_storage_key_transfers(cache, node_id):
 def build_fixture(
     cfg: CacheConfig,
     enable_kv_cache_events: bool = False,
+    dynamo_kv_event_format: bool = False,
     enable_session_radix_cache: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
@@ -608,6 +612,7 @@ def build_fixture(
         dict[ComponentType, type[TreeComponent]]
     ] = None,
     tree_core_backend: Optional[str] = None,
+    kv_event_lora_names: Optional[KvEventLoraNames] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
@@ -738,6 +743,8 @@ def build_fixture(
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
+        dynamo_kv_event_format=dynamo_kv_event_format,
+        kv_event_lora_names=kv_event_lora_names or KvEventLoraNames(),
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
@@ -1295,6 +1302,23 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.sanity_check()
 
 
+class _LoraReq:
+    """The request fields KvEventLoraNames reads."""
+
+    def __init__(self, extra_key, lora_id="lora-id"):
+        self.extra_key = extra_key
+        self.lora_id = lora_id
+
+
+def _lora_names(**names_by_extra_key):
+    """A name table plus the requests that keep its entries alive."""
+    table = KvEventLoraNames()
+    reqs = [_LoraReq(key) for key in names_by_extra_key]
+    for req in reqs:
+        table.register(req, names_by_extra_key[req.extra_key])
+    return table, reqs
+
+
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
@@ -1520,6 +1544,159 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             stored_hashes(extra_key="adapter-a", cache_salt="tenant-a"),
             stored_hashes(extra_key="adapter-b", cache_salt="tenant-a"),
         )
+
+    def test_lora_external_ids_separate_adapter_loads(self):
+        """External IDs distinguish loads; routers match tokens and public names."""
+        lora_names, _reqs = _lora_names(
+            **{
+                "uuid-a": "adapter-a",
+                "user|uuid-a2": "adapter-a",
+                "uuid-b": "adapter-b",
+            }
+        )
+
+        def store_then_evict(extra_key):
+            cache, allocator, _ = build_fixture(
+                self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+            )
+            cache.take_events()
+            self._insert(cache, allocator, [1, 2, 3, 4], extra_key=extra_key)
+            stored = self._stored_events(cache, StorageMedium.GPU)
+            cache.evict(EvictParams(num_tokens=4))
+            removed = self._removed_events(cache, StorageMedium.GPU)
+            self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+            return stored
+
+        base = store_then_evict(None)
+        lora_a = store_then_evict("uuid-a")
+        self.assertIsNone(base[0].lora_name)
+        self.assertEqual(lora_a[0].lora_name, "adapter-a")
+        seed = kv_event_namespace_seed(extra_key="uuid-a", cache_salt=None)
+        self.assertEqual(
+            self._event_hashes(lora_a),
+            [
+                namespaced_block_hash(h, namespace_seed=seed)
+                for h in self._event_hashes(base)
+            ],
+        )
+        # Another load of the same public name has distinct external IDs.
+        self.assertNotEqual(
+            self._event_hashes(store_then_evict("user|uuid-a2")),
+            self._event_hashes(lora_a),
+        )
+        self.assertNotEqual(
+            self._event_hashes(store_then_evict("uuid-b")),
+            self._event_hashes(lora_a),
+        )
+
+    def test_dynamo_lora_hashes_keep_the_dynamo_namespace(self):
+        """The default LoRA mix must not be applied a second time to Dynamo hashes."""
+        extra_key = "0123456789abcdef0123456789abcdef"
+        names, reqs = _lora_names(**{extra_key: "adapter-a"})
+
+        def publish(*, dynamo_format, namespace):
+            cache, allocator, _ = build_fixture(
+                self.cfg,
+                enable_kv_cache_events=True,
+                dynamo_kv_event_format=dynamo_format,
+                kv_event_lora_names=names,
+            )
+            cache.take_events()
+            self._insert(
+                cache,
+                allocator,
+                [1, 2, 3, 4],
+                extra_key=namespace,
+                cache_salt="tenant-a",
+            )
+            stored = self._stored_events(cache, StorageMedium.GPU)
+            cache.evict(EvictParams(num_tokens=4))
+            removed = self._removed_events(cache, StorageMedium.GPU)
+            self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+            return stored
+
+        base = publish(dynamo_format=False, namespace=None)
+        lora = publish(dynamo_format=True, namespace=extra_key)
+        seed = kv_event_namespace_seed(extra_key=extra_key, cache_salt="tenant-a")
+        self.assertEqual(
+            self._event_hashes(lora),
+            [
+                namespaced_block_hash(h, namespace_seed=seed)
+                for h in self._event_hashes(base)
+            ],
+        )
+        self.assertEqual(lora[0].lora_name, "adapter-a")
+
+    def test_lora_request_without_optional_ipc_name_uses_loaded_adapter(self):
+        names = KvEventLoraNames()
+        names.register(lora_id="loaded-id", lora_name="adapter-a")
+        req = _LoraReq("user|loaded-id", lora_id="loaded-id")
+        names.register(req)
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key=req.extra_key)
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(stored[0].lora_name, "adapter-a")
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertEqual(
+            self._event_hashes(self._removed_events(cache, StorageMedium.GPU)),
+            self._event_hashes(stored),
+        )
+
+    def test_lora_name_survives_a_gap_before_a_delayed_store(self):
+        """Write-back can publish a store after the request and GPU blocks are gone."""
+        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        del reqs
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(lora_names.get("uuid-a"), "adapter-a")
+
+        cache.evict(EvictParams(num_tokens=4))
+        removed = self._removed_events(cache, StorageMedium.GPU)
+        self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+        self.assertEqual(lora_names.get("uuid-a"), "adapter-a")
+        # A late background store needs no new request/name registration.
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        delayed = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(delayed[0].lora_name, "adapter-a")
+        self.assertEqual(self._event_hashes(delayed), self._event_hashes(stored))
+
+    def test_lora_name_survives_until_queued_stores_are_taken(self):
+        """A finished request's blocks still publish under its adapter when
+        other requests register before the events are taken."""
+        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        del reqs
+        for i in range(200):
+            lora_names.register(_LoraReq(f"other-{i}"), "adapter-b")
+
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual([e.lora_name for e in stored], ["adapter-a"])
+
+    def test_lora_event_parentage_survives_node_split(self):
+        lora_names, _reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        original = self._stored_events(cache, StorageMedium.GPU)
+        self._insert(cache, allocator, [1, 2, 5, 6], extra_key="uuid-a")
+        branch = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(branch), 1)
+        self.assertEqual(branch[0].lora_name, "adapter-a")
+        self.assertEqual(branch[0].parent_block_hash, original[0].block_hashes[0])
 
     def test_kv_events_split_preserves_block_hash_parentage(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
