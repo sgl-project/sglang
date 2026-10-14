@@ -609,6 +609,16 @@ class _DeepseekV2AFDLayerPending:
     topk_indices: Optional[torch.Tensor]
 
 
+def run_afd_shared_experts_after_launch(layer, pending):
+    moe_pending = [item.moe for item in pending]
+    completed = layer.mlp.run_afd_shared_experts_batch(moe_pending)
+    if completed is moe_pending:
+        return pending
+    return [
+        replace(item, moe=moe) for item, moe in zip(pending, completed, strict=True)
+    ]
+
+
 class MoEOutput(NamedTuple):
     """A MoE block's pieces, before anything merges or reduces them. ``routed`` is
     a deferred finalize handle or the raw routed rows."""
@@ -989,6 +999,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: Optional[BumpAllocator] = None,
         defer_shared_experts: bool = False,
     ) -> DeepseekAFDMoEPending:
+        """Dispatch routed work; deferred shared work must run before finish."""
         if defer_shared_experts:
             assert is_afd_attn_moe_scattered()
             assert gemm_output_zero_allocator is None
@@ -1012,11 +1023,10 @@ class DeepseekV2MoE(nn.Module):
             and not skip_shared_experts
         ):
             if defer_shared_experts:
-                # Only scattered DSV4 callers defer: their MHC/norm output is
-                # owned by this child, rather than a reused DP gather buffer.
+                # Keep this child's norm output alive until all children have
+                # launched their routed experts and shared inputs can be batched.
                 shared_input = hidden_states
             else:
-                # Consume any DP gather buffer before another child reuses it.
                 # Shared GEMMs overlap the remote routed work after dispatch.
                 with afd_shared_expert_sm_budget(handle):
                     shared_output = self._forward_shared_experts(
@@ -2969,6 +2979,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 input_ids_global=None,
                 skip_shared_experts=False,
                 gemm_output_zero_allocator=gemm_output_zero_allocator,
+                defer_shared_experts=(
+                    is_afd_attn_moe_scattered() and gemm_output_zero_allocator is None
+                ),
             ),
             topk_indices=topk_indices,
         )
@@ -3275,6 +3288,7 @@ class DeepseekV2Model(nn.Module):
             child_states=child_states,
             launch_child_layer=launch_child_layer,
             finish_child_layer=finish_child_layer,
+            after_launch_layer=run_afd_shared_experts_after_launch,
         )
         return merge_afd_residual_streams(
             [state[0] for state in child_states], forward_batch
