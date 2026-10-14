@@ -6,6 +6,7 @@ use dynamo_renderer::deepseek::v4::{self, ReasoningEffort, ThinkingMode};
 use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
 
+use super::schema_types::normalize_json_schema_types;
 use crate::model_files::resolve_model_file;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -176,7 +177,23 @@ pub(super) fn engine_message(message: Value) -> Value {
     message.retain(|key, value| kept.contains(&key.as_str()) && !value.is_null());
     message.insert("role".into(), role.into());
     message.entry("content").or_insert_with(|| "".into());
+    if let Some(Value::Array(calls)) = message.get_mut("tool_calls") {
+        calls
+            .iter_mut()
+            .for_each(|call| *call = tool_call_dump(call));
+    }
     message.into()
+}
+
+/// `ToolCall.model_dump()`: its declared fields only, unset ones null.
+fn tool_call_dump(call: &Value) -> Value {
+    let function = &call["function"];
+    json!({
+        "id": call["id"],
+        "index": call["index"],
+        "type": "function",
+        "function": {"name": function["name"], "arguments": function["arguments"]},
+    })
 }
 
 /// `process_content_for_template_format`: text parts joined with spaces.
@@ -237,7 +254,7 @@ pub(super) fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
 }
 
 /// Each assistant tool call's `function.arguments`, absent ones as `null`.
-fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
+pub(super) fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
     let is_assistant = message["role"] == "assistant";
     message
         .get_mut("tool_calls")
@@ -249,9 +266,9 @@ fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
         .map(|function| function.entry("arguments").or_insert(Value::Null))
 }
 
-/// `protocol.py::Function.model_dump()`, in declared field order; the encoder
-/// serializes it verbatim.
-fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
+/// `protocol.py::Function.model_dump()`, in declared field order, after
+/// `_validate_request` normalizes the schema types; the encoder serializes it verbatim.
+pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
     tools
         .iter()
         .map(|tool| {
@@ -260,7 +277,9 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
             let mut function = Map::new();
             function.insert("description".into(), f["description"].clone());
             function.insert("name".into(), name.into());
-            function.insert("parameters".into(), f["parameters"].clone());
+            let mut parameters = f["parameters"].clone();
+            normalize_json_schema_types(&mut parameters);
+            function.insert("parameters".into(), parameters);
             let strict = f.get("strict").map_or(Ok(false), pydantic_bool)?;
             function.insert("strict".into(), strict.into());
             if let Some(defer) = [f.get("defer_loading"), tool.get("defer_loading")]
