@@ -3561,6 +3561,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+            self.storage_metrics_collector.log_storage_call_guard(
+                self.cache_controller.storage_call_guard.take_stats()
+            )
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Sequence
 from contextlib import contextmanager
+from typing import Optional
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    HostKVCache,
+    HostSlotQuarantine,
+    host_memory_budget_bytes,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip
+
+# Seconds a pool-wide clear waits for in-flight layout leases; longer than a
+# healthy backend call, shorter than the operator's patience with a flush.
+_CLEAR_LEASE_WAIT_S = 10.0
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -50,6 +60,8 @@ class _SharedPageEnvelopeHostBacking:
             self.physical_to_logical: dict[int, int] = {}
             self.free_physical_pages: set[int] = set()
             self.watermark = 0 if grow_direction == "up" else page_num - 1
+            # Logical pages an orphaned storage call still uses; see HostKVCache.
+            self.page_quarantine = HostSlotQuarantine()
 
         @property
         def live_page_count(self) -> int:
@@ -327,15 +339,24 @@ class _SharedPageEnvelopeHostBacking:
             page_counts,
         )
 
-    def _begin_compaction(self) -> list:
+    def _begin_compaction(self, timeout: Optional[float] = None) -> list:
         if self._layout_lease_state.depth:
             raise RuntimeError(
                 "Cannot compact a unified host pool while the current thread "
                 "holds a layout lease."
             )
         self._compacting = True
+        deadline = None if timeout is None else time.monotonic() + timeout
         while self._layout_users:
-            self._layout_condition.wait()
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                self._finish_compaction()
+                raise RuntimeError(
+                    "Unified host pool layout is still leased by an in-flight "
+                    "storage call (a timed-out backend call that has not "
+                    "returned); it cannot be cleared until that call returns."
+                )
+            self._layout_condition.wait(remaining)
         events = list(self._pending_transfer_events.values())
         self._pending_transfer_events = {}
         return events
@@ -608,6 +629,9 @@ class _SharedPageEnvelopeHostBacking:
                 raise AssertionError("Host pages cannot be freed more than once.")
             if any(page not in side.logical_to_physical for page in logical_pages):
                 raise AssertionError(f"Host pages are not allocated in {name!r}.")
+            logical_pages = side.page_quarantine.hold_freed(
+                torch.tensor(logical_pages, dtype=torch.int64)
+            ).tolist()
             for logical_page in logical_pages:
                 physical_page = side.logical_to_physical.pop(logical_page)
                 del side.physical_to_logical[physical_page]
@@ -621,9 +645,29 @@ class _SharedPageEnvelopeHostBacking:
             self._release_center_holes(side)
             return len(indices)
 
+    def quarantine(self, name: str, indices: torch.Tensor) -> None:
+        with self.lock:
+            side = self.sides[name]
+            side.page_quarantine.pin(
+                torch.tensor(self._page_ids(indices, side.page_size), dtype=torch.int64)
+            )
+
+    def release_quarantine(self, name: str, indices: torch.Tensor) -> None:
+        with self.lock:
+            side = self.sides[name]
+            held = side.page_quarantine.unpin(
+                torch.tensor(self._page_ids(indices, side.page_size), dtype=torch.int64)
+            )
+            if held.numel():
+                self.free(name, self._expand_pages(held.tolist(), side.page_size))
+
     def clear(self, name: str) -> None:
         with self.lock:
-            events = self._begin_compaction()
+            # An orphaned storage call holds a layout lease until it returns, so
+            # once the wait ends nothing is still writing and no page stays
+            # quarantined; a lease held past the bound fails the clear instead
+            # of blocking the scheduler forever.
+            events = self._begin_compaction(timeout=_CLEAR_LEASE_WAIT_S)
             try:
                 for event in events:
                     event.synchronize()
@@ -633,6 +677,7 @@ class _SharedPageEnvelopeHostBacking:
                 side.physical_to_logical.clear()
                 side.free_physical_pages.clear()
                 side.watermark = 0 if side.grow_direction == "up" else side.page_num - 1
+                side.page_quarantine = HostSlotQuarantine()
             finally:
                 self._finish_compaction()
 
@@ -841,6 +886,12 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
 
     def free(self, indices: torch.Tensor) -> int:
         return self._shared_backing.free(self.pool_label, indices)
+
+    def quarantine(self, indices: torch.Tensor) -> None:
+        self._shared_backing.quarantine(self.pool_label, indices)
+
+    def release_quarantine(self, indices: torch.Tensor) -> None:
+        self._shared_backing.release_quarantine(self.pool_label, indices)
 
     def prepare_transfer_indices(
         self, host_indices, device_indices, io_backend

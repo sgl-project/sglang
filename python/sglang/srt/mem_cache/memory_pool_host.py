@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
+    HostSlotQuarantine,
     host_memory_budget_bytes,
     synchronized,
 )
@@ -90,6 +91,7 @@ class LogicalHostPool:
         self.allocator = None
         self.can_use_write_back_jit = True
         self.lock = threading.RLock()
+        self.slot_quarantine = HostSlotQuarantine()
         self.clear()
 
     @synchronized
@@ -99,10 +101,22 @@ class LogicalHostPool:
         # until an allocation needs the released slots.
         self.release_slots = []
         self.num_release_slots = 0
+        self.free_slots = self.slot_quarantine.carve_after_clear(self.free_slots)
 
     def destroy(self) -> None:
         """Logical anchors own no backing buffers or registrations to release."""
         return None
+
+    @synchronized
+    def quarantine(self, indices: torch.Tensor) -> None:
+        self.slot_quarantine.pin(indices)
+
+    @synchronized
+    def release_quarantine(self, indices: torch.Tensor) -> None:
+        released = self.slot_quarantine.unpin(indices)
+        if released.numel():
+            self.release_slots.append(released)
+            self.num_release_slots += len(released)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -147,8 +161,10 @@ class LogicalHostPool:
         if indices_cpu.numel() == 0:
             return 0
 
-        self.release_slots.append(indices_cpu)
-        self.num_release_slots += len(indices_cpu)
+        indices_cpu = self.slot_quarantine.hold_freed(indices_cpu)
+        if indices_cpu.numel():
+            self.release_slots.append(indices_cpu)
+            self.num_release_slots += len(indices_cpu)
         return len(indices)
 
     def backup_from_device_all_layer(
@@ -426,6 +442,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
+        self.free_slots = self.slot_quarantine.carve_after_clear(self.free_slots)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -451,8 +468,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         if indices_cpu.numel() == 0:
             return 0
 
-        self.release_slots.append(indices_cpu)
-        self.num_release_slots += len(indices_cpu)
+        indices_cpu = self.slot_quarantine.hold_freed(indices_cpu)
+        if indices_cpu.numel():
+            self.release_slots.append(indices_cpu)
+            self.num_release_slots += len(indices_cpu)
         return len(indices)
 
     def backup_from_device_all_layer(
