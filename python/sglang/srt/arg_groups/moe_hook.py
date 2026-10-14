@@ -240,6 +240,81 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         )
 
 
+# Named tables of FlashInfer's Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig.transport_table.
+_SM120_MEGAMOE_TRANSPORT_TABLES = (
+    "all_gin",
+    "all_lsa",
+    "lsa_where_reachable",
+    "tuned",
+    "auto",
+)
+
+
+def validate_flashinfer_megamoe_sm120(server_args: Any) -> None:
+    """SM120 runs FP4-expert checkpoints on FlashInfer's cake MegaMOE kernel."""
+    cfg = resolving_view(server_args)
+    model_config = model_config_of(server_args)
+    if get_platform().device_capability != (12, 0):
+        raise ValueError(
+            "FlashInfer MegaMOE on SM12x requires an SM120 (compute capability "
+            f"12.0) device, got {get_platform().device_capability}."
+        )
+    if (
+        resolved_view(server_args).quantization in ("mxfp8", "modelopt_fp4")
+        or not model_config.is_fp4_experts
+    ):
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 supports only FP4-expert (MXFP4) "
+            "checkpoints such as DeepSeek-V4-Flash."
+        )
+    if cfg.tp_size < 2:
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 requires an expert-parallel size of at "
+            "least 2."
+        )
+    if cfg.enable_eplb:
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 does not support --enable-eplb; static "
+            "expert placement (--init-expert-location, "
+            "--ep-num-redundant-experts) is supported."
+        )
+    table = envs.SGLANG_FLASHINFER_MEGAMOE_SM120_TRANSPORT_TABLE.get()
+    if table not in _SM120_MEGAMOE_TRANSPORT_TABLES:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_SM120_TRANSPORT_TABLE must be one of "
+            f"{_SM120_MEGAMOE_TRANSPORT_TABLES}, got {table!r}."
+        )
+    if os.environ.get("NCCL_CUMEM_ENABLE") == "0":
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 uses NCCL's Device API, which needs "
+            "cuMem-backed buffers; unset NCCL_CUMEM_ENABLE or set it to 1."
+        )
+    if (
+        envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower() != "bf16"
+        or envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+    ):
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE and "
+            "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE apply to the SM100 "
+            "cutedsl MegaMOE kernels; the SM120 kernel combines in BF16."
+        )
+    if cfg.speculative_algorithm and cfg.speculative_moe_runner_backend is None:
+        raise ValueError(
+            "Speculative decoding is not validated with FlashInfer MegaMOE on "
+            "SM120: the default draft MoE runner (flashinfer_trtllm) is "
+            "SM100-only. Set --speculative-moe-runner-backend explicitly."
+        )
+    try:
+        from flashinfer.moe_ep import (  # noqa: F401
+            Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
+        )
+    except ImportError as e:
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 requires a FlashInfer build with the "
+            "sm120_mxfp4_mxfp8_bf16_cake backend (flashinfer-ai/flashinfer#6346)."
+        ) from e
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -284,10 +359,22 @@ def handle_a2a_moe(server_args: Any):
         assert resolved_view(server_args).moe_runner_backend == "flashinfer_megamoe", (
             "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
         )
-        if not is_sm100_supported():
+        if get_platform().is_sm120:
+            validate_flashinfer_megamoe_sm120(server_args)
+            # The cake kernel joins the EP group's ncclComm through NCCL's
+            # Device API, which needs cuMem-backed NCCL buffers.
+            os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+            if cfg.disaggregation_mode != "prefill":
+                logger.info(
+                    "FlashInfer MegaMOE on SM120 targets prefill; decode batches "
+                    "of a few requests per rank run slower than "
+                    "--moe-runner-backend flashinfer_mxfp4. Consider it for the "
+                    "prefill server of a PD-disaggregated deployment."
+                )
+        elif not is_sm100_supported():
             raise ValueError(
                 "FlashInfer MegaMOE currently requires an SM100-family "
-                "CUDA device for all supported quantization formats."
+                "CUDA device, or an SM120 device with an FP4-expert checkpoint."
             )
         logger.info(
             "FlashInfer MegaMOE is enabled. The expert parallel size is "
@@ -695,6 +782,51 @@ def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
             f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK>={required}, "
             "or unset it to size from --chunked-prefill-size, or lower "
             "--chunked-prefill-size / the CUDA graph max batch sizes."
+        )
+
+
+def _flashinfer_megamoe_tokens_per_rank(server_args: Any) -> int:
+    """Per-rank row capacity of the MegaMOE workspace; mirrors
+    flashinfer_megamoe._resolve_max_tokens_per_rank at startup."""
+    configured = envs.SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK.get()
+    if configured > 0:
+        return configured
+    view = resolved_view(server_args)
+    cg_config = view.cuda_graph_config
+    prefill_tokens = view.max_prefill_tokens
+    decode_bs = 0
+    if cg_config is not None:
+        if cg_config.prefill.backend == Backend.TC_PIECEWISE:
+            prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
+        decode_bs = cg_config.decode.max_bs or 0
+    tokens_per_req = (
+        (view.speculative_num_draft_tokens or 1) if view.speculative_algorithm else 1
+    )
+    derived = max(prefill_tokens, decode_bs * tokens_per_req)
+    return derived if derived > 0 else 1024
+
+
+def validate_flashinfer_megamoe_sm120_token_budget(server_args: Any) -> None:
+    """Fail fast if one forward can stage more rows per rank than the SM120
+    MegaMOE workspace holds; the kernel rejects such a call at runtime."""
+    view = resolved_view(server_args)
+    if view.moe_a2a_backend != "flashinfer_megamoe" or not get_platform().is_sm120:
+        return
+    if view.disaggregation_mode != "decode" and view.chunked_prefill_size <= 0:
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120 requires chunked prefill: the per-rank "
+            "workspace has a fixed row capacity, so --chunked-prefill-size must "
+            "be > 0."
+        )
+    required = _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args)
+    capacity = _flashinfer_megamoe_tokens_per_rank(server_args)
+    if required > capacity:
+        raise ValueError(
+            "FlashInfer MegaMOE on SM120: one forward can route "
+            f"{required} tokens per rank (prefill chunk or CUDA graph), but the "
+            f"workspace holds {capacity}. Raise --max-prefill-tokens or "
+            "SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK, or lower "
+            "--chunked-prefill-size."
         )
 
 

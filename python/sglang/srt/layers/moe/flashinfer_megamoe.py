@@ -22,6 +22,7 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -47,8 +48,6 @@ def _format_megakernel_config(config: Any) -> str:
     fc2_alpha / fc1_norm_const); their default repr dumps every element, so
     abbreviate tensors to shape/dtype/device instead.
     """
-    import dataclasses
-
     if not dataclasses.is_dataclass(config):
         return repr(config)
 
@@ -141,6 +140,23 @@ def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
     if mega.supports_output_view:
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
+
+
+def _forward_megamoe_bucketed(mega: Any, tensors: Any) -> torch.Tensor:
+    # The row bucket must match on every EP rank; the DP token counts are global,
+    # so no per-call routing exchange (host sync) is needed and graphs can capture it.
+    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+
+    counts = get_dp_global_num_tokens()
+    if counts is None:
+        raise RuntimeError(
+            "FlashInfer SM120 MegaMOE requires the DP-attention token counts "
+            "of the current step."
+        )
+    # The cake kernel takes int64 expert ids; -1 marks a padded row.
+    tensors.topk_ids = tensors.topk_ids.to(torch.int64)
+    mega.stage_inputs(tensors, compile_tokens_per_rank=max(counts))
+    return mega.compute_staged(output=None)
 
 
 def _resolve_max_tokens_per_rank() -> int:
@@ -241,6 +257,7 @@ def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
     layer._flashinfer_megamoe_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
+    layer._flashinfer_megamoe_cake_weights = None
 
 
 def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
@@ -249,12 +266,21 @@ def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
     return layer._flashinfer_megamoe_layer
 
 
+def _weight_scale_pairs(
+    layer: FusedMoE, *, w13_scale: torch.Tensor, w2_scale: torch.Tensor
+) -> Any:
+    return (
+        (layer.w13_weight.data, w13_scale.data),
+        (layer.w2_weight.data, w2_scale.data),
+    )
+
+
 def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
     megakernel_config: Any,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
+    transformed_weights: Any,
+    bucketed_forward: bool = False,
 ) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
@@ -267,10 +293,6 @@ def _ensure_flashinfer_megamoe_layer(
         MoEEpMegaLayer,
     )
 
-    transformed_weights = (
-        (layer.w13_weight.data, w13_scale.data),
-        (layer.w2_weight.data, w2_scale.data),
-    )
     world_size, rank = _layer_ep_world_rank(layer)
 
     max_tokens_per_rank = _resolve_max_tokens_per_rank()
@@ -315,7 +337,11 @@ def _ensure_flashinfer_megamoe_layer(
         backend=backend,
     )
     layer._flashinfer_megamoe_layer = mega
-    if hasattr(megakernel_config, "knobs"):
+    if bucketed_forward:
+        # One workspace serves every bucket; startup tuning would build one
+        # compiled kernel and NCCL window set per profiled capacity.
+        layer._flashinfer_megamoe_forward = _forward_megamoe_bucketed
+    elif hasattr(megakernel_config, "knobs"):
         from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
             MegaMoeTunedForward,
         )
@@ -333,6 +359,14 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
+    if _uses_sm120_cake():
+        return _ensure_flashinfer_megamoe_layer(
+            layer,
+            megakernel_config=_sm120_cake_megamoe_config(layer),
+            transformed_weights=layer._flashinfer_megamoe_cake_weights,
+            bucketed_forward=True,
+        )
+
     from flashinfer.moe_ep import DeepGemmMegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
@@ -342,8 +376,11 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             activation_clamp=layer.moe_runner_config.swiglu_limit,
         ),
-        w13_scale=layer.w13_weight_scale_inv,
-        w2_scale=layer.w2_weight_scale_inv,
+        transformed_weights=_weight_scale_pairs(
+            layer,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+        ),
     )
 
 
@@ -382,8 +419,11 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
         ),
-        w13_scale=layer.w13_weight_scale,
-        w2_scale=layer.w2_weight_scale,
+        transformed_weights=_weight_scale_pairs(
+            layer,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+        ),
     )
 
 
@@ -403,8 +443,86 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
         ),
-        w13_scale=layer.w13_weight_scale_inv,
-        w2_scale=layer.w2_weight_scale_inv,
+        transformed_weights=_weight_scale_pairs(
+            layer,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+        ),
+    )
+
+
+def _uses_sm120_cake() -> bool:
+    from sglang.srt.runtime_context import get_platform
+
+    return get_platform().is_sm120
+
+
+def _cake_swiglu_limit(swiglu_limit: float | None) -> int:
+    # The cake kernel compiles the clamp in as a non-negative integer; 0 = off.
+    if swiglu_limit is None:
+        return 0
+    if swiglu_limit < 0 or swiglu_limit != int(swiglu_limit):
+        raise ValueError(
+            "FlashInfer SM120 MegaMOE supports only a non-negative integral "
+            f"swiglu_limit, got {swiglu_limit}."
+        )
+    return int(swiglu_limit)
+
+
+def _sm120_cake_megamoe_config(layer: FusedMoE) -> Any:
+    from flashinfer.moe_ep import Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig
+
+    return Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(
+        intermediate_size=layer.intermediate_size_per_partition,
+        top_k=layer.top_k,
+        swiglu_limit=_cake_swiglu_limit(layer.moe_runner_config.swiglu_limit),
+        transport_table=envs.SGLANG_FLASHINFER_MEGAMOE_SM120_TRANSPORT_TABLE.get(),
+    )
+
+
+def _ue8m0_exponent_bytes(scale: torch.Tensor) -> torch.Tensor:
+    """UE8M0 exponent bytes of block scales stored as float32 powers of two."""
+    if scale.dtype == torch.float8_e8m0fnu:
+        return scale.view(torch.uint8)
+    exponents = scale.to(torch.float8_e8m0fnu)
+    if not torch.equal(exponents.to(scale.dtype), scale):
+        raise ValueError(
+            "FlashInfer SM120 MegaMOE requires power-of-two (UE8M0) FP4 block scales."
+        )
+    return exponents.view(torch.uint8)
+
+
+def _prepare_sm120_cake_weights(layer: FusedMoE) -> None:
+    from flashinfer.moe_ep import (
+        MoEWeightPack,
+        preprocess_sm120_mxfp4_mxfp8_cake_mega_weights,
+    )
+
+    from sglang.srt.layers.utils.common import copy_or_rebind_param
+
+    w13 = layer.w13_weight.data.view(torch.uint8)
+    w2 = layer.w2_weight.data.view(torch.uint8)
+    transformed = preprocess_sm120_mxfp4_mxfp8_cake_mega_weights(
+        MoEWeightPack(
+            w13=w13,
+            w2=w2,
+            w13_scale=_ue8m0_exponent_bytes(layer.w13_weight_scale_inv.data),
+            w2_scale=_ue8m0_exponent_bytes(layer.w2_weight_scale_inv.data),
+        ),
+        hidden_size=layer.hidden_size,
+        intermediate_size=layer.intermediate_size_per_partition,
+    )
+    # FC1 is a gate/up row permutation of w13 and FC2 is w2 itself: write FC1
+    # back into w13 and alias both, so the experts stay resident only once.
+    w13.copy_(transformed.w1_fp4)
+    copy_or_rebind_param(layer, "w13_weight_scale_inv", transformed.w1_sfb)
+    copy_or_rebind_param(layer, "w2_weight_scale_inv", transformed.w2_sfb)
+    layer._flashinfer_megamoe_cake_weights = dataclasses.replace(
+        transformed,
+        w1_fp4=w13,
+        w2_fp4=w2,
+        w1_sfb=layer.w13_weight_scale_inv.data,
+        w2_sfb=layer.w2_weight_scale_inv.data,
     )
 
 
@@ -418,6 +536,9 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
     DeepGEMM scale layout transforms.
     """
     _init_flashinfer_megamoe_layer_state(layer)
+    if _uses_sm120_cake():
+        _prepare_sm120_cake_weights(layer)
+        return
 
     from flashinfer.moe_ep import (
         MoEWeightPack,

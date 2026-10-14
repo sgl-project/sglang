@@ -53,6 +53,9 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=types.SimpleNamespace(
             get=lambda: False
         ),
+        SGLANG_FLASHINFER_MEGAMOE_SM120_TRANSPORT_TABLE=types.SimpleNamespace(
+            get=lambda: "lsa_where_reachable"
+        ),
     )
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
@@ -476,6 +479,222 @@ def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
         assert packed.dtype == torch.int32
 
     assert dgm.pack_ue8m0_to_int is original
+
+
+def _install_sm120_fakes(monkeypatch, *, dp_counts=None):
+    runtime_context = sys.modules["sglang.srt.runtime_context"]
+    runtime_context.get_platform = lambda: types.SimpleNamespace(is_sm120=True)
+    runtime_context.get_parallel = lambda: types.SimpleNamespace(
+        moe_ep_group=types.SimpleNamespace(device_group="ep_group")
+    )
+    dp_attention = types.ModuleType("sglang.srt.layers.dp_attention")
+    dp_attention.get_dp_global_num_tokens = lambda: dp_counts
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.dp_attention", dp_attention)
+
+    def copy_or_rebind_param(module, name, new_value):
+        param = getattr(module, name)
+        if param.shape == new_value.shape and param.dtype == new_value.dtype:
+            param.data.copy_(new_value)
+        else:
+            param.data = new_value
+
+    layer_utils = types.ModuleType("sglang.srt.layers.utils.common")
+    layer_utils.copy_or_rebind_param = copy_or_rebind_param
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.utils.common", layer_utils)
+
+
+def _install_fake_moe_ep(monkeypatch, **attrs):
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    for name, value in attrs.items():
+        setattr(fake_moe_ep, name, value)
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.moe_ep = fake_moe_ep
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+
+
+def test_sm120_forward_stages_the_dp_wide_bucket_with_int64_ids(monkeypatch):
+    """Every EP rank must stage the same row bucket, the max over all DP ranks."""
+    module = _load_megamoe_module(monkeypatch)
+    _install_sm120_fakes(monkeypatch, dp_counts=[3, 0, 7, 5])
+
+    topk_ids = torch.tensor([[0, 5], [-1, -1], [9, 2]], dtype=torch.int32)
+    tensors = types.SimpleNamespace(
+        hidden_states=torch.zeros((3, 4), dtype=torch.bfloat16),
+        topk_ids=topk_ids,
+        topk_weights=torch.ones((3, 2), dtype=torch.float32),
+    )
+    output_view = torch.empty((3, 4), dtype=torch.bfloat16)
+
+    class Mega:
+        def stage_inputs(self, t, *, compile_tokens_per_rank):
+            self.staged = (t, compile_tokens_per_rank)
+
+        def compute_staged(self, *, output):
+            self.output = output
+            return output_view
+
+    mega = Mega()
+    result = module._forward_megamoe_bucketed(mega, tensors)
+
+    staged, bucket = mega.staged
+    assert bucket == 7
+    assert staged.topk_ids.dtype == torch.int64
+    assert torch.equal(staged.topk_ids, topk_ids.to(torch.int64))
+    assert mega.output is None
+    assert result is output_view
+
+
+def test_sm120_forward_requires_dp_token_counts(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    _install_sm120_fakes(monkeypatch, dp_counts=None)
+
+    with pytest.raises(RuntimeError, match="DP-attention token counts"):
+        module._forward_megamoe_bucketed(object(), object())
+
+
+def test_sm120_fp4_layer_builds_cake_with_one_bucketed_workspace(monkeypatch):
+    """SM120 must build the cake config and skip startup tuning, whose
+    per-capacity workspaces would each compile a kernel and map NCCL windows."""
+    module = _load_megamoe_module(monkeypatch)
+    _install_sm120_fakes(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    built = {}
+
+    def CakeConfig(**fields):
+        return types.SimpleNamespace(knobs=None, **fields)
+
+    def record(name):
+        def build(**kwargs):
+            built[name] = kwargs
+            return types.SimpleNamespace(**kwargs)
+
+        return build
+
+    _install_fake_moe_ep(
+        monkeypatch,
+        Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig=CakeConfig,
+        BootstrapConfig=record("bootstrap"),
+        FleetParams=record("fleet"),
+        MegaConfig=record("backend"),
+        MoEEpMegaLayer=record("layer"),
+    )
+    cake_weights = object()
+    layer = types.SimpleNamespace(
+        _flashinfer_megamoe_layer=None,
+        _flashinfer_megamoe_cake_weights=cake_weights,
+        layer_id=0,
+        moe_ep_size=4,
+        moe_ep_rank=1,
+        num_experts=288,
+        hidden_size=4096,
+        intermediate_size_per_partition=2048,
+        top_k=6,
+        moe_runner_config=types.SimpleNamespace(swiglu_limit=10.0),
+    )
+
+    module.ensure_fp4_moe_layer_for_flashinfer_megamoe(layer)
+
+    config = built["backend"]["megakernel"]
+    assert config == CakeConfig(
+        intermediate_size=2048,
+        top_k=6,
+        swiglu_limit=10,
+        transport_table="lsa_where_reachable",
+    )
+    assert built["backend"]["preprocess_weights"] is False
+    assert built["backend"]["transformed_weights"] is cake_weights
+    assert built["fleet"]["num_experts"] == 288
+    assert built["bootstrap"]["process_group"] == "ep_group"
+    assert layer._flashinfer_megamoe_forward is module._forward_megamoe_bucketed
+
+
+@pytest.mark.parametrize("limit, expected", [(None, 0), (0.0, 0), (10.0, 10)])
+def test_cake_swiglu_limit_is_compiled_in_as_an_integer(monkeypatch, limit, expected):
+    module = _load_megamoe_module(monkeypatch)
+
+    assert module._cake_swiglu_limit(limit) == expected
+
+
+@pytest.mark.parametrize("limit", [7.5, -1.0])
+def test_cake_swiglu_limit_rejects_unrepresentable_values(monkeypatch, limit):
+    module = _load_megamoe_module(monkeypatch)
+
+    with pytest.raises(ValueError, match="integral swiglu_limit"):
+        module._cake_swiglu_limit(limit)
+
+
+def test_ue8m0_exponent_bytes_are_exact(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    scales = torch.tensor([2.0**-3, 1.0, 2.0**4], dtype=torch.float32)
+
+    assert module._ue8m0_exponent_bytes(scales).tolist() == [124, 127, 131]
+    e8m0 = scales.to(torch.float8_e8m0fnu)
+    assert module._ue8m0_exponent_bytes(e8m0).data_ptr() == e8m0.data_ptr()
+    with pytest.raises(ValueError, match="power-of-two"):
+        module._ue8m0_exponent_bytes(torch.tensor([0.75], dtype=torch.float32))
+
+
+def test_sm120_prepare_keeps_one_resident_copy_of_the_experts(monkeypatch):
+    """FC1 must be written back into w13 and both FC operands must alias the
+    layer weights; the float32 checkpoint scales must not stay resident."""
+    from dataclasses import dataclass
+
+    module = _load_megamoe_module(monkeypatch)
+    _install_sm120_fakes(monkeypatch)
+
+    # Stands in for FlashInfer's frozen TransformedCakeMegaWeights dataclass.
+    @dataclass(frozen=True)
+    class Transformed:
+        w1_fp4: torch.Tensor
+        w1_sfb: torch.Tensor
+        w2_fp4: torch.Tensor
+        w2_sfb: torch.Tensor
+
+    seen = {}
+
+    def preprocess(pack, *, hidden_size, intermediate_size):
+        seen["pack"] = pack
+        return Transformed(
+            w1_fp4=pack.w13.flip(1).contiguous(),
+            w1_sfb=torch.arange(4, dtype=torch.int32),
+            w2_fp4=pack.w2,
+            w2_sfb=torch.arange(2, dtype=torch.int32),
+        )
+
+    _install_fake_moe_ep(
+        monkeypatch,
+        MoEWeightPack=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        preprocess_sm120_mxfp4_mxfp8_cake_mega_weights=preprocess,
+    )
+    layer = torch.nn.Module()
+    w13 = torch.arange(2 * 4 * 2, dtype=torch.int8).reshape(2, 4, 2)
+    expected_fc1 = w13.view(torch.uint8).flip(1).clone()
+    layer.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(
+        torch.ones((2, 2, 1), dtype=torch.int8), requires_grad=False
+    )
+    layer.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.full((2, 4, 1), 2.0**-3), requires_grad=False
+    )
+    layer.w2_weight_scale_inv = torch.nn.Parameter(
+        torch.full((2, 2, 1), 2.0), requires_grad=False
+    )
+    layer.hidden_size = 64
+    layer.intermediate_size_per_partition = 64
+
+    module.prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
+
+    cake = layer._flashinfer_megamoe_cake_weights
+    assert torch.equal(layer.w13_weight.data.view(torch.uint8), expected_fc1)
+    assert cake.w1_fp4.data_ptr() == layer.w13_weight.data_ptr()
+    assert cake.w2_fp4.data_ptr() == layer.w2_weight.data_ptr()
+    assert cake.w1_sfb.data_ptr() == layer.w13_weight_scale_inv.data_ptr()
+    assert cake.w2_sfb.data_ptr() == layer.w2_weight_scale_inv.data_ptr()
+    assert layer.w13_weight_scale_inv.dtype == torch.int32
+    assert seen["pack"].w13_scale.dtype == torch.uint8
+    assert seen["pack"].w13_scale.unique().tolist() == [124]
+    assert seen["pack"].w2_scale.unique().tolist() == [128]
 
 
 if __name__ == "__main__":
