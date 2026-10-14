@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -598,7 +599,9 @@ class DSparkDraftMixin:
         device = weights[0].device
         w_all = torch.cat(weights, dim=0).contiguous()
         knw = torch.stack(knws).to(device)
-        meta = torch.tensor(meta_rows, dtype=torch.int64, device=device)
+        # k_buf/v_buf data_ptr() can set the top bit on XPU (USM addresses),
+        # which dtype=torch.int64 rejects while unpacking; pack unsigned and view.
+        meta = make_ptr_table(meta_rows, device=device)
         cos_sin = rotary.cos_sin_cache.to(device)
         return (w_all, meta, knw, cos_sin, eps, len(layers), kv_size, head_dim)
 
