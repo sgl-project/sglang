@@ -2018,6 +2018,9 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
+        self.dcp_size = (
+            1 if (is_nextn and self.use_dsa) else get_parallel().attn_dcp_size
+        )
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -2156,9 +2159,9 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
-        if get_parallel().dcp_enabled:
+        if self.dcp_size > 1:
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads * self.dcp_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,
@@ -3441,7 +3444,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu:
+        if _is_npu or is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

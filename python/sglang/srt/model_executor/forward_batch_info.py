@@ -629,12 +629,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
+    watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
     # CUDA-graph runners may capture only the transformer body and execute the
     # logits processor eagerly after replay.
     defer_logits_to_eager: bool = False
+    # Full prefill graph capture uses a fixed request axis whose inactive slots
+    # must not participate in data-dependent row selection.
+    full_prefill_cuda_graph_capture: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -993,6 +998,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
+        watermark_state = (
+            model_runner.watermark_state
+            if isinstance(model_runner, ModelRunner)
+            else None
+        )
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -1054,6 +1067,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            watermark_prompt_tail_ids=(
+                watermark_state.prompt_tails(batch)
+                if watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+                else None
+            ),
+            watermark_context_hash_history=(
+                watermark_state.retracted_context_hashes(batch)
+                if watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+                else None
+            ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

@@ -298,7 +298,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.events import LoRANameTable
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -1086,6 +1086,9 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
 
+    # Not DynamicGradMode: tensors created under inference mode here could not
+    # be written in place by the no_grad disagg event loops.
+    @torch.no_grad()
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
         self.tp_worker.init_cuda_graphs()
@@ -2137,6 +2140,13 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
 
         for recv_req in recv_reqs:
+            # Before any early exit, so every request releases its CUDA IPC pool slot.
+            for tokenized_req in self._tokenized_requests(recv_req):
+                if tokenized_req.positional_embed_overrides is not None:
+                    tokenized_req.positional_embed_overrides.reconstruct(
+                        get_device().gpu_id
+                    )
+
             vmm_errors = None
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
@@ -2349,6 +2359,9 @@ class Scheduler(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
 
+    def get_prefill_adder_class(self) -> type[PrefillAdder]:
+        return PrefillAdder
+
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
 
@@ -2438,7 +2451,9 @@ class Scheduler(
 
     def init_kv_event_lora_names(self) -> None:
         """Init the table that maps lora_id to adapter name for KV events."""
-        self.kv_event_lora_names = LoRANameTable.from_lora_refs(get_lora().lora_paths)
+        self.kv_event_lora_names = KvEventLoraNames.from_lora_refs(
+            get_lora().lora_paths
+        )
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
@@ -2765,6 +2780,15 @@ class Scheduler(
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
 
+    def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
+        # Keyed by the final extra_key, so it must run after elastic namespacing.
+        # Only a cache whose events are taken prunes the table.
+        if (
+            self.kv_events_publisher.enable_kv_cache_events
+            and self.tree_cache.supports_prefix_sharing()
+        ):
+            self.kv_event_lora_names.register(req, lora_name)
+
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
             get_exec().moe.elastic_ep_backend is None
@@ -2977,6 +3001,7 @@ class Scheduler(
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
@@ -3553,6 +3578,7 @@ class Scheduler(
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
@@ -3718,6 +3744,11 @@ class Scheduler(
             batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
         )
         batch.input_ids = None
+
+        if not batch.spec_algorithm.is_none():
+            batch.spec_info = self.future_map.make_staged_spec_input(
+                batch.req_pool_indices
+            )
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -4013,7 +4044,7 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
-        adder = PrefillAdder(
+        adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
@@ -4099,6 +4130,7 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
+                req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -4119,12 +4151,11 @@ class Scheduler(
                 self._prefetch_after_device_hit_loss(req)
             ):
                 continue
-            if (
-                self.enable_hicache_storage
-                and buffer_pipeline is not None
-                and not buffer_pipeline.prepare_staged_prefetch(req)
-            ):
-                continue
+            if self.enable_hicache_storage and buffer_pipeline is not None:
+                staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
+                req.time_stats.observe_storage_staging_ready(staging_ready)
+                if not staging_ready:
+                    continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4204,6 +4235,7 @@ class Scheduler(
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
+        new_batch.hisparse_coordinator = self.hisparse_coordinator
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

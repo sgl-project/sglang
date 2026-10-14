@@ -674,9 +674,11 @@ class LocalAttention(nn.Module):
         default_attention_backend: AttentionBackendEnum | None = None,
         is_cross_attention: bool = False,
         compute_dtype: torch.dtype | None = None,
+        capture_dense_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         super().__init__()
+        self.capture_dense_attention = capture_dense_attention
         if softmax_scale is None:
             self.softmax_scale = head_size**-0.5
         else:
@@ -825,6 +827,7 @@ class USPAttention(nn.Module):
         skip_sequence_parallel: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         is_cross_attention: bool = False,
+        capture_dense_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -842,6 +845,7 @@ class USPAttention(nn.Module):
               for cross-attention while remaining strict for self-attention.
         """
         super().__init__()
+        self.capture_dense_attention = capture_dense_attention
         if softmax_scale is None:
             self.softmax_scale = head_size**-0.5
         else:
@@ -1680,10 +1684,9 @@ class USPAttention(nn.Module):
                 "Replicated prefix and suffix cannot be used at the same time."
             )
 
-        # slicing along dim 1 keeps the original row stride, so the shard is
-        # contiguous only while the batch dim is 1; all_gather_into_tensor
-        # requires a contiguous input, so materialize the shard before the
-        # collective
+        # A dim-1 slice keeps the original row stride, and Flux2 K/V are views
+        # from qkv.chunk, so neither form is contiguous. all_gather_into_tensor
+        # rejects a non-contiguous input, so materialize before the collective.
         if num_replicated_prefix:
             replicated = tensor[:, :num_replicated_prefix]
             sharded = tensor[:, num_replicated_prefix:].contiguous()
@@ -1696,7 +1699,7 @@ class USPAttention(nn.Module):
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([gathered, replicated], dim=1)
 
-        return sequence_model_parallel_all_gather(tensor, dim=1)
+        return sequence_model_parallel_all_gather(tensor.contiguous(), dim=1)
 
     def _forward_with_kv_gather(
         self,
@@ -2341,8 +2344,22 @@ def _make_breakable_attention_forward(forward_method):
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
         if is_in_breakable_cuda_graph():
-            out = bcg_forward(self, *args, **kwargs)
-            return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
+            # Opt-in for model paths with fixed-shape dense attention. SP,
+            # varlen and other backends retain the normal eager break points.
+            capture_dense = (
+                getattr(self, "capture_dense_attention", False)
+                and get_sequence_parallel_world_size() == 1
+                and kwargs.get("seq_lens") is None
+                and kwargs.get("attn_mask_meta") is None
+                and self.backend
+                in (
+                    AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+                )
+            )
+            if not capture_dense:
+                out = bcg_forward(self, *args, **kwargs)
+                return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
         return forward_method(self, *args, **kwargs)
 
     return forward
