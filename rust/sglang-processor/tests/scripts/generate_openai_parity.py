@@ -40,6 +40,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers.common import get_context_length
@@ -158,6 +159,8 @@ def record_frames(engine_url, body):
     for line in response.iter_lines(decode_unicode=True):
         if line.startswith("data: ") and line != "data: [DONE]":
             frames.append(json.loads(line[len("data: ") :]))
+    # Unread keys can appear in one frame only, which deltas cannot express.
+    trim_meta({"frames": frames})
     return {"status": 200, "frames": stream_frames(frames, store=True)}
 
 
@@ -221,7 +224,7 @@ def lower(case, settings, model):
         create_abort_task=lambda obj: None,
     )
     # A checkpoint without a Jinja template, as DeepSeek-V4's.
-    template_manager = SimpleNamespace(
+    template_manager = model.template_manager or SimpleNamespace(
         completion_template_name=settings.get("completion_template"),
         chat_template_name=None,
         jinja_template_content_format="string",
@@ -263,6 +266,16 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
     return recorded
 
 
+def load_template_manager(path, tokenizer):
+    """The server's `TemplateManager` for a checkpoint with a Jinja template."""
+    if not tokenizer.chat_template:
+        return None
+    manager = TemplateManager()
+    owner = SimpleNamespace(tokenizer=tokenizer, processor=None)
+    manager.load_chat_template(owner, None, path)
+    return manager
+
+
 def load_model(path):
     config = json.loads(Path(path, "config.json").read_text())
     generation_file = Path(path, "generation_config.json")
@@ -270,9 +283,11 @@ def load_model(path):
         json.loads(generation_file.read_text()) if generation_file.exists() else {}
     )
     keys = ("repetition_penalty", "temperature", "top_k", "top_p", "min_p")
+    tokenizer = get_tokenizer(path, trust_remote_code=True)
     return SimpleNamespace(
         path=path,
-        tokenizer=get_tokenizer(path, trust_remote_code=True),
+        tokenizer=tokenizer,
+        template_manager=load_template_manager(path, tokenizer),
         hf_config=SimpleNamespace(**config, to_dict=lambda: config),
         text_config=SimpleNamespace(**config.get("text_config", config)),
         sampling_defaults={
@@ -288,11 +303,29 @@ def generate(path, model, engine_url):
         "context_length": get_context_length(model.text_config),
         "generation_config": model.sampling_defaults,
     }
+    config = model.template_manager and model.template_manager.reasoning_config
+    if config is not None and config.special_case == "always":
+        fixture["chat_model"]["always_thinks"] = True
+    elif (
+        config is not None
+        and config.toggle_param
+        and config.default_enabled is not None
+    ):
+        fixture["chat_model"]["reasoning_toggle"] = {
+            "toggle_param": config.toggle_param,
+            "default_enabled": config.default_enabled,
+        }
     defaults = generate_defaults()
     fixture["generate_defaults"] = {
         name: value for name, value in defaults.items() if name not in SKIPPED_FIELDS
     }
     settings = fixture.get("settings", {})
+    # The encoder SGLang renders with; its OpenAI layer special-cases `kimi_k3`.
+    handler = lower(
+        {"endpoint": "chat", "request": BARE_REQUESTS["chat"]}, settings, model
+    )[0]
+    if handler.chat_encoding_spec is not None:
+        fixture["chat_model"]["chat_encoding_spec"] = handler.chat_encoding_spec
     fixture["sampling_defaults"] = {
         endpoint: lower({"endpoint": endpoint, "request": bare}, settings, model)[
             2
