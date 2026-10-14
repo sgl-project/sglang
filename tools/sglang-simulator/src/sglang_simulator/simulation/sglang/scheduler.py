@@ -364,8 +364,9 @@ class C_SchedulerHook(BaseHook):
             # Accept both a plan wrapper and a direct batch return value.
             new_batch = getattr(result, "batch_to_run", result)
 
-            # A plan reports the running batch before self.running_batch is updated.
-            running_batch = getattr(result, "running_batch", self.running_batch)
+            # The requests already decoding; this step's admissions join them
+            # at launch.
+            num_decoding = len(self.decoding)
 
             now = time.time()
             if new_batch is not None:
@@ -380,15 +381,14 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request
                         pass
-            elif len(running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
+            elif num_decoding == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
                 StateManager.step_global_clock(0.005)
                 StateManager.set_current_inference_dur(0.005)
             else:
                 # Idle stage, there are some requests pendding in the future queue.
                 if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE and (
-                    C_SchedulerHook.REQ_DISPATCHER.has_next()
-                    and len(running_batch.reqs) == 0
+                    C_SchedulerHook.REQ_DISPATCHER.has_next() and num_decoding == 0
                 ):
                     next_created_time = (
                         C_SchedulerHook.REQ_DISPATCHER.next_req_from_future_ts()
