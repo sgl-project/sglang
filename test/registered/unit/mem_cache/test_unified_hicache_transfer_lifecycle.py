@@ -30,7 +30,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -281,6 +281,63 @@ class TestFloatSwaReservation(_ConfigCase):
         self.assertIn(("move", "swa"), moves)
 
 
+class TestCallerOwnedLoadDestination(_ConfigCase):
+    """A load into rows the caller already owns allocates nothing, keeps those
+    rows when it rolls back, and binds KV-derived side pools to the caller's
+    anchor rows rather than to the destination."""
+
+    def test_load_into_caller_owned_rows_allocates_nothing_and_keeps_them(self):
+        allocator, _ = _unified_swa()
+        full = allocator.full_attn_allocator
+        owned = allocator.alloc(PAGE)
+        anchor = allocator.alloc(PAGE)
+        allocated = full.allocated_count()
+        host_indices = torch.arange(PAGE)
+
+        controller = object.__new__(HybridCacheController)
+        controller.mem_pool_device_allocator = allocator
+        controller.device = "cpu"
+        controller.load_queue, controller.ack_load_queue = [], []
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.SWA: SimpleNamespace(
+                    device_alloc_fn=lambda size: None,
+                    device_free_fn=lambda indices: None,
+                    device_evict_fn=None,
+                )
+            }
+        )
+
+        # A side pool that cannot allocate cancels the load; the destination
+        # rows were never the load's to free.
+        self.assertIsNone(
+            controller.load(
+                host_indices=host_indices,
+                extra_pools=[
+                    PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(PAGE))
+                ],
+                device_indices=owned,
+                anchor_indices=anchor,
+            )
+        )
+        self.assertEqual(controller.load_queue, [])
+        self.assertEqual(full.allocated_count(), allocated)
+
+        derived = PoolTransfer(name=PoolName.SWA, indices_from_pool=PoolName.KV)
+        self.assertIs(
+            controller.load(
+                host_indices=host_indices,
+                extra_pools=[derived],
+                device_indices=owned,
+                anchor_indices=anchor,
+            ),
+            owned,
+        )
+        self.assertEqual(full.allocated_count(), allocated)
+        self.assertIs(controller.load_queue[-1].device_indices, owned)
+        self.assertIs(derived.device_indices, anchor)
+
+
 class TestAllocationAndTransferOrder(_ConfigCase):
     """Allocation reuses free pages without waiting on HiCache copies."""
 
@@ -466,7 +523,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.finished.return_value = False
         req.materialized_host_hit_len.return_value = match.host_hit_length
         req.fulfilled_storage_hit_len.return_value = 0
-        req.kv = SimpleNamespace(
+        req.kv = ReqKvInfo(
             cache_protected_len=match.device_prefix_len, mamba_pool_idx=None
         )
         type(req).extend_len = mock.PropertyMock(

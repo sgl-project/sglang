@@ -17,6 +17,7 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::HttpLayer;
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
 
@@ -119,9 +120,10 @@ impl Drop for Runtime {
     }
 }
 
-/// Boot the whole frontend. Returns once threads are spawned (non-blocking).
+/// Boot the whole frontend, `http_layer` wrapping the HTTP app (see
+/// [`HttpLayer`]). Returns once threads are spawned (non-blocking).
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
-pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
+pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtime, String> {
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
@@ -346,6 +348,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                         http_listener,
                         core,
                         cfg.server_args.clone(),
+                        http_layer,
                         shutdown_rx.clone(),
                     );
                     if let Some((listener, service)) = grpc_server {
@@ -492,7 +495,7 @@ mod tests {
             server_args: Arc::new(server_args),
         };
         // Bind is synchronous in `start`, so the port is already accepting.
-        let rt = start(cfg).expect("start runtime");
+        let rt = start(cfg, None).expect("start runtime");
         assert!(
             std::net::TcpStream::connect(addr).is_ok(),
             "server not listening on {addr} after start returned",
@@ -527,7 +530,7 @@ mod tests {
             },
             server_args: Arc::new(server_args),
         };
-        let rt = start(cfg).expect("start runtime");
+        let rt = start(cfg, None).expect("start runtime");
 
         // Fire a request that will block (already-tokenized → valid → pushed to the
         // ring, then the handler awaits decode frames that never arrive).
@@ -572,7 +575,7 @@ mod tests {
             },
             server_args: Arc::new(server_args),
         };
-        let rt = start(cfg).expect("start runtime");
+        let rt = start(cfg, None).expect("start runtime");
 
         // ~3MB of input_ids plus a `text`, which is mutually exclusive with them:
         // the body parses in full and is then rejected by `into_requests` with a
@@ -616,6 +619,48 @@ mod tests {
         rt.request_shutdown();
     }
 
+    /// An embedding package's `http_layer` wraps the served app: its own route
+    /// serves, and its middleware sees the built-in routes' responses.
+    #[test]
+    fn http_layer_wraps_the_served_app() {
+        use std::io::{Read, Write};
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let layer: HttpLayer = Arc::new(|app: axum::Router| {
+            app.route("/embedder", axum::routing::get(|| async { "embedded" }))
+                .layer(axum::middleware::map_response(
+                    |mut response: axum::response::Response| async move {
+                        response
+                            .headers_mut()
+                            .insert("x-embedder", axum::http::HeaderValue::from_static("1"));
+                        response
+                    },
+                ))
+        });
+        let rt = start(test_config(addr, None), Some(layer)).expect("start runtime");
+        let get = |path: &str| {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            write!(
+                conn,
+                "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        };
+        let model_info = get("/model_info");
+        assert!(model_info.starts_with("HTTP/1.1 200"), "{model_info}");
+        assert!(model_info.contains("x-embedder: 1"), "{model_info}");
+        let embedded = get("/embedder");
+        assert!(embedded.starts_with("HTTP/1.1 200"), "{embedded}");
+        assert!(embedded.ends_with("\r\n\r\nembedded"), "{embedded}");
+
+        rt.request_shutdown();
+    }
+
     /// Regression: a port conflict must fail `start` (so the scheduler doesn't
     /// advertise ready), not return an `Ok` runtime whose listener never binds.
     #[test]
@@ -633,7 +678,7 @@ mod tests {
             },
             server_args: Arc::new(server_args),
         };
-        let err = match start(cfg) {
+        let err = match start(cfg, None) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),
             Err(e) => e,
         };
@@ -653,7 +698,7 @@ mod tests {
         let http_addr = http_probe.local_addr().unwrap();
         drop(http_probe);
 
-        let error = match start(test_config(http_addr, Some(grpc_addr))) {
+        let error = match start(test_config(http_addr, Some(grpc_addr)), None) {
             Ok(_) => panic!("gRPC bind conflict must fail startup"),
             Err(error) => error,
         };
@@ -674,7 +719,7 @@ mod tests {
         use std::time::Duration;
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
-        let rt = start(test_config(http_addr, Some(grpc_addr))).expect("start runtime");
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
         assert!(std::net::TcpStream::connect(http_addr).is_ok());
 
         let client_runtime = tokio::runtime::Builder::new_current_thread()
@@ -739,7 +784,7 @@ mod tests {
         use tonic::Code;
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
-        let rt = start(test_config(http_addr, Some(grpc_addr))).expect("start runtime");
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
         let client_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -780,7 +825,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
-        let rt = start(test_config(http_addr, Some(grpc_addr))).expect("start runtime");
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
         let client_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()

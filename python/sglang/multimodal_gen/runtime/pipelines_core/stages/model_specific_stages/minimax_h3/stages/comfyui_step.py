@@ -193,11 +193,14 @@ def _layout_signature_matches(
     if len(values) < 5:
         return False
     text_len, latent_t, latent_h, latent_w, audio_t = values
+    _, patch_h, patch_w = _PATCH_SIZE
+    padded_h = (int(video_x.shape[3]) + patch_h - 1) // patch_h * patch_h
+    padded_w = (int(video_x.shape[4]) + patch_w - 1) // patch_w * patch_w
     return (
         text_len == int(text.shape[0])
         and latent_t == int(video_x.shape[2])
-        and latent_h == int(video_x.shape[3])
-        and latent_w == int(video_x.shape[4])
+        and latent_h == padded_h
+        and latent_w == padded_w
         and audio_t == int(audio_x.shape[-1])
     )
 

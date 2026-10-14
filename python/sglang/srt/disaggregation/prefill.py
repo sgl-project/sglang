@@ -1177,6 +1177,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if req.return_routed_experts:
+                    self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree

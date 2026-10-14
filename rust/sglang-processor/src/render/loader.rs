@@ -9,7 +9,7 @@ use super::legacy::{
     LegacyFormatter, builtin_template, infer_legacy_template_from_model_path, parse_legacy_template,
 };
 use super::thinking::ThinkingTemplates;
-use super::{ChatFormatter, TemplateError};
+use super::{ChatFormatter, TemplateError, is_glm53};
 
 pub fn load_chat_formatter(
     config_file: Option<&str>,
@@ -116,8 +116,10 @@ fn set_chat_template(config: &mut Value, chat_template: Value) -> Result<(), Tem
 
 impl ChatFormatter {
     /// Build the HuggingFace formatter from parsed `tokenizer_config.json`
-    /// contents, which must carry a `chat_template`.
+    /// contents, which must carry a `chat_template`; GLM-5.3's template builds
+    /// [`ChatFormatter::Glm53`].
     pub fn from_tokenizer_config(config: &Value) -> Result<Self, TemplateError> {
+        let glm53 = config["chat_template"].as_str().is_some_and(is_glm53);
         let thinking = ThinkingTemplates::from_config(config);
         let template: ChatTemplate = serde_json::from_value(config.clone())
             .map_err(|source| TemplateError::Config { source })?;
@@ -132,9 +134,13 @@ impl ChatFormatter {
         .map_err(|error| TemplateError::Renderer {
             message: error.to_string(),
         })?;
-        Ok(Self::HuggingFace {
-            formatter,
-            thinking,
+        Ok(if glm53 {
+            Self::Glm53(formatter)
+        } else {
+            Self::HuggingFace {
+                formatter,
+                thinking,
+            }
         })
     }
 }

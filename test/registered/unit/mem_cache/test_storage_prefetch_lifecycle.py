@@ -553,6 +553,48 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
 
+    def test_unservable_anchor_declines_before_any_staging(self):
+        """A resident but unreadable device prefix must decline the fetch
+        outright: nothing is allocated or parked for a retry, and the loss is
+        counted under its own reason rather than anchor loss or host capacity."""
+        cache = _hit_drain_fixture()
+        handle = CacheRequestHandle("unservable", 0)
+        operation = SimpleNamespace(
+            request_id="unservable",
+            handle=handle,
+            storage_hit_count=6,
+            stats_requested_tokens=8,
+            is_terminated=lambda: False,
+            all_hash_values=None,
+        )
+        cache.ongoing_prefetch[handle] = _OngoingPrefetch(
+            0, RadixKey(array("q", range(8))), None, operation, None, {}
+        )
+        cache.buffer_pipeline.try_lock_anchor = Mock(return_value=("unservable", 2))
+        cache.cache_controller.prefetch_rate_limited = lambda: False
+        cache.cache_controller.prefetch_hit_queue.put(operation)
+        cache._storage_prefetch_hit_remaining_by_reqid[handle] = 6
+        cache.storage_metrics_collector = Mock()
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=1,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        stats = cache._prefetch_outcome_stats
+        self.assertEqual(
+            (stats["declined_unservable_prefix"], stats["declined_anchor_lost"]),
+            (1, 0),
+        )
+        self.assertEqual(list(cache.buffer_pipeline.pending_hit_allocs), [])
+        cache.revoke_pending_prefetch.assert_called_once_with(handle)
+        collector = cache.storage_metrics_collector
+        collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            6, "unservable_prefix"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -181,7 +181,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                 self.assertIs(runner.prepare_dummy_forward_batch(batch), batch)
                 self.assertEqual(batch.attn_tp_sequence_sharded, expected)
 
-    def test_capture_prepare_applies_model_runner_batch_hook(self):
+    def _capture_runner(self, *, prefill_backend_name, capture_req_slots):
         class Slot:
             def __init__(self, buffer):
                 self.buffer = buffer
@@ -213,9 +213,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.model_runner = model_runner
         runner.device = torch.device("cpu")
-        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.prefill_backend_name = prefill_backend_name
         runner.max_context_size = None
-        runner._capture_req_slots = 1
+        runner._capture_req_slots = capture_req_slots
         runner.max_bs = 4
         runner._prefill_static_buffers = None
         runner.buffer_registry = registry
@@ -231,12 +231,36 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.tbo_plugin = SimpleNamespace(
             capture_one_batch_size=lambda batch, **_: captured.append(batch)
         )
+        return runner, prepared, captured, attention_backend
+
+    def test_capture_prepare_applies_model_runner_batch_hook(self):
+        runner, prepared, captured, attention_backend = self._capture_runner(
+            prefill_backend_name=Backend.BREAKABLE, capture_req_slots=1
+        )
 
         batch, backend = runner.capture_prepare(4)
 
         self.assertEqual(prepared, [batch])
         self.assertEqual(captured, [batch])
         self.assertIs(backend, attention_backend)
+
+    def test_capture_prepare_marks_full_prefill_capture(self):
+        """Only Full capture batches carry zero-length padding request slots.
+
+        A model that selects rows per request reads the flag to keep those
+        slots out of the selection; a Breakable capture has no such slots.
+        """
+        for backend_name, expected in (
+            (Backend.FULL, True),
+            (Backend.BREAKABLE, False),
+        ):
+            with self.subTest(backend=backend_name):
+                runner, _, _, _ = self._capture_runner(
+                    prefill_backend_name=backend_name, capture_req_slots=2
+                )
+                batch, _ = runner.capture_prepare(4)
+                self.assertEqual(batch.full_prefill_cuda_graph_capture, expected)
+                self.assertEqual(batch.batch_size, 2 if expected else 1)
 
     def test_trim_logits_output_preserves_customized_info(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)

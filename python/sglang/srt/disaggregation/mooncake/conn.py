@@ -1320,14 +1320,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
-            assert compression_ratios is not None
-            if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
-                start = self.kv_args.prefill_start_layer
-                end = self.kv_args.prefill_end_layer
-                assert end is not None
-                compression_ratios = compression_ratios[start:end]
-            c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
-            dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
+            if compression_ratios is not None:
+                if len(dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs):
+                    start = self.kv_args.prefill_start_layer
+                    end = self.kv_args.prefill_end_layer
+                    assert end is not None
+                    compression_ratios = compression_ratios[start:end]
+                host_backed_kv_count = sum(ratio == 4 for ratio in compression_ratios)
+            else:
+                # The remote target prefix is host-backed, even across PP stages;
+                # only the draft suffix uses logical device page IDs.
+                num_draft_entries = self.kv_args.num_draft_entries
+                if not 0 < num_draft_entries < len(dst_kv_ptrs):
+                    raise ValueError(
+                        "HiSparse spec PD transfer requires an appended device-only "
+                        "draft KV buffer"
+                    )
+                host_backed_kv_count = len(dst_kv_ptrs) - num_draft_entries
+            dst_device_kv_ptrs = set(dst_kv_ptrs[host_backed_kv_count:])
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -1949,7 +1959,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 if (
                     target_rank_registration_info is not None
-                    and self.attn_tp_size
+                    and self.state_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
                     rc = (
@@ -2281,7 +2291,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         logger.warning_once(
             "Using Mamba state slice transfer for different runtime attention TP "
-            f"sizes: prefill={self.attn_tp_size}, decode={dst_attn_tp_size}. "
+            f"sizes: prefill={self.state_tp_size}, decode={dst_attn_tp_size}. "
             "Performance may be affected."
         )
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
@@ -2300,7 +2310,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_state_item_lens,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.state_tp_size
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
         transfer_blocks = []
@@ -2339,7 +2349,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
+                src_attn_tp_size=self.state_tp_size,
                 dst_attn_tp_size=dst_attn_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,
