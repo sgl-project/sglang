@@ -59,6 +59,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    rollout_transition,
+)
 from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
     RolloutDenoisingMixin,
 )
@@ -1516,6 +1519,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 },
                 guidance=None,
             )
+        transition = rollout_transition(batch)
 
         do_cfg = guidance_scale > 1.0
         # Control-CFG runs even when text guidance is off (its own extra
@@ -1784,22 +1788,14 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     timestep_value=t,
                     step_index=i,
                 )
-                latents = scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    generator=batch.generator,
-                    batch=batch,
-                    return_dict=False,
-                )[0]
-            else:
-                latents = scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    generator=generator,
-                    return_dict=False,
-                )[0]
+            latents = scheduler.step(
+                noise_pred,
+                t,
+                latents,
+                generator=generator,
+                transition=transition,
+                return_dict=False,
+            )[0]
 
             if action_noise_pred is not None:
                 # Zero the velocity at conditioned (clean) action tokens and at
