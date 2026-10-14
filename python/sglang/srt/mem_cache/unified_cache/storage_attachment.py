@@ -117,6 +117,7 @@ class StorageAttachment:
                 prefetch_timeout_base,
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
+                write_backlog_throttle,
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
@@ -152,6 +153,8 @@ class StorageAttachment:
                 storage_backend_extra_config=extra_config,
                 host_pools=controller.mem_pool_host.entries,
             )
+            if cache.buffer_pipeline is not None:
+                cache.buffer_pipeline.write_backlog_throttle = write_backlog_throttle
         except Exception as e:
             (
                 cache.prefetch_stop_policy,

@@ -81,6 +81,7 @@ class TestPrefillAdder(CustomTestCase):
             lock is not None and tree_cache.dec_lock_ref(lock.node, lock.receipt)
         )
         tree_cache.buffer_pipeline = None
+        tree_cache.write_backlog_hold_tokens.return_value = 0
         return tree_cache
 
     def create_token_allocator(
@@ -216,6 +217,25 @@ class TestPrefillAdder(CustomTestCase):
         return self.create_adder(
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
+
+    def test_write_backlog_hold_is_charged_to_both_budgets(self):
+        """A buffer-only write backlog the cache reports as held is removed
+        from the admission budget (total and current) for the whole pass;
+        the default report of 0 leaves the budget untouched."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.evictable_size.return_value = 100
+        self.mock_token_allocator.available_size.return_value = 100
+        adder = self.create_adder(self.create_running_batch())
+        self.assertEqual((adder.rem_total_tokens, adder.cur_rem_tokens), (200, 200))
+
+        self.mock_tree_cache.write_backlog_hold_tokens.return_value = 40
+        adder = self.create_adder(self.create_running_batch())
+        self.assertEqual((adder.rem_total_tokens, adder.cur_rem_tokens), (160, 160))
+        self.assertEqual(adder.budget_state(), AddReqResult.CONTINUE)
+
+        self.mock_tree_cache.write_backlog_hold_tokens.return_value = 200
+        adder = self.create_adder(self.create_running_batch())
+        self.assertEqual(adder.budget_state(), AddReqResult.NO_TOKEN)
 
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
         adder = self.create_shortest_prefill_adder()

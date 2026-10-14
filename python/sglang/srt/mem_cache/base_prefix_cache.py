@@ -580,6 +580,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Allocated SWA tokens owned outside the request and tree views."""
         return 0
 
+    def write_backlog_hold_tokens(self) -> int:
+        """Evictable tokens prefill admission must not count as reclaimable
+        because their L3 write is still queued (buffer-only throttle)."""
+        return 0
+
     def total_size(self):
         raise NotImplementedError()
 

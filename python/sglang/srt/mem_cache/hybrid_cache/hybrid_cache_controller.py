@@ -365,7 +365,7 @@ class HybridCacheController(BaseHiCacheController):
     @staticmethod
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
-    ) -> tuple[dict, int, float, float, bool]:
+    ) -> tuple[dict, int, float, float, bool, bool]:
         extra_config = {}
         if storage_backend_extra_config:
             if storage_backend_extra_config.startswith("@"):
@@ -397,6 +397,9 @@ class HybridCacheController(BaseHiCacheController):
         hicache_storage_pass_prefix_keys = extra_config.pop(
             "hicache_storage_pass_prefix_keys", False
         )
+        # Buffer-only write policy knob (see BufferModePipeline): lives with
+        # the other storage-controller policy keys rather than the backend.
+        write_backlog_throttle = extra_config.pop("write_backlog_throttle", False)
 
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
@@ -416,6 +419,11 @@ class HybridCacheController(BaseHiCacheController):
                 "hicache_storage_pass_prefix_keys must be bool, got "
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
+        if not isinstance(write_backlog_throttle, bool):
+            raise ValueError(
+                "write_backlog_throttle must be bool, got "
+                f"{type(write_backlog_throttle).__name__}"
+            )
 
         return (
             extra_config,
@@ -423,6 +431,7 @@ class HybridCacheController(BaseHiCacheController):
             float(prefetch_timeout_base),
             float(prefetch_timeout_per_ki_token),
             hicache_storage_pass_prefix_keys,
+            write_backlog_throttle,
         )
 
     def clear_storage_backend(self) -> bool:

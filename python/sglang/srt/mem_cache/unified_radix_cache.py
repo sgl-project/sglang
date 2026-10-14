@@ -141,6 +141,22 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.SWA: SWAComponent,
 }
 
+# Storage slots of the per-tick HiCache sync vector, in order: the four
+# control-queue sizes, one release-queue size per extra host pool, then the
+# buffer-mode write-path liveness bit. The placeholder PP ranks build is
+# derived from the same list, so the two cannot drift apart.
+_STORAGE_QUEUE_SLOTS = ("prefetch_hit", "ack_prefetch", "ack_backup", "host_release")
+_WRITE_PATH_ALIVE_SLOT = "write_path_alive"
+
+
+def _storage_sync_slot_count(extra_pool_names: Sequence[PoolName]) -> int:
+    return len(_STORAGE_QUEUE_SLOTS) + len(extra_pool_names) + 1
+
+
+def _storage_sync_slot_index(name: str, extra_pool_names: Sequence[PoolName]) -> int:
+    assert name == _WRITE_PATH_ALIVE_SLOT
+    return len(_STORAGE_QUEUE_SLOTS) + len(extra_pool_names)
+
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +466,7 @@ class UnifiedRadixCache(BasePrefixCache):
         prefetch_timeout_base = 1.0
         prefetch_timeout_per_ki_token = 0.25
         hicache_storage_pass_prefix_keys = False
+        write_backlog_throttle = False
         if storage_backend is not None:
             (
                 storage_extra_config,
@@ -457,6 +474,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 prefetch_timeout_base,
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
+                write_backlog_throttle,
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 get_memory().hicache_storage_backend_extra_config
             )
@@ -509,6 +527,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 # span across pools; a cap binding on live content would
                 # drop-newest and punch storage holes.
                 write_backlog_cap=2 * self.token_to_kv_pool_allocator.size_full,
+                write_backlog_throttle=write_backlog_throttle,
             )
         # State initialization
         if self.buffer_pipeline is not None:
@@ -3271,15 +3290,17 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
+        # One slot list for every rank: the placeholder below must match the
+        # live layout exactly or PP1+ would recv into a mismatched buffer.
+        storage_slot_count = (
+            _storage_sync_slot_count(extra_pool_names) if self.enable_storage else 0
+        )
         if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
             write_acks = 0
             load_acks = 0
             # Zero placeholders shaped like PP0's slots: _pp_sync hands the
-            # received tensor back in place, so all ranks must build the same
-            # length or PP1+ would recv into a mismatched buffer.
-            storage_queue_sizes = (
-                (0,) * (4 + len(extra_pool_names)) if self.enable_storage else ()
-            )
+            # received tensor back in place.
+            storage_queue_sizes = (0,) * storage_slot_count
         else:
             write_acks = self._count_ready_acks(cc.ack_write_queue)
             load_acks = self._count_ready_acks(cc.ack_load_queue)
@@ -3290,10 +3311,18 @@ class UnifiedRadixCache(BasePrefixCache):
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
                     *(extra_release_queues[name].qsize() for name in extra_pool_names),
+                    # Buffer-mode write-path liveness (constant 1 without a
+                    # pipeline); MIN agrees on "alive" only when every rank
+                    # saw progress within the stall timeout.
+                    int(
+                        self.buffer_pipeline is None
+                        or self.buffer_pipeline.write_path_alive()
+                    ),
                 )
                 if self.enable_storage
                 else ()
             )
+            assert len(storage_queue_sizes) == storage_slot_count
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
@@ -3311,6 +3340,13 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
             self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+            if self.enable_storage:
+                # Every stage schedules on its own clock, so the liveness
+                # verdict must be PP0's for the stages to build equal batches.
+                alive_slot = 2 + _storage_sync_slot_index(
+                    _WRITE_PATH_ALIVE_SLOT, extra_pool_names
+                )
+                self._pp_sync(ready_counts[alive_slot : alive_slot + 1])
         else:
             self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
@@ -3552,6 +3588,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+            if self.buffer_pipeline is not None:
+                self.buffer_pipeline.set_write_path_alive(
+                    bool(
+                        storage_queue_sizes[
+                            _storage_sync_slot_index(
+                                _WRITE_PATH_ALIVE_SLOT, extra_pool_names
+                            )
+                        ]
+                    )
+                )
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -3682,6 +3728,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.buffer_pipeline is None:
             return 0
         return self.buffer_pipeline.swa_transient_size()
+
+    def write_backlog_hold_tokens(self) -> int:
+        if self.buffer_pipeline is None:
+            return 0
+        return self.buffer_pipeline.write_backlog_hold_tokens()
 
     def mamba_protected_size(self) -> int:
         return self.tree_core.mamba_protected_size()

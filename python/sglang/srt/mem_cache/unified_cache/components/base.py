@@ -782,6 +782,7 @@ class TreeComponent(ABC):
         swa_window_pages: int,
         write_backlog_cap: int,
         max_context_len: int = 0,
+        write_backlog_throttle: bool = False,
     ) -> BufferModePipeline:
         """Called on the FULL component to construct the buffer-mode pipeline."""
         from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -791,6 +792,7 @@ class TreeComponent(ABC):
             swa_window_pages=swa_window_pages,
             write_backlog_cap=write_backlog_cap,
             max_context_len=max_context_len,
+            write_backlog_throttle=write_backlog_throttle,
         )
 
     def prepare_buffer_load_back(
