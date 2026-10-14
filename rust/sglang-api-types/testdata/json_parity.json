@@ -89,7 +89,6 @@
           "h1",
           "h2"
         ],
-        "priority": 3,
         "session_id": "ignored"
       },
       "canonical": "{\"text\":\"see\",\"stream\":false,\"image_data\":[[\"a\",null],null,[]],\"mm_hashes\":[\"h1\",\"h2\"],\"video_data\":{\"url\":\"v\",\"fps\":2.0,\"use_audio\":true},\"audio_data\":\"data:audio/wav;base64,AA==\"}"

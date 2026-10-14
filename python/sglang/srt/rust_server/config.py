@@ -9,12 +9,14 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.environ import envs
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
     get_mm,
     get_model,
     get_observability,
+    get_schedule,
     get_serving,
 )
 from sglang.version import __version__
@@ -78,6 +80,12 @@ def _build_server_args(
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
         health_generate_headers=dict(health_generate_headers or {}),
+        default_priority_value=(
+            get_schedule().default_priority_value
+            if get_schedule().enable_priority_scheduling
+            else None
+        ),
+        enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(
