@@ -218,6 +218,7 @@ class _Shell:
         elif mode == "decode":
             s.disagg_decode = _DecodeOwner(self)
             s.disaggregation_mode = DisaggregationMode.DECODE
+            s.decode_offload_manager = None
         elif mode == "dllm":
             s.dllm = _DllmOwner(self)
 

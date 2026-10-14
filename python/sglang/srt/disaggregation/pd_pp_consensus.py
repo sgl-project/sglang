@@ -277,7 +277,7 @@ class _DisaggDecodeRing:
         )
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
-            owner.decode_offload_manager.check_offload_progress()
+            owner.check_offload_progress()
 
         self.consensus_retract_rids = None
         if self.rmbs[next_mb_id] is not None:

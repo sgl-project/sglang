@@ -4,8 +4,7 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, List
-from weakref import WeakKeyDictionary as WeakKeyDict
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -130,41 +129,26 @@ class DecodeKVCacheOffloadManager:
                 storage_backend_extra_config=hicache_storage_backend_extra_config,
             )
 
+        # ack_id -> (rid, host_indices, incremental_tokens, page_hashes,
+        # start_time, pool_transfers); the request's progress is on the
+        # request itself (``req.disagg.offload``).
         self.ongoing_offload = {}
         self.ongoing_backup = {}
-        # Keyed by Req identity (rids can be reused while a D2H copy is still
-        # in flight); weak keys so a dropped Req is never pinned here.
-        self.offloaded_state: WeakKeyDict[Req, OffloadedState] = WeakKeyDict()
-        self.offload_inflight: WeakKeyDict[Req, int] = WeakKeyDict()
         logger.info("Enable offload kv cache for decode side")
 
     def release_host_resources(self) -> None:
         self.decode_host_mem_pool.destroy()
 
-    def _mark_offload_started(self, req: Req):
-        self.offload_inflight[req] = self.offload_inflight.get(req, 0) + 1
-
-    def _mark_offload_finished(self, req: Req):
-        count = self.offload_inflight.get(req, 0)
-        if count <= 1:
-            self.offload_inflight.pop(req, None)
-        else:
-            self.offload_inflight[req] = count - 1
-
-    def _has_inflight_offload(self, req: Req):
-        return self.offload_inflight.get(req, 0) > 0
+    def has_inflight_offload(self, req: Req) -> bool:
+        """Whether a copy of the request's KV has not landed yet."""
+        state = req.disagg.offload
+        return state is not None and any(
+            ack_id in self.ongoing_offload for ack_id in state.ack_ids
+        )
 
     def _prefill_offloaded_len(self, req: Req) -> int:
         # Page-aligned prompt length; the prefill instance offloaded this part.
         return len(req.origin_input_ids) // self.page_size * self.page_size
-
-    def releasing_reqs(self) -> List[Req]:
-        """Finished requests whose KV release waits on an offload copy."""
-        reqs = {}
-        for req, *_ in self.ongoing_offload.values():
-            if req.finished():
-                reqs[id(req)] = req
-        return list(reqs.values())
 
     def has_inflight_device_transfer(self) -> bool:
         """Whether a device-to-host copy may still read unified KV pages."""
@@ -208,7 +192,7 @@ class DecodeKVCacheOffloadManager:
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
         all_tokens = req.origin_input_ids + req.output_ids[:-1]
         prefill_offloaded_len = self._prefill_offloaded_len(req)
-        state = self.offloaded_state.get(req)
+        state = req.disagg.offload
         if state is None:
             prefill_hashes = self._compute_prefix_hash(
                 req, req.origin_input_ids[:prefill_offloaded_len]
@@ -217,7 +201,7 @@ class DecodeKVCacheOffloadManager:
                 prefill_hashes[-1] if prefill_offloaded_len > 0 else None
             )
             state = OffloadedState(last_hash=last_prefill_hash)
-            self.offloaded_state[req] = state
+            req.disagg.offload = state
         incremental_total = len(all_tokens) - prefill_offloaded_len
         incremental_new = incremental_total - state.inc_len
         incremental_aligned_len = (
@@ -254,19 +238,29 @@ class DecodeKVCacheOffloadManager:
             logger.error(f"Not enough host memory for request {req.rid}")
             return False
 
-        self._mark_offload_started(req)
+        # The chain advances in submit order, the order the copies land in.
+        page_hashes = self._compute_prefix_hash(
+            req, incremental_tokens, state.last_hash
+        )
+        if len(page_hashes) > 0:
+            state.last_hash = page_hashes[-1]
+        state.ack_ids = [a for a in state.ack_ids if a in self.ongoing_offload]
+        state.ack_ids.append(ack_id)
         self.ongoing_offload[ack_id] = (
-            req,
+            req.rid,
             host_indices,
             incremental_tokens,
+            page_hashes,
             time.time(),
             pool_transfers,
         )
         state.inc_len += incremental_aligned_len
         return True
 
-    def check_offload_progress(self):
-        """Check the progress of offload from device to host and backup from host to storage."""
+    def check_offload_progress(self, releasing: List[Req]) -> List[Req]:
+        """Check the progress of offload from device to host and backup from
+        host to storage. A request of ``releasing`` whose last copy landed has
+        its KV released; returns those requests."""
         cc = self.cache_controller
 
         qsizes = torch.tensor(
@@ -282,17 +276,18 @@ class DecodeKVCacheOffloadManager:
             )
 
         n_write, n_backup = map(int, qsizes.tolist())
-        self._check_offload_progress(n_write)
+        released = self._check_offload_progress(n_write, releasing)
         self._check_backup_progress(n_backup)
+        return released
 
-    def drain_before_retraction(self):
-        """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy."""
-        self.check_offload_progress()
+    def refuse_retraction_while_copying(self):
+        """Refuse retraction on every rank if any rank still tracks a D2H copy;
+        the caller first checks the offload progress."""
         cc = self.cache_controller
         # Retraction frees the device KV these copies read. Storage backups read only
         # host memory, so they do not count.
         pending = torch.tensor(
-            [bool(cc.ack_write_queue or self.ongoing_offload or self.offload_inflight)],
+            [bool(cc.ack_write_queue or self.ongoing_offload)],
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
@@ -304,43 +299,54 @@ class DecodeKVCacheOffloadManager:
                 "Decode KV offload copies are still pending on some rank; "
                 f"refusing to retract (local: {len(cc.ack_write_queue)} acks, "
                 f"{len(self.ongoing_offload)} copies, "
-                f"{len(self.offload_inflight)} requests)."
+                f"{len({rid for rid, *_ in self.ongoing_offload.values()})} requests)."
             )
 
-    def _check_offload_progress(self, finish_count):
+    def _check_offload_progress(
+        self, finish_count: int, releasing: List[Req]
+    ) -> List[Req]:
         """Check the progress of offload from device to host."""
+        released = []
         while finish_count > 0:
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 (
-                    req,
+                    rid,
                     host_indices,
                     incremental_tokens,
+                    page_hashes,
                     start_time,
                     pool_transfers,
                 ) = self.ongoing_offload.pop(ack_id)
 
-                self._mark_offload_finished(req)
-                prior_hash = (
-                    self.offloaded_state[req].last_hash
-                    if req in self.offloaded_state
-                    else None
-                )
-                last_hash = self._trigger_backup(
-                    req,
+                self._trigger_backup(
+                    rid,
                     host_indices,
                     incremental_tokens,
+                    page_hashes,
                     start_time,
-                    prior_hash,
                     pool_transfers,
                 )
-                if req in self.offloaded_state:
-                    self.offloaded_state[req].last_hash = last_hash
 
-                if req.finished() and not self._has_inflight_offload(req):
+                # A request still decoding is not in releasing; it releases
+                # at finish, or moves there while a copy is in flight.
+                req = self._find_releasing(releasing, rid, ack_id)
+                if req is not None and not self.has_inflight_offload(req):
                     self._release_finished_req(req)
+                    released.append(req)
             finish_count -= 1
+        return released
+
+    @staticmethod
+    def _find_releasing(releasing: List[Req], rid: str, ack_id: int) -> Optional[Req]:
+        """The releasing request that submitted the copy; a reused rid can
+        name another request, so the ack id decides."""
+        for req in releasing:
+            state = req.disagg.offload
+            if req.rid == rid and state is not None and ack_id in state.ack_ids:
+                return req
+        return None
 
     def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
@@ -359,7 +365,7 @@ class DecodeKVCacheOffloadManager:
         req.lock = None
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
-        self.offloaded_state.pop(req, None)
+        req.disagg.offload = None
 
     def _check_backup_progress(self, finish_count):
         """Check the progress of backup from host to storage."""
@@ -383,15 +389,14 @@ class DecodeKVCacheOffloadManager:
 
     def _trigger_backup(
         self,
-        req,
+        rid,
         host_indices,
         incremental_tokens,
+        page_hashes,
         start_time,
-        prior_hash,
         pool_transfers=(),
     ):
         """Trigger async backup from host to storage."""
-        page_hashes = self._compute_prefix_hash(req, incremental_tokens, prior_hash)
         for transfer in pool_transfers:
             page_count = transfer.device_indices.numel() // self.page_size
             transfer.keys = page_hashes[-page_count:]
@@ -402,12 +407,11 @@ class DecodeKVCacheOffloadManager:
             **({"extra_pools": pool_transfers} if pool_transfers else {}),
         )
         self.ongoing_backup[ack_id] = (
-            req.rid,
+            rid,
             host_indices,
             start_time,
             pool_transfers,
         )
-        return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
     def _compute_prefix_hash(self, req: Req, tokens, prior_hash=""):
         """Match prefill storage hashes."""
@@ -421,6 +425,6 @@ class DecodeKVCacheOffloadManager:
 
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
-        if self._has_inflight_offload(req):
+        if self.has_inflight_offload(req):
             return
         self._release_finished_req(req)

@@ -9,9 +9,9 @@ Requires: torch, sglang (run in an environment with sglang installed)
 
 import gc
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.kv_events import OffloadedState
+from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -56,7 +57,23 @@ def _make_mock_req(
     )
     req.prefix_len = prefix_len
     req.owned_kv_len = lambda: req.kv.kv_committed_len
+    req.disagg = DisaggReqState()
     return req
+
+
+def _in_flight(manager, req, ack_id, tokens=(10, 11, 12, 13)):
+    """Record a submitted copy of req's KV that has not landed."""
+    if req.disagg.offload is None:
+        req.disagg.offload = OffloadedState()
+    req.disagg.offload.ack_ids.append(ack_id)
+    manager.ongoing_offload[ack_id] = (
+        req.rid,
+        torch.arange(4, 8, dtype=torch.int64),
+        list(tokens),
+        ["hash"],
+        0.0,
+        [],
+    )
 
 
 class _RecordingAllocator(BaseTokenToKVPoolAllocator):
@@ -110,10 +127,8 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.kv_cache = MagicMock()
     manager.page_size = page_size
     manager.tree_cache = tree_cache
-    manager.offloaded_state = WeakKeyDict()
     manager.ongoing_offload = {}
     manager.ongoing_backup = {}
-    manager.offload_inflight = WeakKeyDict()
 
     return manager, freed_indices
 
@@ -227,14 +242,14 @@ class TestReleaseFinishedReq(unittest.TestCase):
             rid="req-prefill-present",
             origin_len=8,
         )
-        manager.offloaded_state[req] = OffloadedState(inc_len=4)
+        req.disagg.offload = OffloadedState(inc_len=4)
 
         manager._release_finished_req(req)
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
-        # State entry is removed at the end of _release_finished_req.
-        self.assertNotIn(req, manager.offloaded_state)
+        # The offload state is dropped at the end of _release_finished_req.
+        self.assertIsNone(req.disagg.offload)
 
     def test_release_finished_req_skips_prefill_free_when_prompt_below_page(self):
         """
@@ -275,8 +290,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 13, dtype=torch.int64)))
-        # No state entry is left behind.
-        self.assertNotIn(req, manager.offloaded_state)
+        # No offload state is left behind.
+        self.assertIsNone(req.disagg.offload)
 
     def test_unfinished_offload_ack_does_not_free_incremental_slots(self):
         manager, freed = _make_manager(pool_size=32)
@@ -284,26 +299,19 @@ class TestReleaseFinishedReq(unittest.TestCase):
             req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=1
         )
         req.finished.return_value = False
-        manager.offloaded_state[req] = OffloadedState(inc_len=4)
-        manager.offload_inflight[req] = 1
-        manager.ongoing_offload[7] = (
-            req,
-            torch.arange(4, 8, dtype=torch.int64),
-            [10, 11, 12, 13],
-            0.0,
-            [],
-        )
+        _in_flight(manager, req, 7)
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [7])
         ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager._trigger_backup = MagicMock()
 
-        manager._check_offload_progress(1)
+        # Still decoding: the request is in no releasing list.
+        self.assertEqual(manager._check_offload_progress(1, []), [])
 
         self.assertEqual(freed, [])
         manager.req_to_token_pool.free.assert_not_called()
-        self.assertNotIn(req, manager.offload_inflight)
+        self.assertFalse(manager.has_inflight_offload(req))
 
     def test_offload_kv_cache_tracks_inflight_write_until_ack(self):
         manager, freed = _make_manager(pool_size=32, page_size=4)
@@ -326,19 +334,55 @@ class TestReleaseFinishedReq(unittest.TestCase):
         did_offload = manager.offload_kv_cache(req)
 
         self.assertTrue(did_offload)
-        self.assertEqual(manager.offload_inflight[req], 1)
-        self.assertEqual(manager.offloaded_state[req].inc_len, 4)
+        self.assertTrue(manager.has_inflight_offload(req))
+        self.assertEqual(req.disagg.offload.inc_len, 4)
         manager.cache_controller.write.assert_called_once()
+        # The copy is tracked by rid; the manager holds no request.
+        self.assertEqual(manager.ongoing_offload[1][0], 5)
 
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [1])
         ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager._trigger_backup = MagicMock()
 
-        manager._check_offload_progress(1)
+        manager._check_offload_progress(1, [])
 
         self.assertEqual(freed, [])
-        self.assertNotIn(req, manager.offload_inflight)
+        self.assertFalse(manager.has_inflight_offload(req))
+
+    def test_backup_hashes_chain_across_copies(self):
+        """Each backup carries its chunk's hashes, chained from the prefill
+        pages through the earlier chunks, also with copies in flight."""
+        manager, _ = _make_manager(pool_size=32, page_size=2)
+        manager.cache_controller = MagicMock(
+            get_hash_str=lambda tokens, prior: f"{prior}>{tokens}"
+        )
+        manager.cache_controller.write.return_value = torch.arange(2)
+        manager.decode_host_mem_pool = MagicMock()
+        manager.request_counter = 0
+        manager.offload_stride = 2
+
+        req = _make_mock_req(
+            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid="r"
+        )
+        req.origin_input_ids = [0, 1]
+        req.output_ids = [2, 3, 4]
+        self.assertTrue(manager.offload_kv_cache(req))
+        req.output_ids += [5, 6]
+        self.assertTrue(manager.offload_kv_cache(req))
+
+        manager.cache_controller.ack_write_queue = [
+            HiCacheAck(None, _FinishedEvent(), [1]),
+            HiCacheAck(None, _FinishedEvent(), [2]),
+        ]
+        manager._check_offload_progress(2, [])
+
+        backed_up = [
+            call.kwargs["hash_value"]
+            for call in manager.cache_controller.write_storage.call_args_list
+        ]
+        expected = manager._compute_prefix_hash(req, [0, 1, 2, 3, 4, 5])
+        self.assertEqual(backed_up, [expected[1:2], expected[2:3]])
 
     def test_reused_rid_does_not_share_offload_lifecycle(self):
         manager, _ = _make_manager(pool_size=32, page_size=4)
@@ -369,22 +413,20 @@ class TestReleaseFinishedReq(unittest.TestCase):
         # necessarily finishes, so a caller can reuse the same rid here.
         self.assertTrue(manager.offload_kv_cache(new_req))
         self.assertIsNot(old_req, new_req)
-        self.assertIn(old_req, manager.offloaded_state)
-        self.assertIn(new_req, manager.offloaded_state)
-        self.assertEqual(manager.offload_inflight[old_req], 1)
-        self.assertEqual(manager.offload_inflight[new_req], 1)
+        self.assertTrue(manager.has_inflight_offload(old_req))
+        self.assertTrue(manager.has_inflight_offload(new_req))
 
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [1])
         ]
-        manager._trigger_backup = MagicMock(return_value="old_last_hash")
-        manager._check_offload_progress(1)
+        manager._trigger_backup = MagicMock()
+        # Both releasing under one rid, the new one first: the ack id decides.
+        released = manager._check_offload_progress(1, [new_req, old_req])
 
-        self.assertNotIn(old_req, manager.offloaded_state)
-        self.assertNotIn(old_req, manager.offload_inflight)
-        self.assertIn(new_req, manager.offloaded_state)
-        self.assertEqual(manager.offloaded_state[new_req].inc_len, 4)
-        self.assertEqual(manager.offload_inflight[new_req], 1)
+        self.assertEqual(released, [old_req])
+        self.assertIsNone(old_req.disagg.offload)
+        self.assertEqual(new_req.disagg.offload.inc_len, 4)
+        self.assertTrue(manager.has_inflight_offload(new_req))
         self.assertIn(2, manager.ongoing_offload)
 
     def test_finalize_release_defers_while_offload_is_in_flight(self):
@@ -392,14 +434,13 @@ class TestReleaseFinishedReq(unittest.TestCase):
         req = _make_mock_req(
             req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=2
         )
-        manager.offloaded_state[req] = OffloadedState(inc_len=8)
-        manager.offload_inflight[req] = 1
+        _in_flight(manager, req, 1)
 
         manager.finalize_release_on_finish(req)
 
         self.assertEqual(freed, [])
         manager.req_to_token_pool.free.assert_not_called()
-        self.assertIn(req, manager.offloaded_state)
+        self.assertIsNotNone(req.disagg.offload)
 
     def test_finished_offload_ack_waits_for_other_inflight_writes(self):
         manager, freed = _make_manager(pool_size=32)
@@ -407,26 +448,19 @@ class TestReleaseFinishedReq(unittest.TestCase):
             req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=3
         )
         req.finished.return_value = True
-        manager.offloaded_state[req] = OffloadedState(inc_len=8)
-        manager.offload_inflight[req] = 2
-        manager.ongoing_offload[8] = (
-            req,
-            torch.arange(4, 8, dtype=torch.int64),
-            [10, 11, 12, 13],
-            0.0,
-            [],
-        )
+        _in_flight(manager, req, 8)
+        _in_flight(manager, req, 9)
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [8])
         ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager._trigger_backup = MagicMock()
 
-        manager._check_offload_progress(1)
+        self.assertEqual(manager._check_offload_progress(1, [req]), [])
 
         self.assertEqual(freed, [])
         manager.req_to_token_pool.free.assert_not_called()
-        self.assertEqual(manager.offload_inflight[req], 1)
+        self.assertTrue(manager.has_inflight_offload(req))
 
     def test_finished_request_releases_all_committed_slots_after_last_offload_ack(
         self,
@@ -440,42 +474,34 @@ class TestReleaseFinishedReq(unittest.TestCase):
             origin_len=4,
         )
         req.finished.return_value = True
-        manager.offloaded_state[req] = OffloadedState(inc_len=8)
-        manager.offload_inflight[req] = 1
-        manager.ongoing_offload[9] = (
-            req,
-            torch.arange(8, 12, dtype=torch.int64),
-            [14, 15, 16, 17],
-            0.0,
-            [],
-        )
+        _in_flight(manager, req, 9, tokens=(14, 15, 16, 17))
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
             HiCacheAck(None, _FinishedEvent(), [9])
         ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager._trigger_backup = MagicMock()
 
-        manager._check_offload_progress(1)
+        self.assertEqual(manager._check_offload_progress(1, [req]), [req])
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
-        self.assertNotIn(req, manager.offloaded_state)
-        self.assertNotIn(req, manager.offload_inflight)
+        self.assertIsNone(req.disagg.offload)
+        self.assertFalse(manager.has_inflight_offload(req))
 
-    def test_dropped_req_does_not_pin_offload_state(self):
+    def test_copy_in_flight_does_not_pin_the_request(self):
         manager, _ = _make_manager(pool_size=32)
         req = _make_mock_req(
             req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=6
         )
-        manager.offloaded_state[req] = OffloadedState(inc_len=4)
-        manager.offload_inflight[req] = 1
+        _in_flight(manager, req, 1)
+        ref = weakref.ref(req)
 
         del req
         gc.collect()
 
-        self.assertEqual(len(manager.offloaded_state), 0)
-        self.assertEqual(len(manager.offload_inflight), 0)
+        self.assertIsNone(ref())
+        self.assertIn(1, manager.ongoing_offload)
 
 
 class TestSamplingMaskAbortOffload(CustomTestCase):
@@ -492,8 +518,7 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 )
                 processor = SimpleNamespace(decode_offload_manager=manager)
                 if inflight:
-                    manager.offload_inflight[req] = 1
-                    manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0, [])
+                    _in_flight(manager, req, 1)
                     manager.cache_controller = MagicMock()
                     manager.cache_controller.ack_write_queue = [
                         HiCacheAck(None, _FinishedEvent(), [1])
@@ -511,7 +536,7 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 if inflight:
                     self.assertEqual(freed, [])
                     self.assertEqual(req.kv.req_pool_idx, 0)
-                    manager._check_offload_progress(1)
+                    self.assertEqual(manager._check_offload_progress(1, [req]), [req])
                 self.assertEqual(len(freed), 1)
                 self.assertTrue(torch.equal(freed[0], torch.arange(20)))
                 self.assertIsNone(req.kv.req_pool_idx)

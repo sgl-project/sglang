@@ -2510,6 +2510,22 @@ def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
     return int.from_bytes(digest, byteorder="little") % req.vocab_size
 
 
+@dataclass
+class DeferredRelease:
+    """A failed transfer whose KV is held until prefill stops writing its
+    pages. The request waits in the owner's releasing list, found by its rid
+    and room."""
+
+    rid: str
+    room: int
+    kv_receiver: CommonKVReceiver
+    host_staged: bool
+    metadata_buffer_index: int
+    start_time: float
+    deadline: float
+    required_acks: int
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -2533,6 +2549,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         output_streamer: SchedulerOutputStreamer,
         update_reasoning_tokens: Callable[[Req, int], None],
         release_finished_req: Callable[..., None],
+        hold_release: Callable[[Req], None],
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
@@ -2553,6 +2570,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.output_streamer = output_streamer
         self.update_reasoning_tokens = update_reasoning_tokens
         self.release_finished_req = release_finished_req
+        # Moves a failed transfer's request into the owner's releasing list.
+        self.hold_release = hold_release
         # The preallocation queue that hands its requests over; set by the
         # owner once both queues exist.
         self.prealloc_queue: Optional[DecodePreallocQueue] = None
@@ -2564,10 +2583,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries:
-        # (decode_req, start_time, deadline, metadata_idx, required_acks).
-        self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
+        # Aborted-mid-transfer requests whose KV pages/slot are held until
+        # drained or timed out; the requests wait in the owner's releasing list.
+        self._deferred_releases: List[DeferredRelease] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2782,12 +2800,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def _release_request(self, decode_req: DecodeRequest) -> None:
+    def _release_request(self, req: Req, host_staged: bool) -> None:
         if self.enable_host_receive:
-            discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
-            if decode_req.host_staged:
+            discard_kv_cache_backup(req, self.tree_cache, "host_pool")
+            if host_staged:
                 return
-        self.release_finished_req(decode_req.req, checkpoint=False)
+        self.release_finished_req(req, checkpoint=False)
 
     def _record_transfer_failure(self, failure_reason: str) -> None:
         if self.metrics_reporter.enable_metrics:
@@ -2886,7 +2904,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     indices_to_remove.add(i)
                 else:
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                    self._release_request(decode_req)
+                    self._release_request(decode_req.req, decode_req.host_staged)
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
                     indices_to_remove.add(i)
@@ -2898,7 +2916,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.output_streamer.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
-                        self._release_request(decode_req)
+                        self._release_request(decode_req.req, decode_req.host_staged)
                         decode_req.kv_receiver.clear()
                         decode_req.kv_receiver = None
                         indices_to_remove.add(i)
@@ -2916,7 +2934,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.return_logprob,
                     )
                     self._clean_hicache_prefetch_resources(decode_req)
-                    self._release_request(decode_req)
+                    self._release_request(decode_req.req, decode_req.host_staged)
                     self._record_transfer_failure(
                         decode_req.req.finished_reason.message
                     )
@@ -2965,31 +2983,41 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             else len(decode_req.kv_receiver.bootstrap_infos)
         )
         self._deferred_releases.append(
-            (
-                decode_req,
-                start_time,
-                deadline,
-                decode_req.metadata_buffer_index,
-                required_acks,
+            DeferredRelease(
+                rid=decode_req.req.rid,
+                room=decode_req.req.bootstrap_room,
+                kv_receiver=decode_req.kv_receiver,
+                host_staged=decode_req.host_staged,
+                metadata_buffer_index=decode_req.metadata_buffer_index,
+                start_time=start_time,
+                deadline=deadline,
+                required_acks=required_acks,
             )
         )
+        self.hold_release(decode_req.req)
 
-    def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
-        room = decode_req.req.bootstrap_room
+    def _do_release(self, req: Req, held: DeferredRelease) -> None:
+        room = held.room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self._release_request(decode_req)
+        self._release_request(req, held.host_staged)
+        idx = held.metadata_buffer_index
         self.metadata_buffers.bootstrap_room[idx] = 0
         self.req_to_metadata_buffer_idx_allocator.free(idx)
-        if not (self.enable_host_receive and decode_req.host_staged):
-            decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
-        decode_req.kv_receiver.clear()
-        decode_req.kv_receiver = None
+        if not (self.enable_host_receive and held.host_staged):
+            held.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
+        held.kv_receiver.clear()
 
-    def releasing_reqs(self) -> List[Req]:
-        """Failed transfers held until prefill stops writing their pages."""
-        return [decode_req.req for decode_req, *_ in self._deferred_releases]
+    @staticmethod
+    def _find_releasing(releasing: List[Req], held: DeferredRelease) -> Req:
+        """The releasing request a held transfer belongs to; a reused rid can
+        name another request, so the room decides."""
+        return next(
+            req
+            for req in releasing
+            if req.rid == held.rid and req.bootstrap_room == held.room
+        )
 
     def num_pending_deferred_releases(self) -> int:
         return len(self._deferred_releases)
@@ -3003,15 +3031,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 outcome=outcome,
             )
 
-    def resolve_deferred_releases(self) -> None:
-        """Release drained transfers; device destinations may also time out."""
+    def resolve_deferred_releases(self, releasing: List[Req]) -> List[Req]:
+        """Release drained transfers; device destinations may also time out.
+        Finds each request in ``releasing``; returns those released."""
         if not self._deferred_releases:
-            return
+            return []
         host_ready = torch.tensor(
             [
-                req.kv_receiver.is_abort_release_safe()
-                for req, _, _, _, _ in self._deferred_releases
-                if self.enable_host_receive and req.host_staged
+                held.kv_receiver.is_abort_release_safe()
+                for held in self._deferred_releases
+                if self.enable_host_receive and held.host_staged
             ],
             dtype=torch.int32,
         )
@@ -3024,35 +3053,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         now = time.monotonic()
         still_held = []
         to_release = []
-        for (
-            decode_req,
-            start_time,
-            deadline,
-            idx,
-            required_acks,
-        ) in self._deferred_releases:
-            room = decode_req.req.bootstrap_room
-            if self.enable_host_receive and decode_req.host_staged:
+        for held in self._deferred_releases:
+            if self.enable_host_receive and held.host_staged:
                 if next(host_ready):
-                    to_release.append((decode_req, start_time, idx, room, True))
+                    to_release.append((held, True))
                 else:
                     # A timeout cannot prove that a remote write has stopped.
-                    still_held.append(
-                        (decode_req, start_time, deadline, idx, required_acks)
-                    )
+                    still_held.append(held)
                 continue
-            kv_mgr = decode_req.kv_receiver.kv_mgr
-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
-                still_held.append(
-                    (decode_req, start_time, deadline, idx, required_acks)
-                )
+            kv_mgr = held.kv_receiver.kv_mgr
+            drained = kv_mgr.is_abort_release_safe(held.room, held.required_acks)
+            if not drained and now < held.deadline:
+                still_held.append(held)
             else:
-                to_release.append((decode_req, start_time, idx, room, drained))
+                to_release.append((held, drained))
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
-        for decode_req, start_time, idx, room, drained in to_release:
+        released = []
+        for held, drained in to_release:
+            room = held.room
+            req = self._find_releasing(releasing, held)
+            # The request leaves releasing even if its release fails.
+            released.append(req)
             if not drained:
                 logger.warning(
                     f"Deferred KV release for room {room} timed out after "
@@ -3061,21 +3084,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             outcome = "drained" if drained else "timeout"
             try:
-                self._do_release(decode_req, idx)
+                self._do_release(req, held)
             except Exception:
                 # Isolate a failed release so the rest still run; entry already dropped.
                 logger.exception(f"Deferred KV release failed for room {room}")
                 outcome = "error"
             self._observe_deferred_kv_release(
-                duration_seconds=max(0.0, now - start_time),
+                duration_seconds=max(0.0, now - held.start_time),
                 outcome=outcome,
             )
+        return released
 
-    def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
+    def release_memory_occupation(self, releasing: List[Req]) -> List[Req]:
+        """Clean up in-flight transfers before releasing GPU memory; returns
+        the held transfers' requests, found in ``releasing``."""
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
+        dropped = [
+            self._find_releasing(releasing, held) for held in self._deferred_releases
+        ]
         self._deferred_releases.clear()
+        return dropped
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
@@ -3089,7 +3118,7 @@ class DisaggDecode:
     preallocation queue (new and rebootstrapping requests), the retracted
     queue, the requests held for rebootstrap while generation is paused, the
     transfer queue (KV in flight), `ready` (transferred, waiting for a
-    decoding row), and the failed transfers still releasing their KV.
+    decoding row), and `releasing` (finished, still holding KV until an ack).
     """
 
     def __init__(
@@ -3177,6 +3206,10 @@ class DisaggDecode:
         # The requests whose KV has arrived: they own it and wait for a row of
         # the running set.
         self.ready: List[Req] = []
+        # Finished requests that still hold KV until an ack lands: failed
+        # transfers held until prefill stops writing their pages, and requests
+        # whose KV release waits on an offload copy.
+        self.releasing: List[Req] = []
         # Intake polls the preallocation and transfer queues every
         # polling_interval calls.
         self.polling_count = 0
@@ -3211,6 +3244,7 @@ class DisaggDecode:
             output_streamer=output_streamer,
             update_reasoning_tokens=update_reasoning_tokens,
             release_finished_req=release_finished_req,
+            hold_release=self.hold_release,
         )
 
         # The decode requests pending for pre-allocation
@@ -3273,14 +3307,36 @@ class DisaggDecode:
             # resume_retracted_reqs() re-queues the request without stamping it.
             req.time_stats.set_wait_queue_entry_time()
 
-    def releasing_reqs(self) -> List[Req]:
-        """Finished requests that still hold KV until an ack lands: failed
-        transfers held for a deferred release, and requests whose release
-        waits on a KV offload copy."""
-        reqs = self.transfer_queue.releasing_reqs()
-        if self.decode_offload_manager is not None:
-            reqs += self.decode_offload_manager.releasing_reqs()
-        return reqs
+    def hold_release(self, req: Req) -> None:
+        """Move a finished request that still holds KV into releasing; it
+        leaves when the ack its release waits on lands."""
+        self.releasing.append(req)
+
+    def hold_finished(self, finished: List[Req]) -> None:
+        """Commit, as the finished requests leave decoding: those whose KV
+        release waits on an offload copy move into releasing."""
+        manager = self.decode_offload_manager
+        for req in finished:
+            if manager.has_inflight_offload(req):
+                self.hold_release(req)
+
+    def check_offload_progress(self) -> None:
+        """Back up the landed offload copies; a releasing request whose last
+        copy landed has its KV released and leaves releasing."""
+        manager = self.decode_offload_manager
+        for req in manager.check_offload_progress(self.releasing):
+            self.releasing.remove(req)
+
+    def drain_offloads_before_retraction(self) -> None:
+        """Retraction frees device KV a copy may still read: take the landed
+        copies, then refuse on every rank if one is still in flight."""
+        self.check_offload_progress()
+        self.decode_offload_manager.refuse_retraction_while_copying()
+
+    def resolve_deferred_releases(self) -> None:
+        """Release the drained failed transfers; they leave releasing."""
+        for req in self.transfer_queue.resolve_deferred_releases(self.releasing):
+            self.releasing.remove(req)
 
     def lists(self) -> List[RequestList]:
         """The PD decode lists, from preallocation to the release of the KV."""
@@ -3324,7 +3380,7 @@ class DisaggDecode:
                 retract_on_pause=True,
             ),
             # Finished already: abort leaves them to their release.
-            RequestList(name="releasing", reqs=self.releasing_reqs(), releasing=True),
+            RequestList(name="releasing", reqs=self.releasing, releasing=True),
         ]
 
     def _abort_prealloc_reqs(self, recv_req: AbortReq) -> None:
@@ -3418,7 +3474,8 @@ class DisaggDecode:
             self.prealloc_queue.hold_rebootstrap(req)
 
     def release_memory_occupation(self) -> None:
-        self.transfer_queue.release_memory_occupation()
+        for req in self.transfer_queue.release_memory_occupation(self.releasing):
+            self.releasing.remove(req)
         self.prealloc_queue.release_memory_occupation()
 
     def resume_memory_occupation(self) -> None:
@@ -3435,11 +3492,11 @@ class DisaggDecode:
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
-            self.decode_offload_manager.check_offload_progress()
+            self.check_offload_progress()
 
         # Resolve held releases every iteration (before the retraction/polling
         # gates below) so their timeouts fire under memory pressure.
-        self.transfer_queue.resolve_deferred_releases()
+        self.resolve_deferred_releases()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         # The flat driver's slot runs every decoding request.
@@ -3570,7 +3627,7 @@ class DisaggDecode:
         transfers against slot; returns their ids."""
         # Resolve held deferred releases every call, independent of release_rids,
         # so ack/timeout-driven releases still fire when no rids are being polled.
-        self.transfer_queue.resolve_deferred_releases()
+        self.resolve_deferred_releases()
         if release_rids is not None:
             released_reqs = self.transfer_queue.pop_transferred(
                 slot.filter_decoding(self.get_decoding()), release_rids

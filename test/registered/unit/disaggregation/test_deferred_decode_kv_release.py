@@ -34,7 +34,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.disagg_owner_shells import tree_release
+from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -680,7 +680,17 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.metrics_collector = SimpleNamespace(
         observe_decode_deferred_kv_release=MagicMock()
     )
+    # The owner whose releasing list the held transfers' requests wait in.
+    q.owner = decode_owner_shell(transfer_queue=q)
+    q.hold_release = q.owner.hold_release
     return q
+
+
+def _hold(q, dreq, start_time, deadline):
+    """Hold dreq's failed transfer as pop_transferred does, at start_time."""
+    with patch.object(decode_mod.time, "monotonic", return_value=start_time):
+        q._defer_release(dreq)
+    q._deferred_releases[-1].deadline = deadline
 
 
 def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
@@ -693,9 +703,10 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         clear=lambda: None,
     )
     return SimpleNamespace(
-        req=SimpleNamespace(bootstrap_room=room),
+        req=SimpleNamespace(bootstrap_room=room, rid=f"r{room}"),
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        host_staged=False,
     )
 
 
@@ -718,18 +729,18 @@ class TestResolveDeferredReleases(CustomTestCase):
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.all_reduce") as reduce,
         ):
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
             discard.assert_not_called()
             mgr.note_abort_ack(2, 0, generations[2])
             reduce.side_effect = lambda ready, **_: ready.zero_()
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
             discard.assert_not_called()
             reduce.side_effect = None
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
             discard.assert_called_once_with(entries[1].req, q.tree_cache, "host_pool")
             self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [2])
             mgr.note_abort_ack(1, 0, generations[1])
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
             self.assertEqual(discard.call_count, 2)
             self.assertEqual(q._deferred_releases, [])
             device_release.assert_not_called()
@@ -737,7 +748,7 @@ class TestResolveDeferredReleases(CustomTestCase):
     def test_noop_when_nothing_deferred(self):
         q = _make_queue()
         with patch.object(decode_mod, "release_kv_cache") as rel:
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
         rel.assert_not_called()
 
     def test_holds_until_drained_then_releases(self):
@@ -755,20 +766,21 @@ class TestResolveDeferredReleases(CustomTestCase):
             q._defer_release(dreq)
             with patch.object(decode_mod, "release_kv_cache") as rel:
                 # Not yet acked -> held, not released.
-                q.resolve_deferred_releases()
+                q.owner.resolve_deferred_releases()
                 rel.assert_not_called()
                 self.assertEqual(len(q._deferred_releases), 1)
+                self.assertEqual(q.owner.releasing, [dreq.req])
                 q.metrics_collector.observe_decode_deferred_kv_release.assert_not_called()
 
                 # One of two ranks acked -> still held.
                 mgr.note_abort_ack(room, 0, generation)
-                q.resolve_deferred_releases()
+                q.owner.resolve_deferred_releases()
                 rel.assert_not_called()
                 self.assertEqual(len(q._deferred_releases), 1)
 
                 # Both ranks acked -> released exactly once.
                 mgr.note_abort_ack(room, 1, generation)
-                q.resolve_deferred_releases()
+                q.owner.resolve_deferred_releases()
                 rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
 
         # Held state fully cleaned up.
@@ -777,7 +789,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
         self.assertEqual(q.metadata_buffers.bootstrap_room[idx], 0)
         self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
-        self.assertIsNone(dreq.kv_receiver)
+        self.assertEqual(q.owner.releasing, [])
         q.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
             duration_seconds=3.0,
             outcome="drained",
@@ -789,18 +801,18 @@ class TestResolveDeferredReleases(CustomTestCase):
         q = _make_queue(timeout=30.0, enable_metrics=True)
         dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=1)
         # Force an already-expired deadline (no ack will ever arrive).
-        q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
+        _hold(q, dreq, start_time=10.0, deadline=float("-inf"))
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=42.0),
             patch.object(decode_mod, "release_kv_cache") as rel,
         ):
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
             rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
 
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
-        self.assertIsNone(dreq.kv_receiver)
+        self.assertEqual(q.owner.releasing, [])
         q.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
             duration_seconds=32.0,
             outcome="timeout",
@@ -811,13 +823,13 @@ class TestResolveDeferredReleases(CustomTestCase):
         room, idx = 301, 4
         q = _make_queue(enable_metrics=False)
         dreq = _make_decode_req(room, idx, mgr)
-        q._deferred_releases.append((dreq, 10.0, float("-inf"), idx, 1))
+        _hold(q, dreq, start_time=10.0, deadline=float("-inf"))
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=20.0),
             patch.object(decode_mod, "release_kv_cache") as rel,
         ):
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
 
         rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
         self.assertEqual(q.num_pending_deferred_releases(), 0)
@@ -831,8 +843,8 @@ class TestResolveDeferredReleases(CustomTestCase):
         good = _make_decode_req(700, 1, mgr)
         bad = _make_decode_req(701, 2, mgr)
         # Both already past deadline -> both selected for release.
-        q._deferred_releases.append((bad, 10.0, float("-inf"), 2, 1))
-        q._deferred_releases.append((good, 10.0, float("-inf"), 1, 1))
+        _hold(q, bad, start_time=10.0, deadline=float("-inf"))
+        _hold(q, good, start_time=10.0, deadline=float("-inf"))
 
         calls = []
 
@@ -845,18 +857,37 @@ class TestResolveDeferredReleases(CustomTestCase):
             patch.object(decode_mod.time, "monotonic", return_value=40.0),
             patch.object(decode_mod, "release_kv_cache", side_effect=fake_release),
         ):
-            q.resolve_deferred_releases()  # must not raise
+            q.owner.resolve_deferred_releases()  # must not raise
             # The good one still released despite the bad one throwing.
             self.assertIn(good.req, calls)
             # Nothing left held, and a second call is a clean no-op (no retry).
             self.assertEqual(q._deferred_releases, [])
-            q.resolve_deferred_releases()
+            self.assertEqual(q.owner.releasing, [])
+            q.owner.resolve_deferred_releases()
         q.metrics_collector.observe_decode_deferred_kv_release.assert_has_calls(
             [
                 call(duration_seconds=30.0, outcome="error"),
                 call(duration_seconds=30.0, outcome="timeout"),
             ]
         )
+
+    def test_reused_rid_releases_the_drained_request(self):
+        # A retry reuses the rid while the first failure is still held; the
+        # room tells the two apart.
+        mgr = _make_manager()
+        q = _make_queue()
+        first = _make_decode_req(room=500, idx=1, mgr=mgr)
+        retry = _make_decode_req(room=501, idx=2, mgr=mgr)
+        retry.req.rid = first.req.rid
+        _hold(q, first, start_time=10.0, deadline=float("inf"))
+        _hold(q, retry, start_time=11.0, deadline=float("inf"))
+        mgr.note_abort_ack(501, 0, mgr.register_deferred_abort_room(501))
+
+        with patch.object(decode_mod, "release_kv_cache") as rel:
+            q.owner.resolve_deferred_releases()
+
+        rel.assert_called_once_with(retry.req, q.tree_cache, checkpoint=False)
+        self.assertEqual(q.owner.releasing, [first.req])
 
     def test_defer_release_records_deadline_and_idx(self):
         mgr = _make_manager()
@@ -865,12 +896,14 @@ class TestResolveDeferredReleases(CustomTestCase):
         with patch.object(decode_mod.time, "monotonic", return_value=5.0):
             q._defer_release(dreq)
         self.assertEqual(len(q._deferred_releases), 1)
-        held_req, start_time, deadline, held_idx, required = q._deferred_releases[0]
-        self.assertIs(held_req, dreq)
-        self.assertEqual(start_time, 5.0)
-        self.assertEqual(deadline, 17.5)
-        self.assertEqual(held_idx, 9)
-        self.assertEqual(required, 1)
+        held = q._deferred_releases[0]
+        self.assertEqual((held.rid, held.room), ("r400", 400))
+        self.assertEqual(held.start_time, 5.0)
+        self.assertEqual(held.deadline, 17.5)
+        self.assertEqual(held.metadata_buffer_index, 9)
+        self.assertEqual(held.required_acks, 1)
+        # The request moved to the owner's releasing list.
+        self.assertEqual(q.owner.releasing, [dreq.req])
 
 
 def _make_pop_queue(mgr):
@@ -924,7 +957,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
 
     def _pop(self, q):
         released = []
-        q._release_request = released.append
+        q._release_request = lambda req, host_staged: released.append(req)
         with patch.object(decode_mod, "prepare_abort"):
             q.pop_transferred([])
         return released
@@ -944,6 +977,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertEqual(entry.kv_receiver.force_arm_calls, [True])
         self.assertEqual(released, [])
         self.assertEqual(len(q._deferred_releases), 1)
+        self.assertEqual(q.owner.releasing, [entry.req])
         # Metadata slot stays owned by the hold until resolve time.
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
         self.assertEqual(q.queue, [])
@@ -961,7 +995,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
 
         released = self._pop(q)
 
-        self.assertEqual(released, [entry])
+        self.assertEqual(released, [entry.req])
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [4])
 
@@ -976,7 +1010,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         released = self._pop(q)
 
         self.assertFalse(receiver.abort_notified)
-        self.assertEqual(released, [entry])
+        self.assertEqual(released, [entry.req])
         self.assertEqual(q._deferred_releases, [])
 
 
@@ -1035,14 +1069,14 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
             self.assertTrue(hs.holds_rows(entry.req))
             self.assertEqual(hs.host_free, [])
 
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
             self.assertTrue(hs.holds_rows(entry.req))
             self.assertEqual(hs.host_free, [])
 
             mgr.note_abort_ack(room, 0, generation)
             mgr.note_abort_ack(room, 1, generation)
-            q.resolve_deferred_releases()
-            q.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
+            q.owner.resolve_deferred_releases()
             rel.assert_called_once()
 
         self.assertFalse(hs.holds_rows(entry.req))

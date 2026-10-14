@@ -241,13 +241,10 @@ class _TransferQueue:
 
     def __init__(self):
         self.queue = []
-        self.resolve_deferred_releases = Mock()
+        self.resolve_deferred_releases = Mock(return_value=[])
 
     def extend(self, decode_reqs):
         self.queue.extend(decode_reqs)
-
-    def releasing_reqs(self):
-        return []
 
     def pop_transferred(self, decoding):
         done = [r for r in self.queue if r.kv_receiver.poll() == KVPoll.Success]

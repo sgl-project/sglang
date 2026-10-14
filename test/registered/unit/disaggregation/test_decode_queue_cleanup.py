@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
+from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -25,11 +26,16 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_stages import (
+    ModeStages,
+    ScheduleSlot,
+)
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
+from sglang.test.scheduler_request_lists import assert_one_list_per_request
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -420,6 +426,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             kv_receiver=receiver,
             metadata_buffer_index=3,
             hicache_restore_status=HiCacheRestoreResult.READY,
+            host_staged=False,
         )
 
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
@@ -533,6 +540,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             kv_receiver=receiver,
             metadata_buffer_index=3,
             hicache_restore_status=HiCacheRestoreResult.READY,
+            host_staged=False,
         )
 
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
@@ -583,9 +591,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 retracted_queue=list(retracted),
                 held_rebootstrap_reqs=list(held),
             ),
-            transfer_queue=SimpleNamespace(
-                queue=[], releasing_reqs=lambda: list(releasing)
-            ),
+            transfer_queue=SimpleNamespace(queue=[]),
+            releasing=list(releasing),
         )
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
@@ -605,28 +612,87 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # The paused flush ignores waiting requests; held ones own no KV.
         self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
 
-    def test_releasing_lists_hold_finished_requests_until_their_ack(self):
-        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        failed = SimpleNamespace(req=MagicMock(rid="failed"))
-        queue._deferred_releases = [(failed, 0.0, 1.0, 3, 1)]
-        self.assertEqual(queue.releasing_reqs(), [failed.req])
-
+    def _offloading(self, scheduler, *reqs):
+        """Give the decode owner an offload manager with each request's copies
+        in flight: (rid, finished, ack_ids)."""
         manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
-        done = MagicMock(rid="done")
-        done.finished.return_value = True
-        live = MagicMock(rid="live")
-        live.finished.return_value = False
-        # Two copies in flight for the finished request, one for the live one,
-        # which is still decoding.
-        manager.ongoing_offload = {
-            1: (done, None, 0, 0.0, []),
-            2: (live, None, 0, 0.0, []),
-            3: (done, None, 0, 0.0, []),
-        }
-        self.assertEqual(manager.releasing_reqs(), [done])
+        manager.ongoing_offload = {}
+        manager.ongoing_backup = {}
+        manager.tp_world_size = 1
+        manager.cache_controller = MagicMock(ack_write_queue=[])
+        manager.cache_controller.ack_backup_queue.qsize.return_value = 0
+        manager._trigger_backup = MagicMock()
+        manager._release_finished_req = MagicMock()
+        out = []
+        for rid, finished, ack_ids in reqs:
+            req = MagicMock(rid=rid, disagg=DisaggReqState())
+            req.finished.return_value = finished
+            if ack_ids:
+                req.disagg.offload = OffloadedState(ack_ids=list(ack_ids))
+            for ack_id in ack_ids:
+                manager.ongoing_offload[ack_id] = (rid, None, [], [], 0.0, [])
+            out.append(req)
+        owner = scheduler.disagg_decode
+        owner.decode_offload_manager = manager
+        scheduler.decode_offload_manager = manager
+        scheduler.stages = ModeStages(
+            schedule=MagicMock(), hold_finished=owner.hold_finished
+        )
+        return manager, out
 
-        owner = decode_owner_shell(transfer_queue=queue, decode_offload_manager=manager)
-        self.assertEqual(owner.releasing_reqs(), [failed.req, done])
+    @staticmethod
+    def _land(manager, *ack_ids):
+        manager.cache_controller.ack_write_queue = [
+            SimpleNamespace(
+                finish_event=SimpleNamespace(synchronize=lambda: None),
+                node_ids=[ack_id],
+            )
+            for ack_id in ack_ids
+        ]
+
+    def test_finished_request_releases_after_its_last_offload_copy(self):
+        scheduler = self._decode_scheduler()
+        owner = scheduler.disagg_decode
+        manager, (done, live, plain) = self._offloading(
+            scheduler, ("done", True, [1, 2]), ("live", False, [3]), ("plain", True, [])
+        )
+        scheduler.decoding = [done, live, plain]
+
+        # The commit: finished requests leave decoding; the one whose release
+        # waits on a copy moves into releasing, the live one keeps decoding.
+        scheduler.leave_finished_reqs(ScheduleSlot())
+        self.assertEqual(scheduler.decoding, [live])
+        self.assertEqual(owner.releasing, [done])
+        assert_one_list_per_request(scheduler)
+        self.assertFalse(scheduler.is_fully_idle())
+
+        # Its first copy and the live request's land: it waits for the second.
+        self._land(manager, 1, 3)
+        owner.check_offload_progress()
+        self.assertEqual(owner.releasing, [done])
+        manager._release_finished_req.assert_not_called()
+
+        self._land(manager, 2)
+        owner.check_offload_progress()
+        self.assertEqual(owner.releasing, [])
+        manager._release_finished_req.assert_called_once_with(done)
+        assert_one_list_per_request(scheduler)
+
+    def test_abort_leaves_releasing_requests_to_their_ack(self):
+        scheduler = self._decode_scheduler()
+        owner = scheduler.disagg_decode
+        manager, (done,) = self._offloading(scheduler, ("done", True, [1]))
+        owner.releasing = [done]
+        scheduler.mm_receiver = None
+        scheduler.grammar_manager = MagicMock()
+
+        scheduler.abort_request(AbortReq(abort_all=True))
+
+        self.assertEqual(owner.releasing, [done])
+        manager._release_finished_req.assert_not_called()
+        self._land(manager, 1)
+        owner.check_offload_progress()
+        self.assertEqual(owner.releasing, [])
 
     def test_releasing_requests_keep_scheduler_non_idle(self):
         # A failed transfer held until prefill stops writing its pages.
@@ -683,6 +749,7 @@ def _gated_decode_req(poll, restore_status):
         kv_receiver=_GateReceiver(poll),
         metadata_buffer_index=3,
         hicache_restore_status=restore_status,
+        host_staged=False,
     )
 
 

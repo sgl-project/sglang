@@ -31,8 +31,9 @@ def decode_owner_shell(**attrs) -> DisaggDecode:
     owner.prealloc_queue = SimpleNamespace(
         queue=[], retracted_queue=[], held_rebootstrap_reqs=[]
     )
-    owner.transfer_queue = SimpleNamespace(queue=[], releasing_reqs=lambda: [])
+    owner.transfer_queue = SimpleNamespace(queue=[])
     owner.ready = []
+    owner.releasing = []
     owner.decode_offload_manager = None
     owner.is_engine_paused = lambda: False
     owner.__dict__.update(attrs)

@@ -268,12 +268,15 @@ class StorageMedium(str, enum.Enum):
 
 
 class OffloadedState(msgspec.Struct):
-    """Decode-side offload progress for one request, keyed by Req in the manager."""
+    """Decode-side offload progress for one request, ``req.disagg.offload``."""
 
     # Decode-incremental length already submitted for D2H offload.
     inc_len: int = 0
-    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
+    # Tail of the page hash chain, extended as each chunk is submitted.
     last_hash: Optional[str] = None
+    # The ack ids of the request's submitted copies; those still in the
+    # manager's ongoing offloads have not landed.
+    ack_ids: list[int] = msgspec.field(default_factory=list)
 
 
 class BlockStored(KVCacheEvent):

@@ -106,6 +106,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                     scheduler.disaggregation_mode = DisaggregationMode.DECODE
                     scheduler.disagg_prefill = None
                     scheduler.disagg_decode = _decode_owner()
+                    scheduler.decode_offload_manager = None
                 if poll_pending_copy:
                     # Each pending copy adds one intake pass before completing.
                     scheduler.request_receiver.recv_requests.side_effect = [[]] * (
@@ -466,6 +467,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
         scheduler.disagg_decode = _decode_owner()
+        scheduler.decode_offload_manager = None
 
 
 if __name__ == "__main__":

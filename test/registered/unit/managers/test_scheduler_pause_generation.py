@@ -3,7 +3,6 @@ from array import array
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
-from weakref import WeakKeyDictionary
 
 import torch
 
@@ -217,11 +216,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         manager.decode_host_mem_pool = MagicMock()
         manager.ongoing_offload = {}
         manager.ongoing_backup = {}
-        manager.offloaded_state = WeakKeyDictionary()
-        manager.offload_inflight = WeakKeyDictionary()
         if offload:
             self.assertTrue(manager.offload_kv_cache(req))
         scheduler.decode_offload_manager = manager
+        scheduler.disagg_decode = decode_owner_shell(
+            prealloc_queue=MagicMock(), decode_offload_manager=manager
+        )
 
         frees: List[Tuple[str, bool]] = []
 
@@ -243,7 +243,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def _retract_by_pause(self, scheduler: Scheduler, req: Req):
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler.disagg_decode = decode_owner_shell(prealloc_queue=MagicMock())
         scheduler.decoding = [req]
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
@@ -619,7 +618,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 manager = scheduler.decode_offload_manager
                 if case == "tracked_without_ack":
                     manager.cache_controller.ack_write_queue.clear()
-                    manager.ongoing_offload.clear()
                 ops = []
                 all_reduce = _all_reduce_with_peer(ops, peer_acks, peer_pending)
                 with patch.object(
@@ -628,7 +626,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                     if case == "asymmetric_acks":
                         # The per-iteration drain only waits for the peer: it neither
                         # fails closed nor adds a collective.
-                        manager.check_offload_progress()
+                        scheduler.disagg_decode.check_offload_progress()
                         self.assertEqual(ops, [min_op])
                         ops.clear()
                     with self.assertRaisesRegex(RuntimeError, "refusing to retract"):

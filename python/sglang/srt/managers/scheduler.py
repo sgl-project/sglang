@@ -1652,6 +1652,11 @@ class Scheduler:
                 schedule=self.get_next_disagg_decode_batch_to_run,
                 prefetch=owner.prefetch_prefill_dp_rank_queries,
                 intake=owner.intake,
+                hold_finished=(
+                    owner.hold_finished
+                    if self.decode_offload_manager is not None
+                    else None
+                ),
                 ring_consensus=functools.partial(
                     _DisaggDecodeRing,
                     owner,
@@ -2279,10 +2284,12 @@ class Scheduler:
         self._record_step_counters(record)
 
     def leave_finished_reqs(self, slot: ScheduleSlot) -> None:
-        """Drop the requests a commit finished from decoding, and from the
-        mode's own lists (HiSparse staging); the committed slot's admission
-        reopens if decoding shrank."""
+        """Drop the requests a commit finished from decoding (PD decode holds
+        those still releasing KV), and from the mode's own lists (HiSparse
+        staging); the committed slot's admission reopens if decoding shrank."""
         num_decoding = len(self.decoding)
+        if (hold_finished := self.stages.hold_finished) is not None:
+            hold_finished([r for r in self.decoding if r.finished()])
         self.decoding = [r for r in self.decoding if not r.finished()]
         if len(self.decoding) < num_decoding:
             slot.batch_is_full = False
@@ -4652,9 +4659,9 @@ class Scheduler:
     ) -> List[Req]:
         """Move decoding requests back to the waiting queue until the rest fit
         one decode step; return the requests that stay."""
-        if self.decode_offload_manager is not None:
+        if self.disagg_decode is not None and self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees.
-            self.decode_offload_manager.drain_before_retraction()
+            self.disagg_decode.drain_offloads_before_retraction()
         old_available_tokens = self.token_to_kv_pool_allocator.available_size()
         old_ratio = self.new_token_ratio_tracker.current
         mamba_allocator = getattr(
@@ -5641,10 +5648,10 @@ class Scheduler:
 
         self.cur_batch_for_debug = None
 
-        if self.decode_offload_manager is not None:
+        if self.disagg_decode is not None and self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
-            self.decode_offload_manager.drain_before_retraction()
+            self.disagg_decode.drain_offloads_before_retraction()
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req

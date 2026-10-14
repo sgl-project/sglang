@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.kv_events import OffloadedState
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -38,3 +41,5 @@ class DisaggReqState:
     rebootstrap_in_progress: bool = False
     # Under PP, the micro-batch whose consensus resumes this retracted request.
     retraction_mb_id: Optional[int] = None
+    # Decode KV offload progress, from the first offload until the release.
+    offload: Optional[OffloadedState] = None

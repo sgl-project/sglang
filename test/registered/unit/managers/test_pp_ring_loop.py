@@ -225,7 +225,7 @@ class TestPPSlotTag(CustomTestCase):
             decoding
         )[0]
         owner.prealloc_queue.pop_preallocated = record
-        owner.transfer_queue.resolve_deferred_releases = Mock()
+        owner.transfer_queue.resolve_deferred_releases = Mock(return_value=[])
         owner.transfer_queue.pop_transferred = lambda decoding, rids: record(decoding)[
             0
         ]
