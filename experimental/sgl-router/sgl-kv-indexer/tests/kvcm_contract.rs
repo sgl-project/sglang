@@ -225,18 +225,24 @@ impl MetaService for MockKvcm {
         let violation = validate_registration(&request);
         let error = {
             let mut state = MockState::lock(&self.state);
+            let observed = state.register_error.clone();
+            let rejected = observed.is_some() || violation.is_some();
             // KVCM resolves reported spec names against the instance's
-            // registration, so the mock has to remember them.
-            state.registered_specs.insert(
-                request.instance_id.clone(),
-                request
-                    .location_spec_infos
-                    .iter()
-                    .map(|spec| spec.name.clone())
-                    .collect(),
-            );
+            // registration, so the mock has to remember them -- but only for a
+            // registration it accepts: a rejected one leaves no instance behind,
+            // and reporting into it must fail the way a real manager fails.
+            if !rejected {
+                state.registered_specs.insert(
+                    request.instance_id.clone(),
+                    request
+                        .location_spec_infos
+                        .iter()
+                        .map(|spec| spec.name.clone())
+                        .collect(),
+                );
+            }
             state.registrations.push(request);
-            state.register_error.clone()
+            observed
         };
         let header = match (error, violation) {
             (Some((code, message)), _) => err_header(code, &message),

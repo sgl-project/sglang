@@ -310,9 +310,17 @@ Configuration variables (all under `KV_INDEXER_KVCM_`):
   It declares the `full,swa,mamba` spec names, and restates the block size and
   model deployment KVCM requires of every registration (a registration without
   a model name/dtype, or with a non-positive block size, is rejected
-  `INVALID_ARGUMENT`).
+  `INVALID_ARGUMENT`). Against an instance someone else registered with
+  different fields, `DUPLICATE_ENTITY` now fails the query path too, not just
+  applies: the instance stays unroutable (every request `503`) until the
+  mismatch is resolved, which is the intended loud failure for a deployment
+  that should have left this off.
 - `QUERY_TIMEOUT_MS` (default 50, half the Router-side prefix deadline),
-  `APPLY_TIMEOUT_MS` (default 5000, one budget shared by every chunk of a batch)
+  `APPLY_TIMEOUT_MS` (default 5000, one budget shared by every chunk of a batch).
+  Registration runs on the apply budget, not a caller's: it is a setup call that
+  makes the caller's own request possible. Two first calls racing on a cold
+  deployment may each send one registration; KVCM accepts identical fields, and
+  after the first success no further call does.
 - `HEARTBEAT_INTERVAL_MS` (default 30000; `0` disables heartbeats). It must be
   comfortably below KVCM's EventReport liveness `heartbeat_timeout_ms`; at most a
   third of it leaves room for a missed or delayed beat. A reporter that beats
@@ -322,10 +330,8 @@ Configuration variables (all under `KV_INDEXER_KVCM_`):
 Deployment prerequisites on the KVCM side: an event-report storage and an
 instance group listing it as an `event_report_storage_candidates` entry, and a
 registered instance — either by the workers' own KVCM connector (the common
-case; leave `AUTO_REGISTER` off, since `RegisterInstance` fails with
-`DUPLICATE_ENTITY` on any field mismatch) or by `AUTO_REGISTER=1` in
-routing-only deployments, which then also has to carry the deployment's model
-name, dtype and block size.
+case; leave `AUTO_REGISTER` off) or by `AUTO_REGISTER=1` in routing-only
+deployments.
 
 Semantics and limitations:
 
@@ -439,8 +445,14 @@ process, `stop` kills it), and the workdir keeps the manager's registry, logs an
 a `kvcm_live.env` with the endpoints and instance names the tests read. Pass
 `--kvcm-repo` / `--binary` if the checkout or the binary moved. Both `stop` and
 the reuse path of `start` check that the state file's pid is still the manager
-they started (by `/proc/<pid>/exe` and cmdline) before signalling or trusting
+they started — by the `local://<workdir>/registry.json` URI in its cmdline, which
+no other manager and no wrapper script can carry — before signalling or trusting
 it; a stale workdir cannot make them take down an unrelated process.
+
+A single-test failure that the `status` command reports as `Alive` is not
+explained by the harness: keep the full output (test name and panic message)
+alongside the manager's log tail before rerunning, so the next occurrence can be
+diagnosed from evidence rather than repetition.
 
 The harness provisions deliberately tight liveness (2s heartbeat timeout, 2s
 cleanup grace) so the reclamation tests finish in seconds; production values are

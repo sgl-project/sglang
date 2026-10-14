@@ -13,8 +13,10 @@
 //!     python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py stop --workdir /tmp/kvcm-live
 //!
 //! Two guards keep these tests out of every other run: they are `#[ignore]`d,
-//! and each one returns early unless `KVCM_LIVE_ENDPOINT` is set. Without the
-//! harness `cargo test -p sgl-kv-indexer` never touches the network.
+//! so a plain `cargo test -p sgl-kv-indexer` never touches the network. A run
+//! that does ask for them (`--ignored`/`--include-ignored`) with no harness
+//! fails instead of skipping: `ok. N passed` then always means the manager was
+//! really driven.
 //!
 //! Unlike `tests/kvcm_contract.rs` (which pins our translation against a mock),
 //! these tests pin *KVCM's* behavior: which events it accepts, what its liveness
@@ -35,10 +37,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
 use sgl_kv_indexer::kvcm_pb::meta_service_client::MetaServiceClient;
 use sgl_kv_indexer::kvcm_pb::{
-    BlockAddEventParams, BlockDeleteEventParams, CommonResponseHeader, ErrorCode, EventItem,
-    GetHostCacheStateRequest, GetHostCacheStateResponse, HeartbeatEventParams, LocationSpec,
-    LocationSpecInfo, ModelDeployment, NodeRegisterEventParams, QueryType, RegisterInstanceRequest,
-    RegisterInstanceResponse, ReportEventRequest, ReportEventResponse, ReportEventType,
+    block_mask, BlockAddEventParams, BlockDeleteEventParams, BlockMask, CacheLocation,
+    CommonResponse, CommonResponseHeader, ErrorCode, EventItem, FinishWriteCacheRequest,
+    GetCacheMetaRequest, GetCacheMetaResponse, GetHostCacheStateRequest, GetHostCacheStateResponse,
+    HeartbeatEventParams, LocationSpec, LocationSpecInfo, ModelDeployment, NodeRegisterEventParams,
+    QueryType, RegisterInstanceRequest, RegisterInstanceResponse, ReportEventRequest,
+    ReportEventResponse, ReportEventType, StartWriteCacheRequest, StartWriteCacheResponse,
     StorageType,
 };
 use sgl_kv_indexer::pb::{
@@ -53,6 +57,10 @@ const ENV_INSTANCE_ID: &str = "KVCM_LIVE_INSTANCE_ID";
 const ENV_INSTANCE_GROUP: &str = "KVCM_LIVE_INSTANCE_GROUP";
 const ENV_MODEL_NAME: &str = "KVCM_LIVE_MODEL_NAME";
 const ENV_MODEL_DTYPE: &str = "KVCM_LIVE_MODEL_DTYPE";
+/// Written by the harness so a failure can name the workdir it used instead of
+/// assuming the default.
+const ENV_WORKDIR: &str = "KVCM_LIVE_WORKDIR";
+const DEFAULT_LIVE_WORKDIR: &str = "/tmp/kvcm-live";
 
 /// The harness provisions a 2s heartbeat timeout; 300ms keeps every reporter
 /// alive with room for a slow test step.
@@ -117,11 +125,15 @@ fn live_env() -> Option<LiveEnv> {
     };
     // A manager that is gone (this host's other workflows kill by name) must
     // read as an environment failure with a next step, not as 17 bare
-    // connection errors that look like assertion failures.
+    // connection errors that look like assertion failures. The workdir is
+    // whatever the harness was started with, so the printed commands are the
+    // ones that work on this run.
     if let Err(reason) = probe_endpoint(&env.endpoint) {
+        let workdir =
+            std::env::var(ENV_WORKDIR).unwrap_or_else(|_| DEFAULT_LIVE_WORKDIR.to_string());
         panic!(
             "{} is not reachable ({reason}); check the manager with \
-             `python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py status --workdir /tmp/kvcm-live` \
+             `python3 sgl-kv-indexer/tests/kvcm_live/setup_kvcm.py status --workdir {workdir}` \
              and restart it with `start`",
             env.endpoint
         );
@@ -403,6 +415,87 @@ impl RawKvcm {
             .await
             .expect("ReportEvent RPC completes")
             .into_inner()
+    }
+
+    /// A data-plane write session: the L3 (KVCM pool) side of the user's model.
+    /// `write_timeout_seconds` must be positive or the manager drops the session
+    /// before `finish_write_cache` can use it.
+    async fn start_write_cache(
+        &mut self,
+        keys: &[i64],
+        write_timeout_seconds: i32,
+    ) -> StartWriteCacheResponse {
+        let request = StartWriteCacheRequest {
+            trace_id: self.next_trace("start-write"),
+            instance_id: self.instance_id.clone(),
+            block_keys: keys.to_vec(),
+            token_ids: Vec::new(),
+            location_spec_group_names: Vec::new(),
+            write_timeout_seconds,
+            min_replica_count: 0,
+        };
+        let response = self
+            .client
+            .start_write_cache(request)
+            .await
+            .expect("StartWriteCache RPC completes")
+            .into_inner();
+        assert_eq!(
+            header_code(response.header.as_ref()),
+            ErrorCode::Ok,
+            "StartWriteCache must succeed"
+        );
+        response
+    }
+
+    /// Completes a write session. `success_blocks` marks the blocks that really
+    /// landed, as a prefix of the requested keys (`BlockMask::offset` covers
+    /// `[0, offset)`); a block outside the mask is deleted, not served.
+    async fn finish_write_cache(
+        &mut self,
+        session: &str,
+        success_blocks: i32,
+        locations: Vec<CacheLocation>,
+    ) -> CommonResponse {
+        let request = FinishWriteCacheRequest {
+            trace_id: self.next_trace("finish-write"),
+            instance_id: self.instance_id.clone(),
+            write_session_id: session.to_string(),
+            success_blocks: Some(BlockMask {
+                info: Some(block_mask::Info::Offset(success_blocks)),
+            }),
+            locations,
+        };
+        self.client
+            .finish_write_cache(request)
+            .await
+            .expect("FinishWriteCache RPC completes")
+            .into_inner()
+    }
+
+    /// The serving locations per key: the only way to tell "KVCM holds this
+    /// data-plane block" from "the write was dropped".
+    async fn cache_meta(&mut self, keys: &[i64]) -> GetCacheMetaResponse {
+        let request = GetCacheMetaRequest {
+            trace_id: self.next_trace("cache-meta"),
+            instance_id: self.instance_id.clone(),
+            block_keys: keys.to_vec(),
+            token_ids: Vec::new(),
+            block_mask: None,
+            detail_level: 0,
+        };
+        let response = self
+            .client
+            .get_cache_meta(request)
+            .await
+            .expect("GetCacheMeta RPC completes")
+            .into_inner();
+        assert_eq!(
+            header_code(response.header.as_ref()),
+            ErrorCode::Ok,
+            "GetCacheMeta must succeed"
+        );
+        response
     }
 
     async fn query(
@@ -1165,6 +1258,92 @@ async fn zero_p2p_host_count_answers_local_prefixes_only() {
             "p2p_host_count=0 leaves the local prefix unchanged"
         );
     }
+}
+
+/// The per-worker answer only ever reflects what the workers reported over ZMQ
+/// (their L1 HBM), never KVCM's own pool (L3). A data-plane write
+/// (`StartWriteCache`/`FinishWriteCache`) lands a serving location on the
+/// harness's NFS storage: KVCM knows it, and names the *storage* as the holder
+/// when the query carries no medium filter -- while the query this backend makes
+/// (filtered by `REPORT_TIERS`) sees nothing, and the reporter→address join
+/// would drop a storage-named host anyway.
+#[tokio::test]
+#[ignore]
+async fn l3_locations_do_not_answer_per_worker_prefixes() {
+    let env = live_env!();
+    let instance = unique("l3");
+    let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
+    let worker = format!("{instance}-w0");
+    let address = "http://127.0.0.1:30041";
+    let l1_key = 9401;
+    let l3_key = 9402;
+
+    // L1 arm: the block arrives the way this backend's own ingestion does.
+    let backend = backend(&env, &instance, None);
+    backend
+        .apply_external_kv_batch(report_batch(&worker, address, 1, &[l1_key]))
+        .await
+        .expect("a legacy whole-block report is accepted");
+
+    // L3 arm: a data-plane write into the instance group's data-plane storage.
+    // A positive write timeout is required, and the success mask covers the
+    // keys that landed, so a single-key write marks `[0, 1)`.
+    let started = raw.start_write_cache(&[l3_key], 60).await;
+    assert_eq!(started.locations.len(), 1, "one location for one key");
+    let finished = raw
+        .finish_write_cache(&started.write_session_id, 1, started.locations)
+        .await;
+    assert_eq!(
+        header_code(finished.header.as_ref()),
+        ErrorCode::Ok,
+        "FinishWriteCache must succeed"
+    );
+
+    // The write really landed: without this the "not in the answer" assertions
+    // below would hold for the wrong reason (nothing to answer with).
+    let meta = raw.cache_meta(&[l3_key]).await;
+    assert!(
+        meta.locations.iter().any(|location| location
+            .location_specs
+            .iter()
+            .any(|spec| !spec.uri.is_empty())),
+        "the L3 block must have serving locations: {:?}",
+        meta.locations
+    );
+    assert!(
+        meta.metas.iter().any(|meta| meta.contains("CLS_SERVING")),
+        "the L3 block must be serving: {:?}",
+        meta.metas
+    );
+
+    // KVCM answers the L3 block as the storage that holds it, and only when the
+    // medium filter does not exclude it. `nfs_01` is a storage, not a worker:
+    // no routing address can come out of this arm.
+    let unfiltered = raw.query(&[l3_key], &[], 0).await;
+    assert_eq!(
+        locals(&unfiltered),
+        HashMap::from([("nfs_01".to_string(), 1)]),
+        "the storage itself is the holder when nothing is filtered"
+    );
+    assert!(
+        raw.query(&[l3_key], &["hbm"], 0).await.hosts.is_empty(),
+        "the hbm filter the backend uses excludes the L3 location"
+    );
+
+    // Through the trait the Router calls: the reported block answers with the
+    // worker's routing address, the pool block answers nothing.
+    let answer = prefix(&backend, &[l1_key], 0).await;
+    assert_eq!(
+        prefixes_by_address(&answer),
+        HashMap::from([(address.to_string(), 1)]),
+        "the L1 fact is served"
+    );
+    let answer = prefix(&backend, &[l3_key], 0).await;
+    assert!(
+        answer.matches.is_empty(),
+        "an L3-only block must not name any worker: {:?}",
+        answer.matches
+    );
 }
 
 /// The reported medium decides which placements a query sees: the backend

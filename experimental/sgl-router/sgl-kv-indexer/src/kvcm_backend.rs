@@ -21,37 +21,18 @@
 //! a spec, is excluded from the query answer (see [`batch_is_kvcm_eligible`]):
 //! the answer stays a lower bound, never an over-report — except for the
 //! stale placements a skipped `CLEAR_ALL_AT_TIER` leaves behind (documented
-//! below). The per-block
-//! placement query (`MatchExternalKv`) has no KVCM equivalent — KVCM answers
-//! hosts, not per-block location lists — so it fails `UNIMPLEMENTED` and the
-//! prefix query is the only routing signal.
+//! below). The per-block placement query (`MatchExternalKv`) has no KVCM
+//! equivalent -- KVCM answers hosts, not per-block location lists -- so it
+//! fails `UNIMPLEMENTED` and the prefix query is the only routing signal.
 //!
 //! # Deliberate limitations
 //!
-//! * `CLEAR_ALL_AT_TIER` has no KVCM equivalent (a `BLOCK_SNAPSHOT` replaces
-//!   every medium at once). It is skipped with a warning; see the README for
-//!   what does and does not reclaim the stale placements.
-//! * Host-dram placements are not reported by default: deployments that run
-//!   the KVCM connector on their workers already register those blocks through
-//!   the data-plane write path, and double reporting would race eviction.
-//!   `KV_INDEXER_KVCM_REPORT_TIERS` widens the set for routing-only
-//!   deployments.
-//! * The instance is not registered by default. Deployments running the KVCM
-//!   connector already registered it with the real model deployment, and
-//!   `RegisterInstance` fails with `DUPLICATE_ENTITY` on any field mismatch.
-//!   Auto-registration is opt-in for routing-only deployments, and has to
-//!   restate the model name, dtype and block size KVCM requires of every
-//!   registration ([`KvcmAutoRegister`]).
-//! * The reporter→address map is process-local: after an indexer restart,
-//!   prefix answers stay empty until each worker's next batch restates its
-//!   address. KVCM's own placements survive; only the join is lost.
-//! * `snapshot_required` is not an error and not actionable here: KVCM sets it
-//!   while a reporter has no committed snapshot version, which for a
-//!   delta-only reporter is the shape of its first delta (that request creates
-//!   the version). The backend logs the lifecycle start and never sends a
-//!   snapshot -- it holds no placement state to reconcile, so after a
-//!   KVCM-side cleanup the index under-reports (the safe direction) until the
-//!   worker's own events re-report live blocks.
+//! `CLEAR_ALL_AT_TIER` has no KVCM equivalent and is skipped with a warning;
+//! host-dram placements are not reported by default; the instance is registered
+//! only when auto-registration is configured; the reporter→address map is
+//! process-local, so a restart loses the join and not the placements; and
+//! `snapshot_required` marks a reporter lifecycle rather than a fault. The
+//! README carries the operational contract and the failure mode behind each.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -92,9 +73,9 @@ pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 50;
 /// stalling a bridge.
 pub const DEFAULT_APPLY_TIMEOUT_MS: u64 = 5_000;
 /// Default heartbeat cadence. The backend heartbeats every worker it has seen
-/// for its own lifetime: an idle worker's cache stays routable, at the cost of
-/// KVCM liveness never reclaiming a dead reporter (the Router's health
-/// intersection keeps stale entries unroutable instead; see the README).
+/// for its own lifetime, so an idle worker's cache stays routable at the cost of
+/// KVCM liveness never reclaiming a dead reporter -- the Router's health
+/// intersection is what keeps stale entries unroutable.
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 /// Events per `ReportEvent` RPC. A maximal apply batch (16,384 hashes) would
 /// otherwise produce one multi-hundred-kilobyte message; chunking keeps each
@@ -150,9 +131,9 @@ impl fmt::Display for KvcmConfigError {
 
 impl std::error::Error for KvcmConfigError {}
 
-/// Instance registration sent once before the first event batch. Only for
-/// routing-only deployments; deployments running the KVCM connector must leave
-/// this off (see module docs).
+/// Instance registration for routing-only deployments (the KVCM connector
+/// registers the instance otherwise, and a second registration with different
+/// fields fails `DUPLICATE_ENTITY`).
 ///
 /// KVCM refuses a registration that omits the model deployment or a positive
 /// block size (`MetaServiceImpl::RegisterInstance`), so both are required here.
@@ -160,12 +141,12 @@ impl std::error::Error for KvcmConfigError {}
 pub struct KvcmAutoRegister {
     pub instance_group: String,
     pub block_size: u32,
-    /// The routed deployment's identity, as a KVCM `ModelDeployment`. The
-    /// indexer only knows the fleet's workers, not the model they serve, so the
-    /// operator states the name and dtype KVCM demands. Every other
-    /// `ModelDeployment` field keeps its KVCM default, which means registering
-    /// on top of a connector-registered instance fails `DUPLICATE_ENTITY`
-    /// unless that deployment matched the defaults too.
+    /// The routed deployment's identity, as a KVCM `ModelDeployment`: the
+    /// indexer knows the fleet's workers, not their model, so the operator
+    /// states the name and dtype KVCM demands (a pre-registered instance
+    /// accepts this registration only when its fields match; otherwise it
+    /// fails `DUPLICATE_ENTITY`). Other `ModelDeployment` fields keep their
+    /// KVCM default.
     pub model_name: String,
     pub dtype: String,
 }
@@ -181,7 +162,7 @@ pub struct KvcmBackendConfig {
     pub storage_type: StorageType,
     /// Tiers whose events are forwarded to KVCM. Everything else is dropped.
     pub report_tiers: Vec<TierType>,
-    /// Opt-in `RegisterInstance` before the first batch.
+    /// Opt-in `RegisterInstance` before the first apply batch or query.
     pub auto_register: Option<KvcmAutoRegister>,
     pub query_timeout: Duration,
     pub apply_timeout: Duration,
@@ -316,9 +297,6 @@ fn parse_report_tiers(raw: Option<&str>) -> Result<Vec<TierType>, KvcmConfigErro
     Ok(tiers)
 }
 
-/// Parses a non-negative integer, `default` when unset. Shared by the
-/// millisecond knobs and `KV_INDEXER_KVCM_BLOCK_SIZE`; `0` is meaningful for
-/// some knobs (disables heartbeats, default block size).
 /// Parses a millisecond timeout, `default` when unset, capped at one day:
 /// the apply path adds the value to an `Instant`, which panics on overflow.
 fn parse_timeout_ms(key: &'static str, default: u64) -> Result<u64, KvcmConfigError> {
@@ -332,6 +310,8 @@ fn parse_timeout_ms(key: &'static str, default: u64) -> Result<u64, KvcmConfigEr
     Ok(value)
 }
 
+/// Parses a non-negative integer, `default` when unset; a `0` is meaningful
+/// rather than an error (it disables heartbeats and means "no block size").
 fn parse_u64(key: &'static str, default: u64) -> Result<u64, KvcmConfigError> {
     let Some(raw) = env_nonempty(key) else {
         return Ok(default);
@@ -351,13 +331,12 @@ fn env_nonempty(key: &str) -> Option<String> {
     }
 }
 
-/// Resident component-spec names for a reported bitmask. Legacy (mask 0) is
-/// an implicit whole-block store: the full component alone. A non-zero mask
-/// without the FULL bit yields no specs: such a block cannot serve full
-/// attention, and KVCM's prefix match counts a held block by *any* spec
-/// present, so reporting it would over-report. The caller drops it (fail
-/// closed, matching the prefix rule engine, where FULL is required on every
-/// matched block).
+/// Resident component-spec names for a reported bitmask. Legacy (mask 0) is an
+/// implicit whole-block store: the full component alone. A non-zero mask without
+/// FULL yields no specs at all -- such a block cannot serve full attention, and
+/// KVCM counts a held block by *any* spec present, so reporting it would
+/// over-report. The caller drops it, matching the rule engine's fail-closed
+/// rule that FULL is required on every matched block.
 fn component_spec_names(mask: u32) -> Vec<&'static str> {
     if mask == 0 {
         return vec![SPEC_FULL];
@@ -376,14 +355,15 @@ fn component_spec_names(mask: u32) -> Vec<&'static str> {
 }
 
 /// Whether one apply batch keeps its worker answerable by KVCM's whole-block
-/// prefix match *without over-reporting* relative to the trait's rule engine.
+/// prefix match *without over-reporting* relative to the rule engine in
+/// `service::compute_worker_prefix`.
 ///
-/// The rule engine (`service::compute_worker_prefix`) gates a component-aware
-/// worker on more than block presence: SWA must cover a trailing window,
-/// MAMBA must sit on the boundary, and component detail without a spec fails
-/// closed. `GetHostCacheState` answers none of that — so a worker stays
-/// answerable only while every batch keeps it legacy whole-block, or FULL-only
-/// within servable reported tiers with component detail on every block.
+/// The rule engine gates a component-aware worker on more than block presence
+/// (SWA must cover a trailing window, MAMBA must sit on the boundary,
+/// fail-closed detail without a spec) and `GetHostCacheState` answers none of
+/// it, so a worker stays answerable only while every batch keeps it legacy
+/// whole-block, or FULL-only within servable reported tiers with component
+/// detail on every block.
 fn batch_is_kvcm_eligible(
     request: &ApplyExternalKvBatchRequest,
     report_tiers: &[TierType],
@@ -534,7 +514,6 @@ fn heartbeat_event() -> EventItem {
     }
 }
 
-/// Whether an event list carries the reporter's node registration.
 fn carries_node_register(events: &[EventItem]) -> bool {
     events
         .iter()
@@ -704,10 +683,10 @@ fn prefix_entry(
 #[derive(Debug, Default, Clone)]
 struct WorkerRecord {
     address: String,
-    /// Whether a `NODE_REGISTER` for this reporter has been accepted. A first
-    /// batch that fails at the KVCM layer must not burn the registration, and
-    /// KVCM may forget the node after a liveness cleanup, so the flag flips
-    /// only on a successful report carrying one.
+    /// Whether a `NODE_REGISTER` for this reporter has been accepted: a first
+    /// batch that fails must not burn the registration, and KVCM may forget the
+    /// node after a liveness cleanup, so the flag flips only on a successful
+    /// report carrying one.
     node_registered: bool,
     /// Sticky: once a batch makes the worker unanswerable by whole-block
     /// matching (see [`batch_is_kvcm_eligible`]), it stays excluded — the
@@ -719,8 +698,8 @@ struct Inner {
     client: MetaServiceClient<Channel>,
     config: KvcmBackendConfig,
     mediums: Vec<String>,
-    /// Router-facing record per worker, refreshed by every apply batch. The
-    /// query side resolves KVCM reporter ids back into routing addresses here.
+    /// Router-facing record per worker, refreshed by every apply batch: the
+    /// query side resolves KVCM reporter ids back into addresses here.
     workers: RwLock<HashMap<String, WorkerRecord>>,
     instance_registered: AtomicBool,
     trace: AtomicU64,
@@ -783,14 +762,10 @@ impl Inner {
             self.set_node_registered(host, false);
         }
         if response.snapshot_required {
-            // KVCM asks for a reconciliation snapshot while the reporter has no
-            // committed snapshot version, and the first delta of a lifecycle is
-            // what creates that version — so this marks a lifecycle start, not
-            // a fault. A request that carries deltas is that start; anything
-            // else (a heartbeat, a report that translated to nothing) is a
-            // reporter that never wrote a delta, which is only worth a debug
-            // line: this backend holds no placement state and cannot reconcile
-            // either way.
+            // A lifecycle start, not a fault: a request carrying deltas is
+            // what creates the version KVCM is asking about, while a beat from
+            // a reporter that never wrote one is only worth a debug line. This
+            // backend holds no placement state and cannot reconcile either way.
             if has_delta {
                 tracing::info!(
                     host,
@@ -1117,14 +1092,11 @@ impl KvIndexerBackend for KvcmIndexerBackend {
         if hashes.is_empty() {
             return Ok(MatchExternalKvPrefixResponse::default());
         }
-        // A prefix query can be the first thing this backend ever does: the
-        // Router asks about a deployment before any worker has published a KV
-        // event, so no apply batch has registered the instance yet and KVCM
-        // answers INSTANCE_NOT_EXIST -- a permanent fault that would fail every
-        // request until traffic warmed a worker by some other path. The
-        // registration needs nothing from a batch, so the query path ensures it
-        // too; deployments without `auto_register` keep the fault, which is then
-        // a real configuration error.
+        // A prefix query can be the first thing this backend ever does, and an
+        // unregistered instance is a permanent fault the router turns into a
+        // 503 for every request. Registration needs nothing from a batch, so
+        // the query path ensures it too; without `auto_register` the fault
+        // stays, and is then a real configuration error.
         self.inner.register_instance().await?;
         let response = self.inner.get_host_cache_state(&hashes).await?;
         let blocks_read = hashes.len() as u32;
@@ -1207,8 +1179,6 @@ mod tests {
             "event_report"
         );
         assert_eq!(storage_uri_scheme(StorageType::StEventReportL2), "vineyard");
-        // The address authority is preferred; ids, bare hosts, and empty
-        // values fall back to the worker id.
         assert_eq!(
             reporter_uri_authority("http://10.0.0.1:30000", "worker-0"),
             "10.0.0.1:30000"
@@ -1475,7 +1445,6 @@ mod tests {
     #[test]
     fn full_only_specs_stay_eligible_within_servable_reported_tiers() {
         let masks = [COMPONENT_FULL];
-        // Servable reported tier: eligible.
         let request = apply(
             "worker-0",
             "http://w0:30000",
@@ -1483,7 +1452,6 @@ mod tests {
             Some(spec(COMPONENT_FULL, 1, 1 << hbm())),
         );
         assert!(batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
-        // The spec does not serve FULL on the reported tier: ineligible.
         let request = apply(
             "worker-0",
             "http://w0:30000",
@@ -1563,7 +1531,6 @@ mod tests {
             prefix_entry(host("w0", 99), 10, &record("http://w0", true)).map(|e| e.2),
             Some(10)
         );
-        // Zero-length, negative, unroutable, and ineligible entries are excluded.
         assert_eq!(
             prefix_entry(host("w0", 0), 10, &record("http://w0", true)),
             None
