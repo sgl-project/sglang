@@ -11,6 +11,7 @@ from array import array
 from collections import defaultdict
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
+from queue import Queue
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -49,6 +50,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -3571,9 +3573,6 @@ class UnifiedRadixCacheSuite:
         leaf = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", seq)))
         ).last_device_node
-        self._backup_node(cache, leaf)
-        page_hashes = self._all_page_hashes(cache, leaf)
-
         backend = cache.cache_controller.storage_backend
         with (
             mock.patch.object(backend, "batch_set", return_value=False),
@@ -3581,6 +3580,10 @@ class UnifiedRadixCacheSuite:
                 backend, "batch_set_v1", side_effect=lambda h, *a, **k: [False] * len(h)
             ),
         ):
+            # The D->H ack can immediately enqueue an L3 write, so inject the
+            # failure before starting the host backup, not just the explicit put.
+            self._backup_node(cache, leaf)
+            page_hashes = self._all_page_hashes(cache, leaf)
             self._write_path_to_l3(cache, leaf)
             self._flush_l3_backups(cache)
 
@@ -3678,16 +3681,110 @@ class UnifiedRadixCacheSuite:
                     self.assertEqual([node for node, _, _ in candidates], expected)
                     self.assertEqual(pool.available_size(), 4 * ps)
                     result = core.drive_host_eviction(ComponentType.FULL, pages * ps)
-                    self.assertEqual(
-                        [
-                            t.tolist()
-                            for t in result.host_frees.get(ComponentType.FULL, [])
-                        ],
-                        [slots[node] for node in expected],
-                    )
+                    try:
+                        self.assertEqual(
+                            [
+                                t.tolist()
+                                for t in result.host_frees.get(ComponentType.FULL, [])
+                            ],
+                            [slots[node] for node in expected],
+                        )
+                    finally:
+                        cache._free_values(result.device_frees, result.host_frees)
+                    self.assertEqual(pool.available_size(), (4 + pages) * ps)
                     for node in expected:
                         with self.assertRaises(KeyError):
                             core.node_by_id(node)
+
+    def test_hicache_l3_dedup_requires_auxiliary_pool_coverage(self):
+        self._require_host_only_l3_fixture()
+        for pool_name, component in (
+            (PoolName.MAMBA, ComponentType.MAMBA),
+            (PoolName.SWA, ComponentType.SWA),
+            (PoolName.DRAFT, None),
+        ):
+            for from_tail in (False, True):
+                with self.subTest(pool=pool_name, from_tail=from_tail):
+                    cache, pool = self._host_only_l3_fixture()
+                    node = self._insert_host_page(cache, pool, 1000)
+                    spec = cache.tree_core.build_storage_backup_spec(node, False)
+                    transfer = PoolTransfer(
+                        name=pool_name,
+                        host_indices=spec.host_value,
+                        keys=spec.hash_value,
+                    )
+                    comp_xfers = (
+                        {component: [transfer]} if component is not None else {}
+                    )
+                    if component is None:
+                        cache.sidecar_pool_specs.append(
+                            SidecarPoolSpec(pool_name, PoolName.KV)
+                        )
+                    backup_spec = SimpleNamespace(
+                        host_value=spec.host_value,
+                        token_ids=spec.token_ids,
+                        hash_value=spec.hash_value,
+                        prefix_keys=spec.prefix_keys,
+                        comp_xfers=comp_xfers,
+                    )
+                    cache.storage_existence_cache.pool(PoolName.KV).add(spec.hash_value)
+                    with mock.patch.object(
+                        cache.tree_core,
+                        "build_storage_backup_spec",
+                        return_value=backup_spec,
+                    ):
+                        if from_tail:
+                            # Leave less free space than the write-behind reserve.
+                            for token in range(2000, 8000, 1000):
+                                self._insert_host_page(cache, pool, token)
+                            with mock.patch.object(
+                                cache.tree_core,
+                                "peek_host_eviction_candidates",
+                                return_value=[(node, cache.page_size, spec.hash_value)],
+                            ):
+                                for _ in range(4):
+                                    cache._write_behind_host_tail()
+                            self.assertEqual(cache._write_behind_clean_tokens, 0)
+                            self.assertEqual(
+                                sum(cache._write_behind_inflight.values()),
+                                cache.page_size,
+                            )
+                        else:
+                            self.assertIsNotNone(cache.write_backup_storage(node))
+                        writes = cache.cache_controller.write_storage
+                        writes.assert_called_once()
+                        extras = writes.call_args.kwargs["extra_pools"]
+                        self.assertEqual([t.name for t in extras], [pool_name])
+                        self.assertEqual(extras[0].keys, spec.hash_value)
+                        operation_id = next(iter(cache.ongoing_backup))
+                        cache.cache_controller.ack_backup_queue = Queue()
+                        cache.cache_controller.ack_backup_queue.put(
+                            SimpleNamespace(
+                                id=operation_id,
+                                hash_value=spec.hash_value,
+                                pool_transfers=extras,
+                                completed_tokens=0,
+                            )
+                        )
+                        # Even failure acks teach the same advisory beliefs on
+                        # every rank; a later miss repairs them pool by pool.
+                        cache._drain_storage_control_queues_impl(
+                            n_storage_hit=0,
+                            n_ack_prefetch=0,
+                            n_backup=1,
+                            n_release=0,
+                            extra_release_counts={},
+                            log_metrics=False,
+                        )
+                        self.assertFalse(cache.ongoing_backup)
+                        self.assertFalse(cache._write_behind_inflight)
+                        self.assertTrue(
+                            cache.storage_existence_cache.pool(pool_name).covered(
+                                spec.hash_value
+                            )
+                        )
+                        self.assertIsNone(cache.write_backup_storage(node))
+                        self.assertEqual(writes.call_count, 1)
 
     def test_hicache_l3_host_tail_reserve_and_write_through_ack(self):
         self._require_host_only_l3_fixture()

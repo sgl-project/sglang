@@ -2039,10 +2039,30 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return transfers
 
+    def _storage_backup_is_covered(self, spec) -> bool:
+        beliefs = self.storage_existence_cache
+        if not beliefs.pool(PoolName.KV).covered(spec.hash_value):
+            return False
+        kv_xfer = PoolTransfer(
+            name=PoolName.KV, host_indices=spec.host_value, keys=spec.hash_value
+        )
+        aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
+        aux_xfers.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_STORAGE, kv_xfer, spec.comp_xfers
+            )
+        )
+        # KV coverage alone does not prove that a checkpoint or sidecar was written.
+        return all(
+            transfer.keys is not None
+            and beliefs.pool(transfer.name).covered(transfer.keys)
+            for transfer in aux_xfers
+        )
+
     @rank_consensus
     def write_backup_storage(self, node_id: NodeId) -> Optional[int]:
         """Issue the node's host->storage backup; returns the operation id, or
-        None when nothing was issued (no host copy)."""
+        None when nothing was issued (no host copy or all pools covered)."""
         if not self.enable_storage or self.cache_controller is None:
             return None
         spec = self.tree_core.build_storage_backup_spec(
@@ -2052,7 +2072,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         # A recompute after L2 eviction re-creates the node with backuped=False, so the
         # flag alone would re-write content L3 holds; stale positives heal on prefetch miss.
-        if self.storage_existence_cache.covers_all(PoolName.KV, spec.hash_value):
+        if self._storage_backup_is_covered(spec):
             return None
 
         kv_xfer = PoolTransfer(
@@ -2111,9 +2131,13 @@ class UnifiedRadixCache(BasePrefixCache):
         ) in self.tree_core.peek_host_eviction_candidates(
             BASE_COMPONENT_TYPE, target - pool.available_size()
         ):
-            if hash_value and beliefs.covers_all(PoolName.KV, hash_value):
-                clean += num_tokens
-                continue
+            if hash_value and beliefs.pool(PoolName.KV).covered(hash_value):
+                spec = self.tree_core.build_storage_backup_spec(
+                    node_id, self.hicache_storage_pass_prefix_keys
+                )
+                if spec is not None and self._storage_backup_is_covered(spec):
+                    clean += num_tokens
+                    continue
             operation_id = self.write_backup_storage(node_id)
             if operation_id is None:
                 # No host copy to write from; the page leaves L2 without an L3 copy.
@@ -2586,8 +2610,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._apply_cache_actions(insert_result.cache_actions)
 
         # The rank-synced fetch proves L3 presence even if the host insert is dropped.
-        self.storage_existence_cache.add(
-            PoolName.KV, hash_value[: completed_tokens // self.page_size]
+        self.storage_existence_cache.pool(PoolName.KV).add(
+            hash_value[: completed_tokens // self.page_size]
         )
 
         if insert_result.host_insert_dropped:
@@ -3367,9 +3391,14 @@ class UnifiedRadixCache(BasePrefixCache):
                     # Added unconditionally: completed_tokens can diverge across ranks on
                     # backend failure and a divergent belief desyncs the rank collectives.
                     if operation.hash_value:
-                        self.storage_existence_cache.add(
-                            PoolName.KV, operation.hash_value
+                        self.storage_existence_cache.pool(PoolName.KV).add(
+                            operation.hash_value
                         )
+                    for transfer in operation.pool_transfers or ():
+                        if transfer.keys:
+                            self.storage_existence_cache.pool(transfer.name).add(
+                                transfer.keys
+                            )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
