@@ -62,11 +62,13 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
         cache._pp_sync = MagicMock()
+        cache.storage_unavailable = False
         cache.writing_check = MagicMock()
         cache.loading_check = MagicMock()
         cache.cache_controller = SimpleNamespace(
             start_writing=MagicMock(),
             storage_workers_healthy=lambda: True,
+            pp_prefetch_command_group=None,
             ack_write_queue=[
                 SimpleNamespace(
                     finish_event=SimpleNamespace(query=MagicMock(return_value=ready))
@@ -133,7 +135,9 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
 
         cache._all_reduce.assert_not_called()
         cache._all_reduce_attn_groups.assert_called_once()
-        # Only the storage health verdict is relayed from PP0, not the counts.
+        # Without PP tickets only the storage health verdict is relayed from
+        # PP0 (never the counts); with tickets PP0 decides per request and
+        # the stage keeps its own verdict, so nothing touches the PP group.
         cache._pp_sync.assert_called_once()
         self.assertEqual(cache._pp_sync.call_args.args[0].tolist(), [1])
         cache.writing_check.assert_called_once_with(finish_count=1)
@@ -146,6 +150,10 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             extra_release_counts={},
             log_metrics=True,
         )
+        cc.pp_prefetch_command_group = "command"
+        cache._pp_sync.reset_mock()
+        cache.check_hicache_events()
+        cache._pp_sync.assert_not_called()
 
 
 if __name__ == "__main__":

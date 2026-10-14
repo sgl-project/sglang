@@ -31,14 +31,19 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=50, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 PAGE = 2
 TOKENS = list(range(4))
-# The storage sync groups get a short timeout; the hung rank releases its
-# backend call only after every peer collective on them has timed out.
-SYNC_TIMEOUT_S = 3.0
-HOLD_S = 6.0
+BATCH_TOKENS = PAGE * 64
+# A failing storage sync group times out after SYNC_TIMEOUT_S; the hung rank
+# releases its backend call at HOLD_S, after every peer collective on that
+# group has timed out. A healthy group outlives both by a wide margin, so a
+# rank that blocks on it for its full timeout is a visible hang.
+SYNC_TIMEOUT_S = 1.0
+HOLD_S = 2.5
+HEALTHY_TIMEOUT_S = 8.0
+FAST_S = HEALTHY_TIMEOUT_S / 2
 
 
 class _HoldingBackend:
@@ -75,6 +80,10 @@ def _controller(hits_group, completion_group, backend) -> HybridCacheController:
     cc.ack_backup_queue = Queue()
     cc.host_mem_release_queue = Queue()
     cc.extra_host_mem_release_queues = {}
+    cc.ack_write_queue = []
+    cc.ack_load_queue = []
+    cc.start_writing = Mock()
+    cc.append_host_mem_release = Mock()
     cc.prefetch_hits_sync_groups = [hits_group] if hits_group is not None else []
     cc.prefetch_completion_sync_groups = (
         [completion_group] if completion_group is not None else []
@@ -83,6 +92,7 @@ def _controller(hits_group, completion_group, backend) -> HybridCacheController:
     cc.storage_sync_failure = None
     cc._storage_sync_lock = threading.Lock()
     cc.storage_failure_policy = "disable"
+    cc.pp_prefetch_command_group = None
     cc.pp_prefetch_command_thread = None
     cc.pp_prefetch_decisions = {}
     # Workers not under test idle until the stop event.
@@ -94,17 +104,22 @@ def _controller(hits_group, completion_group, backend) -> HybridCacheController:
 
 
 def _scheduler_cache(cc) -> UnifiedRadixCache:
-    """The scheduler-thread side: a real queue drain whose cross-rank MIN runs
-    on the default (healthy) process group, as the TP group does."""
+    """The scheduler-thread side: the real check_hicache_events round, whose
+    cross-rank MIN runs on the default (healthy) process group like the TP
+    group does; only the L2 ack checks and the buffer flush are stubbed."""
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.cache_controller = cc
     # enable_storage and page_size are proxied to the tree core.
-    cache.tree_core = SimpleNamespace(enable_storage=True, page_size=PAGE)
+    cache.tree_core = SimpleNamespace(
+        enable_storage=True, page_size=PAGE, write_back_duplicate_reclaim_digest=0
+    )
     cache.storage_unavailable = False
+    cache._storage_unavailable_warned_at = 0.0
     cache.host_memory_mode = "buffer_only"
     cache.prefetch_threshold = PAGE
     cache.enable_storage_metrics = False
     cache.storage_metrics_collector = None
+    cache.linker = None
     cache.pp_rank = 0
     cache.pp_size = 1
     cache.pp_group = None
@@ -113,6 +128,8 @@ def _scheduler_cache(cc) -> UnifiedRadixCache:
     cache.attn_cp_group = None
     cache.attn_tp_group = None
     cache.work_list = []
+    cache.writing_check = Mock()
+    cache.loading_check = Mock()
     cache.storage_prefetch_retries = StoragePrefetchRetries()
     cache._prefetch_outcome_stats = defaultdict(int)
     cache._storage_prefetch_hit_remaining_by_reqid = {}
@@ -120,7 +137,9 @@ def _scheduler_cache(cc) -> UnifiedRadixCache:
     cache.revoke_pending_prefetch = Mock()
     cache._handle_prefetch_result = Mock()
     cache.buffer_pipeline = SimpleNamespace(
-        pending_hit_allocs=deque(), has_staged=lambda request: False
+        pending_hit_allocs=deque(),
+        has_staged=lambda request: False,
+        flush_pending_writes=Mock(),
     )
     cache.ongoing_prefetch = {}
     return cache
@@ -139,12 +158,21 @@ def _track(cache, operation) -> None:
     )
 
 
+def _ack(operation, completed=None, done=False) -> PrefetchAck:
+    return PrefetchAck(
+        rid=operation.request_id,
+        operation=operation,
+        completed_tokens=completed,
+        completed_req=True if done else None,
+    )
+
+
 def _drain(queue: Queue, want: int, budget_s: float) -> list:
     items = []
     deadline = time.monotonic() + budget_s
     while len(items) < want and time.monotonic() < deadline:
         try:
-            items.append(queue.get(timeout=0.1))
+            items.append(queue.get(timeout=0.05))
         except Empty:
             continue
     return items
@@ -157,67 +185,98 @@ def _same_on_every_rank(snapshot):
     return snapshots[0]
 
 
-def _rank_main(rank: int, rendezvous: str, body) -> None:
-    # A regression that turns a recovery into a hang must fail, not block CI.
-    watchdog = threading.Timer(120, lambda: os._exit(86))
-    watchdog.daemon = True
-    watchdog.start()
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{rendezvous}",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=60),
+def _wait_for(predicate, budget_s: float) -> None:
+    t0 = time.monotonic()
+    while not predicate():
+        assert time.monotonic() - t0 < budget_s, "condition not met in time"
+        time.sleep(0.02)
+
+
+def _sync_groups():
+    """Fresh (failing, healthy) gloo groups, created collectively."""
+    failing = dist.new_group(backend="gloo", timeout=timedelta(seconds=SYNC_TIMEOUT_S))
+    healthy = dist.new_group(
+        backend="gloo", timeout=timedelta(seconds=HEALTHY_TIMEOUT_S)
     )
-    try:
-        body(rank)
-    finally:
-        dist.destroy_process_group()
+    return failing, healthy
+
+
+def _start_workers(cc) -> tuple[threading.Thread, threading.Thread]:
+    query_thread = threading.Thread(target=cc.prefetch_thread_func, daemon=True)
+    sync_thread = threading.Thread(target=cc.prefetch_sync_thread_func, daemon=True)
+    query_thread.start()
+    sync_thread.start()
+    cc.prefetch_thread, cc.prefetch_sync_thread = query_thread, sync_thread
+    return query_thread, sync_thread
+
+
+def _stop(cc, *workers) -> None:
+    cc.storage_stop_event.set()
+    cc.prefetch_queue.put(None)
+    cc.prefetch_sync_queue.put(None)
+    for worker in workers:
+        worker.join(5)
 
 
 def _hit_query_timeout_body(rank: int) -> None:
-    hits_group = dist.new_group(
-        backend="gloo", timeout=timedelta(seconds=SYNC_TIMEOUT_S)
-    )
+    """Rank 1 hangs in its backend; rank 0's hit MIN times out. Both query
+    threads must survive, the untouched completion group must stay usable on
+    both ranks, and check_hicache_events must degrade every rank at once."""
+    hits_group, completion_group = _sync_groups()
     backend = _HoldingBackend(hold_first=(rank == 1))
-    cc = _controller(hits_group, None, backend)
+    cc = _controller(hits_group, completion_group, backend)
     get_storage_hash_str(TOKENS, None, page_size=PAGE)  # JIT warm-up off the clock
-    worker = threading.Thread(target=cc.prefetch_thread_func, daemon=True)
-    worker.start()
-    cc.prefetch_thread = worker
+    query_thread, sync_thread = _start_workers(cc)
     cache = _scheduler_cache(cc)
     dist.barrier()
 
+    t0 = time.monotonic()
     ops = [_operation("op1"), _operation("op2")]
     for operation in ops:
         _track(cache, operation)
         cc.prefetch_queue.put(operation)
+    if rank == 0:
+        _wait_for(lambda: cc.storage_sync_failed, budget_s=FAST_S)
+    # Cross-group: rank 1's query thread is still hung and rank 0 has already
+    # failed on the hits group, yet an ack on the completion group must still
+    # reduce promptly on both ranks (a peer that skipped it would strand this
+    # rank for that group's whole timeout).
+    dist.barrier()
+    transfer = _operation("xfer", host_indices=torch.arange(BATCH_TOKENS))
+    cc.prefetch_sync_queue.put(_ack(transfer, BATCH_TOKENS - rank * 10))
+    acks = _drain(cc.ack_prefetch_queue, want=1, budget_s=FAST_S)
+    assert [(a.rid, a.completed_tokens) for a in acks] == [
+        ("xfer", BATCH_TOKENS - 10)
+    ], acks
     if rank == 1:
-        time.sleep(HOLD_S)
+        time.sleep(max(0.0, HOLD_S - (time.monotonic() - t0)))
         backend.hold.set()
-    published = _drain(cc.prefetch_hit_queue, want=2, budget_s=HOLD_S + 20)
-    # The hung rank's own collective fails once the peer's has timed out, so
-    # op 1 is a published miss on both ranks and the query thread is alive to
-    # serve op 2 (also a miss: the groups stay broken) without any collective.
+    published = _drain(cc.prefetch_hit_queue, want=2, budget_s=FAST_S)
+    published_at = time.monotonic() - t0
+    # The hung rank's own collective fails as soon as it enters (the peer's
+    # timeout closed the pair), so op 1 is a published miss on both ranks and
+    # the query thread is alive to serve op 2: a retry on the broken group
+    # fails at once instead of waiting out another timeout.
     assert [(op.request_id, op.storage_hit_count) for op in published] == [
         ("op1", 0),
         ("op2", 0),
     ], published
-    assert worker.is_alive()
+    assert published_at < (SYNC_TIMEOUT_S if rank == 0 else HOLD_S) + FAST_S / 2
+    assert query_thread.is_alive() and sync_thread.is_alive()
     assert cc.storage_sync_failed and not cc.storage_workers_healthy()
     op3 = _operation("op3")
     _track(cache, op3)
     cc.prefetch_queue.put(op3)
-    assert [op.request_id for op in _drain(cc.prefetch_hit_queue, 1, 5)] == ["op3"]
+    assert [op.request_id for op in _drain(cc.prefetch_hit_queue, 1, FAST_S)] == ["op3"]
     for operation in published + [op3]:
         cc.prefetch_hit_queue.put(operation)
 
-    # Scheduler side: the MIN-reduced health bit degrades every rank in the
-    # same drain round; the drained queries resolve as misses, an unpublished
-    # prefetch is cut, and no new prefetch is issued.
+    # Scheduler side, the production round: the MIN-reduced health bit
+    # degrades every rank in the same tick; the drained queries resolve as
+    # misses, an unpublished prefetch is cut, and no new prefetch is issued.
     op4 = _operation("op4")
     _track(cache, op4)
-    cache.drain_storage_control_queues()
+    cache.check_hicache_events()
     assert cache.storage_unavailable
     revoked = [
         call.args[0].rid for call in cache.revoke_pending_prefetch.call_args_list
@@ -240,96 +299,85 @@ def _hit_query_timeout_body(rank: int) -> None:
     cc.storage_failure_policy = "raise"
     loud = _scheduler_cache(cc)
     try:
-        loud.drain_storage_control_queues()
+        loud.check_hicache_events()
     except RuntimeError as e:
         assert "unhealthy" in str(e), e
     else:
         raise AssertionError("raise policy did not fail the drain")
-    cc.storage_stop_event.set()
-    cc.prefetch_queue.put(None)
-    worker.join(5)
+    _stop(cc, query_thread, sync_thread)
 
 
 def _ack_alignment_body(rank: int) -> None:
-    completion_group = dist.new_group(
-        backend="gloo", timeout=timedelta(seconds=SYNC_TIMEOUT_S)
-    )
-    cc = _controller(None, completion_group, None)
-    worker = threading.Thread(target=cc.prefetch_sync_thread_func, daemon=True)
-    worker.start()
-    cc.prefetch_sync_thread = worker
-    op_a = _operation("A", host_indices=torch.arange(3 * PAGE * 64))
-    op_b = _operation("B", host_indices=torch.arange(PAGE * 64))
-    tokens_per_batch = PAGE * 64
-
-    def ack(operation, completed=None, done=False):
-        return PrefetchAck(
-            rid=operation.request_id,
-            operation=operation,
-            completed_tokens=completed,
-            completed_req=True if done else None,
-        )
+    """A completion-group timeout mid-transfer: one ack per batch still
+    reaches the scheduler on every rank, in order; progress freezes at the
+    last agreed value and each completion finishes its own operation."""
+    completion_group, hits_group = _sync_groups()
+    cc = _controller(hits_group, completion_group, _HoldingBackend(hold_first=False))
+    query_thread, sync_thread = _start_workers(cc)
+    cache = _scheduler_cache(cc)
+    op_a = _operation("A", host_indices=torch.arange(3 * BATCH_TOKENS))
+    op_b = _operation("B", host_indices=torch.arange(BATCH_TOKENS))
+    for operation in (op_a, op_b):
+        _track(cache, operation)
 
     dist.barrier()
-    cc.prefetch_sync_queue.put(ack(op_a, tokens_per_batch))
+    cc.prefetch_sync_queue.put(_ack(op_a, BATCH_TOKENS))
+    _wait_for(lambda: cc.ack_prefetch_queue.qsize() == 1, budget_s=FAST_S)
+    cache.check_hicache_events()  # healthy round: the agreed progress lands
+    assert (op_a.completed_tokens, cache.storage_unavailable) == (BATCH_TOKENS, False)
     if rank == 1:
-        # The IO thread of this rank is stuck in its backend for batch 2.
-        time.sleep(HOLD_S)
-    cc.prefetch_sync_queue.put(ack(op_a, 2 * tokens_per_batch - rank * 10))
-    cc.prefetch_sync_queue.put(ack(op_a, 3 * tokens_per_batch))
-    cc.prefetch_sync_queue.put(ack(op_a, done=True))
-    cc.prefetch_sync_queue.put(ack(op_b, tokens_per_batch))
-    cc.prefetch_sync_queue.put(ack(op_b, done=True))
-    acks = _drain(cc.ack_prefetch_queue, want=6, budget_s=HOLD_S + 20)
+        time.sleep(HOLD_S)  # this rank's IO thread is stuck for batch 2
+    cc.prefetch_sync_queue.put(_ack(op_a, 2 * BATCH_TOKENS - rank * 10))
+    cc.prefetch_sync_queue.put(_ack(op_a, 3 * BATCH_TOKENS))
+    cc.prefetch_sync_queue.put(_ack(op_a, done=True))
+    cc.prefetch_sync_queue.put(_ack(op_b, BATCH_TOKENS))
+    cc.prefetch_sync_queue.put(_ack(op_b, done=True))
+    acks = _drain(cc.ack_prefetch_queue, want=5, budget_s=FAST_S)
     sequence = [(a.rid, a.completed_tokens, bool(a.completed_req)) for a in acks]
-    # One ack per transfer batch reaches the scheduler on every rank, in
-    # order; the batches after the failed collective carry no progress.
     assert sequence == [
-        ("A", tokens_per_batch, False),
         ("A", 0, False),
         ("A", 0, False),
         ("A", None, True),
         ("B", 0, False),
         ("B", None, True),
     ], sequence
-    assert worker.is_alive() and cc.storage_sync_failed
+    assert sync_thread.is_alive() and cc.storage_sync_failed
     _same_on_every_rank(sequence)
+    # Cross-group: the hits group did not fail, so a query still reduces
+    # promptly on both ranks and keeps its agreed value.
+    dist.barrier()
+    query = _operation("after")
+    _track(cache, query)
+    t0 = time.monotonic()
+    cc.prefetch_queue.put(query)
+    hits = _drain(cc.prefetch_hit_queue, want=1, budget_s=FAST_S)
+    assert time.monotonic() - t0 < FAST_S / 2
+    assert [(op.request_id, op.storage_hit_count) for op in hits] == [
+        ("after", len(TOKENS))
+    ], hits
 
-    # Scheduler side: the first ack was drained while healthy; from the
-    # degrade round on, progress freezes at the last agreed value and each
-    # completion still finishes its own operation and releases the tail.
-    cache = _scheduler_cache(cc)
-    cc.append_host_mem_release = Mock()
-    for operation in (op_a, op_b):
-        _track(cache, operation)
-    for ack_ in acks:
-        cc.ack_prefetch_queue.put(ack_)
-    drain = lambda n: cache._drain_storage_control_queues_impl(
-        n_storage_hit=0,
-        n_ack_prefetch=n,
-        n_backup=0,
-        n_release=0,
-        extra_release_counts={},
-        log_metrics=False,
-    )
-    drain(1)
-    assert op_a.completed_tokens == tokens_per_batch
-    cache.storage_unavailable = True
-    drain(5)
-    assert (op_a.completed_tokens, op_b.completed_tokens) == (tokens_per_batch, 0)
+    # Degraded round: no progress is applied from the failed acks, each
+    # completion finishes its own operation and releases the right tail, and
+    # the agreed hit reads as a miss.
+    for ack in acks:
+        cc.ack_prefetch_queue.put(ack)
+    cc.prefetch_hit_queue.put(hits[0])
+    cache.check_hicache_events()
+    assert cache.storage_unavailable
+    assert (op_a.completed_tokens, op_b.completed_tokens) == (BATCH_TOKENS, 0)
     finished = [
         call.args[0].request_id for call in cache._handle_prefetch_result.call_args_list
     ]
     assert finished == ["A", "B"], finished
     released = [len(call.args[0]) for call in cc.append_host_mem_release.call_args_list]
-    assert released == [2 * tokens_per_batch, tokens_per_batch], released
-    cc.storage_stop_event.set()
-    cc.prefetch_sync_queue.put(None)
-    worker.join(5)
+    assert released == [2 * BATCH_TOKENS, BATCH_TOKENS], released
+    assert cache.revoke_pending_prefetch.call_args.args[0] == query.handle
+    _stop(cc, query_thread, sync_thread)
 
 
 def _dead_worker_body(rank: int) -> None:
-    cc = _controller(None, None, None)
+    """One rank's dead worker degrades every rank in the same tick."""
+    cc = _controller(None, None, SimpleNamespace(get_stats=lambda: None))
     if rank == 1:
         cc.backup_thread = threading.Thread(target=lambda: None)
         cc.backup_thread.start()
@@ -338,10 +386,8 @@ def _dead_worker_body(rank: int) -> None:
     cache.enable_storage_metrics = True
     cache.storage_metrics_collector = Mock()
     with patch("sglang.srt.mem_cache.unified_radix_cache.logger.error") as log_error:
-        cache.drain_storage_control_queues()
-        cache.drain_storage_control_queues()
-    # Both ranks degrade in the same round, from one rank's dead worker; the
-    # healthy rank attributes it to a peer, and the gauge drops once.
+        cache.check_hicache_events()
+        cache.check_hicache_events()
     assert cache.storage_unavailable
     assert log_error.call_count == 1
     reason = log_error.call_args.args[1]
@@ -351,24 +397,36 @@ def _dead_worker_body(rank: int) -> None:
     cc.storage_stop_event.set()
 
 
+def _rank_main(rank: int, rendezvous: str) -> None:
+    # A regression that turns a recovery into a hang must fail, not block CI.
+    watchdog = threading.Timer(120, lambda: os._exit(86))
+    watchdog.daemon = True
+    watchdog.start()
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        for body in (_hit_query_timeout_body, _ack_alignment_body, _dead_worker_body):
+            body(rank)
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 class TestStorageSyncRecovery(unittest.TestCase):
-    def _spawn(self, body):
+    def test_two_rank_recovery_and_degrade(self):
+        """A gloo timeout inside a worker thread's MIN (a peer stuck in its
+        backend) used to kill that thread on every rank, stranding every later
+        L3-hit request under wait_complete; one spawn runs the hit-query,
+        ack-alignment and dead-worker cases back to back."""
         with tempfile.TemporaryDirectory(prefix="hicache-sync-test-") as directory:
             torch.multiprocessing.spawn(
-                _rank_main, args=(f"{directory}/store", body), nprocs=2, join=True
+                _rank_main, args=(f"{directory}/store",), nprocs=2, join=True
             )
-
-    def test_hit_query_survives_sync_timeout_and_degrades(self):
-        """A gloo timeout inside the query thread's MIN (a peer stuck in its
-        backend) used to kill the query thread on every rank, stranding every
-        later L3-hit request under wait_complete."""
-        self._spawn(_hit_query_timeout_body)
-
-    def test_ack_sequence_stays_aligned_across_sync_failure(self):
-        self._spawn(_ack_alignment_body)
-
-    def test_one_dead_worker_degrades_every_rank(self):
-        self._spawn(_dead_worker_body)
 
     def test_sync_knobs_are_popped_and_validated(self):
         cc = HiCacheController.__new__(HiCacheController)

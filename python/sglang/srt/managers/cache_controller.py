@@ -352,16 +352,20 @@ class HiCacheController:
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
 
-        # Set by a storage worker thread whose collective on a storage sync
-        # group raised; a gloo timeout closes the pair on every rank, so the
-        # groups stay unusable until attach recreates them. The scheduler
-        # thread folds it into the rank-agreed health bit of its queue drain.
+        # Set by a storage worker whose sync collective raised; the scheduler
+        # drain folds it into the rank-agreed health bit. Attach clears it.
         self.storage_sync_failed = False
         self.storage_sync_failure: Optional[str] = None
         self._storage_sync_lock = threading.Lock()
         self.storage_failure_policy = "disable"
         # Seconds; None keeps torch's default group timeout (30 min on gloo).
         self.storage_sync_timeout: Optional[float] = None
+
+        # Storage worker threads, started by _start_storage_threads and reset.
+        self.prefetch_thread: Optional[threading.Thread] = None
+        self.prefetch_io_aux_thread: Optional[threading.Thread] = None
+        self.prefetch_sync_thread: Optional[threading.Thread] = None
+        self.backup_thread: Optional[threading.Thread] = None
 
         # Storage control queues, (re)created whenever the storage threads start.
         self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
@@ -468,16 +472,15 @@ class HiCacheController:
             torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _record_storage_sync_failure(self, exc: BaseException, what: str) -> None:
-        """Flag the storage sync groups as broken; logs the first failure only."""
+        """Mark this rank's storage pipeline degraded; logs the first failure only."""
         with self._storage_sync_lock:
             if self.storage_sync_failed:
                 return
             self.storage_sync_failed = True
             self.storage_sync_failure = f"{what}: {exc!r}"
         logger.error(
-            "HiCache storage sync failed (%s); this rank publishes every "
-            "pending storage operation as failed until the backend is "
-            "re-attached.",
+            "HiCache storage sync failed (%s); the scheduler degrades L3 on "
+            "every rank at its next drain.",
             self.storage_sync_failure,
             exc_info=exc,
         )
@@ -491,19 +494,17 @@ class HiCacheController:
         """Rank-reduce from a storage worker; False means `tensor` holds no
         agreed value and the caller publishes the operation as failed.
 
-        After one failure the collective is skipped outright: the broken pair
-        would only fail again after a full timeout, and skipping keeps the
-        per-rank publication sequence intact for the queue-count drain."""
-        if self.storage_sync_failed:
-            return False
+        Always entered, even after a failure: gloo keeps a timed-out pair
+        closed, so a broken group raises at once on every rank, while
+        skipping would strand a peer on a group that did not fail."""
         try:
             self._all_reduce(tensor, op, groups)
-        except Exception as e:
+        except RuntimeError as e:
             self._record_storage_sync_failure(e, "storage sync collective")
             return False
         return True
 
-    def _storage_worker_threads(self) -> List[threading.Thread]:
+    def _storage_worker_threads(self) -> List[Optional[threading.Thread]]:
         return [
             self.prefetch_thread,
             self.prefetch_io_aux_thread,
@@ -512,19 +513,24 @@ class HiCacheController:
         ]
 
     def storage_workers_healthy(self) -> bool:
-        """Rank-local liveness of the storage pipeline; MIN-reduced by the
-        scheduler-thread drain. Valid only while storage is attached."""
+        """Rank-local liveness of the storage pipeline, MIN-reduced by the
+        scheduler drain. Read it after the storage queue sizes: a worker sets
+        the failure flag before it publishes the failed item, so a counted
+        item implies a 0 bit in the same round."""
         if self.storage_sync_failed:
             return False
-        return all(thread.is_alive() for thread in self._storage_worker_threads())
+        return all(
+            thread is not None and thread.is_alive()
+            for thread in self._storage_worker_threads()
+        )
 
     def storage_health_reason(self) -> Optional[str]:
         if self.storage_sync_failure is not None:
             return self.storage_sync_failure
         dead = [
-            thread.name
+            "not started" if thread is None else thread.name
             for thread in self._storage_worker_threads()
-            if not thread.is_alive()
+            if thread is None or not thread.is_alive()
         ]
         if dead:
             return f"storage worker thread(s) exited: {dead}"
@@ -628,6 +634,11 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
+        # Validated before any side effect, so a bad value leaves the
+        # controller exactly as it was.
+        self._apply_storage_sync_config(storage_backend_extra_config)
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -644,9 +655,6 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
-        if storage_backend_extra_config is None:
-            storage_backend_extra_config = {}
-        self._apply_storage_sync_config(storage_backend_extra_config)
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
@@ -787,8 +795,8 @@ class HiCacheController:
         self.storage_stop_event.clear()
 
     def _apply_storage_sync_config(self, storage_backend_extra_config: dict) -> None:
-        """Pop the controller's own sync knobs so backends never see them;
-        the fresh groups attach is about to create start out healthy."""
+        """Pop the controller's own sync knobs so backends never see them, and
+        clear the failure state: attach creates fresh sync groups."""
         policy = storage_backend_extra_config.pop("storage_failure_policy", "disable")
         if policy not in STORAGE_FAILURE_POLICIES:
             raise ValueError(

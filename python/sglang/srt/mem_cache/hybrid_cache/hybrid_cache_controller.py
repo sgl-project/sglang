@@ -1244,7 +1244,12 @@ class HybridCacheController(BaseHiCacheController):
             state = self.pp_prefetch_states.get(rid)
         if state is None or state.consumed:
             return None
-        state.ready_event.wait()
+        # PP0 agreed the ticket is ready; a stage whose ticket thread died can
+        # never publish it and must fail loud rather than block the pipeline.
+        while not state.ready_event.wait(1.0):
+            thread = self.pp_prefetch_command_thread
+            if thread is None or not thread.is_alive():
+                raise RuntimeError(f"PP HiCache ticket thread exited: req={rid}")
         with self.pp_prefetch_state_lock:
             if self.pp_prefetch_states.get(rid) is not state or state.consumed:
                 return None
