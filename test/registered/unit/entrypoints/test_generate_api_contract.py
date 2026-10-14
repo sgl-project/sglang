@@ -1,6 +1,6 @@
 """The `/generate` schema gate (`entrypoints/api_contract.py`): the typed media
 contract that replaced the raw_json passthrough, checked without a server, and
-where the route applies it."""
+where the route applies it; plus the Vertex route that feeds the same path."""
 
 import unittest
 from types import SimpleNamespace
@@ -136,6 +136,46 @@ class TestGenerateRouteGate(CustomTestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json(), {"text": "ok"})
             self.assertEqual(len(served), 1)
+        finally:
+            http_server._global_state = prior_state
+
+
+class TestVertexGenerateRoute(CustomTestCase):
+    def test_instances_with_and_without_images_share_a_batch(self):
+        """Each Vertex instance keeps its own images, whichever instances have them."""
+        served = []
+
+        class FakeTokenizerManager:
+            async def generate_request(self, obj, request):
+                obj.normalize_batch_and_arguments()
+                served.append(obj)
+                yield [{"text": "ok"}] * obj.batch_size
+
+        app = FastAPI()
+        app.add_api_route(
+            "/vertex_generate", http_server.vertex_generate, methods=["POST"]
+        )
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(
+            SimpleNamespace(tokenizer_manager=FakeTokenizerManager())
+        )
+        try:
+            client = TestClient(app)
+            for instances, expected_images in (
+                ([{"text": "a", "image_data": "u"}, {"text": "b"}], [["u"], None]),
+                ([{"text": "a"}, {"text": "b", "image_data": "u"}], [None, ["u"]]),
+                (
+                    [{"text": "a"}, {"text": "b", "image_data": ["u", "v"]}],
+                    [None, ["u", "v"]],
+                ),
+            ):
+                with self.subTest(instances=instances):
+                    response = client.post(
+                        "/vertex_generate", json={"instances": instances}
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(len(response.json()["predictions"]), 2)
+                    self.assertEqual(served[-1].image_data, expected_images)
         finally:
             http_server._global_state = prior_state
 

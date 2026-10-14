@@ -2162,11 +2162,15 @@ async def vertex_generate(
                 instance.get(input_key) for instance in vertex_req.instances
             ]
             break
-    image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+    # One entry per instance (None or a list of images), keeping batch alignment.
+    image_data = []
+    for instance in vertex_req.instances:
+        images = instance.get("image_data")
+        if images is not None and not isinstance(images, list):
+            images = [images]
+        image_data.append(images)
+    if all(images is None for images in image_data):
+        image_data = None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
