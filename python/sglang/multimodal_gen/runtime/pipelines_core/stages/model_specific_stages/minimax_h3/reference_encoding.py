@@ -485,7 +485,7 @@ def minimax_h3_decode_reference_video_frames(
     )
 
 
-def _try_create_reference_video_memfd(name: str) -> int:
+def _create_reference_video_memfd(name: str) -> int:
     """Return an anonymous output fd, or -1 when memfd is unavailable."""
     if not sys.platform.startswith("linux") or not hasattr(os, "memfd_create"):
         return -1
@@ -503,7 +503,7 @@ def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     # Linux workers can let ffmpeg write the exact RGB24 stream into an
     # anonymous file descriptor. Mapping that output avoids communicate()'s
     # chunk list and final bytes join for a several-hundred-MiB reference.
-    output_fd = _try_create_reference_video_memfd("sglang-h3-reference-video")
+    output_fd = _create_reference_video_memfd("sglang-h3-reference-video")
 
     payload: Any = b""
     payload_size = 0
@@ -582,7 +582,7 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
     leader_state = None
     if is_leader:
         try:
-            leader_fd = _try_create_reference_video_memfd(
+            leader_fd = _create_reference_video_memfd(
                 "sglang-h3-reference-video-shared"
             )
             if leader_fd < 0:
