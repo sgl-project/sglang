@@ -44,18 +44,29 @@ def forward_fuseep(
     topk_output: TopKOutput,
 ) -> torch.Tensor:
     buf = _get_fuseep_buffer(layer)
+    # BF16 (unquantized) layers carry no weight scales. Per the deep_ep
+    # contract, an empty scale tensor makes the fused kernel skip the scale
+    # transforms, and quant_mode must then be 0 (no quantization) instead of
+    # the INT8 default.
+    w13_scale = getattr(layer, "w13_weight_scale", None)
+    w2_scale = getattr(layer, "w2_weight_scale", None)
+    quant_mode = 0 if w13_scale is None or w13_scale.numel() == 0 else 1
+    empty_scale = torch.empty(0, dtype=torch.float32, device=hidden_states.device)
     hidden_states, _ = buf.fused_deep_moe(
         hidden_states,
         topk_idx=topk_output.topk_ids,
         topk_weights=topk_output.topk_weights,
         gmm1_permuted_weight=layer.w13_weight,
-        gmm1_permuted_weight_scale=layer.w13_weight_scale,
+        gmm1_permuted_weight_scale=(
+            w13_scale if w13_scale is not None else empty_scale
+        ),
         gmm2_weight=layer.w2_weight,
-        gmm2_weight_scale=layer.w2_weight_scale,
+        gmm2_weight_scale=(w2_scale if w2_scale is not None else empty_scale),
         num_max_dispatch_tokens_per_rank=(
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         ),
         num_experts=layer.num_experts,
+        quant_mode=quant_mode,
         fuse_mode=get_exec().moe.fuseep_mode,
     )
     return hidden_states
@@ -125,6 +136,32 @@ def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
 
     Invoked by ``maybe_apply_fuseep_weights`` for both ``"w13"`` and ``"w2"``.
     """
+    weight = getattr(layer, f"{weight_prefix}_weight")
+    # BF16 (unquantized) layers never create ``{prefix}_weight_scale``. The
+    # fused kernel then runs with quant_mode=0 and skips the scale transforms
+    # when the scale tensors are empty (see forward_fuseep).
+    scale = getattr(layer, f"{weight_prefix}_weight_scale", None)
+    if scale is None:
+        if get_exec().moe.fuseep_mode == 2:
+            raise NotImplementedError(
+                "ascend_fuseep fuseep_mode=2 (dispatch_ffn_combine) does not "
+                "support BF16 (unquantized) weights; use fuseep_mode=1 or a "
+                "quantized checkpoint."
+            )
+        if weight_prefix == "w13":
+            cpu_w13 = weight.data.transpose(1, 2).cpu()
+            weight.data = _reshape_w13_weight(cpu_w13, -1).npu()
+        weight.data = npu_format_cast(weight.data)
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            torch.nn.Parameter(
+                torch.empty(0, dtype=torch.float32, device=weight.device),
+                requires_grad=False,
+            ),
+        )
+        return
+
     if get_exec().moe.fuseep_mode == 1:
         # -- The fused MoE optimization mode "1": dispatch_gmm_combine_decode --
         if weight_prefix == "w13":
