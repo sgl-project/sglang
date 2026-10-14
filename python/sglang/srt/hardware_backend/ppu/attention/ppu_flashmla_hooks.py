@@ -261,4 +261,7 @@ def _ppu_flashmla_init_forward_metadata_in_graph(self, forward_batch):
 
     if isinstance(self.forward_metadata, FlashMLADecodeMetadata):
         assert self.forward_metadata.flashmla_metadata is not None
-        self.forward_metadata.flashmla_metadata.have_initialized = False
+        metadata = self.forward_metadata.flashmla_metadata
+        metadata.have_initialized = False
+        metadata.tile_scheduler_metadata = None
+        metadata.num_splits = None

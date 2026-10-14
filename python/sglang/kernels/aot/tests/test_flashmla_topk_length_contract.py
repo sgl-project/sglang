@@ -16,6 +16,8 @@ import sys
 import textwrap
 import unittest
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 # ---------------------------------------------------------------------------
 # Locate repo root from this file (tests/ → aot/ → kernels/ → sglang/ → python/ → root)
@@ -205,6 +207,59 @@ class TestFlashMLABackendUnaffected(unittest.TestCase):
             has_topk_length,
             "flashmla_backend.py should NOT pass topk_length (dense attention path)",
         )
+
+
+class TestPPUFlashMLACaptureMetadataReset(unittest.TestCase):
+    def setUp(self):
+        path = "python/sglang/srt/hardware_backend/ppu/attention/ppu_flashmla_hooks.py"
+        func = _find_function_def(
+            _parse_file(path), "_ppu_flashmla_init_forward_metadata_in_graph"
+        )
+        func.decorator_list = []
+        namespace = {}
+        exec(
+            compile(ast.Module(body=[func], type_ignores=[]), path, "exec"),
+            namespace,
+        )
+        self.hook = namespace[func.name]
+        module = ModuleType("sglang.srt.layers.attention.flashmla_backend")
+        module.FlashMLADecodeMetadata = type("FlashMLADecodeMetadata", (), {})
+        self.decode_metadata = module.FlashMLADecodeMetadata()
+        patcher = patch.dict(sys.modules, {module.__name__: module})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_resets_metadata_before_warmup_and_capture(self):
+        scheduler = SimpleNamespace(
+            have_initialized=False, tile_scheduler_metadata=None, num_splits=None
+        )
+        self.decode_metadata.flashmla_metadata = scheduler
+        backend = SimpleNamespace(forward_metadata=self.decode_metadata)
+
+        for phase in ("first_warmup", "second_warmup", "capture", "recapture"):
+            with self.subTest(phase=phase):
+                self.hook(backend, None)
+                self.assertIs(backend.forward_metadata, self.decode_metadata)
+                self.assertIs(self.decode_metadata.flashmla_metadata, scheduler)
+                self.assertFalse(scheduler.have_initialized)
+                self.assertIsNone(scheduler.tile_scheduler_metadata)
+                self.assertIsNone(scheduler.num_splits)
+                scheduler.have_initialized = True
+                scheduler.tile_scheduler_metadata = object()
+                scheduler.num_splits = object()
+
+    def test_non_decode_metadata_is_unchanged(self):
+        for metadata in (None, object()):
+            with self.subTest(metadata=metadata):
+                backend = SimpleNamespace(forward_metadata=metadata)
+                self.hook(backend, None)
+                self.assertIs(backend.forward_metadata, metadata)
+
+    def test_missing_scheduler_is_rejected(self):
+        self.decode_metadata.flashmla_metadata = None
+        backend = SimpleNamespace(forward_metadata=self.decode_metadata)
+        with self.assertRaises(AssertionError):
+            self.hook(backend, None)
 
 
 if __name__ == "__main__":
