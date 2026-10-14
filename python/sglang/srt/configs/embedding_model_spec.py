@@ -150,6 +150,12 @@ _CLASSIFICATION_ARCHITECTURES = {
     "XLMRobertaForSequenceClassification",
 }
 
+# Cross-encoders: classification heads on a bidirectional encoder.
+_ENCODER_CLASSIFICATION_ARCHITECTURES = {
+    "BertForSequenceClassification",
+    "XLMRobertaForSequenceClassification",
+}
+
 
 def embedding_support_matrix() -> list[dict[str, Any]]:
     """Return registry-backed rows for docs, tooling, and CI coverage checks.
@@ -226,6 +232,9 @@ def _embedding_gemma_spec() -> EmbeddingModelSpec:
 def _native_embedding_spec(
     family: str, execution: EmbeddingExecution, pooling: PoolingStrategy
 ) -> EmbeddingModelSpec:
+    # An encoder's K/V depend on later prompt tokens, so neither a reused prefix
+    # nor a split prefill is valid.
+    encoder_only = execution == EmbeddingExecution.ENCODER_ONLY
     return EmbeddingModelSpec(
         family=family,
         task=EmbeddingTask.EMBED,
@@ -246,6 +255,8 @@ def _native_embedding_spec(
         auto_enable_embedding=True,
         bidirectional_attention=execution != EmbeddingExecution.DECODER_POOLING,
         bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=encoder_only,
+        safe_disable_chunked_prefill=encoder_only,
     )
 
 
@@ -312,6 +323,7 @@ def resolve_embedding_model_spec(
         return _embedding_gemma_spec()
 
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
+        encoder = bool(architecture_set & _ENCODER_CLASSIFICATION_ARCHITECTURES)
         return EmbeddingModelSpec(
             family="sequence_classification",
             task=EmbeddingTask.CLASSIFY,
@@ -328,6 +340,8 @@ def resolve_embedding_model_spec(
             auto_enable_embedding=False,
             bidirectional_attention=False,
             bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+            safe_disable_radix_cache=encoder,
+            safe_disable_chunked_prefill=encoder,
         )
 
     for architecture, (family, execution, pooling) in _EMBEDDING_ARCHITECTURES.items():
