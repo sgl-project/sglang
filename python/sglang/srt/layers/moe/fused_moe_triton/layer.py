@@ -974,7 +974,6 @@ class FusedMoE(torch.nn.Module):
         if (
             not self._has_fused_shared
             or expert_id < self._num_local_routed
-            or shard_id not in ("w1", "w2", "w3")
             or not getattr(scheme, "quantize_shared_expert_online", False)
             or loaded_weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
         ):
@@ -983,6 +982,23 @@ class FusedMoE(torch.nn.Module):
         weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
         if param is not weight_param:
             return False
+
+        if shard_id not in ("w1", "w2", "w3"):
+            # make_expert_params_mapping_fused emits "w13" for a checkpoint that
+            # ships gate and up already concatenated, which this cannot convert:
+            # the helpers below place one half of w13 at a time.  Returning False
+            # would hand the unquantized tensor to the normal loader, which
+            # copies it into the packed FP4 buffer and serves garbage with
+            # nothing raised, so refuse loudly instead.  Unreachable from the
+            # Qwen3.5/Qwen3.8 checkpoints the gate admits today, which use the
+            # unfused mapping; it is here for the next model that does not.
+            raise ValueError(
+                f"Quantizing the shared expert at load time supports the w1, w2 "
+                f"and w3 shards, not the pre-fused {shard_id!r}. Drop "
+                f"--enforce-shared-experts-fusion to serve this checkpoint with "
+                f"a standalone shared expert."
+            )
+
         scale_param = (
             self.w2_weight_scale if shard_id == "w2" else self.w13_weight_scale
         )

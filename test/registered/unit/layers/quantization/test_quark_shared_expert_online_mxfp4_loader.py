@@ -429,10 +429,16 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
         self.assertEqual(layer.scheme.seen, [])
 
     def test_already_quantized_weight_is_not_intercepted(self):
-        # A packed uint8 tensor is a routed expert's serialized MXFP4, which
-        # must reach the normal loader unconverted.
+        for dtype in (torch.uint8, torch.float8_e4m3fn):
+            with self.subTest(dtype=dtype):
+                layer = _StubFusedMoE()
+                self.assertFalse(layer.load("w1", dtype=dtype))
+                self.assertEqual(layer.scheme.seen, [])
+
+    def test_a_prefused_gate_up_shard_raises_rather_than_declining(self):
         layer = _StubFusedMoE()
-        self.assertFalse(layer.load("w1", dtype=torch.uint8))
+        with self.assertRaisesRegex(ValueError, "pre-fused 'w13'"):
+            layer.load("w13")
         self.assertEqual(layer.scheme.seen, [])
 
     def test_opt_out_scheme_is_not_intercepted(self):
