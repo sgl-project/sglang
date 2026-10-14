@@ -796,6 +796,9 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Under overlap, publish decode KV destinations one iteration later instead of
+    # reading them back inline; False restores the inline publish.
+    SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
 
     # ===================================================================
     # Distributed and model-parallel runtime
