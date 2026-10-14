@@ -50,12 +50,15 @@ pub(crate) fn render(
     if messages.first().is_none_or(|m| m["role"] != "system") {
         messages.insert(0, json!({"role": "system", "content": ""}));
     }
-    // Unlike the Jinja path, SGLang passes every request tool, whatever the tool_choice.
+    // Unlike the Jinja path, SGLang passes every request tool once `tool_choice` allows any.
     if let Some(tools) = request["tools"]
         .as_array()
         .filter(|tools| !tools.is_empty())
     {
-        messages[0]["tools"] = normalize_tools(tools)?.into();
+        let normalized = normalize_tools(tools)?;
+        if renders_tools(request, tools) {
+            messages[0]["tools"] = normalized.into();
+        }
     }
     let mode = if thinking(request, defaults) {
         ThinkingMode::Thinking
@@ -254,7 +257,7 @@ pub(super) fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
 }
 
 /// Each assistant tool call's `function.arguments`, absent ones as `null`.
-fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
+pub(super) fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
     let is_assistant = message["role"] == "assistant";
     message
         .get_mut("tool_calls")
@@ -264,6 +267,18 @@ fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
         .flatten()
         .filter_map(|call| call.get_mut("function")?.as_object_mut())
         .map(|function| function.entry("arguments").or_insert(Value::Null))
+}
+
+/// Whether `serving_chat` hands the encoder the request tools: `tool_choice`
+/// `"none"` withholds them, and a named choice needs a request tool of that name.
+pub(super) fn renders_tools(request: &Value, tools: &[Value]) -> bool {
+    match &request["tool_choice"] {
+        Value::Null => true,
+        Value::String(choice) => choice != "none",
+        named => tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == named["function"]["name"]),
+    }
 }
 
 /// `protocol.py::Function.model_dump()`, in declared field order, after

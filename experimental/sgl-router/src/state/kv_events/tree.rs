@@ -1187,6 +1187,7 @@ pub struct HashTree {
     /// cross-shard scan that chose its target are atomic against the other
     /// writer. Readers never take it.
     writer: Mutex<()>,
+    pub(super) lora: Mutex<HashMap<KvWorkerId, sgl_kv_indexer::lora::LoraIndex>>,
     /// Route-time predictions, kept apart from the event-driven shards.
     pending: PendingPrefixes,
 }
@@ -1206,6 +1207,7 @@ impl HashTree {
         Self {
             shards,
             writer: Mutex::new(()),
+            lora: Mutex::new(HashMap::new()),
             pending: PendingPrefixes::default(),
         }
     }
@@ -1398,6 +1400,57 @@ impl HashTree {
         descend(&self.shards[shard_of(block_hashes[0])].read(), None)
     }
 
+    /// Base events retain their published keys. LoRA uses an independent
+    /// per-worker ID map; raw IDs are never query keys for adapter requests.
+    pub fn store_event(&self, worker: &KvWorkerId, event: &super::wire::BlockStored) {
+        let tiers = Tiers::for_store(event.medium.as_deref());
+        let Some(name) = event.lora_name.as_deref().filter(|s| !s.is_empty()) else {
+            self.insert_tiered(worker, event.parent_block_hash, &event.block_hashes, tiers);
+            return;
+        };
+        let mut maps = self.lora.lock();
+        let stores =
+            maps.entry(worker.clone())
+                .or_default()
+                .store(sgl_kv_indexer::lora::LoraStore {
+                    hashes: event.block_hashes.clone(),
+                    parent: event.parent_block_hash,
+                    tokens: event.token_ids.clone(),
+                    block_size: event.block_size as usize,
+                    bigram: event.is_bigram,
+                    name: name.to_string(),
+                    salt: event.cache_salt.clone(),
+                    tiers: tiers.bits(),
+                    component_mask: None,
+                });
+        for store in stores {
+            self.insert_tiered(
+                worker,
+                store.parent,
+                &store.hashes,
+                Tiers::from_bits(store.tiers),
+            );
+        }
+    }
+
+    pub fn remove_event(&self, worker: &KvWorkerId, hashes: &[i64], tiers: Tiers) {
+        let mut maps = self.lora.lock();
+        if let Some(map) = maps.get_mut(worker) {
+            for (hash, bits) in map.remove(hashes, tiers.bits()) {
+                self.remove_tiered(worker, &[hash], Tiers::from_bits(bits));
+            }
+        } else {
+            self.remove_tiered(worker, hashes, tiers);
+        }
+    }
+
+    pub(super) fn restore_lora(&self, maps: &[(KvWorkerId, Vec<sgl_kv_indexer::lora::LoraBlock>)]) {
+        let mut lora = self.lora.lock();
+        for (worker, blocks) in maps {
+            lora.entry(worker.clone()).or_default().restore(blocks);
+        }
+    }
+
     /// Apply an untagged `BlockStored` event: a device store. See
     /// [`Self::insert_tiered`].
     pub fn insert(&self, worker: &KvWorkerId, parent_hash: Option<i64>, block_hashes: &[i64]) {
@@ -1477,6 +1530,8 @@ impl HashTree {
     /// pump task — hence [`Self::writer`]. Pending prefixes are per URL, so
     /// clearing any rank drops the whole worker's.
     pub fn clear_worker(&self, worker: &KvWorkerId) {
+        let mut lora = self.lora.lock();
+        lora.remove(worker);
         let _writer = self.writer.lock();
         for shard in &self.shards {
             shard.write().clear_worker(worker);
