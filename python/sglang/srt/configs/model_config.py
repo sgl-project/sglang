@@ -211,6 +211,16 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
+    """Whether a DSA EAGLE/NEXTN draft shards its KV like the DCP target.
+
+    Only the ROCm DSA DCP path does. The NPU one keeps allocator-global cache
+    slots for the draft and runs it through the non-DCP attention path, so the
+    draft stays replicated there.
+    """
+    return dcp_size > 1 and get_platform().is_hip and is_deepseek_dsa(config)
+
+
 def is_glm_moe_dsa(config) -> bool:
     """True for GLM-5.2, both the main arch and the NextN draft head."""
     return _hf_arch(config) in (

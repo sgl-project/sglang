@@ -121,14 +121,15 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "backup and the storage keys must become dcp_rank-aware "
             "first. Run HiCache+DCP with L1/L2 only."
         )
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import dsa_draft_shards_under_dcp
 
     # A DSA EAGLE/NEXTN draft shards its KV like the target, so its rows ride
     # the target's translated host rows.
+    draft_hf_config = model_config_of(server_args).hf_config
     draft_shards_like_target = cfg.speculative_algorithm in (
         "EAGLE",
         "NEXTN",
-    ) and is_deepseek_dsa(model_config_of(server_args).hf_config)
+    ) and dsa_draft_shards_under_dcp(draft_hf_config, cfg.dcp_size)
     if cfg.speculative_algorithm not in (None, "DSPARK") and not (
         draft_shards_like_target
     ):

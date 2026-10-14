@@ -3572,6 +3572,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                     _deepseek_family_overrides(
                                         _args(dcp_size=2), hf_config
                                     )
+                        # DSA + DCP: CUDA has no path and stays rejected.
+                        with self.assertRaisesRegex(ValueError, "ROCm and NPU"):
+                            _deepseek_family_overrides(_args(dcp_size=4), None)
+                    # NPU has its own DSA DCP path (gated in model_hook), so the
+                    # ROCm-only limits must not reject it.
+                    with override_platform(is_npu=True):
+                        self.assertEqual(
+                            _deepseek_family_overrides(_args(dcp_size=4), None),
+                            {"attention_backend": "dsa"},
+                        )
                     # HIP without the preshuffle path: page 1
                     with override_platform(is_hip=True):
                         with patch(

@@ -19,6 +19,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
+    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -474,8 +475,8 @@ class KVCacheConfigurator:
     @property
     def loc_space_scale(self) -> int:
         dcp_size = get_parallel().attn_dcp_size
-        replicated_draft = self.is_draft_worker and not is_deepseek_dsa(
-            self.model_config.hf_config
+        replicated_draft = self.is_draft_worker and not dsa_draft_shards_under_dcp(
+            self.model_config.hf_config, dcp_size
         )
         return dcp_size if (replicated_draft and dcp_size > 1) else 1
 

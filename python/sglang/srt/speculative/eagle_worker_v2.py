@@ -9,7 +9,10 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
 )
-from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    dsa_draft_shards_under_dcp,
+    get_dsa_mtp_topk_width,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -284,12 +287,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         hf_config = self.draft_runner.model_config.hf_config
         # Reuse the first draft step's DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
-        # Under DCP each rank holds only its owned share of the top-k, which
-        # the shared-index buffers do not carry.
+        # Under the ROCm DCP path each rank holds only its owned share of the
+        # top-k, which the shared-index buffers do not carry.
         self.index_share_for_mtp_iteration = (
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
-            and not get_parallel().dcp_enabled
+            and not dsa_draft_shards_under_dcp(hf_config, get_parallel().attn_dcp_size)
         )
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
@@ -395,8 +398,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
-        if get_parallel().dcp_enabled and is_deepseek_dsa(
-            self.draft_runner.model_config.hf_config
+        if dsa_draft_shards_under_dcp(
+            self.draft_runner.model_config.hf_config,
+            get_parallel().attn_dcp_size,
         ):
             # A DSA draft shards under DCP; its swapped-in backends need the translator.
             self.draft_runner.kv_index_translator.bind_and_verify_backends(

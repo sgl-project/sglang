@@ -78,27 +78,32 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config) and getattr(cfg, "dcp_size", 1) > 1:
-        # DSA + DCP covers ROCm decode and chain EAGLE/MTP on the plain DSA
-        # pool; the draft shards its KV like the target.
-        if not get_platform().is_hip:
+        if not (get_platform().is_hip or get_platform().is_npu):
             raise ValueError(
-                "--dcp-size > 1 with DSA models is only supported on ROCm."
+                "--dcp-size > 1 with DSA models is only supported on ROCm and "
+                "NPU; CUDA has no DSA decode context-parallel attention path."
             )
-        if cfg.speculative_algorithm not in (None, "EAGLE", "NEXTN"):
-            raise ValueError(
-                "--dcp-size > 1 with DSA models only supports EAGLE/NEXTN "
-                "speculative decoding."
-            )
-        if cfg.speculative_algorithm is not None and (
-            cfg.speculative_eagle_topk not in (None, 1)
-        ):
-            raise ValueError(
-                "--dcp-size > 1 with DSA models requires --speculative-eagle-topk 1."
-            )
-        if cfg.enable_hisparse:
-            raise ValueError(
-                "--dcp-size > 1 with DSA models does not support --enable-hisparse yet."
-            )
+        # NPU has its own DSA DCP path, gated in model_hook. The limits below
+        # are the ROCm one's: decode plus chain EAGLE/MTP on the plain DSA
+        # pool, where the draft shards its KV like the target.
+        if get_platform().is_hip:
+            if cfg.speculative_algorithm not in (None, "EAGLE", "NEXTN"):
+                raise ValueError(
+                    "--dcp-size > 1 with DSA models only supports EAGLE/NEXTN "
+                    "speculative decoding."
+                )
+            if cfg.speculative_algorithm is not None and (
+                cfg.speculative_eagle_topk not in (None, 1)
+            ):
+                raise ValueError(
+                    "--dcp-size > 1 with DSA models requires "
+                    "--speculative-eagle-topk 1."
+                )
+            if cfg.enable_hisparse:
+                raise ValueError(
+                    "--dcp-size > 1 with DSA models does not support "
+                    "--enable-hisparse yet."
+                )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
