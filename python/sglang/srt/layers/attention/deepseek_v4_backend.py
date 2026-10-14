@@ -1933,8 +1933,15 @@ class DeepseekV4AttnBackend(
         live.positions = forward_batch.positions[:num_tokens]
         live.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
         block_metadata = self.tail_forward_metadata
-        self.tail_forward_metadata = self._build_late_layer_tail_metadata(live)
-        self.tail_forward_metadata.candidates_cover_window = True
+        live_metadata = self._build_late_layer_tail_metadata(live)
+        live_metadata.candidates_cover_window = True
+        # The graph's full-width buffers are padded past the extend, so the tail's
+        # gathers from them (a contiguous tail is a slice) stop at its real rows.
+        live_tail = live_metadata.late_layer_tail
+        live_metadata.late_layer_tail = msgspec.structs.replace(
+            live_tail, real_rows_count=sum(live_tail.extend_seq_lens_cpu)
+        )
+        self.tail_forward_metadata = live_metadata
         try:
             tail = self.tail_forward_metadata.late_layer_tail
             return self.enter_late_layer_tail(forward_batch), tail

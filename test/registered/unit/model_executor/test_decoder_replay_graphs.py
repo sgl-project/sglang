@@ -269,6 +269,61 @@ class TestLateConsumersInPrefillGraph(CustomTestCase):
         b.prefill_candidates.consume_prefill.assert_called_once_with("inputs", None)
 
 
+class TestEnterLiveLateLayerTail(CustomTestCase):
+    def test_live_rows_only_and_block_metadata_restored(self):
+        try:
+            from sglang.srt.layers.attention.deepseek_v4_backend import (
+                DeepseekV4AttnBackend,
+                LateLayerTail,
+            )
+        except (ImportError, OSError) as e:
+            self.skipTest(f"backend not importable here: {e}")
+        # One request of 10 tokens padded to a 16-token bucket; its tail is rows 2..9.
+        built, entered = [], []
+        block = SimpleNamespace(name="block")
+
+        def build(live):
+            built.append((live.positions.shape[0], live.out_cache_loc.shape[0]))
+            return SimpleNamespace(
+                late_layer_tail=LateLayerTail(
+                    token_indices=torch.arange(2, 10),
+                    positions=torch.arange(2, 10),
+                    extend_seq_lens=torch.tensor([8]),
+                    extend_seq_lens_cpu=[8],
+                    swa_out_cache_loc=torch.arange(8),
+                    contiguous_start=2,
+                ),
+                candidates_cover_window=False,
+            )
+
+        def enter(fb):
+            entered.append(backend.tail_forward_metadata)
+            return "saved"
+
+        backend = SimpleNamespace(
+            tail_forward_metadata=block,
+            _build_late_layer_tail_metadata=build,
+            enter_late_layer_tail=enter,
+        )
+        batch = SimpleNamespace(
+            positions=torch.arange(16), out_cache_loc=torch.arange(16)
+        )
+        saved, tail = DeepseekV4AttnBackend.enter_live_late_layer_tail(
+            backend, batch, num_tokens=10
+        )
+        self.assertEqual(built, [(10, 10)])
+        self.assertEqual(saved, "saved")
+        self.assertEqual(tail.real_rows_count, 8)
+        self.assertTrue(entered[0].candidates_cover_window)
+        self.assertIs(entered[0].late_layer_tail, tail)
+        self.assertIs(backend.tail_forward_metadata, block)
+        # The padded full-width buffer's contiguous gather, cut as enter does.
+        full = torch.arange(16)
+        self.assertEqual(
+            tail.real_rows(full)[: tail.real_rows_count].tolist(), list(range(2, 10))
+        )
+
+
 class TestBreakContextNesting(CustomTestCase):
     def test_keeps_the_prefill_graph_flag_set_after_a_nested_run(self):
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
