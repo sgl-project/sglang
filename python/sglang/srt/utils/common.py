@@ -1870,25 +1870,47 @@ def _assert_local_media_file(path: str) -> os.stat_result:
     return st
 
 
-def _read_local_media_file(path: str) -> bytes:
+def _checked_local_media_path(source: str) -> str:
+    # file://localhost/dev/zero is /dev/zero. Return that path, not the URL.
+    path = unquote(urlparse(source).path) if source.startswith("file://") else source
     _assert_local_media_file(path)
-    max_bytes = _media_url_max_file_size_bytes
-    content = bytearray()
-    with open(path, "rb") as handle:
-        # The path can be replaced between the stat above and this open.
-        st = os.fstat(handle.fileno())
+    return path
+
+
+def _open_local_media_fd(path: str) -> int:
+    # O_NONBLOCK: a FIFO swapped in after the name check must not block open.
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise ValueError("Local media path is not a regular file")
+        max_bytes = _media_url_max_file_size_bytes
         if max_bytes and st.st_size > max_bytes:
             _reject_oversized_local_media(max_bytes)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _read_local_media_file(path: str) -> bytes:
+    max_bytes = _media_url_max_file_size_bytes
+    fd = _open_local_media_fd(path)
+    try:
+        content = bytearray()
         while True:
-            chunk = handle.read(64 * 1024)
+            chunk = os.read(fd, 64 * 1024)
             if not chunk:
                 break
             if max_bytes and len(content) + len(chunk) > max_bytes:
                 _reject_oversized_local_media(max_bytes)
             content.extend(chunk)
-    return bytes(content)
+        return bytes(content)
+    finally:
+        os.close(fd)
 
 
 # Raised by the loaders below when client-supplied media cannot be fetched or
@@ -1931,9 +1953,11 @@ def load_audio(
     if isinstance(source, bytes):
         header = source[:16]
     else:
-        _assert_local_media_file(source)
-        with open(source, "rb") as audio_stream:
-            header = audio_stream.read(16)
+        fd = _open_local_media_fd(source)
+        try:
+            header = os.read(fd, 16)
+        finally:
+            os.close(fd)
 
     if is_audio_container(header):
         return decode_audio_container(
@@ -2189,11 +2213,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         with open(image_file, "rb") as f:
             return f.read()
     if image_file.startswith("/"):
-        try:
-            return _read_local_media_file(image_file)
-        except FileNotFoundError:
-            with open(image_file, "rb") as f:
-                return f.read()
+        return _read_local_media_file(image_file)
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
@@ -2221,14 +2241,12 @@ def _normalize_video_input(
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            path = unquote(urlparse(video_file).path)
-            _assert_local_media_file(path)
-            return path
-        elif os.path.isfile(unquote(urlparse(video_file).path)):
-            path = unquote(urlparse(video_file).path)
-            _assert_local_media_file(path)
-            return video_file
+            return _checked_local_media_path(video_file)
         else:
+            path = unquote(urlparse(video_file).path)
+            if os.path.isfile(path):
+                _assert_local_media_file(path)
+                return path
             return pybase64.b64decode(video_file, validate=True)
     else:
         return None

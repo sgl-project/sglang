@@ -229,6 +229,29 @@ class TestMediaURLSecurity(unittest.TestCase):
             configure_media_url_security([], max_file_size_mb=0)
             self.assertEqual(get_image_bytes(str(path)), payload)
 
+    def test_percent_encoded_video_path_is_the_file_that_was_checked(self):
+        """A %20 in the path must not select a different file from the size check."""
+        configure_media_url_security([], max_file_size_mb=1)
+        with tempfile.TemporaryDirectory() as directory:
+            checked = Path(directory) / "a b.mp4"
+            checked.write_bytes(b"tiny")
+            literal = Path(directory) / "a%20b.mp4"
+            literal.write_bytes(b"")
+            os.truncate(literal, 1024 * 1024 + 1)
+            self.assertEqual(_normalize_video_input(str(literal)), str(checked))
+
+    def test_preprocess_snapshot_rejects_an_oversized_local_image(self):
+        """The preprocess-cache snapshot uses the same local byte cap."""
+        from sglang.srt.multimodal.cache.identity import _read_media_bytes
+
+        configure_media_url_security([], max_file_size_mb=1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frame.png"
+            path.write_bytes(b"")
+            os.truncate(path, 1024 * 1024 + 1)
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                _read_media_bytes(str(path))
+
 
 if __name__ == "__main__":
     unittest.main()

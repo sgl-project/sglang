@@ -140,7 +140,9 @@ def _read_media_bytes(media: str | bytes) -> bytes:
     # ``load_image`` accepts relative local paths only by image extension.
     # Match that contract instead of probing arbitrary base64 as a filename.
     if media.lower().endswith(image_extension_names) and Path(media).is_file():
-        return Path(media).read_bytes()
+        from sglang.srt.utils.common import _read_local_media_file
+
+        return _read_local_media_file(media)
     return get_image_bytes(media)
 
 

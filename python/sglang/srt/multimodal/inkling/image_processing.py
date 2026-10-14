@@ -85,9 +85,14 @@ def _load_image_bytes(image) -> bytes:
                 "InklingImageProcessor received a URL/data: image; resolve it to bytes "
                 "upstream (e.g. via SGLang load_mm_data) before preprocessing."
             )
-        path = image[len("file://") :] if image.startswith("file://") else image
-        from sglang.srt.utils.common import _read_local_media_file
+        from sglang.srt.utils.common import (
+            _checked_local_media_path,
+            _read_local_media_file,
+        )
 
+        path = (
+            _checked_local_media_path(image) if image.startswith("file://") else image
+        )
         return _read_local_media_file(path)
 
     from PIL import Image

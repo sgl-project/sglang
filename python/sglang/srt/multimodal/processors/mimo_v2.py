@@ -39,7 +39,11 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.common import _assert_local_media_file, download_remote_media
+from sglang.srt.utils.common import (
+    _assert_local_media_file,
+    _checked_local_media_path,
+    download_remote_media,
+)
 from sglang.utils import logger
 
 
@@ -485,17 +489,22 @@ class MiMoProcessor:
         else:
             if isinstance(path_or_data, str):
                 local_path = (
-                    path_or_data[len("file://") :]
+                    _checked_local_media_path(path_or_data)
                     if path_or_data.startswith("file://")
                     else path_or_data
                 )
-                try:
-                    exists = os.path.exists(local_path)
-                except OSError:
-                    exists = False
-                if exists:
-                    _assert_local_media_file(local_path)
-            source = path_or_data  # local path or file://
+                if path_or_data.startswith("file://"):
+                    source = local_path
+                else:
+                    try:
+                        exists = os.path.exists(local_path)
+                    except OSError:
+                        exists = False
+                    if exists:
+                        _assert_local_media_file(local_path)
+                    source = path_or_data
+            else:
+                source = path_or_data
         try:
             AudioDecoder(source)
             return True
@@ -1442,8 +1451,7 @@ class MiMoProcessor:
                 with BytesIO(download_remote_media(image, timeout=3)) as bio:
                     image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
-                path = image[len("file://") :]
-                _assert_local_media_file(path)
+                path = _checked_local_media_path(image)
                 image_obj = Image.open(path)
             elif image.startswith("data:image"):
                 if "base64," in image:
@@ -1452,13 +1460,12 @@ class MiMoProcessor:
                     with BytesIO(data) as bio:
                         image_obj = copy.deepcopy(Image.open(bio))
             else:
-                if image.startswith("/"):
-                    try:
-                        exists = os.path.exists(image)
-                    except OSError:
-                        exists = False
-                    if exists:
-                        _assert_local_media_file(image)
+                try:
+                    exists = os.path.exists(image)
+                except OSError:
+                    exists = False
+                if exists:
+                    _assert_local_media_file(image)
                 image_obj = Image.open(image)
         else:
             image_obj = Image.open(BytesIO(image))
