@@ -121,7 +121,7 @@ class TestEveryRankWrites(CustomTestCase):
             Event=lambda: SimpleNamespace(record=lambda: None)
         )
         with mock.patch.object(unified_cache_linker, "device_module", fake_device):
-            self.assertTrue(linker.offload(["t"]))
+            self.assertTrue(linker.offload(1, ["t"]))
         self.assertEqual(linker._offload_queue.qsize(), 1)
         # The result comes from the offload thread once the write lands, so
         # nothing may pre-post one here.
@@ -135,7 +135,7 @@ class TestEveryRankWrites(CustomTestCase):
         linker.pool_group = SimpleNamespace(
             resolve_transfers=lambda _transfers, allow_partial: []
         )
-        self.assertFalse(linker.offload([]))
+        self.assertFalse(linker.offload(1, []))
         self.assertEqual(linker._offload_results.qsize(), 0)
         self.assertEqual(linker._offload_queue.qsize(), 0)
 
