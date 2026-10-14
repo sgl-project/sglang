@@ -58,7 +58,17 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
-        "disaggregation-mode": cfg.disaggregation_mode != "null",
+        "disaggregation-mode": cfg.disaggregation_mode not in ("null", "prefill"),
+        "PD prefill requires NIXL": (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.disaggregation_transfer_backend != "nixl"
+        ),
+        "PD prefill speculative decoding": (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.speculative_algorithm is not None
+        ),
+        "pipeline parallelism": cfg.pp_size != 1,
+        "data parallelism": cfg.dp_size != 1,
     }
     for flag, enabled in unsupported.items():
         if enabled:
@@ -79,12 +89,15 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 f"{name}={count} must be divisible by --tp-size={cfg.tp_size}."
             )
 
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+    graph_config = cfg.cuda_graph_config
+    if not supports_prefill_cp_bcg(server_args):
+        graph_config = with_phase(graph_config, Phase.PREFILL, backend=Backend.DISABLED)
     declare_resolution(
         server_args,
         "resolve_cp_tp_group_sharing",
         enable_cp_tp_group_sharing=True,
-        # The sequence collectives have batch-dependent sizes.
-        cuda_graph_config=with_phase(
-            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-        ),
+        # Qualified GLM CP uses exact BCG buckets for its sequence collectives.
+        cuda_graph_config=graph_config,
     )

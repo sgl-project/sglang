@@ -22,6 +22,17 @@ def _kpool_indexer_prefill_with_output(
     # Resolve the live batch inside the eager break, never from capture args.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     n = forward_batch.extend_num_tokens
+    num_logical = sum(forward_batch.extend_seq_lens_cpu)
+    from sglang.srt.layers.cp.interleave import is_interleave_extend
+    from sglang.srt.runtime_context import get_parallel
+
+    if n is not None and is_interleave_extend(forward_batch):
+        parallel = get_parallel()
+        def local_rows(rows):
+            return max(0, (int(rows) + parallel.attn_cp_size - 1
+                           - parallel.attn_cp_rank) // parallel.attn_cp_size)
+        n = local_rows(n)
+        num_logical = local_rows(num_logical)
     if n is None or not 0 <= n <= x.shape[0]:
         raise ValueError(f"Invalid pooled-indexer prefill token count: {n}")
     if n > q_lora.shape[0] or n > positions.shape[0]:
@@ -37,7 +48,6 @@ def _kpool_indexer_prefill_with_output(
     )
     if not return_indices:
         return
-    num_logical = sum(forward_batch.extend_seq_lens_cpu)
     if (
         result is None
         or result.ndim != 2

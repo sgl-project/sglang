@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
@@ -51,6 +52,15 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
+    glm_cp = (
+        cfg.cp_strategy == "interleave"
+        and "Glm5NextForConditionalGeneration"
+        in (model_config_of(cfg).hf_config.architectures or [])
+        and resolved.dsa_prefill_backend in ("tilelang", "flashmla_sparse_q8")
+        and cfg.dp_size == 1
+        and cfg.speculative_algorithm is None
+        and not cfg.enable_dsa_cache_layer_split
+    )
     return (
         cfg.enable_prefill_cp
         and cfg.pp_size == 1
@@ -58,6 +68,7 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
         and (
             (cfg.cp_strategy == "zigzag" and prefill_attention_backend == "trtllm_mha")
             or (cfg.cp_strategy == "interleave" and prefill_attention_backend == "dsv4")
+            or glm_cp
         )
     )
 
@@ -178,6 +189,17 @@ class PrefillCPBCGInput:
         capture_num_tokens: list[int],
         max_padding_factor: int,
     ) -> Optional[int]:
+        from sglang.srt.runtime_context import process_model_config
+
+        # GLM KDA computes the full causal sequence. Do not replay a larger
+        # captured geometry over a shorter live recurrence or padded tail.
+        if (
+            isinstance(get_cp_strategy(), InterleaveCPStrategy)
+            and "Glm5NextForConditionalGeneration"
+            in (process_model_config().hf_config.architectures or [])
+            and num_tokens not in capture_num_tokens
+        ):
+            return None
         required_local_tokens = self.required_local_tokens(extend_seq_lens)
         if required_local_tokens is None:
             return None

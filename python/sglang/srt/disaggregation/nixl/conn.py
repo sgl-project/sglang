@@ -2761,6 +2761,29 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             comp_notif = f"{notif}_{i}"
 
             if st == StateType.MAMBA:
+                if get_parallel().enable_cp_tp_group_sharing:
+                    # DSA KV uses query CP, but recurrent states are head-TP
+                    # shards. Only the corresponding D TP rank owns this state.
+                    if decode_tp_size != get_parallel().tp_size:
+                        raise RuntimeError("CP/TP KDA requires matching decode TP size")
+                    if self.kv_args.engine_rank % decode_tp_size != decode_tp_rank % decode_tp_size:
+                        self.agent.send_notif(peer_name, comp_notif.encode("ascii"))
+                        continue
+                    pairs = build_transfer_entry_pairs(
+                        src_lids, dst_lids, len(src_ptrs), len(dst_ptrs),
+                        allow_positional_fallback=self.pp_size == 1,
+                    )
+                    for si, di in pairs:
+                        if src_lens[si] != dst_lens[di] or src_dims[si] != dst_dims[di]:
+                            raise RuntimeError("CP/TP KDA state layout mismatch")
+                    h = self._send_mamba_state(
+                        peer_name, src_indices, src_ptrs, src_lens, dst_ptrs,
+                        dst_indices, dst_gpu_id, comp_notif,
+                        src_layer_ids=src_lids, dst_layer_ids=dst_lids,
+                    )
+                    if h is not None:
+                        handles.append(h)
+                    continue
                 if self.attn_tp_size != decode_tp_size:
                     if 0 in src_dims:
                         raise RuntimeError(
@@ -3313,6 +3336,10 @@ class NixlKVSender(CommonKVSender):
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
+            return
+        # An empty non-final CP shard emits no KV notification: do not advance
+        # its receiver-visible chunk ID. Final empty sends still carry state.
+        if len(kv_indices) == 0 and not is_last_chunk:
             return
 
         if self._transfer_start_time is None and (

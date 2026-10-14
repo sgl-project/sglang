@@ -120,7 +120,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"attn_cp_size={attn_cp_size}, "
                     f"kv_cache_dtype={cfg.kv_cache_dtype}, "
                     f"moe_a2a_backend={overrides.get('moe_a2a_backend', cfg.moe_a2a_backend)}, "
-                    f"cuda_graph_config[prefill].backend=disabled"
+                    "prefill CUDA graph compatibility is resolved by model/graph hooks"
                 )
 
             # Deferred import to avoid a circular import at module-load
