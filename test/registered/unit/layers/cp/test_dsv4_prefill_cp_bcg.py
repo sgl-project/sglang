@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -192,7 +193,8 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                 return_value=("dsv4", "dsv4"),
             ),
         ):
-            self.assertTrue(supports_prefill_cp_bcg(cfg))
+            # Interleave + DSV4 is enabled on ROCm only.
+            self.assertEqual(supports_prefill_cp_bcg(cfg), is_hip())
             self.assertEqual(
                 filter_prefill_cp_bcg_capture_num_tokens([1, 2, 4, 8], cfg), [2, 4, 8]
             )

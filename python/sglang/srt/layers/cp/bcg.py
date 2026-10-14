@@ -44,6 +44,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -58,6 +59,12 @@ PREFILL_CP_BCG_SUPPORTED_COMBINATIONS: set[
 ] = {
     (ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA),
 }
+if is_hip():
+    # The capture path shards input_ids with the hidden states for DSV4 hash
+    # routing; enabled on ROCm only until the CUDA path is validated as well.
+    PREFILL_CP_BCG_SUPPORTED_COMBINATIONS.add(
+        (ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSV4)
+    )
 
 
 def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
