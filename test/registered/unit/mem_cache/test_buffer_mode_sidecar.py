@@ -434,6 +434,9 @@ class TestBufferModeSidecar(unittest.TestCase):
 
         controller.write.side_effect = _write
         controller.write_storage.side_effect = [98, 99]
+        controller.extend_storage_prefix = (
+            HybridCacheController.extend_storage_prefix.__get__(controller)
+        )
 
         cache = MagicMock()
         cache.cache_controller = controller
@@ -510,7 +513,7 @@ class TestBufferModeSidecar(unittest.TestCase):
         # No KV page in the SWA write; the window's keys ride the transfer.
         self.assertEqual(swa_call.args[0].numel(), 0)
         self.assertEqual(swa_call.args[2], [])
-        self.assertEqual(swa_call.args[3], ["page-p"])
+        self.assertEqual(swa_call.args[3], ["page-p", hashes[0]])
         storage_transfers = {
             transfer.name: transfer
             for call in (kv_call, swa_call)
