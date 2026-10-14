@@ -4,15 +4,20 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 
+PARTIALS_PER_BRANCH = 2 * (160 // 32)
+
 
 @cache_once
-def _jit_module(c, h, dtype):
-    args = make_cpp_args(c, h, dtype)
+def _jit_module(c, h, dtype, write_partials=False):
+    args = make_cpp_args(c, h, dtype, write_partials)
+    wrappers = [("run", f"HcRawFp32StatKernel<{args}>::run")]
+    if write_partials:
+        wrappers.append(("reduce", "HcSumPartialsKernel::run"))
     return load_jit(
         "hc_apply_sum",
         *args,
         cuda_files=["elementwise/hc_apply_sum.cuh"],
-        cuda_wrappers=[("run", f"HcRawFp32StatKernel<{args}>::run")],
+        cuda_wrappers=wrappers,
     )
 
 
@@ -34,6 +39,7 @@ def hc_apply_sum(
     out,
     sum_sq,
     hc_count=4,
+    partial_sums=None,
 ):
     """Write updated residual and accumulate its pre-rounding FP32 square sums.
 
@@ -47,7 +53,7 @@ def hc_apply_sum(
     Statistics intentionally observe u BEFORE the BF16/FP16 output cast;
     they are neither inverse RMS nor the exact RMS of the stored residual.
 
-    Caller owns out and sum_sq and MUST zero sum_sq before each invocation,
+    In atomic mode, the caller MUST zero sum_sq before each invocation,
     including every CUDA Graph replay. This function performs no allocation,
     reset, rsqrt, synchronization or data-dependent host validation. Writes
     must not overlap any input or each other. Inputs may alias each other.
@@ -55,6 +61,9 @@ def hc_apply_sum(
     Two ordinary CTAs per token/branch, 160 threads per CTA; each warp issues
     one atomicAdd. No cluster or inter-CTA barrier is required. Atomic order
     may cause small FP32 rounding differences. Inference-only, no autograd.
+    With 32B-aligned, caller-owned FP32 partial_sums [T,C,10], warps overwrite slots
+    and a second kernel reduces them with a fixed shuffle tree, overwriting sum_sq.
+    Neither partial_sums nor sum_sq needs clearing in this deterministic mode.
     Returns the supplied (out, sum_sq) buffers; T=0 launches nothing.
     """
     if (
@@ -70,13 +79,23 @@ def hc_apply_sum(
     t, h = residual.shape[0], residual.shape[1] // hc_count
     if h <= 0 or h % 512 or h > 16384:
         raise ValueError("H must be a positive multiple of 512 <=16384")
-    for name, tensor, shape, dtype in (
+    specs = (
         ("residual", residual, (t, hc_count * h), residual.dtype),
         ("block_output", block_output, (t, h), residual.dtype),
         ("alpha", alpha, (t, hc_count), torch.float32),
         ("out", out, (t, hc_count * h), residual.dtype),
         ("sum_sq", sum_sq, (t, hc_count), torch.float32),
-    ):
+    )
+    if partial_sums is not None:
+        specs += (
+            (
+                "partial_sums",
+                partial_sums,
+                (t, hc_count, PARTIALS_PER_BRANCH),
+                torch.float32,
+            ),
+        )
+    for name, tensor, shape, dtype in specs:
         if (
             tensor.shape != shape
             or tensor.dtype != dtype
@@ -87,15 +106,21 @@ def hc_apply_sum(
             raise ValueError(
                 f"{name}: invalid shape, dtype, device, stride or alignment"
             )
-    for destination in (out, sum_sq):
+    destinations = (out, sum_sq)
+    if partial_sums is not None:
+        destinations += (partial_sums,)
+    for i, destination in enumerate(destinations):
         if any(
             _overlap(destination, source) for source in (block_output, residual, alpha)
         ):
             raise ValueError("output buffers must not overlap inputs")
-    if _overlap(out, sum_sq):
-        raise ValueError("output buffers must not overlap each other")
+        if any(_overlap(destination, other) for other in destinations[:i]):
+            raise ValueError("output buffers must not overlap each other")
     if t:
-        _jit_module(hc_count, h, residual.dtype).run(
-            block_output, residual, alpha, out, sum_sq
-        )
+        module = _jit_module(hc_count, h, residual.dtype, partial_sums is not None)
+        if partial_sums is None:
+            module.run(block_output, residual, alpha, out, sum_sq)
+        else:
+            module.run(block_output, residual, alpha, out, partial_sums)
+            module.reduce(partial_sums, sum_sq)
     return out, sum_sq

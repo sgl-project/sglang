@@ -6,7 +6,11 @@ from typing import NamedTuple
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
-from sglang.kernels.ops.elementwise.hc_apply_sum import _overlap, hc_apply_sum
+from sglang.kernels.ops.elementwise.hc_apply_sum import (
+    PARTIALS_PER_BRANCH,
+    _overlap,
+    hc_apply_sum,
+)
 from sglang.kernels.ops.elementwise.hc_mix_raw import (
     hc_mix_raw,
     prepare_raw_hc_weights,
@@ -26,6 +30,7 @@ class HCSumBuffers(NamedTuple):
     mixed: torch.Tensor
     alpha: torch.Tensor
     output: HCSumState
+    partial_sums: torch.Tensor | None = None
 
 
 @cache_once
@@ -48,10 +53,18 @@ class SmallTSumHCShell:
     Reuse buffers and scratch sequentially on one stream, including Graph replay.
     """
 
-    def __init__(self, source, *, down_weights=None, norm_weight_permuted=None):
+    def __init__(
+        self,
+        source,
+        *,
+        down_weights=None,
+        norm_weight_permuted=None,
+        deterministic=False,
+    ):
         if not source.config.hc_per_branch_norm:
             raise ValueError("sum-state requires per-branch RMSNorm")
         self.eps = source.config.rms_norm_eps
+        self.deterministic = deterministic
         if not math.isfinite(self.eps) or self.eps <= 0:
             raise ValueError("RMS epsilon must be positive and finite")
         if down_weights is None:
@@ -98,6 +111,9 @@ class SmallTSumHCShell:
             new((rows, w.hidden_size)),
             new((rows, 4), torch.float32),
             HCSumState(new((rows, 4 * w.hidden_size)), new((rows, 4), torch.float32)),
+            new((rows, 4, PARTIALS_PER_BRANCH), torch.float32)
+            if self.deterministic
+            else None,
         )
 
     def _validate(self, state, buffers):
@@ -115,6 +131,12 @@ class SmallTSumHCShell:
             (buffers.output.residual, (t, 4 * h), w.down_inject.dtype),
             (buffers.output.sum_sq, (t, 4), torch.float32),
         )
+        if self.deterministic != (buffers.partial_sums is not None):
+            raise ValueError("Apply workspace must match the HC deterministic mode")
+        if buffers.partial_sums is not None:
+            specs += (
+                (buffers.partial_sums, (t, 4, PARTIALS_PER_BRANCH), torch.float32),
+            )
         for tensor, shape, dtype in specs:
             if (
                 tensor.shape != shape
@@ -164,5 +186,6 @@ class SmallTSumHCShell:
             buffers.alpha,
             out=buffers.output.residual,
             sum_sq=buffers.output.sum_sq,
+            partial_sums=buffers.partial_sums,
         )
         return buffers.output

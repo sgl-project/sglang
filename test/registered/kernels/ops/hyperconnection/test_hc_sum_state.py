@@ -172,27 +172,117 @@ class TestHCSumState(CustomTestCase):
     def tensor(self, shape, dtype):
         return torch.randn(shape, device="cuda", dtype=dtype, generator=self.generator)
 
-    def test_deterministic_mode_rejects_packed_hc(self):
-        """Reject unsupported atomic/BMM HC before model warmup can reach it."""
-        config = HyperConnectionConfig(
-            hidden_size=512, hc_lowrank=64, hc_per_branch_norm=True
+    @torch.no_grad()
+    def test_deterministic_mode(self):
+        """Flag-enabled HC is repeatable at fixed T, including Graph and slices.
+
+        Small/large-T projection rounding is unchanged; this is not a claim of
+        bitwise equality across that dispatch boundary or whole-model determinism.
+        """
+        from sglang.srt.batch_invariant_ops import (
+            disable_batch_invariant_mode,
+            enable_batch_invariant_mode,
+            is_batch_invariant_mode_enabled,
         )
+
+        self.assertFalse(is_batch_invariant_mode_enabled())
         execution = SimpleNamespace(
             deterministic=SimpleNamespace(enable_deterministic_inference=True)
         )
+        cases = []
         with patch("sglang.srt.runtime_context.get_exec", return_value=execution):
-            with self.assertRaisesRegex(ValueError, "enable-deterministic-inference"):
-                GatedResidual(config, packed_weights=True)
-            legacy = GatedResidual(config).to(device="cuda", dtype=torch.bfloat16)
+            config = HyperConnectionConfig(
+                hidden_size=512, hc_lowrank=64, hc_per_branch_norm=True
+            )
+            legacy = GatedResidual(config)
             self.assertFalse(legacy.prepare_sum_state_weights())
             self.assertIsNone(legacy._sum_operators)
             final = GatedResidual(config, use_combine=False, packed_weights=True)
             self.assertFalse(final._packed_sum_weights)
+            for dtype in (torch.bfloat16, torch.float16):
+                for h, lowrank in ((512, 64), (2560, 320)):
+                    checkpoint = _checkpoint(h, lowrank, dtype)
+                    layer = _layer(h, lowrank, dtype)
+                    layer.load_state_dict(checkpoint)
+                    for t in (0, 1, 24, 25, 80):
+                        state = layer.bootstrap_sum_state(
+                            self.tensor((t, 4 * h), dtype)
+                        )
+                        # Reference runs before installing the framework overrides.
+                        expected = _reference_mix(
+                            state, checkpoint, layer.config.rms_norm_eps
+                        )
+                        cases.append(
+                            (layer, state, self.tensor((t, h), dtype), expected)
+                        )
 
-    def check_mix(self, mixed, context, checkpoint):
-        expected, alpha = _reference_mix(
-            context.state, checkpoint, context.operator.eps
-        )
+        enable_batch_invariant_mode()
+        self.addCleanup(disable_batch_invariant_mode)
+        for layer, state, core, expected in cases:
+            t, h = core.shape
+            with self.subTest(dtype=core.dtype, h=h, t=t):
+
+                def step():
+                    mixed, context = layer.mix(state)
+                    return mixed, context, layer.combine(core, context)
+
+                def values(mixed, context, output):
+                    return (
+                        mixed,
+                        context.buffers.alpha,
+                        output.residual,
+                        output.sum_sq,
+                    )
+
+                mixed, context, output = step()
+                self.assertEqual(context.buffers.partial_sums.shape, (t, 4, 10))
+                self.check_mix(mixed, context, None, expected=expected)
+                self.check_apply(context, core, output)
+                reference = [
+                    x.view(torch.uint8).clone() for x in values(mixed, context, output)
+                ]
+                for _ in range(3):
+                    mixed, context, output = step()
+                    for actual, wanted in zip(
+                        values(mixed, context, output), reference
+                    ):
+                        self.assertTrue(torch.equal(actual.view(torch.uint8), wanted))
+                if t in (24, 25):
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        mixed, context, output = step()
+                    for _ in range(3):
+                        context.buffers.partial_sums.fill_(float("nan"))
+                        output.sum_sq.fill_(float("nan"))
+                        graph.replay()
+                        for actual, wanted in zip(
+                            values(mixed, context, output), reference
+                        ):
+                            self.assertTrue(
+                                torch.equal(actual.view(torch.uint8), wanted)
+                            )
+                    # Attention TP can slice a large-T Mix down to small-T Apply.
+                    sliced = context.slice_rows(1, 2)
+                    sliced.buffers.output.sum_sq.fill_(float("nan"))
+                    sliced.buffers.partial_sums.fill_(float("nan"))
+                    written = sliced.combine(core.tensor_split(2)[1])
+                    self.check_apply(sliced, core.tensor_split(2)[1], written)
+                    for _ in range(3):
+                        sliced.combine(core.tensor_split(2)[1])
+                        self.assertTrue(
+                            torch.equal(
+                                written.sum_sq.view(torch.uint8),
+                                reference[-1].tensor_split(2)[1],
+                            )
+                        )
+
+    def check_mix(self, mixed, context, checkpoint, *, expected=None):
+        if expected is None:
+            expected = _reference_mix(context.state, checkpoint, context.operator.eps)
+        expected, alpha = expected
+        if not context.operator.deterministic:
+            self.assertIsNone(context.buffers.partial_sums)
         bf16 = mixed.dtype == torch.bfloat16
         torch.testing.assert_close(
             mixed,
@@ -378,7 +468,11 @@ class TestHCSumState(CustomTestCase):
                     self.check_mix(mixed, following, checkpoint)
 
     @torch.no_grad()
-    def test_graph_replay_resets_sums_with_changed_inputs(self):
+    def test_graph_replay_with_changed_inputs_and_weights(self):
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            _model_load_weights_direct,
+        )
+
         h, lowrank = 512, 64
         for dtype in (torch.bfloat16, torch.float16):
             checkpoint = _checkpoint(h, lowrank, dtype)
@@ -411,6 +505,144 @@ class TestHCSumState(CustomTestCase):
                         torch.cuda.synchronize()
                         self.check_mix(mixed, context, checkpoint)
                         self.check_apply(context, core, output)
+
+                    model = torch.nn.Module()
+                    model.hc = layer
+                    prepared = layer._sum_operators[0].weights
+                    pointers = (prepared.up.data_ptr(), prepared.scratch.data_ptr())
+                    for i, route in enumerate(("loader", "direct", "state_dict")):
+                        with self.subTest(update=route):
+                            checkpoint = _checkpoint(h, lowrank, dtype, seed=419 + i)
+                            checkpoint["input_mix_weight_up.weight"] *= 4
+                            if route == "loader":
+                                parameters = dict(layer.named_parameters())
+                                for name, value in checkpoint.items():
+                                    param = parameters[name]
+                                    param.weight_loader(param, value)
+                                layer.prepare_sum_state_weights()
+                            elif route == "direct":
+                                _model_load_weights_direct(
+                                    model,
+                                    [("hc." + k, v) for k, v in checkpoint.items()],
+                                )
+                            else:
+                                layer.load_state_dict(checkpoint)
+                            current = layer._sum_operators[0].weights
+                            self.assertEqual(
+                                (current.up.data_ptr(), current.scratch.data_ptr()),
+                                pointers,
+                            )
+                            graph.replay()
+                            torch.cuda.synchronize()
+                            self.check_mix(mixed, context, checkpoint)
+                            self.check_apply(context, core, output)
+
+    @torch.no_grad()
+    def test_deterministic_apply_partials(self):
+        from sglang.kernels.ops.elementwise.hc_apply_sum import (
+            PARTIALS_PER_BRANCH,
+            hc_apply_sum,
+        )
+
+        for dtype in (torch.bfloat16, torch.float16):
+            for h in (512, 2560, 16384):
+                residual = self.tensor((80, 4 * h), dtype)
+                core = self.tensor((80, h), dtype)
+                alpha = torch.rand((80, 4), device="cuda", generator=self.generator) * 2
+                previous_batch = None
+                for t in (0, 1, 24, 25, 80):
+                    with self.subTest(dtype=dtype, h=h, t=t):
+                        out = torch.empty_like(residual[:t])
+                        sums = torch.empty((t, 4), device="cuda", dtype=torch.float32)
+                        partials = torch.empty(
+                            (t, 4, PARTIALS_PER_BRANCH),
+                            device="cuda",
+                            dtype=torch.float32,
+                        )
+                        context = SimpleNamespace(
+                            state=HCSumState(residual[:t], sums),
+                            buffers=SimpleNamespace(alpha=alpha[:t]),
+                        )
+
+                        def step():
+                            return hc_apply_sum(
+                                core[:t],
+                                residual[:t],
+                                alpha[:t],
+                                out=out,
+                                sum_sq=sums,
+                                partial_sums=partials,
+                            )
+
+                        expected_bits = None
+                        for _ in range(3):
+                            sums.fill_(float("nan"))
+                            partials.fill_(float("nan"))
+                            step()
+                            self.check_apply(context, core[:t], HCSumState(out, sums))
+                            bits = (out.view(torch.int16), sums.view(torch.int32))
+                            if expected_bits is None:
+                                expected_bits = tuple(x.clone() for x in bits)
+                            for actual, expected in zip(bits, expected_bits):
+                                torch.testing.assert_close(
+                                    actual, expected, rtol=0, atol=0
+                                )
+                        if t:
+                            if previous_batch is not None:
+                                for actual, expected in zip(bits, previous_batch):
+                                    torch.testing.assert_close(
+                                        actual[: expected.shape[0]],
+                                        expected,
+                                        rtol=0,
+                                        atol=0,
+                                    )
+                            previous_batch = expected_bits
+                        if t == 25:
+                            torch.cuda.synchronize()
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph):
+                                step()
+                            for _ in range(3):
+                                sums.fill_(float("nan"))
+                                partials.fill_(float("nan"))
+                                graph.replay()
+                                for actual, expected in zip(bits, expected_bits):
+                                    torch.testing.assert_close(
+                                        actual, expected, rtol=0, atol=0
+                                    )
+
+                        atomic_out = torch.empty_like(out)
+                        atomic_sums = torch.zeros_like(sums)
+                        hc_apply_sum(
+                            core[:t],
+                            residual[:t],
+                            alpha[:t],
+                            out=atomic_out,
+                            sum_sq=atomic_sums,
+                        )
+                        torch.testing.assert_close(out, atomic_out, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            sums, atomic_sums, rtol=3e-6, atol=1e-5
+                        )
+
+        with self.assertRaisesRegex(ValueError, "partial_sums"):
+            hc_apply_sum(
+                core,
+                residual,
+                alpha,
+                out=out,
+                sum_sq=sums,
+                partial_sums=partials[..., :9],
+            )
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            hc_apply_sum(
+                core,
+                residual,
+                alpha,
+                out=out,
+                sum_sq=partials.view(-1)[: 80 * 4].view(80, 4),
+                partial_sums=partials,
+            )
 
     def check_storage(self, layer, checkpoint):
         small, large = layer._sum_operators

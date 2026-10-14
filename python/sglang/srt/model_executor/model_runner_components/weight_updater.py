@@ -459,7 +459,7 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
         loader = getattr(param, "hc_weight_loader", default_weight_loader)
         loader(param, tensor)
     # Refresh complete pairs; incomplete pairs stay dirty until a later bucket.
-    # Captured graphs must follow the normal recapture lifecycle after reload.
+    # Refresh HC layouts in place so existing captured graphs see the new weights.
     _model_refresh_hc_weights(model)
 
 
