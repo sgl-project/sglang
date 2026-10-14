@@ -18,6 +18,7 @@ from sglang.srt.utils.common import (
     get_video_bytes,
     load_audio,
     load_image,
+    load_video,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -225,9 +226,10 @@ class TestMediaURLSecurity(unittest.TestCase):
             configure_media_url_security([], max_file_size_mb=1)
             self.assertEqual(get_image_bytes(str(path)), payload)
             self.assertEqual(get_video_bytes(str(path)), payload)
-            self.assertEqual(_normalize_video_input(path.as_uri()), str(path))
+            self.assertEqual(_normalize_video_input(path.as_uri()), payload)
             configure_media_url_security([], max_file_size_mb=0)
             self.assertEqual(get_image_bytes(str(path)), payload)
+            self.assertEqual(_normalize_video_input(path.as_uri()), payload)
 
     def test_percent_encoded_video_path_is_the_file_that_was_checked(self):
         """A %20 in the path must not select a different file from the size check."""
@@ -238,7 +240,13 @@ class TestMediaURLSecurity(unittest.TestCase):
             literal = Path(directory) / "a%20b.mp4"
             literal.write_bytes(b"")
             os.truncate(literal, 1024 * 1024 + 1)
-            self.assertEqual(_normalize_video_input(str(literal)), str(checked))
+            self.assertEqual(_normalize_video_input(str(literal)), b"tiny")
+            with patch(
+                "sglang.srt.utils.common.VideoDecoderWrapper",
+                return_value="decoder",
+            ) as wrapper:
+                self.assertEqual(load_video(str(literal), use_gpu=False), "decoder")
+            wrapper.assert_called_once_with(b"tiny", device="cpu")
 
     def test_preprocess_snapshot_rejects_an_oversized_local_image(self):
         """The preprocess-cache snapshot uses the same local byte cap."""

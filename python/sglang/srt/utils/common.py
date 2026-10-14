@@ -2224,12 +2224,11 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
 
 def _normalize_video_input(
     video_file: Union[str, bytes],
-) -> Union[str, bytes, None]:
-    """Normalize video input (URL, base64, file://, etc.) to a file path or bytes.
+) -> Union[bytes, None]:
+    """Normalize video input (URL, base64, file://, etc.) to bytes.
 
-    Returns a file path or bytes suitable for a decoder, or None on failure.
-    URLs and base64 are returned as bytes (no temp files needed since both
-    torchcodec and VideoDecoderWrapper accept bytes natively).
+    Local files are read under the media byte cap. The decoder must not
+    open the path again, or a replaced file would skip that check.
     """
     if isinstance(video_file, bytes):
         return video_file
@@ -2241,12 +2240,11 @@ def _normalize_video_input(
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            return _checked_local_media_path(video_file)
+            return _read_local_media_file(_checked_local_media_path(video_file))
         else:
             path = unquote(urlparse(video_file).path)
             if os.path.isfile(path):
-                _assert_local_media_file(path)
-                return path
+                return _read_local_media_file(path)
             return pybase64.b64decode(video_file, validate=True)
     else:
         return None
