@@ -48,16 +48,11 @@ from sglang.srt.parser.template_detection import (
     ReasoningToggleConfig,
     build_detection_context,
     detect_reasoning_pattern,
-    detect_tool_call_parser,
     match_rules,
 )
 from sglang.srt.runtime_context import get_serving
 
 logger = logging.getLogger(__name__)
-
-_BEAM_CHAT_TEMPLATE = os.path.join(
-    os.path.dirname(__file__), "beam_chat_template.jinja"
-)
 
 
 class TemplateManager:
@@ -169,10 +164,7 @@ class TemplateManager:
             if self._chat_template_name is None:
                 # Try HuggingFace template first
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
-                if hf_template and detect_tool_call_parser(hf_template, None) == "beam":
-                    logger.info("Using SGLang's Beam chat template")
-                    self._load_jinja_template(tokenizer_manager, _BEAM_CHAT_TEMPLATE)
-                elif hf_template:
+                if hf_template:
                     # override the chat template
                     if tokenizer_manager.tokenizer:
                         tokenizer_manager.tokenizer.chat_template = hf_template
