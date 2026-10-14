@@ -74,6 +74,7 @@ def _make_accumulator() -> _GenerationStreamAccumulator:
         default_stream_interval=1,
         default_force_stream_interval=1,
         get_cached_tokens_details=lambda req: None,
+        is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
     )
 

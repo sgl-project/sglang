@@ -75,6 +75,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "require_reasoning",
         "return_bytes",
         "return_entropy",
+        "return_flat_raw_output_top_logprobs",
         "return_flat_raw_top_logprobs",
         "return_flat_raw_top_logprobs_b64",
         "return_indexer_topk",
@@ -90,6 +91,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "use_audio_in_video",
         "video_config",
         "video_max_dynamic_patch",
+        "watermark",
     }
 )
 
