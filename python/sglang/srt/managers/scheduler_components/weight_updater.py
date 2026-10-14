@@ -398,7 +398,8 @@ class SchedulerWeightUpdaterManager:
             )
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
-        """Open the session: restore in-place-packed weights on the selected runners."""
+        """Open the session: restore in-place-packed weights on the selected runners, and return only once the
+        device has finished the work already launched on it."""
         if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,
@@ -409,6 +410,9 @@ class SchedulerWeightUpdaterManager:
         if recv_req.sync_base:
             for _, runner in self._select_runners(recv_req.selector):
                 runner.weight_updater.begin_weight_update()
+        # peers write the weights over RDMA, outside the engine's streams; an in_place pause leaves the last
+        # overlapped forward running
+        torch.get_device_module().synchronize()
         self._session = _WeightUpdateSession(
             selector=recv_req.selector, sync_base=recv_req.sync_base
         )
