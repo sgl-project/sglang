@@ -41,6 +41,8 @@ class FlowRolloutController:
         debug_mode: bool,
         sde_step_indices: list[int] | None,
         generator: Union[torch.Generator, list[torch.Generator]],
+        return_dit_trajectory: bool,
+        return_step_indices: list[int] | None,
         shard_for_sp: Callable[[torch.Tensor], torch.Tensor],
         gather_for_sp: Callable[[torch.Tensor], torch.Tensor],
         sigmas: torch.Tensor,
@@ -52,6 +54,8 @@ class FlowRolloutController:
         self.debug_mode = debug_mode
         self.sde_step_indices = sde_step_indices
         self.generator = generator
+        self.return_dit_trajectory = return_dit_trajectory
+        self.return_step_indices = return_step_indices
         # Shard a full-shape tensor to this rank / gather [B, T, ...] stacks back.
         self.shard_for_sp = shard_for_sp
         self.gather_for_sp = gather_for_sp
@@ -68,6 +72,10 @@ class FlowRolloutController:
         self.local_prev_sample_means: list[torch.Tensor] = []
         self.local_noise_std_devs: list[torch.Tensor] = []
         self.local_model_outputs: list[torch.Tensor] = []
+
+        self.step_latents: list[torch.Tensor] = []
+        self.step_latent_indices: list[int] = []
+        self.step_timesteps: list[torch.Tensor] = []
 
     def _reset_rollout_debug_tensors(self) -> None:
         self.local_variance_noises = []
@@ -138,10 +146,14 @@ class FlowRolloutController:
         ``sample`` arrives already upcast to fp32 by ``step()``.
 
         Draws variance noise from the request generator captured at creation, so
-        the caller's ``generator`` argument is not used.
+        the caller's ``generator`` argument is not used. Records ``sample`` as the
+        step's x_t before advancing it.
         """
         if current_sigma.dim() != 0:
             raise ValueError("Rollout does not support per-token timesteps")
+        self._maybe_append_dit_trajectory_step(
+            latents=sample, timestep_value=timestep, step_index=step_index
+        )
         return self.flow_sde_sampling(
             model_output=model_output,
             sample=sample,
@@ -378,3 +390,20 @@ class FlowRolloutController:
         )
         rollout_log_probs_tensor = trajectory_log_prob_sum / trajectory_log_prob_count
         return rollout_log_probs_tensor.cpu()
+
+    def _maybe_append_dit_trajectory_step(
+        self,
+        latents: torch.Tensor,
+        timestep_value: torch.Tensor,
+        step_index: int,
+    ) -> None:
+        if not self.return_dit_trajectory:
+            return
+
+        self.step_timesteps.append(timestep_value.detach().cpu())
+        return_step_indices = self.return_step_indices
+        if return_step_indices is not None and step_index not in return_step_indices:
+            return
+
+        self.step_latents.append(latents.detach())
+        self.step_latent_indices.append(step_index)
