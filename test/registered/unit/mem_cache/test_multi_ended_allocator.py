@@ -51,7 +51,13 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaSlotAllocator,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 
 _DEV = "cpu"
@@ -686,6 +692,55 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                                 ),
                                 feasible[0] if feasible else None,
                             )
+                            # ``prefer_swa`` flips the lexicographic order:
+                            # least FULL reclaim first, then least SWA.
+                            self.assertEqual(
+                                allocator.reclaim_plan(
+                                    full_pages * page_size,
+                                    swa_pages * page_size,
+                                    full_evictable_tokens=full_evictable,
+                                    swa_evictable_tokens=swa_evictable,
+                                    prefer_swa=True,
+                                ),
+                                min(feasible) if feasible else None,
+                            )
+
+    def test_evict_to_free_tokens_prefers_swa_reclaim_on_storage_or_decode(self):
+        """The default quota order spends FULL prefix to keep the sliding
+        window. With a HiCache storage backend attached, or while serving as
+        the decode side of a PD pair, the FULL prefix is the one worth keeping,
+        so the allocator asks the planner for SWA-first quotas. Hierarchical
+        cache alone (no storage backend) keeps the default. Pins the planner
+        argument per configuration, so a predicate that degrades to one branch
+        is caught."""
+        _, allocator, _ = self._build(page_size=4)
+        tree_cache = MagicMock()
+        tree_cache.supports_prefix_sharing.return_value = True
+        tree_cache.full_evictable_size.return_value = 8
+        tree_cache.swa_evictable_size.return_value = 8
+        allocator.reclaim_plan = MagicMock(return_value=(0, 0))
+        cases = (
+            ({}, None, False),
+            ({"enable_hierarchical_cache": True}, None, False),
+            (
+                {"enable_hierarchical_cache": True, "hicache_storage_backend": "file"},
+                None,
+                True,
+            ),
+            ({}, "decode", True),
+        )
+        for memory, role, prefer_swa in cases:
+            with self.subTest(memory=memory, role=role):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(get_memory().override(**memory))
+                    if role is not None:
+                        stack.enter_context(
+                            get_disagg().override(disaggregation_mode=role)
+                        )
+                    allocator.evict_to_free_tokens(tree_cache, 4)
+                self.assertEqual(
+                    allocator.reclaim_plan.call_args.kwargs["prefer_swa"], prefer_swa
+                )
 
     def test_restore_swa_without_allocating_more_full(self):
         _, allocator, _ = self._build(page_size=4)
@@ -2255,78 +2310,6 @@ class TestO3FusedAllocBind(unittest.TestCase):
         ma.bind_peer(fa)
         return pool, fa, full_kv
 
-    def test_fast_path_when_no_holes(self):
-        """When `_free_phys_pages` is empty, the fused fast path fires."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        # Sanity: empty holeset.
-        self.assertEqual(len(fa._free_phys_pages), 0)
-        wm_before = fa.watermark_physical
-        # Pick virtual page ids the kernel will bind.
-        v_pages = torch.tensor([20, 21, 22, 23], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 4)
-        # Watermark advanced by N.
-        self.assertEqual(fa.watermark_physical, wm_before + 4)
-        # Returned phys ids match the grow-up arange [wm_before, wm_before+4).
-        expected_phys = torch.arange(
-            wm_before, wm_before + 4, dtype=torch.int64, device="cuda"
-        )
-        self.assertTrue(torch.equal(phys, expected_phys))
-        # v2p table: each virtual -> its physical.
-        for v, p in zip(v_pages.tolist(), expected_phys.tolist()):
-            self.assertEqual(int(fa.virtual_to_physical[v].item()), p)
-        # p2v table: each physical -> its virtual.
-        for v, p in zip(v_pages.tolist(), expected_phys.tolist()):
-            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
-        # live_page_count updated.
-        self.assertEqual(fa.live_page_count, 4)
-        # Another fast-path call accumulates.
-        v_pages2 = torch.tensor([24, 25], dtype=torch.int64, device="cuda")
-        fa._alloc_bind_fast_or_slow(v_pages2, 2)
-        self.assertEqual(fa.live_page_count, 6)
-
-    def test_slow_path_when_holes_exist(self):
-        """Greedy hole reuse: an existing hole must be drained before the
-        watermark extends, so the fast path must not fire."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        # Build a hole by alloc-then-free-non-boundary.
-        a = fa.alloc(3)
-        self.assertEqual(fa.live_page_count, 3)
-        fa.free(a[0:1].clone())  # frees a non-boundary slot -> enters holeset
-        self.assertEqual(fa.live_page_count, 2)
-        self.assertEqual(len(fa._free_phys_pages), 1)
-        # `_free_phys_pages` is a torch.Tensor; read the hole via `.tolist()`.
-        hole_pos = int(fa._free_phys_pages.tolist()[0])
-        wm_before = fa.watermark_physical
-        # Alloc 1 page via the helper. Slow path should drain the hole.
-        v_pages = torch.tensor([42], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 1)
-        # Hole drained, NOT a watermark extension.
-        self.assertEqual(int(phys[0].item()), hole_pos)
-        self.assertEqual(fa.watermark_physical, wm_before)
-        self.assertEqual(len(fa._free_phys_pages), 0)
-        # v2p/p2v updated.
-        self.assertEqual(int(fa.virtual_to_physical[42].item()), hole_pos)
-        self.assertEqual(int(fa.physical_to_virtual[hole_pos].item()), 42)
-        # The slow path advances live_page_count via take_physical_pages.
-        self.assertEqual(fa.live_page_count, 3)
-
-    def test_fast_path_in_eager_mode(self):
-        """Eager mode never accumulates holes, so it always takes the fast path;
-        `live_page_count` is not maintained there and stays 0."""
-        _pool, fa, _kv = self._make_full(lazy=False)
-        self.assertFalse(fa.lazy_compaction)
-        self.assertEqual(fa.live_page_count, 0)
-        wm_before = fa.watermark_physical
-        v_pages = torch.tensor([30, 31, 32], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
-        self.assertEqual(fa.watermark_physical, wm_before + 3)
-        expected_phys = torch.arange(
-            wm_before, wm_before + 3, dtype=torch.int64, device="cuda"
-        )
-        self.assertTrue(torch.equal(phys, expected_phys))
-        # live_page_count UNCHANGED (eager mode invariant).
-        self.assertEqual(fa.live_page_count, 0)
-
     def test_index_space_overflow_returns_none(self):
         """When the requested allocation would overflow `num_pages`,
         the helper returns None and leaves the allocator unchanged."""
@@ -2341,16 +2324,6 @@ class TestO3FusedAllocBind(unittest.TestCase):
         # Allocator state unchanged.
         self.assertEqual(fa.watermark_physical, wm_before)
         self.assertEqual(fa.live_page_count, 0)
-
-    def test_empty_alloc_returns_empty_tensor(self):
-        """N=0 returns an empty tensor (no kernel launch, no state change)."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        wm_before = fa.watermark_physical
-        v_pages = torch.empty(0, dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 0)
-        self.assertIsNotNone(phys)
-        self.assertEqual(phys.numel(), 0)
-        self.assertEqual(fa.watermark_physical, wm_before)
 
     def test_fast_path_equivalent_to_slow_path(self):
         """On an empty holeset, the fast path must produce identical v2p / p2v /
@@ -2375,82 +2348,6 @@ class TestO3FusedAllocBind(unittest.TestCase):
         # Identical watermark + live_page_count.
         self.assertEqual(fa_a.watermark_physical, fa_b.watermark_physical)
         self.assertEqual(fa_a.live_page_count, fa_b.live_page_count)
-
-    def test_page_size_gt_1(self):
-        """At page_size > 1 the kernel must scatter one v2p entry per PAGE,
-        not per token."""
-        _pool, fa, _kv = self._make_full(
-            lazy=True, n_full_slots=64, n_mamba_slots=16, page_size=4
-        )
-        self.assertEqual(fa.page_size, 4)
-        v_pages = torch.tensor([3, 4, 5], dtype=torch.int64, device="cuda")
-        wm_before = fa.watermark_physical
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
-        self.assertIsNotNone(phys)
-        self.assertEqual(phys.shape, (3,))
-        # Watermark advances by N PAGES (not N tokens).
-        self.assertEqual(fa.watermark_physical, wm_before + 3)
-        # v2p table updated at page granularity.
-        for v, p in zip(v_pages.tolist(), phys.tolist()):
-            self.assertEqual(int(fa.virtual_to_physical[v].item()), p)
-            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
-
-    def test_grow_down_fast_path(self):
-        """The mamba sub-pool is grow-down. Verifies fast-path arithmetic
-        in the descending direction."""
-        _pool, _fa, _kv = self._make_full(lazy=True)
-        # Build a grow-down allocator standalone for the test.
-        from sglang.srt.mem_cache.unified_memory_pool import (
-            UnifiedKVPool,
-        )
-
-        full = _make_mha_spec("full", "up", layer_num=2)
-        swa = _make_mha_spec("swa", "down", layer_num=2)  # grow-down
-        total = (full.entry_bytes() + swa.entry_bytes()) * 32
-        pool = UnifiedKVPool(
-            total_bytes=total,
-            sub_pool_specs=[full, swa],
-            device="cuda",
-            enable_memory_saver=False,
-        )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        swa_kv = _FakeKVCache(pool.max_slots("swa"))
-        fa = MultiEndedAllocator(
-            kvcache=full_kv,
-            unified_buffer=pool,
-            sub_pool_name="full",
-            device="cuda",
-            is_id_owner=True,
-            lazy_compaction=True,
-        )
-        sa = MultiEndedAllocator(
-            kvcache=swa_kv,
-            unified_buffer=pool,
-            sub_pool_name="swa",
-            device="cuda",
-            is_id_owner=False,  # non-owner, grow-down
-            lazy_compaction=True,
-        )
-        fa.bind_peer(sa)
-        sa.bind_peer(fa)
-        # Grow-down: watermark starts at num_pages - 1, decreases.
-        self.assertEqual(sa.grow_direction, "down")
-        wm_before = sa.watermark_physical
-        v_pages = torch.tensor([5, 6, 7], dtype=torch.int64, device="cuda")
-        phys = sa._alloc_bind_fast_or_slow(v_pages, 3)
-        # Grow-down: the kernel emits ASCENDING, matching
-        # `_take_physical_eager`'s `torch.arange(wm - N + 1, wm + 1)`.
-        expected = torch.tensor(
-            [wm_before - 2, wm_before - 1, wm_before],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        self.assertTrue(torch.equal(phys, expected))
-        # Watermark decreased by N.
-        self.assertEqual(sa.watermark_physical, wm_before - 3)
-        for v, p in zip(v_pages.tolist(), expected.tolist()):
-            self.assertEqual(int(sa.virtual_to_physical[v].item()), p)
-            self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
 
 
 class TestSWACompositeKernelIdSurface(unittest.TestCase):

@@ -31,10 +31,11 @@ use sglang_processor::{
 };
 
 use super::completions::completion_usage;
+use super::pd_routing::PDRoutingFields;
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
-    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
+    indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreCall, CoreEvent};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
@@ -53,6 +54,8 @@ struct ChatRequest {
     #[serde(flatten)]
     request: CreateChatCompletionRequest,
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(flatten)]
+    routing: PDRoutingFields,
 }
 
 async fn chat_completions(
@@ -62,18 +65,15 @@ async fn chat_completions(
     let ChatRequest {
         request,
         chat_template_kwargs,
+        routing,
     } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if request.model != state.server_args.served_model_name {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("The model `{}` does not exist", request.model),
-            false,
-        );
+    if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     if request.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
@@ -167,7 +167,16 @@ async fn chat_completions(
     };
 
     let stream = request.stream.unwrap_or(false);
-    let n = request.n.unwrap_or(1) as usize;
+    let prompt_count = 1;
+    let choices_per_prompt = request.n.unwrap_or(1) as usize;
+    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+        Ok(routing) => routing,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
+    // Chat normalizes one prompt, so each bootstrap column has one entry.
+    let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
+    let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
+    let bootstrap_room = routing.bootstrap.bootstrap_rooms[0];
     let want_logprobs = request.logprobs.unwrap_or(false);
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let stream_tool_choice = request.tool_choice.clone();
@@ -180,17 +189,13 @@ async fn chat_completions(
         .stream_options
         .is_some_and(|options| options.include_usage)
         || state.server_args.stream_response_default_include_usage;
-    let mut submitted = Vec::with_capacity(n);
+    let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    // V4 prefills <think>, so the generated stream has no opening marker.
-    let starts_in_reasoning = matches!(
-        reasoning_parser.as_deref(),
-        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
-    ) && prompt.ends_with("<think>");
+    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt);
     let mut prompt = Some(prompt);
-    for index in 0..n {
+    for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
-        let choice_prompt = if index + 1 == n {
+        let choice_prompt = if index + 1 == choices_per_prompt {
             prompt.take().expect("last chat choice owns the prompt")
         } else {
             prompt
@@ -210,6 +215,11 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
+            bootstrap_host: bootstrap_host.clone(),
+            bootstrap_port,
+            bootstrap_room,
+            routed_dp_rank: routing.routed_dp_rank,
+            disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             ..Default::default()
         };
         let call = match submit_generation(&state, native, stream).await {
@@ -836,12 +846,21 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
+/// V4 and GLM-5.3 prefill `<think>` when thinking, so the generated stream has
+/// no opening marker.
+fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    matches!(
+        reasoning_parser,
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45")
+    ) && prompt.ends_with("<think>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        merge_template_stops, starts_in_reasoning, unary_chat,
     };
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
@@ -855,6 +874,21 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn prefilled_think_starts_in_reasoning() {
+        let glm = Some("glm45");
+        assert!(starts_in_reasoning(glm, "<|user|>hi<|assistant|><think>"));
+        assert!(!starts_in_reasoning(
+            glm,
+            "<|user|>hi<|assistant|><think></think>"
+        ));
+        assert!(starts_in_reasoning(
+            Some("deepseek-v4"),
+            "<｜Assistant｜><think>"
+        ));
+        assert!(!starts_in_reasoning(None, "<think>"));
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
