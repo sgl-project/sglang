@@ -30,6 +30,7 @@
 //! | `sgl_router_worker_cb_state` | Gauge | `worker_url` |
 //! | `sgl_router_worker_inflight_requests` | Gauge | `worker_url` |
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
+//! | `sgl_router_retries_total` | Counter | `model_id` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
@@ -43,7 +44,11 @@
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
+//! | `sgl_router_openai_route_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
+//! | `sgl_router_tokenizer_l1_tokens_total` | Counter | `source` |
+//!
+//! The tokenizer series are rendered by [`crate::tokenizer::stats::TokenizerStats`].
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
 //! cache-aware prefill selection that resolves a worker, so the labels sum to
@@ -89,9 +94,8 @@
 //! the share the engine tokenized itself:
 //!
 //! - `forwarded` — router-rendered `input_ids` replaced engine tokenization.
-//! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`,
-//!   no chat formatter, or a renderer not verified against SGLang, such as
-//!   DeepSeek-V4.1).
+//! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`
+//!   or no chat formatter).
 //! - `ineligible_multimodal` — the chat carries image, video, or audio content
 //!   parts, which only the engine's multimodal processor can tokenize.
 //! - `ineligible` — the forwarding guard excluded some other request shape
@@ -176,8 +180,9 @@ pub enum RequestOutcome {
     /// The worker failed to serve the request: a 5xx fault, a transport failure,
     /// a timeout, or a body that never completed.
     Error,
-    /// The router cancelled the request itself — today only the stale-request
-    /// deadline. Never derived from a status; see [`outcome_from_status`].
+    /// The router cancelled the request itself: the stale-request deadline, or
+    /// a PD decode dispatch abandoned because prefill failed first. Never
+    /// derived from a status; see [`outcome_from_status`].
     Cancelled,
 }
 
@@ -257,11 +262,14 @@ pub enum StreamOutcome {
     ClientDisconnect,
     /// The router's stale-request deadline aborted the stream.
     Expired,
+    /// The router aborted the stream before its first chunk.
+    Aborted,
 }
 
 pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
     match end.reason {
         StreamEndReason::Expired => StreamOutcome::Expired,
+        StreamEndReason::Aborted => StreamOutcome::Aborted,
         StreamEndReason::UpstreamError
         | StreamEndReason::IdleTimeout
         | StreamEndReason::PumpPanicked => StreamOutcome::UpstreamError,
@@ -279,6 +287,7 @@ impl StreamOutcome {
             Self::UpstreamError => "upstream_error",
             Self::ClientDisconnect => "client_disconnect",
             Self::Expired => "expired",
+            Self::Aborted => "aborted",
         }
     }
 }
@@ -470,7 +479,9 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    input_ids_forwarding_total: Mutex<HashMap<InputIdsForwardingKey, Arc<AtomicU64>>>,
+    retries_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    input_ids_forwarding_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
+    openai_route_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
@@ -541,8 +552,9 @@ struct CacheAwareDecisionKey {
     decision: &'static str,
 }
 
+/// A per-model outcome label.
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-struct InputIdsForwardingKey {
+struct ModelOutcomeKey {
     model_id: String,
     outcome: &'static str,
 }
@@ -876,10 +888,38 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Bump `sgl_router_retries_total{model_id}`: one per dispatch attempt
+    /// after a request's first.
+    pub fn record_retry(&self, model_id: &str) {
+        let mut guard = self.retries_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_openai_route_total{model_id,outcome}`: `generate`, or
+    /// why the request went to the engine's own OpenAI route.
+    pub fn record_openai_route(&self, model_id: &str, passthrough: Option<&'static str>) {
+        let key = ModelOutcomeKey {
+            model_id: model_id.to_owned(),
+            outcome: passthrough.unwrap_or("generate"),
+        };
+        let counter = self
+            .openai_route_total
+            .lock()
+            .entry(key)
+            .or_default()
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Bump `sgl_router_input_ids_forwarding_total{model_id,outcome}`
     /// — exactly one call per dispatched chat request.
     pub fn record_input_ids_forwarding(&self, model_id: &str, outcome: InputIdsForwarding) {
-        let key = InputIdsForwardingKey {
+        let key = ModelOutcomeKey {
             model_id: model_id.to_owned(),
             outcome: outcome.as_str(),
         };
@@ -1353,26 +1393,38 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // input_ids_forwarding_total
+        // retries_total
         out.push_str(
-            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible_multimodal, ineligible, tokenize_failed).\n",
+            "# HELP sgl_router_retries_total Dispatch attempts retried on another worker after a failure that reached the client as a status only.\n",
         );
-        out.push_str("# TYPE sgl_router_input_ids_forwarding_total counter\n");
-        let guard = self.input_ids_forwarding_total.lock();
-        let mut entries: Vec<(&InputIdsForwardingKey, u64)> = guard
+        out.push_str("# TYPE sgl_router_retries_total counter\n");
+        let guard = self.retries_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
             .iter()
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
-        entries.sort_by(|a, b| (&a.0.model_id, a.0.outcome).cmp(&(&b.0.model_id, b.0.outcome)));
-        for (key, value) in entries {
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
             out.push_str(&format!(
-                "sgl_router_input_ids_forwarding_total{{model_id=\"{}\",outcome=\"{}\"}} {}\n",
-                escape_label(&key.model_id),
-                key.outcome,
+                "sgl_router_retries_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
                 value,
             ));
         }
         drop(guard);
+
+        render_model_outcomes(
+            &mut out,
+            "sgl_router_input_ids_forwarding_total",
+            "Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible_multimodal, ineligible, tokenize_failed).",
+            &self.input_ids_forwarding_total,
+        );
+        render_model_outcomes(
+            &mut out,
+            "sgl_router_openai_route_total",
+            "OpenAI requests served through the engine's /generate (outcome=generate) or, with the reason, through its own OpenAI route.",
+            &self.openai_route_total,
+        );
 
         // sampling_contract_rejections_total
         out.push_str(
@@ -1404,6 +1456,28 @@ impl MetricsRegistry {
 /// emitted verbatim — callers escape their own label values. Buckets are
 /// rendered cumulatively per the Prometheus histogram contract, with a
 /// final `+Inf` bucket.
+fn render_model_outcomes(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    counters: &Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
+) {
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+    let guard = counters.lock();
+    let mut entries: Vec<_> = guard
+        .iter()
+        .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+        .collect();
+    entries.sort_by(|a, b| (&a.0.model_id, a.0.outcome).cmp(&(&b.0.model_id, b.0.outcome)));
+    for (key, value) in entries {
+        out.push_str(&format!(
+            "{name}{{model_id=\"{}\",outcome=\"{}\"}} {value}\n",
+            escape_label(&key.model_id),
+            escape_label(key.outcome),
+        ));
+    }
+}
+
 fn render_histogram(out: &mut String, name: &str, label_body: &str, hist: &Histogram) {
     let mut cumulative: u64 = 0;
     for (i, &bound) in hist.bounds.iter().enumerate() {
@@ -1599,6 +1673,7 @@ mod tests {
             (StreamEndReason::IdleTimeout, UpstreamError),
             (StreamEndReason::PumpPanicked, UpstreamError),
             (StreamEndReason::Expired, Expired),
+            (StreamEndReason::Aborted, Aborted),
         ] {
             for saw_error_event in [false, true] {
                 let end = StreamEnd {

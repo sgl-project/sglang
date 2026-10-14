@@ -10,6 +10,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Type,
     overload,
@@ -21,6 +22,8 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -49,6 +52,44 @@ if is_npu():
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 
+def pp_sync_polls(
+    polls: Optional[List[int]],
+    pp_group: GroupCoordinator,
+    pp_rank: int,
+    pp_size: int,
+    sync_work_list: List,
+) -> List[int]:
+    """Synchronize poll states from PP0 through the PP pipeline.
+
+    PP0 provides the data. Each later PP rank receives it from the previous
+    rank and asynchronously forwards it to the next rank.
+    """
+    if pp_size <= 1:
+        assert polls is not None
+        return polls
+
+    for p2p_work in sync_work_list:
+        p2p_work.work.wait()
+    sync_work_list.clear()
+
+    data = polls
+    if pp_rank > 0:
+        data = pp_group.recv_object(
+            src=pp_rank - 1,
+            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+        )
+    if pp_rank + 1 < pp_size:
+        sync_work_list.extend(
+            pp_group.send_object(
+                data,
+                dst=pp_rank + 1,
+                async_send=True,
+                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            )
+        )
+    return data
+
+
 def poll_and_all_reduce_pp(
     rids: Iterable[str],
     ready_poll: int,
@@ -65,6 +106,25 @@ def poll_and_all_reduce_pp(
         KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
         for rid in rids
     ]
+
+
+def poll_and_all_reduce_prefill_pp(
+    pollers: List[CommonKVSender],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    pp_group: GroupCoordinator,
+    pp_rank: int,
+    pp_size: int,
+    pp_poll_sync_work_list: List[torch.distributed.Work],
+) -> List[int]:
+    polls: List[int] = []
+    if pp_rank == 0:
+        polls = _poll_with_failure_injection_pp(pollers)
+        polls = _all_reduce_polls(polls, attn_tp_cpu_group)
+        polls = _all_reduce_polls(polls, attn_cp_cpu_group)
+    # Propagate PP0's data to other ranks
+    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
+    return polls
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -163,6 +223,17 @@ def _poll_with_failure_injection(pollers) -> List[int]:
     return [int(poller.poll()) for poller in pollers]
 
 
+def _poll_with_failure_injection_pp(pollers) -> List[int]:
+    if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
+        return [
+            int(KVPoll.Failed)
+            if random.random() < failure_prob
+            else int(poller.poll_pp_consensus())
+            for poller in pollers
+        ]
+    return [int(poller.poll_pp_consensus()) for poller in pollers]
+
+
 def _is_fake_transfer(req: Req) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
         req.bootstrap_host is None
@@ -232,6 +303,7 @@ def poll_and_all_reduce_with_staging(
     staging_handler,
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    pollers=None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -241,8 +313,9 @@ def poll_and_all_reduce_with_staging(
             staging_handler.advance_scatter(decode_req)
 
     # allow test injection of failure probability at runtime
-    receivers = [dr.kv_receiver for dr in decode_reqs]
-    raw_polls = _poll_with_failure_injection(receivers)
+    if pollers is None:
+        pollers = [dr.kv_receiver for dr in decode_reqs]
+    raw_polls = _poll_with_failure_injection(pollers)
     for i, decode_req in enumerate(decode_reqs):
         if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
             decode_req
@@ -912,6 +985,28 @@ def compute_mamba_state_slice_byte_blocks(
     return blocks
 
 
+def is_elided_entry(
+    src_len: int,
+    dst_lens: Optional[Sequence[int]],
+    dst_index: int,
+    *,
+    allow_dst_elision: bool = True,
+) -> bool:
+    """True when either peer elided this entry (a 0-row DSA index-K buffer).
+
+    Nothing moves for it, and the elided side never registered the buffer.
+    allow_dst_elision=False restricts the skip to a zero-length source.
+    """
+    if src_len == 0:
+        return True
+    return (
+        allow_dst_elision
+        and dst_lens is not None
+        and dst_index < len(dst_lens)
+        and dst_lens[dst_index] == 0
+    )
+
+
 def build_transfer_entry_pairs(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],
@@ -1320,6 +1415,7 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
+        MHATokenToKVPool,
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
@@ -1335,6 +1431,7 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+    kv_args.swa_kv_cache_layout = None
     # V4's KVCache is organized by compression-ratio buckets rather than by layer.
     kv_args.mla_compression_ratios = (
         list(token_to_kv_pool.compression_ratios)
@@ -1385,23 +1482,26 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
+                token_to_kv_pool.swa_kv_pool, MHATokenToKVPool
+            ):
+                kv_args.swa_kv_cache_layout = (
+                    token_to_kv_pool.swa_kv_pool.kv_cache_layout
+                )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
             # Only the concrete SWAKVPool owns a full sub-pool; other
             # BaseSWAKVPool implementations describe their state per entry.
-            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
-                token_to_kv_pool.full_kv_pool, MHATokenToKVPoolMXFP8
-            ):
-                append_state_component(
-                    kv_args,
-                    StateType.BLOCK_SCALE,
-                    *token_to_kv_pool.get_kv_scale_buf_infos(),
-                )
-                append_state_component(
-                    kv_args,
-                    StateType.BLOCK_SCALE_SWA,
-                    *token_to_kv_pool.get_swa_kv_scale_buf_infos(),
-                )
+            if isinstance(token_to_kv_pool, SWAKVPool):
+                # Global and SWA caches may use different dtypes.
+                for pool, state_type in (
+                    (token_to_kv_pool.full_kv_pool, StateType.BLOCK_SCALE),
+                    (token_to_kv_pool.swa_kv_pool, StateType.BLOCK_SCALE_SWA),
+                ):
+                    if isinstance(pool, MHATokenToKVPoolMXFP8):
+                        append_state_component(
+                            kv_args, state_type, *pool.get_kv_scale_buf_infos()
+                        )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
@@ -1558,7 +1658,7 @@ def setup_state_kv_args(
                 tail_item_lens = tail_item_lens + draft_tail_item_lens
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
-                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                    3 if token_to_kv_pool.index_head_dim is not None else 2
                 )
                 kv_args.hidden_kv_layers = total_kv_layers
                 kv_args.draft_kv_layers = (

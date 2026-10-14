@@ -9,7 +9,11 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     msgpack_decode,
@@ -94,7 +98,11 @@ class _FakeReq:
         return False
 
 
-def _accumulator(current_weight_version="default", return_sampling_mask=False):
+def _accumulator(
+    current_weight_version="default",
+    return_sampling_mask=False,
+    request_level_keys=frozenset(),
+):
     return _GenerationStreamAccumulator(
         return_logprob=False,
         return_hidden_states=False,
@@ -106,6 +114,7 @@ def _accumulator(current_weight_version="default", return_sampling_mask=False):
         default_stream_interval=1,
         default_force_stream_interval=1,
         get_cached_tokens_details=lambda req: None,
+        is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
     )
 
@@ -150,6 +159,105 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         self.assertEqual(
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
+        )
+
+    def test_request_level_value_is_preserved_for_finished_zero_token_request(self):
+        """A request that finishes with no output tokens still ships its value.
+
+        Token-sliced keys yield ``req_values[0:0]`` here, so without the
+        request-level path the one value a prefill-only request produced
+        would arrive as an empty list.
+        """
+        key = "prompt_score"
+        accumulator = _accumulator(request_level_keys=frozenset({key}))
+
+        accumulator.accept(
+            req=_FakeReq(
+                "prefill-only",
+                [],
+                customized_info={key: [386.25]},
+                finished=True,
+            )
+        )
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(
+            unwrap_from_pickle(payload.customized_info),
+            {key: [[386.25]]},
+        )
+
+    def test_request_level_customized_info_is_emitted_only_once(self):
+        """Streaming emits a request-level value with the first chunk only.
+
+        A later chunk that re-sends it would be appended by the receiver and
+        the client would read the same value twice.
+        """
+        key = "request_score"
+        req = _FakeReq("streaming", [10], customized_info={key: [386.25]})
+        req.stream = True
+
+        first = _accumulator(request_level_keys=frozenset({key}))
+        first.accept(req=req)
+        self.assertEqual(
+            unwrap_from_pickle(
+                first.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+            ),
+            {key: [[386.25]]},
+        )
+
+        req.output_ids.append(11)
+        second = _accumulator(request_level_keys=frozenset({key}))
+        second.accept(req=req)
+        self.assertIsNone(
+            second.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+        )
+
+    def test_nonstreaming_request_level_customized_info_waits_for_finish(self):
+        """Non-streaming requests emit the value with the terminal output only.
+
+        Intermediate outputs of a non-streaming request are coalesced on the
+        receiver, so emitting earlier would duplicate the value as well.
+        """
+        key = "request_score"
+        req = _FakeReq("nonstreaming", [10], customized_info={key: [386.25]})
+
+        intermediate = _accumulator(request_level_keys=frozenset({key}))
+        intermediate.accept(req=req)
+        self.assertIsNone(
+            intermediate.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+        )
+
+        req.output_ids.append(11)
+        req._finished = True
+        terminal = _accumulator(request_level_keys=frozenset({key}))
+        terminal.accept(req=req)
+        self.assertEqual(
+            unwrap_from_pickle(
+                terminal.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+            ),
+            {key: [[386.25]]},
+        )
+
+    def test_request_level_customized_info_uses_empty_list_for_missing_request(self):
+        """Requests without the key take an empty slot, not a ``None`` per token.
+
+        The per-request lists stay aligned with ``output_ids`` while the
+        receiver never sees token-shaped padding for a request-level key.
+        """
+        key = "request_score"
+        accumulator = _accumulator(request_level_keys=frozenset({key}))
+
+        without_score = _FakeReq("without-score", [10, 11])
+        without_score.stream = True
+        with_score = _FakeReq("with-score", [20], customized_info={key: [386.25]})
+        with_score.stream = True
+        accumulator.accept(req=without_score)
+        accumulator.accept(req=with_score)
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(
+            unwrap_from_pickle(payload.customized_info),
+            {key: [[], [386.25]]},
         )
 
     def test_additional_customized_info_uses_the_existing_payload(self):
@@ -210,6 +318,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1
         terminal = _FakeReq("terminal", [20], finished=True)
 
         streamer._stream_output_generation([quiet, terminal], False)
@@ -247,6 +356,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1
 
         streamer._stream_output_generation([terminal, quiet], False)
 
@@ -388,6 +498,33 @@ class TestOutputStreamerWeightVersions(unittest.TestCase):
         self.assertIsNone(payload.weight_versions)
 
 
+class TestOutputStreamerStreamInterval(unittest.TestCase):
+    def test_sends_once_interval_tokens_are_unsent(self):
+        """With stream_interval=4, the first token goes out at once, then a chunk
+        whenever 4 or more tokens are unsent, however many each step appends."""
+        cases = {
+            # One token per step keeps the cadence of sending at 1, 5, 9, ...
+            "single_token_steps": ([1] * 9, (), [1, 0, 0, 0, 4, 0, 0, 0, 4]),
+            # Speculative steps pass multiples of 4 without landing on them.
+            "multi_token_steps": ([1, 3, 3, 3, 3], (), [1, 0, 6, 0, 6]),
+            # A chunk held for a possible stop string goes out on the next step.
+            "held_for_stop_str": ([1] * 6, (4,), [1, 0, 0, 0, 0, 5]),
+        }
+        for name, (steps, held_steps, expected) in cases.items():
+            with self.subTest(name):
+                req = _FakeReq("r0", [])
+                req.stream = True
+                req.sampling_params.stream_interval = 4
+                sent = []
+                for step, num_tokens in enumerate(steps):
+                    req.check_match_stop_str_prefix = lambda: step in held_steps
+                    req.output_ids.extend(range(num_tokens))
+                    accumulator = _accumulator()
+                    accumulator.accept(req=req)
+                    sent.append(sum(map(len, accumulator.output_ids)))
+                self.assertEqual(sent, expected)
+
+
 _IPC_ROUND_TRIPS = {
     "pickle": lambda payload: pickle.loads(
         pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
@@ -494,7 +631,7 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                     support = torch.randn(len(support_reqs), width, generator=generator)
                     output = LogitsProcessorOutput(
                         next_token_logits=None,
-                        sampling_mask_output=SimpleNamespace(
+                        sampling_mask_output=SamplingMaskOutput(
                             token_ids=token_ids,
                             lengths=lengths,
                             selected_logprobs=selected,
