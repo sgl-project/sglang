@@ -78,6 +78,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
+    attn_tp_all_gather_into_tensor,
     attn_tp_all_reduce,
     dp_gather_partial,
     dp_gather_replicate,
@@ -162,6 +163,11 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
+)
+from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
+    enter_late_layer_dp,
+    exit_late_layer_dp,
+    late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -791,6 +797,29 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 
 
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
+
+
+def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+    # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
+    # backend onto the tail metadata of the *live* batch (the captured args hold
+    # the capture-time batch). The sentinel keeps the break in the replay sequence.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    get_attn_backend().prefill_graph_enter_late_layer_tail(forward_batch)
+    return sentinel
+
+
+def deepseek_v4_exit_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    get_attn_backend().prefill_graph_exit_late_layer_tail(forward_batch)
+    return sentinel
+
+
+bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(True)(
+    deepseek_v4_enter_late_layer_tail
+)
+bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
+    deepseek_v4_exit_late_layer_tail
+)
 
 
 class MqaAttentionBase(nn.Module):
@@ -2674,6 +2703,28 @@ def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
         ) = saved
 
 
+def _attn_tp_all_gather_chunks(
+    local: torch.Tensor, chunk_rows: List[int]
+) -> torch.Tensor:
+    # Tensor all_gather stays on aiter AG / pynccl under graph capture; the list
+    # all_gather falls back to ProcessGroupNCCL, which invalidates HIP capture.
+    max_rows = max(chunk_rows)
+    padded = local
+    if local.shape[0] != max_rows:
+        padded = local.new_zeros((max_rows, *local.shape[1:]))
+        padded[: local.shape[0]].copy_(local)
+    gathered = local.new_empty((len(chunk_rows) * max_rows, *local.shape[1:]))
+    attn_tp_all_gather_into_tensor(gathered, padded.contiguous())
+    if all(rows == max_rows for rows in chunk_rows):
+        return gathered
+    return torch.cat(
+        [
+            gathered[i * max_rows : i * max_rows + rows]
+            for i, rows in enumerate(chunk_rows)
+        ]
+    )
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2724,7 +2775,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             is_deepseek_v4=True,
             vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3298,17 +3350,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
-        seam_open: bool = True,
-        mega_mhc_seam_open: bool = True,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
-        pre-mix. ``seam_open`` preserves the existing tail-mode boundary policy;
-        ``mega_mhc_seam_open`` disables Mega mHC for both sublayers in the layer
-        immediately before row selection."""
+        pre-mix."""
         self._init_boundaries()
-        mega_mhc_prefill = mhc.can_use_mega_mhc_prefill(
-            self.hc_cfg, seam_open=mega_mhc_seam_open
-        )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -3343,7 +3388,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 next=self.local_boundary,
                 world_size=world_size,
                 precomputed=precomputed,
-                mega_mhc=mega_mhc_prefill,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
@@ -3354,7 +3398,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             precomputed = state.stats
             state.release()
             del state
-            nxt = self.next_boundary if seam_open else None
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
@@ -3371,10 +3414,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=nxt,
+                next=self.next_boundary,
                 world_size=self.mlp.tp_size,
                 precomputed=precomputed,
-                mega_next=self.next_boundary if mega_mhc_prefill else None,
             )
 
         return run_ffn_hc(run_attn_hc(state))
@@ -3470,6 +3512,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+            # The gather ships the whole padded chunk and the MoE runs on it, but
+            # graph replay never refreshes pad rows, so they hold stale pool
+            # memory (bf16-max scale) that overflows the MoE and the combine.
+            if _is_hip:
+                _mask_dp_pad_rows(local_hidden_states, forward_batch)
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -3512,7 +3559,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+            if self.config.model_type == "deepseek_v41":
+                parallel = get_parallel()
+                hidden_states = parallel.tp_group.all_reduce(hidden_states)
+                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
+                    parallel.attn_cp_rank
+                ].contiguous()
+            else:
+                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -3549,9 +3603,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
-            gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
-            attn_tp_all_gather(gathered, hidden_states.contiguous())
-            hidden_states = torch.cat(gathered)
+            if _is_hip:
+                hidden_states = _attn_tp_all_gather_chunks(
+                    hidden_states, chunk_rows=[t.shape[0] for t in _a2a_scatter_chunks]
+                )
+            else:
+                gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
+                attn_tp_all_gather(gathered, hidden_states.contiguous())
+                hidden_states = torch.cat(gathered)
         return hidden_states
 
     # ------------------------------------------------------------------
@@ -3809,10 +3868,36 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_mlp_output = hidden
 
 
+def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
+    n_real = forward_batch.num_token_non_padded
+    num_rows = local_hidden_states.shape[0]
+    if n_real is None or num_rows == 0:
+        return
+    pad = torch.arange(num_rows, device=local_hidden_states.device) >= n_real
+    local_hidden_states.masked_fill_(
+        pad.view(-1, *([1] * (local_hidden_states.dim() - 1))), 0
+    )
+
+
+def _gather_late_layer_ids(
+    input_ids: torch.Tensor, counts: List[int], forward_batch: ForwardBatch
+) -> torch.Tensor:
+    # Re-gather the compact tail IDs in the late-layer MoE layout.
+    gathered = input_ids.new_empty((sum(counts), 1))
+    dp_gather_replicate(gathered, input_ids[:, None].clone(), forward_batch)
+    return gathered.squeeze(-1)
+
+
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
     # Rows outside the tail are never read (see _check_late_layer_tail_readers).
+    if tail.scatter_indices is not None:
+        # Prefill CUDA graph: fixed-capacity tail block; padding rows land on the
+        # dummy row past the extend and are dropped by the slice.
+        full = rows.new_zeros((num_tokens + 1, rows.shape[1]))
+        full.index_copy_(0, tail.scatter_indices, rows)
+        return full[:num_tokens]
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
         full[tail.contiguous_start :].copy_(rows)
@@ -3952,6 +4037,15 @@ class DeepseekV4Model(nn.Module):
                 0,
                 1,
             }, f"late layers must not compress on their own, got ratios {late_ratios}"
+            assert getattr(config, "num_hash_layers", 0) <= self.late_layer_start, (
+                "decoder SWA bounded replay needs hash routing before the late layers"
+            )
+        # Only vision routing reads token IDs in the late layers.
+        self.late_layer_vl_routing = (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4059,6 +4153,28 @@ class DeepseekV4Model(nn.Module):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+        tail_in_graph = (
+            tail is not None
+            and tail.scatter_indices is not None
+            and is_in_breakable_cuda_graph()
+        )
+        late_dp_counts = None
+        saved_dp = None
+        if (
+            self.late_layer_start is not None
+            and get_parallel().attn_dp_size > 1
+            and (forward_batch.is_extend_in_batch or _is_hip)
+        ):
+            late_dp_counts = late_layer_dp_counts(
+                forward_batch,
+                (
+                    tail.token_indices.shape[0]
+                    if tail is not None
+                    else hidden_states.shape[0]
+                ),
+                in_graph=tail_in_graph,
+            )
+        tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
@@ -4068,15 +4184,32 @@ class DeepseekV4Model(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
-                saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+                if tail_in_graph:
+                    # Eager break: re-run at replay so the backend swaps onto the
+                    # live batch's tail metadata; the gathers below are captured
+                    # against the persistent index buffers.
+                    tail_sentinel = bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
+                    saved_full = attn_backend.prefill_graph_late_layer_saved
+                else:
+                    saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                input_ids, input_ids_global = (
-                    tail.rows(input_ids),
-                    tail.rows(input_ids_global),
-                )
+                input_ids = tail.rows(input_ids)
+                if not (
+                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
+                ):
+                    input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+            if late_dp_counts is not None and i == self.late_layer_start:
+                saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
+                if get_moe_a2a_backend().is_none():
+                    # Full-prefill IDs are not indexed by this rank's tail rows.
+                    input_ids_global = (
+                        _gather_late_layer_ids(input_ids, late_dp_counts, forward_batch)
+                        if self.late_layer_vl_routing
+                        else None
+                    )
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4129,12 +4262,15 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
-                    seam_open=tail is None,
-                    mega_mhc_seam_open=i + 1 != self.late_layer_start,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        if saved_dp is not None:
+            exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
-            attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+            if tail_in_graph:
+                tail_sentinel = bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+            else:
+                attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
         return state.residual, state.pre, None
 
@@ -4465,7 +4601,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        ):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
@@ -4597,7 +4737,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         spans = []
         device, dtype = self.image_start.device, self.image_start.dtype
         for item in items:
-            item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
+            item.reconstruct(device.index)
             h, w = int(item.n_vit_h), int(item.n_vit_w)
             pixels = torch.as_tensor(item.feature, device=device)
             plan = item.model_specific_data.get(GPU_PLAN_KEY)
@@ -4683,16 +4823,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    def forward(
+    def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare full-sequence image embeddings and model IDs before CP splits.
+
+        Scheduler hash IDs stay intact for multimodal cache keys; the language
+        model uses image_token_id for Engram masking and visual MoE routing.
+        """
         if (
-            self.vision is not None
+            getattr(self, "vision", None) is not None
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
@@ -4701,7 +4844,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
+        if getattr(self, "vision", None) is not None and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -4711,6 +4854,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        return input_ids, input_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -4732,6 +4888,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
             input_ids = tail.rows(input_ids)
+            if tail.real_rows_count is not None:
+                # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
+                n = tail.real_rows_count
+                input_ids = input_ids[:n]
+                hidden_states = hidden_states[:n]
+                pre_hc_head = pre_hc_head[:n]
+                if aux_hidden_states is not None:
+                    aux_hidden_states = [a[:n] for a in aux_hidden_states]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
@@ -4748,7 +4912,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = tail.token_indices
+            output.hidden_states_token_indices = (
+                tail.token_indices[: tail.real_rows_count]
+                if tail.real_rows_count is not None
+                else tail.token_indices
+            )
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

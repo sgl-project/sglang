@@ -904,7 +904,7 @@ class ReqLogprob:
     input_top_logprobs_val: Optional[List[List[float]]] = None
     input_top_logprobs_idx: Optional[List[List[int]]] = None
     # Flat replacements for the rows above (see
-    # build_flat_input_top_logprobs_arrays); when set, the nested rows are
+    # build_flat_top_logprobs_arrays); when set, the nested rows are
     # emptied and the arrays ship instead.
     input_top_logprobs_val_flat: Optional[np.ndarray] = None
     input_top_logprobs_idx_flat: Optional[np.ndarray] = None
@@ -1077,6 +1077,8 @@ class Req(ReqDllmMixin):
         self.dllm_initialized: bool = False
 
         self.session = session
+        # media added by this turn, excluding the session's borrowed history
+        self._session_mm_items: List[MultimodalDataItem] = []
         self.session_id = session_id
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
@@ -1365,7 +1367,14 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        # Override embeds give KV that the token ids alone do not determine.
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or positional_embed_overrides is not None
+        )
+        # Set when the request's in-flight forward ran on KV that never landed:
+        # that forward's output is dropped and the request finishes with it.
+        self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -1519,6 +1528,7 @@ class Req(ReqDllmMixin):
 
     def _extend_session_image_inputs(self, image_inputs):
         """Append media while preserving the saved session and its position history."""
+        self._session_mm_items.extend(image_inputs.mm_items)
         # Padding can change token values without changing their count.
         self.full_untruncated_fill_ids = array("q")
         if self.multimodal_inputs is not None:
@@ -1563,6 +1573,18 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs.mrope_position_delta = (
                 positions.max() + 1 - positions.shape[1]
             ).reshape(1, 1)
+
+    def release_mm_inputs_on_abort(self) -> None:
+        """Release this turn's media without invalidating session history."""
+        if self.session is None:
+            if self.multimodal_inputs is not None:
+                self.multimodal_inputs.release_features()
+        else:
+            for item in self._session_mm_items:
+                item.release_transport_proxies()
+                item.feature = None
+            self._session_mm_items.clear()
+        self.multimodal_inputs = None
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -2110,9 +2132,7 @@ class Req(ReqDllmMixin):
             logger.error(f"{error_msg}, {self.rid=}")
         # Session requests share historical multimodal inputs with their prior
         # request. The session owns and releases those features when it closes.
-        if self.multimodal_inputs is not None and self.session is None:
-            self.multimodal_inputs.release_features()
-        self.multimodal_inputs = None
+        self.release_mm_inputs_on_abort()
         self.grammar = None
         self.origin_input_ids = array(
             "q", [0]
@@ -2900,8 +2920,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         if self.return_logprob:
+            # Pin so the non_blocking H2D copy in ForwardBatch.init_new is stream-ordered
             extend_input_logprob_token_ids = torch.tensor(
-                extend_input_logprob_token_ids
+                extend_input_logprob_token_ids,
+                pin_memory=is_pin_memory_available(self.device),
             )
             # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
             # so they stay within the vocab boundary before being sent to GPU.
@@ -3317,15 +3339,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # No backup exists and the device KV is already freed, so the
                 # request cannot resume.
-                if get_disagg().disaggregation_decode_retraction_backup == "none":
+                if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+                    message = "Retraction host KV pool exhausted. Aborting the request."
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                else:
                     message = (
                         "Retracted under decode memory pressure without a KV "
                         "backup. Retry later."
                     )
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE
-                else:
-                    message = "Retraction host KV pool exhausted. Aborting the request."
-                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 req.to_finish = FINISH_ABORT(message, status_code=status_code)
                 reqs_to_abort.append(req)
                 logger.warning(
@@ -3472,6 +3494,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.kv.mamba_next_track_idx = other_idx
+            else:
+                # The in-flight write invalidates the keep slot's old checkpoint.
+                req.kv.mamba_last_track_seqlen = None
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -3508,6 +3533,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if new_slot is not None:
                     pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                     has_pending = True
+                else:
+                    req.kv.mamba_last_track_seqlen = None
             # On failure the verify scatters in place into the keep slot.
             track_positions.append(
                 other_idx if has_pending else req.kv.mamba_next_track_idx
