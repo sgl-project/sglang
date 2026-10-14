@@ -26,7 +26,7 @@ use axum::{
     Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -102,12 +102,12 @@ fn health_routes() -> Router<Arc<AppState>> {
     let timeout = std::time::Duration::from_secs(
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
     );
-    let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout));
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
-        probe.clone()
+        get(move |state: State<Arc<AppState>>| health_generate(state, timeout, false))
     } else {
         get(health_without_generation)
     };
+    let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout, true));
     Router::new()
         .route("/health", health)
         .route("/health_generate", probe)
@@ -125,7 +125,8 @@ async fn health_without_generation(State(state): State<Arc<AppState>>) -> Respon
 /// producing output. 200 if the response heartbeat advances within `timeout`
 /// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
 /// It also returns 503 until startup warmup completes. (`/health` uses the same
-/// handler when its env gate is on.)
+/// handler when its env gate is on, without `metadata_headers`.) A healthy
+/// `/health_generate` carries the configured `health_generate_headers`.
 ///
 /// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
 /// an idle pipeline produces a frame, then watches the *global*
@@ -135,9 +136,24 @@ async fn health_without_generation(State(state): State<Arc<AppState>>) -> Respon
 async fn health_generate(
     State(state): State<Arc<AppState>>,
     timeout: std::time::Duration,
+    metadata_headers: bool,
 ) -> Response {
     match state.core.probe_health(timeout).await {
-        Ok(HealthStatus::Healthy) => StatusCode::OK.into_response(),
+        Ok(HealthStatus::Healthy) => {
+            let mut response = StatusCode::OK.into_response();
+            if metadata_headers {
+                // Validated at startup (`ServerArgs::validate`).
+                for (name, value) in &state.server_args.health_generate_headers {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        response.headers_mut().insert(name, value);
+                    }
+                }
+            }
+            response
+        }
         Ok(HealthStatus::NotReady | HealthStatus::Stalled) => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
@@ -551,10 +567,59 @@ mod tests {
             chat_formatter: None,
         });
 
-        let response = health_generate(State(state), Duration::ZERO).await;
+        let response = health_generate(State(state), Duration::ZERO, true).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(intake_rx.try_recv().is_err());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// A healthy `/health_generate` carries the configured metadata headers;
+    /// `/health` sharing the probe does not.
+    #[tokio::test]
+    async fn healthy_probe_carries_configured_headers() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let activity: crate::tokenizer_manager::from_scheduler::ActivityCounter =
+            Default::default();
+        let server_args = crate::message::config::ServerArgs {
+            health_generate_headers: [
+                ("x-custom-header".to_string(), "v".to_string()),
+                ("x-rust-server".to_string(), "health".to_string()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let state = Arc::new(AppState {
+            core: crate::api_server::core::CoreHandle::new(
+                intake_tx,
+                abort_tx,
+                crate::api_server::core::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: activity.clone(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    metadata: crate::api_server::core::CoreMetadata::default(),
+                },
+            ),
+            server_args: Arc::new(server_args),
+            chat_formatter: None,
+        });
+        // Each probe that reaches intake counts as scheduler output.
+        tokio::spawn(async move {
+            while intake_rx.recv_async().await.is_ok() {
+                activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        let response = health_generate(State(state.clone()), Duration::from_secs(5), true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-custom-header"], "v");
+        assert_eq!(response.headers()["x-rust-server"], "health");
+
+        let response = health_generate(State(state), Duration::from_secs(5), false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-custom-header").is_none());
     }
 
     #[tokio::test]
