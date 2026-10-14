@@ -74,7 +74,6 @@ from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
-    is_deepseek_v4,
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -111,10 +110,6 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.layers.moe import initialize_moe_config
-from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
-from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
-from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -209,6 +204,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_components import worker_setup
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -320,7 +316,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -352,7 +347,6 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     freeze_gc,
-    get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
@@ -365,7 +359,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -379,19 +372,12 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-def _prewarm_hccl_group(device, group, device_module):
-    warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
-    torch.distributed.all_reduce(warmup_tensor, group=group)
-    device_module.synchronize()
-
-
 # Min wall-clock between load publishes on the stalled no-batch path, which
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
 LOAD_STALL_REFRESH_S = 0.05
 
 
-_is_npu = is_npu()
 _is_hip = is_hip()
 
 
@@ -467,6 +453,9 @@ class Scheduler:
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+        self.init_worker_info()
+        self.init_process_groups()
+        self.init_startup_memory()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -697,34 +686,12 @@ class Scheduler:
         )
 
     def maybe_init_hccl_dp_prewarm(self) -> None:
-        if not (
-            _is_npu
-            and is_deepseek_v4(self.tp_worker.model_runner.model_config.hf_config)
-        ):
-            return
-
-        parallel = get_parallel()
-        tp_group = parallel.tp_group
-        rank = (
-            parallel.dp_rank if parallel.dp_rank is not None else tp_group.rank_in_group
+        worker_setup.maybe_prewarm_hccl_dp(
+            self.tp_worker.model_runner.model_config.hf_config
         )
-        logger.info("HCCL DP prewarm start: rank=%s", rank)
-        _prewarm_hccl_group(
-            device=tp_group.device,
-            group=tp_group.device_group,
-            device_module=tp_group.device_module,
-        )
-        logger.info("HCCL DP prewarm done: rank=%s", rank)
 
     def init_zbal_on_npu(self):
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import init_zbal
-
-            if get_parallel().pp_size > 1:
-                logger.error("only zbal mix mode support pp_size > 1!")
-            init_zbal(
-                get_parallel().tp_size, get_device().gpu_id, get_parallel().tp_rank
-            )  # only switch allocator if is mix mode
+        worker_setup.init_zbal_on_npu()
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -910,29 +877,7 @@ class Scheduler:
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        # Use the language config already normalized by ModelConfig. Multimodal
-        # wrappers expose it under different attributes (for example,
-        # ``text_config`` or ``llm_config``).
-        config_to_check = self.model_config.hf_text_config
-
-        # Different MoE architectures expose the per-token expert count under
-        # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
-        # LongCat-2.0 uses ``moe_topk``).
-        moe_topk_attrs = (
-            "num_experts_per_tok",
-            "num_experts_per_token",
-            "top_k_experts",
-            "moe_top_k",
-            "moe_topk",
-        )
-        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
-            initialize_moe_config()
-
-        # Initialize GEMM-related configuration for FP8 and FP4 backends.
-        initialize_fp8_gemm_config()
-        initialize_fp4_gemm_config()
-        initialize_bf16_gemm_config()
-
+        worker_setup.init_moe_gemm_config(self.model_config.hf_text_config)
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync()
 
@@ -1001,32 +946,16 @@ class Scheduler:
 
     def init_target_memory_pool(self):
         """Allocate target KV cache pools if they have not been allocated yet."""
-        if (
-            self.tp_worker.model_runner.memory_pool_config is not None
-            and self.tp_worker.model_runner.req_to_token_pool is not None
-            and self.tp_worker.model_runner.token_to_kv_pool_allocator is not None
-        ):
-            return
-        preloaded_weights_bytes = self.tp_worker.preloaded_weights_bytes
-        if self.draft_worker is not None:
-            preloaded_weights_bytes += self.draft_worker.preloaded_weights_bytes
-        self.tp_worker.model_runner.account_preloaded_weights(preloaded_weights_bytes)
-        self.tp_worker.alloc_memory_pool()
+        worker_setup.alloc_target_memory_pool(
+            tp_worker=self.tp_worker, draft_worker=self.draft_worker
+        )
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
         self.init_target_memory_pool()
-        # Lands the retraction backend on the disagg bag before the draft
-        # worker's HiCache plan reads it.
-        kv_cache_builder.resolve_decode_retraction_backup(tp_worker=self.tp_worker)
-        if self.draft_worker is not None:
-            pool, allocator = self.tp_worker.get_memory_pool()
-            self.draft_worker.alloc_memory_pool(
-                memory_pool_config=self.tp_worker.model_runner.memory_pool_config,
-                req_to_token_pool=pool,
-                token_to_kv_pool_allocator=allocator,
-            )
-            self.draft_worker.init_hicache_draft_plan()
+        worker_setup.alloc_draft_memory_pool(
+            tp_worker=self.tp_worker, draft_worker=self.draft_worker
+        )
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -1059,71 +988,20 @@ class Scheduler:
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 
-        model_runner = self.tp_worker.model_runner
-        if model_runner.token_to_kv_pool.post_capture_active:
-            kv_cache_builder.prepare_hicache_staging(
-                tp_worker=self.tp_worker,
-                draft_plan=(
-                    self.draft_worker.hicache_draft_plan
-                    if self.draft_worker is not None
-                    else None
-                ),
-            )
-        device_module = torch.get_device_module(model_runner.device)
-        self.schedule_stream = device_module.Stream(priority=0)
-        # Match run_batch / PPRing.run_slot_batch so warmup allocations stay reusable.
-        forward_stream = (
-            model_runner.forward_stream
-            if (not get_schedule().disable_overlap_schedule)
-            or get_parallel().pp_size > 1
-            else self.schedule_stream
+        startup = worker_setup.finish_worker_startup(
+            tp_worker=self.tp_worker, draft_worker=self.draft_worker
         )
-        with device_module.stream(forward_stream):
-            prewarm_graph_pool_borrow()
-            if self.draft_worker is None:
-                model_runner.prewarm_sampling()
-            else:
-                self.draft_worker.prewarm_sampling()
-        if model_runner.token_to_kv_pool.post_capture_active:
-            tic = time.perf_counter()
-            model_runner.post_capture_resize_kv_pool(
-                draft_runners=(
-                    self.draft_worker._draft_model_runners()
-                    if self.draft_worker is not None
-                    else ()
-                )
-            )
-            self.kv_cache_allocation_time += time.perf_counter() - tic
+        self.schedule_stream = startup.schedule_stream
+        self.kv_cache_allocation_time += startup.kv_resize_time
 
-        if get_model().is_startup_weight_load_overlap:
-            self.tp_worker.finalize_startup_weight_load()
-
-        # Adaptive/speculative graphs and post-capture KV sizing can consume
-        # the headroom seen by the initial DeepGEMM layout budget. Refresh it
-        # after these allocations, before elastic EP rejoins healthy ranks
-        # that do not participate in this startup collective.
-        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
-            refresh_deep_gemm_layout_memory_budget,
+        self.model_worker = worker_setup.select_model_worker(
+            tp_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            dllm_worker=self.dllm_worker,
+            spec_algorithm=self.spec_algorithm,
         )
 
-        refresh_deep_gemm_layout_memory_budget(model_runner, only_if_initialized=True)
-
-        if (
-            get_exec().moe.elastic_ep_backend is not None
-            and get_exec().moe.ep_join_mode == "recover"
-        ):
-            model_runner.post_capture_elastic_ep_recover()
-
-        # Dispatch the model worker
-        if self.dllm_worker is not None:
-            self.model_worker = self.dllm_worker
-        elif self.spec_algorithm.is_none() or self.draft_worker is None:
-            # PP+spec: non-last stages have no draft worker; they run the
-            # verify-shaped target forward through the plain tp_worker.
-            self.model_worker = self.tp_worker
-        else:
-            self.model_worker = self.draft_worker
-
+    def init_worker_info(self):
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
@@ -1151,14 +1029,10 @@ class Scheduler:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
-        if not get_parallel().pp_max_micro_batch_size:
-            get_context().override(
-                "scheduler.pp_max_micro_batch_size_default",
-                pp_max_micro_batch_size=max(
-                    self.max_running_requests // get_parallel().pp_size, 1
-                ),
-            )
+        worker_setup.set_default_pp_max_micro_batch_size(self.max_running_requests)
+        set_random_seed(self.random_seed)
 
+    def init_process_groups(self):
         self.tp_group = get_parallel().tp_group
         self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_parallel().attn_tp_group
@@ -1174,23 +1048,14 @@ class Scheduler:
         self.dp_tp_group = get_dp_tp_group()
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
-        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
-        set_random_seed(self.random_seed)
-
-        # Print debug info
-        self.startup_available_gpu_memory_gb = get_available_gpu_memory(
-            self.device, get_device().gpu_id, empty_cache=False
+    def init_startup_memory(self):
+        self.startup_available_gpu_memory_gb = worker_setup.measure_startup_memory(
+            device=self.device,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_prefill_tokens=self.max_prefill_tokens,
+            max_running_requests=self.max_running_requests,
+            context_len=self.model_config.context_len,
         )
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                f"max_total_num_tokens={self.max_total_num_tokens}, "
-                f"chunked_prefill_size={get_schedule().chunked_prefill_size}, "
-                f"max_prefill_tokens={self.max_prefill_tokens}, "
-                f"max_running_requests={self.max_running_requests}, "
-                f"context_len={self.model_config.context_len}, "
-                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}="
-                f"{self.startup_available_gpu_memory_gb:.2f} GB"
-            )
 
     def emit_metrics_constants(self) -> None:
         if not get_observability().enable_metrics:
@@ -1572,7 +1437,7 @@ class Scheduler:
             transfer_backend=self.transfer_backend,
             tokenizer=self.tokenizer,
             mm_processor=self._mm_processor,
-            pad_input_ids_func=self.pad_input_ids_func,
+            pad_input_ids_func=self.tp_worker.get_pad_input_ids_func(),
             dp_tp_group=self.dp_tp_group,
             max_req_len=self.max_req_len,
             max_req_input_len=self.max_req_input_len,

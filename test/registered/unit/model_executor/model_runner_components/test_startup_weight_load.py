@@ -798,7 +798,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.managers.scheduler.get_exec",
+                "sglang.srt.managers.scheduler_components.worker_setup.get_exec",
                 return_value=SimpleNamespace(
                     moe=SimpleNamespace(
                         elastic_ep_backend=None,
@@ -807,13 +807,13 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 ),
             ),
             patch(
-                "sglang.srt.managers.scheduler.torch.get_device_module",
+                "sglang.srt.managers.scheduler_components.worker_setup.torch.get_device_module",
                 return_value=SimpleNamespace(
                     stream=stream_context, Stream=lambda priority: schedule_stream
                 ),
             ),
             patch(
-                "sglang.srt.managers.scheduler.prewarm_graph_pool_borrow",
+                "sglang.srt.managers.scheduler_components.worker_setup.prewarm_graph_pool_borrow",
                 side_effect=lambda: trace.append("borrow_prewarm"),
             ),
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
