@@ -338,18 +338,8 @@ impl RequestExtensions {
             expand_per_prompt("bootstrap_host", self.bootstrap_host, prompt_count)?;
         let bootstrap_ports =
             expand_per_prompt("bootstrap_port", self.bootstrap_port, prompt_count)?;
-        let bootstrap_rooms = match self.bootstrap_room {
-            Some(OneOrMany::One(base)) => (0..prompt_count)
-                .map(|prompt_index| {
-                    let offset = i64::try_from(prompt_index)
-                        .map_err(|_| "bootstrap_room prompt index exceeds i64".to_owned())?;
-                    base.checked_add(offset)
-                        .map(Some)
-                        .ok_or_else(|| "bootstrap_room overflows i64".to_owned())
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            value => expand_per_prompt("bootstrap_room", value, prompt_count)?,
-        };
+        let bootstrap_rooms =
+            expand_bootstrap_rooms(self.bootstrap_room, prompt_count, choice_count)?;
         let routed_dp_rank = self.routed_dp_rank.or(self.data_parallel_rank);
         let total = prompt_count
             .checked_mul(choice_count)
@@ -376,7 +366,7 @@ impl RequestExtensions {
                         priority: self.priority,
                         bootstrap_host: bootstrap_hosts[prompt_index].clone(),
                         bootstrap_port: bootstrap_ports[prompt_index].flatten(),
-                        bootstrap_room: bootstrap_rooms[prompt_index],
+                        bootstrap_room: bootstrap_rooms[index],
                         routed_dp_rank,
                         disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
                     },
@@ -384,6 +374,35 @@ impl RequestExtensions {
             }
         }
         Ok(contexts)
+    }
+}
+
+pub(crate) fn expand_bootstrap_rooms(
+    value: Option<OneOrMany<i64>>,
+    prompt_count: usize,
+    choice_count: usize,
+) -> Result<Vec<Option<i64>>, String> {
+    let total = prompt_count
+        .checked_mul(choice_count)
+        .ok_or_else(|| "prompt count times n overflows usize".to_owned())?;
+    match value {
+        Some(OneOrMany::One(base)) => (0..total)
+            .map(|index| {
+                // Requests are prompt-major, but Python assigns scalar rooms in
+                // sample-major order before dispatching each choice with n=1.
+                let prompt_index = index / choice_count;
+                let sample_index = index % choice_count;
+                let offset = i64::try_from(sample_index * prompt_count + prompt_index)
+                    .map_err(|_| "bootstrap_room index exceeds i64".to_owned())?;
+                base.checked_add(offset)
+                    .map(Some)
+                    .ok_or_else(|| "bootstrap_room overflows i64".to_owned())
+            })
+            .collect(),
+        value => Ok(expand_per_prompt("bootstrap_room", value, prompt_count)?
+            .into_iter()
+            .flat_map(|room| std::iter::repeat_n(room, choice_count))
+            .collect()),
     }
 }
 
