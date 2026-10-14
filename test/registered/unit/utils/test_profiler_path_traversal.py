@@ -10,7 +10,6 @@ Usage:
     python -m unittest test_profiler_path_traversal -v
 """
 
-import os
 import unittest
 
 from sglang.srt.managers.scheduler_components.profiler_manager import (
