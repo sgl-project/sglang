@@ -624,10 +624,6 @@ canonical quantizer for the requested operand pair and launches the matching ASM
 row. No calibration pass and no extra checkpoint weights are involved: the
 format is purely a runtime choice.
 
-Two steps are shared by every quantized row and run inside the kernel: a
-per-channel K mean is subtracted before quantization, and Q/K are rotated by a
-Walsh-Hadamard transform before packing on every row except `i8fp8`.
-
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "20%"}} />
