@@ -67,6 +67,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             # MindIE uses the operator's rint default for offline Wan.
             self.single_level_kernel.activation_round_mode = "rint"
             self.w4a8_kernel = NPUMXFP4W4A8OfflineLinearMethod()
+            self.w4a8_kernel.use_wan_bias = True
         else:
             if self.dual_scale_key not in self.quant_config:
                 raise ValueError(
@@ -156,9 +157,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         if not self.is_dual_scale:
-            self.single_level_kernel.process_weights_after_loading(
-                layer, prepare_w4a8=True
-            )
+            self.single_level_kernel.process_weights_after_loading(layer)
             layer.mxfp4_quant_kwargs = mxfp4_quant_kwargs(self.quant_config)
             if self.has_mul_scale:
                 mul_scale = layer.mul_scale.data
@@ -174,12 +173,10 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        from sglang.srt.hardware_backend.npu.utils import (
-            cast_packed_fp4_weight_to_nz,
-        )
-
         # DualLevelQuantMatmulWeightNz rejects ND weights.
-        weight = cast_packed_fp4_weight_to_nz(weight, force_nz=True)
+        weight = torch_npu.npu_format_cast(
+            weight.view(torch.int8), 29, customize_dtype=torch.int8
+        )
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
         # Reshape weight_scale: [out, in/32] -> [out, in/64, 2]

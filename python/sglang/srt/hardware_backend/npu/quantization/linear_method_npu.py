@@ -4,11 +4,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.hardware_backend.npu.utils import (
-    NPUACLFormat,
-    cast_packed_fp4_weight_to_nz,
-    npu_format_cast,
-)
+from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
 if TYPE_CHECKING:
@@ -671,7 +667,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        if hasattr(layer, "weight_w4a8"):
+        if getattr(self, "use_wan_bias", False):
             if bias is not None:
                 # Wan W4A8 expects a BF16 bias with a batch dimension.
                 bias = bias.to(torch.bfloat16)
@@ -683,7 +679,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         # W4(weight)A8(activation) matmul.
         output = torch.ops.npu.npu_quant_matmul(
             quantized_x,
-            getattr(layer, "weight_w4a8", layer.weight),
+            layer.weight,
             layer.weight_scale,
             scale_dtype=e8m0_dtype,
             pertoken_scale=dynamic_scale,
@@ -849,23 +845,14 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
-    [out, in/32]). Wan can prepare both NZ layouts and select MindIE's
-    activation rounding; other callers keep the base method's defaults.
+    [out, in/32]). The weight remains ND and is transposed for matmul.
+    Wan selects MindIE's activation rounding on its kernel instance.
     """
 
-    def process_weights_after_loading(
-        self, layer: torch.nn.Module, *, prepare_w4a8: bool = False
-    ) -> None:
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        if prepare_w4a8:
-            # ND shares storage; NZ needs separate K0=32 and K0=64 layouts.
-            weight_w4a8 = cast_packed_fp4_weight_to_nz(weight, w4a8=True)
-            layer.register_buffer(
-                "weight_w4a8", weight_w4a8.transpose(-1, -2), persistent=False
-            )
-            weight = cast_packed_fp4_weight_to_nz(weight)
         layer.weight = Parameter(weight.transpose(-1, -2), requires_grad=False)
 
         weight_scale = layer.weight_scale.data
