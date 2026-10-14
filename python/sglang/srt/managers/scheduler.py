@@ -669,6 +669,7 @@ class Scheduler:
 
         # Init overlap schedule
         self.init_overlap()
+        self.finalize_schedule_stream()
 
         # Init the launch of a step: its forward and its result's copy to host
         self.init_forward_launch()
@@ -1711,6 +1712,23 @@ class Scheduler:
             self.copy_stream
         )
 
+    def finalize_schedule_stream(self):
+        """Settle the schedule stream the event loop runs on, before any
+        component that waits on it is built; it does not change afterwards."""
+        if self.device == "cpu":
+            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        elif (is_cuda() or _is_hip) and (
+            self.enable_overlap or get_parallel().pp_size > 1
+        ):
+            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
+            # stream aliases forward_stream, which would eliminate scheduler
+            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
+            # other accelerators (e.g. NPU/XPU) skip the alias check.
+            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
+                self.schedule_stream = allocate_distinct_stream(
+                    self.device_module, (self.forward_stream,)
+                )
+
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
             self.tp_worker.model_runner.ngram_embedding_manager
@@ -1936,19 +1954,6 @@ class Scheduler:
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
 
-        if self.device == "cpu":
-            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif (is_cuda() or _is_hip) and (
-            self.enable_overlap or get_parallel().pp_size > 1
-        ):
-            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
-            # stream aliases forward_stream, which would eliminate scheduler
-            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
-            # other accelerators (e.g. NPU/XPU) skip the alias check.
-            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
-                self.schedule_stream = allocate_distinct_stream(
-                    self.device_module, (self.forward_stream,)
-                )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
