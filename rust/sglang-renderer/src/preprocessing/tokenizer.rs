@@ -57,6 +57,9 @@ impl PooledTokenizer {
                         while let Ok(job) = rx.recv() {
                             match job {
                                 PoolJob::Tokenize { request, reply } => {
+                                    if reply.is_canceled() {
+                                        continue;
+                                    }
                                     let result =
                                         tokenize_text_request(*request, tokenizer.as_ref());
                                     let _ = reply.send(result);
