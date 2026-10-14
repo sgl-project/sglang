@@ -1,5 +1,6 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -416,6 +417,121 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(first.normal_text, "Checking.")
         self.assertEqual(first.calls, [])
         self.assertEqual(second.normal_text, " tail")
+
+
+def _json_tool(name: str, properties: dict, required=None) -> Tool:
+    return Tool(
+        type="function",
+        function=Function(
+            name=name,
+            parameters={
+                "type": "object",
+                "properties": properties,
+                "required": list(properties) if required is None else required,
+            },
+        ),
+    )
+
+
+class TestDeepSeekV4WrappedArguments(unittest.TestCase):
+    """Regression tests for #38924: the model sometimes wraps the real
+    parameters in a spurious top-level ``arguments``/``input`` key, e.g.
+    ``{"arguments": {"path": "/x"}}`` or ``{"arguments": "cmd"}``, which reaches
+    the client verbatim and fails schema validation. The detector must unwrap it
+    back to the tool's declared parameters in both delivery modes, and the
+    streaming and one-shot paths must agree."""
+
+    def setUp(self):
+        self.tools = [
+            _json_tool("bash", {"command": {"type": "string"}}),
+            _json_tool("read", {"path": {"type": "string"}}),
+            _json_tool(
+                "move",
+                {"src": {"type": "string"}, "dst": {"type": "string"}},
+                required=["src", "dst"],
+            ),
+            # A tool whose real parameter is literally named "arguments".
+            _json_tool("argtool", {"arguments": {"type": "string"}}),
+        ]
+
+    def _non_streaming(self, invoke: str):
+        result = DeepSeekV4Detector().detect_and_parse(_wrapped(invoke), self.tools)
+        return [(c.name, json.loads(c.parameters)) for c in result.calls]
+
+    def _streaming(self, invoke: str, chunk: int):
+        detector = DeepSeekV4Detector()
+        text = _wrapped(invoke)
+        calls = []
+        for i in range(0, len(text), chunk):
+            result = detector.parse_streaming_increment(text[i : i + chunk], self.tools)
+            calls.extend(result.calls)
+        calls.extend(detector.finish(self.tools).calls)
+        return [(c.name, json.loads(c.parameters)) for c in calls]
+
+    def _assert_both(self, invoke: str, expected):
+        self.assertEqual(self._non_streaming(invoke), expected)
+        for chunk in (1, 4, len(_wrapped(invoke))):
+            self.assertEqual(self._streaming(invoke, chunk), expected, f"chunk={chunk}")
+
+    def test_dict_wrapper_is_unwrapped(self):
+        """``{"arguments": {...}}`` -> the inner object."""
+        self._assert_both(
+            _invoke("read", '{"arguments": {"path": "/x"}}'), [("read", {"path": "/x"})]
+        )
+
+    def test_input_wrapper_is_unwrapped(self):
+        """``input`` is a wrapper key too."""
+        self._assert_both(
+            _invoke("read", '{"input": {"path": "/x"}}'), [("read", {"path": "/x"})]
+        )
+
+    def test_scalar_wrapper_is_remapped_to_sole_property(self):
+        """A bare scalar payload is remapped onto the tool's only property."""
+        self._assert_both(
+            _invoke("bash", '{"arguments": "cd /x && ls"}'),
+            [("bash", {"command": "cd /x && ls"})],
+        )
+
+    def test_xml_parameter_tag_wrapper_is_remapped(self):
+        """The XML ``<parameter name="arguments" ...>`` shape hits the same bug."""
+        self._assert_both(
+            _invoke("bash", _param("arguments", "true", "cd /x")),
+            [("bash", {"command": "cd /x"})],
+        )
+
+    def test_double_json_encoded_wrapper_is_decoded(self):
+        """A wrapper whose value is itself a JSON-object string is decoded once."""
+        self._assert_both(
+            _invoke("read", '{"arguments": "{\\"path\\": \\"/x\\"}"}'),
+            [("read", {"path": "/x"})],
+        )
+
+    def test_declared_arguments_property_is_not_unwrapped(self):
+        """When ``arguments`` is a genuine declared property, it must be left as
+        is -- unwrapping it would drop the caller's real parameter."""
+        self._assert_both(
+            _invoke("argtool", '{"arguments": "hi"}'),
+            [("argtool", {"arguments": "hi"})],
+        )
+
+    def test_ambiguous_scalar_wrapper_is_left_untouched(self):
+        """A scalar wrapper cannot be safely remapped when the tool has no single
+        target property, so it is left untouched rather than guessed."""
+        self._assert_both(
+            _invoke("move", '{"arguments": "x"}'), [("move", {"arguments": "x"})]
+        )
+
+    def test_wrapped_and_good_calls_in_one_turn(self):
+        """A wrapped call and a well-formed call in the same turn are both
+        correct; the fix must not disturb the non-buggy call."""
+        invoke = (
+            _invoke("read", '{"arguments": {"path": "/a"}}')
+            + "\n"
+            + _invoke("bash", '{"command": "ls"}')
+        )
+        self._assert_both(
+            invoke, [("read", {"path": "/a"}), ("bash", {"command": "ls"})]
+        )
 
 
 if __name__ == "__main__":
