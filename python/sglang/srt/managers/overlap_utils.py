@@ -369,7 +369,7 @@ class FutureMap:
         self.last_seq_lens_ready = None
 
         self.confidence_relay = ConfidenceRelay(
-            device=self.device,
+            device=torch.device(self.device),
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )

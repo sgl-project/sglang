@@ -73,8 +73,9 @@ class TestConfidencePrepareReadsNoDeviceValue(CustomTestCase):
             req_generation=torch.ones(POOL, dtype=torch.int64),
         )
         with patch.object(overlap_utils, "_is_cuda", False):
+            # The scheduler passes the device as a string.
             future_map = FutureMap(
-                torch.device("cpu"),
+                "cpu",
                 SpeculativeAlgorithm.DSPARK,
                 pool,
                 needs_confidence_relay=True,
