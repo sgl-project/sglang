@@ -125,7 +125,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
-| `torch_rmsnorm_modulate_bitexact` | Triton | ATen-ordered FP32 reduction and exact BF16 modulation | MOSS-Image BSC, width 3072 |
+| `rmsnorm_cast_before_weight_modulate_bitexact` | Triton | ATen-ordered FP32 reduction and exact BF16 modulation | MOSS-Image BSC, width 3072 |
 | `fuse_scale_shift_kernel` | Triton | close | contiguous BLC; scalar/row/token modulation plus causal-video `[B, F, 1, C]`, using a static capped power-of-two tile to avoid request-time autotuning |
 | `fused_rmsnorm_scale_shift_bitexact` | Triton | bit-exact vs flashinfer CuTe RMSNorm + aten modulate | bf16, contiguous rows, `H == 64 * threads_per_row` |
 | `fused_scale_residual_rmsnorm_scale_shift_bitexact` | Triton | bit-exact, incl. the preceding residual-gate add | as above |
@@ -140,7 +140,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
-| `torch_rmsnorm_bitexact` | Triton / aten | FP32 reduction, BF16 round before learned scale | MOSS-Image token and head RMSNorm |
+| `rmsnorm_cast_before_weight_bitexact` | Triton / aten | FP32 reduction, BF16 round before learned scale | MOSS-Image token and head RMSNorm |
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
 | `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU |
@@ -182,7 +182,7 @@ tensor copy at each residual site.
 | `fused_qknorm_rope_out_of_place` | JIT CUDA | as above, bit-equal to the in-place kernel; reads strided q/k and writes contiguous copies, inputs untouched (VDN-H3 keeps the raw q/k for its linear branch) |
 | `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
-| `torch_rmsnorm_rope_bitexact` | Triton | ATen-ordered RMSNorm plus exact BF16 rotate-half RoPE, MOSS-Image width 128 |
+| `rmsnorm_cast_before_weight_rope_bitexact` | Triton | ATen-ordered RMSNorm plus exact BF16 rotate-half RoPE, MOSS-Image width 128 |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
 | `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |
@@ -252,7 +252,7 @@ device and remain alive for captured graphs. Initialization finishes before
 publication to other streams. Small inputs and captures without initialized
 tables use the direct fused formula. This is an exact path, subject to the first-use bit-exact check.
 
-MOSS-Image uses `torch_rmsnorm_bitexact` for contiguous CUDA BF16 token and
+MOSS-Image uses `rmsnorm_cast_before_weight_bitexact` for contiguous CUDA BF16 token and
 per-head tensors. Widths 3072 and 128 with at least 16 rows and fewer than
 `2**29` elements use one kernel that reproduces ATen's vectorized FP32 mean
 reduction order; other shapes retain ATen's mean with fused pointwise
@@ -262,8 +262,8 @@ weight. The model verifies each width/reduction regime on first sight and
 falls back on unsupported layouts or a mismatch. Unverified regimes use the
 native path during compilation or CUDA graph capture.
 
-MOSS-Image also uses `torch_rmsnorm_modulate_bitexact` for width-3072 BSC
-activations and `torch_rmsnorm_rope_bitexact` for width-128 BSHD heads.
+MOSS-Image also uses `rmsnorm_cast_before_weight_modulate_bitexact` for width-3072 BSC
+activations and `rmsnorm_cast_before_weight_rope_bitexact` for width-128 BSHD heads.
 Both retain the same ordered reduction and BF16 round-before-gamma contract,
 then preserve each modulation or rotate-half rounding boundary. Their guards
 require contiguous CUDA BF16 tensors, at least 16 normalization rows, and

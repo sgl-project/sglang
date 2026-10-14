@@ -149,7 +149,7 @@ def _normalize_kernel(
     tl.store(Out + offsets, mul_rn_f32(normalized, weight), mask)
 
 
-def can_use_torch_rmsnorm(
+def can_use_rmsnorm_cast_before_weight(
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -165,29 +165,29 @@ def can_use_torch_rmsnorm(
     )
 
 
-def can_use_torch_rmsnorm_modulate(
+def can_use_rmsnorm_cast_before_weight_modulate(
     *, device: torch.device, dtype: torch.dtype, dim: int, rows: int
 ) -> bool:
     return (
-        can_use_torch_rmsnorm(device=device, dtype=dtype)
+        can_use_rmsnorm_cast_before_weight(device=device, dtype=dtype)
         and dim == 3072
         and rows >= 16
         and rows * dim < 2**29
     )
 
 
-def can_use_torch_rmsnorm_rope(
+def can_use_rmsnorm_cast_before_weight_rope(
     *, device: torch.device, dtype: torch.dtype, dim: int, rows: int
 ) -> bool:
     return (
-        can_use_torch_rmsnorm(device=device, dtype=dtype)
+        can_use_rmsnorm_cast_before_weight(device=device, dtype=dtype)
         and dim == 128
         and rows >= 16
         and rows * dim < 2**29
     )
 
 
-def _valid_torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> bool:
+def _valid_rmsnorm_cast_before_weight(x: torch.Tensor, weight: torch.Tensor) -> bool:
     return (
         is_cuda()
         and x.is_cuda
@@ -202,13 +202,15 @@ def _valid_torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
-def _fake_torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _fake_rmsnorm_cast_before_weight(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
     return torch.empty_like(x)
 
 
-def _valid_torch_rmsnorm_modulate(x, weight, scale, shift):
+def _valid_rmsnorm_cast_before_weight_modulate(x, weight, scale, shift):
     return (
-        _valid_torch_rmsnorm(x, weight)
+        _valid_rmsnorm_cast_before_weight(x, weight)
         and x.ndim == 3
         and x.shape[-1] == 3072
         and 16 <= x.numel() // 3072
@@ -221,9 +223,9 @@ def _valid_torch_rmsnorm_modulate(x, weight, scale, shift):
     )
 
 
-def _valid_torch_rmsnorm_rope(x, weight, cos, sin):
+def _valid_rmsnorm_cast_before_weight_rope(x, weight, cos, sin):
     return (
-        _valid_torch_rmsnorm(x, weight)
+        _valid_rmsnorm_cast_before_weight(x, weight)
         and x.ndim == 4
         and x.shape[-1] == 128
         and 16 <= x.numel() // 128
@@ -241,14 +243,14 @@ def _fake_rmsnorm_epilogue(x, weight, first, second):
 
 
 @register_custom_op(
-    op_name="torch_rmsnorm_modulate_bitexact",
+    op_name="rmsnorm_cast_before_weight_modulate_bitexact",
     mutates_args=[],
     fake_impl=_fake_rmsnorm_epilogue,
 )
-def torch_rmsnorm_modulate_bitexact(
+def rmsnorm_cast_before_weight_modulate_bitexact(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> torch.Tensor:
-    if not _valid_torch_rmsnorm_modulate(x, weight, scale, shift):
+    if not _valid_rmsnorm_cast_before_weight_modulate(x, weight, scale, shift):
         raise ValueError("Unsupported MOSSImage RMSNorm + modulation inputs.")
     with torch.cuda.device(x.device):
         out = torch.empty_like(x)
@@ -268,14 +270,14 @@ def torch_rmsnorm_modulate_bitexact(
 
 
 @register_custom_op(
-    op_name="torch_rmsnorm_rope_bitexact",
+    op_name="rmsnorm_cast_before_weight_rope_bitexact",
     mutates_args=[],
     fake_impl=_fake_rmsnorm_epilogue,
 )
-def torch_rmsnorm_rope_bitexact(
+def rmsnorm_cast_before_weight_rope_bitexact(
     x: torch.Tensor, weight: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    if not _valid_torch_rmsnorm_rope(x, weight, cos, sin):
+    if not _valid_rmsnorm_cast_before_weight_rope(x, weight, cos, sin):
         raise ValueError("Unsupported MOSSImage RMSNorm + RoPE inputs.")
     with torch.cuda.device(x.device):
         out = torch.empty_like(x)
@@ -295,13 +297,15 @@ def torch_rmsnorm_rope_bitexact(
 
 
 @register_custom_op(
-    op_name="torch_rmsnorm_bitexact",
+    op_name="rmsnorm_cast_before_weight_bitexact",
     mutates_args=[],
-    fake_impl=_fake_torch_rmsnorm,
+    fake_impl=_fake_rmsnorm_cast_before_weight,
 )
-def torch_rmsnorm_bitexact(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def rmsnorm_cast_before_weight_bitexact(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
     """Match ``(x.float() * rsqrt(mean(x.float()**2) + 1e-6)).bf16() * w``."""
-    if not _valid_torch_rmsnorm(x, weight):
+    if not _valid_rmsnorm_cast_before_weight(x, weight):
         raise ValueError("RMSNorm requires contiguous CUDA BF16 inputs and weight.")
     with torch.cuda.device(x.device):
         out = torch.empty_like(x)

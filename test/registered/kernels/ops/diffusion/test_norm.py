@@ -682,10 +682,10 @@ def test_bias_residual_add_predicates():
     "shape", [(1, 6620, 3072), (1, 4109, 24, 128), (2, 65, 3072), (1, 13, 128)]
 )
 @pytest.mark.parametrize("varying_exponent", [False, True])
-def test_torch_rmsnorm_bitexact(shape, varying_exponent):
+def test_rmsnorm_cast_before_weight_bitexact(shape, varying_exponent):
     from sglang.kernels.ops.diffusion import (
-        can_use_torch_rmsnorm,
-        torch_rmsnorm_bitexact,
+        can_use_rmsnorm_cast_before_weight,
+        rmsnorm_cast_before_weight_bitexact,
     )
 
     x = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
@@ -698,13 +698,13 @@ def test_torch_rmsnorm_bitexact(shape, varying_exponent):
     expected = (
         x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
     ).to(x.dtype) * weight
-    assert can_use_torch_rmsnorm(device=x.device, dtype=x.dtype)
-    assert torch.equal(torch_rmsnorm_bitexact(x, weight), expected)
+    assert can_use_rmsnorm_cast_before_weight(device=x.device, dtype=x.dtype)
+    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight), expected)
 
 
 @torch.no_grad()
-def test_torch_rmsnorm_extreme_values():
-    from sglang.kernels.ops.diffusion import torch_rmsnorm_bitexact
+def test_rmsnorm_cast_before_weight_extreme_values():
+    from sglang.kernels.ops.diffusion import rmsnorm_cast_before_weight_bitexact
 
     # Every BF16 encoding, including signed zero, subnormals, infinities and
     # NaNs. Isolate each value in a row so non-finite statistics do not hide
@@ -723,7 +723,7 @@ def test_torch_rmsnorm_extreme_values():
             inputs.float()
             * torch.rsqrt(inputs.float().square().mean(-1, keepdim=True) + 1e-6)
         ).to(inputs.dtype) * weight
-        actual = torch_rmsnorm_bitexact(inputs, weight)
+        actual = rmsnorm_cast_before_weight_bitexact(inputs, weight)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
         finite = torch.isfinite(expected)
         assert torch.equal(
@@ -731,9 +731,9 @@ def test_torch_rmsnorm_extreme_values():
         )
 
 
-def test_torch_rmsnorm_guards():
+def test_rmsnorm_cast_before_weight_guards():
     from sglang.kernels.ops.diffusion import (
-        torch_rmsnorm_bitexact,
+        rmsnorm_cast_before_weight_bitexact,
     )
 
     x = torch.ones(2, 3, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -750,14 +750,14 @@ def test_torch_rmsnorm_guards():
     ]:
         # CPU tensors are rejected by the CUDA-only custom-op dispatcher.
         with pytest.raises((ValueError, NotImplementedError)):
-            torch_rmsnorm_bitexact(inputs, gamma)
+            rmsnorm_cast_before_weight_bitexact(inputs, gamma)
 
 
 @torch.no_grad()
 @pytest.mark.parametrize("dim", [128, 256, 3072])
 @pytest.mark.parametrize("rows", [1, 15, 16, 17])
-def test_torch_rmsnorm_reduction_boundaries(dim, rows):
-    from sglang.kernels.ops.diffusion import torch_rmsnorm_bitexact
+def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, rows):
+    from sglang.kernels.ops.diffusion import rmsnorm_cast_before_weight_bitexact
 
     # Nonzero, unaligned storage offsets remain contiguous; the reference
     # casts to a freshly aligned FP32 buffer before its reduction.
@@ -771,7 +771,7 @@ def test_torch_rmsnorm_reduction_boundaries(dim, rows):
     expected = (
         x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
     ).to(x.dtype) * weight
-    assert torch.equal(torch_rmsnorm_bitexact(x, weight), expected)
+    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight), expected)
 
 
 def _moss_image_norm_eager(x, weight):
@@ -787,8 +787,8 @@ def _moss_image_norm_eager(x, weight):
 @pytest.mark.parametrize("amplitude", [1.0, 1e-38, 1e19])
 def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
     from sglang.kernels.ops.diffusion import (
-        torch_rmsnorm_modulate_bitexact,
-        torch_rmsnorm_rope_bitexact,
+        rmsnorm_cast_before_weight_modulate_bitexact,
+        rmsnorm_cast_before_weight_rope_bitexact,
     )
 
     torch.manual_seed(0)
@@ -800,7 +800,7 @@ def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
         scale = torch.randn(batch, 3072, device="cuda", dtype=torch.bfloat16)
         shift = torch.zeros_like(scale)
         expected = norm * (1 + scale[:, None]) + shift[:, None]
-        actual = torch_rmsnorm_modulate_bitexact(x, weight, scale, shift)
+        actual = rmsnorm_cast_before_weight_modulate_bitexact(x, weight, scale, shift)
     else:
         cos = torch.randn(batch * seq, 128, device="cuda", dtype=torch.bfloat16)
         sin = torch.randn_like(cos)
@@ -808,7 +808,7 @@ def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
         expected = norm * cos.view(batch, seq, 1, 128) + torch.cat(
             (-hi, lo), -1
         ) * sin.view(batch, seq, 1, 128)
-        actual = torch_rmsnorm_rope_bitexact(x, weight, cos, sin)
+        actual = rmsnorm_cast_before_weight_rope_bitexact(x, weight, cos, sin)
     assert torch.equal(actual, expected)
 
 
@@ -816,23 +816,26 @@ def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
 @pytest.mark.parametrize("epilogue", ["modulate", "rope"])
 def test_moss_image_norm_epilogue_guards(epilogue):
     from sglang.kernels.ops.diffusion import (
-        can_use_torch_rmsnorm_modulate,
-        can_use_torch_rmsnorm_rope,
-        torch_rmsnorm_modulate_bitexact,
-        torch_rmsnorm_rope_bitexact,
+        can_use_rmsnorm_cast_before_weight_modulate,
+        can_use_rmsnorm_cast_before_weight_rope,
+        rmsnorm_cast_before_weight_modulate_bitexact,
+        rmsnorm_cast_before_weight_rope_bitexact,
     )
 
     if epilogue == "modulate":
         x = torch.randn(1, 15, 3072, device="cuda", dtype=torch.bfloat16)
         a = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
         predicate, kernel = (
-            can_use_torch_rmsnorm_modulate,
-            torch_rmsnorm_modulate_bitexact,
+            can_use_rmsnorm_cast_before_weight_modulate,
+            rmsnorm_cast_before_weight_modulate_bitexact,
         )
     else:
         x = torch.randn(1, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
         a = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
-        predicate, kernel = can_use_torch_rmsnorm_rope, torch_rmsnorm_rope_bitexact
+        predicate, kernel = (
+            can_use_rmsnorm_cast_before_weight_rope,
+            rmsnorm_cast_before_weight_rope_bitexact,
+        )
     weight = torch.ones(x.shape[-1], device="cuda", dtype=torch.bfloat16)
     assert not predicate(
         device=x.device, dtype=x.dtype, dim=x.shape[-1], rows=x.numel() // x.shape[-1]

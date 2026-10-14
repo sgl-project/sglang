@@ -39,16 +39,16 @@ from torch import nn
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_situ_softcap_mul,
-    can_use_torch_rmsnorm,
-    can_use_torch_rmsnorm_modulate,
-    can_use_torch_rmsnorm_rope,
+    can_use_rmsnorm_cast_before_weight,
+    can_use_rmsnorm_cast_before_weight_modulate,
+    can_use_rmsnorm_cast_before_weight_rope,
     fused_rope_rotate_half_bitexact,
     fused_situ_softcap_mul_bitexact,
     modulate_scale_shift,
     residual_gate_add,
-    torch_rmsnorm_bitexact,
-    torch_rmsnorm_modulate_bitexact,
-    torch_rmsnorm_rope_bitexact,
+    rmsnorm_cast_before_weight_bitexact,
+    rmsnorm_cast_before_weight_modulate_bitexact,
+    rmsnorm_cast_before_weight_rope_bitexact,
 )
 from sglang.multimodal_gen.configs.models.dits.moss_image import MOSSImageDiTConfig
 from sglang.multimodal_gen.runtime.layers.attention.layer import LocalAttention
@@ -96,7 +96,7 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        if not _RMSNORM_FUSION.disabled and can_use_torch_rmsnorm(
+        if not _RMSNORM_FUSION.disabled and can_use_rmsnorm_cast_before_weight(
             device=x.device, dtype=x.dtype, contiguous=x.is_contiguous()
         ):
             sig = (x.device.index, x.dtype, x.shape[-1], x.numel() // x.shape[-1] >= 16)
@@ -107,7 +107,7 @@ class _RMSNorm(nn.Module):
             ):
                 return self.forward_native(x)
             try:
-                out = torch_rmsnorm_bitexact(x, self.weight)
+                out = rmsnorm_cast_before_weight_bitexact(x, self.weight)
             except ValueError:
                 raise
             except Exception as exc:
@@ -203,7 +203,7 @@ def _norm_modulate(norm, x, scale, shift):
     gate = _NORM_MOD_FUSION
     if (
         not gate.disabled
-        and can_use_torch_rmsnorm_modulate(
+        and can_use_rmsnorm_cast_before_weight_modulate(
             device=x.device,
             dtype=x.dtype,
             dim=x.shape[-1],
@@ -212,7 +212,9 @@ def _norm_modulate(norm, x, scale, shift):
         and (gate.verified or gate.can_attempt_once())
     ):
         try:
-            out = torch_rmsnorm_modulate_bitexact(x, norm.weight, scale, shift)
+            out = rmsnorm_cast_before_weight_modulate_bitexact(
+                x, norm.weight, scale, shift
+            )
         except ValueError:
             raise
         except Exception as exc:
@@ -232,7 +234,7 @@ def _norm_rope(norm, x, rope, heads):
     gate = _NORM_ROPE_FUSION
     if (
         not gate.disabled
-        and can_use_torch_rmsnorm_rope(
+        and can_use_rmsnorm_cast_before_weight_rope(
             device=x.device,
             dtype=x.dtype,
             dim=x.shape[-1],
@@ -241,7 +243,7 @@ def _norm_rope(norm, x, rope, heads):
         and (gate.verified or gate.can_attempt_once())
     ):
         try:
-            out = torch_rmsnorm_rope_bitexact(x, norm.weight, cos, sin)
+            out = rmsnorm_cast_before_weight_rope_bitexact(x, norm.weight, cos, sin)
         except ValueError:
             raise
         except Exception as exc:

@@ -2120,7 +2120,9 @@ def test_moss_image_rmsnorm_failure_disables_fast_path(monkeypatch, failure):
 
     state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
     monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
-    monkeypatch.setattr(moss_image, "can_use_torch_rmsnorm", lambda **kwargs: True)
+    monkeypatch.setattr(
+        moss_image, "can_use_rmsnorm_cast_before_weight", lambda **kwargs: True
+    )
     calls = []
 
     def incorrect(x, weight):
@@ -2129,7 +2131,7 @@ def test_moss_image_rmsnorm_failure_disables_fast_path(monkeypatch, failure):
             raise RuntimeError("kernel unavailable")
         return torch.zeros_like(x)
 
-    monkeypatch.setattr(moss_image, "torch_rmsnorm_bitexact", incorrect)
+    monkeypatch.setattr(moss_image, "rmsnorm_cast_before_weight_bitexact", incorrect)
     norm = moss_image._RMSNorm(128)
     x = torch.ones(1, 3, 128)
     for _ in range(2):
