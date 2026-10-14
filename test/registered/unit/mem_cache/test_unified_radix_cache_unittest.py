@@ -3549,6 +3549,7 @@ class UnifiedRadixCacheSuite:
         req.cache_request_handle = req_id
         req.extra_key = extra_key
         req.cache_salt = cache_salt
+        req.storage_prefetch_last_match_len = None
         req.prefix_len = prefix_len
         req.last_node = cache.root_node_handle() if last_node is None else last_node
         joint = cache.match_prefix(
@@ -5686,8 +5687,10 @@ class UnifiedRadixCacheSuite:
             cache_request_handle=req_id,
             prefix_len=live.device_prefix_len,
             last_node=live.last_device_node,
+            storage_prefetch_last_match_len=None,
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
+        self.assertEqual(req.storage_prefetch_last_match_len, live.device_prefix_len)
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
         self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
         self.assertEqual(cons.buffer_pipeline.anchor_locks, {})
