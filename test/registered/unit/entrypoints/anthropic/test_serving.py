@@ -3,6 +3,7 @@ import json
 import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -21,6 +22,12 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.entrypoints.openai.serving_chat import (  # noqa: E402
+    OpenAIServingChat,
+)
+from sglang.srt.entrypoints.openai.serving_inkling import (  # noqa: E402
+    InklingSpecAdapter,
+)
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -31,7 +38,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
-    chat_encoding_spec = None
+    _spec_adapter = None
+    normalize_history_messages = OpenAIServingChat.normalize_history_messages
 
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
@@ -62,7 +70,10 @@ class _FakeNonStreamingErrorOpenAI:
     """Returns an error response or raises an exception from the OpenAI handler."""
 
     supports_inline_system = False
-    chat_encoding_spec = None
+
+    @staticmethod
+    def normalize_history_messages(messages):
+        return messages
 
     def __init__(self, status_code=400, body=None, content=None, exception=None):
         self._status_code = status_code
@@ -1120,7 +1131,11 @@ class TestAnthropicServing(unittest.TestCase):
 
         class _InklingOpenAI(_FakeOpenAIServingChat):
             native_reasoning_history = True
-            chat_encoding_spec = "inkling"
+            _spec_adapter = InklingSpecAdapter(
+                reasoning_parser="inkling",
+                tool_call_parser="inkling",
+                chat_hooks=Mock(),
+            )
 
         serving = AnthropicServing(_InklingOpenAI())
         request = self._anthropic_request(

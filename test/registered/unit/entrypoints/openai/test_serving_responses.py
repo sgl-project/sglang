@@ -370,6 +370,7 @@ class InputMessageConstructionTestCase(CustomTestCase):
         thinking content parts, so a replayed reasoning item was dropped."""
         serving = make_serving()
         serving.chat_encoding_spec = "inkling"
+        serving._spec_adapter = serving._build_spec_adapter()
         request = ResponsesRequest(
             model="x",
             input=[

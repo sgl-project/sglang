@@ -98,7 +98,8 @@ class AnthropicMessagesMixin:
 
         serving = AnthropicServing(
             openai_serving_chat=SimpleNamespace(
-                supports_inline_system=True, chat_encoding_spec=None
+                supports_inline_system=True,
+                normalize_history_messages=lambda messages: messages,
             )
         )
         chat_request = serving._convert_to_chat_completion_request(anthropic_request)

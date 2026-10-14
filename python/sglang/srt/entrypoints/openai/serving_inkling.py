@@ -54,9 +54,26 @@ class InklingSpecAdapter:
         self._separate_reasoning = bool(reasoning_parser)
         self._hooks = chat_hooks
 
+    collects_openai_media = True
+
     @property
     def output(self) -> Optional[InklingSpecAdapter]:
         return self if self._token_output else None
+
+    def normalize_history_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        # tml-renderers reads prior reasoning only from thinking content parts.
+        reasoning = message.get("reasoning_content")
+        if message.get("role") != "assistant" or not reasoning:
+            return message
+        parts: list[Any] = [{"type": "thinking", "thinking": reasoning}]
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            parts.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            parts.extend(content)
+        converted = {k: v for k, v in message.items() if k != "reasoning_content"}
+        converted["content"] = parts
+        return converted
 
     def encode_messages(
         self,

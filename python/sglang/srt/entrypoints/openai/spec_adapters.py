@@ -69,9 +69,18 @@ class SpecOutputAdapter(Protocol):
 
 
 class SpecAdapter(Protocol):
+    collects_openai_media: bool
+    """Whether media still has to be collected from the OpenAI messages after
+    ``encode_messages`` returns prompt ids."""
+
     @property
     def output(self) -> Optional[SpecOutputAdapter]:
         """None when the configured parsers leave output to the text parsers."""
+        ...
+
+    def normalize_history_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Rewrite one Anthropic or Responses history message into the form this
+        spec's encoder reads; Chat Completions history is passed as sent."""
         ...
 
     def encode_messages(

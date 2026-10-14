@@ -498,6 +498,19 @@ class OpenAIServingChat(OpenAIServingBase):
             ),
         )
 
+    def normalize_history_messages(self, messages: List[Any]) -> List[Any]:
+        """Adapt Anthropic or Responses history to the form this spec's encoder reads."""
+        if self._spec_adapter is None:
+            return messages
+        return [
+            (
+                self._spec_adapter.normalize_history_message(message)
+                if isinstance(message, dict)
+                else message
+            )
+            for message in messages
+        ]
+
     def _spec_output(self) -> Optional[spec_adapters.SpecOutputAdapter]:
         if self._spec_adapter is None:
             return None
@@ -1469,7 +1482,12 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if prompt_ids is not None:
-            if chat_encoding.spec_collects_openai_media(self.chat_encoding_spec):
+            collects_openai_media = (
+                self._spec_adapter.collects_openai_media
+                if self._spec_adapter is not None
+                else self.chat_encoding_spec == "kimi_k3"
+            )
+            if collects_openai_media:
                 for message in request.messages:
                     msg_dict = message.model_dump()
                     if msg_dict.get("content") is None:
