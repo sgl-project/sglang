@@ -15,6 +15,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.bundles import Streams
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.runtime_context import get_context
@@ -150,11 +151,16 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         enter_scope(self, published_topology(pp_size=2))
         self._override_flags()
         s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
-        s.world_group = s.attn_tp_group = s.device = s.device_module = None
+        s.world_group = s.attn_tp_group = s.device = None
         s.schedule_stream = s.forward_stream = s.copy_stream = None
         s.copy_stream_ctx = s.forward_stream_ctx = s.spec_algorithm = None
         s.req_to_token_pool = s.token_to_kv_pool_allocator = None
         s.tp_worker = s.model_worker = s.future_map = None
+        s.streams = Streams(
+            device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
+        )
+        s.device_module = SimpleNamespace(stream=lambda stream: None)
+        s.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
         s.pp_spec_forward = None
         s.recv_skipper = None
         s.ingest_requests = Mock(return_value=[])

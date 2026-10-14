@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -14,6 +14,9 @@ from sglang.srt.managers.utils import GenerationBatchResult, allocate_distinct_s
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import point_to_point_pyobj
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.bundles import Streams
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +32,13 @@ class PPChannel:
         pp_group,
         world_group,
         attn_tp_group,
-        device,
         device_module,
-        schedule_stream,
-        forward_stream,
-        copy_stream,
+        streams: Streams,
     ):
+        device = streams.device
+        schedule_stream = streams.schedule_stream
+        forward_stream = streams.forward_stream
+        copy_stream = streams.copy_stream
         self.pp_group = pp_group
         self.world_group = world_group
         self.attn_tp_group = attn_tp_group

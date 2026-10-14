@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler import (  # noqa: E402
     Scheduler,
     _dispatch_event_loop_once,
 )
+from sglang.srt.managers.scheduler_components.bundles import Streams  # noqa: E402
 from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
     EngineFlags,
     LaunchCounters,
@@ -490,12 +491,13 @@ class _RingShell(_Shell):
     def __init__(self, mode, iterations, **script):
         super().__init__(mode, iterations, **script)
         s = self.s
-        s.device = "cpu"
         s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
         s.world_group = s.attn_tp_group = None
-        s.schedule_stream = s.forward_stream = s.copy_stream = None
-        s.copy_stream_ctx = s.future_map = s.req_to_token_pool = None
-        s.token_to_kv_pool_allocator = s.tp_worker = s.model_worker = None
+        s.streams = Streams(
+            device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
+        )
+        s.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
+        s.future_map = s.tp_worker = None
         s.pp_spec_forward = None
         self.channel = SimpleNamespace(
             is_first_rank=True,
@@ -510,10 +512,10 @@ class _RingShell(_Shell):
             wait_forward_dependencies=lambda: None,
             launch_event=None,
         )
-        s.forward_stream_ctx = nullcontext()
         s.device_module = SimpleNamespace(
             Event=lambda: SimpleNamespace(record=lambda stream: None),
             current_stream=lambda: None,
+            stream=lambda stream: nullcontext(),
         )
 
     def send(self, data, async_send=False):

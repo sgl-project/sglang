@@ -20,6 +20,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.bundles import Streams  # noqa: E402
 from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
     EngineFlags,
     LaunchCounters,
@@ -65,19 +66,21 @@ class TestPPRingCommit(CustomTestCase):
         s.flags = EngineFlags()
         s.lists = CoreLists()
         s.spec_algorithm = SimpleNamespace(is_none=lambda: True)
-        s.device = "cpu"
         s.pp_group = SimpleNamespace(is_last_rank=True)
-        s.device_module = SimpleNamespace(Event=Mock, current_stream=Mock())
+        s.device_module = SimpleNamespace(
+            Event=Mock, current_stream=Mock(), stream=lambda stream: nullcontext()
+        )
         s.world_group = s.attn_tp_group = None
-        s.schedule_stream = s.forward_stream = s.copy_stream = None
-        s.copy_stream_ctx = s.future_map = s.req_to_token_pool = None
-        s.token_to_kv_pool_allocator = s.tp_worker = s.model_worker = None
+        s.streams = Streams(
+            device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
+        )
+        s.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
+        s.future_map = s.tp_worker = None
         s.pending = PendingSteps()
         s.recv_skipper = None
         s.pp_spec_forward = None
         s._sched_idled = False
         s.ingest_requests = Mock(return_value=[])
-        s.forward_stream_ctx = nullcontext()
         s.run_batch = lambda step, pp_proxy_tensors: SimpleNamespace(launched=step.name)
         s.join_launched_step = Mock()
         s.on_idle = Mock()

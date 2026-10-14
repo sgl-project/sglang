@@ -2063,11 +2063,8 @@ class Scheduler:
             pp_group=self.pp_group,
             world_group=self.world_group,
             attn_tp_group=self.attn_tp_group,
-            device=self.device,
             device_module=self.device_module,
-            schedule_stream=self.schedule_stream,
-            forward_stream=self.forward_stream,
-            copy_stream=self.copy_stream,
+            streams=self.streams,
         )
         self.pp_ring = PPRing(
             channel=channel,
@@ -2085,15 +2082,11 @@ class Scheduler:
             counters=self.counters,
             pp_spec_forward=self.pp_spec_forward,
             pp_group=self.pp_group,
-            device=self.device,
             device_module=self.device_module,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            kv=self.kv,
+            streams=self.streams,
             tp_worker=self.tp_worker,
             future_map=self.future_map,
-            schedule_stream=self.schedule_stream,
-            copy_stream=self.copy_stream,
-            copy_stream_ctx=self.copy_stream_ctx,
-            forward_stream_ctx=self.forward_stream_ctx,
         )
 
     def mark_sched_idled(self):

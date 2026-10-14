@@ -12,6 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.bundles import Streams
 from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
@@ -444,7 +445,16 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
-        scheduler.device_module = SimpleNamespace(Event=Mock, current_stream=Mock())
+        scheduler.device_module = SimpleNamespace(
+            Event=Mock, current_stream=Mock(), stream=lambda stream: nullcontext()
+        )
+        scheduler.streams = Streams(
+            device="cpu",
+            schedule_stream=scheduler.schedule_stream,
+            forward_stream=scheduler.forward_stream,
+            copy_stream=None,
+        )
+        scheduler.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
         scheduler.world_group = scheduler.attn_tp_group = None
         scheduler.copy_stream = scheduler.copy_stream_ctx = None
         scheduler.req_to_token_pool = scheduler.token_to_kv_pool_allocator = None

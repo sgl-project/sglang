@@ -38,6 +38,7 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.bundles import KvResources, Streams
     from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.mode_stages import (
         DriverOps,
@@ -112,18 +113,20 @@ class PPRing:
         counters: LaunchCounters,
         pp_spec_forward: Optional[PPSpecForward],
         pp_group,
-        device,
         device_module,
-        token_to_kv_pool_allocator,
+        kv: KvResources,
+        streams: Streams,
         tp_worker,
         future_map,
-        schedule_stream,
-        copy_stream,
-        copy_stream_ctx,
-        forward_stream_ctx,
     ):
+        device = streams.device
+        schedule_stream = streams.schedule_stream
+        copy_stream = streams.copy_stream
+        copy_stream_ctx = device_module.stream(copy_stream)
+        forward_stream_ctx = device_module.stream(streams.forward_stream)
+        token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         self.channel = channel
-        # The driver's hooks into the scheduler.
+        # The driver's stages and the state it shares.
         self.stages = stages
         self.pending = pending
         self.recv_skipper = recv_skipper
