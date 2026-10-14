@@ -1388,10 +1388,11 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
                 queue.prealloc_queue = SimpleNamespace(kv_checksum_computer=None)
-                queue.update_reasoning_tokens = lambda req, token_id: None
+                queue.model_config = None
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
                 req = SimpleNamespace(
+                    require_reasoning=False,
                     rid="r0",
                     bootstrap_host="127.0.0.1",
                     bootstrap_room=9,
@@ -1438,7 +1439,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             )
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
             queue.prealloc_queue = SimpleNamespace(kv_checksum_computer=None)
-            queue.update_reasoning_tokens = lambda req, token_id: None
+            queue.model_config = None
             queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
             queue.metadata_buffers = buffers
             # Retracting popped token 6 from output_ids; its row is still queued.
@@ -1450,6 +1451,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 np.array([6, 2], np.int32), np.array([-0.25, -1.75], np.float32)
             )
             req = SimpleNamespace(
+                require_reasoning=False,
                 rid="r0",
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=9,

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
+    Deque,
     List,
     Optional,
 )
@@ -24,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
+    HealthCheckOutput,
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -45,6 +48,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
     from sglang.srt.rust_server.server import RustServer
 
 
@@ -59,6 +63,8 @@ class SchedulerOutputStreamer:
     has_additional_customized_info: ClassVar[bool] = False
 
     send_to_detokenizer: zmq.Socket
+    # Health checks are answered to the tokenizer.
+    send_to_tokenizer: SenderWrapper
     tree_cache: BasePrefixCache
     server_args: ServerArgs
     is_generation: bool
@@ -68,6 +74,24 @@ class SchedulerOutputStreamer:
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+    # Health checks deferred while requests run, oldest first.
+    return_health_check_ipcs: Deque[Optional[str]] = field(default_factory=deque)
+
+    def defer_health_check(self, http_worker_ipc: Optional[str]) -> None:
+        self.return_health_check_ipcs.append(http_worker_ipc)
+
+    def maybe_reply_health_check(self) -> None:
+        """Answer the oldest deferred health check; the requests running
+        meanwhile prove the scheduler alive."""
+        if self.return_health_check_ipcs:
+            # Return some signal for the health check.
+            # This is used to prevent the health check signal being blocked by long context prefill.
+            # However, one minor issue is that this code path does not check the status of detokenizer manager.
+            self.send_to_tokenizer.send_output(
+                HealthCheckOutput(
+                    http_worker_ipc=self.return_health_check_ipcs.popleft()
+                )
+            )
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:

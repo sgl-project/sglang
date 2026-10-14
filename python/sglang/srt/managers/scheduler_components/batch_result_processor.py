@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
-    Callable,
     Iterable,
     List,
     Optional,
@@ -188,6 +187,30 @@ def commit_pending_grammar(pending: Iterable[PendingStep]) -> None:
         advance_grammar_fsm(record.result, record.step)
 
 
+def maybe_update_reasoning_tokens(
+    model_config: ModelConfig,
+    req: Req,
+    next_token_id: Union[int, List[int]],
+):
+    if not req.require_reasoning:
+        return
+    think_end_ids = model_config.think_end_ids
+    if req._think_end_matcher is None:
+        request_think_end_ids = get_request_reasoning_end_token_ids(
+            req.sampling_params.custom_params,
+            allowed_sequences=getattr(
+                model_config,
+                "request_selectable_think_end_id_sequences",
+                None,
+            ),
+        )
+        if request_think_end_ids is not None:
+            think_end_ids = request_think_end_ids
+        if not think_end_ids:
+            return
+    req.update_reasoning_tokens(next_token_id, think_end_ids)
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -202,7 +225,6 @@ class SchedulerBatchResultProcessor:
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
     beam_coordinator: BeamCoordinator
-    abort_request: Callable
     pending: PendingSteps
 
     def _maybe_collect_routed_experts(self, req: Req):
@@ -440,7 +462,9 @@ class SchedulerBatchResultProcessor:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
 
-                        self._maybe_update_reasoning_tokens(req, next_token_id)
+                        maybe_update_reasoning_tokens(
+                            self.model_config, req, next_token_id
+                        )
 
                         req.update_finish_state()
                     # A mixed spec tail committed its pending bonus token; advance
@@ -1000,7 +1024,7 @@ class SchedulerBatchResultProcessor:
             else:
                 req.output_ids.extend(next_token_id)
                 new_accept_len = len(next_token_id)
-                self._maybe_update_reasoning_tokens(req, next_token_id)
+                maybe_update_reasoning_tokens(self.model_config, req, next_token_id)
             req.update_finish_state(new_accept_len)
 
             if sampling_mask_finish_reason is not None:
@@ -1368,29 +1392,6 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
-
-    def _maybe_update_reasoning_tokens(
-        self,
-        req: Req,
-        next_token_id: Union[int, List[int]],
-    ):
-        if not req.require_reasoning:
-            return
-        think_end_ids = self.model_config.think_end_ids
-        if req._think_end_matcher is None:
-            request_think_end_ids = get_request_reasoning_end_token_ids(
-                req.sampling_params.custom_params,
-                allowed_sequences=getattr(
-                    self.model_config,
-                    "request_selectable_think_end_id_sequences",
-                    None,
-                ),
-            )
-            if request_think_end_ids is not None:
-                think_end_ids = request_think_end_ids
-            if not think_end_ids:
-                return
-        req.update_reasoning_tokens(next_token_id, think_end_ids)
 
     def _mamba_prefix_cache_update(
         self,

@@ -37,7 +37,7 @@ def _scheduler(order: Mock, *, mode: str) -> Scheduler:
     s.tree_cache = Mock()
     s.enable_fpm = False
     s._maybe_clear_mm_inputs = Mock()
-    s.maybe_send_health_check_signal = Mock()
+    s.output_streamer = Mock()
     s.scripted_scheduler_hook = None
     return s
 

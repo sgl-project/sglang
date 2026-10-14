@@ -110,7 +110,6 @@ def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
         draft_worker=None,
         model_worker=MagicMock(),
         logprob_result_processor=None,
-        abort_request=lambda *args, **kwargs: None,
         pending=PendingSteps(),
     )
 

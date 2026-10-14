@@ -164,7 +164,6 @@ for _name, _source in (
     ("batch_result_processor", "batch_result_processor"),
     ("send_kv_chunk", "send_kv_chunk"),
     ("release_aborted_request", "_release_aborted_request"),
-    ("maybe_send_health_check_signal", "maybe_send_health_check_signal"),
 ):
     setattr(_Owner, _name, property(lambda self, n=_source: getattr(self.scheduler, n)))
 
@@ -283,7 +282,7 @@ class _Scheduler:
         self.enable_fpm = False
         self._record_step_counters = Mock()
         self._maybe_clear_mm_inputs = Mock()
-        self.maybe_send_health_check_signal = Mock()
+        self.output_streamer = Mock(spec=["maybe_reply_health_check"])
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(
@@ -881,7 +880,9 @@ class TestPrefillResultPolling(CustomTestCase):
         owner.after_commit = MethodType(DisaggPrefill.after_commit, owner)
         allocator = ReqToMetadataIdxAllocator(2)
         owner.req_to_metadata_buffer_idx_allocator = allocator
-        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.output_streamer = SimpleNamespace(
+            stream_output=Mock(), maybe_reply_health_check=Mock()
+        )
         prior = _batch(0).reqs[0]
         prior.disagg.metadata_buffer_index = allocator.alloc()
         prior.disagg.pending_bootstrap = False

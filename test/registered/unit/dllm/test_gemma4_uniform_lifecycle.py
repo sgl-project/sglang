@@ -115,7 +115,7 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         enable_priority_scheduling=False,
         truncation_align_size=None,
         context_len=context_len,
-        get_num_allocatable_reqs=None,
+        beam_coordinator=None,
         build_extend_step=None,
         build_sampling_info=None,
         release_aborted_request=Mock(),

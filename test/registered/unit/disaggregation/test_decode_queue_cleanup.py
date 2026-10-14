@@ -442,7 +442,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
-        queue.release_finished_req = tree_release(queue)
+        queue.batch_result_processor = SimpleNamespace(
+            release_finished_req=tree_release(queue)
+        )
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
@@ -558,7 +560,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
-        queue.release_finished_req = tree_release(queue)
+        queue.batch_result_processor = SimpleNamespace(
+            release_finished_req=tree_release(queue)
+        )
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
@@ -826,7 +830,9 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.req_to_metadata_buffer_idx_allocator = MagicMock()
             queue.tp_rank = 0
             queue.tree_cache = MagicMock()
-            queue.release_finished_req = tree_release(queue)
+            queue.batch_result_processor = SimpleNamespace(
+                release_finished_req=tree_release(queue)
+            )
             queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()

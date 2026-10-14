@@ -71,8 +71,6 @@ def _owner():
         req_to_metadata_buffer_idx_allocator=Mock(),
         send_kv_chunk=Mock(),
         output_streamer=Mock(),
-        metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
-        maybe_send_health_check_signal=Mock(),
     )
 
 

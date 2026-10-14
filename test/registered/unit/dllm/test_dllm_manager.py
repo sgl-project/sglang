@@ -55,7 +55,9 @@ def _manager(**deps):
         enable_priority_scheduling=False,
         truncation_align_size=None,
         context_len=128,
-        get_num_allocatable_reqs=lambda running_bs: 64,
+        beam_coordinator=SimpleNamespace(
+            get_num_allocatable_reqs=lambda running_bs: 64
+        ),
         build_extend_step=_Step,
         build_sampling_info=Mock(),
         release_aborted_request=Mock(),
@@ -272,7 +274,11 @@ class TestDllmManagerLists(unittest.TestCase):
 
     def test_latch_set_with_an_empty_manager_does_not_block_later_requests(self):
         allocatable = [0]
-        manager = _manager(get_num_allocatable_reqs=lambda running_bs: allocatable[0])
+        manager = _manager(
+            beam_coordinator=SimpleNamespace(
+                get_num_allocatable_reqs=lambda running_bs: allocatable[0]
+            )
+        )
 
         step, rest = manager.schedule([_req("a")])
         self.assertIsNone(step)

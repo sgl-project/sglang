@@ -71,10 +71,7 @@ class TestDisaggPrefillLists(CustomTestCase):
             checkpoint=Mock(),
             send_kv_chunk=Mock(),
             output_streamer=Mock(),
-            metrics_sink=SimpleNamespace(
-                report_prefill_stats=Mock(), enable_metrics=False
-            ),
-            maybe_send_health_check_signal=Mock(),
+            metrics_sink=SimpleNamespace(enable_metrics=False),
             release_aborted_request=Mock(),
             attn_cp_cpu_group=None,
             attn_tp_cpu_group=None,
@@ -280,7 +277,7 @@ class TestDisaggDecodeLists(CustomTestCase):
             release_aborted_request=Mock(),
             send_abort_output=Mock(),
             retire_beam_group=Mock(),
-            release_finished_req=Mock(),
+            batch_result_processor=SimpleNamespace(release_finished_req=Mock()),
         )
 
     def preallocating(self, rid):
@@ -392,7 +389,9 @@ class TestDisaggDecodeLists(CustomTestCase):
 
         self.assertEqual(_names(owner)["ready"], ["x"])
         owner.release_aborted_request.assert_called_once_with(req)
-        owner.release_finished_req.assert_called_once_with(req, checkpoint=True)
+        owner.batch_result_processor.release_finished_req.assert_called_once_with(
+            req, checkpoint=True
+        )
         self.assertIsNotNone(req.finished_reason)
 
 

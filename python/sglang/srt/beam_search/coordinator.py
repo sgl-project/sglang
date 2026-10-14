@@ -74,6 +74,7 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -107,6 +108,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     future_map: FutureMap
+    # The decoding requests, whose pending beam members hold rows.
+    core_lists: CoreLists
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
@@ -221,6 +224,25 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         req.skip_radix_cache_insert = True
         self._num_live_groups += 1
         return None
+
+    def get_num_allocatable_reqs(
+        self,
+        running_bs: int,
+        beam_width: Optional[int] = None,
+    ) -> int:
+        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
+        available = self.req_to_token_pool.available_size()
+
+        available = max(
+            available - self.pending_member_rows(self.core_lists.decoding),
+            0,
+        )
+        res = min(pp_budget, available)
+        if beam_width is not None:
+            # A beam candidate owns beam_width rows once decoding.
+            res = min(res, available // beam_width)
+
+        return res
 
     def pending_member_rows(self, reqs: List[Req]) -> int:
         """Rows admitted-but-not-yet-spawned groups will claim; the admission

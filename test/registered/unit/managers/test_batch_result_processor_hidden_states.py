@@ -10,6 +10,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.scheduler_components import batch_result_processor as brp_mod
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -54,7 +55,6 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         model_worker=Mock(),
         logprob_result_processor=None,
         beam_coordinator=Mock(),
-        abort_request=lambda *args, **kwargs: None,
         pending=PendingSteps(),
     )
 
@@ -327,9 +327,7 @@ class TestDecodeWithoutLogits(CustomTestCase):
         )
 
         with (
-            patch.object(
-                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
-            ),
+            patch.object(brp_mod, "maybe_update_reasoning_tokens"),
             patch.object(
                 SchedulerBatchResultProcessor, "_handle_finish_state_updated_req"
             ),
@@ -424,10 +422,7 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
                     ([[4, 5, 6]], None),
                 ],
             ),
-            patch.object(
-                SchedulerBatchResultProcessor,
-                "_maybe_update_reasoning_tokens",
-            ),
+            patch.object(brp_mod, "maybe_update_reasoning_tokens"),
             patch.object(
                 SchedulerBatchResultProcessor,
                 "_handle_finish_state_updated_req",

@@ -169,6 +169,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(
                 stream_interval=1,
@@ -199,6 +200,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(
                 stream_interval=1,
@@ -234,6 +236,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(
                 stream_interval=1,
@@ -272,6 +275,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(
                 stream_interval=1,
@@ -297,6 +301,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(),
             is_generation=True,
@@ -320,6 +325,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(),
             is_generation=True,
@@ -339,6 +345,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Rust egress"):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
+                send_to_tokenizer=SimpleNamespace(),
                 tree_cache=None,
                 server_args=SimpleNamespace(),
                 is_generation=True,

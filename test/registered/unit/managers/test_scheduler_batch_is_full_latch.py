@@ -47,7 +47,9 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s.lists.decoding = []
         s.lists.chunked_req = None
         s.min_free_slots_delayer = None
-        s.get_num_allocatable_reqs = Mock(return_value=8)
+        s.beam_coordinator = SimpleNamespace(
+            get_num_allocatable_reqs=Mock(return_value=8)
+        )
         s.counters.processed_tokens_counter = 0
         # Reaching the policy means the admission gates were passed.
         s.policy = SimpleNamespace(calc_priority=Mock(side_effect=_AdmissionAttempted))

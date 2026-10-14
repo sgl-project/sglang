@@ -45,15 +45,12 @@ _DECLARED = {
     "StepCounters": [],
     "SessionController": ["KvResources"],
     "FutureMap": ["KvResources"],
-    "BeamCoordinator": ["KvResources", "FutureMap"],
+    "BeamCoordinator": ["KvResources", "FutureMap", "CoreLists"],
     "GrammarManager": [],
     "SchedulePolicy": ["KvResources"],
     "NewTokenRatioTracker": [],
     "HiSparse": ["KvResources"],
     "DecodeOffloadManager": ["KvResources"],
-    "Releaser": ["KvResources", "HiSparse"],
-    "HealthCheckReplier": ["IpcChannels"],
-    "RowBudget": ["KvResources", "BeamCoordinator", "CoreLists"],
     "PoolStatsObserver": ["KvResources", "SessionController", "HiSparse", "KvCapacity"],
     "InvariantChecker": [
         "PoolStatsObserver",
@@ -90,7 +87,6 @@ _DECLARED = {
         "PendingSteps",
         "Workers",
         "KvResources",
-        "Releaser",
     ],
     "DisaggPrefill": [
         "KvResources",
@@ -102,7 +98,6 @@ _DECLARED = {
         "BatchResultProcessor",
         "LaunchCounters",
         "RequestRetirer",
-        "HealthCheckReplier",
     ],
     "DisaggDecode": [
         "KvResources",
@@ -116,7 +111,7 @@ _DECLARED = {
         "OutputStreamer",
         "PoolStatsObserver",
         "DecodeOffloadManager",
-        "Releaser",
+        "BatchResultProcessor",
         "RequestRetirer",
         "BeamCoordinator",
         "EngineFlags",
@@ -129,7 +124,7 @@ _DECLARED = {
         "KvResources",
         "SchedulePolicy",
         "NewTokenRatioTracker",
-        "RowBudget",
+        "BeamCoordinator",
         "StepBuilder",
         "RequestRetirer",
         "MetricsSink",
@@ -183,7 +178,7 @@ _DECLARED = {
         "LoraAdmission",
         "StoragePrefetcher",
         "RequestEnqueuer",
-        "RowBudget",
+        "BeamCoordinator",
         "DecodeSelector",
         "StepBuilder",
         "HiSparse",
@@ -310,9 +305,6 @@ _PARAM = {
     "SchedulePolicy": ("policy",),
     "NewTokenRatioTracker": ("new_token_ratio_tracker",),
     "BatchResultProcessor": ("batch_result_processor",),
-    "Releaser": ("releaser",),
-    "HealthCheckReplier": ("health_check_replier",),
-    "RowBudget": ("row_budget",),
     "MetricsReporter": ("metrics_reporter",),
     "RequestRegistry": ("request_registry", "abort_request"),
     "ModeOwners": ("mode_owners",),
@@ -434,12 +426,6 @@ _CALLBACK_SITES = {
         "release_aborted_request",
         _BOUND,
     ): 1,
-    (
-        "maybe_init_disagg_prefill",
-        "DisaggPrefill",
-        "maybe_send_health_check_signal",
-        _BOUND,
-    ): 1,
     ("maybe_init_disagg_decode", "DisaggDecode", "can_schedule_lora_req", _BOUND): 1,
     (
         "maybe_init_disagg_decode",
@@ -515,13 +501,6 @@ _CALLBACK_SITES = {
     ): 1,
     ("init_running_status", "SchedulerFlushWrapper", "flush_cache", _BOUND): 1,
     ("init_running_status", "SchedulerFlushWrapper", "is_fully_idle", _BOUND): 1,
-    (
-        "init_batch_result_processor",
-        "SchedulerBatchResultProcessor",
-        "abort_request",
-        _BOUND,
-    ): 1,
-    ("maybe_init_dllm", "DllmManager", "get_num_allocatable_reqs", _BOUND): 1,
     ("maybe_init_dllm", "DllmManager", "build_extend_step", _BOUND): 1,
     ("maybe_init_dllm", "DllmManager", "build_sampling_info", _BOUND): 1,
     ("maybe_init_dllm", "DllmManager", "release_aborted_request", _BOUND): 1,
@@ -530,13 +509,7 @@ _CALLBACK_SITES = {
 }
 
 # R4: (module under srt/, class, parameter).
-_HUB_PARAMS_BELOW_MODE_OWNERS = {
-    (
-        "managers/scheduler_components/batch_result_processor.py",
-        "SchedulerBatchResultProcessor",
-        "abort_request",
-    ): 1,
-}
+_HUB_PARAMS_BELOW_MODE_OWNERS = {}
 
 
 # ---------------------------------------------------------------------------

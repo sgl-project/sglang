@@ -554,8 +554,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         prefilling=[req],
         checkpoint=Mock(),
         send_kv_chunk=Mock(),
-        metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
-        maybe_send_health_check_signal=Mock(),
+        output_streamer=Mock(),
     )
 
     owner.commit_extend(batch, result, [], None)
@@ -569,7 +568,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         host_output,
         [0],
     )
-    owner.maybe_send_health_check_signal.assert_called_once_with()
+    owner.output_streamer.maybe_reply_health_check.assert_called_once_with()
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():

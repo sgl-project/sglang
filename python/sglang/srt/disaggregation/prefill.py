@@ -620,7 +620,6 @@ class DisaggPrefill:
         counters: LaunchCounters,
         retire_unadmitted_request: Callable[[Req], None],
         release_aborted_request: Callable[[Req], None],
-        maybe_send_health_check_signal: Callable[[], None],
     ):
         token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         draft_token_to_kv_pool = kv.draft_token_to_kv_pool
@@ -651,7 +650,6 @@ class DisaggPrefill:
         self.batch_result_processor = batch_result_processor
         self.counters = counters
         self.release_aborted_request = release_aborted_request
-        self.maybe_send_health_check_signal = maybe_send_health_check_signal
 
         # *2 for the headroom.
         buffer_size = max_running_requests * 2
@@ -1116,7 +1114,7 @@ class DisaggPrefill:
                 any(req.return_logprob for req in aborted_reqs),
             )
 
-        self.maybe_send_health_check_signal()
+        self.output_streamer.maybe_reply_health_check()
         return waiting
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)

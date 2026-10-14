@@ -23,14 +23,12 @@ import signal
 import sys
 import time
 from array import array
-from collections import deque
 from contextlib import ExitStack, nullcontext
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     AbstractSet,
     Any,
-    Deque,
     Dict,
     List,
     Optional,
@@ -157,7 +155,6 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetWeightsByNameReqInput,
-    HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -1317,7 +1314,6 @@ class Scheduler:
         # The last decode step's request inputs, shared with the next decode
         # step of the same requests.
         self.decode_rows: Optional[DecodeRows] = None
-        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -1548,7 +1544,6 @@ class Scheduler:
             counters=self.counters,
             retire_unadmitted_request=self.retire_unadmitted_request,
             release_aborted_request=self._release_aborted_request,
-            maybe_send_health_check_signal=self.maybe_send_health_check_signal,
         )
 
     def maybe_init_disagg_decode(self) -> None:
@@ -1582,14 +1577,11 @@ class Scheduler:
             metrics_collector=self.metrics_collector,
             pool_stats_observer=self.pool_stats_observer,
             decode_offload_manager=self.decode_offload_manager,
-            update_reasoning_tokens=(
-                self.batch_result_processor._maybe_update_reasoning_tokens
-            ),
             retire_unadmitted_request=self.retire_unadmitted_request,
             release_aborted_request=self._release_aborted_request,
             send_abort_output=self._send_abort_output,
             retire_beam_group=self.beam_coordinator.retire_group,
-            release_finished_req=self.batch_result_processor.release_finished_req,
+            batch_result_processor=self.batch_result_processor,
             flags=self.flags,
             core_lists=self.lists,
             get_pending_lora_ids=self.pending.lora_ids,
@@ -2389,7 +2381,7 @@ class Scheduler:
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
-                self.return_health_check_ipcs.append(
+                self.output_streamer.defer_health_check(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
                 continue
@@ -2745,6 +2737,7 @@ class Scheduler:
     def init_output_streamer(self) -> None:
         self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
+            send_to_tokenizer=self.ipc_channels.send_to_tokenizer,
             tree_cache=self.tree_cache,
             server_args=self.server_args,
             is_generation=self.is_generation,
@@ -2771,6 +2764,7 @@ class Scheduler:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             future_map=self.future_map,
+            core_lists=self.lists,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -2790,7 +2784,6 @@ class Scheduler:
                 model_config=self.model_config
             ),
             beam_coordinator=self.beam_coordinator,
-            abort_request=self.abort_request,
             pending=self.pending,
         )
 
@@ -2814,7 +2807,7 @@ class Scheduler:
             enable_priority_scheduling=get_schedule().enable_priority_scheduling,
             truncation_align_size=self.truncation_align_size,
             context_len=self.model_config.context_len,
-            get_num_allocatable_reqs=self.get_num_allocatable_reqs,
+            beam_coordinator=self.beam_coordinator,
             build_extend_step=self.build_extend_step,
             build_sampling_info=self._build_sampling_info,
             release_aborted_request=self._release_aborted_request,
@@ -4107,25 +4100,6 @@ class Scheduler:
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
 
-    def get_num_allocatable_reqs(
-        self,
-        running_bs: int,
-        beam_width: Optional[int] = None,
-    ) -> int:
-        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        available = self.req_to_token_pool.available_size()
-
-        available = max(
-            available - self.beam_coordinator.pending_member_rows(self.lists.decoding),
-            0,
-        )
-        res = min(pp_budget, available)
-        if beam_width is not None:
-            # A beam candidate owns beam_width rows once decoding.
-            res = min(res, available // beam_width)
-
-        return res
-
     def get_new_batch_prefill(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -4187,7 +4161,9 @@ class Scheduler:
             and self.lists.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
-                num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+                num_allocatable_reqs=self.beam_coordinator.get_num_allocatable_reqs(
+                    running_bs
+                ),
             )
         ):
             return None
@@ -4198,7 +4174,7 @@ class Scheduler:
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            self.beam_coordinator.get_num_allocatable_reqs(running_bs) <= 0
             and self.lists.chunked_req is None
             and not self.enable_priority_preemption
         ):
@@ -4306,7 +4282,9 @@ class Scheduler:
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+            if len(
+                adder.can_run_list
+            ) >= self.beam_coordinator.get_num_allocatable_reqs(
                 running_bs, candidate_beam_width
             ):
                 slot.batch_is_full = True
@@ -5091,7 +5069,7 @@ class Scheduler:
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
         self._maybe_clear_mm_inputs(batch)
-        self.maybe_send_health_check_signal()
+        self.output_streamer.maybe_reply_health_check()
         self.metrics_sink.update_device_timer()
 
         if self.scripted_scheduler_hook is not None:
@@ -5146,17 +5124,6 @@ class Scheduler:
                 record.result.get_num_generated_tokens(batch_size),
             )
 
-    def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
-            # Return some signal for the health check.
-            # This is used to prevent the health check signal being blocked by long context prefill.
-            # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
-                )
-            )
-
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
     ) -> Optional[AddExternalCorpusReqOutput]:
@@ -5202,7 +5169,7 @@ class Scheduler:
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
         # Flush any health-check signal deferred while the engine was busy.
-        self.maybe_send_health_check_signal()
+        self.output_streamer.maybe_reply_health_check()
 
         # Publish before the fully-idle gate: a no-batch-but-not-idle stall
         # (queues parked under KV pressure / disagg transfer) has no

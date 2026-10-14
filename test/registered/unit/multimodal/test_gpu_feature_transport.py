@@ -1046,7 +1046,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         self._publish(mm_feature_transport="cuda_vmm")
         self._prepare_scheduler(scheduler)
         scheduler.is_fully_idle = MagicMock(return_value=True)
-        scheduler.return_health_check_ipcs = []
+        scheduler.output_streamer = MagicMock()
         scheduler.handle_generate_request = MagicMock()
         scheduler.handle_embedding_request = MagicMock()
         scheduler._materialize_cuda_vmm_inputs = MagicMock(

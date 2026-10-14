@@ -81,6 +81,9 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    maybe_update_reasoning_tokens,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -145,6 +148,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import SchedulePolicy
+    from sglang.srt.managers.scheduler_components.batch_result_processor import (
+        SchedulerBatchResultProcessor,
+    )
     from sglang.srt.managers.scheduler_components.bundles import (
         KvCapacity,
         KvResources,
@@ -2551,8 +2557,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         metrics_sink: MetricsSink,
         metrics_collector: Optional[SchedulerMetricsCollector],
         output_streamer: SchedulerOutputStreamer,
-        update_reasoning_tokens: Callable[[Req, int], None],
-        release_finished_req: Callable[..., None],
+        model_config: ModelConfig,
+        batch_result_processor: SchedulerBatchResultProcessor,
         hold_release: Callable[[Req], None],
     ):
         self.queue: List[DecodeRequest] = []
@@ -2572,8 +2578,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metrics_sink = metrics_sink
         self.metrics_collector = metrics_collector
         self.output_streamer = output_streamer
-        self.update_reasoning_tokens = update_reasoning_tokens
-        self.release_finished_req = release_finished_req
+        self.model_config = model_config
+        self.batch_result_processor = batch_result_processor
         # Moves a failed transfer's request into the owner's releasing list.
         self.hold_release = hold_release
         # The preallocation queue that hands its requests over; set by the
@@ -2706,7 +2712,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # terminator matcher as subsequent decode tokens.  A rebootstrap
             # boundary has already been accounted for before retraction and
             # must not be consumed twice.
-            self.update_reasoning_tokens(decode_req.req, committed_output_id)
+            maybe_update_reasoning_tokens(
+                self.model_config, decode_req.req, committed_output_id
+            )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -2809,7 +2817,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             discard_kv_cache_backup(req, self.tree_cache, "host_pool")
             if host_staged:
                 return
-        self.release_finished_req(req, checkpoint=False)
+        self.batch_result_processor.release_finished_req(req, checkpoint=False)
 
     def _record_transfer_failure(self, failure_reason: str) -> None:
         if self.metrics_sink.enable_metrics:
@@ -3151,12 +3159,11 @@ class DisaggDecode:
         metrics_collector: Optional[SchedulerMetricsCollector],
         pool_stats_observer: SchedulerPoolStatsObserver,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
-        update_reasoning_tokens: Callable[[Req, int], None],
         retire_unadmitted_request: Callable[[Req], None],
         release_aborted_request: Callable[[Req], None],
         send_abort_output: Callable[..., None],
         retire_beam_group: Callable[[Req], None],
-        release_finished_req: Callable[..., None],
+        batch_result_processor: SchedulerBatchResultProcessor,
         flags: EngineFlags,
         core_lists: CoreLists,
         get_pending_lora_ids: Callable[[], Set[Optional[str]]],
@@ -3209,7 +3216,7 @@ class DisaggDecode:
         self.release_aborted_request = release_aborted_request
         self.send_abort_output = send_abort_output
         self.retire_beam_group = retire_beam_group
-        self.release_finished_req = release_finished_req
+        self.batch_result_processor = batch_result_processor
         self.flags = flags
         # The requests whose KV has arrived: they own it and wait for a row of
         # the running set.
@@ -3250,8 +3257,8 @@ class DisaggDecode:
             metrics_sink=metrics_sink,
             metrics_collector=metrics_collector,
             output_streamer=output_streamer,
-            update_reasoning_tokens=update_reasoning_tokens,
-            release_finished_req=release_finished_req,
+            model_config=model_config,
+            batch_result_processor=batch_result_processor,
             hold_release=self.hold_release,
         )
 
@@ -3484,7 +3491,7 @@ class DisaggDecode:
                 discard_kv_cache_backup(req, self.tree_cache, "host_pool")
             if req.finished_reason is None:
                 req.finished_reason = FINISH_ABORT()
-            self.release_finished_req(req, checkpoint=True)
+            self.batch_result_processor.release_finished_req(req, checkpoint=True)
             logger.debug(f"Abort queued request. {req.rid=}")
 
     def hold_for_rebootstrap(self, reqs: List[Req]) -> None:
@@ -3784,7 +3791,7 @@ class DisaggDecode:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                self.release_finished_req(req, checkpoint=True)
+                self.batch_result_processor.release_finished_req(req, checkpoint=True)
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(
             reqs, any(req.return_logprob for req in reqs)
@@ -3897,6 +3904,6 @@ class DisaggDecode:
         self.output_streamer.stream_output([req], req.return_logprob)
         # A ready request holds its HiSparse rows (preallocation, then the
         # move to ready), so it releases like any leaving request.
-        self.release_finished_req(req, checkpoint=False)
+        self.batch_result_processor.release_finished_req(req, checkpoint=False)
         if self.metrics_sink.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()

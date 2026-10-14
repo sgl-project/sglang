@@ -20,6 +20,7 @@ from sglang.srt.runtime_context import get_schedule
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler_components.bundles import (
         KvResources,
@@ -56,7 +57,7 @@ class DllmManager:
         enable_priority_scheduling: bool,
         truncation_align_size: Optional[int],
         context_len: int,
-        get_num_allocatable_reqs: Callable[[int], int],
+        beam_coordinator: BeamCoordinator,
         build_extend_step: Callable[..., ScheduleBatch],
         build_sampling_info: Callable,
         release_aborted_request: Callable[[Req], None],
@@ -83,7 +84,7 @@ class DllmManager:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.truncation_align_size = truncation_align_size
         self.context_len = context_len
-        self.get_num_allocatable_reqs = get_num_allocatable_reqs
+        self.beam_coordinator = beam_coordinator
         self.build_extend_step = build_extend_step
         self.build_sampling_info = build_sampling_info
         self.metrics_sink = metrics_sink
@@ -416,7 +417,7 @@ class DllmManager:
         # No request decodes in dLLM mode.
         running_bs = 0
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            self.beam_coordinator.get_num_allocatable_reqs(running_bs) <= 0
             and self.is_empty()
             and not self.enable_priority_preemption
         ):
@@ -530,7 +531,9 @@ class DllmManager:
         for req in reqs:
             # Check if batch is full
             running_bs = 0
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            if len(
+                adder.can_run_list
+            ) >= self.beam_coordinator.get_num_allocatable_reqs(running_bs):
                 self.batch_is_full = True
 
             # Try preemption if batch is full

@@ -210,7 +210,9 @@ class _FakeOwner(DisaggDecode):
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
-        self.release_finished_req = tree_release(self)
+        self.batch_result_processor = SimpleNamespace(
+            release_finished_req=tree_release(self)
+        )
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
         self.metrics_sink = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
@@ -263,8 +265,10 @@ class TestChecksumMismatchRelease(unittest.TestCase):
         owner = decode_owner_shell(
             kv_checksum_computer=SimpleNamespace(compute=lambda pages, states: 1),
             tree_cache=None,
-            release_finished_req=MethodType(
-                SchedulerBatchResultProcessor.release_finished_req, processor
+            batch_result_processor=SimpleNamespace(
+                release_finished_req=MethodType(
+                    SchedulerBatchResultProcessor.release_finished_req, processor
+                )
             ),
             output_streamer=SimpleNamespace(stream_output=lambda reqs, *args: None),
             metrics_sink=SimpleNamespace(enable_metrics=False),

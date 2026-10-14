@@ -188,6 +188,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
             token_to_kv_pool_allocator=allocator,
             tree_cache=None,
             future_map=None,
+            core_lists=None,
         )
 
     def test_retract_abort_does_not_leak_staged_orphans(self):
@@ -283,6 +284,7 @@ class TestRelayReparentLength(CustomTestCase):
             token_to_kv_pool_allocator=None,
             tree_cache=None,
             future_map=None,
+            core_lists=None,
         )
         capture = SimpleNamespace(
             leader_logits=torch.zeros(1, 8), tail_logits=torch.zeros(1, 8)
