@@ -309,6 +309,12 @@ def generate(path, model, engine_url):
         name: value for name, value in defaults.items() if name not in SKIPPED_FIELDS
     }
     settings = fixture.get("settings", {})
+    # The encoder SGLang renders with; its OpenAI layer special-cases `kimi_k3`.
+    handler = lower(
+        {"endpoint": "chat", "request": BARE_REQUESTS["chat"]}, settings, model
+    )[0]
+    if handler.chat_encoding_spec is not None:
+        fixture["chat_model"]["chat_encoding_spec"] = handler.chat_encoding_spec
     fixture["sampling_defaults"] = {
         endpoint: lower({"endpoint": endpoint, "request": bare}, settings, model)[
             2

@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 use dynamo_protocols::types::ChatCompletionRequestMessage;
 use dynamo_renderer::deepseek::common::tokens;
-use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, RenderedPrompt, RenderedSegment};
+use dynamo_renderer::kimi_k3::KimiK3Formatter;
+use dynamo_renderer::{
+    OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt, RenderedSegment,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -21,7 +24,7 @@ pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, render_deepseek_v4,
-    render_deepseek_v41, render_glm53,
+    render_deepseek_v41, render_glm53, render_kimi_k3,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
@@ -50,6 +53,9 @@ pub enum ChatFormatter {
     DeepSeekV41,
     /// GLM-5.3's Jinja template, which `render_request` renders as SGLang does.
     Glm53(PromptFormatter),
+    /// Dynamo's K3 formatter: [`Self::render_prompt`] keeps Dynamo's request
+    /// semantics, while [`Self::render_request`] follows SGLang's.
+    KimiK3,
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -87,6 +93,13 @@ impl ChatFormatter {
                 }
                 render_oai(formatter, &TemplateArgsRequest { request, args })
             }
+            ChatFormatter::KimiK3 => {
+                KimiK3Formatter::new(true)
+                    .render_prompt(request)
+                    .map_err(|error| TemplateError::Renderer {
+                        message: error.to_string(),
+                    })
+            }
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
                 // Typed messages serialize straight to JSON, skipping minijinja.
                 let messages = match request.typed_messages() {
@@ -104,6 +117,7 @@ impl ChatFormatter {
                 });
                 body["messages"] = messages;
                 let (prompt, prefix) = self.render_request(body, &HashMap::new())?;
+                let prompt = prompt.into_text();
                 // SGLang tokenizes the prefix on its own and drops its leading BOS.
                 let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
                 if prefix.is_empty() {
@@ -122,19 +136,23 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4, V4.1 and GLM-5.3 render this way; others use
-    /// [`Self::render_prompt`].
+    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3 and Kimi K3 render this way;
+    /// others use [`Self::render_prompt`].
     pub fn render_request(
         &self,
         request: Value,
         default_kwargs: &HashMap<String, Value>,
-    ) -> Result<(String, String), TemplateError> {
+    ) -> Result<(RenderedPrompt, String), TemplateError> {
+        let text = |(prompt, prefix)| (RenderedPrompt::text(prompt), prefix);
         match self {
             ChatFormatter::DeepSeekV4(profile) => {
-                render_deepseek_v4(*profile, request, default_kwargs)
+                render_deepseek_v4(*profile, request, default_kwargs).map(text)
             }
-            ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs),
-            ChatFormatter::Glm53(formatter) => render_glm53(formatter, request, default_kwargs),
+            ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs).map(text),
+            ChatFormatter::Glm53(formatter) => {
+                render_glm53(formatter, request, default_kwargs).map(text)
+            }
+            ChatFormatter::KimiK3 => render_kimi_k3(request, default_kwargs),
             _ => Err("this formatter renders through render_prompt".into()),
         }
         .map_err(|message| TemplateError::Renderer { message })
@@ -150,7 +168,8 @@ impl ChatFormatter {
             | ChatFormatter::KimiK25 { .. }
             | ChatFormatter::DeepSeekV4(_)
             | ChatFormatter::DeepSeekV41
-            | ChatFormatter::Glm53(_) => None,
+            | ChatFormatter::Glm53(_)
+            | ChatFormatter::KimiK3 => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -172,6 +191,9 @@ impl ChatFormatter {
         match self {
             ChatFormatter::HuggingFace { thinking, .. }
             | ChatFormatter::KimiK25 { thinking, .. } => thinking
+                .for_request(tools_enabled)
+                .apply(args, named_tool_choice),
+            ChatFormatter::KimiK3 => ThinkingTemplates::native(true, true)
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
