@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -196,3 +197,76 @@ def test_gdn_prefill_matches_hf_production_exactly(length, dtype, qk_norm):
         )
         actual = _chunk_gated_delta_rule(q, k, v, g, beta, use_qk_l2norm=qk_norm)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("resident_layers", [0, 1])
+@pytest.mark.parametrize("host_embedding", [False, True])
+def test_native_layerwise_and_weight_updates(
+    small_text_encoder, monkeypatch, resident_layers, host_embedding
+):
+    from sglang.multimodal_gen.runtime.managers.memory_managers import layerwise_offload
+    from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+        _load_weights_into_module,
+    )
+
+    torch.manual_seed(0)
+    encoder = native_encoder(cuda_reference(small_text_encoder))
+    monkeypatch.setattr(
+        layerwise_offload,
+        "HOST_RESIDENT_TABLE_MIN_BYTES",
+        0 if host_embedding else 2**30,
+    )
+    tokens = [
+        torch.randint(1, 40, (1, length), device="cuda") for length in (17, 5, 33, 7)
+    ]
+    with torch.inference_mode(), set_forward_context(0, None):
+        expected = [encoder(ids).last_hidden_state.cpu() for ids in tokens]
+    name = "language_model.layers.0.mlp.down_proj.weight"
+    changed_weight = small_text_encoder.state_dict()[name].cpu().clone() + 0.125
+    encoder.configure_layerwise_offload(
+        SimpleNamespace(
+            performance_mode="manual",
+            pin_cpu_memory=True,
+            layerwise_tuning_for=lambda *args, **kwargs: (
+                1,
+                resident_layers,
+                "strided",
+                "forward",
+            ),
+        ),
+        component_name="text_encoder",
+    )
+    [manager] = encoder.layerwise_offload_managers
+    assert manager.enabled and manager.num_layers == 2
+    assert (
+        encoder.language_model.embed_tokens.weight.device.type == "cpu"
+    ) == host_embedding
+    torch.cuda.synchronize()
+    try:
+        for start in (0, 2):
+            with (
+                torch.cuda.stream(torch.cuda.Stream()),
+                torch.inference_mode(),
+                set_forward_context(0, None),
+            ):
+                encoder.prepare_for_next_req()
+                outputs = [
+                    encoder(ids).last_hidden_state for ids in tokens[start : start + 2]
+                ]
+                manager.release_all()
+            torch.cuda.synchronize()
+            for output, reference in zip(outputs, expected[start : start + 2]):
+                torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
+        _load_weights_into_module(encoder, [(name, changed_weight)])
+        with torch.inference_mode(), set_forward_context(0, None):
+            encoder.prepare_for_next_req()
+            updated = encoder(tokens[0]).last_hidden_state.cpu()
+            manager.release_all()
+            encoder.disable_offload()
+            resident = encoder(tokens[0]).last_hidden_state.cpu()
+        torch.testing.assert_close(updated, resident, rtol=0, atol=0)
+        assert not torch.equal(updated, expected[0])
+    finally:
+        encoder.disable_offload()
+        manager.release_host_stores()

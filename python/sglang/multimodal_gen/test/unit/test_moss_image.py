@@ -927,3 +927,53 @@ def test_invalid_guidance_is_rejected_before_encoding(options, message):
     batch = Req(sampling_params=MOSSImageSamplingParams(prompt="test", **options))
     with pytest.raises(ValueError, match=message):
         stage.forward(batch, SimpleNamespace(pipeline_config=MOSSImagePipelineConfig()))
+
+
+@pytest.mark.parametrize(
+    "mode,available_gib,explicit,expected",
+    [
+        ("auto", 24, None, "layerwise-offload"),
+        ("auto", 39, None, "layerwise-offload"),
+        ("auto", 40, None, "resident"),
+        ("auto", 80, "component-offload", "component-offload"),
+        ("auto", 24, "resident", "resident"),
+        ("auto", 24, "layerwise-offload", "layerwise-offload"),
+        ("memory", 80, None, "layerwise-offload"),
+    ],
+)
+def test_pipeline_auto_uses_supported_encoder_offload(
+    monkeypatch, mode, available_gib, explicit, expected
+):
+    from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+    from sglang.multimodal_gen.runtime.pipelines.moss_image import MOSSImagePipeline
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    for name, value in {
+        "is_cpu": False,
+        "is_mps": False,
+        "is_cuda": True,
+        "get_device_total_memory": 80 * 1024**3,
+        "get_available_gpu_memory": available_gib,
+        "enable_dit_layerwise_offload_by_default": True,
+    }.items():
+        monkeypatch.setattr(
+            current_platform, name, lambda *args, _value=value, **kwargs: _value
+        )
+    monkeypatch.setattr(
+        PipelineConfig, "from_kwargs", lambda kwargs: MOSSImagePipelineConfig()
+    )
+    args = ServerArgs.from_dict(
+        {
+            "model_path": "/fake",
+            "performance_mode": mode,
+            "component_residency": {"text_encoder": explicit} if explicit else None,
+        }
+    )
+    pipe = object.__new__(MOSSImagePipeline)
+    pipe.modules = {}
+    pipe.initialize_pipeline(args)
+    assert args.residency_mode("text_encoder") == expected
+    if expected == "component-offload":
+        assert "text_encoder" not in (args.layerwise_offload_components or [])
+    assert not args.enable_torch_compile and not args.enable_cfg_parallel

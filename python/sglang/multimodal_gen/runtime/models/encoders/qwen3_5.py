@@ -298,6 +298,9 @@ class Qwen3_5TextModel(nn.Module):
 class Qwen3_5Model(TextEncoder):
     """Qwen3.5 text-only prefill for diffusion conditioning."""
 
+    layer_names = ["language_model.layers"]
+    host_resident_table_names = ["language_model.embed_tokens"]
+
     _supported_attention_backends = {
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,

@@ -39,6 +39,7 @@ class MOSSImagePipelineConfig(SpatialImagePipelineConfig):
 
     def get_model_deployment_config(self):
         return ModelDeploymentConfig(
+            keep_resident_min_available_gb=40,
             keep_resident_components=("dit", "text_encoder", "vae"),
             auto_enable_cfg_parallel=False,
             supports_cfg_parallel=False,
