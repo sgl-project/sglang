@@ -22,6 +22,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/mbarrier.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
@@ -779,11 +780,10 @@ inline void wo_a_fused_run(
   const auto launch = [&](const auto* pos) {
     using PosT = std::decay_t<decltype(*pos)>;
     constexpr auto kernel = wo_a_fused_kernel<Trait, PosT>;
-    [[maybe_unused]] static const auto _ = [] {
-      CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem)));
-      CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-      return 0;
-    }();
+    runtime::init_per_device(device, [=] {
+      runtime::set_max_dynamic_smem(kernel, sizeof(Smem));
+      runtime::set_smem_carveout(kernel, cudaSharedmemCarveoutMaxShared);
+    });
     LaunchKernel(kClusters * kSplitK, kThreads, device, sizeof(Smem))
         .config({.use_pdl = true, .cluster_dim = dim3{kSplitK, 1, 1}})(
             kernel,
