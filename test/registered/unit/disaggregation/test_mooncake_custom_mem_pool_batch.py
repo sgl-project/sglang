@@ -1,9 +1,7 @@
 import threading
 import time
 import unittest
-import unittest
 from unittest.mock import MagicMock
-from concurrent.futures import Future
 
 import numpy as np
 

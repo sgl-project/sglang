@@ -612,6 +612,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         wait_for_rooms(remaining_rooms, timeout_ms / 1000.0)
         return self.process_disagg_prefill_inflight_queue()
+
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
