@@ -1182,7 +1182,9 @@ class TestGenerateReqInputTokenization(CustomTestCase):
         self.manager.validate_total_tokens = True
         self.manager.is_generation = True
         self.manager.model_config = SimpleNamespace(
-            vocab_size=32, hf_config=SimpleNamespace(architectures=[])
+            vocab_size=32,
+            hf_config=SimpleNamespace(architectures=[]),
+            joint_head_config=None,
         )
         self.manager.tokenizer = None
         self.manager.mm_processor = None
