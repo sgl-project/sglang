@@ -61,7 +61,7 @@ def test_the_cast_weights_end_up_file_backed(tmp_path):
         vae, _server_args(), "video_vae", str(model_path)
     )
 
-    path = _decode_dtype_store_path(str(model_path), "video_vae", torch.float16)
+    path = _decode_dtype_store_path(str(model_path), "video_vae", torch.float16, vae)
     import os
 
     assert os.path.exists(path)
@@ -101,7 +101,8 @@ def test_a_second_start_adopts_the_store_without_casting(tmp_path):
 def test_a_mismatched_store_is_discarded_and_the_cast_kept(tmp_path):
     model_path = tmp_path / "ckpt"
     model_path.mkdir()
-    path = _decode_dtype_store_path(str(model_path), "video_vae", torch.float16)
+    vae = _TinyVAE()
+    path = _decode_dtype_store_path(str(model_path), "video_vae", torch.float16, vae)
     import os
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -109,7 +110,6 @@ def test_a_mismatched_store_is_discarded_and_the_cast_kept(tmp_path):
 
     save_file({"blocks.0.weight": torch.zeros(4, 4, dtype=torch.float16)}, path)
 
-    vae = _TinyVAE()
     _hold_decoder_weights_in_decode_dtype(
         vae, _server_args(), "video_vae", str(model_path)
     )
@@ -127,8 +127,33 @@ def test_the_store_kill_switch_keeps_the_copies_in_memory(monkeypatch, tmp_path)
         vae, _server_args(), "video_vae", str(model_path)
     )
 
-    path = _decode_dtype_store_path(str(model_path), "video_vae", torch.float16)
+    path = _decode_dtype_store_path(str(model_path), "video_vae", torch.float16, vae)
     import os
 
     assert not os.path.exists(path)
     assert all(b.weight.dtype == torch.float16 for b in vae.blocks)
+
+
+def test_module_layouts_do_not_share_a_store(tmp_path):
+    """A runtime exposing a different parameter set must not evict another's store."""
+    model_path = tmp_path / "ckpt"
+    model_path.mkdir()
+    first = _TinyVAE()
+    _hold_decoder_weights_in_decode_dtype(
+        first, _server_args(), "video_vae", str(model_path)
+    )
+    first_path = _decode_dtype_store_path(
+        str(model_path), "video_vae", torch.float16, first
+    )
+    other = _TinyVAE()
+    other.blocks.append(nn.Linear(8, 8))
+    _hold_decoder_weights_in_decode_dtype(
+        other, _server_args(), "video_vae", str(model_path)
+    )
+    other_path = _decode_dtype_store_path(
+        str(model_path), "video_vae", torch.float16, other
+    )
+    import os
+
+    assert first_path != other_path
+    assert os.path.exists(first_path) and os.path.exists(other_path)

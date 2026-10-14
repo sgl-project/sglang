@@ -9,20 +9,31 @@ import glob
 import json
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from itertools import chain
 from typing import Any, Dict, Type
 
 import torch
+from huggingface_hub import (
+    hf_hub_download,
+    parse_local_safetensors_file_metadata,
+    parse_safetensors_file_metadata,
+    snapshot_download,
+)
+from huggingface_hub.errors import LocalEntryNotFoundError, RemoteEntryNotFoundError
 from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 from torch.nn.utils import parametrize
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
 )
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -121,12 +132,15 @@ def load_model_state_dict(
 
 def get_param_names_mapping(
     mapping_dict: dict[str, str | tuple[str, int, int]],
+    valid_target_names: set[str] | None = None,
 ) -> Callable[[str], tuple[str, Any, Any]]:
     """
     Creates a mapping function that transforms parameter names using regex patterns.
 
     Args:
         mapping_dict (Dict[str, str]): Dictionary mapping regex patterns to replacement patterns
+        valid_target_names: Keep a valid intermediate mapping when a later
+            alias does not exist in the constructed model.
 
     Returns:
         Callable[[str], str]: A function that maps parameter names from source to target format
@@ -140,6 +154,7 @@ def get_param_names_mapping(
         max_steps = max(8, len(mapping_dict) * 2)
         applied_patterns: set[str] = set()
         visited_names: set[str] = {name}
+        valid_mapping = None
 
         for _ in range(max_steps):
             transformed = False
@@ -166,6 +181,8 @@ def get_param_names_mapping(
 
                     name = new_name
                     applied_patterns.add(pattern)
+                    if valid_target_names is not None and name in valid_target_names:
+                        valid_mapping = (name, merge_index, total_split_params)
                     if name in visited_names:
                         transformed = False
                         break
@@ -176,15 +193,60 @@ def get_param_names_mapping(
             if not transformed:
                 break
 
+        # Prefer the complete mapping. If a later alias does not exist in this
+        # model (e.g. INT8 weight_scale -> FP8 weight_scale_inv), retain the
+        # last valid intermediate name, including any required QKV merge.
+        if (
+            name
+            and valid_mapping is not None
+            and valid_target_names is not None
+            and name not in valid_target_names
+        ):
+            return valid_mapping
         return name, merge_index, total_split_params
 
     return mapping_fn
+
+
+def _fuse_tensors(
+    target_param_name: str,
+    tensors: list[torch.Tensor],
+    fused_tensor_factory: (
+        Callable[[str, torch.Size, torch.dtype], tuple[torch.Tensor, bool] | None]
+        | None
+    ),
+) -> torch.Tensor:
+    """Concatenate the pieces of one parameter along dim 0.
+
+    The factory, when given, provides the destination (a file mapping that
+    outlives anonymous memory) and says whether an earlier run already filled
+    it -- then the pieces are not even read.
+    """
+    if fused_tensor_factory is None or any(t.device.type != "cpu" for t in tensors):
+        return torch.cat(tensors, dim=0)
+    if (
+        len({tuple(t.shape[1:]) for t in tensors}) != 1
+        or len({t.dtype for t in tensors}) != 1
+    ):
+        return torch.cat(tensors, dim=0)
+    shape = torch.Size([sum(t.shape[0] for t in tensors), *tensors[0].shape[1:]])
+    provided = fused_tensor_factory(target_param_name, shape, tensors[0].dtype)
+    if provided is None:
+        return torch.cat(tensors, dim=0)
+    out, filled = provided
+    if not filled:
+        torch.cat(tensors, dim=0, out=out)
+    return out
 
 
 def hf_to_custom_state_dict(
     hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
     param_names_mapping: Callable[[str], tuple[str, Any, Any]],
     valid_target_names: set[str] | None = None,
+    fused_tensor_factory: (
+        Callable[[str, torch.Size, torch.dtype], tuple[torch.Tensor, bool] | None]
+        | None
+    ) = None,
     *,
     strict: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]:
@@ -236,7 +298,9 @@ def hf_to_custom_state_dict(
                     to_merge_params[target_param_name][i]
                     for i in range(num_params_to_merge)
                 ]
-                full_tensor = torch.cat(sorted_tensors, dim=0)
+                full_tensor = _fuse_tensors(
+                    target_param_name, sorted_tensors, fused_tensor_factory
+                )
                 del to_merge_params[target_param_name]
             else:
                 continue
@@ -312,8 +376,6 @@ def _try_redownload_missing_shards(model_path: str, missing: list[str]) -> bool:
     for each missing shard. Returns True if all shards were recovered.
     """
     try:
-        from huggingface_hub import hf_hub_download
-
         match = re.search(
             r"models--([^/\\]+)--([^/\\]+)[/\\]snapshots[/\\]([^/\\]+)", model_path
         )
@@ -355,6 +417,96 @@ def checkpoint_bytes(model_path: str) -> int:
     return total
 
 
+_DIT_SUBFOLDER = "transformer"
+_DIT_SINGLE_FILE = "diffusion_pytorch_model.safetensors"
+_FLOAT_DTYPES = frozenset({"F64", "F32", "F16", "BF16"})
+
+
+def _index_shard_names(index_path: str) -> list[str]:
+    with open(index_path) as f:
+        return sorted(set(json.load(f)["weight_map"].values()))
+
+
+def _local_dit_parameter_counts(folder: str) -> Counter[str] | None:
+    # the same files _list_safetensors_files loads, without its shard repair
+    index_path = _select_safetensors_index_file(folder, _DEFAULT_SAFETENSORS_INDEX)
+    if index_path is None:
+        shards = filter_duplicate_precision_variant_safetensors(
+            sorted(glob.glob(os.path.join(folder, "*.safetensors")))
+        )
+    else:
+        shards = [os.path.join(folder, name) for name in _index_shard_names(index_path)]
+    if not shards or not all(os.path.isfile(shard) for shard in shards):
+        return None
+    counts: Counter[str] = Counter()
+    for shard in shards:
+        counts.update(parse_local_safetensors_file_metadata(shard).parameter_count)
+    return counts
+
+
+def _hub_dit_parameter_counts(
+    repo_id: str, folder: str, revision: str | None
+) -> Counter[str]:
+    try:
+        index_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=f"{folder}/{_DEFAULT_SAFETENSORS_INDEX}",
+            revision=revision,
+        )
+        shards = _index_shard_names(index_path)
+    except RemoteEntryNotFoundError:
+        shards = [_DIT_SINGLE_FILE]
+    counts: Counter[str] = Counter()
+    for shard in shards:
+        metadata = parse_safetensors_file_metadata(
+            repo_id=repo_id, filename=f"{folder}/{shard}", revision=revision
+        )
+        counts.update(metadata.parameter_count)
+    return counts
+
+
+def _dit_parameter_counts(
+    model_path: str, folder: str, revision: str | None
+) -> Counter[str] | None:
+    if os.path.isdir(model_path):
+        return _local_dit_parameter_counts(os.path.join(model_path, folder))
+    if os.path.exists(model_path) or envs.SGLANG_USE_MODELSCOPE.get():
+        # a single-file checkpoint has no transformer folder to size,
+        # and ModelScope has no header-only read
+        return None
+    try:
+        snapshot = snapshot_download(
+            repo_id=model_path,
+            revision=revision,
+            allow_patterns=[f"{folder}/*"],
+            local_files_only=True,
+        )
+        counts = _local_dit_parameter_counts(os.path.join(snapshot, folder))
+    except LocalEntryNotFoundError:
+        counts = None
+    if counts is None:
+        counts = _hub_dit_parameter_counts(model_path, folder, revision)
+    return counts
+
+
+def dit_parameter_count(
+    model_path: str, *, subfolder: str | None, revision: str | None
+) -> int | None:
+    """Parameter count of a Diffusers transformer, from its safetensors headers.
+
+    None when it cannot be sized without its weights, or is stored quantized.
+    """
+    folder = f"{subfolder}/{_DIT_SUBFOLDER}" if subfolder else _DIT_SUBFOLDER
+    try:
+        counts = _dit_parameter_counts(os.path.expanduser(model_path), folder, revision)
+    except Exception as exc:
+        logger.debug("Could not size the transformer of %s: %s", model_path, exc)
+        return None
+    if not counts or not counts.keys() <= _FLOAT_DTYPES:
+        return None
+    return sum(counts.values())
+
+
 def keep_checkpoint_mapped(*, weight_bytes: int, component: str) -> bool:
     """Whether a component's weights should stay on their file mapping.
 
@@ -365,10 +517,18 @@ def keep_checkpoint_mapped(*, weight_bytes: int, component: str) -> bool:
     choice -- its pages are resident, where a mapping's first use pays a fault.
     """
     from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        host_copies_are_redundant,
         host_copies_would_not_fit,
         host_memory_available_bytes,
     )
 
+    if host_copies_are_redundant():
+        logger.info(
+            "%s stays on its checkpoint mapping: host and device share one "
+            "memory pool, so a copy would hold the same bytes twice.",
+            component,
+        )
+        return True
     if not host_copies_would_not_fit(weight_bytes):
         return False
     logger.info(
@@ -449,6 +609,27 @@ def _list_safetensors_files(
     return filter_duplicate_precision_variant_safetensors(found)
 
 
+def _load_safetensors_file(path: str) -> dict[str, torch.Tensor]:
+    """One safetensors file; a read-only mapping where host copies are redundant.
+
+    safetensors maps for torch through a private *writable* mapping, and on a
+    shared CPU/GPU pool a device copy from such a mapping copies every page it
+    touches into anonymous memory (the driver pins with write intent). A
+    read-only mapping copies at full speed and stays page cache.
+    """
+    from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        host_copies_are_redundant,
+    )
+
+    if host_copies_are_redundant():
+        from sglang.multimodal_gen.runtime.loader.readonly_safetensors import (
+            load_safetensors_readonly,
+        )
+
+        return load_safetensors_readonly(path)
+    return safetensors_load_file(path)
+
+
 def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     """Load one safetensors checkpoint, including an indexed sharded set."""
     index_path = _select_safetensors_index_file(model_path, _DEFAULT_SAFETENSORS_INDEX)
@@ -456,7 +637,7 @@ def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     if index_path is not None:
         state_dict: dict[str, torch.Tensor] = {}
         for path in safetensors_files:
-            state_dict.update(safetensors_load_file(path))
+            state_dict.update(_load_safetensors_file(path))
         return state_dict
 
     if not safetensors_files:
@@ -466,7 +647,7 @@ def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
             f"Found {len(safetensors_files)} safetensors files in {model_path} "
             "and no index to disambiguate them."
         )
-    return safetensors_load_file(safetensors_files[0])
+    return _load_safetensors_file(safetensors_files[0])
 
 
 BYTES_PER_GB = 1024**3
@@ -608,6 +789,8 @@ def component_residency_bytes(module) -> Dict[str, int]:
     for tensor in module.parameters():
         add(tensor)
     for tensor in module.buffers():
+        add(tensor)
+    for tensor in (weight_snapshot(module) or {}).values():
         add(tensor)
     for manager in getattr(module, "layerwise_offload_managers", None) or []:
         iter_cpu_weights = getattr(manager, "iter_cpu_weights", None)

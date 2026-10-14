@@ -13,7 +13,8 @@ separate region at the end of each page.
 
 import logging
 import math
-from typing import Optional
+from functools import lru_cache
+from typing import FrozenSet, Optional, Tuple
 
 import torch
 import triton
@@ -264,6 +265,34 @@ def _flash_mla_sm120_prefill(
         mid_lse=None,
     )
     return (output.unsqueeze(1), None)
+
+
+@lru_cache(maxsize=1)
+def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
+    """Read the installed FlashInfer DSV4 decode capabilities once."""
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _DECODE_DSV4_DISPATCH,
+            _DECODE_MAX_TOKENS,
+        )
+    except (AttributeError, ImportError):
+        return 0, frozenset()
+
+    return int(_DECODE_MAX_TOKENS), frozenset(
+        heads for heads, _ in _DECODE_DSV4_DISPATCH
+    )
+
+
+def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
+    """Return whether FlashInfer supports this DSV4 decode head count.
+
+    Keep this capability check fail-closed because SGLang can be used with a
+    locally installed FlashInfer even though the release dependency is pinned.
+    The padded 64-head decode path remains the safe fallback for older builds.
+    Prefill head selection is handled separately by the caller.
+    """
+    decode_max_tokens, supported_heads = _flashinfer_dsv4_decode_capabilities()
+    return num_tokens <= decode_max_tokens and num_heads in supported_heads
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
@@ -671,12 +700,15 @@ def _validate_flashinfer_sparse_mla_backend(
             f"decode_impl={decode_impl!r}."
         )
     if is_glm_sm12_fp8:
-        unsupported = selected - {"flashinfer_sparse_mla"}
+        # flashinfer_sparse_mla stays the auto-selected default on this
+        # platform; triton_sparse_mla is a validated alternative prefill
+        # implementation that the user may select explicitly.
+        unsupported = selected - {"flashinfer_sparse_mla", "triton_sparse_mla"}
         if unsupported:
             raise ValueError(
                 "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
-                "only flashinfer_sparse_mla, "
-                f"but got {sorted(unsupported)}."
+                "only flashinfer_sparse_mla (default) or triton_sparse_mla "
+                f"(prefill), but got {sorted(unsupported)}."
             )
     return uses_flashinfer_sparse_mla
 
