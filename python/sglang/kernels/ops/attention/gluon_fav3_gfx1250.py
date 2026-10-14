@@ -896,6 +896,8 @@ def select_fav3_launch_config(
             and os.environ.get("SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT", "0") == "1"
         )
         schedule = "wan_self" if use_fixed_shift else "pingpong"
+        if use_fixed_shift:
+            scheduler = "amdgpu-sched-strategy=max-ilp,amdgpu-post-ra-direction=topdown"
         return FAv3LaunchConfig(schedule, 256, 64, 8, True, scheduler)
     return FAv3LaunchConfig(
         "pipeline",
@@ -1056,6 +1058,7 @@ def gluon_fav3_attention(
             num_warps=config.num_warps,
             waves_per_eu=2 if config.schedule in ("pingpong", "wan_self") else 1,
             llvm_fn_attrs=config.llvm_fn_attrs,
+            enable_fp_fusion=config.schedule == "wan_self",
         )
     return output
 
