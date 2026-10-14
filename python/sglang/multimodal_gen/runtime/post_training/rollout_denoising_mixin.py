@@ -67,15 +67,13 @@ class RolloutDenoisingMixin:
             if batch.rollout_trajectory_data is None:
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
             batch.rollout_trajectory_data.rollout_log_probs = (
-                SchedulerRLMixin.collect_rollout_log_probs(
-                    scheduler._get_rollout_session_data(batch)
-                )
+                scheduler._get_rollout_session_data(batch).collect_rollout_log_probs()
             )
             if batch.rollout_debug_mode:
                 batch.rollout_trajectory_data.rollout_debug_tensors = (
-                    SchedulerRLMixin.collect_rollout_debug_tensors(
-                        scheduler._get_rollout_session_data(batch), batch
-                    )
+                    scheduler._get_rollout_session_data(
+                        batch
+                    ).collect_rollout_debug_tensors(batch)
                 )
             scheduler.release_rollout_resources(batch)
 
