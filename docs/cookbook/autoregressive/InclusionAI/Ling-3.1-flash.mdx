@@ -30,10 +30,6 @@ Pick your hardware to generate the launch command:
 
 For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. The combination is verified: prefix hits return from Mooncake L3 on every TP rank.
 
-<Note>
-DSpark is not available for Ling-3.1-flash yet: a compatible draft checkpoint does not exist. The built-in NEXTN head is the speculative path.
-</Note>
-
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/inclusionAI/ling-3.1-flash.jsx";
 import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.1-flash-benchmarks.jsx";
@@ -64,7 +60,6 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 - On H200, enable `SGLANG_ENABLE_FP8_BLOCK_GEMV=1` and `SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1`. Both are included in the generated commands; they are no-ops on GB300 (SM10x).
 - Leave `--mem-fraction-static` at its default. SGLang auto-selects the `ling3` reasoning and tool-call parsers for this architecture; you can change the parser settings in the Playground.
 - **NEXTN:** add `--speculative-algorithm NEXTN` for built-in MTP speculative decoding. Measured acceptance length is 2.61 on random tokens and 2.13 on real-text probes.
-- **DSpark:** the [Ling-3.0-flash draft](https://huggingface.co/inclusionAI/Ling-3.0-flash-dspark) targets a 2,560-wide, 42-layer model. Ling-3.1-flash uses width 4,096 and 72 layers, so that draft is incompatible. Wait for a 3.1-compatible draft.
 - For prefix-heavy, multi-turn workloads, select **Cache fork and tail** in the Playground. It combines `--mamba-radix-cache-strategy extra_buffer`, `--chunked-prefill-size 4096`, and `SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK=1`. GPU checks confirmed both fork and tail states are cached, saving about 576 tokens per subsequent turn in the measured workload.
 
 ### Playground support

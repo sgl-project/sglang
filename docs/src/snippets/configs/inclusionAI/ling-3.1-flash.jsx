@@ -110,12 +110,6 @@ export const config = {
         { id: "current", label: "Inherited from base" },
         { id: "off", label: "Off" },
         { id: "nextn", label: "NEXTN (built-in MTP)", flags: ["--speculative-algorithm NEXTN"] },
-        {
-          id: "dspark",
-          label: "DSpark — no compatible draft",
-          disable: true,
-          disableReason: "A compatible Ling-3.1-flash draft checkpoint is required. The Ling-3.0-flash draft is incompatible.",
-        },
       ],
     },
     hicache: {
