@@ -671,18 +671,7 @@ class Scheduler:
         self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
-        if self.spec_algorithm.is_none():
-            self.draft_worker = None
-            self.external_corpus_manager = None
-            return
-
-        if (
-            envs.SGLANG_ENABLE_PP_SPEC.get()
-            and get_parallel().pp_size > 1
-            and get_parallel().pp_rank != get_parallel().pp_size - 1
-        ):
-            # PP+spec: the draft model (MTP layer) needs final hidden states and
-            # the lm_head, both of which live on the last PP stage only.
+        if not worker_setup.runs_draft_worker(self.spec_algorithm):
             self.draft_worker = None
             self.external_corpus_manager = None
             return

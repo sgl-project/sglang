@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.configs.model_config import is_deepseek_v4
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -92,6 +93,22 @@ def init_moe_gemm_config(hf_text_config) -> None:
     initialize_fp8_gemm_config()
     initialize_fp4_gemm_config()
     initialize_bf16_gemm_config()
+
+
+def runs_draft_worker(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    """Whether this rank runs a draft worker for speculative decoding."""
+    if spec_algorithm.is_none():
+        return False
+
+    if (
+        envs.SGLANG_ENABLE_PP_SPEC.get()
+        and get_parallel().pp_size > 1
+        and get_parallel().pp_rank != get_parallel().pp_size - 1
+    ):
+        # PP+spec: the draft model (MTP layer) needs final hidden states and
+        # the lm_head, both of which live on the last PP stage only.
+        return False
+    return True
 
 
 def alloc_target_memory_pool(*, tp_worker, draft_worker) -> None:
