@@ -1797,7 +1797,7 @@ class TestPrefillAdder(CustomTestCase):
                         req = self._create_host_hit_req(host_hit=24, tail=8)
                         req.host_hit_length -= 4
                         tree_cache.init_load_back.side_effect = lambda params: (
-                            torch.arange(24),
+                            24,
                             params.req.last_node,
                         )
                         kwargs.update(page_size=2, rem_chunk_tokens=8)
