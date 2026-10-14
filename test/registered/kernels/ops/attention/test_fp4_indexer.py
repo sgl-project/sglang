@@ -633,8 +633,8 @@ def test_hopper_indexer_backends_replay(ratio):
         token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
     )
     full = FullTopKIndexer(**kwargs, use_deep_gemm_decode=False)
-    # This replay test checks the paged select_decode output contract; DeepSelect
-    # decode is covered by test_deep_select.py.
+    # This replay test pins the select_decode contract (sorted picks); the
+    # DeepSelect replay contract lives in test_hopper_deep_select_full_topk_replay.
     full.use_deep_select_decode = False
     candidates = DenseBlocksBackend(
         **kwargs, candidate_topk_blocks=4, candidate_block_size=8
@@ -759,7 +759,7 @@ def test_hopper_deep_select_full_topk_replay(ratio):
     from sglang.srt.layers.attention.dsv4.v41_indexer.full_topk import FullTopKIndexer
     from sglang.srt.layers.attention.dsv4.v41_indexer.types import DecodeInputs
 
-    batch, width, topk = 12, 193, 512
+    batch, width, topk = 12, 1025, 512
     # DeepSelect rejects score rows whose byte stride is not a multiple of 128
     # (entry.cuh); production keeps lmax page-granular through the
     # max_compressed_seq_len property, so the mock's capacity must be too.
@@ -827,7 +827,7 @@ def test_hopper_deep_select_full_topk_replay(ratio):
     with torch.cuda.graph(graph):
         run()
 
-    for step, visible in enumerate([193, 0, 1, 63, 64, 65, 193]):
+    for step, visible in enumerate([1025, 0, 1, 511, 512, 513, 1025]):
         lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
         positions.copy_(lens * ratio - 1)
         req.copy_(req.roll(1))
