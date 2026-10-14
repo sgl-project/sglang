@@ -8,6 +8,25 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.runtime_context import get_buffer
 
 
+def use_mega_paged_prefill(
+    num_query_tokens: int,
+    seq_lens: list[int],
+    compress_ratio: int,
+    num_heads: int,
+) -> bool:
+    if (
+        num_heads != 64
+        or compress_ratio not in (1, 2)
+        or not 0 < num_query_tokens <= 1024
+        or not seq_lens
+    ):
+        return False
+    # Gathered prefill dequantizes a rectangular request-by-context workspace.
+    # GB300 sweeps favor paged reads when this cost dominates a short extension.
+    gather_tokens = len(seq_lens) * (max(seq_lens) // compress_ratio)
+    return gather_tokens >= max(32768, 192 * num_query_tokens)
+
+
 def mega_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     tables = get_buffer("dsv4_mega_cos_sin", dict)
     key = freqs_cis.data_ptr()

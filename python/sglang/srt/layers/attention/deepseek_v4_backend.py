@@ -65,6 +65,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.mega_attention import use_mega_paged_prefill
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -3724,10 +3725,25 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
+            use_mega_paged = (
+                self.mega_attn
+                and extra_k_cache is not None
+                and extra_k_cache.shape[-1] == 288
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and forward_batch.seq_lens_cpu is not None
+                and use_mega_paged_prefill(
+                    q.shape[0],
+                    forward_batch.seq_lens_cpu.tolist(),
+                    compress_ratio,
+                    q.shape[-2],
+                )
+            )
+
             # The tail stays dense: its window floor lives in swa_page_indices,
             # which the sparse chunk cache ignores.
             if (
                 self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
+                and not use_mega_paged
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):
