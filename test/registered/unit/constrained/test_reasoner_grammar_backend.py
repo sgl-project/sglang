@@ -574,6 +574,33 @@ class TestReasonerGrammarBackend(CustomTestCase):
         )
         self.assertTrue(grammar.is_terminated())
 
+    def test_inkling_framing_tokens_never_match_payload_text(self):
+        """Control tokens decode to their spellings; inside a JSON string an Inkling
+        constraint must not admit <|end_message|>, which would close the message."""
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        key = ("json", '{"type":"object","properties":{"a":{"type":"string"}}}')
+        for inkling in (True, False):
+            with self.subTest(inkling=inkling):
+                backend, tokenizer = self._make_xgrammar_backend()
+                if inkling:
+                    parser = SimpleNamespace(detector=InklingDetector())
+                    reasoner = ReasonerGrammarBackend(backend, parser, tokenizer)
+                    head = [ids[MESSAGE_MODEL], ids[CONTENT_TEXT]]
+                else:
+                    reasoner = ReasonerGrammarBackend(
+                        backend, self._make_parser(), tokenizer
+                    )
+                    head = tokenizer.encode("</think>")
+                grammar = reasoner._init_value_dispatch(key, reasoning=True)
+                self._accept_allowed_tokens(
+                    grammar, head + tokenizer.encode('{"a": "x'), backend.vocab_size
+                )
+                mask = self._vocab_mask(grammar, backend.vocab_size)
+                self.assertEqual(
+                    _allowed_token_ids(mask, [ord("y"), ids[END_MESSAGE]]),
+                    [ord("y")] if inkling else [ord("y"), ids[END_MESSAGE]],
+                )
+
     def test_inkling_strict_budget_caps_thinking_and_cannot_reopen_it(self):
         """Strict thinking caps the thinking message; after its end a header may only
         open the answer, and a turn that skips thinking is held to the payload."""

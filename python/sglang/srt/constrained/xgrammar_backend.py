@@ -16,7 +16,7 @@
 import dataclasses
 import json
 import logging
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from xgrammar import (
@@ -26,6 +26,7 @@ from xgrammar import (
     StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
+    VocabType,
     bitmask_dtype,
     get_bitmask_shape,
 )
@@ -241,12 +242,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
-        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
-        # The cache mixes up token-level structural tags of different shapes, so
-        # framed grammars compile uncached (seen on xgrammar 0.2.1 through 0.2.7).
-        self._framing_compiler = GrammarCompiler(
-            tokenizer_info=tokenizer_info, cache_enabled=False
-        )
+        self._init_compilers(tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
@@ -255,6 +251,33 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     @property
     def is_support_token_filter(self):
         return True
+
+    def _init_compilers(self, tokenizer_info: TokenizerInfo) -> None:
+        self._tokenizer_info = tokenizer_info
+        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        # The cache mixes up token-level structural tags of different shapes, so
+        # framed grammars compile uncached (seen on xgrammar 0.2.1 through 0.2.7).
+        self._framing_compiler = GrammarCompiler(
+            tokenizer_info=tokenizer_info, cache_enabled=False
+        )
+
+    def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
+        info = self._tokenizer_info
+        reserved = set(token_ids)
+        # A leading 0xFF is invalid UTF-8, so no text grammar can match these;
+        # token-level structural-tag elements still match them by id.
+        vocab = [
+            b"\xff" + piece if token_id in reserved else piece
+            for token_id, piece in enumerate(info.decoded_vocab)
+        ]
+        self._init_compilers(
+            TokenizerInfo(
+                vocab,
+                VocabType.RAW,
+                vocab_size=info.vocab_size,
+                stop_token_ids=info.stop_token_ids,
+            )
+        )
 
     def compile_framed_grammar(
         self, grammar: XGrammarGrammar, frame: Callable[[dict], dict]

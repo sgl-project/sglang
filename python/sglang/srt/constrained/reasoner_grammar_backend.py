@@ -22,6 +22,7 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
 from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_MODEL_END_SAMPLING,
     CONTENT_TEXT,
     CONTENT_THINKING,
     END_MESSAGE,
@@ -364,6 +365,16 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self._is_inkling_detector = isinstance(
             reasoning_parser.detector, InklingReasoningDetector
         )
+        if self._is_inkling_detector:
+            # Inkling's control tokens decode to their literal spellings, so text
+            # positions such as JSON strings would otherwise admit <|end_message|>.
+            self.grammar_backend.reserve_framing_tokens(
+                [
+                    token_id
+                    for token, token_id in INKLING_SPECIAL_TOKEN_IDS.items()
+                    if token != CONTENT_MODEL_END_SAMPLING
+                ]
+            )
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
         )

@@ -229,6 +229,9 @@ class BaseGrammarBackend:
         """Cache key for this request's grammar; may depend on how the prompt ends."""
         return key
 
+    def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
+        """Let ``token_ids`` match only token-level framing, never grammar text."""
+
     def compile_framed_grammar(
         self, grammar: BaseGrammarObject, frame: Callable[[dict], dict]
     ) -> Optional[BaseGrammarObject]:
