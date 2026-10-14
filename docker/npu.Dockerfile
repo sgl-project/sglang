@@ -38,6 +38,7 @@ ARG ZBAL_VERSION_A3="1.1.3"
 
 ENV ASCEND_HOME_PATH=/usr/local/Ascend/cann-${CANN_VERSION}
 ENV LD_LIBRARY_PATH=/usr/local/Ascend/cann-${CANN_VERSION}/lib64:/usr/local/Ascend/cann-${CANN_VERSION}/lib:/usr/local/Ascend/cann-${CANN_VERSION}/x86_64-linux/devlib/device:/usr/local/Ascend/driver/lib64:/usr/local/lib:${LD_LIBRARY_PATH}
+ENV ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/cann-${CANN_VERSION}/opp/vendors/custom_transformer:/usr/local/Ascend/cann-${CANN_VERSION}/opp/vendors/customize
 
 RUN touch /etc/environment_new
 
@@ -147,7 +148,6 @@ RUN mkdir cann-custom-ops && \
     ${PIP_INSTALL} custom_ops-1.0-cp312-cp312-linux_$(arch).whl && \
     cd .. && rm -rf cann-custom-ops
 
-ENV ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/cann-${CANN_VERSION}/opp/vendors/custom_transformer:/usr/local/Ascend/cann-${CANN_VERSION}/opp/vendors/customize
 
 RUN printf '%s\n' \
     '. /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash' \
