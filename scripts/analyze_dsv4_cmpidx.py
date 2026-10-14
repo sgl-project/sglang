@@ -794,6 +794,7 @@ def report_idxk_aligned(rows):
     print(f"  [IDXK-ALIGNED] evolving (partially-written) pages: "
           f"{sorted(evolving)}")
     tb = _idxk_evolve_table(rows)
+    _still_diff = set()  # evolving pages whose FULLY-ASSEMBLED hash still differs
     for key in sorted(evolving):
         by_req = {}
         for req, lp, h in tb[key]:
@@ -812,20 +813,29 @@ def report_idxk_aligned(rows):
             print(f"     req{req} {role} first(lp={s['first_lp']})="
                   f"{s['first']} last(lp={s['last_lp']})={s['last']}")
         conv = "CONVERGED" if len(finals) == 1 else "STILL-DIFF"
+        if len(finals) > 1:
+            _still_diff.add(key)
         print(f"     fully-assembled hashes={finals} => {conv}")
     aligned_groups = _idxk_aligned_groups(rows, evolving)
     aligned_div = sorted((ly, b) for (ly, b), s in aligned_groups.items()
                          if len(s) > 1)
-    artifact = sorted(k for k in raw_div if k in evolving)
-    real = sorted(k for k in raw_div if k not in evolving)
+    artifact = sorted(k for k in raw_div if k in evolving and k not in _still_diff)
+    # A page whose FULLY-ASSEMBLED hash still differs across requests is a REAL
+    # divergence, NOT a sampling artifact (sampling only explains a first-vs-last
+    # gap WITHIN one request that CONVERGES).  Previously such pages were dropped
+    # from `real` and the verdict wrongly printed CLEAN.
+    real = sorted(set(k for k in raw_div if k not in evolving) | _still_diff)
     if not real:
         print(f"  [IDXK-ALIGNED] VERDICT: every raw divergent page "
               f"{sorted(raw_div)} is an EVOLVING tail page {artifact} "
               f"-> MISS==HIT on all prefill-WRITTEN pages => index-K CLEAN "
               f"(raw divergence is a sampling-time artifact)")
     else:
+        _sd = sorted(_still_diff)
         print(f"  [IDXK-ALIGNED] VERDICT: artifact page(s)={artifact}; REAL "
-              f"divergence remains on {real} => index-K NOT clean")
+              f"divergence remains on {real}"
+              + (f" (fully-assembled STILL differs on {_sd})" if _sd else "")
+              + " => index-K NOT clean")
     if aligned_div:
         print(f"  [IDXK-ALIGNED] non-evolving divergent groups: {aligned_div}")
 
@@ -1054,11 +1064,17 @@ def _cmp_aligned_roles(cmp_reqs, c4pos_rows, idxin_rows):
                 return (f"idxin:{source}", list(miss_set), list(hit_idx), note)
     if len(cmp_reqs) >= 2:
         ntoks = [_cmpidx_ntok0(g) for g in cmp_reqs]
-        mi = ntoks.index(max(ntoks))
-        hit = [j for j in range(len(cmp_reqs)) if j != mi and cmp_reqs[j]]
-        if hit:
-            return ("largest-ntok", [mi], hit,
-                    "no [C4POS]/[IDXIN]; MISS=largest prefill ntok")
+        mx = max(ntoks)
+        # MISS = ALL requests at the largest prefill ntok (the harness sends N
+        # identical full-prefill MISS followed by 1 suffix HIT, so the old
+        # single-max rule collapsed req0..req{N-1} into one MISS and mislabeled
+        # req1..req{N-1} as HIT). HIT = every request below the max.
+        miss = [j for j in range(len(cmp_reqs)) if cmp_reqs[j] and ntoks[j] == mx]
+        hit = [j for j in range(len(cmp_reqs)) if cmp_reqs[j] and ntoks[j] != mx]
+        if miss and hit:
+            return ("largest-ntok", miss, hit,
+                    f"no [C4POS]/[IDXIN]; MISS=ALL largest-ntok prefill "
+                    f"(ntok={mx}) {miss}")
     return "none", [], [], "no usable MISS/HIT split"
 
 
@@ -3457,20 +3473,40 @@ def main(path):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if recs.get("CMPIDX"):
         cmp_reqs = segment(recs["CMPIDX"])
-        miss_i = max(range(len(cmp_reqs)), key=lambda i: (cmp_reqs[i]["ntok0"] or 0))
+        _ntoks = [(rq["ntok0"] or 0) for rq in cmp_reqs]
+        _mx = max(_ntoks) if _ntoks else 0
+        # MISS = ALL requests at the largest prefill ntok. The harness sends N
+        # identical full-prefill MISS then 1 suffix HIT; the old single-max rule
+        # marked only ONE MISS and labeled the other N-1 MISS as HIT.
+        miss_set = {i for i, n in enumerate(_ntoks) if n == _mx}
+        hit_set = {i for i in range(len(cmp_reqs))} - miss_set
         print("\n== requests (classified by [CMPIDX] prefill ntok) ==")
         for i, rq in enumerate(cmp_reqs[:MAX_REQ_SHOWN]):
-            role = "MISS" if i == miss_i else "HIT "
+            role = "MISS" if i in miss_set else "HIT "
             print(f"  req{i:<2} {role} prefill_ntok={rq['ntok0']}"
                   f"  steps={len(rq['steps'])}")
         if len(cmp_reqs) > MAX_REQ_SHOWN:
             print(f"  ... {len(cmp_reqs) - MAX_REQ_SHOWN} more requests")
-        print(f"\nMISS = req{miss_i} (largest prefill ntok); each HIT compared to it.")
+        print(f"\nMISS = req{sorted(miss_set)} (ALL largest prefill ntok={_mx}); "
+              f"each HIT compared to them.")
+        miss_i = min(miss_set) if miss_set else 0
     else:
-        # No [CMPIDX]: fall back to per-tag segments; req0 = MISS (best effort).
+        # No [CMPIDX]: ntok is unavailable, so use the harness convention --
+        # N full-prefill MISS followed by ONE suffix HIT => the LAST request is
+        # the HIT, every earlier request is a MISS.  (The old "req0 = MISS" rule
+        # mislabeled req1..req{N-1} -- which are ALSO MISS -- as HIT.)
         cmp_reqs = None
+        _nreq = 0
+        for _t in ("IDXK", "C4POS", "LHID", "C4DEC", "WSTAGE", "XIN", "LIMETA",
+                   "OSHAPE", "C4KV", "C128KV"):
+            if recs.get(_t):
+                _nreq = len(segment(recs[_t]))
+                break
         miss_i = 0
-        print("\nno [CMPIDX] lines; per-tag request split used (req0 = MISS).")
+        hit_set = {_nreq - 1} if _nreq >= 1 else set()
+        print(f"\nno [CMPIDX] lines; split by harness convention: "
+              f"req0..req{max(0, _nreq - 2)} MISS (same-side), "
+              f"req{max(0, _nreq - 1)} HIT   [{_nreq} requests].")
 
     for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "KSTATELOC", "C4POS", "C4DEC", "WSTAGE"):
         rows = recs.get(tag, [])
@@ -3589,7 +3625,8 @@ def main(path):
             if i == miss_i or (cmp_reqs is not None and i >= len(cmp_reqs)):
                 continue
             n, same, pre, n_pre = compare(tag, reqs[miss_i]["steps"], rq["steps"])
-            print(f"  MISS(req{miss_i}) vs HIT(req{i}): lastpos={n}"
+            _role = "HIT " if (not hit_set or i in hit_set) else "MISS"
+            print(f"  MISS(req{miss_i}) vs {_role}(req{i}): lastpos={n}"
                   f"  SAME-SHAPE differing={len(same)} (real)"
                   f"  PREFILL rows={n_pre} differing={len(pre)} (tail-only)")
             for (lp, ly, a, b) in (same + pre)[:MAX_DIFF_SHOWN]:
