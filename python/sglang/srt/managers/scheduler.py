@@ -26,7 +26,17 @@ from array import array
 from collections import deque
 from contextlib import ExitStack, nullcontext
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Any,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -3594,7 +3604,12 @@ class Scheduler:
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
 
-    def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+    def _add_request_to_queue(
+        self,
+        req: Req,
+        is_retracted: bool = False,
+        admitted: AbstractSet[Req] = frozenset(),
+    ):
         if not self._set_or_validate_priority(req):
             self._release_aborted_request(req)
             return
@@ -3608,7 +3623,7 @@ class Scheduler:
         elif self.disagg_decode is not None:
             self.disagg_decode.enqueue(req, is_retracted=is_retracted)
         else:
-            if self._abort_on_queued_limit(req):
+            if self._abort_on_queued_limit(req, admitted):
                 self._release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
@@ -3655,11 +3670,20 @@ class Scheduler:
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
 
-    def _abort_on_queued_limit(self, recv_req: Req) -> bool:
-        """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
+    def _abort_on_queued_limit(
+        self, recv_req: Req, admitted: AbstractSet[Req] = frozenset()
+    ) -> bool:
+        """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted.
+
+        The requests in ``admitted`` belong to the step being built: they
+        leave the queue at its launch, so they neither count nor are aborted.
+        """
+        waiting = self.waiting_queue
+        if admitted:
+            waiting = [r for r in waiting if r not in admitted]
         if (
             self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
+            or len(waiting) + 1 <= self.max_queued_requests
         ):
             return False
 
@@ -3672,17 +3696,17 @@ class Scheduler:
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
             # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
             direction = 1 if self.schedule_low_priority_values_first else -1
-            key_fn = lambda item: (
-                direction * item[1].priority,
-                item[1].time_stats.wait_queue_entry_time,
+            key_fn = lambda req: (
+                direction * req.priority,
+                req.time_stats.wait_queue_entry_time,
             )
-            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+            candidate_req = max(waiting, key=key_fn)
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
                 self._release_aborted_request(candidate_req)
-                self.waiting_queue.pop(idx)
+                self.waiting_queue.remove(candidate_req)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -4378,8 +4402,9 @@ class Scheduler:
             preempted = set(adder.preempt_list)
             self.decoding = [r for r in self.decoding if r not in preempted]
             running_reqs = slot.filter_decoding(self.decoding)
+            admitted = set(adder.can_run_list)
             for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+                self._add_request_to_queue(req, admitted=admitted)
 
         # The admitted requests stay in the waiting queue until the launch.
         can_run_list: List[Req] = adder.can_run_list

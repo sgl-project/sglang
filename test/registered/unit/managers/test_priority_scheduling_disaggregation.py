@@ -196,6 +196,42 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                     self.assertEqual(scheduler.waiting_queue, [incoming])
                     scheduler._prefetch_kvcache.assert_called_once_with(incoming)
 
+    def test_full_queue_skips_the_requests_a_step_admits(self):
+        """A request preempted while a prefill step is built is requeued before
+        that step's admissions leave the queue at its launch: they neither
+        count toward the limit nor are aborted."""
+        for limit, expected_abort in ((2, None), (1, "queued")):
+            with self.subTest(max_queued_requests=limit):
+                scheduler = self._new_scheduler(DisaggregationMode.NULL)
+                del scheduler._abort_on_queued_limit  # Exercise the real queue check.
+                scheduler.max_queued_requests = limit
+                scheduler.tree_cache = MagicMock(spec=["finish"])
+                scheduler.beam_coordinator = MagicMock()
+                admitted = self._new_req(priority=0)
+                admitted.rid = "admitted"
+                queued = self._new_req(priority=1)
+                queued.rid = "queued"
+                scheduler.waiting_queue = [admitted, queued]
+                preempted = self._new_req(priority=2)
+                preempted.rid = "preempted"
+
+                with patch(
+                    "sglang.srt.managers.scheduler.get_serving",
+                    return_value=SimpleNamespace(weight_version="v0"),
+                ):
+                    scheduler._add_request_to_queue(preempted, admitted={admitted})
+
+                send_output = scheduler.ipc_channels.send_to_tokenizer.send_output
+                if expected_abort is None:
+                    send_output.assert_not_called()
+                    self.assertEqual(
+                        scheduler.waiting_queue, [admitted, queued, preempted]
+                    )
+                else:
+                    send_output.assert_called_once()
+                    self.assertIs(send_output.call_args.args[1], queued)
+                    self.assertEqual(scheduler.waiting_queue, [admitted, preempted])
+
 
 class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
     def _new_unpublished_swa_state(self):
