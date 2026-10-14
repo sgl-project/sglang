@@ -1,5 +1,6 @@
 """Unit tests for prefill CUDA graph wrapper helpers."""
 
+import inspect
 import unittest
 from contextlib import nullcontext
 from functools import partial
@@ -267,6 +268,19 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 )
                 self.assertEqual(kwargs, expected)
                 layer_model.forward(None, None, forward_batch, **kwargs)
+
+    def test_decoder_bodies_take_positions_before_forward_batch(self):
+        """Breakable and full prefill capture pass the decoder body
+        (input_ids, positions, forward_batch) positionally; another order swaps them."""
+        from sglang.srt.models.persimmon import PersimmonModel
+        from sglang.srt.models.phi import PhiModel
+
+        for body in (PhiModel, PersimmonModel):
+            with self.subTest(body=body.__name__):
+                params = list(inspect.signature(body.forward).parameters)
+                self.assertEqual(
+                    params[1:4], ["input_ids", "positions", "forward_batch"]
+                )
 
     def test_finalize_pp_proxy_trims_padded_token_rows(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
