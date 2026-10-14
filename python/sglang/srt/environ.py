@@ -2071,9 +2071,6 @@ def third_party_cache_defaults() -> Dict[str, str]:
     }
 
 
-ROCPROFILER_REGISTER_LIBRARY = "ROCPROFILER_REGISTER_LIBRARY"
-
-
 def _rocprofiler_sdk_already_loaded() -> bool:
     """Check whether this process has already loaded a rocprofiler-sdk library.
 
@@ -2107,13 +2104,13 @@ def clear_inherited_rocprofiler_registration():
     process, so it never disturbs a profiler that is really collecting data.
     The process must call this function before it imports torch.
     """
-    if os.environ.get(ROCPROFILER_REGISTER_LIBRARY) is None:
+    if os.environ.get("ROCPROFILER_REGISTER_LIBRARY") is None:
         return
     if envs.SGLANG_KEEP_INHERITED_ROCPROFILER_REGISTER.get():
         return
     if _rocprofiler_sdk_already_loaded():
         return
-    os.environ.pop(ROCPROFILER_REGISTER_LIBRARY, None)
+    os.environ.pop("ROCPROFILER_REGISTER_LIBRARY", None)
 
 
 def redirect_third_party_caches():
