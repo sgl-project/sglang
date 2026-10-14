@@ -23,6 +23,9 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
+)
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (  # noqa: E402
     MultiEndedAllocator,
 )
@@ -82,12 +85,13 @@ def _installed_gate(test: CustomTestCase, scheduler: _FakeScheduler):
     enter_scope(test, published_topology())
     get_context().override("test.unified_memory", enable_unified_memory=True)
     s = Scheduler.__new__(Scheduler)
-    s.disagg_prefill = (
+    s.mode_owners = ModeOwners()
+    s.mode_owners.disagg_prefill = (
         scheduler.disagg_prefill
         if scheduler.disaggregation_mode == DisaggregationMode.PREFILL
         else None
     )
-    s.disagg_decode = (
+    s.mode_owners.disagg_decode = (
         scheduler.disagg_decode
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE
         else None

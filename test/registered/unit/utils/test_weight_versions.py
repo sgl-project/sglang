@@ -9,6 +9,7 @@ from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.weight_versions import (
@@ -306,17 +307,18 @@ def _scheduler_stub(
     version, decoding, waiting, chunked=None, hisparse=None, mode=None
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.mode_owners = ModeOwners()
     scheduler.lists = CoreLists()
     scheduler.serving = _ServingStub(version)
     scheduler.lists.decoding = decoding
     scheduler.lists.waiting_queue = waiting
     scheduler.lists.chunked_req = chunked
     scheduler.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=None)
-    scheduler.dllm = None
-    scheduler.hisparse_coordinator = hisparse
+    scheduler.mode_owners.dllm = None
+    scheduler.mode_owners.hisparse_coordinator = hisparse
     scheduler.disaggregation_mode = mode or DisaggregationMode.NULL
-    scheduler.disagg_prefill = None
-    scheduler.disagg_decode = None
+    scheduler.mode_owners.disagg_prefill = None
+    scheduler.mode_owners.disagg_decode = None
     scheduler.request_registry = request_registry_of(scheduler)
     return scheduler
 
@@ -374,7 +376,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         retracted_req = _ReqStub(4)
         held_req = _ReqStub(6)
         scheduler = self._scheduler("v1", [], [], mode=DisaggregationMode.DECODE)
-        scheduler.disagg_decode = decode_owner_shell(
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             prealloc_queue=SimpleNamespace(
                 queue=[],
                 retracted_queue=[retracted_req],

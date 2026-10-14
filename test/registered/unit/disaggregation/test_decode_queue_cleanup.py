@@ -31,6 +31,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import (
     ModeStages,
     ScheduleSlot,
@@ -586,6 +587,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def _decode_scheduler(self, *, retracted=(), held=(), releasing=()):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
@@ -596,12 +598,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.grammar_manager = SimpleNamespace(
             grammar_queue=[], abort_requests=MagicMock()
         )
-        scheduler.dllm = None
-        scheduler.hisparse_coordinator = None
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = None
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.flags._engine_paused = False
-        scheduler.disagg_prefill = None
-        scheduler.disagg_decode = decode_owner_shell(
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             prealloc_queue=SimpleNamespace(
                 queue=[],
                 retracted_queue=list(retracted),
@@ -729,7 +731,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler = self._decode_scheduler(held=[held, kept])
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
-        scheduler.dllm = None
+        scheduler.mode_owners.dllm = None
         scheduler.ipc_channels = MagicMock()
         release_aborted_request = MagicMock()
         retirer = RequestRetirer(

@@ -26,6 +26,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
@@ -94,18 +95,19 @@ def _rank(rank):
 
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
+    scheduler.mode_owners = ModeOwners()
     scheduler.lists = CoreLists()
     scheduler.lists.waiting_queue = [req]
-    scheduler.lists.chunked_req = scheduler.mm_receiver = scheduler.dllm = None
+    scheduler.lists.chunked_req = scheduler.mm_receiver = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL
-    scheduler.disagg_prefill = None
-    scheduler.disagg_decode = None
+    scheduler.mode_owners.disagg_prefill = None
+    scheduler.mode_owners.disagg_decode = None
     scheduler.tree_cache = MagicMock()
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()
     scheduler.grammar_manager = MagicMock()
     scheduler.lists.decoding = []
-    scheduler.hisparse_coordinator = None
+    scheduler.mode_owners.hisparse_coordinator = None
     scheduler.request_retirer = RequestRetirer(
         kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
         beam_coordinator=scheduler.beam_coordinator,

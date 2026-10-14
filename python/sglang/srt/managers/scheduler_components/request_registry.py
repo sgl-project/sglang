@@ -18,20 +18,17 @@ from sglang.srt.runtime_context import get_memory
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.constrained.grammar_manager import GrammarManager
-    from sglang.srt.disaggregation.decode import DisaggDecode
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.disaggregation.encoder.receiver import MMReceiverBase
-    from sglang.srt.disaggregation.prefill import DisaggPrefill
-    from sglang.srt.dllm.manager import DllmManager
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler_components.bundles import KvResources
     from sglang.srt.managers.scheduler_components.ipc_channels import (
         SchedulerIpcChannels,
     )
+    from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
@@ -53,10 +50,7 @@ class RequestRegistry:
         mm_receiver: Optional[MMReceiverBase],
         pending: PendingSteps,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
-        disagg_prefill: Optional[DisaggPrefill],
-        disagg_decode: Optional[DisaggDecode],
-        dllm: Optional[DllmManager],
-        hisparse_coordinator: Optional[HiSparseCoordinator],
+        mode_owners: ModeOwners,
     ):
         self.core_lists = core_lists
         self.grammar_manager = grammar_manager
@@ -67,12 +61,8 @@ class RequestRegistry:
         self.mm_receiver = mm_receiver
         self.pending = pending
         self.decode_offload_manager = decode_offload_manager
-        # The mode owners. A PD role switch replaces them, and the scheduler
-        # then builds a new registry.
-        self.disagg_prefill = disagg_prefill
-        self.disagg_decode = disagg_decode
-        self.dllm = dllm
-        self.hisparse_coordinator = hisparse_coordinator
+        # Read at call time: a PD role switch replaces the owners.
+        self.mode_owners = mode_owners
 
     def queued_reqs(self) -> List[Req]:
         """The requests waiting for admission, in list order."""
@@ -129,17 +119,17 @@ class RequestRegistry:
                 inflight=True,
                 abort=self._defer_chunked_abort,
                 health_check=True,
-                retract_on_pause=self.disagg_prefill is None,
+                retract_on_pause=self.mode_owners.disagg_prefill is None,
             ),
         ]
-        if self.disagg_prefill is not None:
-            lists += self.disagg_prefill.lists()
-        if self.disagg_decode is not None:
-            lists += self.disagg_decode.lists()
-        if self.dllm is not None:
-            lists += self.dllm.lists()
-        if self.hisparse_coordinator is not None:
-            lists += self.hisparse_coordinator.lists()
+        if self.mode_owners.disagg_prefill is not None:
+            lists += self.mode_owners.disagg_prefill.lists()
+        if self.mode_owners.disagg_decode is not None:
+            lists += self.mode_owners.disagg_decode.lists()
+        if self.mode_owners.dllm is not None:
+            lists += self.mode_owners.dllm.lists()
+        if self.mode_owners.hisparse_coordinator is not None:
+            lists += self.mode_owners.hisparse_coordinator.lists()
         return {entry.name: entry for entry in lists}
 
     def abort_request(self, recv_req: AbortReq):
@@ -173,8 +163,8 @@ class RequestRegistry:
             self.ipc_channels.send_to_tokenizer.send_output(
                 make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
-            if self.disagg_prefill is not None:
-                self.disagg_prefill.release_aborted_waiting_req(req)
+            if self.mode_owners.disagg_prefill is not None:
+                self.mode_owners.disagg_prefill.release_aborted_waiting_req(req)
             # For mamba radix cache
             elif req.kv.holds_mamba:
                 release_kv_cache(req, self.tree_cache, checkpoint=False)

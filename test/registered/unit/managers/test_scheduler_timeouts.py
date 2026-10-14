@@ -25,6 +25,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -67,6 +68,7 @@ def _req(
 
 def _scheduler(waiting_queue, decoding=(), chunked_req=None):
     s = Scheduler.__new__(Scheduler)
+    s.mode_owners = ModeOwners()
     s.lists = CoreLists()
     s.lists.waiting_queue = waiting_queue
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
@@ -74,11 +76,11 @@ def _scheduler(waiting_queue, decoding=(), chunked_req=None):
     s.lists.decoding = list(decoding)
     s.lists.chunked_req = chunked_req
     s.disaggregation_mode = DisaggregationMode.NULL
-    s.disagg_prefill = None
-    s.disagg_decode = None
+    s.mode_owners.disagg_prefill = None
+    s.mode_owners.disagg_decode = None
     s.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=MagicMock())
-    s.dllm = None
-    s.hisparse_coordinator = None
+    s.mode_owners.dllm = None
+    s.mode_owners.hisparse_coordinator = None
     return s
 
 

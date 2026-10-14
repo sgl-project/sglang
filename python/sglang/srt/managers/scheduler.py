@@ -278,6 +278,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import (
     DriverOps,
     ModeStages,
@@ -602,6 +603,7 @@ class Scheduler:
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
+        self.init_mode_owners()
         self.init_hisparse_coordinator()
 
         if (
@@ -710,13 +712,13 @@ class Scheduler:
 
         self.init_request_retirer()
 
+        self.init_request_registry()
+
         self.maybe_init_dllm()
 
         self.maybe_init_disagg_prefill()
 
         self.maybe_init_disagg_decode()
-
-        self.init_request_registry()
 
         self.maybe_init_disagg_move_gate()
 
@@ -1300,13 +1302,35 @@ class Scheduler:
             max_running_requests=self.max_running_requests,
         )
 
+    def init_mode_owners(self) -> None:
+        self.mode_owners = ModeOwners()
+
+    # The mode owners, read through the holder a PD role switch updates.
+    @property
+    def disagg_prefill(self) -> Optional[DisaggPrefill]:
+        return self.mode_owners.disagg_prefill
+
+    @property
+    def disagg_decode(self) -> Optional[DisaggDecode]:
+        return self.mode_owners.disagg_decode
+
+    @property
+    def dllm(self) -> Optional[DllmManager]:
+        return self.mode_owners.dllm
+
+    @property
+    def hisparse_coordinator(self) -> Optional[HiSparseCoordinator]:
+        return self.mode_owners.hisparse_coordinator
+
     def init_hisparse_coordinator(self) -> None:
-        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.mode_owners.hisparse_coordinator = None
         if not get_memory().enable_hisparse:
             return
 
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
-        self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+        self.mode_owners.hisparse_coordinator = (
+            self.tp_worker.model_runner.hisparse_coordinator
+        )
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def init_running_status(self):
@@ -1527,9 +1551,9 @@ class Scheduler:
 
     def maybe_init_disagg_prefill(self) -> None:
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
-            self.disagg_prefill = None
+            self.mode_owners.disagg_prefill = None
             return
-        self.disagg_prefill = DisaggPrefill(
+        self.mode_owners.disagg_prefill = DisaggPrefill(
             server_args=self.server_args,
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
@@ -1556,9 +1580,9 @@ class Scheduler:
 
     def maybe_init_disagg_decode(self) -> None:
         if self.disaggregation_mode != DisaggregationMode.DECODE:
-            self.disagg_decode = None
+            self.mode_owners.disagg_decode = None
             return
-        self.disagg_decode = DisaggDecode(
+        self.mode_owners.disagg_decode = DisaggDecode(
             server_args=self.server_args,
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
@@ -1585,7 +1609,6 @@ class Scheduler:
         )
 
     def init_request_registry(self) -> None:
-        """Built after the mode owners; a PD role switch rebuilds it."""
         self.request_registry = RequestRegistry(
             core_lists=self.lists,
             grammar_manager=self.grammar_manager,
@@ -1596,10 +1619,7 @@ class Scheduler:
             mm_receiver=self.mm_receiver,
             pending=self.pending,
             decode_offload_manager=self.decode_offload_manager,
-            disagg_prefill=self.disagg_prefill,
-            disagg_decode=self.disagg_decode,
-            dllm=self.dllm,
-            hisparse_coordinator=self.hisparse_coordinator,
+            mode_owners=self.mode_owners,
         )
 
     def maybe_init_disagg_move_gate(self) -> None:
@@ -2829,9 +2849,9 @@ class Scheduler:
 
     def maybe_init_dllm(self) -> None:
         if get_exec().dllm.dllm_algorithm is None:
-            self.dllm = None
+            self.mode_owners.dllm = None
             return
-        self.dllm = DllmManager(
+        self.mode_owners.dllm = DllmManager(
             dllm_config=DllmConfig.from_server_args(self.server_args),
             kv=self.kv,
             services=self.services,
@@ -5285,7 +5305,7 @@ class Scheduler:
         )
 
     # The abort RPC handler, and the callbacks of the components built before
-    # the registry (a PD role switch rebuilds it).
+    # the registry.
     def request_lists(self) -> Dict[str, RequestList]:
         return self.request_registry.request_lists()
 

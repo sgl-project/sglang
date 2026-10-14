@@ -33,6 +33,9 @@ from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E40
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
@@ -190,6 +193,7 @@ class _Shell:
         self.ready_at = ready_at or {}
         self.results = {}
         s = self.s = Scheduler.__new__(Scheduler)
+        s.mode_owners = ModeOwners()
         s.counters = LaunchCounters()
         s.flags = EngineFlags()
         s.lists = CoreLists()
@@ -210,7 +214,7 @@ class _Shell:
         s.enable_unified_memory = False
         s.enable_fpm = False
         s.enable_hisparse = False
-        s.hisparse_coordinator = None
+        s.mode_owners.hisparse_coordinator = None
         s.require_mlp_sync = False
         s.is_generation = True
         s.tp_size = 2
@@ -218,19 +222,19 @@ class _Shell:
         s._prefill_decode_interval_remaining = 0
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.scripted_scheduler_hook = _Hook(self)
-        s.dllm = None
-        s.disagg_prefill = None
-        s.disagg_decode = None
+        s.mode_owners.dllm = None
+        s.mode_owners.disagg_prefill = None
+        s.mode_owners.disagg_decode = None
         s.disaggregation_mode = DisaggregationMode.NULL
         if mode == "prefill":
-            s.disagg_prefill = _PrefillOwner(self)
+            s.mode_owners.disagg_prefill = _PrefillOwner(self)
             s.disaggregation_mode = DisaggregationMode.PREFILL
         elif mode == "decode":
-            s.disagg_decode = _DecodeOwner(self)
+            s.mode_owners.disagg_decode = _DecodeOwner(self)
             s.disaggregation_mode = DisaggregationMode.DECODE
             s.decode_offload_manager = None
         elif mode == "dllm":
-            s.dllm = _DllmOwner(self)
+            s.mode_owners.dllm = _DllmOwner(self)
 
         s.ingest_requests = self.ingest_requests
         s._record_scheduler_state_for_paused_engine = lambda: self.log("paused")

@@ -122,7 +122,6 @@ def handle_pd_role_switch(
             scheduler.init_disaggregation()
             scheduler.maybe_init_disagg_prefill()
             scheduler.maybe_init_disagg_decode()
-            scheduler.init_request_registry()
             scheduler.maybe_init_disagg_move_gate()
             scheduler.init_mode_stages()
         except Exception as e:
@@ -221,19 +220,19 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
 
 def _current_kv_manager(scheduler: Scheduler):
     """The KV manager of the current role's owner, or None."""
-    owner = scheduler.disagg_prefill or scheduler.disagg_decode
+    owner = scheduler.mode_owners.disagg_prefill or scheduler.mode_owners.disagg_decode
     return owner.kv_manager if owner is not None else None
 
 
 def teardown_disaggregation(scheduler: Scheduler) -> None:
     """Release the current role's owner (its queues, metadata buffers and KV
     transfer manager) so the other role can be rebuilt."""
-    if scheduler.disagg_prefill is not None:
-        scheduler.disagg_prefill.kv_manager.teardown()
-        scheduler.disagg_prefill = None
-    elif scheduler.disagg_decode is not None:
-        scheduler.disagg_decode.kv_manager.teardown()
-        scheduler.disagg_decode = None
+    if scheduler.mode_owners.disagg_prefill is not None:
+        scheduler.mode_owners.disagg_prefill.kv_manager.teardown()
+        scheduler.mode_owners.disagg_prefill = None
+    elif scheduler.mode_owners.disagg_decode is not None:
+        scheduler.mode_owners.disagg_decode.kv_manager.teardown()
+        scheduler.mode_owners.disagg_decode = None
         # clear socket ctx in CommonKVReceiver
         CommonKVReceiver.close_all_sockets()
     _release_prefix_cache_for_role_switch(scheduler)

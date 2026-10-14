@@ -30,6 +30,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
@@ -87,6 +88,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = _Scheduler.__new__(_Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
@@ -101,7 +103,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
-        scheduler.hisparse_coordinator = MagicMock()
+        scheduler.mode_owners.hisparse_coordinator = MagicMock()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
@@ -116,13 +118,13 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             )
         )
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.disagg_prefill = None
-        scheduler.disagg_decode = None
-        scheduler.dllm = None
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = None
+        scheduler.mode_owners.dllm = None
         scheduler.grammar_manager = SimpleNamespace(
             grammar_queue=[], abort_requests=None
         )
-        scheduler.hisparse_coordinator = None
+        scheduler.mode_owners.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
         scheduler.server_args = MagicMock()
         scheduler.lists.waiting_queue = []
@@ -236,7 +238,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         if offload:
             self.assertTrue(manager.offload_kv_cache(req))
         scheduler.decode_offload_manager = manager
-        scheduler.disagg_decode = decode_owner_shell(
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             prealloc_queue=MagicMock(), decode_offload_manager=manager
         )
 
@@ -296,6 +298,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def test_paused_engine_accounting_uses_current_scheduler_state(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.metrics_sink = MagicMock()
         scheduler.request_registry = MagicMock()
 
@@ -379,7 +382,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_retract_releases_via_scheduler_hisparse_coordinator(self):
         """retract must release through the scheduler-owned hisparse coordinator."""
         scheduler = self._new_scheduler()
-        scheduler.hisparse_coordinator = MagicMock()
+        scheduler.mode_owners.hisparse_coordinator = MagicMock()
         scheduler.hisparse_coordinator.lists.return_value = []
         last_req = self._make_req("last")
         scheduler.lists.decoding = [last_req]
@@ -491,7 +494,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        scheduler.disagg_prefill = prefill_owner_shell()
+        scheduler.mode_owners.disagg_prefill = prefill_owner_shell()
         scheduler._add_request_to_queue = MagicMock()
 
         chunked_req = MagicMock()
@@ -517,9 +520,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 scheduler.enable_overlap = True
                 scheduler.disaggregation_mode = mode
                 if mode == DisaggregationMode.PREFILL:
-                    scheduler.disagg_prefill = prefill_owner_shell()
+                    scheduler.mode_owners.disagg_prefill = prefill_owner_shell()
                 if mode == DisaggregationMode.DECODE:
-                    scheduler.disagg_decode = decode_owner_shell()
+                    scheduler.mode_owners.disagg_decode = decode_owner_shell()
                 batch = ScheduleBatch(reqs=[], forward_mode=ForwardMode.EXTEND)
                 result = SimpleNamespace(delay_sample_func=None)
                 self._push_pending(scheduler, batch, result)
@@ -538,7 +541,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler._add_request_to_queue = MagicMock()
-        scheduler.disagg_decode = decode_owner_shell(prealloc_queue=MagicMock())
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
+            prealloc_queue=MagicMock()
+        )
 
         req = SimpleNamespace(
             finished=lambda: False,
@@ -568,7 +573,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         and KV; retract must rebuild it too, so a paused flush cannot free it."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler.disagg_decode = decode_owner_shell(prealloc_queue=MagicMock())
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
+            prealloc_queue=MagicMock()
+        )
 
         def _req(rid):
             return SimpleNamespace(
@@ -673,7 +680,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler.disagg_decode = decode_owner_shell(prealloc_queue=MagicMock())
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
+            prealloc_queue=MagicMock()
+        )
         scheduler.flags._engine_paused = True
 
         scheduler.continue_generation(

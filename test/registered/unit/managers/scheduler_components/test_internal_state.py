@@ -10,6 +10,7 @@ from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
     UpdateRejected,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_registry import (
     RequestRegistry,
 )
@@ -21,7 +22,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _prefill_registry(transfer) -> RequestRegistry:
     return make_request_registry(
-        disagg_prefill=prefill_owner_shell(transfer=list(transfer))
+        mode_owners=ModeOwners(
+            disagg_prefill=prefill_owner_shell(transfer=list(transfer))
+        )
     )
 
 

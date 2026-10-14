@@ -17,6 +17,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
@@ -110,8 +111,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 scheduler = self.make_scheduler(schedule)
                 if mode == ForwardMode.DECODE:
                     scheduler.disaggregation_mode = DisaggregationMode.DECODE
-                    scheduler.disagg_prefill = None
-                    scheduler.disagg_decode = _decode_owner()
+                    scheduler.mode_owners.disagg_prefill = None
+                    scheduler.mode_owners.disagg_decode = _decode_owner()
                     scheduler.decode_offload_manager = None
                 if poll_pending_copy:
                     # Each pending copy adds one intake pass before completing.
@@ -379,6 +380,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.lists = CoreLists()
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
@@ -395,8 +397,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.enable_overlap = True
         scheduler.is_generation = True
-        scheduler.dllm = None
-        scheduler.hisparse_coordinator = None
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = None
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.request_registry = SimpleNamespace(
             poll_timeout_aborts=Mock(return_value=[])
@@ -418,7 +420,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
         )
         scheduler.process_input_requests = Mock()
-        scheduler.disagg_prefill = prefill_owner_shell(
+        scheduler.mode_owners.disagg_prefill = prefill_owner_shell(
             bootstrap_queue=SimpleNamespace(pop_bootstrapped=Mock(return_value=[])),
             enable_staging=False,
             tp_size=scheduler.tp_size,
@@ -429,7 +431,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 waiting,
             ),
         )
-        scheduler.disagg_decode = None
+        scheduler.mode_owners.disagg_decode = None
         scheduled_batches = iter(schedule)
         # Intake ends the test; extra admission attempts simply find no work.
         scheduler.schedule = lambda: next(scheduled_batches, None)
@@ -487,7 +489,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
-        scheduler.disagg_decode = _decode_owner()
+        scheduler.mode_owners.disagg_decode = _decode_owner()
         scheduler.decode_offload_manager = None
 
 

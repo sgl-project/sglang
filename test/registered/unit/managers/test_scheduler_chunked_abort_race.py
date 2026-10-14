@@ -17,6 +17,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
+)
 from sglang.test.scheduler_request_lists import request_registry_of  # noqa: E402
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -43,18 +46,19 @@ class _FakeReq:
 
 def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = Scheduler.__new__(Scheduler)
+    sched.mode_owners = ModeOwners()
     sched.lists = CoreLists()
     sched.lists.chunked_req = chunked_req
     sched.lists._pending_chunked_abort_req = pending_req
     sched.lists.waiting_queue = []
-    sched.dllm = None
+    sched.mode_owners.dllm = None
     sched.grammar_manager = Mock()
     sched.disaggregation_mode = None
-    sched.disagg_prefill = None
-    sched.disagg_decode = None
+    sched.mode_owners.disagg_prefill = None
+    sched.mode_owners.disagg_decode = None
     sched.mm_receiver = None
     sched.lists.decoding = list(running_reqs)
-    sched.hisparse_coordinator = None
+    sched.mode_owners.hisparse_coordinator = None
     sched.request_registry = request_registry_of(sched)
     return sched
 

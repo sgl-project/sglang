@@ -13,6 +13,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers import scheduler as scheduler_mod  # noqa: E402
 from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -20,14 +23,17 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 def _scheduler(order: Mock, *, mode: str) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
+    s.mode_owners = ModeOwners()
     s.lists = CoreLists()
     s.scheduler_stage_metrics = None
     s.publish_load_snapshot = Mock(return_value=None)
     s.load_publisher = Mock()
     s.load_inquirer = Mock()
-    s.hisparse_coordinator = None
-    s.dllm = order.dllm if mode == "dllm" else None
-    s.disagg_prefill = order.disagg_prefill if mode == "pd_prefill" else None
+    s.mode_owners.hisparse_coordinator = None
+    s.mode_owners.dllm = order.dllm if mode == "dllm" else None
+    s.mode_owners.disagg_prefill = (
+        order.disagg_prefill if mode == "pd_prefill" else None
+    )
     order.disagg_prefill.commit_extend.return_value = ["waiting"]
     s.batch_result_processor = order.processor
     s.batch_result_processor.process_batch_result_decode.return_value = 7

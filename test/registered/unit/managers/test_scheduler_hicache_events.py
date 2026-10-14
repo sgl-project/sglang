@@ -17,6 +17,7 @@ from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.bundles import Streams
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.runtime_context import get_context
 from sglang.test.disagg_owner_shells import prefill_owner_shell
@@ -28,6 +29,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
     def setUp(self):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
+        self.scheduler.mode_owners = ModeOwners()
         s.lists = CoreLists()
         s.counters = LaunchCounters()
         s.scheduler_stage_metrics = None
@@ -46,16 +48,16 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.process_pending_chunked_abort = Mock()
         s.lists.chunked_req = None
         s.pending = []
-        s.disagg_prefill = prefill_owner_shell(
+        s.mode_owners.disagg_prefill = prefill_owner_shell(
             resolve_waiting_bootstrap=lambda waiting: waiting,
             process_prefill_chunk=lambda chunked_req, waiting, pending: (
                 chunked_req,
                 waiting,
             ),
         )
-        s.disagg_decode = None
-        s.dllm = None
-        s.hisparse_coordinator = None
+        s.mode_owners.disagg_decode = None
+        s.mode_owners.dllm = None
+        s.mode_owners.hisparse_coordinator = None
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         s._arm_prefill_decode_interval = Mock()
@@ -126,7 +128,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.enable_fpm = False
         s._abort_on_waiting_timeout = Mock()
         s._abort_on_running_timeout = Mock()
-        s.disagg_prefill = None
+        s.mode_owners.disagg_prefill = None
         s.lists.chunked_req = None
         s.require_mlp_sync = False
         s._should_defer_prefill = self.calls.defer

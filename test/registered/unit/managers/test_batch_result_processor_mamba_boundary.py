@@ -22,6 +22,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
@@ -138,13 +139,14 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         result = _make_result()
 
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.disagg_prefill = None
-        scheduler.disagg_decode = None
-        scheduler.dllm = None
-        scheduler.hisparse_coordinator = None
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = None
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = None
         scheduler.flags.gracefully_exit = False
         scheduler.flat_slot = ScheduleSlot()
         scheduler.ingest_requests = MagicMock(side_effect=[[], [], [], StopIteration])

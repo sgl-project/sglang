@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.test.scheduler_request_lists import request_registry_of
 
@@ -34,18 +35,19 @@ class TestHiSparseStagingList(unittest.TestCase):
         prefill commit finished leaves staging at that commit."""
         live, done = _Req("live", 0), _Req("done", 1)
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.lists = CoreLists()
         scheduler.lists.waiting_queue = [live, done]
         scheduler.lists.decoding = []
         scheduler.lists.chunked_req = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.disagg_prefill = None
-        scheduler.disagg_decode = None
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = None
         scheduler.grammar_manager = SimpleNamespace(
             grammar_queue=[], abort_requests=None
         )
-        scheduler.dllm = None
-        scheduler.hisparse_coordinator = HiSparseCoordinator.__new__(
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = HiSparseCoordinator.__new__(
             HiSparseCoordinator
         )
         scheduler.hisparse_coordinator.staging = []

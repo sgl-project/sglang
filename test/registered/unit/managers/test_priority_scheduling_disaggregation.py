@@ -27,6 +27,9 @@ from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E40
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
@@ -57,6 +60,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
     def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
@@ -71,12 +75,12 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler._prefetch_kvcache = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler._abort_on_queued_limit = MagicMock(return_value=False)
-        scheduler.disagg_prefill = (
+        scheduler.mode_owners.disagg_prefill = (
             prefill_owner_shell(bootstrap_queue=MagicMock(), num_kv_heads=8)
             if disaggregation_mode == DisaggregationMode.PREFILL
             else None
         )
-        scheduler.disagg_decode = (
+        scheduler.mode_owners.disagg_decode = (
             decode_owner_shell(prealloc_queue=MagicMock())
             if disaggregation_mode == DisaggregationMode.DECODE
             else None
@@ -468,7 +472,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             ),
             ipc_channels=ipc_channels,
             kv=kv,
-            disagg_prefill=disagg_prefill,
+            mode_owners=ModeOwners(disagg_prefill=disagg_prefill),
         )
 
         with (
@@ -923,6 +927,7 @@ class TestDecodeAdmission(unittest.TestCase):
 
     def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
@@ -930,7 +935,7 @@ class TestDecodeAdmission(unittest.TestCase):
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.lists.waiting_queue = []
         scheduler.lists.decoding = []
-        scheduler.disagg_decode = decode_owner_shell(
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             kv_checksum_computer=None,
             enable_priority_scheduling=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,

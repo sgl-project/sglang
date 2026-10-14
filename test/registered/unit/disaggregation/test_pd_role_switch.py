@@ -11,6 +11,9 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
+)
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -33,6 +36,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
 
     def _scheduler(self, mode, *, enable=True, idle=True):
         s = Scheduler.__new__(Scheduler)
+        s.mode_owners = ModeOwners()
         s.disaggregation_mode = mode
         sa = ServerArgs(
             model_path="dummy",
@@ -48,10 +52,9 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_disaggregation = MagicMock()
         s.maybe_init_disagg_prefill = MagicMock()
         s.maybe_init_disagg_decode = MagicMock()
-        s.init_request_registry = MagicMock()
         s.init_mode_stages = MagicMock()
-        s.disagg_prefill = None
-        s.disagg_decode = None
+        s.mode_owners.disagg_prefill = None
+        s.mode_owners.disagg_decode = None
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False
         s._pd_role_switch_unhealthy = False
@@ -171,8 +174,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertEqual(s.server_args.disaggregation_mode, "prefill")
         s.init_disaggregation.assert_called_once()
         s.maybe_init_disagg_decode.assert_called_once()
-        # The new owner's registry and stages replace the old one's.
-        s.init_request_registry.assert_called_once()
+        # The new owner's stages replace the old one's.
         s.init_mode_stages.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
@@ -599,10 +601,10 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
     def test_teardown_invokes_release(self):
         s = _radix_scheduler(disable_radix_cache=False)
         kv_manager = MagicMock()
-        s.disagg_prefill = SimpleNamespace(kv_manager=kv_manager)
+        s.mode_owners.disagg_prefill = SimpleNamespace(kv_manager=kv_manager)
         teardown_disaggregation(s)
         kv_manager.teardown.assert_called_once_with()
-        self.assertIsNone(s.disagg_prefill)
+        self.assertIsNone(s.mode_owners.disagg_prefill)
         s.tree_cache.reset.assert_called_once_with()
 
 

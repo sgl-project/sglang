@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List
 from unittest.mock import Mock
 
 from sglang.srt.managers.request_lists import CoreLists
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_registry import (
     RequestRegistry,
@@ -30,10 +31,7 @@ def make_request_registry(**deps) -> RequestRegistry:
         mm_receiver=None,
         pending=PendingSteps(),
         decode_offload_manager=None,
-        disagg_prefill=None,
-        disagg_decode=None,
-        dllm=None,
-        hisparse_coordinator=None,
+        mode_owners=ModeOwners(),
     )
     args.update(deps)
     return RequestRegistry(**args)
@@ -49,10 +47,7 @@ _SCHEDULER_FIELDS = {
     "mm_receiver": "mm_receiver",
     "pending": "pending",
     "decode_offload_manager": "decode_offload_manager",
-    "disagg_prefill": "disagg_prefill",
-    "disagg_decode": "disagg_decode",
-    "dllm": "dllm",
-    "hisparse_coordinator": "hisparse_coordinator",
+    "mode_owners": "mode_owners",
 }
 
 

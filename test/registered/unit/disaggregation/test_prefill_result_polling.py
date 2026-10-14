@@ -39,6 +39,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
@@ -203,6 +204,10 @@ class _Scheduler:
     commit_step = Scheduler.commit_step
     commit_pending_steps = Scheduler.commit_pending_steps
     leave_finished_reqs = Scheduler.leave_finished_reqs
+    disagg_prefill = Scheduler.disagg_prefill
+    disagg_decode = Scheduler.disagg_decode
+    dllm = Scheduler.dllm
+    hisparse_coordinator = Scheduler.hisparse_coordinator
 
     def __init__(
         self,
@@ -236,7 +241,7 @@ class _Scheduler:
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.is_generation = True
-        self.dllm = None
+        self.mode_owners = ModeOwners()
         self.tp_cpu_group = None
         self.tp_size = 1
         self.attn_cp_cpu_group = None
@@ -255,7 +260,6 @@ class _Scheduler:
         self.enable_unified_cache_external_linker = False
         self.require_mlp_sync = False
         self.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=Mock())
-        self.hisparse_coordinator = None
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
         )
@@ -291,8 +295,7 @@ class _Scheduler:
             maybe_set_extend_view=lambda batch: None,
         )
         self._arm_prefill_decode_interval = Mock()
-        self.disagg_prefill = _Owner(self)
-        self.disagg_decode = None
+        self.mode_owners.disagg_prefill = _Owner(self)
 
     def apply_config(self):
         get_context().override(

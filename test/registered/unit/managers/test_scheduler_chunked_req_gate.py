@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
@@ -63,12 +64,13 @@ def _make_tree_cache() -> BasePrefixCache:
 
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
+    s.mode_owners = ModeOwners()
     s.lists = CoreLists()
     s.scheduler_stage_metrics = None
     s.scripted_scheduler_hook = None
     s.disaggregation_mode = DisaggregationMode.NULL
-    s.disagg_prefill = None
-    s.dllm = None
+    s.mode_owners.disagg_prefill = None
+    s.mode_owners.dllm = None
     s.enable_hisparse = False
     s.enable_fpm = False
     # Exercise the unconditional scheduler-loop HiCache event-drain point.
@@ -94,8 +96,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.tree_cache = tree_cache
     s.lists.chunked_req = chunked_req
     s.lists._pending_chunked_abort_req = None
-    s.disagg_decode = None
-    s.hisparse_coordinator = None
+    s.mode_owners.disagg_decode = None
+    s.mode_owners.hisparse_coordinator = None
     s.init_mode_stages()
     return s
 

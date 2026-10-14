@@ -17,6 +17,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.runtime_context import get_context
 from sglang.test.scheduler_request_lists import request_registry_of
@@ -46,6 +47,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
     def _new_scheduler(self) -> Scheduler:
         enter_scope(self, published_topology())
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.counters = LaunchCounters()
         scheduler.flags = EngineFlags()
         scheduler.lists = CoreLists()
@@ -54,13 +56,13 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.cur_batch = None
         scheduler.lists.chunked_req = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.disagg_prefill = None
-        scheduler.disagg_decode = None
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = None
         scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
         scheduler.lists.waiting_queue = []
-        scheduler.dllm = None
-        scheduler.hisparse_coordinator = None
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []

@@ -25,6 +25,9 @@ from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E40
     EngineFlags,
     LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
+)
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ModeStages,
     ScheduleSlot,
@@ -62,6 +65,7 @@ class TestPPRingCommit(CustomTestCase):
             self, get_parallel().override(pp_size=2, pp_async_batch_depth=depth)
         )
         s = object.__new__(Scheduler)
+        s.mode_owners = ModeOwners()
         s.counters = LaunchCounters()
         s.flags = EngineFlags()
         s.lists = CoreLists()
@@ -162,14 +166,15 @@ class TestPPSlotTag(CustomTestCase):
         prefill chunk; another slot's step never decodes it while that slot's
         step may still be in flight."""
         s = object.__new__(Scheduler)
+        s.mode_owners = ModeOwners()
         s.counters = LaunchCounters()
         s.flags = EngineFlags()
         s.lists = CoreLists()
         s.disaggregation_mode = DisaggregationMode.NULL
-        s.disagg_prefill = None
-        s.disagg_decode = None
-        s.dllm = None
-        s.hisparse_coordinator = None
+        s.mode_owners.disagg_prefill = None
+        s.mode_owners.disagg_decode = None
+        s.mode_owners.dllm = None
+        s.mode_owners.hisparse_coordinator = None
         s.lists.decoding = []
         s.lists.waiting_queue = []
         s.pending = PendingSteps()
@@ -195,6 +200,7 @@ class TestPPSlotTag(CustomTestCase):
         counting only that slot's decoding requests."""
         enter_scope(self, published_topology(role="scheduler", pp_size=2))
         s = object.__new__(Scheduler)
+        s.mode_owners = ModeOwners()
         s.counters = LaunchCounters()
         s.flags = EngineFlags()
         s.lists = CoreLists()

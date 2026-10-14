@@ -13,6 +13,7 @@ from sglang.srt.dllm.prefill_adder import DllmPrefillAdder
 from sglang.srt.dllm.req_state import DllmReqPhase, DllmReqState
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -376,11 +377,12 @@ class TestGemma4RequestValidation(unittest.TestCase):
         from sglang.srt.runtime_context import get_context, get_parallel
 
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
         scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_sink = SimpleNamespace(enable_metrics=False)
         scheduler.tokenizer = None
-        scheduler.dllm = _manager(fdfo=False)
+        scheduler.mode_owners.dllm = _manager(fdfo=False)
         scheduler._maybe_namespace_elastic_radix_cache = Mock()
         scheduler._add_request_to_queue = Mock()
         scheduler.init_req_max_new_tokens = Mock()

@@ -290,6 +290,11 @@ _PARAM = {
     "StageMetrics": ("scheduler_stage_metrics",),
     "MetricsSink": ("metrics_sink",),
     "HiSparse": ("hisparse_coordinator",),
+    "DisaggPrefill": ("disagg_prefill",),
+    "DisaggDecode": ("disagg_decode",),
+    "DllmManager": ("dllm",),
+    "GrammarManager": ("grammar_manager",),
+    "MMReceiver": ("mm_receiver",),
     "OutputStreamer": ("output_streamer",),
     "BeamCoordinator": ("beam_coordinator",),
     "FutureMap": ("future_map",),
@@ -349,6 +354,11 @@ _BUILT = {
     "StepBuilder": ("managers/scheduler_components/step_builder.py", "StepBuilder"),
     "DisaggDecode": ("disaggregation/decode.py", "DisaggDecode"),
     "DisaggPrefill": ("disaggregation/prefill.py", "DisaggPrefill"),
+    "ModeOwners": ("managers/scheduler_components/mode_owners.py", "ModeOwners"),
+    "RequestRegistry": (
+        "managers/scheduler_components/request_registry.py",
+        "RequestRegistry",
+    ),
 }
 
 # The modules whose classes sit below ModeOwners.
@@ -564,10 +574,12 @@ def _scheduler_class() -> ast.ClassDef:
 def _scan_callback_sites() -> Counter:
     """R2: callables and self that Scheduler methods pass into calls."""
     cls = _scheduler_class()
+    # A property read passes a value, not a callable.
     methods = {
         node.name
         for node in cls.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and "property" not in map(ast.unparse, node.decorator_list)
     }
 
     def is_self(node):

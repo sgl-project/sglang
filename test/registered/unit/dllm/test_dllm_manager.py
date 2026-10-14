@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_request_lists import make_request_registry
@@ -116,7 +117,7 @@ class _Step:
 
 def _registry_over(manager):
     """A registry whose only live requests are the manager's."""
-    return make_request_registry(dllm=manager)
+    return make_request_registry(mode_owners=ModeOwners(dllm=manager))
 
 
 def _fdfo_result(blocks, accept_lengths, algo_states):

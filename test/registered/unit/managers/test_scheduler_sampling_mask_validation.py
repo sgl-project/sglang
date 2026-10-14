@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 
@@ -24,24 +25,25 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
                 scheduler = Scheduler.__new__(Scheduler)
+                scheduler.mode_owners = ModeOwners()
                 scheduler.model_config = SimpleNamespace(
                     hf_eos_token_id={1}, vocab_size=128
                 )
                 scheduler.disaggregation_mode = mode
                 buffers = SimpleNamespace(enable_sampling_mask=False)
-                scheduler.disagg_prefill = (
+                scheduler.mode_owners.disagg_prefill = (
                     prefill_owner_shell(metadata_buffers=buffers)
                     if mode == DisaggregationMode.PREFILL
                     else None
                 )
-                scheduler.disagg_decode = (
+                scheduler.mode_owners.disagg_decode = (
                     decode_owner_shell(metadata_buffers=buffers)
                     if mode == DisaggregationMode.DECODE
                     else None
                 )
                 scheduler.metrics_sink = SimpleNamespace(enable_metrics=False)
                 scheduler.tokenizer = None
-                scheduler.dllm = None
+                scheduler.mode_owners.dllm = None
                 scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
                 scheduler.spec_algorithm = SimpleNamespace(
                     is_dflash_family=lambda: False,
