@@ -75,7 +75,7 @@ class GlmAsrProcessor(BaseMultimodalProcessor):
         )
         if base_output is None:
             return None
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
         return MultimodalProcessorOutput(

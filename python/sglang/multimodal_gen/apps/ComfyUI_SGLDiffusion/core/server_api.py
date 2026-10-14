@@ -3,14 +3,11 @@ SGLang Diffusion Server API client.
 Provides a low-level interface for interacting with SGLang Diffusion HTTP server.
 """
 
-import base64
-import io
 import os
 import time
 from typing import Any, Dict, Optional
 
 import requests
-from PIL import Image
 
 
 class SGLDiffusionServerAPI:
@@ -52,13 +49,16 @@ class SGLDiffusionServerAPI:
             - vae_precision: VAE model precision
         """
         try:
-            # Remove /v1 from base_url for /models endpoint
-            models_url = self.base_url.removesuffix("/v1") + "/models"
-            response = requests.get(models_url, headers=self.headers, timeout=30)
+            response = requests.get(
+                f"{self.base_url}/models", headers=self.headers, timeout=30
+            )
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            return data["data"][0]
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to get model info: {str(e)}")
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"Unexpected response shape from /models: {str(e)}")
 
     def generate_image(
         self,
@@ -99,7 +99,8 @@ class SGLDiffusionServerAPI:
             seed: Random seed for reproducible generation
             enable_teacache: Enable TEA cache acceleration
             response_format: Response format ("b64_json" or "url")
-            quality: Image quality ("auto", "standard", "hd") - only for generation
+            quality: Request optimization tier ("auto", "exact",
+                "lossless", "high") - only for generation
             style: Image style ("vivid" or "natural") - only for generation
             background: Background type ("auto", "transparent", "opaque")
             output_format: Output format ("png", "jpeg", "webp")
@@ -219,6 +220,7 @@ class SGLDiffusionServerAPI:
         generator_device: Optional[str] = "cuda",
         input_reference: Optional[str] = None,
         output_path: Optional[str] = None,
+        extra_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generate a video using SGLang Diffusion API and wait for completion.
@@ -238,6 +240,10 @@ class SGLDiffusionServerAPI:
             enable_teacache: Enable TEA cache acceleration
             generator_device: Device for random generator ("cuda" or "cpu")
             input_reference: Path to input reference image for image-to-video
+            extra_fields: Model-specific request fields merged into the payload
+                last, so a caller can reach a model's own request surface
+                (MiniMax-H3's `task`/`conditions`/`target`, per-model flow
+                shifts) without this client growing a parameter per model
 
         Returns:
             Dictionary containing completed video job information with file_path
@@ -281,6 +287,10 @@ class SGLDiffusionServerAPI:
             payload["input_reference"] = input_reference
         if output_path:
             payload["output_path"] = output_path
+        # merged last so a model-specific field wins over a generic default of
+        # the same name (H3 sizes its output from `target`, not `size`)
+        if extra_fields:
+            payload.update(extra_fields)
 
         try:
             # Create video generation job
@@ -406,38 +416,6 @@ class SGLDiffusionServerAPI:
             ".webp": "image/webp",
         }
         return content_types.get(ext, "image/png")
-
-    def decode_image_from_response(
-        self, response_data: Dict[str, Any], index: int = 0
-    ) -> Image.Image:
-        """
-        Decode base64 image from API response.
-
-        Args:
-            response_data: API response dictionary
-            index: Index of the image in the response (default: 0)
-
-        Returns:
-            PIL Image object
-        """
-        if "data" not in response_data or not response_data["data"]:
-            raise ValueError("No image data in response")
-
-        if index >= len(response_data["data"]):
-            raise IndexError(f"Image index {index} out of range")
-
-        image_data = response_data["data"][index]
-        if "b64_json" not in image_data or not image_data["b64_json"]:
-            raise ValueError("No base64 image data found")
-
-        image_bytes = base64.b64decode(image_data["b64_json"])
-        image = Image.open(io.BytesIO(image_bytes))
-
-        # Convert to RGB if needed
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-
-        return image
 
     def set_lora(
         self,

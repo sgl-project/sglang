@@ -26,7 +26,7 @@ def _quant_k_cache_fused_kernel(
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     tile_id = tl.program_id(1)
 
     if tile_id == NUM_TILES:

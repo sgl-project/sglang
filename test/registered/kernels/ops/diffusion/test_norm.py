@@ -282,6 +282,19 @@ def test_wan_rmsnorm_silu_rejects_empty_input():
         wan_rmsnorm_silu(x, gamma)
 
 
+@torch.no_grad()
+def test_wan_rmsnorm_silu_rejects_non_dense_channel_rows():
+    # C=1 can report channels_last_3d compatibility while retaining NCTHW
+    # strides. The flat-row kernel requires stride(C)=1 and must fall back.
+    x = torch.randn(1, 1, 2, 3, 4, device=DEVICE, dtype=torch.bfloat16)
+    assert x.is_contiguous(memory_format=torch.channels_last_3d)
+    assert x.stride(1) != 1
+    gamma = torch.ones(1, 1, 1, 1, device=DEVICE, dtype=torch.float32)
+    assert not can_use_wan_rmsnorm_silu(x, gamma, None)
+    with pytest.raises(ValueError):
+        wan_rmsnorm_silu(x, gamma)
+
+
 # ---------------------------------------------------------------------------
 # CuTe-DSL fused (residual +) norm + scale/shift
 # ---------------------------------------------------------------------------

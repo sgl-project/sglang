@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import Cols, IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -49,6 +50,12 @@ class DFlashVerifyInput(SpecInput):
     # Committed/live lengths before the verify caller temporarily expands
     # batch.seq_lens_cpu to the target-attention KV lengths.
     live_seq_lens_cpu: Optional[torch.Tensor] = None
+    # Conservative request-lifetime bound for candidate graph dispatch.
+    candidate_max_seq_len_upper_bound: Optional[int] = None
+    # The iteration's plan when the caller planned the verify window, and the
+    # part of it this verify writes (`KVLocPlan.write_ids`).
+    kv_loc_plan: Optional[KVLocPlan] = None
+    kv_loc_cols: Optional[Cols] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -99,6 +106,8 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner,
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
+            kv_loc_plan=self.kv_loc_plan,
+            write_cols=self.kv_loc_cols,
         )
 
         can_run_cuda_graph = bool(
@@ -126,14 +135,21 @@ class DFlashVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        translator: KVIndexTranslator,
+        plan: KVLocPlan,
         kv_start_idx: Optional[torch.Tensor] = None,
+        kv_indices_buf: Optional[torch.Tensor] = None,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the translator packs the read ids straight into
+        ``kv_indices``."""
         device = req_pool_indices.device
-        bs = len(req_pool_indices)
+        bs = req_pool_indices.numel()
 
         layout = self.ragged_verify_layout
         if layout is not None and layout.bs != bs:
@@ -159,19 +175,26 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens = paged_kernel_lens + verify_lens
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + kv_indices_extra,
-            dtype=torch.int32,
-            device=device,
-        )
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            kv_start_idx,
-            kv_indices,
-            req_to_token.size(1),
+        if kv_indices_buf is not None:
+            # Sync-free fast-plan path: write straight into the attention
+            # backend's cuda-graph kv_indices buffer (the captured kernels read
+            # it), skipping both the fresh allocation and the wrapper plan()'s
+            # device-to-device refresh copy.
+            kv_indices = kv_indices_buf
+        else:
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum + kv_indices_extra,
+                dtype=torch.int32,
+                device=device,
+            )
+        translator.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            out=kv_indices,
+            kv_start_idx=kv_start_idx,
+            kind=kind,
         )
         mask = self.custom_mask
         if mask is not None:

@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class TritonRunnerInput(RunnerInput):
-
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -42,7 +41,6 @@ class TritonRunnerInput(RunnerInput):
 
 @dataclass
 class TritonRunnerOutput(RunnerOutput):
-
     hidden_states: torch.Tensor
 
     @property
@@ -74,8 +72,12 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     fuse_swiglu_interleaved: bool = False
 
 
-class TritonRunnerCore(MoeRunnerCore):
+def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
+    # only expert parallelism can route a token to an expert this rank does not hold
+    return config.num_experts is None or config.num_experts != config.num_local_experts
 
+
+class TritonRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
@@ -111,6 +113,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 gemm1_limit=self.config.gemm1_clamp_limit,
                 swiglu_limit=self.config.swiglu_limit,
                 gate_up_interleaved=self.config.gate_up_interleaved,
+                sanitize_topk_ids=_topk_ids_may_be_nonlocal(self.config),
             )
             return TritonRunnerOutput(hidden_states=out)
 
@@ -211,6 +214,7 @@ def fused_experts_none_to_triton(
             gemm1_limit=runner_config.gemm1_clamp_limit,
             swiglu_limit=runner_config.swiglu_limit,
             gate_up_interleaved=runner_config.gate_up_interleaved,
+            sanitize_topk_ids=_topk_ids_may_be_nonlocal(runner_config),
         )
     else:
         if quant_info.use_mxfp8 and is_cuda():

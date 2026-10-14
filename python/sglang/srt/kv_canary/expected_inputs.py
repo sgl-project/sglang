@@ -10,6 +10,10 @@ class ExpectedInputs:
     tokens: torch.Tensor
     positions: torch.Tensor
 
+    @staticmethod
+    def allocation_bytes(capacity: int) -> int:
+        return 2 * capacity * torch.int64.itemsize
+
     @classmethod
     def allocate(cls, *, capacity: int, device: torch.device) -> ExpectedInputs:
         return cls(

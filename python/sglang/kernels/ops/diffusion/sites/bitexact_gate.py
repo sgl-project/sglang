@@ -63,6 +63,13 @@ def flashinfer_rmsnorm_diagnostic_hint() -> str:
 class BitExactFusionGate:
     """Track permanent disable + first-sight ``torch.equal`` verification.
 
+    This is the ``exact`` tier's mechanism: it backs a fast path that is
+    bit-exact by construction, so the path mounts unconditionally and the gate
+    only catches the case where the dispatch it replicates changed underneath
+    it. A fast path whose rounding differs from the reference belongs to a
+    later tier and uses ``QualityGatedFusion`` instead, which mounts per
+    request from the tier declared in ``_QUALITY_FUSION_HANDLERS``.
+
     Two modes:
 
     * **once-for-all** (default): the first successful equal-check enables the

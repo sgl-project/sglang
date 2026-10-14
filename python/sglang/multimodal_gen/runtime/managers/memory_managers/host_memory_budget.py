@@ -13,19 +13,26 @@ container at 1117.2 GiB, a 900 GiB over-report. Serving runs in containers, so
 the cap is read directly from whichever cgroup version is mounted.
 """
 
-import psutil
+import os
+import weakref
 
+import psutil
+import torch
+
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 GIB_BYTES = 1024**3
 
-_CGROUP_V2 = ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current")
-_CGROUP_V1 = (
-    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+# (mount root, limit file, usage file), v2 before v1.
+_CGROUP_MOUNTS = (
+    ("/sys/fs/cgroup", "memory.max", "memory.current"),
+    ("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "memory.usage_in_bytes"),
 )
+_PROC_SELF_CGROUP = "/proc/self/cgroup"
 
 # An unlimited v1 cgroup reports a sentinel near 2**63 rather than omitting the
 # file, so treat anything implausibly large as "no cap".
@@ -37,6 +44,10 @@ _UNLIMITED_ABOVE = 1 << 62
 # nothing on a serving host.
 HOST_RESERVE_FRACTION = 0.05
 MIN_HOST_RESERVE_BYTES = 2 * GIB_BYTES
+
+# Left free when weighing a checkpoint against host memory: activations, staging
+# buffers and allocator slack are none of them in the weight total.
+HOST_COPY_RESERVE_BYTES = 4 * GIB_BYTES
 
 
 def _read_int(path: str) -> int | None:
@@ -53,15 +64,104 @@ def _read_int(path: str) -> int | None:
         return None
 
 
-def cgroup_memory_limit_bytes() -> tuple[int, int] | None:
-    """This process's (cap, usage) under its cgroup, or None when uncapped."""
-    for limit_path, usage_path in (_CGROUP_V2, _CGROUP_V1):
-        limit = _read_int(limit_path)
-        if limit is None or limit >= _UNLIMITED_ABOVE:
+def _own_cgroup_path() -> str:
+    """The cgroup path /proc reports for this process, or "" if it reports none."""
+    try:
+        with open(_PROC_SELF_CGROUP) as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) != 3:
             continue
-        usage = _read_int(usage_path) or 0
-        return limit, usage
+        # v2 leaves the controller field empty; v1 lists memory among its own
+        if not fields[1] or "memory" in fields[1].split(","):
+            return fields[2]
+    return ""
+
+
+def _cgroup_dirs(mount: str) -> list[str]:
+    """This process's cgroup directory and its ancestors up to `mount`.
+
+    The path /proc reports is relative to the host's cgroup root, while the
+    mount seen inside a container is already the container's own cgroup -- so
+    the two do not simply concatenate. Measured in a Docker container: /proc
+    says /docker/8e10..., and the deepest directory that exists under the mount
+    is the mount itself. Trying progressively shorter suffixes finds the leaf
+    whichever way the container was set up.
+    """
+    if not os.path.isdir(mount):
+        return []
+    parts = [part for part in _own_cgroup_path().split("/") if part]
+    leaf = mount
+    for start in range(len(parts)):
+        candidate = os.path.join(mount, *parts[start:])
+        if os.path.isdir(candidate):
+            leaf = candidate
+            break
+    dirs = [leaf]
+    while dirs[-1] != mount:
+        dirs.append(os.path.dirname(dirs[-1]))
+    return dirs
+
+
+# memory.stat keys for the page cache a cgroup is charged for: v2, then v1.
+_CGROUP_FILE_CACHE_KEYS = ("file", "cache")
+
+
+def _cgroup_file_cache_bytes(directory: str) -> int:
+    try:
+        with open(os.path.join(directory, "memory.stat")) as handle:
+            for line in handle:
+                key, _, value = line.partition(" ")
+                if key in _CGROUP_FILE_CACHE_KEYS:
+                    return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def cgroup_memory_limit_bytes(
+    *, exclude_file_cache: bool = False
+) -> tuple[int, int] | None:
+    """This process's (cap, usage) under its cgroup, or None when uncapped.
+
+    The tightest cap in the chain wins. A nested cgroup -- a systemd scope with
+    MemoryMax, a container started with --cgroup-parent -- holds this process
+    below whatever the mount root allows, and planning against the root would
+    commit memory the process cannot have.
+
+    A cgroup is charged for the page cache it touches, so its usage grows by
+    the whole checkpoint the process maps. ``exclude_file_cache`` reports the
+    anonymous share alone, for callers that may spend cache the kernel would
+    reclaim under the cap anyway.
+    """
+    for mount, limit_name, usage_name in _CGROUP_MOUNTS:
+        tightest = None
+        for directory in _cgroup_dirs(mount):
+            limit = _read_int(os.path.join(directory, limit_name))
+            if limit is None or limit >= _UNLIMITED_ABOVE:
+                continue
+            if tightest is not None and limit >= tightest[0]:
+                continue
+            usage = _read_int(os.path.join(directory, usage_name)) or 0
+            if exclude_file_cache:
+                usage = max(0, usage - _cgroup_file_cache_bytes(directory))
+            tightest = (limit, usage)
+        if tightest is not None:
+            return tightest
     return None
+
+
+def physical_host_memory_available_bytes() -> int:
+    """What the machine itself can still give: kernel available under any cgroup cap."""
+    available = int(psutil.virtual_memory().available)
+    capped = cgroup_memory_limit_bytes()
+    if capped is None:
+        return available
+    limit, usage = capped
+    return min(available, max(0, limit - usage))
 
 
 def host_memory_available_bytes() -> int:
@@ -70,12 +170,75 @@ def host_memory_available_bytes() -> int:
     The smaller of what the kernel reports free and what the cgroup still
     allows, so a container does not plan against the whole machine.
     """
+    forced_gib = envs.SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB
+    if forced_gib is not None:
+        # Behave like a machine of that size: what such a host would still
+        # have free is the pretend total minus what this process has already
+        # taken in anonymous memory.
+        own_anonymous = 0
+        try:
+            with open("/proc/self/status") as handle:
+                for line in handle:
+                    if line.startswith("RssAnon:"):
+                        own_anonymous = int(line.split()[1]) * 1024
+                        break
+        except OSError:
+            pass
+        return max(0, int(forced_gib * GIB_BYTES) - own_anonymous)
+    return physical_host_memory_available_bytes()
+
+
+def shared_pool_available_bytes() -> int:
+    """Bytes a shared host/device pool can still give this process.
+
+    The device's own free figure is the kernel's MemFree, which leaves out the
+    page cache -- memory the kernel hands back on demand and a placement may
+    therefore spend. A cgroup cap is honoured on its anonymous share only, for
+    the same reason: the cache charged to the cgroup is reclaimed under the cap.
+    """
     available = int(psutil.virtual_memory().available)
-    capped = cgroup_memory_limit_bytes()
+    capped = cgroup_memory_limit_bytes(exclude_file_cache=True)
     if capped is None:
         return available
-    limit, usage = capped
-    return min(available, max(0, limit - usage))
+    limit, anonymous = capped
+    return min(available, max(0, limit - anonymous))
+
+
+def host_copies_are_redundant() -> bool:
+    """Whether a host copy of a mapped weight buys nothing.
+
+    When host and device share one physical pool the device reads page-cache
+    pages directly, so a pinned or pageable copy holds the same bytes twice and
+    adds only pressure. The mapping is then the right home for every weight
+    that has one, whatever the free-memory reading says.
+    """
+    return current_platform.device_shares_host_memory()
+
+
+def page_cache_cannot_hold(mapped_bytes: int) -> bool:
+    """Whether the kernel's page cache cannot keep a mapping of this size.
+
+    Read against the machine, not the test-only forced view: a mapping the
+    cache holds is re-read from memory however small the pretend host is.
+    """
+    if mapped_bytes <= 0:
+        return False
+    return (
+        mapped_bytes >= physical_host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
+    )
+
+
+def host_copies_would_not_fit(weight_bytes: int) -> bool:
+    """Whether copying `weight_bytes` into host memory would run the host out.
+
+    The alternative to a copy is leaving the weights on their file mapping,
+    which the kernel may drop under pressure and re-read from disk. That is
+    slower per byte but bounded, so it is the right answer exactly when the
+    copies do not fit -- and the wrong one when they do.
+    """
+    if weight_bytes <= 0:
+        return False
+    return weight_bytes >= host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
 
 
 class HostPinBudget:
@@ -96,7 +259,13 @@ class HostPinBudget:
 
     def __init__(self, available_bytes: int | None = None) -> None:
         if available_bytes is None:
-            available_bytes = host_memory_available_bytes()
+            if host_copies_are_redundant():
+                # Nothing to pin for: on one pool the copy duplicates
+                # page-cache bytes the device can already read, and the mapped
+                # courier overlaps its transfers anyway.
+                available_bytes = 0
+            else:
+                available_bytes = host_memory_available_bytes()
         self.available_bytes = available_bytes
         self.reserve_bytes = max(
             int(available_bytes * HOST_RESERVE_FRACTION), MIN_HOST_RESERVE_BYTES
@@ -133,6 +302,14 @@ class HostPinBudget:
         )
         return False
 
+    def release(self, weight_bytes: int) -> None:
+        """Return an allowance when its pinned storage is no longer owned."""
+        self.committed_bytes -= weight_bytes
+
+    def track_storage(self, storage: torch.UntypedStorage) -> None:
+        """Tie an already booked allowance to the storage's last owner."""
+        weakref.finalize(storage, self.release, storage.nbytes())
+
 
 def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:
     """Host-to-device bytes a pin would cover for one request.
@@ -149,12 +326,16 @@ def module_weight_bytes(module) -> int:
     seen: set[int] = set()
     total = 0
     for tensor in list(module.parameters()) + list(module.buffers()):
-        storage = tensor.untyped_storage()
-        pointer = storage.data_ptr()
+        try:
+            storage = tensor.untyped_storage()
+            pointer = storage.data_ptr()
+            storage_bytes = storage.nbytes()
+        except RuntimeError:
+            continue
         if pointer == 0 or pointer in seen:
             continue
         seen.add(pointer)
-        total += storage.nbytes()
+        total += storage_bytes
     return total
 
 
@@ -163,9 +344,9 @@ def describe_host_memory() -> str:
     capped = cgroup_memory_limit_bytes()
     available = host_memory_available_bytes()
     if capped is None:
-        return f"host memory available: {available / GIB_BYTES:.1f} GiB (no cgroup cap)"
+        return f"{available / GIB_BYTES:.1f} GiB available (no cgroup cap)"
     limit, usage = capped
     return (
-        f"host memory available: {available / GIB_BYTES:.1f} GiB "
+        f"{available / GIB_BYTES:.1f} GiB available "
         f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB)"
     )

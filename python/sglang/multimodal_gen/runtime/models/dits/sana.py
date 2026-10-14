@@ -7,8 +7,6 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_bias_glu,
-    can_use_fused_bias_silu,
     can_use_fused_layernorm_modulate,
     fused_bias_glu,
     fused_bias_silu,
@@ -47,7 +45,7 @@ def _eager_ln_modulate(
     return norm(x) * (1 + scale) + shift
 
 
-def _sana_ln_modulate(
+def sana_ln_modulate(
     norm: nn.LayerNorm,
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -106,7 +104,7 @@ def _sana_ln_modulate(
         and is_plain_layer_norm(norm, x.shape[-1])
     ):
         x_c = x.contiguous()
-        if not can_use_fused_layernorm_modulate(x_c, scale[:, 0], shift[:, 0]):
+        if not can_use_fused_layernorm_modulate(x_c.dtype, x_c.shape[-1]):
             return _eager_ln_modulate(norm, x, scale, shift)
         try:
             out = fused_layernorm_modulate_raw(x_c, scale[:, 0], shift[:, 0], norm.eps)
@@ -156,11 +154,13 @@ def _mps_safe_conv2d(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
     ).to(x.dtype)
 
 
-def _use_sana_bcg_fast_path(x: torch.Tensor) -> bool:
+def _use_sana_bcg_fast_path(x: torch.Tensor, *, allow_eager: bool = False) -> bool:
     if torch.compiler.is_compiling() or not x.is_cuda:
         return False
-    return torch.cuda.is_current_stream_capturing() or (
-        torch.cuda.current_stream() != torch.cuda.default_stream()
+    return (
+        (allow_eager and not torch.is_grad_enabled())
+        or torch.cuda.is_current_stream_capturing()
+        or (torch.cuda.current_stream() != torch.cuda.default_stream())
     )
 
 
@@ -176,12 +176,14 @@ def _conv2d_without_bias(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _sana_conv_bias_silu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
-    if conv.bias is None or not _use_sana_bcg_fast_path(x):
+def sana_conv_bias_silu(
+    conv: nn.Conv2d, x: torch.Tensor, *, allow_eager: bool = False
+) -> torch.Tensor:
+    if conv.bias is None or not _use_sana_bcg_fast_path(x, allow_eager=allow_eager):
         return F.silu(_mps_safe_conv2d(conv, x))
 
     raw = _conv2d_without_bias(conv, x)
-    if not can_use_fused_bias_silu(raw, conv.bias):
+    if raw.dtype is not torch.bfloat16:
         return F.silu(raw + conv.bias[None, :, None, None])
     verified = _SANA_CONV_SILU.verified
     if not verified and not _SANA_CONV_SILU.can_attempt_once():
@@ -204,17 +206,17 @@ def _sana_conv_bias_silu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _sana_conv_bias_glu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
-    if conv.bias is None or not _use_sana_bcg_fast_path(x):
+def sana_conv_bias_glu(
+    conv: nn.Conv2d, x: torch.Tensor, *, allow_eager: bool = False
+) -> torch.Tensor:
+    if conv.bias is None or not _use_sana_bcg_fast_path(x, allow_eager=allow_eager):
         hidden_states = _mps_safe_conv2d(conv, x)
         hidden_states, gate = torch.chunk(hidden_states, 2, dim=1)
         return hidden_states * F.silu(gate)
 
     raw = _conv2d_without_bias(conv, x)
-    if not can_use_fused_bias_glu(raw, conv.bias):
-        hidden_states, gate = torch.chunk(
-            raw + conv.bias[None, :, None, None], 2, dim=1
-        )
+    if raw.dtype is not torch.bfloat16:
+        hidden_states, gate = (raw + conv.bias[None, :, None, None]).chunk(2, dim=1)
         return hidden_states * F.silu(gate)
     verified = _SANA_CONV_GLU.verified
     if not verified and not _SANA_CONV_GLU.can_attempt_once():
@@ -245,7 +247,7 @@ def _sana_conv_bias_glu(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _sana_residual_gate_add(
+def sana_residual_gate_add(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
     if torch.compiler.is_compiling():
@@ -307,7 +309,7 @@ class SanaModulatedNorm(nn.Module):
     def forward(self, x, temb, scale_shift_table):
         scale_shift_table = _mps_match_dtype(scale_shift_table, temb)
         shift, scale = (scale_shift_table[None] + temb[:, None]).chunk(2, dim=1)
-        return _sana_ln_modulate(self.norm, x, scale, shift)
+        return sana_ln_modulate(self.norm, x, scale, shift)
 
 
 class GLUMBConv(nn.Module):
@@ -329,8 +331,8 @@ class GLUMBConv(nn.Module):
         self.conv_point = nn.Conv2d(hidden_channels, out_channels, 1, 1, 0, bias=False)
 
     def forward(self, hidden_states):
-        hidden_states = _sana_conv_bias_silu(self.conv_inverted, hidden_states)
-        hidden_states = _sana_conv_bias_glu(self.conv_depth, hidden_states)
+        hidden_states = sana_conv_bias_silu(self.conv_inverted, hidden_states)
+        hidden_states = sana_conv_bias_glu(self.conv_depth, hidden_states)
         hidden_states = _mps_safe_conv2d(self.conv_point, hidden_states)
         return hidden_states
 
@@ -475,26 +477,25 @@ class SanaTransformerBlock(nn.Module):
             scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
 
-        norm_hidden = _sana_ln_modulate(self.norm1, hidden_states, scale_msa, shift_msa)
+        norm_hidden = sana_ln_modulate(self.norm1, hidden_states, scale_msa, shift_msa)
         attn_output = self.attn1(norm_hidden)
-        hidden_states = _sana_residual_gate_add(hidden_states, attn_output, gate_msa)
+        hidden_states = sana_residual_gate_add(hidden_states, attn_output, gate_msa)
 
         attn_output = self.attn2(
             hidden_states, encoder_hidden_states, encoder_attention_mask
         )
         hidden_states = hidden_states + attn_output
 
-        norm_hidden = _sana_ln_modulate(self.norm2, hidden_states, scale_mlp, shift_mlp)
+        norm_hidden = sana_ln_modulate(self.norm2, hidden_states, scale_mlp, shift_mlp)
         norm_hidden = norm_hidden.unflatten(1, (height, width)).permute(0, 3, 1, 2)
         ff_output = self.ff(norm_hidden)
         ff_output = ff_output.flatten(2, 3).permute(0, 2, 1)
-        hidden_states = _sana_residual_gate_add(hidden_states, ff_output, gate_mlp)
+        hidden_states = sana_residual_gate_add(hidden_states, ff_output, gate_mlp)
 
         return hidden_states
 
 
 class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-
     _fsdp_shard_conditions = [
         lambda n, m: isinstance(m, SanaTransformerBlock),
     ]

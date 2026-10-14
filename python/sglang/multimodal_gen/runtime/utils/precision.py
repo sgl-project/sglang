@@ -1,7 +1,10 @@
+import threading
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Iterator, Optional, Union
 
 import torch
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
@@ -24,12 +27,31 @@ def resolve_precision(
     precision_attr: Optional[str] = None,
     field_name: Optional[str] = None,
 ) -> torch.dtype:
+    component_precision = server_args.component_precisions.get(
+        component_or_precision_attr
+    )
+    if component_precision is not None:
+        return precision_to_dtype(
+            component_precision,
+            f"component_precisions.{component_or_precision_attr}",
+        )
     precision_attr = precision_attr or component_or_precision_attr
     precision = getattr(server_args.pipeline_config, precision_attr)
     return precision_to_dtype(precision, field_name or precision_attr)
 
 
-def resolve_decode_precision(server_args, component_name: str = "vae") -> torch.dtype:
+def resolve_decode_precision(
+    server_args,
+    component_name: str = "vae",
+    *,
+    quality: str | None = None,
+) -> torch.dtype:
+    component_precision = server_args.component_precisions.get(component_name)
+    if component_precision is not None:
+        return precision_to_dtype(
+            component_precision, f"component_precisions.{component_name}"
+        )
+
     pipeline_config = server_args.pipeline_config
     if component_name in ("audio_vae", "vocoder"):
         return resolve_precision(
@@ -37,6 +59,11 @@ def resolve_decode_precision(server_args, component_name: str = "vae") -> torch.
             component_name,
             precision_attr="audio_vae_precision",
         )
+
+    if quality == "high":
+        high_precision = getattr(pipeline_config, "vae_decode_precision_high", None)
+        if high_precision is not None:
+            return precision_to_dtype(high_precision, "vae_decode_precision_high")
 
     decode_precision = getattr(pipeline_config, "vae_decode_precision", None)
     if decode_precision is not None:
@@ -48,10 +75,21 @@ def resolve_decode_precision(server_args, component_name: str = "vae") -> torch.
     )
 
 
-def resolve_component_precision(server_args, module_name: str) -> Optional[torch.dtype]:
-    pipeline_config = getattr(server_args, "pipeline_config", None)
-    if pipeline_config is None:
+def resolve_component_precision_override(
+    server_args, module_name: str
+) -> Optional[torch.dtype]:
+    exact_precision = server_args.component_precisions.get(module_name)
+    if exact_precision is None:
         return None
+    return precision_to_dtype(exact_precision, f"component_precisions.{module_name}")
+
+
+def resolve_component_precision(server_args, module_name: str) -> Optional[torch.dtype]:
+    exact_precision = resolve_component_precision_override(server_args, module_name)
+    if exact_precision is not None:
+        return exact_precision
+
+    pipeline_config = server_args.pipeline_config
 
     if module_name in ("audio_vae", "vocoder"):
         precision_attr = "audio_vae_precision"
@@ -94,6 +132,14 @@ def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:
         dtype != torch.float32
         and not disable_autocast
         and current_platform.is_amp_supported()
+    )
+
+
+def autocast_enabled_for_device(
+    tensor: torch.Tensor, dtype: torch.dtype, disable_autocast: bool
+) -> bool:
+    return tensor.device.type == current_platform.device_type and autocast_enabled(
+        dtype, disable_autocast
     )
 
 
@@ -159,3 +205,55 @@ def temporary_module_dtype(
         yield module
     finally:
         module.to(dtype=original_dtype)
+
+
+@dataclass
+class MixedPrecisionState:
+    param_dtype: torch.dtype | None = None
+    reduce_dtype: torch.dtype | None = None
+    output_dtype: torch.dtype | None = None
+    compute_dtype: torch.dtype | None = None
+    mp_policy: MixedPrecisionPolicy | None = None
+
+
+class _MixedPrecisionContext(threading.local):
+    state: MixedPrecisionState | None = None
+
+
+_mixed_precision_state = _MixedPrecisionContext()
+
+
+def get_mixed_precision_state() -> MixedPrecisionState:
+    """Get the current mixed precision state."""
+    state = _mixed_precision_state.state
+    if state is None:
+        raise ValueError("Mixed precision state not set")
+    return state
+
+
+def set_mixed_precision_policy(
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    output_dtype: torch.dtype | None = None,
+    mp_policy: MixedPrecisionPolicy | None = None,
+):
+    """Set mixed precision policy for the current thread.
+
+    Args:
+        param_dtype: Parameter dtype used for training
+        reduce_dtype: Reduction dtype used for gradients
+        output_dtype: Optional output dtype
+    """
+    state = MixedPrecisionState(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=output_dtype,
+        mp_policy=mp_policy,
+    )
+    _mixed_precision_state.state = state
+
+
+def get_compute_dtype() -> torch.dtype:
+    """Get the current compute dtype from mixed precision policy."""
+    state = _mixed_precision_state.state
+    return torch.get_default_dtype() if state is None else state.param_dtype

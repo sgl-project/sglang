@@ -7,6 +7,10 @@ metatags:
 
 SGLang HiCache extends the traditional RadixAttention with a three-tier hierarchical KV caching system that dramatically improves performance for long-context and multi-turn conversation scenarios. By intelligently managing KV caches across GPU memory, host memory, and external storage backends, HiCache addresses the fundamental capacity bottleneck that limits cache hit rates in conventional systems.
 
+<Note>
+L1 and L2 are private to a single inference instance; only L3 can be shared. Host memory cannot be pooled across instances or across hosts, not even for two instances on the same node. Raising `--hicache-ratio` or `--hicache-size` only enlarges the instance's own private L2. Cross-instance reuse is the job of L3, which needs `--hicache-storage-backend` and a backend configured for the scope you want: the `file` backend defaults to the node-local `/tmp/hicache`, whereas `mooncake`, `hf3fs`, `nixl` and `aibrix` reach cluster scope when every instance shares the same namespace. See [Tier Sharing Scope](/docs/advanced_features/hicache_design#tier-sharing-scope).
+</Note>
+
 ## Configuration Guidelines
 
 ## Core HiCache Parameters

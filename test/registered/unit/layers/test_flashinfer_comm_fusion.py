@@ -1,18 +1,17 @@
 import contextlib
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Collectives are mocked and world_size is a plain int, so the world_size=4
 # cases need one real CUDA device.
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeWorkspace:
@@ -32,6 +31,7 @@ class _FakeFlashInferComm:
 
     def __init__(self):
         self.calls = []
+        self.fusion_kwargs = None
 
     def create_allreduce_fusion_workspace(self, **kwargs):
         self.calls.append(kwargs)
@@ -53,6 +53,7 @@ class _FakeFlashInferComm:
         rms_eps=None,
         **_kwargs,
     ):
+        self.fusion_kwargs = _kwargs
         if pattern is self.AllReduceFusionPattern.kAllReduce:
             allreduced = input * workspace.world_size
             if output is None:
@@ -90,93 +91,86 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(CustomTestCase):
+    """The arch dispatch is `_resolve_backend(backend, is_multi_node)`.
+
+    The public entry above it takes no arguments -- it reads
+    `exec.comm.flashinfer_allreduce_fusion_backend` and `parallel.nnodes` off the
+    published bags -- so the cases here drive the dispatch directly.
+    """
+
     def test_auto_backend_resolves_by_arch(self):
-        single_node = types.SimpleNamespace(
-            flashinfer_allreduce_fusion_backend="auto", nnodes=1
-        )
-        multi_node = types.SimpleNamespace(
-            flashinfer_allreduce_fusion_backend="auto", nnodes=2
-        )
+        single_node = ("auto", False)
+        multi_node = ("auto", True)
 
         # Blackwell: mnnvl on both single-node and multi-node.
-        with patch.object(fusion, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
+                fusion._resolve_backend(*single_node),
                 "mnnvl",
             )
-            self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node), "mnnvl"
-            )
+            self.assertEqual(fusion._resolve_backend(*multi_node), "mnnvl")
 
         # SM90: auto uses trtllm on single-node, multi-node is unsupported.
         with (
-            patch.object(fusion, "is_sm100_supported", return_value=False),
-            patch.object(fusion, "is_sm90_supported", return_value=True),
+            override_platform(is_sm100=False),
+            override_platform(is_sm90=True),
         ):
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
+                fusion._resolve_backend(*single_node),
                 "trtllm",
             )
             with self.assertRaises(ValueError):
-                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node)
+                fusion._resolve_backend(*multi_node)
 
         # Architectures outside SM90/SM10X are unsupported. Both pre-SM90
         # and post-SM10X devices (e.g. SM120) must fail closed.
         for arch in ("pre_sm90", "post_sm10x"):
             with (
                 self.subTest(arch=arch),
-                patch.object(fusion, "is_sm100_supported", return_value=False),
-                patch.object(fusion, "is_sm90_supported", return_value=False),
+                override_platform(is_sm100=False),
+                override_platform(is_sm90=False),
             ):
                 with self.assertRaises(ValueError):
-                    fusion.resolve_flashinfer_allreduce_fusion_backend(single_node)
+                    fusion._resolve_backend(*single_node)
                 with self.assertRaises(ValueError):
-                    fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node)
+                    fusion._resolve_backend(*multi_node)
 
     def test_explicit_backend_validation(self):
-        single_node_mnnvl = types.SimpleNamespace(
-            flashinfer_allreduce_fusion_backend="mnnvl", nnodes=1
-        )
-        multi_node_mnnvl = types.SimpleNamespace(
-            flashinfer_allreduce_fusion_backend="mnnvl", nnodes=2
-        )
-        single_node_trtllm = types.SimpleNamespace(
-            flashinfer_allreduce_fusion_backend="trtllm", nnodes=1
-        )
-        multi_node_trtllm = types.SimpleNamespace(
-            flashinfer_allreduce_fusion_backend="trtllm", nnodes=2
-        )
+        single_node_mnnvl = ("mnnvl", False)
+        multi_node_mnnvl = ("mnnvl", True)
+        single_node_trtllm = ("trtllm", False)
+        multi_node_trtllm = ("trtllm", True)
 
         with (
-            patch.object(fusion, "is_sm100_supported", return_value=False),
-            patch.object(fusion, "is_sm90_supported", return_value=True),
+            override_platform(is_sm100=False),
+            override_platform(is_sm90=True),
         ):
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node_mnnvl),
+                fusion._resolve_backend(*single_node_mnnvl),
                 "mnnvl",
             )
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node_trtllm),
+                fusion._resolve_backend(*single_node_trtllm),
                 "trtllm",
             )
             with self.assertRaises(ValueError):
-                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_mnnvl)
+                fusion._resolve_backend(*multi_node_mnnvl)
             with self.assertRaises(ValueError):
-                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm)
+                fusion._resolve_backend(*multi_node_trtllm)
 
-        with patch.object(fusion, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_mnnvl),
+                fusion._resolve_backend(*multi_node_mnnvl),
                 "mnnvl",
             )
             with self.assertRaises(ValueError):
-                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm)
+                fusion._resolve_backend(*multi_node_trtllm)
 
         for arch in ("pre_sm90", "post_sm10x"):
             with (
                 self.subTest(arch=arch),
-                patch.object(fusion, "is_sm100_supported", return_value=False),
-                patch.object(fusion, "is_sm90_supported", return_value=False),
+                override_platform(is_sm100=False),
+                override_platform(is_sm90=False),
             ):
                 for args in (
                     single_node_mnnvl,
@@ -184,9 +178,9 @@ class TestFlashInferCommFusion(CustomTestCase):
                     single_node_trtllm,
                     multi_node_trtllm,
                 ):
-                    with self.subTest(backend=args.flashinfer_allreduce_fusion_backend):
+                    with self.subTest(backend=args[0], multi_node=args[1]):
                         with self.assertRaises(ValueError):
-                            fusion.resolve_flashinfer_allreduce_fusion_backend(args)
+                            fusion._resolve_backend(*args)
 
     def test_allreduce_fusion_backends_match_torch_baseline(self):
         fake_comm = _FakeFlashInferComm()
@@ -210,6 +204,7 @@ class TestFlashInferCommFusion(CustomTestCase):
                     world_size = 4
                     manager = fusion.FlashInferWorkspaceManager()
                     manager.workspace = _FakeWorkspace(backend, world_size)
+                    manager.backend = backend
                     manager.initialized = True
                     buffers[manager_key] = manager
                     if not torch.cuda.is_available():
@@ -248,6 +243,10 @@ class TestFlashInferCommFusion(CustomTestCase):
 
                     torch.testing.assert_close(norm_out, expected_norm)
                     torch.testing.assert_close(residual_out, expected_residual)
+                    self.assertEqual(
+                        fake_comm.fusion_kwargs.get("fp32_acc", False),
+                        backend == "trtllm",
+                    )
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create
@@ -287,10 +286,11 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         original_unavailable = fusion._flashinfer_allreduce_unavailable
 
         buffers[manager_key] = manager
-        fusion._flashinfer_comm = _FakeFlashInferComm()
+        fake_comm = _FakeFlashInferComm()
+        fusion._flashinfer_comm = fake_comm
         fusion._flashinfer_allreduce_unavailable = False
         try:
-            yield
+            yield fake_comm
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
@@ -314,7 +314,7 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         manager = self._make_manager(world_size)
         manager.dtype = torch.bfloat16
         manager.use_fp32_lamport = False
-        with self._patched_attn_workspace(manager):
+        with self._patched_attn_workspace(manager) as fake_comm:
             input_ = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
             expected = input_ * world_size
 
@@ -323,6 +323,8 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
                 result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
 
             torch.testing.assert_close(result, expected)
+            # trtllm rounds to the input dtype on every rank without this
+            self.assertTrue(fake_comm.fusion_kwargs["fp32_acc"])
 
     def test_shape_guard_rejects_non_2d(self):
         with self._patched_attn_workspace(self._make_manager(4)):
@@ -492,9 +494,12 @@ class TestTagGroupsForFlashInferAllReduceOnly(CustomTestCase):
     def _tag(self, *, attn_tp, moe_ep, moe_tp):
         from sglang.srt.distributed import parallel_state as ps
 
-        with patch.object(ps, "_ENABLE_FLASHINFER_ALLREDUCE_ONLY", True), patch.object(
-            ps, "_ATTN_TP", attn_tp
-        ), patch.object(ps, "_MOE_EP", moe_ep), patch.object(ps, "_MOE_TP", moe_tp):
+        with (
+            patch.object(ps, "_ENABLE_FLASHINFER_ALLREDUCE_ONLY", True),
+            patch.object(ps, "_ATTN_TP", attn_tp),
+            patch.object(ps, "_MOE_EP", moe_ep),
+            patch.object(ps, "_MOE_TP", moe_tp),
+        ):
             ps._tag_groups_for_flashinfer_allreduce_only()
 
     def test_hybrid_ep_tp_tags_only_the_ep_group(self):
