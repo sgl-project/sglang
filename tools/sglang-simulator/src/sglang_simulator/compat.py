@@ -48,7 +48,11 @@ def apply_simulator_server_args(target) -> None:
     """Apply simulator-owned values before constructing the final ServerArgs."""
     overrides = SIMULATOR_SERVER_ARG_OVERRIDES
     if os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
-        overrides = {**overrides, "skip_server_warmup": True}
+        overrides = {
+            **overrides,
+            "skip_server_warmup": True,
+            "enable_cache_report": True,
+        }
     if isinstance(target, dict):
         target.update(overrides)
         return

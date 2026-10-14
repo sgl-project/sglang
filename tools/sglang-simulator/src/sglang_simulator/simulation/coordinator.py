@@ -134,6 +134,13 @@ class Coordinator:
         request = self._requests.get(rid)
         return request is not None and request.terminal is None
 
+    def request_arrival_ns(self, rid: str) -> int:
+        """Return the manifest arrival without a float clock conversion."""
+        try:
+            return self._requests[rid].arrival_ns
+        except KeyError as exc:
+            raise self._error(f"unknown request rid={rid!r}") from exc
+
     def is_terminal(self, rid: str) -> bool:
         request = self._requests.get(rid)
         return request is not None and request.terminal is not None

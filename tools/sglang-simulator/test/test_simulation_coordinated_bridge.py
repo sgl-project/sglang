@@ -37,12 +37,17 @@ def test_coordinator_server_args_are_opt_in(monkeypatch, coordinated, as_dict):
     )
     if coordinated:
         monkeypatch.setenv("SGLANG_SIMULATOR_COORDINATOR", "tcp://127.0.0.1:12345")
-    values = {"skip_server_warmup": False, "enable_hierarchical_cache": not coordinated}
+    values = {
+        "skip_server_warmup": False,
+        "enable_cache_report": False,
+        "enable_hierarchical_cache": not coordinated,
+    }
     args = values if as_dict else SimpleNamespace(**values)
     apply_simulator_server_args(args)
     if as_dict:
         args = SimpleNamespace(**args)
     assert args.skip_server_warmup is coordinated
+    assert args.enable_cache_report is coordinated
     validate_simulator_server_args(args)
 
 
@@ -175,7 +180,9 @@ class Harness:
                 events.append((request.rid, self.bridge.clock.now_ns))
 
         self.bridge.process_batch_result(
-            SimpleNamespace(reqs=requests), None, process=native_process
+            SimpleNamespace(reqs=requests),
+            SimpleNamespace(auxiliary_host_output=None),
+            process=native_process,
         )
 
     def run_driver(self, run):
@@ -349,7 +356,9 @@ def test_cancel_at_batch_boundary_drains_native_work_before_finished(
         future = pool.submit(harness.run_driver, driver)
         harness.receive()
         StateManager.set_current_inference_dur(10 / 1e9)
-        harness.bridge.process_batch_result(batch, None, process=first_result)
+        harness.bridge.process_batch_result(
+            batch, SimpleNamespace(auxiliary_host_output=None), process=first_result
+        )
         assert harness.receive() == []
         assert not harness.bridge._finished
         assert long.to_finish is not None

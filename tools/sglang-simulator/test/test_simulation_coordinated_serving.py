@@ -413,3 +413,112 @@ def test_openai_stream_cancellation_drains_native_running_batch(tmp_path, monkey
         assert runner.server_proc.poll() is None
     finally:
         runner.shutdown()
+
+
+async def _chat_timing_stream(session, base_url, rid, read_delay):
+    snapshots = []
+    usage = None
+    done = False
+    event_type = None
+    async with session.post(
+        f"{base_url}/v1/chat/completions",
+        json={
+            "model": str(ASSETS / "qwen3-8b"),
+            "rid": rid,
+            "messages": [{"role": "user", "content": "hello"}],
+            "input_ids": [101] * 8,
+            "max_tokens": 4,
+            "ignore_eos": True,
+            "temperature": 0,
+            "n": 1,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    ) as response:
+        response.raise_for_status()
+        await asyncio.sleep(read_delay)
+        async for line in response.content:
+            if not line.strip():
+                event_type = None
+                continue
+            if line.startswith(b"event: "):
+                event_type = line[len(b"event: ") :].strip()
+                continue
+            if not line.startswith(b"data: "):
+                continue
+            data = line[len(b"data: ") :].strip()
+            if data == b"[DONE]":
+                done = True
+                break
+            event = json.loads(data)
+            assert "error" not in event
+            if event_type == b"sglang_simulator":
+                snapshots.append(event)
+            else:
+                assert event["id"] == rid
+                if any(
+                    choice.get("delta", {}).get("content")
+                    for choice in event.get("choices", [])
+                ):
+                    assert snapshots, "content preceded its timing snapshot"
+                if event.get("usage"):
+                    usage = event["usage"]
+    assert done and snapshots and usage
+    final = snapshots[-1]
+    assert final["terminal_ns"] == final["commit_ns"]
+    assert final["prompt_tokens"] == usage["prompt_tokens"] == 8
+    assert final["completion_tokens"] == usage["completion_tokens"] == 4
+    assert final["cached_tokens"] == usage["prompt_tokens_details"]["cached_tokens"]
+    assert all(snapshot["rid"] == rid for snapshot in snapshots)
+    assert all(
+        snapshot["first_token_ns"] == final["first_token_ns"] for snapshot in snapshots
+    )
+    assert all(
+        snapshot["cached_tokens"] == final["cached_tokens"] for snapshot in snapshots
+    )
+    return final
+
+
+async def _chat_timing_run(base_url, endpoint):
+    results = []
+    async with (
+        aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session,
+        AsyncCoordinatorClient(endpoint) as client,
+    ):
+        for index, delay in enumerate((0, 0.08)):
+            rid = f"request{index}"
+            task = asyncio.create_task(
+                _chat_timing_stream(session, base_url, rid, delay)
+            )
+            try:
+                grant = await client.request(Ready("timing", index, [Submit(rid)]))
+                result = await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            arrival = index * 40 * MILLISECOND
+            assert result["arrival_ns"] == arrival
+            assert result["first_token_ns"] == arrival + 10 * MILLISECOND
+            assert result["last_token_ns"] == arrival + 40 * MILLISECOND
+            assert result["terminal_ns"] == grant.now_ns
+            assert [(event.rid, event.at_ns) for event in grant.terminals] == [
+                (rid, result["terminal_ns"])
+            ]
+            results.append(result)
+        final = await client.request(Ready("timing", 2, [], finished=True))
+        assert final.status == "FINISHED"
+    assert results[0]["cached_tokens"] == 0
+    assert results[1]["cached_tokens"] > 0
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_chat_timing_metadata_matches_native_usage(tmp_path, monkeypatch, incremental):
+    args = ["--stream-interval", "3"]
+    if incremental:
+        args.append("--incremental-streaming-output")
+    runner, endpoint = _start_server(tmp_path / "chat-timing", monkeypatch, args)
+    try:
+        asyncio.run(_chat_timing_run(runner.base_url, endpoint))
+    finally:
+        runner.shutdown()

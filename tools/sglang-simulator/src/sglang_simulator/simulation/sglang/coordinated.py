@@ -19,6 +19,7 @@ from sglang_simulator.simulation.coordinator import (
 )
 from sglang_simulator.simulation.manager import Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.sglang.timing_metadata import attach_timing_output
 
 
 def validate_server_args(args) -> None:
@@ -37,6 +38,8 @@ def validate_server_args(args) -> None:
         raise ValueError("coordinator does not support disaggregation")
     if not getattr(args, "skip_server_warmup", False):
         raise ValueError("coordinator requires skip_server_warmup")
+    if not getattr(args, "enable_cache_report", False):
+        raise ValueError("coordinator requires enable_cache_report")
     for name in ("SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT"):
         if float(os.getenv(name, "-1")) > 0:
             raise ValueError(
@@ -319,6 +322,7 @@ class CoordinatedScheduler:
                 self._settle()
             self._advance(finish_ns)
             self._cleanup_cancelled()
+            attach_timing_output(result, self.clock)
             ret = process()
             self.scheduler.process_pending_chunked_abort()
             for req in batch.reqs:

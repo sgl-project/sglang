@@ -129,12 +129,35 @@ fallback is rejected rather than allowing an endless workload at one timestamp.
 
 Startup generation warmup is skipped. Workload/cache warmup belongs to the
 driver and must be excluded from its measurement window while retaining cache
-state. Administrative resets and profiling requests are rejected. This protocol
-and example are the foundation for an AgentX adapter; they do not implement
-AgentX benchmark phases or native metrics.
+state. Administrative resets and profiling requests are rejected. The two-request
+example demonstrates the driver protocol; AgentX phase scheduling and metric
+aggregation belong to the separate AgentX adapter.
+
+Coordinated streaming chat (`/v1/chat/completions`, `n=1`) emits an additional
+SSE event before each native content output:
+
+```text
+event: sglang_simulator
+data: {"version":1,"rid":"request0","arrival_ns":0,"first_token_ns":10000000,"last_token_ns":30000000,"commit_ns":30000000,"terminal_ns":30000000,"prompt_tokens":7,"completion_tokens":3,"cached_tokens":0}
+```
+
+All times are integer nanoseconds relative to the coordinated run. Arrival is
+the `Submit` time; first/last token times are native visible-token commits after
+the modeled batch finishes. `commit_ns` is the current result's commit time.
+`terminal_ns` is null until native completion; first/last are null until a token
+is committed. A result with no new tokens leaves first/last unchanged. Counts
+come from native prompt, visible output and cache state; cache reporting is
+enabled automatically for coordinated runs.
+
+Snapshots use constant space per request and preserve first/last times when
+streaming chunks are coalesced or emitted less frequently. They do not contain
+per-token timestamps, so they support TTFT, completion latency and mean TPOT,
+not per-token ITL percentiles. The initial empty role chunk can precede the first
+snapshot. Normal success requires a terminal snapshot, matching final usage and
+`[DONE]`; cancellation before a token commit retains the native abort response.
 
 Focused tests are `test_simulation_coordinator.py`,
-`test_simulation_coordinated_bridge.py`, and
+`test_simulation_timing_metadata.py`, `test_simulation_coordinated_bridge.py`, and
 `test_simulation_coordinated_serving.py`. Run test files in separate processes,
 as simulator hooks cache configuration at import time.
 
