@@ -3252,8 +3252,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Enable or disable the direct external-cache linker.
-    pub fn set_enable_external_cache_linker(&mut self, value: bool) {
+    pub fn set_enable_external_cache_linker(
+        &mut self,
+        value: bool,
+    ) -> Result<(), TreeCoreRuntimeError> {
         self.enable_external_cache_linker = value;
+        Ok(())
     }
 
     // ==== KV cache placement events ====

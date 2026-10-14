@@ -693,11 +693,10 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        ct = self.component_type
         if phase == LinkerTransferPhase.OFFLOAD:
             if node is None or not node.hash_value:
                 return None
-            value = node.component_data[ct].value
+            value = node.component_data[self.component_type].value
             if value is None:
                 return None
             # One state per node, valid only at the node's end boundary.

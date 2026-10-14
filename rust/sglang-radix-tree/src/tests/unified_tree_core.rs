@@ -2656,7 +2656,7 @@ fn external_linker_hashes_new_nodes_and_triggers_offload_action() {
         ..Default::default()
     };
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL]);
-    tc.set_enable_external_cache_linker(true);
+    tc.set_enable_external_cache_linker(true).unwrap();
 
     let result = tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let leaf = result.last_device_node_id.unwrap();
@@ -2695,7 +2695,7 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
         ..Default::default()
     };
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, SWA]);
-    tc.set_enable_external_cache_linker(true);
+    tc.set_enable_external_cache_linker(true).unwrap();
     let root = tc.arena.root();
     let node = tc.add_new_node_(
         root,
@@ -2731,7 +2731,7 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
 #[test]
 fn external_linker_state_follows_load_offload_and_split_lifecycle() {
     let mut tc = core();
-    tc.set_enable_external_cache_linker(true);
+    tc.set_enable_external_cache_linker(true).unwrap();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
     let anchor = tc
@@ -2830,7 +2830,7 @@ fn external_linker_state_follows_load_offload_and_split_lifecycle() {
 #[test]
 fn failed_external_offload_preserves_independently_confirmed_state() {
     let mut tc = core();
-    tc.set_enable_external_cache_linker(true);
+    tc.set_enable_external_cache_linker(true).unwrap();
     tc.insert(&insert_params(&vec![1], &[10]));
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let anchor = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
@@ -3100,7 +3100,7 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
 #[test]
 fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
     let mut tc = core();
-    tc.set_enable_external_cache_linker(true);
+    tc.set_enable_external_cache_linker(true).unwrap();
     tc.insert(&insert_params(&vec![1], &[10]));
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));

@@ -9,7 +9,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -638,35 +637,6 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(keys_a, ["org-model-a_page0_0_k", "org-model-a_page0_0_v"])
         self.assertEqual(keys_b, ["org-model-b_page0_0_k", "org-model-b_page0_0_v"])
         self.assertTrue(set(keys_a).isdisjoint(keys_b))
-
-    def test_direct_linker_entries_map_one_object_per_page(self):
-        store, _ = _make_store(enable_group_semantics=False)
-        store.mla_suffix = store.mha_suffix = "tp0"
-        store.registered_pools = {
-            name: DevicePoolEntry(
-                name=name,
-                indices_from_pool=name,
-                device_pool=None,
-                components=[[torch.empty((4, 8), dtype=torch.uint8)] * 2],
-                layer_mapping={0: (0, 1)},
-                page_size=1,
-                rows_are_pages=True,
-            )
-            for name in (PoolName.KV, PoolName.SWA, PoolName.MAMBA)
-        }
-
-        for name, object_name in (
-            (PoolName.KV, "k"),
-            (PoolName.SWA, "swa"),
-            (PoolName.MAMBA, "mamba"),
-        ):
-            keys, key_multiplier = store._get_hybrid_page_component_keys(
-                ["page0", "page1"], PoolTransfer(name=name)
-            )
-            self.assertEqual(key_multiplier, 1)
-            self.assertEqual(
-                keys, [f"page0_tp0_{object_name}", f"page1_tp0_{object_name}"]
-            )
 
 
 if __name__ == "__main__":

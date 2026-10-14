@@ -2151,8 +2151,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     /// Enable or disable the direct external-cache linker.
-    fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) {
+    fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) -> PyResult<()> {
         py.detach(|| self.core().set_enable_external_cache_linker(value))
+            .map_err(tree_core_assertion_error)
     }
 
     /// Whether the direct external-cache linker is wired.
@@ -3478,10 +3479,7 @@ macro_rules! tree_core_binding {
 
             /// Enable or disable the direct external-cache linker.
             fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) -> PyResult<()> {
-                catch_native_panic(|| {
-                    self.inner.set_enable_external_cache_linker(py, value);
-                    Ok(())
-                })
+                catch_native_panic(|| self.inner.set_enable_external_cache_linker(py, value))
             }
 
             /// Whether the direct external-cache linker is wired.
