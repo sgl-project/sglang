@@ -16,12 +16,12 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
-    can_use_fused_situ,
+    can_use_fused_situ_softcap_mul,
     fused_bias_glu,
     fused_bias_silu,
     fused_packed_silu_mul_bitexact,
     fused_silu_mul_bitexact,
-    fused_situ_bitexact,
+    fused_situ_softcap_mul_bitexact,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -120,8 +120,8 @@ def test_situ_preserves_bf16_rounding_and_projection_strides(shape, packed):
     else:
         hidden = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 5
         gate = torch.randn_like(hidden)
-    assert can_use_fused_situ(device=hidden.device, dtype=hidden.dtype)
-    actual = fused_situ_bitexact(hidden, gate)
+    assert can_use_fused_situ_softcap_mul(device=hidden.device, dtype=hidden.dtype)
+    actual = fused_situ_softcap_mul_bitexact(hidden, gate)
     assert actual.is_contiguous()
     assert torch.equal(actual, _situ_reference(hidden, gate))
 
@@ -144,7 +144,7 @@ def test_situ_all_bf16_encodings(operand, other):
         hidden, gate = values, torch.full_like(values, other)
     else:
         hidden, gate = torch.full_like(values, other), values
-    actual = fused_situ_bitexact(hidden, gate)
+    actual = fused_situ_softcap_mul_bitexact(hidden, gate)
     expected = _situ_reference(hidden, gate)
     nan = torch.isnan(expected)
     assert torch.equal(torch.isnan(actual), nan)
@@ -153,7 +153,9 @@ def test_situ_all_bf16_encodings(operand, other):
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
 def test_situ_cold_and_warm_tables_preserve_cuda_graph_replay(monkeypatch):
-    from sglang.kernels.ops.diffusion.activation import situ_bitexact as impl
+    from sglang.kernels.ops.diffusion.activation import (
+        situ_softcap_mul_bitexact as impl,
+    )
 
     tables = {}
     monkeypatch.setattr(impl, "_SITU_TABLES", tables)
@@ -161,16 +163,16 @@ def test_situ_cold_and_warm_tables_preserve_cuda_graph_replay(monkeypatch):
     gate = torch.randn_like(hidden)
     # Warm the direct kernel without constructing tables.
     small = torch.randn(1, 1, 8192, device="cuda", dtype=torch.bfloat16)
-    fused_situ_bitexact(small, small)
+    fused_situ_softcap_mul_bitexact(small, small)
     cold = torch.cuda.CUDAGraph()
     with torch.cuda.graph(cold):
-        cold_out = fused_situ_bitexact(hidden, gate)
+        cold_out = fused_situ_softcap_mul_bitexact(hidden, gate)
     assert not tables
-    fused_situ_bitexact(hidden, gate)
+    fused_situ_softcap_mul_bitexact(hidden, gate)
     pointers = tuple(t.data_ptr() for t in tables[hidden.device])
     warm = torch.cuda.CUDAGraph()
     with torch.cuda.graph(warm):
-        warm_out = fused_situ_bitexact(hidden, gate)
+        warm_out = fused_situ_softcap_mul_bitexact(hidden, gate)
     for scale in (1.0, 5.0):
         hidden.copy_(torch.randn_like(hidden) * scale)
         gate.copy_(torch.randn_like(gate) * scale)
@@ -184,21 +186,23 @@ def test_situ_cold_and_warm_tables_preserve_cuda_graph_replay(monkeypatch):
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
 def test_situ_tables_are_ready_for_other_streams(monkeypatch):
-    from sglang.kernels.ops.diffusion.activation import situ_bitexact as impl
+    from sglang.kernels.ops.diffusion.activation import (
+        situ_softcap_mul_bitexact as impl,
+    )
 
     hidden = torch.randn(1, 32, 8192, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(hidden)
-    fused_situ_bitexact(hidden, gate)  # Compile the lookup kernel first.
+    fused_situ_softcap_mul_bitexact(hidden, gate)  # Compile the lookup kernel first.
     monkeypatch.setattr(impl, "_SITU_TABLES", {})
     producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
     producer.wait_stream(torch.cuda.current_stream())
     consumer.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(producer):
         torch.cuda._sleep(50_000_000)
-        fused_situ_bitexact(hidden, gate)
+        fused_situ_softcap_mul_bitexact(hidden, gate)
     # No wait on producer: published tables must already be usable.
     with torch.cuda.stream(consumer):
-        actual = fused_situ_bitexact(hidden, gate)
+        actual = fused_situ_softcap_mul_bitexact(hidden, gate)
     consumer.synchronize()
     assert torch.equal(actual, _situ_reference(hidden, gate))
 
@@ -207,11 +211,11 @@ def test_situ_rejects_unsupported_operands():
     hidden = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
     for gate in (hidden.float(), hidden[:, :-1], hidden.cpu()):
         with pytest.raises(ValueError, match="matching CUDA BF16"):
-            fused_situ_bitexact(hidden, gate)
+            fused_situ_softcap_mul_bitexact(hidden, gate)
     strided = hidden[..., ::2]
     for x in (strided, hidden[:, :0]):
         with pytest.raises(ValueError, match="matching CUDA BF16"):
-            fused_situ_bitexact(x, x)
+            fused_situ_softcap_mul_bitexact(x, x)
 
 
 if __name__ == "__main__":

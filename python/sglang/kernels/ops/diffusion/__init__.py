@@ -407,9 +407,9 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Bit-exact silu(a) * b for split-projection SwiGLU.",
     ),
     (
-        "diffusion.situ",
+        "diffusion.situ_softcap_mul",
         KernelBackend.TRITON,
-        "activation.situ_bitexact:fused_situ_bitexact",
+        "activation.situ_softcap_mul_bitexact:fused_situ_softcap_mul_bitexact",
         _CUDA,
         "Bit-exact bounded SiTU for MOSSImage FFN projections.",
     ),
@@ -777,8 +777,8 @@ _EXPORTS: dict[str, str] = {
     "fused_bias_silu": "activation.sana_conv_post_triton",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
-    "can_use_fused_situ": "activation.situ_bitexact",
-    "fused_situ_bitexact": "activation.situ_bitexact",
+    "can_use_fused_situ_softcap_mul": "activation.situ_softcap_mul_bitexact",
+    "fused_situ_softcap_mul_bitexact": "activation.situ_softcap_mul_bitexact",
     # Diffusion attention kernels
     "cam_scan_bidi_chunkwise": "attention.sana_wm_gdn_chunkwise_triton",
     "fused_bigdn_func": "attention.sana_wm_gdn_triton",

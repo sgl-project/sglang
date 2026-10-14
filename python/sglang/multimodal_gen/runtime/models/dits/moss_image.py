@@ -38,12 +38,12 @@ from torch import nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_situ,
+    can_use_fused_situ_softcap_mul,
     can_use_torch_rmsnorm,
     can_use_torch_rmsnorm_modulate,
     can_use_torch_rmsnorm_rope,
     fused_rope_rotate_half_bitexact,
-    fused_situ_bitexact,
+    fused_situ_softcap_mul_bitexact,
     modulate_scale_shift,
     residual_gate_add,
     torch_rmsnorm_bitexact,
@@ -135,11 +135,11 @@ def _situ(hidden, gate):
     verified = _SITU_FUSION.verified
     if (
         not _SITU_FUSION.disabled
-        and can_use_fused_situ(device=hidden.device, dtype=hidden.dtype)
+        and can_use_fused_situ_softcap_mul(device=hidden.device, dtype=hidden.dtype)
         and (verified or _SITU_FUSION.can_attempt_once())
     ):
         try:
-            out = fused_situ_bitexact(hidden, gate)
+            out = fused_situ_softcap_mul_bitexact(hidden, gate)
         except ValueError:
             raise
         except Exception as exc:

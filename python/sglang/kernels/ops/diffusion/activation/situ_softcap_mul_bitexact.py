@@ -132,7 +132,7 @@ def _situ_kernel(
     tl.store(out_ptr + offsets, result, mask=mask)
 
 
-def can_use_fused_situ(*, device: torch.device, dtype: torch.dtype) -> bool:
+def can_use_fused_situ_softcap_mul(*, device: torch.device, dtype: torch.dtype) -> bool:
     return is_cuda() and device.type == "cuda" and dtype == torch.bfloat16
 
 
@@ -159,11 +159,13 @@ def _fake_situ(hidden: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 
 
 @register_custom_op(
-    op_name="triton_fused_situ_bitexact",
+    op_name="triton_fused_situ_softcap_mul_bitexact",
     mutates_args=[],
     fake_impl=_fake_situ,
 )
-def fused_situ_bitexact(hidden: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+def fused_situ_softcap_mul_bitexact(
+    hidden: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
     """Evaluate SiTU for BF16 ``[B, S, D]`` operands with packed or dense rows."""
     if not _valid_situ_inputs(hidden, gate):
         raise ValueError("SiTU requires matching CUDA BF16 tensors with dense rows.")

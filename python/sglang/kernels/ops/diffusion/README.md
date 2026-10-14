@@ -171,7 +171,7 @@ tensor copy at each residual site.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
-| `fused_situ_bitexact` | Triton | bit-exact vs MOSSImage's nine-op BF16 SiTU chain | CUDA BF16 `[B, S, D]`, dense rows or strided halves of a packed FFN projection; first-use verification in the model wrapper |
+| `fused_situ_softcap_mul_bitexact` | Triton | bit-exact vs MOSSImage's nine-op BF16 SiTU chain | CUDA BF16 `[B, S, D]`, dense rows or strided halves of a packed FFN projection; first-use verification in the model wrapper |
 
 ### RoPE / QK-norm
 
@@ -244,7 +244,7 @@ calls copy each one again.
 
 ### BF16 activation and normalization contracts
 
-MOSS-Image's `fused_situ_bitexact` uses exact BF16 lookup tables for inputs with
+MOSS-Image's `fused_situ_softcap_mul_bitexact` uses exact BF16 lookup tables for inputs with
 at least 65536 elements. The two factors are evaluated with the live aten CUDA
 formula for every BF16 encoding, preserving each rounding boundary; the fused
 kernel then looks up both factors and multiplies them. Tables use 256 KiB per

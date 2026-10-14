@@ -2052,14 +2052,16 @@ def test_moss_image_situ_fusion_mismatch_disables_fast_path(monkeypatch):
 
     gate_state = BitExactFusionGate("test SiTU")
     monkeypatch.setattr(moss_image, "_SITU_FUSION", gate_state)
-    monkeypatch.setattr(moss_image, "can_use_fused_situ", lambda **kwargs: True)
+    monkeypatch.setattr(
+        moss_image, "can_use_fused_situ_softcap_mul", lambda **kwargs: True
+    )
     calls = []
 
     def incorrect(hidden, gate):
         calls.append(1)
         return torch.zeros_like(hidden)
 
-    monkeypatch.setattr(moss_image, "fused_situ_bitexact", incorrect)
+    monkeypatch.setattr(moss_image, "fused_situ_softcap_mul_bitexact", incorrect)
     hidden = torch.ones(1, 2, 4)
     gate = torch.full_like(hidden, 2)
     expected = moss_image._situ_native(hidden, gate)
