@@ -275,7 +275,7 @@ class TestDisaggDecodeLists(CustomTestCase):
             core_lists=CoreLists(),
             tree_cache=Mock(),
             request_retirer=Mock(),
-            retire_beam_group=Mock(),
+            beam_coordinator=Mock(),
             batch_result_processor=SimpleNamespace(release_finished_req=Mock()),
         )
 

@@ -125,8 +125,10 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_lora,
     get_memory,
     get_parallel,
+    get_schedule,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.common import is_pin_memory_available
@@ -139,6 +141,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
@@ -164,6 +167,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
@@ -3146,30 +3150,20 @@ class DisaggDecode:
         capacity: KvCapacity,
         streams: Streams,
         services: SchedulerServices,
-        transfer_backend: TransferBackend,
-        attn_cp_cpu_group: Any,
-        attn_tp_cpu_group: Any,
         is_hybrid_swa: bool,
         kv_cache_dtype_str: str,
         sliding_window_size: Optional[int],
-        enable_hisparse: bool,
         hisparse_coordinator: Optional[HiSparseCoordinator],
-        enable_decode_hicache: bool,
-        enable_lora: bool,
         can_schedule_lora_req: Callable[[Req, Set[Optional[str]]], bool],
-        enable_priority_scheduling: bool,
-        schedule_low_priority_values_first: bool,
-        metrics_collector: Optional[SchedulerMetricsCollector],
         pool_stats_observer: SchedulerPoolStatsObserver,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         request_retirer: RequestRetirer,
-        retire_beam_group: Callable[[Req], None],
+        beam_coordinator: BeamCoordinator,
         batch_result_processor: SchedulerBatchResultProcessor,
         flags: EngineFlags,
         core_lists: CoreLists,
-        get_pending_lora_ids: Callable[[], Set[Optional[str]]],
+        pending: PendingSteps,
         policy: SchedulePolicy,
-        enable_overlap: bool,
         future_map: Any,
         ngram_embedding_manager: Any,
     ):
@@ -3188,6 +3182,22 @@ class DisaggDecode:
         metrics_sink = services.metrics_sink
         output_streamer = services.output_streamer
         scheduler_stage_metrics = services.scheduler_stage_metrics
+        metrics_collector = metrics_sink.metrics_collector
+        transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
+        attn_cp_cpu_group = get_parallel().attn_cp_group.cpu_group
+        attn_tp_cpu_group = get_parallel().attn_tp_group.cpu_group
+        enable_hisparse = get_memory().enable_hisparse
+        enable_decode_hicache = (
+            get_disagg().disaggregation_decode_enable_radix_cache
+            and get_memory().enable_hierarchical_cache
+        )
+        enable_lora = get_lora().enable_lora
+        enable_priority_scheduling = get_schedule().enable_priority_scheduling
+        schedule_low_priority_values_first = (
+            get_schedule().schedule_low_priority_values_first
+        )
+        enable_overlap = not get_schedule().disable_overlap_schedule
+        get_pending_lora_ids = pending.lora_ids
         self.model_config = model_config
         self.spec_algorithm = spec_algorithm
         self.req_to_token_pool = req_to_token_pool
@@ -3215,7 +3225,7 @@ class DisaggDecode:
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.decode_offload_manager = decode_offload_manager
         self.request_retirer = request_retirer
-        self.retire_beam_group = retire_beam_group
+        self.beam_coordinator = beam_coordinator
         self.batch_result_processor = batch_result_processor
         self.flags = flags
         # The requests whose KV has arrived: they own it and wait for a row of
@@ -3484,7 +3494,7 @@ class DisaggDecode:
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.ready.pop(i)
             self.request_retirer.release_aborted_request(req)
-            self.retire_beam_group(req)
+            self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.request_retirer.send_abort_output(

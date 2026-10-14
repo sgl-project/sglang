@@ -103,22 +103,18 @@ _DECLARED = {
         "KvResources",
         "KvCapacity",
         "Streams",
+        "SchedulerServices",
         "HiSparse",
-        "LoraAdmission",
         "SchedulePolicy",
-        "MetricsSink",
-        "StageMetrics",
-        "OutputStreamer",
         "PoolStatsObserver",
         "DecodeOffloadManager",
         "BatchResultProcessor",
-        "RequestRetirer",
         "BeamCoordinator",
         "EngineFlags",
         "CoreLists",
         "PendingSteps",
         "FutureMap",
-        "Workers",
+        "RequestRetirer",
     ],
     "DllmManager": [
         "KvResources",
@@ -353,6 +349,7 @@ _BUILT = {
         "RequestRetirer",
     ),
     "StepBuilder": ("managers/scheduler_components/step_builder.py", "StepBuilder"),
+    "DisaggDecode": ("disaggregation/decode.py", "DisaggDecode"),
 }
 
 # The modules whose classes sit below ModeOwners.
