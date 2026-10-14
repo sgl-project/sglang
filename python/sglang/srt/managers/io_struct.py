@@ -1173,6 +1173,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # LoRA adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1537,6 +1539,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+    # LoRA adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
