@@ -31,13 +31,19 @@
 #if !defined(USE_ROCM)
 // currently only apply cluster for SM90 & SM100, SM120 has poor cluster performance
 #define SUPPORT_CLUSTER (SGL_CUDA_ARCH >= 900 && SGL_CUDA_ARCH < 1100)
+#elif defined(SGL_ROCM_ARCH_GFX1250)
+// Test-only: gfx1250 cluster launch. CDNA (gfx942/gfx950) stays off.
+#define SUPPORT_CLUSTER true
 #else
-// AMD doesn't support cluster
 #define SUPPORT_CLUSTER false
 #endif
 
 #if SUPPORT_CLUSTER
+#ifdef USE_ROCM
+#include <hip/hip_cooperative_groups.h>
+#else
 #include <cooperative_groups.h>
+#endif
 #endif
 
 namespace sglang {
@@ -244,13 +250,14 @@ struct TopKConfig {
         problem.emit(base + t, base + t);
       }
     } else if (num_ties <= kWarpSize) {
-      if (lane_id >= num_ties || warp_id >= num_ties) return;  // some threads are idle
-      /// NOTE: use long long to avoid mask overflow when num_tie == 32
-      const uint32_t mask = (1ull << num_ties) - 1u;
-      const auto tie = tie_buffer[lane_id];
-      const auto target = tie_buffer[warp_id];
-      const auto rank = warp_sum_bool(is_greater(tie, target), mask);
-      if (lane_id == 0 && rank < topk) problem.emit(base + rank, target.idx);
+      if (lane_id < num_ties && warp_id < num_ties) {
+        /// NOTE: use long long to avoid mask overflow when num_tie == 32
+        const uint32_t mask = (1ull << num_ties) - 1u;
+        const auto tie = tie_buffer[lane_id];
+        const auto target = tie_buffer[warp_id];
+        const auto rank = warp_sum_bool(is_greater(tie, target), mask);
+        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target.idx);
+      }
     } else if (num_ties <= kWarpSize * 2) {
       // 64 x 64 topk implementation: each thread takes 2 elements
       const auto warp_id_0 = warp_id;
@@ -402,6 +409,86 @@ struct TopKConfig {
 #pragma unroll
     for (uint32_t i = 0; i < kItems; ++i) {
       if (write_pos[i] < topk) problem.emit(base + write_pos[i], idx[i]);
+    }
+  }
+
+  /// Exact overflow path for a threshold bin that does not fit in
+  /// kMaxNumTie. Re-read the complete row for each radix round instead of
+  /// selecting from a truncated candidate buffer.
+  SGL_DEVICE static void radix_tie_select_from_input(
+      const TopKProblem& problem,
+      const uint32_t base,
+      const float v_lo,
+      const float v_hi,
+      const uint32_t num_ties,
+      const uint32_t topk,
+      TieHandleSmem* smem) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = broadcast(tx / kWarpSize);
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+    uint32_t topk_remain = topk;
+    uint32_t total_active = num_ties;
+
+#pragma unroll
+    for (int round = 0; round < 4; ++round) {
+      const uint32_t shift = 24 - round * 8;
+      const auto histogram = smem->histogram[round % 2];
+      if (tx < kRadixSize) histogram[tx] = 0;
+      __syncthreads();
+
+      for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
+        const auto value = problem.in[idx];
+        const auto key = extract_exact_bin(value);
+        if (value >= v_lo && value < v_hi && (key & prefix_mask) == prefix) {
+          atomicAdd(&histogram[(key >> shift) & 0xFFu], 1u);
+        }
+      }
+      __syncthreads();
+
+      uint32_t hist_val = 0;
+      uint32_t warp_inc = 0;
+      if (tx < kRadixSize) {
+        hist_val = histogram[tx];
+        warp_inc = warp::inclusive_sum(hist_val, lane_id);
+        if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+      }
+      __syncthreads();
+      if (tx < kRadixSize) {
+        const auto inter = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
+        const auto inclusive = inter + warp_inc;
+        const auto above = total_active - inclusive;
+        if (above < topk_remain && above + hist_val >= topk_remain) {
+          smem->match = {tx, above, hist_val};
+        }
+      }
+      __syncthreads();
+
+      const auto [threshold_bin, above_count, equal_count] = smem->match;
+      topk_remain -= above_count;
+      total_active = equal_count;
+      prefix |= threshold_bin << shift;
+      prefix_mask |= 0xFFu << shift;
+    }
+
+    if (tx == 0) {
+      smem->counter = 0;
+      smem->counter_final = 0;
+    }
+    __syncthreads();
+    const auto num_above = topk - topk_remain;
+    for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
+      const auto value = problem.in[idx];
+      if (value < v_lo || value >= v_hi) continue;
+      const auto key = extract_exact_bin(value);
+      if (key > prefix) {
+        const auto pos = atomicAdd(&smem->counter, 1u);
+        if (pos < num_above) problem.emit(base + pos, idx);
+      } else if (key == prefix) {
+        const auto pos = atomicAdd(&smem->counter_final, 1u);
+        if (pos < topk_remain) problem.emit(base + num_above + pos, idx);
+      }
     }
   }
 };
@@ -713,15 +800,28 @@ struct TopKStreaming : TopKRadixBase<12> {
 // Cluster path: very long seq_len, small batch. `kClusterSize` blocks cooperate
 // on one batch element via distributed shared memory (one cluster per element).
 //
-// CUDA only: thread-block clusters and distributed shared memory have no CDNA
-// equivalent.
+// CUDA SM90/SM100, plus a gfx1250 test route. CDNA has no cluster launch.
 // ---------------------------------------------------------------------------
 
 #if SUPPORT_CLUSTER
 
-template <uint32_t N>
-struct TopKCluster : TopKRadixBase<10> {
+template <uint32_t N, uint32_t HistBits = 10>
+struct TopKCluster : TopKRadixBase<HistBits> {
  public:
+  using Base = TopKRadixBase<HistBits>;
+  using typename Base::TieHandleSmem;
+  using Base::find_threshold;
+  using Base::for_each_input;
+  using Base::handle_tie;
+  using Base::init_histogram;
+  using Base::kBlockSize;
+  using Base::kHistBits;
+  using Base::kHistSize;
+  using Base::kMaxNumTie;
+  using Base::kMaxTopK;
+  using Base::kNumWarps;
+  using Base::kTieItems;
+  using Base::kTopKItems;
   static constexpr uint32_t kClusterSize = N;
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
   struct Smem {
@@ -741,15 +841,31 @@ struct TopKCluster : TopKRadixBase<10> {
   };
 
   SGL_DEVICE static void barrier_cluster_arrive_relaxed() {
+#ifndef USE_ROCM
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#else
+    // gfx1250's combined cluster.sync() path hangs. HIP's split helper uses a
+    // workgroup barrier, signals cluster barrier -3 once per workgroup, and
+    // returns an empty arrival token.
+    static_cast<void>(cooperative_groups::this_cluster().barrier_arrive());
+#endif
   }
 
   SGL_DEVICE static void barrier_cluster_arrive_release() {
+#ifndef USE_ROCM
     asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+#else
+    static_cast<void>(cooperative_groups::this_cluster().barrier_arrive());
+#endif
   }
 
   SGL_DEVICE static void barrier_cluster_wait() {
+#ifndef USE_ROCM
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#else
+    using Token = cooperative_groups::cluster_group::arrival_token;
+    cooperative_groups::this_cluster().barrier_wait(Token{});
+#endif
   }
 
   template <bool kUsePDL>
@@ -787,6 +903,14 @@ struct TopKCluster : TopKRadixBase<10> {
     __syncthreads();
     if (this_rank != 0) {
       const auto smem_0 = cluster.map_shared_rank(smem, 0);
+#ifdef USE_ROCM
+      // The installed HIP header returns nullptr when
+      // __builtin_amdgcn_map_shared_rank is missing. Trap here instead of
+      // faulting on that null.
+      if (smem_0 == nullptr) {
+        __builtin_trap();
+      }
+#endif
       // Phase 2. atomic flush all histogram into rank 0
       static_assert(kHistSize == kBlockSize);  // one bin per thread
 
@@ -890,7 +1014,172 @@ struct TopKCluster : TopKRadixBase<10> {
   }
 };
 
-#endif  // !USE_ROCM
+#if defined(SGL_ROCM_ARCH_GFX1250)
+
+struct Gfx1250ClusterWorkspace {
+  uint32_t* hist;
+  uint32_t* counts;
+  TieValue* ties;
+};
+
+// gfx1250 has cluster barriers and global-memory multicast to registers, but
+// no CUDA-style pointer into another workgroup's LDS. Stage one 12-bit
+// histogram per rank in global memory, then multicast each bin to the
+// corresponding lane in every rank. Candidate payloads use prefix sums over
+// one count pair per rank; no per-candidate global atomics are needed.
+template <uint32_t N>
+struct TopKGfx1250Cluster : TopKCluster<N, 12> {
+  using Parent = TopKCluster<N, 12>;
+  using Smem = typename Parent::Smem;
+  static constexpr uint32_t kMask = (1u << N) - 1u;
+  static constexpr uint32_t kHistItems = Parent::kHistSize / Parent::kBlockSize;
+  static_assert(Parent::kHistSize % Parent::kBlockSize == 0);
+
+  template <bool kUsePDL>
+  SGL_DEVICE static void forward(
+      TopKProblem problem,
+      void* _smem,
+      Gfx1250ClusterWorkspace workspace,
+      uint32_t slot) {
+    const auto tx = threadIdx.x;
+    const auto rank = blockIdx.y;
+    auto* const smem = static_cast<Smem*>(_smem);
+    auto* const row_hist = workspace.hist + static_cast<size_t>(slot) * N * Parent::kHistSize;
+    auto* const row_counts = workspace.counts + static_cast<size_t>(slot) * N * 2;
+    auto* const row_ties = workspace.ties + static_cast<size_t>(slot) * Parent::kMaxNumTie;
+
+    Parent::init_histogram(smem->histogram, tx);
+    if (tx == 0) {
+      smem->count_gt = 0;
+      smem->count_eq = 0;
+    }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    Parent::template for_each_input<N>(problem.in, problem.seq_len, [&](float value, uint32_t) {
+      atomicAdd(&smem->histogram[extract_coarse_bin<Parent::kHistBits>(value)], 1u);
+    });
+    __syncthreads();
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i) {
+      const auto bin = tx * kHistItems + i;
+      row_hist[rank * Parent::kHistSize + bin] = smem->histogram[bin];
+    }
+
+    Parent::barrier_cluster_arrive_release();
+    Parent::barrier_cluster_wait();
+
+#pragma unroll
+    for (uint32_t i = 0; i < kHistItems; ++i) {
+      const auto bin = tx * kHistItems + i;
+      uint32_t histogram_sum = 0;
+#pragma unroll
+      for (uint32_t peer = 0; peer < N; ++peer) {
+        histogram_sum += static_cast<uint32_t>(__builtin_amdgcn_cluster_load_b32(
+            reinterpret_cast<int*>(row_hist) + peer * Parent::kHistSize + bin, 0, kMask));
+      }
+      smem->histogram[bin] = histogram_sum;
+    }
+    __syncthreads();
+
+    Parent::find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
+      smem->v_hi = coarse_bin_lower_bound<Parent::kHistBits>(threshold_bin + 1);
+      smem->v_lo = coarse_bin_lower_bound<Parent::kHistBits>(threshold_bin);
+    });
+    if (tx == 0) {
+      smem->count_gt = 0;
+      smem->count_eq = 0;
+    }
+    __syncthreads();
+
+    const auto topk = problem.topk;
+    const auto v_hi = smem->v_hi;
+    const auto v_lo = smem->v_lo;
+    Parent::template for_each_input<N>(problem.in, problem.seq_len, [&](float value, uint32_t idx) {
+      if (value >= v_hi) {
+        const auto pos = atomicAdd(&smem->count_gt, 1u);
+        if (pos < topk) smem->stage_out_idxs[pos] = static_cast<int32_t>(idx);
+      } else if (value >= v_lo) {
+        const auto pos = atomicAdd(&smem->count_eq, 1u);
+        if (pos < Parent::kMaxNumTie) smem->tie_values[pos] = {value, idx};
+      }
+    });
+    __syncthreads();
+
+    const auto local_gt = min(smem->count_gt, topk);
+    const auto local_eq_count = smem->count_eq;
+    const auto local_eq = min(local_eq_count, Parent::kMaxNumTie);
+    if (tx == 0) {
+      row_counts[rank * 2] = local_gt;
+      row_counts[rank * 2 + 1] = local_eq_count;
+    }
+    Parent::barrier_cluster_arrive_release();
+    Parent::barrier_cluster_wait();
+
+    if (tx == 0) {
+      uint32_t base_gt = 0;
+      uint32_t base_eq = 0;
+      uint32_t total_gt = 0;
+      uint32_t total_eq = 0;
+#pragma unroll
+      for (uint32_t peer = 0; peer < N; ++peer) {
+        const auto peer_gt = row_counts[peer * 2];
+        const auto peer_eq = row_counts[peer * 2 + 1];
+        if (peer < rank) {
+          base_gt += peer_gt;
+          base_eq += peer_eq;
+        }
+        total_gt += peer_gt;
+        total_eq += peer_eq;
+      }
+      smem->local_start_gt = base_gt;
+      smem->local_start_eq = base_eq;
+      smem->count_gt = total_gt;
+      smem->count_eq = total_eq;
+    }
+    __syncthreads();
+
+    const auto base_gt = smem->local_start_gt;
+    const auto base_eq = smem->local_start_eq;
+#pragma unroll
+    for (uint32_t i = 0; i < Parent::kTopKItems; ++i) {
+      const auto item = tx + i * Parent::kBlockSize;
+      if (item < local_gt && base_gt + item < topk) {
+        problem.emit(base_gt + item, static_cast<uint32_t>(smem->stage_out_idxs[item]));
+      }
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < Parent::kTieItems; ++i) {
+      const auto item = tx + i * Parent::kBlockSize;
+      if (item < local_eq && base_eq + item < Parent::kMaxNumTie) {
+        row_ties[base_eq + item] = smem->tie_values[item];
+      }
+    }
+
+    Parent::barrier_cluster_arrive_release();
+    Parent::barrier_cluster_wait();
+    if (rank == 0) {
+      const auto total_gt = smem->count_gt;
+      const auto total_eq = smem->count_eq;
+      const auto remain = total_gt < topk ? topk - total_gt : 0;
+      if (total_eq <= Parent::kMaxNumTie) {
+        for (uint32_t item = tx; item < total_eq; item += Parent::kBlockSize) {
+          smem->tie_values[item] = row_ties[item];
+        }
+        __syncthreads();
+        Parent::handle_tie(smem->tie_values, problem, total_gt, total_eq, remain, &smem->tie_handle);
+      } else {
+        Parent::radix_tie_select_from_input(
+            problem, total_gt, v_lo, v_hi, total_eq, remain, &smem->tie_handle);
+      }
+      __syncthreads();
+    }
+  }
+};
+
+#endif  // SGL_ROCM_ARCH_GFX1250
+
+#endif  // SUPPORT_CLUSTER
 
 }  // namespace device::topk
 

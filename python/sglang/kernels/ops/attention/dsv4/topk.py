@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -15,6 +16,109 @@ from sglang.srt.utils import is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
+
+_GFX1250_CLUSTER_MAX_BATCH = 512
+_GFX1250_CLUSTER_HIST_BINS = 4096
+_GFX1250_CLUSTER_MAX_TIES = 2048
+_GFX1250_CLUSTER_BOUNDARY = 30
+_GFX1250_CLUSTER_MAX_STREAMS_PER_DEVICE = 8
+_GFX1250_CLUSTER_WORKSPACES: dict[
+    tuple[int, int], tuple[torch.cuda.Stream, torch.Tensor]
+] = {}
+
+
+def _gfx1250_cluster_width(batch: int, max_seq_len: int) -> int:
+    override = os.environ.get("SGLANG_GFX1250_TOPK_CLUSTER_SIZE")
+    if override is not None:
+        try:
+            width = int(override)
+        except ValueError as error:
+            raise ValueError(
+                "SGLANG_GFX1250_TOPK_CLUSTER_SIZE must be one of 2, 4, 8, 15"
+            ) from error
+        if width not in (2, 4, 8, 15):
+            raise ValueError(
+                "SGLANG_GFX1250_TOPK_CLUSTER_SIZE must be one of 2, 4, 8, 15"
+            )
+        return width
+    if batch <= _GFX1250_CLUSTER_BOUNDARY:
+        if max_seq_len > 131072:
+            return 8
+        return 4 if batch <= 8 else 8
+    return 2 if max_seq_len > 131072 else 4
+
+
+def _gfx1250_cluster_workspace_bytes(batch: int, width: int) -> int:
+    hist_bytes = batch * width * _GFX1250_CLUSTER_HIST_BINS * 4
+    count_bytes = batch * width * 2 * 4
+    tie_bytes = batch * _GFX1250_CLUSTER_MAX_TIES * 8
+    return hist_bytes + count_bytes + tie_bytes
+
+
+_GFX1250_CLUSTER_MAX_WORKSPACE_BYTES = max(
+    _gfx1250_cluster_workspace_bytes(_GFX1250_CLUSTER_BOUNDARY, 15),
+    _gfx1250_cluster_workspace_bytes(_GFX1250_CLUSTER_MAX_BATCH, 4),
+)
+
+
+def _gfx1250_cluster_workspace(
+    scores: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if os.environ.get("SGLANG_GFX1250_TOPK_CLUSTER") != "1":
+        return None
+    props = torch.cuda.get_device_properties(scores.device)
+    if "gfx1250" not in getattr(props, "gcnArchName", ""):
+        return None
+    batch, max_seq_len = scores.shape
+    floor = 32768 if batch <= 15 else 65536
+    if (
+        batch == 0
+        or batch == 1
+        or batch > _GFX1250_CLUSTER_MAX_BATCH
+        or max_seq_len <= floor
+    ):
+        return None
+
+    width = _gfx1250_cluster_width(batch, max_seq_len)
+    required_bytes = _gfx1250_cluster_workspace_bytes(batch, width)
+    device_index = (
+        scores.device.index
+        if scores.device.index is not None
+        else torch.cuda.current_device()
+    )
+    stream = torch.cuda.current_stream(scores.device)
+    key = (device_index, int(stream.cuda_stream))
+    entry = _GFX1250_CLUSTER_WORKSPACES.get(key)
+    if entry is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "gfx1250 TopK cluster workspace must be allocated before graph capture"
+            )
+        num_device_streams = sum(
+            entry_device == device_index
+            for entry_device, _ in _GFX1250_CLUSTER_WORKSPACES
+        )
+        if num_device_streams >= _GFX1250_CLUSTER_MAX_STREAMS_PER_DEVICE:
+            raise RuntimeError(
+                "gfx1250 TopK cluster workspace stream limit exceeded: "
+                f"{_GFX1250_CLUSTER_MAX_STREAMS_PER_DEVICE}"
+            )
+        workspace = torch.empty(
+            _GFX1250_CLUSTER_MAX_WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=scores.device,
+        )
+        # Retain the stream object with the storage so its raw handle cannot be
+        # destroyed and reused while a captured graph still references it.
+        entry = (stream, workspace)
+        _GFX1250_CLUSTER_WORKSPACES[key] = entry
+    workspace = entry[1]
+    if workspace.numel() < required_bytes:
+        raise RuntimeError(
+            f"gfx1250 TopK cluster workspace has {workspace.numel()} bytes, "
+            f"but this launch requires {required_bytes}"
+        )
+    return workspace
 
 
 @cache_once
@@ -270,6 +374,7 @@ def topk_transform_paged_v2(
         )
         return
     module = _jit_topk_v2_module()
+    cluster_workspace = _gfx1250_cluster_workspace(scores)
     module.topk_transform_paged(
         scores,
         seq_lens,
@@ -278,6 +383,7 @@ def topk_transform_paged_v2(
         page_size,
         metadata,
         out_raw_indices,
+        cluster_workspace,
     )
 
 
