@@ -4,6 +4,7 @@
 
 #![cfg(all(feature = "render", feature = "tokenizer"))]
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
@@ -32,7 +33,7 @@ fn fixtures_match_sglang() {
 fn check(fixture: &Value) {
     let model = fixture["model"].as_str().unwrap();
     let revision = fixture["revision"].as_str().unwrap();
-    let formatter = formatter(model, &fixture["config"]);
+    let formatter = formatter(model, fixture);
     let tokenizer = cached_tokenizer(model, revision);
     // The fixture records Python's DeepSeek-V4 profile; the checkpoint's encoder must agree.
     if let (ChatFormatter::DeepSeekV4(profile), Some(_)) = (&formatter, &tokenizer) {
@@ -71,7 +72,10 @@ fn check_case(
     bos: &Value,
     case: &Value,
 ) -> Result<(), String> {
-    let rendered = formatter.render_request(case["request"].clone(), &Default::default());
+    let defaults: HashMap<String, Value> = (case["default_chat_template_kwargs"].as_object())
+        .map(|defaults| defaults.clone().into_iter().collect())
+        .unwrap_or_default();
+    let rendered = formatter.render_request(case["request"].clone(), &defaults);
     if !case["error"].is_null() {
         return match rendered {
             Ok(_) => Err("SGLang rejects this request".into()),
@@ -97,15 +101,19 @@ fn check_case(
     Ok(())
 }
 
-/// What `select_chat_formatter` picks for the fixture's `config.json`.
-fn formatter(model: &str, config: &Value) -> ChatFormatter {
+/// What `select_chat_formatter` picks for the fixture's `config.json` and Jinja template.
+fn formatter(model: &str, fixture: &Value) -> ChatFormatter {
     let dir = std::env::temp_dir().join(format!(
         "sglang-processor-parity-{}-{}",
         std::process::id(),
         model.replace('/', "--")
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    std::fs::write(dir.join("config.json"), fixture["config"].to_string()).unwrap();
+    if let Some(template) = fixture["chat_template"].as_str() {
+        std::fs::write(dir.join("chat_template.jinja"), template).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
+    }
     let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
         tokenizer_path: dir.to_string_lossy().into_owned(),
         ..Default::default()
