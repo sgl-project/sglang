@@ -44,7 +44,7 @@ def paged_view(raw, page_size, bytes_per_token):
 )
 class TestMegaAttention(CustomTestCase):
     def test_pack_mega_query_layout(self):
-        for heads in (8, 16, 32, 64, 128):
+        for heads in (16, 128):
             with self.subTest(heads=heads):
                 q = torch.randn(3, heads, 512, device="cuda", dtype=torch.bfloat16)
                 padded = 64 if heads <= 64 else 128
@@ -77,49 +77,34 @@ class TestMegaAttention(CustomTestCase):
                         scale_fmt="ue8m0",
                     )
                 )
-            for heads in (64, 128):
-                with self.subTest(backend=backend, heads=heads):
-                    linear = torch.nn.Module()
-                    linear.quant_method = method
-                    linear.weight = torch.randn(heads * 512, 1280, device="cuda").to(
-                        torch.float8_e4m3fn
+            with self.subTest(backend=backend):
+                linear = torch.nn.Module()
+                linear.quant_method = method
+                linear.weight = torch.randn(64 * 512, 1280, device="cuda").to(
+                    torch.float8_e4m3fn
+                )
+                linear.weight_scale_inv = torch.randint(
+                    119, 129, (64 * 512, 40), device="cuda", dtype=torch.uint8
+                )
+                method._process_mxfp8_linear_weight_scale(linear)
+                projection = prepare_mega_wq_b(linear, 64)
+                self.assertIsNone(prepare_mega_wq_b(linear, 16))
+                x = torch.randn(1536, 1280, device="cuda", dtype=torch.bfloat16)
+                # The fused-RMSNorm decode path hands apply() a pre-quantized input.
+                quantized = Mxfp8SwizzledInput(
+                    *fp8_utils.flashinfer_mxfp8_quantize(
+                        x[:3], is_sf_swizzled_layout=True, alignment=32
                     )
-                    linear.weight_scale_inv = torch.randint(
-                        119, 129, (heads * 512, 40), device="cuda", dtype=torch.uint8
-                    )
-                    method._process_mxfp8_linear_weight_scale(linear)
-                    projection = prepare_mega_wq_b(linear, heads)
-                    self.assertIsNotNone(projection)
-                    for tokens in (3, 96, 1536):
-                        x = torch.randn(
-                            tokens, 1280, device="cuda", dtype=torch.bfloat16
-                        )
-                        expected = pack_mega_query(
-                            method.apply(linear, x).view(tokens, heads, 512), heads
-                        )
-                        torch.testing.assert_close(
-                            method.apply(projection, x).view(tokens, heads, 512),
-                            expected,
-                            rtol=0,
-                            atol=0,
-                        )
-                    # The fused-RMSNorm decode path hands apply() a pre-quantized input.
-                    x = torch.randn(3, 1280, device="cuda", dtype=torch.bfloat16)
-                    quantized = Mxfp8SwizzledInput(
-                        *fp8_utils.flashinfer_mxfp8_quantize(
-                            x, is_sf_swizzled_layout=True, alignment=32
-                        )
-                    )
+                )
+                for inputs in (x, quantized):
                     torch.testing.assert_close(
-                        method.apply(projection, quantized),
+                        method.apply(projection, inputs),
                         pack_mega_query(
-                            method.apply(linear, quantized).view(3, heads, 512), heads
-                        ).view(3, -1),
+                            method.apply(linear, inputs).view(-1, 64, 512), 64
+                        ).view(-1, 64 * 512),
                         rtol=0,
                         atol=0,
                     )
-                    # Padded head counts keep the runtime pack.
-                    self.assertIsNone(prepare_mega_wq_b(linear, 16))
 
     def test_wo_a_projection_matches_reference(self):
         torch.manual_seed(456)

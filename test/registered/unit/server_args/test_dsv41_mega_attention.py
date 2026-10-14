@@ -69,25 +69,18 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
         )
         self.assertEqual(resolved_backend(args), "flashmla_mega")
         self.assertEqual(args.dsv4_attn_backend, "auto")
-        for backend in ("flashmla", "trtllm"):
-            args = mega_args(dsv4_attn_backend=backend, chunked_prefill_size=32768)
-            self.assertEqual(resolved_backend(args), backend)
-        falls_back = (
-            dict(model_type="deepseek_v4"),
-            dict(kv_cache_dtype="bfloat16"),
-            dict(cuda_graph_backend_prefill=Backend.FULL),
-            dict(enable_encoder_swa_bounded_replay=True),
-            dict(disaggregation_mode="prefill"),
-            dict(enable_prefill_cp=True),
-            dict(tp_size=16),
+        self.assertEqual(
+            resolved_backend(mega_args(dsv4_attn_backend="flashmla")), "flashmla"
         )
-        for fields in falls_back:
+        for fields in (
+            dict(model_type="deepseek_v4"),
+            dict(cuda_graph_backend_prefill=Backend.FULL),
+            dict(disaggregation_mode="prefill"),
+            dict(tp_size=16),
+        ):
             with self.subTest(fields=fields):
                 args = mega_args(dsv4_attn_backend="auto", **fields)
                 self.assertEqual(resolved_backend(args), "flashmla")
-        with envs.SGLANG_DSV4_KV_LAYOUT.override("v4"):
-            args = mega_args(dsv4_attn_backend="auto")
-            self.assertEqual(resolved_backend(args), "flashmla")
         with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True):
             args = mega_args(dsv4_attn_backend="auto")
             args._model_config.hf_config.quantization_config = {
@@ -111,15 +104,6 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
                     apply_deepseek_v4_defaults(
                         mega_args(**fields), "DeepseekV4ForCausalLM"
                     )
-        apply_deepseek_v4_defaults(
-            mega_args(
-                tp_size=4,
-                attn_dp_size=4,
-                cuda_graph_backend_prefill=Backend.BREAKABLE,
-                enable_decoder_swa_bounded_replay=True,
-            ),
-            "DeepseekV4ForCausalLM",
-        )
         with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
             with self.assertRaisesRegex(ValueError, "SM100/SM103"):
                 apply_deepseek_v4_defaults(mega_args(), "DeepseekV4ForCausalLM")

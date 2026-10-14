@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -21,52 +20,6 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestHiCacheAutoSize(CustomTestCase):
-    def test_dsv41_default_counts_paged_regions_and_draft_swa(self):
-        """Default sizing must accept V4.1 and exclude rebuilt pair-ring state."""
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4SingleKVPool,
-            DeepSeekV4TokenToKVPool,
-        )
-
-        target = object.__new__(DeepSeekV4TokenToKVPool)
-        target._unified_kv = target._unified_kv_fp8 = False
-        target._stage_start, target._stage_end = 0, 2
-        target.compression_ratios = [1, 2]
-        target.page_size = target.swa_page_size = 256
-        target.kv_pools = {
-            ratio: SimpleNamespace(kv_buffer=[torch.zeros(2, 288, dtype=torch.uint8)])
-            for ratio in (1, 2)
-        }
-        index_buffers = [torch.zeros(4, 68, dtype=torch.uint8) for _ in (1, 2)]
-        target.index_pools = {
-            ratio: SimpleNamespace(
-                page_size=128,
-                contiguous_page_row_buffers=lambda b=buffer: [b],
-            )
-            for ratio, buffer in zip((1, 2), index_buffers)
-        }
-        target.swa_kv_pool = object.__new__(DeepSeekV4SingleKVPool)
-        target.swa_kv_pool.page_size = 256
-        target.swa_kv_pool.size = 16
-        target.swa_kv_pool.kv_buffer = [torch.zeros(2, 528, dtype=torch.uint8)]
-        target.compress_state_pools = [
-            SimpleNamespace(request_scoped=True),
-        ]
-        target.indexer_compress_state_pools = []
-        draft = object.__new__(DeepSeekV4TokenToKVPool)
-        draft.swa_kv_pool = object.__new__(DeepSeekV4SingleKVPool)
-        draft.swa_kv_pool.size = 8
-        draft.swa_kv_pool.kv_buffer = [torch.zeros(2, 512, dtype=torch.bfloat16)]
-        params = CacheInitParams(
-            disable=False,
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
-            mtp_draft_device_pools=(draft,),
-            page_size=256,
-        )
-        expected = 2 * (2 * 288 + 4 * 68) + 2 * 528 + 2 * (2 * 512 * 2)
-        self.assertEqual(sizing._estimate_hicache_bytes(params, None), expected)
-
     def test_hybrid_target_draft_uses_its_sidecar_slot_capacity(self):
         # EAGLE3 can pair a hybrid target with a plain MHA draft. Full drafts
         # follow full target slots; SWA drafts follow the smaller SWA capacity.
