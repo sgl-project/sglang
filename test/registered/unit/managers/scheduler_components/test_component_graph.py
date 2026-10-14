@@ -185,8 +185,8 @@ _DECLARED = {
         "LaunchCounters",
         "EngineFlags",
         "MetricsSink",
+        "StageMetrics",
         "ProfilerManager",
-        "ModeOwners",
         "PendingSteps",
         "CoreLists",
         "KvResources",
@@ -312,6 +312,8 @@ _PARAM = {
     "RequestEnqueuer": ("request_enqueuer",),
     "StepBuilder": ("step_builder",),
     "StepCounters": ("step_counters",),
+    "ProfilerManager": ("profiler_manager",),
+    "PPSpecForward": ("pp_spec_forward",),
 }
 
 # Components in their final form: node -> (module under srt/, class).
@@ -358,6 +360,10 @@ _BUILT = {
     ),
     "StepBuilder": ("managers/scheduler_components/step_builder.py", "StepBuilder"),
     "StepCounters": ("managers/scheduler_components/step_counters.py", "StepCounters"),
+    "StepLauncher": (
+        "managers/scheduler_components/step_launcher.py",
+        "StepLauncher",
+    ),
     "DisaggDecode": ("disaggregation/decode.py", "DisaggDecode"),
     "DisaggPrefill": ("disaggregation/prefill.py", "DisaggPrefill"),
     "DllmManager": ("dllm/manager.py", "DllmManager"),
@@ -411,7 +417,6 @@ _CALLBACK_SITES = {
     ("init_pp_ring", "DriverOps", "ingest_requests", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "launch_step", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "commit_step", _BOUND): 1,
-    ("init_pp_ring", "DriverOps", "run_batch", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "on_idle", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "mark_idle", _BOUND): 1,
     # RPC dispatch and the PD role switch, which name the scheduler itself.

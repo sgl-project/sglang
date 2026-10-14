@@ -2,6 +2,7 @@
 step's host commit; that step's grammar commit runs inside the launch."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -122,7 +123,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
             # The host commit runs the step's grammar commit if not done yet.
             advance_grammar_fsm(result, step)
 
-        s.run_batch = run_batch
+        s.step_launcher = SimpleNamespace(run_batch=run_batch)
         s.process_batch_result = process_batch_result
         s.init_mode_stages()
 

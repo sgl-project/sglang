@@ -156,7 +156,9 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         scheduler.recv_skipper = None
         scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.run_batch = MagicMock(return_value=result)
+        scheduler.step_launcher = SimpleNamespace(
+            run_batch=MagicMock(return_value=result)
+        )
         scheduler._apply_war_barrier = MagicMock()
         scheduler.step_counters = MagicMock()
         scheduler.is_generation = False

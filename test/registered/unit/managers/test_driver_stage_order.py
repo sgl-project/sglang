@@ -248,9 +248,10 @@ class _Shell:
         )
         s._arm_prefill_decode_interval = lambda step: self.log("arm_interval")
         s.ngram_embedding_manager = SimpleNamespace(prepare_for_forward=self.ngram)
-        s.run_batch = self.run_batch
+        s.step_launcher = SimpleNamespace(
+            run_batch=self.run_batch, launch_batch_sample_if_needed=self.sample
+        )
         s._apply_war_barrier = lambda: self.log("war_barrier")
-        s.launch_batch_sample_if_needed = self.sample
         s.process_batch_result = self.process_batch_result
         s.step_counters = SimpleNamespace(record=lambda record: None)
         s.on_idle = lambda: self.log("idle")

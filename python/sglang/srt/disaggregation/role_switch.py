@@ -124,6 +124,7 @@ def handle_pd_role_switch(
             scheduler.maybe_init_disagg_decode()
             scheduler.maybe_init_disagg_move_gate()
             scheduler.init_mode_stages()
+            scheduler.init_step_launcher()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
             logger.critical(

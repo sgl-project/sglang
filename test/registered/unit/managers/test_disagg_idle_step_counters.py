@@ -24,6 +24,7 @@ from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingSteps,
 )
 from sglang.srt.managers.scheduler_components.step_counters import StepCounters
+from sglang.srt.managers.scheduler_components.step_launcher import StepLauncher
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -300,7 +301,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         def run_batch(batch, pp_proxy_tensors=None):
             # Exercise the real iteration handoff up to the model forward.
             with self.assertRaises(_BeforeModelForward):
-                Scheduler.run_batch(scheduler, batch, pp_proxy_tensors)
+                StepLauncher.run_batch(scheduler.step_launcher, batch, pp_proxy_tensors)
             copy_done = Mock(
                 query=Mock(
                     return_value=True,
@@ -322,7 +323,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         scheduler.get_next_disagg_prefill_batch_to_run = schedule
         scheduler.get_next_disagg_decode_batch_to_run = schedule
-        scheduler.run_batch = run_batch
+        scheduler.step_launcher.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
         scheduler.step_counters = SimpleNamespace(record=record_step_counters)
         scheduler.init_mode_stages()
@@ -380,7 +381,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             "sglang.srt.managers.scheduler.time.monotonic", return_value=launch_ts
         ):
             with self.assertRaises(_BeforeModelForward):
-                Scheduler.run_batch(scheduler, batch, pp_proxy_tensors)
+                StepLauncher.run_batch(scheduler.step_launcher, batch, pp_proxy_tensors)
 
     def record_result(self, scheduler, record, result_ts):
         # Prefill accounting reads the clock again when the result lands.
@@ -415,9 +416,15 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         )
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_sink = SimpleNamespace(record_scheduler_active=Mock())
-        scheduler.scripted_scheduler_hook = SimpleNamespace(
+        # The launch runs up to the scripted pre-forward hook.
+        launcher = scheduler.step_launcher = StepLauncher.__new__(StepLauncher)
+        launcher.counters = scheduler.counters
+        launcher.scheduler_stage_metrics = None
+        launcher.metrics_sink = scheduler.metrics_sink
+        launcher.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)
         )
+        launcher.launch_batch_sample_if_needed = Mock()
         scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
         scheduler.recv_skipper = None
@@ -444,14 +451,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.schedule = lambda: next(scheduled_batches, None)
         scheduler.is_disable_overlap_for_batch = Mock(return_value=False)
         scheduler._apply_war_barrier = Mock()
-        scheduler.launch_batch_sample_if_needed = Mock()
         scheduler.on_idle = Mock()
         return scheduler
 
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
-        scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
         scheduler.device_module = SimpleNamespace(
@@ -465,7 +470,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         )
         scheduler.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
         scheduler.world_group = scheduler.attn_tp_group = None
-        scheduler.copy_stream = scheduler.copy_stream_ctx = None
+        scheduler.copy_stream = None
         scheduler.req_to_token_pool = scheduler.token_to_kv_pool_allocator = None
         scheduler.tp_worker = scheduler.model_worker = scheduler.future_map = None
         scheduler.pp_spec_forward = None

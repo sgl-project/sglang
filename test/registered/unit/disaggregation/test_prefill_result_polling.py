@@ -43,6 +43,7 @@ from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.step_launcher import StepLauncher
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -173,6 +174,25 @@ for _name, _source in (
     setattr(_Owner, _name, property(lambda self, n=_source: getattr(self.scheduler, n)))
 
 
+class _Launcher:
+    """The real delayed sample and its host copy start; the forward is the
+    scheduler double's run_batch."""
+
+    launch_batch_sample_if_needed = StepLauncher.launch_batch_sample_if_needed
+
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+        self.forward_stream_ctx = nullcontext()
+        self.copy_stream_ctx = nullcontext()
+        self.forward_stream = Mock(spec=["wait_stream"])
+        self.copy_stream = Mock(spec=["wait_stream"])
+        self.schedule_stream = object()
+        self._relay_beam_tokens = Mock()
+
+    def run_batch(self, batch):
+        return self.scheduler.run_batch(batch)
+
+
 class _Scheduler:
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
@@ -193,7 +213,6 @@ class _Scheduler:
         Scheduler._is_continuous_input_polling_enabled
     )
     _yield_gil_if_needed = Scheduler._yield_gil_if_needed
-    launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
     run_flat_loop = Scheduler.run_flat_loop
@@ -263,12 +282,7 @@ class _Scheduler:
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
         )
-        self.forward_stream_ctx = nullcontext()
-        self.copy_stream_ctx = nullcontext()
-        self.forward_stream = Mock(spec=["wait_stream"])
-        self.copy_stream = Mock(spec=["wait_stream"])
-        self.schedule_stream = object()
-        self._relay_beam_tokens = Mock()
+        self.step_launcher = _Launcher(self)
         self.tree_cache = Mock(spec=["flush_pending_backups", "finish"])
         self.batch_result_processor = result_processor_shell()
         self.metrics_reporter = Mock(spec=["report_prefill_stats"])

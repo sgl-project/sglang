@@ -85,7 +85,9 @@ class TestPPRingCommit(CustomTestCase):
         s.pp_spec_forward = None
         s._sched_idled = False
         s.ingest_requests = Mock(return_value=[])
-        s.run_batch = lambda step, pp_proxy_tensors: SimpleNamespace(launched=step.name)
+        s.step_launcher = SimpleNamespace(
+            run_batch=lambda step, pp_proxy_tensors: SimpleNamespace(launched=step.name)
+        )
         s.join_launched_step = Mock()
         s.on_idle = Mock()
 

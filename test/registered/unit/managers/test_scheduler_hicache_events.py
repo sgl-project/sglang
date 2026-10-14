@@ -155,7 +155,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
         s.world_group = s.attn_tp_group = s.device = None
         s.schedule_stream = s.forward_stream = s.copy_stream = None
-        s.copy_stream_ctx = s.forward_stream_ctx = s.spec_algorithm = None
+        s.spec_algorithm = None
         s.req_to_token_pool = s.token_to_kv_pool_allocator = None
         s.tp_worker = s.model_worker = s.future_map = None
         s.streams = Streams(
@@ -164,6 +164,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.device_module = SimpleNamespace(stream=lambda stream: None)
         s.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
         s.pp_spec_forward = None
+        s.step_launcher = SimpleNamespace(run_batch=Mock())
         s.recv_skipper = None
         s.ingest_requests = Mock(return_value=[])
         s.lists.waiting_queue = []
