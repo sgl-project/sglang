@@ -1698,8 +1698,8 @@ class Scheduler:
             enable_overlap=(not get_schedule().disable_overlap_schedule),
         )
 
-        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
-        # via the PP ring; init unconditionally to match main.
+        # copy_stream is also used by PP (non-overlap) via the PP ring; init
+        # unconditionally to match main.
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
