@@ -1458,6 +1458,7 @@ def gluon_fav3_wan_cross_attention(
             num_warps=4,
             waves_per_eu=1,
             llvm_fn_attrs="amdgpu-sched-strategy=iterative-ilp",
+            enable_fp_fusion=True,
         )
     return output
 
