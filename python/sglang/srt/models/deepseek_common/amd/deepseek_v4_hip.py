@@ -168,6 +168,10 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer.hc_boundary_fused = (
         _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
     )
+
+
+def finalize_decoder_layer(layer) -> None:
+    """Initialize mono state after the decoder layer has attached its Engram."""
     dsv41_mono_decode.init_layer(layer)
 
 

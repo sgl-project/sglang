@@ -174,6 +174,69 @@ def draft_layer_cases(cfg):
     return fails
 
 
+def k1_variant_cases():
+    """Layer 0 and Engram layers do not fold; index sources select the index build."""
+    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
+
+    old_decode = os.environ.get("SGLANG_ROCM_MONO_DECODE")
+    old_k1 = os.environ.get("SGLANG_ROCM_MONO_K1")
+    unsupported = m._unsupported
+    unsupported_k1 = m._unsupported_k1
+    mono_ffn, mono_k1 = m.MonoFfn, m.MonoK1
+    seen = []
+
+    class K1:
+        def __init__(self, layer, fold=True, index=False):
+            self.fold, self.index = fold, index
+
+    def layer(layer_id, *, engram=False, index=False):
+        attn = types.SimpleNamespace(
+            layer_id=layer_id,
+            compress_ratio=0 if layer_id in (0, 1) else 2,
+            compressor=object() if index else None,
+            indexer=object() if index else None,
+        )
+        return types.SimpleNamespace(
+            mlp=types.SimpleNamespace(is_nextn=False, is_hash=False),
+            config=object(),
+            hc_boundary_fused=True,
+            self_attn=attn,
+            engram=object() if engram else None,
+        )
+
+    try:
+        os.environ["SGLANG_ROCM_MONO_DECODE"] = "1"
+        os.environ["SGLANG_ROCM_MONO_K1"] = "1"
+        m._unsupported = lambda config: None
+        m._unsupported_k1 = lambda attn: None
+        m.MonoFfn = lambda layer: object()
+        m.MonoK1 = K1
+        cases = [
+            ("first", layer(0), (False, False)),
+            ("engram", layer(1, engram=True), (False, False)),
+            ("engram-index", layer(14, engram=True, index=True), (False, True)),
+            ("standard", layer(3), (True, False)),
+        ]
+        for name, candidate, want in cases:
+            m.init_layer(candidate)
+            got = (candidate.mono_k1.fold, candidate.mono_k1.index)
+            print(f"  {'PASS' if got == want else 'FAIL'} {name} K1: {got}")
+            if got != want:
+                seen.append(f"{name}: {got}, want {want}")
+    finally:
+        m._unsupported, m._unsupported_k1 = unsupported, unsupported_k1
+        m.MonoFfn, m.MonoK1 = mono_ffn, mono_k1
+        for key, value in (
+            ("SGLANG_ROCM_MONO_DECODE", old_decode),
+            ("SGLANG_ROCM_MONO_K1", old_k1),
+        ):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return seen
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "deepseek-ai/DeepSeek-V4.1-Flash"
     cfg = load_config(path)
@@ -205,8 +268,9 @@ def main():
     f, nm = step_cases()
     fails += f
     fails += draft_layer_cases(cfg)
+    fails += k1_variant_cases()
     print(
-        f"{len(cases)} negative cases + warmup + {ns} speculative + {nm} step + 2 layer cases; "
+        f"{len(cases)} negative cases + warmup + {ns} speculative + {nm} step + layer cases; "
         + ("ALL PASS" if not fails else f"FAILED: {fails}")
     )
     sys.exit(1 if fails else 0)

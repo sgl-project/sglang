@@ -2811,6 +2811,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("engram", prefix),
             )
+        if _is_hip:
+            _hip.finalize_decoder_layer(self)
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
 
