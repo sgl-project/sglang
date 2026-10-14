@@ -1612,8 +1612,6 @@ class DeepseekV4AttnBackend(
     def _prefill_graph_tail_routing_bound(
         self, non_padded: torch.Tensor, real_rows: int
     ) -> torch.Tensor:
-        # Captured MoE kernels read the bound by address, so every replay clamps
-        # into one persistent scalar; an idle DP peer's zero stays zero.
         if self._bcg_tail_num_token_non_padded is None:
             self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
         return torch.clamp(
@@ -1872,9 +1870,9 @@ class DeepseekV4AttnBackend(
         )
         tail = tail_metadata.late_layer_tail
         # Inside the prefill CUDA graph the tail block is padded to a fixed capacity;
-        # the eager breaks (attention, low-ratio sources) and the captured MoE
-        # routing clip their inputs to the batch's non-padded counts, so point
-        # them at the real tail rows while the late layers run.
+        # the eager breaks (attention, low-ratio sources) clip their inputs to the
+        # batch's non-padded count, so point it at the real tail rows while the
+        # late layers run.
         saved = saved + (
             forward_batch.global_num_token_non_padded_cpu,
             forward_batch.global_num_token_non_padded,
