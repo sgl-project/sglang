@@ -92,5 +92,31 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
+def test_wrapper_serves_cpu_tensors_on_a_gpu_host():
+    """The registry picks a kernel by platform; a CPU tensor on a GPU host (the
+    CPU unit suites run there too) must reach the torch reference, which agrees
+    with the device kernel."""
+    from sglang.kernels.ops.sampling import top_k_renorm_probs, top_p_renorm_probs
+
+    torch.manual_seed(7)
+    probs = torch.rand(4, 300)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    top_ks = torch.tensor([1, 7, 50, 300], dtype=torch.int32)
+    top_ps = torch.tensor([0.1, 0.5, 0.9, 1.0])
+    on_device = probs.to("cuda:0")
+    torch.testing.assert_close(
+        top_k_renorm_probs(probs, top_ks),
+        top_k_renorm_probs(on_device, top_ks.to("cuda:0")).cpu(),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        top_p_renorm_probs(probs, top_ps),
+        top_p_renorm_probs(on_device, top_ps.to("cuda:0")).cpu(),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

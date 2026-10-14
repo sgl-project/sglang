@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
@@ -104,6 +104,12 @@ def _vendor_sgl_kernel(probs: torch.Tensor) -> bool:
     return probs.device.type in ("musa", "xpu")
 
 
+def _registry_backend(probs: torch.Tensor) -> Optional[KernelBackend]:
+    # The registry resolves by platform, so a CPU tensor on a GPU host (unit
+    # tests, host-side staging) has to name the torch reference itself.
+    return KernelBackend.TORCH if probs.device.type == "cpu" else None
+
+
 def top_k_renorm_probs(
     probs: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
@@ -112,7 +118,9 @@ def top_k_renorm_probs(
         from sgl_kernel import top_k_renorm_prob
 
         return top_k_renorm_prob(probs, top_k)
-    return get_kernel("sampling.top_k_renorm_probs")(probs, top_k)
+    return get_kernel("sampling.top_k_renorm_probs", _registry_backend(probs))(
+        probs, top_k
+    )
 
 
 def top_p_renorm_probs(
@@ -123,7 +131,9 @@ def top_p_renorm_probs(
         from sgl_kernel import top_p_renorm_prob
 
         return top_p_renorm_prob(probs, top_p)
-    return get_kernel("sampling.top_p_renorm_probs")(probs, top_p)
+    return get_kernel("sampling.top_p_renorm_probs", _registry_backend(probs))(
+        probs, top_p
+    )
 
 
 __all__ = ["cake_softmax", "softmax", "top_k_renorm_probs", "top_p_renorm_probs"]
