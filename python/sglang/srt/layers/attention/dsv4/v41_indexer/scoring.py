@@ -367,7 +367,7 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     req: torch.Tensor
     req_to_token: torch.Tensor
     ratio: int
-    plan: torch.Tensor
+    plan: Optional[torch.Tensor]  # None when the caller skips the top-k v2 plan
     has_candidate_mask: bool
 
 
@@ -377,6 +377,7 @@ def decode_scores(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
+    compute_topk_plan: bool = True,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
@@ -405,7 +406,7 @@ def decode_scores(
     if paged:
         lens = lens.to(torch.int32)
         # Prepare the device-side plan before scoring, away from its top-k consumer.
-        plan = plan_topk_v2(lens)
+        plan = plan_topk_v2(lens) if compute_topk_plan else None
         scores = fp4_index_logits_paged(
             q,
             weights,
@@ -445,6 +446,7 @@ def select_decode(
 ) -> None:
     k = min(topk, d.lmax)
     if isinstance(d, PagedDecodeScores):
+        assert d.plan is not None, "paged select_decode needs the top-k v2 plan"
         idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
         topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
         finish_paged_indexer_topk(
