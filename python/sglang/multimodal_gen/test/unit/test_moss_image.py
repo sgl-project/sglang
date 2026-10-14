@@ -614,6 +614,46 @@ def test_conditioning_cache_keys_actual_tokens(text_stage, change):
     assert torch.equal(mask, expected_mask)
 
 
+def test_pipeline_residency_declares_only_components_used_by_each_stage(
+    small_model, monkeypatch
+):
+    from sglang.multimodal_gen.runtime.pipelines.moss_image import MOSSImagePipeline
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+        DecodingStage,
+    )
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+    args = get_global_server_args()
+    monkeypatch.setattr(args, "pipeline_config", MOSSImagePipelineConfig())
+    monkeypatch.setattr(args, "component_precisions", {}, raising=False)
+    pipe = object.__new__(MOSSImagePipeline)
+    pipe.modules = {
+        "transformer": small_model,
+        "text_encoder": torch.nn.Identity(),
+        "tokenizer": object(),
+        "scheduler": MOSSImageScheduler(),
+        "vae": torch.nn.Identity(),
+    }
+    stages = []
+    monkeypatch.setattr(pipe, "add_stage", stages.append)
+    monkeypatch.setattr(
+        pipe, "add_stage_factory", lambda role, factory, name: stages.append(factory())
+    )
+    monkeypatch.setattr(
+        pipe,
+        "add_standard_decoding_stage",
+        lambda: stages.append(DecodingStage(vae=pipe.modules["vae"], pipeline=pipe)),
+    )
+    pipe.create_pipeline_stages(args)
+    # Offload/auto-residency must see encoding -> DiT -> VAE. MOSSImage never
+    # uses the VAE in denoising, unlike the shared stage's TI2V callers.
+    assert [
+        [use.component_name for use in stage.component_uses(args)] for stage in stages
+    ] == [[], ["text_encoder"], ["transformer"], ["vae"]]
+    assert stages[1].component_uses(args)[0].memory_intensive
+    assert stages[2].vae is None
+
+
 @pytest.mark.parametrize(
     "guidance,expected_cfg", [(0.0, True), (0.5, True), (1.0, False), (5.0, True)]
 )

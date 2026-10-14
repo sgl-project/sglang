@@ -81,6 +81,7 @@ class MOSSImageBeforeDenoisingStage(PipelineStage):
             ComponentUse(
                 self._component_stage_name(stage_name),
                 "text_encoder",
+                memory_intensive=True,
                 start_at_stage_entry=False,
             )
         ]
