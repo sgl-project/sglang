@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvPro
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -64,16 +65,11 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_npu
-from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
-# DSpark confidence is a per-token score that must stay in [0, 1].
-_CONFIDENCE = Invariant(
-    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
-)
 _is_npu = is_npu()
 
 
@@ -951,8 +947,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
         pre = None
-        for stage in self.stages:
-            x, pre = stage(positions, x, forward_batch, pre)
+        # Draft MoE layers have no recorder layer index, so keep them out of the stats.
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for stage in self.stages:
+                x, pre = stage(positions, x, forward_batch, pre)
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
@@ -999,25 +997,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self,
         *,
         anchor_tokens: torch.Tensor,
-        sampled_tokens: torch.Tensor,
-        x_post_hc: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        confidence_head = self.confidence_head
-        if confidence_head is None:
-            return None
-        bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
-        if confidence_head.with_markov:
-            prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
-            )
-            markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
-        else:
-            markov_embed_stack = None
-        confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
-        confidence = confidence_head.apply_sts(confidence_raw)
-        expect(_CONFIDENCE, confidence)
-        return confidence
+        draft_tokens: torch.Tensor,
+        confidence_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.confidence_head.predict(
+            confidence_features,
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=self.markov_head,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
