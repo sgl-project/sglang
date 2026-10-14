@@ -1604,6 +1604,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 lora_ids=([None] * bs if self._capture_lora else None),
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
                 max_seq_len_override=self.max_context_size,
+                full_prefill_cuda_graph_capture=(
+                    self.prefill_backend_name == Backend.FULL
+                ),
             )
             self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
             ngram_manager = self.model_runner.ngram_embedding_manager
@@ -2216,6 +2219,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_logprobs_copy_done=output.input_logprobs_copy_done,
             customized_info=output.customized_info,
             mm_input_embeds=mm_input_embeds,
+            # Bounded SWA replay returns the late layers' tail rows plus the
+            # extend indices they came from; the DSpark injector needs both.
+            hidden_states_token_indices=output.hidden_states_token_indices,
         )
 
     def _finalize_execute_output(
