@@ -1,4 +1,4 @@
-//! SGLang-compatible prompt and chat tokenization.
+//! SGLang-compatible prompt and chat tokenization, and detokenization.
 
 use dynamo_protocols::types::{
     ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
@@ -7,7 +7,7 @@ use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{ChatRequest, OneOrMany, ReasoningEffort, RendererService, ResponseError};
+use crate::{ChatRequest, OneOrMany, ReasoningEffort, RendererService, ResponseError, TokenIds};
 
 use super::protocol::normalize_reasoning_inputs;
 
@@ -113,6 +113,32 @@ impl TokenizeRequest {
             metadata: crate::GenerateRequestMetadata::default(),
         })
     }
+}
+
+pub(crate) async fn detokenize(
+    renderer: &RendererService,
+    request: DetokenizeRequest,
+) -> Result<Value, ResponseError> {
+    let skip_special_tokens = request.skip_special_tokens;
+    let text = match request.tokens {
+        OneOrMany::One(tokens) => json!(renderer.detokenize(tokens, skip_special_tokens).await?),
+        OneOrMany::Many(batch) => json!(
+            try_join_all(
+                batch
+                    .into_iter()
+                    .map(|tokens| renderer.detokenize(tokens, skip_special_tokens)),
+            )
+            .await?
+        ),
+    };
+    Ok(json!({ "text": text }))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DetokenizeRequest {
+    tokens: OneOrMany<TokenIds>,
+    #[serde(default = "default_true")]
+    skip_special_tokens: bool,
 }
 
 const fn default_true() -> bool {
