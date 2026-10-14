@@ -1843,6 +1843,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 topk_out=_topk_buf if _want_topk else None,
                 hisparse_swap_in_fn=hisparse_swap_in_fn,
                 indexer_cp=self.indexer_cp,
+                # the verify funnel lays out each request's draft rows consecutively
+                packed_queries=(
+                    self.speculative_num_draft_tokens
+                    if forward_batch.forward_mode.is_target_verify()
+                    else 1
+                ),
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),

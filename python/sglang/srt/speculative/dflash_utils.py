@@ -187,8 +187,20 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     backend = attn_backend
     for _ in range(4):
+        if isinstance(backend, HybridAttnBackend):
+            # Resolve wrappers down to the backend that runs TARGET_VERIFY
+            backend = backend._select_backend(ForwardMode.TARGET_VERIFY)
+            continue
+        if isinstance(backend, TboAttnBackend):
+            # primary and children come from the same creator.
+            backend = backend.primary
+            continue
         full_backend = getattr(backend, "full_attn_backend", None)
         if full_backend is None:
             break
@@ -937,10 +949,15 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_len: float,
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
+    next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
 ) -> None:
-    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
-    block_size = candidates.shape[1]
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
+    ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
+    bs, block_size = candidates.shape
+    if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
+        # The sampling-verify branch does not materialize the target argmax.
+        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
@@ -1134,7 +1151,7 @@ def build_speculative_verify_target_probs(
         vocab_size = int(scaled_logits.shape[-1])
         repeated_top_ks.clamp_(min=1, max=vocab_size)
         if max_top_k is None:
-            max_top_k = int(getattr(sampling_info, "max_top_k", vocab_size))
+            max_top_k = int(getattr(sampling_info, "max_bounded_top_k", vocab_size))
         else:
             max_top_k = int(max_top_k)
         if max_top_k < 1:
@@ -1172,7 +1189,7 @@ def build_speculative_verify_target_probs(
                 max_top_k=(
                     max_top_k
                     if max_top_k is not None
-                    else getattr(sampling_info, "max_top_k", None)
+                    else getattr(sampling_info, "max_bounded_top_k", None)
                 ),
             )
         if need_top_p:

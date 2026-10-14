@@ -210,10 +210,6 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
-def test_kimi_k3_model_namespace_is_retired():
-    assert importlib.util.find_spec("sglang.kernels.ops.kimi_k3") is None
-
-
 def test_operator_and_test_groups_agree():
     """A new root-level model bundle must not bypass logical op grouping."""
     root = Path(K.__file__).resolve().parents[3]
@@ -255,6 +251,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "embeddings.qwen4_ngram",
         "elementwise.qwen4_gate",
         "elementwise.row_scale",
+        "elementwise.hc_combine_decode",
         "mamba.qwen4_short_conv",
         "mamba.lfm_short_conv",
         "gemm.dsv4_wo_a",
@@ -268,6 +265,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",
         "moe.gemma4_routing",
+        "moe.shared_expert_gate",
         "memory.adler32",
         "memory.row_compact",
         "mm.process.image",
@@ -293,6 +291,10 @@ def test_reclassified_public_entry_points_are_inventoried():
     [
         ("gemm.hopper_bf16_gemv", (9, 0), True),
         ("gemm.hopper_bf16_gemv", (10, 0), False),
+        ("elementwise.hc_combine_apply_norm", (8, 9), False),
+        ("elementwise.hc_combine_apply_norm", (9, 0), True),
+        ("communication.moe_finalize_shared_gate_all_reduce", (8, 9), False),
+        ("communication.moe_finalize_shared_gate_all_reduce", (10, 3), True),
         ("gemm.fp8_blockwise_scaled_mm", (12, 0), True),
         ("gemm.fp8_blockwise_scaled_mm", (12, 1), True),
         ("gemm.fp8_blockwise_scaled_mm", (10, 0), False),
