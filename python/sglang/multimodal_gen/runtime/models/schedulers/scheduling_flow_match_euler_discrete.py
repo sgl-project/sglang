@@ -32,7 +32,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import BaseOutput
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
-from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     SchedulerRLMixin,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
