@@ -203,7 +203,7 @@ export const config = {
 
   modelNames: {
     nvfp4: "meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
-    mxfp4: "amd/Muse-Spark-1.2-816B-A42B-Quark-MXFP4",
+    mxfp4: "amd/Muse-Spark-open-816B-A42B-Quark-MXFP4",
     bf16: "meta-models/Muse-Spark-Open-816B-A42B",
     int4: "intel-ai/Muse-Spark-open-816B-A42B-INT4",
   },
@@ -211,7 +211,7 @@ export const config = {
     b300: "lmsysorg/sglang:dev-muse-spark",
     gb300: "lmsysorg/sglang:dev-muse-spark",
     b200: "lmsysorg/sglang:dev-muse-spark",
-    mi355x: "lmsysorg/sglang-rocm:muse-spark-1.2",
+    mi355x: "lmsysorg/sglang-rocm:muse-spark-open",
     xeon: "lmsysorg/sglang:muse-spark-1.2-xeon",
   },
   dockerHostNetworkWhen: (s) => s.pdMode !== "collocated",
