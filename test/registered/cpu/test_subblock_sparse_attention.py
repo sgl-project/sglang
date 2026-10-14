@@ -52,7 +52,11 @@ from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="stage-a-test-cpu-intel")
+register_cpu_ci(
+    est_time=9,
+    suite="stage-a-test-cpu-intel",
+    disabled="Xeon import initializes CUDA-only vsa (sgl-project/sglang#43334); until 2026-10-24",
+)
 
 
 class TestSubBlockSageFp8PlanAdapter(CustomTestCase):
