@@ -726,8 +726,8 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> PromptTokensDetails | None:
         if not get_serving().enable_cache_report:
             return None
-        return UsageProcessor._details_if_cached(
-            content["meta_info"].get("cached_tokens", 0)
+        return PromptTokensDetails(
+            cached_tokens=content["meta_info"].get("cached_tokens", 0)
         )
 
     def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
@@ -803,6 +803,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: dict[str, Any],
         index: int,
         request: ChatCompletionRequest,
+        created: int,
         stream_offsets: dict[int, int],
         reasoning_parser_dict: dict,
         parser_dict: dict,
@@ -872,7 +873,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    created=created,
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
@@ -890,7 +891,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 content,
                 request,
                 has_tool_calls,
-                continuous_usage_stats,
+                created=created,
+                continuous_usage_stats=continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
             ):
                 if chunk:
@@ -900,7 +902,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
+                    parser, content, request, index, created=created
                 )
                 if remaining_chunk:
                     yield remaining_chunk
@@ -919,7 +921,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    created=created,
                     model=request.model,
                     index=index,
                     content=delta,
@@ -947,7 +949,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             yield build_sse_content(
                 chunk_id=content["meta_info"]["id"],
-                created=int(time.time()),
+                created=created,
                 model=request.model,
                 index=index,
                 logprobs=remaining_logprobs,
@@ -983,6 +985,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
+
+        if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
+            return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
 
         media_error = self._validate_media_content(request)
         if media_error:
@@ -1235,6 +1240,12 @@ class OpenAIServingChat(OpenAIServingBase):
             sampling_logprobs_mode=request.sampling_logprobs_mode,
             stream=request.stream,
             return_text_in_logprobs=True,
+            return_flat_raw_output_top_logprobs=request.return_flat_raw_output_top_logprobs,
+            # GenerateReqInput rejects b64 without a flat flag; chat has only the output one
+            return_flat_raw_top_logprobs_b64=(
+                request.return_flat_raw_output_top_logprobs
+                and request.return_flat_raw_top_logprobs_b64
+            ),
             modalities=processed_messages.modalities,
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
@@ -1902,6 +1913,8 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
+        created = int(time.time())
+
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
@@ -2039,7 +2052,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     # K2 templates require preserved thinking, including empty reasoning.
                     yield build_sse_content(
                         chunk_id=content["meta_info"]["id"],
-                        created=int(time.time()),
+                        created=created,
                         model=request.model,
                         index=index,
                         role="assistant",
@@ -2058,6 +2071,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     content=content,
                     index=index,
                     request=request,
+                    created=created,
                     stream_offsets=stream_offsets,
                     reasoning_parser_dict=reasoning_parser_dict,
                     parser_dict=parser_dict,
@@ -2083,7 +2097,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 matched_stop = finish_reason_data.get("matched")
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    created=created,
                     model=request.model,
                     index=idx,
                     finish_reason=final_finish_reason,
@@ -2099,7 +2113,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
-                            created=int(time.time()),
+                            created=created,
                             choices=[
                                 ChatCompletionResponseStreamChoice(
                                     index=index,
@@ -2167,7 +2181,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if sglext_non_ids is not None:
                     sglext_chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
-                        created=int(time.time()),
+                        created=created,
                         choices=[],
                         model=request.model,
                         sglext=sglext_non_ids,
@@ -2176,7 +2190,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if sglext_ids is not None:
                     sglext_ids_chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
-                        created=int(time.time()),
+                        created=created,
                         choices=[],
                         model=request.model,
                         sglext=sglext_ids,
@@ -2185,7 +2199,7 @@ class OpenAIServingChat(OpenAIServingBase):
             elif sglext_non_ids is not None or sglext_ids is not None:
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    created=created,
                     choices=[],  # sglext is at response level
                     model=request.model,
                     sglext=sglext_full,
@@ -2218,7 +2232,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
-                    created=int(time.time()),
+                    created=created,
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
@@ -3011,6 +3025,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: dict[int, bool],
+        created: int,
         continuous_usage_stats: bool = False,
         flush: bool = False,
     ):
@@ -3072,7 +3087,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
-                created=int(time.time()),
+                created=created,
                 choices=[choice_data],
                 model=request.model,
             )
@@ -3125,7 +3140,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
-                created=int(time.time()),
+                created=created,
                 choices=[choice_data],
                 model=request.model,
             )
@@ -3150,6 +3165,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
+        created: int,
     ) -> str | None:
         """
         Check for any remaining tool call arguments that need to be streamed
@@ -3211,7 +3227,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
-                created=int(time.time()),
+                created=created,
                 choices=[choice_data],
                 model=request.model,
             )
