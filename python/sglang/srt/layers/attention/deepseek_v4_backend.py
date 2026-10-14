@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import enum
 import functools
 import logging
@@ -1918,6 +1919,24 @@ class DeepseekV4AttnBackend(
         set_local_dp_buffer_len(local_dp_buffer_len)
         forward_batch.global_num_token_non_padded_cpu = non_padded
 
+    def enter_live_late_layer_tail(
+        self, forward_batch: ForwardBatch, *, num_tokens: int
+    ) -> tuple[tuple, LateLayerTail]:
+        """Inside the prefill CUDA graph, switch the late layers onto the live tail
+        rows instead of the graph's fixed block (they run as one eager break).
+        The block's metadata stays published for the logits that read it."""
+        # The static batch's rows are padded to the captured shape.
+        live = copy.copy(forward_batch)
+        live.positions = forward_batch.positions[:num_tokens]
+        live.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
+        block_metadata = self.tail_forward_metadata
+        self.tail_forward_metadata = self._build_late_layer_tail_metadata(live)
+        try:
+            tail = self.tail_forward_metadata.late_layer_tail
+            return self.enter_late_layer_tail(forward_batch), tail
+        finally:
+            self.tail_forward_metadata = block_metadata
+
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).
     def prefill_graph_enter_late_layer_tail(self, forward_batch: ForwardBatch) -> None:
@@ -3014,8 +3033,15 @@ class DeepseekV4AttnBackend(
             if cached is not None and cached.shape[0] == positions.shape[0]:
                 req = cached
             else:
+                from sglang.srt.models.deepseek_v4_replay_graphs import (
+                    step_caches_allowed,
+                )
+
                 req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
-                if envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get():
+                if (
+                    envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get()
+                    and step_caches_allowed()
+                ):
                     meta.eager_req_rows = req
             pos = positions
         if (

@@ -35,6 +35,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
     get_tc_piecewise_forward_context,
     set_tc_piecewise_forward_context,
@@ -63,6 +66,12 @@ _stream = None
 def in_decoder_replay_graph() -> bool:
     """True while a layer range captures or replays an eager replay graph."""
     return _in_replay_graph
+
+
+def step_caches_allowed() -> bool:
+    """Per-step caches on attention metadata are safe: the prefill CUDA graph's
+    metadata outlives the step, while the replay graphs run on per-step metadata."""
+    return not is_in_breakable_cuda_graph() or _in_replay_graph
 
 
 @contextmanager
@@ -273,25 +282,37 @@ class EagerReplayGraphs:
             self._capture_open = False
 
     def run(
-        self, *, state: HcState, forward_batch: ForwardBatch, **inputs
+        self,
+        *,
+        state: HcState,
+        forward_batch: ForwardBatch,
+        eager_fallback: bool = False,
+        use_graph: bool = True,
+        **inputs,
     ) -> Optional[HcState]:
         """Run the range on ``state``'s rows from its graph; None (run eagerly) when
-        no graph exists for the bucket and capture is closed."""
+        no graph exists for the bucket and capture is closed, unless
+        ``eager_fallback`` runs the body here with the same eager breaks."""
         leaves, structure, rebuild = _flatten_state(state)
         num_rows = leaves[0].shape[0]
         rows = self.bucket_rows(num_rows)
-        if rows is None:
-            return None
         names = tuple(k for k, v in inputs.items() if v is not None)
         live = leaves + [inputs[k] for k in names]
         shape_key = (structure, names, tuple((t.dtype, t.shape[1:]) for t in live))
         key = (rows, shape_key)
-        graph = self._graphs.get(key)
-        if graph is None and not self._capture_open:
-            return None
+        graph = self._graphs.get(key) if rows is not None and use_graph else None
         # The eager breaks read the step's real row count off this view.
         break_batch = copy.copy(forward_batch)
         break_batch.global_num_token_non_padded_cpu = num_rows
+        if graph is None and (rows is None or not self._capture_open or not use_graph):
+            if not eager_fallback:
+                return None
+            with self._break_context(break_batch), _replay_graph_scope():
+                return self._run_layers(
+                    rebuild(leaves),
+                    forward_batch=break_batch,
+                    **{k: inputs[k] for k in names},
+                )
         label = f"{self.name} graph {rows} rows"
         with self._break_context(break_batch), _replay_graph_scope():
             static = self._static_inputs(shape_key, live)
@@ -467,6 +488,82 @@ class EagerReplayGraphs:
                 self.capture_bytes / 2**30,
             )
         return replay_graph
+
+
+# ---------------------------------------------------------------------------
+# The late layers as one break of the breakable prefill graph
+# ---------------------------------------------------------------------------
+
+# The break's outputs, read by address by the captured segment after it: one
+# max-size allocation per row structure, and one fixed view per block size.
+_late_bridge: dict[tuple, tuple[list[torch.Tensor], dict[int, tuple]]] = {}
+
+
+def _late_bridge_outputs(leaves, rows: int) -> tuple:
+    key = tuple((t.dtype, t.shape[1:]) for t in leaves)
+    entry = _late_bridge.get(key)
+    if entry is None or entry[0][0].shape[0] < rows:
+        # Shapes are captured largest first, so this allocates once.
+        entry = _late_bridge[key] = (
+            [t.new_empty((rows, *t.shape[1:])) for t in leaves],
+            {},
+        )
+    full, views = entry
+    out = views.get(rows)
+    if out is None:
+        out = views[rows] = tuple(b[:rows] for b in full)
+    return out
+
+
+def _late_layers_in_prefill_graph(
+    model, leaves, rebuild, positions, input_ids, input_ids_global
+) -> tuple:
+    # Runs at every replay: the late layers on the live tail rows from the
+    # tail-row graph (eager past its buckets), real rows first in the block.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    attn_backend = get_attn_backend()
+    rows = attn_backend.tail_forward_metadata.late_layer_tail.token_indices.shape[0]
+    num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+    saved, tail = attn_backend.enter_live_late_layer_tail(
+        forward_batch, num_tokens=num_tokens
+    )
+    try:
+        out = model.decoder_replay_graphs.run(
+            state=rebuild([t[:num_tokens] for t in leaves]).take_rows(tail.rows),
+            forward_batch=forward_batch,
+            eager_fallback=True,
+            use_graph=not forward_batch.contains_mm_inputs(),
+            positions=tail.positions,
+            input_ids=tail.rows(input_ids[:num_tokens]),
+            input_ids_global=(
+                None
+                if input_ids_global is None
+                else tail.rows(input_ids_global[:num_tokens])
+            ),
+        )
+    finally:
+        attn_backend.exit_late_layer_tail(saved, forward_batch)
+    out_leaves, _, _ = _flatten_state(out)
+    bridge = _late_bridge_outputs(leaves, rows)
+    assert [(t.dtype, t.shape[1:]) for t in out_leaves] == [
+        (b.dtype, b.shape[1:]) for b in bridge
+    ], "the late layers changed the mHC state's row layout"
+    for buf, t in zip(bridge, out_leaves):
+        buf[: t.shape[0]].copy_(t)
+    return bridge
+
+
+def _late_layers_capture_stub(
+    model, leaves, rebuild, positions, input_ids, input_ids_global
+) -> tuple:
+    # Capture only records the output addresses; warmups and replays run the body.
+    tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+    return _late_bridge_outputs(leaves, tail.token_indices.shape[0])
+
+
+bcg_late_layers_in_prefill_graph = eager_on_graph(
+    capture_stub=_late_layers_capture_stub
+)(_late_layers_in_prefill_graph)
 
 
 # ---------------------------------------------------------------------------

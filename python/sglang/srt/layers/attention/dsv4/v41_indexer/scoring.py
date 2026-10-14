@@ -168,6 +168,7 @@ def _step_rows(inputs: PrefillInputs, req_to_token: torch.Tensor):
     """The prefill data's row and column plumbing; it depends on the step and the
     ratio only, so every index layer of a step can share it."""
     from sglang.srt.environ import envs
+    from sglang.srt.models.deepseek_v4_replay_graphs import step_caches_allowed
 
     ratio = inputs.compress_ratio
     pos = inputs.positions
@@ -207,7 +208,7 @@ def _step_rows(inputs: PrefillInputs, req_to_token: torch.Tensor):
             lens_per_request=lens_per_request,
             compress_lens=((pos + 1) // ratio).to(torch.int32),
         )
-    if envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get():
+    if envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get() and step_caches_allowed():
         _step_rows_cache[ratio] = (
             inputs.kv_page_table,
             (pos.data_ptr(), pos.shape[0]),

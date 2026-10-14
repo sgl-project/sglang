@@ -185,8 +185,10 @@ from sglang.srt.models.deepseek_v4_replay_graphs import (
     TAIL_ROW_STEP,
     TOKEN_STEP,
     EagerReplayGraphs,
+    _flatten_state,
     _late_kv_store,
     bcg_late_kv_store,
+    bcg_late_layers_in_prefill_graph,
     in_decoder_replay_graph,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
@@ -4367,6 +4369,14 @@ class DeepseekV4Model(nn.Module):
                 ),
                 in_graph=tail_in_graph,
             )
+        # Inside the prefill graph, the late layers replay the tail-row graphs on
+        # the live tail instead of running the captured fixed-capacity block.
+        late_from_replay_graphs = (
+            tail_in_graph
+            and self.decoder_replay_graphs is not None
+            and not capture_dspark
+            and late_dp_counts is None
+        )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
@@ -4389,6 +4399,12 @@ class DeepseekV4Model(nn.Module):
             if out is not None:
                 state, first_layer = out, self.full_graph_end
         for i in range(first_layer, self.end_layer):
+            if late_from_replay_graphs and i == self.late_layer_start:
+                leaves, _, rebuild = _flatten_state(state)
+                out = bcg_late_layers_in_prefill_graph(
+                    self, tuple(leaves), rebuild, positions, input_ids, input_ids_global
+                )
+                return out[0], out[1] if len(out) > 1 else None, tail
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:

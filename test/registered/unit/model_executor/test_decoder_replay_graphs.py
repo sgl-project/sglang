@@ -1,6 +1,7 @@
 """Eager replay graphs of DeepSeek-V4 layer ranges: bucketing, the state's static-buffer
-round trip, refill without recapture, no capture outside the startup scope, and the
-replay pointer guard. CPU only; capture runs on GPU."""
+round trip, refill without recapture, no capture outside the startup scope, the eager
+fallback, the late layers as one prefill-graph break, and the replay pointer guard.
+CPU only; capture runs on GPU."""
 
 import unittest
 from contextlib import nullcontext
@@ -115,6 +116,128 @@ class TestRunAndCapture(CustomTestCase):
         self.assertEqual(captured[0].graph.replay.call_count, 2)
         self.assertEqual(int(captured[0].owned["num_token_non_padded"]), 90)
         self.assertEqual(out.streams.shape[0], 90)
+
+
+class TestEagerFallback(CustomTestCase):
+    def _body_graphs(self):
+        graphs, captured = _graphs(), []
+        _fake_capture(graphs, captured)
+        calls = []
+
+        def body(state, *, forward_batch, **inputs):
+            calls.append(forward_batch.global_num_token_non_padded_cpu)
+            return HcState(state.streams * 3)
+
+        graphs._run_layers = body
+        return graphs, captured, calls
+
+    def test_runs_the_body_when_no_graph_exists(self):
+        graphs, _, calls = self._body_graphs()
+        state = HcState(torch.randn(100, 4))
+        out = graphs.run(
+            state=state,
+            forward_batch=SimpleNamespace(global_num_token_non_padded_cpu=None),
+            eager_fallback=True,
+            positions=torch.arange(100),
+        )
+        torch.testing.assert_close(out.streams, state.streams * 3)
+        self.assertEqual(calls, [100])
+        self.assertEqual(graphs._capture.call_count, 0)
+
+    def test_past_the_last_bucket_and_without_graphs(self):
+        graphs, captured, calls = self._body_graphs()
+        with graphs.capture_scope():
+            _step(graphs, 100)
+        batch = SimpleNamespace(global_num_token_non_padded_cpu=None)
+        for n, use_graph in ((600, True), (100, False)):
+            graphs.run(
+                state=HcState(torch.randn(n, 4)),
+                forward_batch=batch,
+                eager_fallback=True,
+                use_graph=use_graph,
+                positions=torch.arange(n),
+            )
+        self.assertEqual(calls, [600, 100])
+        self.assertEqual(captured[0].graph.replay.call_count, 1)
+
+
+class TestLateLayersInPrefillGraph(CustomTestCase):
+    def test_bridge_views_are_fixed_per_block_and_share_storage(self):
+        rg._late_bridge.clear()
+        self.addCleanup(rg._late_bridge.clear)
+        leaves = [torch.zeros(8, 2, 4), torch.zeros(8, 2)]
+        big = rg._late_bridge_outputs(leaves, 512)
+        small = rg._late_bridge_outputs(leaves, 256)
+        self.assertIs(rg._late_bridge_outputs(leaves, 256), small)
+        self.assertEqual([t.shape[0] for t in small], [256, 256])
+        self.assertEqual(small[0].data_ptr(), big[0].data_ptr())
+
+    def test_live_tail_rows_first_and_metadata_restored(self):
+        rg._late_bridge.clear()
+        self.addCleanup(rg._late_bridge.clear)
+        # Bucket of 16 rows, 10 live tokens, tail rows 7..9; the block holds 8 rows.
+        bucket, live, tail_idx = 16, 10, torch.tensor([7, 8, 9])
+        events = []
+        tail = SimpleNamespace(
+            rows=lambda t: t[tail_idx], positions=torch.tensor([7, 8, 9])
+        )
+        block = SimpleNamespace(
+            late_layer_tail=SimpleNamespace(token_indices=torch.zeros(8))
+        )
+        backend = SimpleNamespace(
+            tail_forward_metadata=block,
+            enter_live_late_layer_tail=lambda fb, num_tokens: (
+                events.append(("enter", num_tokens)) or ("saved", tail)
+            ),
+            exit_late_layer_tail=lambda saved, fb: events.append(("exit", saved)),
+        )
+        batch = SimpleNamespace(
+            extend_seq_lens_cpu=[6, 4], contains_mm_inputs=lambda: False
+        )
+
+        def run(*, state, forward_batch, eager_fallback, use_graph, **inputs):
+            self.assertTrue(eager_fallback and use_graph)
+            torch.testing.assert_close(inputs["input_ids"], tail_idx)
+            return HcState(state.streams + 1, state.pre)
+
+        model = SimpleNamespace(decoder_replay_graphs=SimpleNamespace(run=run))
+        streams = torch.arange(bucket, dtype=torch.float32)[:, None].repeat(1, 4)
+        pre = torch.ones(bucket, 2)
+        leaves, _, rebuild = rg._flatten_state(HcState(streams, pre))
+        ids = torch.arange(bucket)
+        with (
+            patch.object(rg, "get_attn_backend", lambda: backend),
+            patch.object(
+                rg,
+                "get_tc_piecewise_forward_context",
+                lambda: SimpleNamespace(forward_batch=batch),
+            ),
+        ):
+            out = rg._late_layers_in_prefill_graph(
+                model, tuple(leaves), rebuild, torch.arange(bucket), ids, ids
+            )
+            stub = rg._late_layers_capture_stub(
+                model, tuple(leaves), rebuild, None, None, None
+            )
+        self.assertEqual(events, [("enter", live), ("exit", "saved")])
+        self.assertIs(out, stub)
+        self.assertEqual(out[0].shape[0], 8)
+        torch.testing.assert_close(out[0][:3], streams[tail_idx] + 1)
+        torch.testing.assert_close(out[1][:3], pre[tail_idx])
+
+
+class TestStepCaches(CustomTestCase):
+    def test_off_under_the_prefill_graph_unless_in_a_replay_graph(self):
+        for breakable, replay, allowed in (
+            (False, False, True),
+            (True, False, False),
+            (True, True, True),
+        ):
+            with (
+                patch.object(rg, "is_in_breakable_cuda_graph", lambda: breakable),
+                patch.object(rg, "_in_replay_graph", replay),
+            ):
+                self.assertEqual(rg.step_caches_allowed(), allowed)
 
 
 class TestPointerGuard(CustomTestCase):
