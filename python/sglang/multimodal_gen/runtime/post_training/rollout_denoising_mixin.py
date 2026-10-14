@@ -5,7 +5,7 @@ Moved out of DenoisingStage to keep the core stage lean.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -39,6 +39,13 @@ def _kwargs_to_cpu(d: Any) -> Any:
     return d
 
 
+def rollout_transition(batch: Req) -> Callable[..., torch.FloatTensor] | None:
+    """The ``transition`` to pass to ``scheduler.step`` for this request: the
+    visual-stream rollout controller, or None to keep the scheduler's own update."""
+    rollout = batch.rollout_controllers.get("visual")
+    return None if rollout is None else rollout.transition
+
+
 class RolloutDenoisingMixin:
     def _maybe_prepare_rollout(self, batch: Req):
         """Create the rollout controller of the visual stream of this request.
@@ -57,6 +64,7 @@ class RolloutDenoisingMixin:
                 log_prob_no_const=batch.rollout_log_prob_no_const,
                 debug_mode=batch.rollout_debug_mode,
                 sde_step_indices=batch.rollout_sde_step_indices,
+                generator=batch.generator,
                 shard_for_sp=lambda latents: pipeline_config.shard_latents_for_sp(
                     batch=batch, latents=latents
                 )[0],
