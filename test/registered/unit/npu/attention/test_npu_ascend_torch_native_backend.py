@@ -19,6 +19,61 @@ register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
 
 
 class TestReferenceSWADecodeMask(CustomTestCase):
+    def test_verify_ancestry_uses_logical_positions_and_avoids_evicted_kv(self):
+        """A branch's storage index is not its position; freed KV may be NaN."""
+        torch.manual_seed(73)
+        prefix, reference, window, nodes = 20, 7, 4, 6
+        parents = [-1, 0, 1, 2, 0, 4]
+        depth, ancestry = [], torch.ones(nodes, prefix + nodes, dtype=torch.bool)
+        ancestry[:, prefix:] = False
+        for node, parent in enumerate(parents):
+            depth.append(0 if parent < 0 else depth[parent] + 1)
+            current = node
+            while current >= 0:
+                ancestry[node, prefix + current] = True
+                current = parents[current]
+        q = torch.randn(nodes, 2, 4)
+        raw_k, raw_v = (
+            torch.randn(prefix + nodes, 2, 4),
+            torch.randn(prefix + nodes, 2, 4),
+        )
+        # A permutation makes slot identity independent of the token position.
+        slots = torch.randperm(prefix + nodes)
+        cache_k, cache_v = torch.empty_like(raw_k), torch.empty_like(raw_v)
+        cache_k[slots], cache_v[slots] = raw_k, raw_v
+        cache_k[slots[reference : prefix - window + 1]] = float("nan")
+        cache_v[slots[reference : prefix - window + 1]] = float("nan")
+        positions = torch.tensor([prefix + d for d in depth])
+        mask = torch.zeros_like(ancestry)
+        for node, query_position in enumerate(positions.tolist()):
+            for key in range(prefix + nodes):
+                key_position = key if key < prefix else prefix + depth[key - prefix]
+                mask[node, key] = bool(ancestry[node, key]) and (
+                    key < reference or key_position > query_position - window
+                )
+        expected = scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            raw_k.transpose(0, 1)[None],
+            raw_v.transpose(0, 1)[None],
+            attn_mask=mask,
+        )[0].transpose(0, 1)
+        output = torch.empty_like(q)
+        AscendTorchNativeAttnBackend().run_sdpa_forward_reference_verify(
+            q,
+            output,
+            cache_k,
+            cache_v,
+            slots[None],
+            torch.tensor([0]),
+            torch.tensor([prefix]),
+            torch.tensor([reference]),
+            ancestry.flatten(),
+            positions,
+            nodes,
+            window,
+        )
+        torch.testing.assert_close(output, expected)
+
     def test_non_aligned_references_suffix_and_padding(self):
         """References survive past W; holes and graph padding remain invisible."""
         lengths = torch.tensor([0, 1, 11, 139, 140, 257, 386, 900])

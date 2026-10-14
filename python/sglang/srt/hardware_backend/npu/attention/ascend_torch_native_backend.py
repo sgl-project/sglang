@@ -21,6 +21,66 @@ class AscendTorchNativeAttnBackend:
     def __init__(self):
         pass
 
+    def run_sdpa_forward_reference_verify(
+        self,
+        query,
+        output,
+        k_cache,
+        v_cache,
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+        reference_lens,
+        custom_mask,
+        positions,
+        draft_tokens,
+        window_size,
+        scaling=None,
+        enable_gqa=False,
+    ):
+        """Verify speculative nodes while excluding reclaimed generated KV.
+
+        ``custom_mask`` is the corpus ancestry mask, with True meaning visible.
+        Storage positions of draft nodes differ from their logical positions.
+        """
+        mask_offset = 0
+        for row, prefix in enumerate(prefix_lens.tolist()):
+            reference = min(int(reference_lens[row]), prefix)
+            # Earliest query is at prefix, so this is the union of live keys
+            # across the verification block. Never gather an evicted slot.
+            live = torch.cat(
+                (
+                    torch.arange(reference, device=query.device),
+                    torch.arange(
+                        max(reference, prefix - window_size + 1),
+                        prefix + draft_tokens,
+                        device=query.device,
+                    ),
+                )
+            )
+            begin, end = row * draft_tokens, (row + 1) * draft_tokens
+            node_positions = positions[begin:end]
+            logical_keys = torch.cat((live[live < prefix], node_positions))
+            mask_size = draft_tokens * (prefix + draft_tokens)
+            ancestry = custom_mask[mask_offset : mask_offset + mask_size].view(
+                draft_tokens, prefix + draft_tokens
+            )
+            mask_offset += mask_size
+            allowed = ancestry[:, live] & (
+                (logical_keys[None, :] < reference)
+                | (logical_keys[None, :] > node_positions[:, None] - window_size)
+            )
+            slots = req_to_token[req_pool_indices[row], live]
+            result = scaled_dot_product_attention(
+                query[begin:end].transpose(0, 1)[None],
+                k_cache[slots].transpose(0, 1)[None],
+                v_cache[slots].transpose(0, 1)[None],
+                attn_mask=allowed,
+                scale=scaling,
+                enable_gqa=enable_gqa,
+            )
+            output[begin:end] = result[0].transpose(0, 1)
+
     def scaled_dot_product_attention_with_softcapping(
         self,
         query,

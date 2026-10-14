@@ -12,9 +12,10 @@ def _unlimited_ocr_overrides(server_args: Any, hf_config: Any) -> dict:
         return {}
 
     cfg = resolving_view(server_args)
-    if cfg.speculative_algorithm is not None:
+    if cfg.speculative_algorithm not in (None, "NGRAM"):
         raise ValueError(
-            "Unlimited-OCR on Ascend does not support speculative decoding."
+            "Unlimited-OCR on Ascend supports NGRAM speculation; this checkpoint "
+            "does not provide a trained EAGLE or native MTP draft model."
         )
 
     # Ascend's pure-SWA allocator retains references and reclaims generated

@@ -542,7 +542,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        if self.prefill_aware_swa and forward_batch.forward_mode.is_extend():
+        if self.prefill_aware_swa and forward_batch.reference_lens_cpu is not None:
             # Prompt lengths remain stable across chunks and retraction; a
             # re-prefill may include generated tokens that are not references.
             prompt_lens = forward_batch.reference_lens_cpu
@@ -2434,6 +2434,31 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if not self.use_mla:
+            if self.prefill_aware_swa:
+                output = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+                )
+                self.native_attn.run_sdpa_forward_reference_verify(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    output,
+                    self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                        -1, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                        -1, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens_cpu,
+                    self.reference_lens[forward_batch.req_pool_indices.cpu().long()],
+                    forward_batch.spec_info.custom_mask,
+                    forward_batch.positions,
+                    forward_batch.spec_info.draft_token_num,
+                    self.sliding_window_size,
+                    scaling=layer.scaling,
+                    enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+                )
+                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
             )
