@@ -69,7 +69,7 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 
 ## 2. Configuration tips
 
-- Use eight H200 GPUs with `--tp 8 --ep-size 8`, or four GB300 GPUs with `--tp 4 --ep-size 4`. SGLang detects FP8 from the checkpoint.
+- Use eight H200 GPUs with `--tp 8 --ep 8`, or four GB300 GPUs with `--tp 4 --ep 4`. SGLang detects FP8 from the checkpoint.
 - On H200, enable `SGLANG_ENABLE_FP8_BLOCK_GEMV=1` and `SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1`. Both are included in the generated commands; they are no-ops on GB300 (SM10x).
 - Leave `--mem-fraction-static` at its default. SGLang auto-selects the `ling3` reasoning and tool-call parsers for this architecture; you can change the parser settings in the Playground.
 - **NEXTN:** add `--speculative-algorithm NEXTN` for built-in MTP speculative decoding. Measured acceptance length is 2.61 on random tokens and 2.13 on real-text probes.

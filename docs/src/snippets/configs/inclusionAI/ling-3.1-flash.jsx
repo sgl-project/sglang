@@ -167,7 +167,7 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--ep-size 8",
+        "--ep 8",
         "--speculative-algorithm NEXTN",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -180,7 +180,7 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--ep-size 4",
+        "--ep 4",
         "--speculative-algorithm NEXTN",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
