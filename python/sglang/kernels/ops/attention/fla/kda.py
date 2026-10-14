@@ -6,6 +6,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import functools
 from typing import Optional
 
 import torch
@@ -23,6 +24,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
+from sglang.kernels.ops.attention.fla.kda_chunk_scan import chunk_kda_fwd_scan_o
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
@@ -31,6 +33,8 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_intel,
     is_nvidia,
 )
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -537,12 +541,14 @@ def _recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     STORE_KG: tl.constexpr,
+    KG_CHUNK_MAJOR: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
+        i_tg = i_t
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
             tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
@@ -553,6 +559,7 @@ def _recompute_w_u_fwd_kernel(
         )
         T = eos - bos
     else:
+        i_tg = i_b * tl.cdiv(T, BT) + i_t
         bos, eos = i_b * T, i_b * T + T
 
     # Padded chunk_indices rows (kda_prefill_graph.py) start past T, where every
@@ -630,15 +637,28 @@ def _recompute_w_u_fwd_kernel(
             )
             b_kg = b_k * exp2(b_gn - b_gk)
 
-            p_kg = tl.make_block_ptr(
-                kg + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
-            tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
+            if KG_CHUNK_MAJOR:
+                # [chunks, H, K, BT]: tokens contiguous; tail tokens store the
+                # zeros their masked k loads produced.
+                p_kg = tl.make_block_ptr(
+                    kg + (i_tg * H + i_h).to(tl.int64) * K * BT,
+                    (BT, K),
+                    (1, BT),
+                    (0, i_k * BK),
+                    (BT, BK),
+                    (0, 1),
+                )
+                tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(1,))
+            else:
+                p_kg = tl.make_block_ptr(
+                    kg + (bos * H + i_h) * K,
+                    (T, K),
+                    (H * K, 1),
+                    (i_t * BT, i_k * BK),
+                    (BT, BK),
+                    (1, 0),
+                )
+                tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
 
         b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
@@ -713,6 +733,7 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    kg_chunk_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
@@ -723,7 +744,12 @@ def recompute_w_u_fwd(
 
     w = torch.empty_like(k)
     u = torch.empty_like(v)
-    kg = torch.empty_like(k) if gk is not None else None
+    if gk is None:
+        kg = None
+    elif kg_chunk_major:
+        kg = k.new_empty(B * NT if cu_seqlens is None else NT, H, K, BT)
+    else:
+        kg = torch.empty_like(k)
     static_config = _get_k3_recompute_w_u_config(k, gk, cu_seqlens, K, V, BT)
     kernel = (
         _recompute_w_u_fwd_kernel
@@ -747,6 +773,7 @@ def recompute_w_u_fwd(
         V=V,
         BT=BT,
         STORE_KG=kg is not None,
+        KG_CHUNK_MAJOR=kg_chunk_major,
         IS_VARLEN=cu_seqlens is not None,
         DOT_PRECISION="ieee",
         **(static_config or {}),
@@ -1144,6 +1171,23 @@ def kda_gate_chunk_cumsum(
     return g if beta is None else (g, beta_out)
 
 
+@functools.lru_cache(maxsize=None)
+def _num_cus(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _chunk_scan_tile(
+    *, num_seqs: int, num_heads: int, device: torch.device
+) -> tuple[int, int, int]:
+    """(BV, num_warps, num_stages) of the chunk-major KDA scan: the smallest V tile whose
+    grid still gives every program its own CU, since each runs a serial chunk chain."""
+    # stage counts measured on MI350X with 12 heads and V = 128
+    for block_v, num_stages in ((16, 3), (32, 3)):
+        if num_seqs * num_heads * (128 // block_v) <= _num_cus(device):
+            return block_v, 4, num_stages
+    return 64, 4, 2
+
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1217,6 +1261,20 @@ def chunk_kda_fwd(
     _H_pr = q.shape[-2]
     _B = q.shape[0]
     _small_grid = _B * _NT_pr * _H_pr <= 256
+    # gfx950, K = V = 128: the gated key goes chunk-major for either scan below.
+    kg_chunk_major = (
+        is_gfx95_supported()
+        and envs.SGLANG_ROCM_KDA_CHUNK_MAJOR_SCAN.get()
+        and q.shape[-1] == v.shape[-1] == 128
+        and initial_state is not None
+    )
+    # The fused-output scan keeps no per-chunk states; a caller that reads them
+    # back (output_intermediate_states without a track snapshot) cannot use it.
+    fused_output = (
+        kg_chunk_major
+        and _B * q.shape[1] <= envs.SGLANG_ROCM_KDA_FUSED_OUTPUT_MAX_TOKENS.get()
+        and (not output_intermediate_states or track_state is not None)
+    )
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -1230,7 +1288,27 @@ def chunk_kda_fwd(
         safe_gate=lower_bound is not None,
         fuse_diagonal=_small_grid,
         fuse_recompute=_small_grid,
+        kg_chunk_major=kg_chunk_major,
     )
+
+    if fused_output:
+        o = chunk_kda_fwd_scan_o(
+            q=q,
+            kgc=kg,
+            w=w,
+            u=u,
+            gk=g,
+            A=Aqk,
+            o=v,
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            chunk_offsets=chunk_offsets,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+        )
+        return (o, None) if output_intermediate_states else o
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
@@ -1245,6 +1323,16 @@ def chunk_kda_fwd(
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
         chunk_offsets=chunk_offsets,
+        kg_chunk_major=kg_chunk_major,
+        tile=(
+            _chunk_scan_tile(
+                num_seqs=_B if cu_seqlens is None else len(cu_seqlens) - 1,
+                num_heads=q.shape[-2],
+                device=q.device,
+            )
+            if kg_chunk_major
+            else None
+        ),
     )
     del w, u, kg
 

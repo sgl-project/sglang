@@ -37,6 +37,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl, is_hip_runtime
+from sglang.srt.utils import is_gfx95_supported
 
 # V-tile width of the fused verify kernel. Tuned on B200 at T=5 with
 # benchmark/kernels/bench_kda_verify_sweep.py; any power of two is
@@ -45,6 +46,13 @@ KDA_VERIFY_BLOCK_V = 4
 # gfx950 V-tile width for the measured GLM TP4 shapes: wider tiles share the q/k
 # convolution across more lanes
 KDA_VERIFY_BLOCK_V_HIP = 16
+
+
+def _k3_hip_block_v(B: int) -> int:
+    # Measured on gfx950 for Kimi-K3 TP8 (H = HV = 12, K = V = 128, T = 4, one wave).
+    if B <= 2:
+        return 4
+    return 8 if B <= 4 else 16
 
 
 @triton.jit
@@ -124,6 +132,9 @@ def fused_kda_conv_gating_verify_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    # gfx9 vmcnt also counts stores, so a load issued after a step's stores
+    # waits for their write acks: load step t+1's inputs before step t stores.
+    PREFETCH_NEXT: tl.constexpr = False,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
     # every global load (conv_state_indices, mixed_qkv, weights) happens after
@@ -218,12 +229,35 @@ def fused_kda_conv_gating_verify_kernel(
     b_A_log = tl.load(A_log + i_hv).to(tl.float32)
     b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
 
+    if PREFETCH_NEXT:
+        n_q = tl.load(x + bos * stride_x_tok + q_ch, mask=mask_k, other=0.0)
+        n_k = tl.load(x + bos * stride_x_tok + k_ch, mask=mask_k, other=0.0)
+        n_v = tl.load(x + bos * stride_x_tok + v_ch, mask=mask_v, other=0.0)
+        n_b = tl.load(b_gate + bos * stride_b_tok + i_hv)
+        n_a = tl.load(a + bos * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0)
+
     for t in tl.static_range(T):
         # ---- inline causal conv (reference: bias + c0*w0 + c1*w1 + c2*w2 + x*w3,
         # then silu; accumulation order and dtypes mirror the unfused kernel) ----
-        x_q = tl.load(x + (bos + t) * stride_x_tok + q_ch, mask=mask_k, other=0.0)
-        x_k = tl.load(x + (bos + t) * stride_x_tok + k_ch, mask=mask_k, other=0.0)
-        x_v = tl.load(x + (bos + t) * stride_x_tok + v_ch, mask=mask_v, other=0.0)
+        if PREFETCH_NEXT:
+            x_q = n_q
+            x_k = n_k
+            x_v = n_v
+            raw_b = n_b
+            raw_a = n_a
+            if t + 1 < T:
+                row_n = bos + t + 1
+                n_q = tl.load(x + row_n * stride_x_tok + q_ch, mask=mask_k, other=0.0)
+                n_k = tl.load(x + row_n * stride_x_tok + k_ch, mask=mask_k, other=0.0)
+                n_v = tl.load(x + row_n * stride_x_tok + v_ch, mask=mask_v, other=0.0)
+                n_b = tl.load(b_gate + row_n * stride_b_tok + i_hv)
+                n_a = tl.load(
+                    a + row_n * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
+                )
+        else:
+            x_q = tl.load(x + (bos + t) * stride_x_tok + q_ch, mask=mask_k, other=0.0)
+            x_k = tl.load(x + (bos + t) * stride_x_tok + k_ch, mask=mask_k, other=0.0)
+            x_v = tl.load(x + (bos + t) * stride_x_tok + v_ch, mask=mask_v, other=0.0)
 
         if HAS_BIAS:
             acc_q = bias_q
@@ -311,10 +345,14 @@ def fused_kda_conv_gating_verify_kernel(
         b_v = acc_v.to(o.dtype.element_ty).to(tl.float32)
 
         # ---- sigmoid-gating delta rule step (mirrors the reference kernel) ----
-        b_b = tl.load(b_gate + (bos + t) * stride_b_tok + i_hv).to(tl.float32)
-        b_a = tl.load(
-            a + (bos + t) * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
-        ).to(tl.float32)
+        if PREFETCH_NEXT:
+            b_b = raw_b.to(tl.float32)
+            b_a = raw_a.to(tl.float32)
+        else:
+            b_b = tl.load(b_gate + (bos + t) * stride_b_tok + i_hv).to(tl.float32)
+            b_a = tl.load(
+                a + (bos + t) * stride_a_tok + i_hv * K + o_k, mask=mask_k, other=0.0
+            ).to(tl.float32)
 
         gx = b_a + b_dt_bias
         if USE_LOWER_BOUND:
@@ -444,6 +482,8 @@ def fused_kda_conv_gating_verify(
     # elementwise (conv FMA chain, gate, sigmoid), upstream of every tl.sum.
     # None picks 1 on ROCm (faster on gfx950 and bit-exact with the reference), else 4
     num_warps: Optional[int] = None,
+    # None prefetches on gfx950 only.
+    prefetch_next: Optional[bool] = None,
     # ReplaySSM fused ring-write; same parameter names as the unfused
     # fused_sigmoid_gating_delta_rule_update so ring_kwargs pass through both.
     cache_ring: bool = False,
@@ -460,6 +500,8 @@ def fused_kda_conv_gating_verify(
     W = conv_weight.shape[1]
     if num_warps is None:
         num_warps = 1 if is_hip_runtime() else 4
+    if prefetch_next is None:
+        prefetch_next = is_gfx95_supported()
 
     assert mixed_qkv.stride(-1) == 1, "mixed_qkv must be contiguous in dim"
     assert dim == 2 * H * K + HV * V, f"packed dim mismatch: {dim}"
@@ -493,6 +535,15 @@ def fused_kda_conv_gating_verify(
         and 3 <= B <= 16
     ):
         BV = KDA_VERIFY_BLOCK_V_HIP
+    if (
+        is_gfx95_supported()
+        and num_warps == 1
+        and T == 4
+        and H == HV == 12
+        and K == V == 128
+        and conv_weight.dtype == torch.float32
+    ):
+        BV = _k3_hip_block_v(B)
     NV = triton.cdiv(V, BV)
 
     a2 = a.reshape(seq_len, HV * K)
@@ -618,6 +669,7 @@ def fused_kda_conv_gating_verify(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        PREFETCH_NEXT=prefetch_next,
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.
         num_warps=num_warps,
