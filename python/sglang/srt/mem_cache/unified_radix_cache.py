@@ -1096,9 +1096,16 @@ class UnifiedRadixCache(BasePrefixCache):
         ]
 
         # components prepare insert data + return effective cache_len
+        #
+        # If this is the final insert for a request that already went through
+        # intermediate checkpoints (chunked prefill), replay hit-count bumps
+        # on every node the root walk passes so HiCache write-through can fire
+        # on the retained prefix. See issue #33714.
+        force_bump_hit_count = is_finished and req.kv.cache_inserted_len > 0
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             inserted_len=req.kv.cache_inserted_len,
+            force_bump_hit_count=force_bump_hit_count,
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
@@ -1191,6 +1198,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     value=values[: len(prompt_key)],
                     prev_prefix_len=len(prompt_key),
                     inserted_len=len(prompt_key),
+                    force_bump_hit_count=False,
                     priority=min(
                         insert_params.priority + 1, torch.iinfo(torch.int64).max
                     ),

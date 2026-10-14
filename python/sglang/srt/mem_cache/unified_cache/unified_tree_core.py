@@ -1348,9 +1348,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if swa_already_freed < dup.numel():
                     step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
-        # Nodes this request already inserted were counted back then.
+        # Nodes this request already inserted were counted back then — unless
+        # the caller forces a replay (used at request finish to give a chunked
+        # prefill's retained prefix its deferred hit-count bump).
         node_end = state.total_prefix_length + prefix_len
-        if node_end > state.params.inserted_len and self._inc_hit_count_and_check(node):
+        if (
+            state.params.force_bump_hit_count
+            or node_end > state.params.inserted_len
+        ) and self._inc_hit_count_and_check(node):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
@@ -1413,9 +1418,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if state.is_new_leaf:
             leaf_end = state.total_prefix_length + len(state.target_node.key)
             return (
-                leaf_end > state.params.inserted_len
-                and self._inc_hit_count_and_check(state.target_node)
-            )
+                state.params.force_bump_hit_count
+                or leaf_end > state.params.inserted_len
+            ) and self._inc_hit_count_and_check(state.target_node)
 
         node = state.target_node
         return (

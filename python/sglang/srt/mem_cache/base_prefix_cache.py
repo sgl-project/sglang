@@ -98,6 +98,11 @@ class InsertParams:
     # The inserting request already inserted [0, here) (req.kv.cache_inserted_len);
     # only the nodes past it count a hit, so a request counts each node once.
     inserted_len: int = 0
+    # When True, skip the inserted_len gate and bump hit counts on every node
+    # the root walk passes — used at request finish to give a chunked prefill's
+    # retained prefix its deferred hit-count bump (see unified_tree_core.py
+    # _insert_walk_step / _should_backup_after_insert).
+    force_bump_hit_count: bool = False
     priority: int = 0
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
