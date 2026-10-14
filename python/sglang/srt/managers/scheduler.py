@@ -1335,8 +1335,8 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
-        self.prefill_decode_interval_min_running_requests = (
-            get_schedule().prefill_decode_interval_min_running_requests
+        self.prefill_decode_interval_min_bs = (
+            get_schedule().prefill_decode_interval_min_bs
         )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
@@ -1386,10 +1386,7 @@ class Scheduler(
 
         # A small running batch admits prefill every round so it can grow;
         # the interval only protects decode once the batch is large enough.
-        if (
-            running_batch.batch_size()
-            < self.prefill_decode_interval_min_running_requests
-        ):
+        if running_batch.batch_size() < self.prefill_decode_interval_min_bs:
             self._prefill_decode_interval_remaining = 0
             return False
 

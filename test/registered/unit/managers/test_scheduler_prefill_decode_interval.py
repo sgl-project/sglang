@@ -14,12 +14,12 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_scheduler(
-    *, interval: int, require_mlp_sync: bool, min_running_requests: int = 0
+    *, interval: int, require_mlp_sync: bool, min_bs: int = 0
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_decode_interval = interval
     scheduler._prefill_decode_interval_remaining = 0
-    scheduler.prefill_decode_interval_min_running_requests = min_running_requests
+    scheduler.prefill_decode_interval_min_bs = min_bs
     scheduler.require_mlp_sync = require_mlp_sync
     return scheduler
 
@@ -81,9 +81,7 @@ class TestPrefillDecodeInterval(unittest.TestCase):
         self.assertEqual(scheduler._prefill_decode_interval_remaining, 1)
 
     def test_small_running_batch_admits_prefill_and_clears_interval(self):
-        scheduler = _make_scheduler(
-            interval=4, require_mlp_sync=False, min_running_requests=8
-        )
+        scheduler = _make_scheduler(interval=4, require_mlp_sync=False, min_bs=8)
         scheduler._arm_prefill_decode_interval(
             _make_batch(local_extend=True, global_extend=False)
         )
@@ -94,9 +92,7 @@ class TestPrefillDecodeInterval(unittest.TestCase):
         self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(8)))
 
     def test_large_running_batch_defers_prefill(self):
-        scheduler = _make_scheduler(
-            interval=2, require_mlp_sync=False, min_running_requests=8
-        )
+        scheduler = _make_scheduler(interval=2, require_mlp_sync=False, min_bs=8)
         scheduler._arm_prefill_decode_interval(
             _make_batch(local_extend=True, global_extend=False)
         )
@@ -106,9 +102,7 @@ class TestPrefillDecodeInterval(unittest.TestCase):
         self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(9)))
 
     def test_running_batch_shrinking_below_threshold_ends_interval(self):
-        scheduler = _make_scheduler(
-            interval=4, require_mlp_sync=False, min_running_requests=8
-        )
+        scheduler = _make_scheduler(interval=4, require_mlp_sync=False, min_bs=8)
         scheduler._arm_prefill_decode_interval(
             _make_batch(local_extend=True, global_extend=False)
         )

@@ -440,10 +440,10 @@ class TestPrepareServerArgs(CustomTestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "--prefill-decode-interval-min-running-requests must be non-negative",
+            "--prefill-decode-interval-min-bs must be non-negative",
         ):
             ServerArgs(
-                model_path="dummy", prefill_decode_interval_min_running_requests=-1
+                model_path="dummy", prefill_decode_interval_min_bs=-1
             ).resolve_once()
 
     def test_sampling_mask_max_tokens(self):
