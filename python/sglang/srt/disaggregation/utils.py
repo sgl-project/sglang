@@ -282,9 +282,14 @@ def poll_and_all_reduce(
     gloo_group: dist.ProcessGroup,
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    inject_failure: bool = True,
 ):
     # at a certain prob, the poll is failed to simulate failure
-    polls = _poll_with_failure_injection(pollers)
+    polls = (
+        _poll_with_failure_injection(pollers)
+        if inject_failure
+        else [int(poller.poll()) for poller in pollers]
+    )
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
