@@ -39,6 +39,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     hadamard_preserved,
     is_dsa_enable_prefill_cp,
     is_graph_dsa_split_op_surface,
+    resolve_fp8_mqa_logits_fn,
+    resolve_fp8_paged_mqa_logits_fn,
+    resolve_num_sms,
+    resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.attention.mqa_logits_utils import (
@@ -317,7 +321,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = resolve_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = (
@@ -1289,7 +1293,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
@@ -1318,7 +1322,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if batch_size == 0:
                 return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
             if batch_size <= self.sm_count:
-                return deep_gemm.fp8_paged_mqa_logits(
+                return resolve_fp8_paged_mqa_logits_fn()(
                     q,
                     kv_cache,
                     w,
@@ -1332,11 +1336,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             for start in range(0, batch_size, self.sm_count):
                 end = min(start + self.sm_count, batch_size)
                 chunk_context_lens = context_lens[start:end]
-                chunk_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                chunk_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     chunk_context_lens, blocksize, self.sm_count
                 )
                 logits_chunks.append(
-                    deep_gemm.fp8_paged_mqa_logits(
+                    resolve_fp8_paged_mqa_logits_fn()(
                         q[start:end],
                         kv_cache,
                         w[start * chunk_next_n : end * chunk_next_n],
@@ -1388,7 +1392,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dsl_atom=dsl_atom,
                 blocksize=blocksize,
                 sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
@@ -1577,7 +1581,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[:q_offset], weights[:q_offset]
                     )
-                    logits = deep_gemm.fp8_mqa_logits(
+                    logits = resolve_fp8_mqa_logits_fn()(
                         q_padded,
                         kv_fp8,
                         w_padded,
@@ -1642,7 +1646,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[start:end], weights[start:end]
                     )
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                    logits_chunk = resolve_fp8_mqa_logits_fn()(
                         q_padded,
                         kv_fp8,
                         w_padded,

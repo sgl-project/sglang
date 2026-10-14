@@ -398,6 +398,13 @@ class CompletionRequest(PDRoutingFields):
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+    watermark: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-request watermark settings: enabled, key, and context_window. "
+            "A key implicitly enables watermarking."
+        ),
+    )
 
     images_config: Optional[Dict] = None
 
@@ -904,6 +911,11 @@ class ChatCompletionRequest(PDRoutingFields):
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
     sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
+    # Flat output top logprobs in choices[].meta_info (requires return_meta_info);
+    # choices[].logprobs top_logprobs are then empty.
+    return_flat_raw_output_top_logprobs: bool = False
+    # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
+    return_flat_raw_top_logprobs_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -958,6 +970,13 @@ class ChatCompletionRequest(PDRoutingFields):
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+    watermark: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-request watermark settings: enabled, key, and context_window. "
+            "A key implicitly enables watermarking."
+        ),
+    )
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
@@ -1149,6 +1168,7 @@ class ChatCompletionRequest(PDRoutingFields):
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
+            "watermark": self.watermark,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
