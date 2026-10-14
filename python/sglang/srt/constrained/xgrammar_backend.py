@@ -251,6 +251,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def is_support_token_filter(self):
         return True
 
+    def get_structural_tag_content(self, grammar: XGrammarGrammar) -> dict:
+        return {"type": "grammar", "grammar": str(grammar.ctx.grammar)}
+
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
         return _allocate_token_bitmask(vocab_size, batch_size)

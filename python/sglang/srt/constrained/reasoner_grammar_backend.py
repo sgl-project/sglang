@@ -21,6 +21,13 @@ import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
+from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_TEXT,
+    CONTENT_THINKING,
+    END_MESSAGE,
+    INKLING_SPECIAL_TOKEN_IDS,
+    MESSAGE_MODEL,
+)
 from sglang.srt.parser.reasoning_parser import (
     InklingDetector as InklingReasoningDetector,
 )
@@ -38,6 +45,7 @@ from .base_grammar_backend import (
 logger = logging.getLogger(__name__)
 
 _canonical_inkling_auto_tool_schema: Optional[dict] = None
+_INKLING_FRAMED_KEY_TYPES = ("json", "regex", "ebnf")
 
 
 def _get_canonical_inkling_auto_tool_schema() -> dict:
@@ -53,6 +61,37 @@ def _get_canonical_inkling_auto_tool_schema() -> dict:
             .model_dump(by_alias=True)
         )
     return _canonical_inkling_auto_tool_schema
+
+
+def _inkling_answer_structural_tag(content: dict) -> dict:
+    def token(name: str) -> dict:
+        return {"type": "token", "token": INKLING_SPECIAL_TOKEN_IDS[name]}
+
+    thinking_message = {
+        "type": "sequence",
+        "elements": [
+            token(MESSAGE_MODEL),
+            token(CONTENT_THINKING),
+            {
+                "type": "any_tokens",
+                "exclude_tokens": [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
+            },
+            token(END_MESSAGE),
+        ],
+    }
+    return {
+        "type": "structural_tag",
+        "format": {
+            "type": "sequence",
+            "elements": [
+                {"type": "optional", "content": thinking_message},
+                token(MESSAGE_MODEL),
+                token(CONTENT_TEXT),
+                content,
+                token(END_MESSAGE),
+            ],
+        },
+    }
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
@@ -378,6 +417,13 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             return ret
         if key[0] == "full_assistant_ebnf":
             return ret
+        if self._is_inkling_detector and key[0] in _INKLING_FRAMED_KEY_TYPES:
+            framed = self._frame_inkling_answer(ret, reasoning)
+            if framed is not None:
+                if not self.enable_strict_thinking:
+                    # The frame admits the thinking message itself, so it owns the turn.
+                    return framed
+                ret = framed
         if (
             not self.enable_strict_thinking
             and key[0] == "structural_tag"
@@ -387,3 +433,14 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             if json.loads(key[1]) == _get_canonical_inkling_auto_tool_schema():
                 return ret
         return self._make_grammar_object(ret, reasoning)
+
+    def _frame_inkling_answer(
+        self, grammar: BaseGrammarObject, reasoning: bool
+    ) -> Optional[BaseGrammarObject]:
+        content = self.grammar_backend.get_structural_tag_content(grammar)
+        if content is None:
+            return None
+        tag = _inkling_answer_structural_tag(content)
+        return self.grammar_backend._init_value_dispatch(
+            ("structural_tag", json.dumps(tag)), reasoning
+        )

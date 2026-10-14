@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import unittest
@@ -474,6 +475,60 @@ class TestReasonerGrammarBackend(CustomTestCase):
                         self.assertIs(grammar.grammar, inner_grammar)
                     else:
                         self.assertIs(grammar, inner_grammar)
+
+    def test_inkling_output_constraints_keep_message_framing(self):
+        """Constrained Inkling output is a framed text message after optional thinking."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        keys = {
+            ("json", '{"type":"object","properties":{"a":{"type":"integer"}}}'): (
+                '{"a": 1}'
+            ),
+            ("regex", "Answer: [0-9]+"): "Answer: 42",
+            ("ebnf", 'root ::= "yes" | "no"'): "yes",
+        }
+        thinking = (
+            [ids[MESSAGE_MODEL], ids[CONTENT_THINKING]]
+            + tokenizer.encode("reason")
+            + [ids[END_MESSAGE]]
+        )
+        for (key, payload), reasoning, prefix, strict in itertools.product(
+            keys.items(), (False, True), ([], thinking), (False, True)
+        ):
+            if strict and not prefix:
+                continue
+            with self.subTest(key=key, reasoning=reasoning, prefix=bool(prefix)):
+                reasoner = ReasonerGrammarBackend(
+                    backend,
+                    SimpleNamespace(detector=InklingDetector()),
+                    tokenizer,
+                    enable_strict_thinking=strict,
+                )
+                grammar = reasoner._init_value_dispatch(key, reasoning=reasoning)
+                self._accept_allowed_tokens(grammar, prefix, backend.vocab_size)
+                mask = self._vocab_mask(grammar, backend.vocab_size)
+                self.assertEqual(
+                    _allowed_token_ids(mask, [ord(payload[0]), ids[MESSAGE_MODEL]]),
+                    [ids[MESSAGE_MODEL]],
+                )
+                self._accept_allowed_tokens(
+                    grammar,
+                    [ids[MESSAGE_MODEL], ids[CONTENT_TEXT]] + tokenizer.encode(payload),
+                    backend.vocab_size,
+                )
+                mask = self._vocab_mask(grammar, backend.vocab_size)
+                self.assertEqual(
+                    _allowed_token_ids(
+                        mask, [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]]
+                    ),
+                    [ids[END_MESSAGE]],
+                )
+                self._accept_allowed_tokens(
+                    grammar,
+                    [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]],
+                    backend.vocab_size,
+                )
+                self.assertTrue(grammar.is_terminated())
 
     def test_inkling_backend_matches_native_think_end_id(self):
         """Strict mode and other constraints must see the native END_MESSAGE id."""

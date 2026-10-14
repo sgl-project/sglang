@@ -223,6 +223,10 @@ class BaseGrammarBackend:
     def enable_strict_thinking(self):
         return self._enable_strict_thinking
 
+    def get_structural_tag_content(self, grammar: BaseGrammarObject) -> Optional[dict]:
+        """Embed a compiled grammar as XGrammar structural-tag content; None if unsupported."""
+        return None
+
     @property
     def is_support_token_filter(self):
         return False
