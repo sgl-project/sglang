@@ -20,17 +20,26 @@ MODEL_TYPES = [
 EXECUTION_MODES = ["eager", "torch_compile", "cuda_graph"]
 ATTENTION_BACKENDS = [
     "auto",
-    "fa",
+    "flash_attention",
     "torch_sdpa",
-    "sage_attn",
-    "sage_attn_3",
+    "sage_attention2",
+    "sage_attention3",
+    "sol_attention",
     "subblock_sparse_attn",
     "video_sparse_attn_h3",
     "hybrid_window_attn_h3",
 ]
 MEMORY_MODES = ["resident", "layerwise_offload"]
 QUANTIZATIONS = ["none", "fp8", "convrot_int8", "mxfp8"]
-INT8_KERNELS = ["auto", "jit", "comfy_kitchen"]
+# Display names -> SGLang backend names; the rest are passed through unchanged.
+_ATTENTION_IDS = {
+    "flash_attention": "fa",
+    "sage_attention2": "sage_attn",
+    "sage_attention3": "sage_attn_3",
+    "sol_attention": "sol_attn",
+}
+# Display names -> SGLANG_DIFFUSION_CONVROT_INT8_BACKEND values.
+_INT8_GEMMS = {"auto": "auto", "sglang_jit": "jit", "comfy_kitchen": "comfy_kitchen"}
 
 PLUGIN_KEYS = (
     "model_type",
@@ -106,22 +115,18 @@ class SGLDOptions:
                     "Native Model Loader.",
                 ),
                 "num_gpus": _field("INT", 1, "basic", min=1, max=64),
+                # ===== parallel =====
                 "parallel_mode": _field(
                     ["auto", "manual"],
                     "auto",
-                    "basic",
-                    "auto lets SGLang pick the layout for num_gpus.",
+                    "parallel",
+                    "auto lets SGLang pick the layout for num_gpus; manual sets "
+                    "TP x Ulysses x Ring.",
                 ),
-                "execution_mode": _field(
-                    EXECUTION_MODES,
-                    "eager",
-                    "execution",
-                    "torch_compile and cuda_graph (breakable CUDA graph) add "
-                    "first-run work.",
-                ),
-                "regional_compile": _field(
-                    "BOOLEAN", False, "execution", "torch_compile only."
-                ),
+                "tp_size": _field("INT", 1, "parallel", min=1),
+                "ulysses_degree": _field("INT", 1, "parallel", min=1),
+                "ring_degree": _field("INT", 1, "parallel", min=1),
+                # ===== attention =====
                 "attention_backend": _field(
                     ATTENTION_BACKENDS,
                     "auto",
@@ -135,6 +140,23 @@ class SGLDOptions:
                     "attention",
                     "Same format as --attention-backend-config.",
                 ),
+                # ===== quantization =====
+                "quantization": _field(
+                    QUANTIZATIONS,
+                    "none",
+                    "quantization",
+                    "Online quantization at load; native model directories only. "
+                    "ComfyUI files carry their own format.",
+                ),
+                "int8_gemm": _field(
+                    list(_INT8_GEMMS),
+                    "auto",
+                    "quantization",
+                    "GEMM implementation for INT8 ConvRot weights (*_int8_convrot "
+                    "files or convrot_int8): SGLang's JIT kernel or ComfyUI's "
+                    "comfy_kitchen. auto prefers sglang_jit.",
+                ),
+                # ===== cache =====
                 "enable_cache_dit": _field(
                     "BOOLEAN",
                     False,
@@ -142,6 +164,18 @@ class SGLDOptions:
                     "Lossy step caching. MiniMax H3 only for now; other models run "
                     "each sampler step as its own request.",
                 ),
+                # ===== execution =====
+                "execution_mode": _field(
+                    EXECUTION_MODES,
+                    "eager",
+                    "execution",
+                    "torch_compile and cuda_graph (breakable CUDA graph) add "
+                    "first-run work.",
+                ),
+                "regional_compile": _field(
+                    "BOOLEAN", False, "execution", "torch_compile only."
+                ),
+                # ===== memory =====
                 "memory_mode": _field(
                     MEMORY_MODES,
                     "resident",
@@ -155,28 +189,6 @@ class SGLDOptions:
                 "prefetch_layers": _field(
                     "INT", 0, "memory", "Layers prefetched ahead; 0 means 1.", min=0
                 ),
-                "tp_size": _field("INT", 1, "parallel", min=1),
-                "ulysses_degree": _field("INT", 1, "parallel", min=1),
-                "ring_degree": _field("INT", 1, "parallel", min=1),
-                "transformer_weights_path": _field(
-                    "STRING",
-                    "",
-                    "weights",
-                    "Weight override, e.g. a GGUF file or owner/repo:QUANT.",
-                ),
-                "quantization": _field(
-                    QUANTIZATIONS,
-                    "none",
-                    "weights",
-                    "Online quantization at load; native model directories only. "
-                    "ComfyUI files carry their own format.",
-                ),
-                "int8_kernel": _field(
-                    INT8_KERNELS,
-                    "auto",
-                    "weights",
-                    "ConvRot INT8 kernel: SGLang JIT or comfy_kitchen.",
-                ),
             },
         }
 
@@ -189,7 +201,7 @@ class SGLDOptions:
             "regional_compile": execution == "torch_compile" and v["regional_compile"],
             "enable_breakable_cuda_graph": execution == "cuda_graph",
             "dit_layerwise_offload": v["memory_mode"] == "layerwise_offload",
-            "int8_kernel": v["int8_kernel"],
+            "int8_kernel": _INT8_GEMMS[v["int8_gemm"]],
         }
         if v["model_type"] != "auto-detect":
             options["model_type"] = v["model_type"]
@@ -199,12 +211,13 @@ class SGLDOptions:
             options["dit_layerwise_resident_layers"] = v["resident_layers"]
             options["dit_offload_prefetch_size"] = v["prefetch_layers"]
         if v["attention_backend"] != "auto":
-            options["attention_backend"] = v["attention_backend"]
+            options["attention_backend"] = _ATTENTION_IDS.get(
+                v["attention_backend"], v["attention_backend"]
+            )
         if v["quantization"] != "none":
             options["quantization"] = v["quantization"]
-        for key in ("attention_backend_config", "transformer_weights_path"):
-            if v[key]:
-                options[key] = v[key]
+        if v["attention_backend_config"]:
+            options["attention_backend_config"] = v["attention_backend_config"]
         if v["enable_cache_dit"]:
             options["enable_cache_dit"] = True
         return (options,)

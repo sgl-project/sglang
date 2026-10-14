@@ -50,19 +50,19 @@ decode on the worker).
 
 ### Options
 
-`SGLDiffusion Options` keeps `model_type`, `num_gpus` and the parallel mode on
+`SGLDiffusion Options` keeps `model_type` and `num_gpus` on
 top; the other groups fold, and each folded header shows its current choice.
 The fields are plain ComfyUI widgets, so the node works without the JavaScript
 extension, which only changes the presentation.
 
 | Group | Fields |
 | --- | --- |
-| Execution | `execution_mode`: eager, torch_compile, cuda_graph (breakable CUDA graph); `regional_compile` |
-| Attention | `attention_backend` (auto = model default), `attention_backend_config` |
+| Parallel | `parallel_mode` auto or manual; manual sets `tp_size`, `ulysses_degree`, `ring_degree`, whose product must equal `num_gpus` |
+| Attention | `attention_backend`: auto (model default), flash_attention, torch_sdpa, sage_attention2, sage_attention3, sol_attention (H3; needs the `sol-attn` package; picking it fills `attention_backend_config` with its defaults), and the H3 sparse backends; `attention_backend_config` |
+| Quantization | `quantization` (online, native directories only); `int8_gemm`: GEMM implementation for INT8 ConvRot weights, auto / sglang_jit / comfy_kitchen |
 | Cache-DiT | `enable_cache_dit` (lossy step caching; currently effective for the MiniMax H3 family) |
+| Execution | `execution_mode`: eager, torch_compile, cuda_graph (breakable CUDA graph); `regional_compile` |
 | Memory | `memory_mode`: resident or DiT layerwise offload; `resident_layers`, `prefetch_layers` |
-| Manual parallel layout | `tp_size`, `ulysses_degree`, `ring_degree`; their product must equal `num_gpus` |
-| Weights & quantization | `transformer_weights_path` (GGUF or other override), `quantization` (online, native directories only), `int8_kernel`: auto, jit, comfy_kitchen for ConvRot INT8 |
 
 The loader checks the options against the resolved model before starting the
 worker and raises instead of dropping a setting. Current limits in integrated mode:

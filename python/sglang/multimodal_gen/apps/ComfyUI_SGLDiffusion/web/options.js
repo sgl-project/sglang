@@ -1,5 +1,5 @@
 import { app } from '../../../scripts/app.js';
-import { GROUPS, groupSummary, statusLine, visibleField } from './options_state.mjs';
+import { GROUPS, defaultBackendConfig, headerLabel, visibleField } from './options_state.mjs';
 
 app.registerExtension({
   name: 'SGLDiffusion.Options',
@@ -18,8 +18,6 @@ app.registerExtension({
       node.properties.sgld_sections ??= {};
       const sections = () => node.properties.sgld_sections ??= {};
       const values = () => Object.fromEntries(fieldWidgets.map(w => [w.name, w.value]));
-      const info = node.addWidget('button', 'SGLD configuration', null, () => {}, { serialize: false });
-      info.serializeValue = () => undefined;
       for (const [group, label] of Object.entries(GROUPS)) {
         const header = node.addWidget('button', label, null, () => {
           sections()[group] = !sections()[group];
@@ -39,7 +37,7 @@ app.registerExtension({
         }
         ordered.push(widget);
       }
-      node.widgets = [...ordered, info];
+      node.widgets = ordered;
 
       function setVisible(widget, visible) {
         if (!states.has(widget)) states.set(widget, { type: widget.type, computeSize: widget.computeSize, hidden: widget.hidden });
@@ -58,10 +56,8 @@ app.registerExtension({
           setVisible(widget, connected || ((group === 'basic' || sections()[group]) && visibleField(widget.name, v)));
         }
         for (const [group, header] of Object.entries(headers)) {
-          header.name = `${sections()[group] ? '\u25be' : '\u25b8'} ${GROUPS[group]}: ${groupSummary(group, v)}`;
+          header.name = headerLabel(group, v, sections()[group]);
         }
-        info.name = statusLine(v);
-        info.options.tooltip = 'Requested configuration. Unsupported combinations for the loaded model are reported when the loader runs. Changing anything but the cache settings restarts the worker.';
         node.setSize([Math.max(node.size[0], 420), node.computeSize()[1]]);
         node.setDirtyCanvas(true, true);
       }
@@ -69,6 +65,10 @@ app.registerExtension({
         const callback = widget.callback;
         widget.callback = function (...args) {
           const result = callback?.apply(this, args);
+          if (widget.name === 'attention_backend') {
+            const config = fieldWidgets.find(w => w.name === 'attention_backend_config');
+            if (config) config.value = defaultBackendConfig(widget.value, config.value);
+          }
           refresh();
           return result;
         };

@@ -34,6 +34,12 @@ def test_defaults_leave_layout_and_attention_to_the_worker() -> None:
     }
 
 
+def test_display_names_map_to_sglang_backends() -> None:
+    options = _options(attention_backend="flash_attention", int8_gemm="sglang_jit")
+    assert options["attention_backend"] == "fa"
+    assert options["int8_kernel"] == "jit"
+
+
 def test_manual_layout_derives_sp_and_checks_gpu_count() -> None:
     options = _options(num_gpus=4, parallel_mode="manual", tp_size=2, ulysses_degree=2)
     assert (options["tp_size"], options["sp_degree"], options["ring_degree"]) == (
@@ -92,12 +98,12 @@ def test_execution_mode_maps_to_exactly_one_server_flag() -> None:
                 "num_gpus": 2,
                 "parallel_mode": "manual",
                 "ring_degree": 2,
-                "attention_backend": "sage_attn",
+                "attention_backend": "sage_attention2",
             },
             False,
             "requires attention_backend=fa",
         ),
-        ("vdn_h3", {"attention_backend": "fa"}, True, "does not apply"),
+        ("vdn_h3", {"attention_backend": "flash_attention"}, True, "does not apply"),
         (
             "qwen_image",
             {"attention_backend": "subblock_sparse_attn"},
@@ -105,7 +111,7 @@ def test_execution_mode_maps_to_exactly_one_server_flag() -> None:
             "does not apply",
         ),
         ("flux", {"quantization": "fp8"}, False, "native model directories"),
-        ("lumina2", {"int8_kernel": "comfy_kitchen"}, False, "no effect"),
+        ("lumina2", {"int8_gemm": "comfy_kitchen"}, False, "no effect"),
     ],
 )
 def test_preflight_rejects_what_the_model_cannot_run(
@@ -121,7 +127,7 @@ def test_preflight_rejects_what_the_model_cannot_run(
         ("minimax_h3", {"execution_mode": "cuda_graph"}, False),
         (
             "minimax_h3",
-            {"enable_cache_dit": True, "attention_backend": "sage_attn"},
+            {"enable_cache_dit": True, "attention_backend": "sage_attention2"},
             False,
         ),
         (
@@ -131,7 +137,7 @@ def test_preflight_rejects_what_the_model_cannot_run(
         ),
         (
             "minimax_h3",
-            {"int8_kernel": "comfy_kitchen"},
+            {"int8_gemm": "comfy_kitchen"},
             False,
         ),
         ("fast_h3", {"attention_backend": "video_sparse_attn_h3"}, True),

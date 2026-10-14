@@ -16,6 +16,10 @@ from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEn
 
 _INSTALL_HINTS = {
     AttentionBackendEnum.SAGE_ATTN: "install SageAttention 2: https://github.com/thu-ml/SageAttention",
+    AttentionBackendEnum.SOL_ATTN: (
+        "install sol-attn: pip install git+https://github.com/NVlabs/Sana.git"
+        "@sol-engine#subdirectory=techniques/sparse_backends"
+    ),
     AttentionBackendEnum.SAGE_ATTN_3: (
         "SageAttention 3 targets Blackwell GPUs: "
         "https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell"
@@ -117,6 +121,7 @@ _ATTENTION_BY_MODEL = {
         "torch_sdpa",
         "sage_attn",
         "sage_attn_3",
+        "sol_attn",
         "subblock_sparse_attn",
         "video_sparse_attn_h3",
     ),
@@ -184,6 +189,6 @@ def _check_weights(model_type: str, opts: dict, *, native_dir: bool) -> None:
     kernel = opts.get("int8_kernel", "auto")
     if kernel != "auto" and model_type not in H3_MODELS:
         raise ValueError(
-            f"int8_kernel={kernel} has no effect on {model_type}: only MiniMax H3 "
+            f"int8_gemm={kernel} has no effect on {model_type}: only MiniMax H3 "
             "runs ConvRot INT8 weights; leave it at auto"
         )
