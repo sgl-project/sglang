@@ -3,6 +3,12 @@
 ``build_spec_adapter`` returns None for a spec with no registered adapter; that
 spec keeps its existing rendering branches in ``serving_chat``. Concrete
 adapters are imported lazily, so selecting another spec never loads them.
+
+The output protocols re-derive encode-time state (such as a prompt ending inside
+an open text block) from the request. A spec whose output parsing depends on a
+decision the encoder made, such as whether the prompt opened a thinking block,
+should return it from encoding as an ``EncodedPrompt`` (prompt ids plus that
+state) and take it in the output methods, rather than deciding twice.
 """
 
 from __future__ import annotations
