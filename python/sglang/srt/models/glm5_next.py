@@ -55,6 +55,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_num_fused_shared_experts,
+    is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -1105,14 +1106,7 @@ class Glm5NextModel(nn.Module):
             )
         self.layers_to_capture = []
         self.dflash_capture = False
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_deepep_v2()
-        ):
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
+        self.enable_a2a_moe = is_moe_input_scattered_across_dp_ranks()
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
