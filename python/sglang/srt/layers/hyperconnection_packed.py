@@ -6,6 +6,8 @@ they must not be folded again. No original checkpoint tensors are retained.
 """
 
 import logging
+from contextlib import contextmanager
+from functools import cache
 from typing import Optional
 
 import msgspec
@@ -16,6 +18,64 @@ from sglang.kernels.ops.gemm.hc_mix import _deterministic_inference
 from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionBase
 
 logger = logging.getLogger(__name__)
+
+
+@cache
+def _sum_state_type():
+    from sglang.kernels.ops.elementwise.hc_sum_state import HCSumState
+
+    return HCSumState
+
+
+class _HCSumContext:
+    """Mix-owned buffers carried through the active attention/MoE boundary."""
+
+    def __init__(self, operator, state, buffers):
+        self.operator = operator
+        self.state = state
+        self.buffers = buffers
+        self.sliced = False
+
+    def slice_rows(self, rank, size):
+        def split(tensor):
+            return tensor.tensor_split(size)[rank]
+
+        state = self.state._replace(
+            residual=split(self.state.residual), sum_sq=split(self.state.sum_sq)
+        )
+        output = self.buffers.output._replace(
+            residual=split(self.buffers.output.residual),
+            sum_sq=split(self.buffers.output.sum_sq),
+        )
+        buffers = self.buffers._replace(
+            mixed=split(self.buffers.mixed),
+            alpha=split(self.buffers.alpha),
+            output=output,
+            partial_sums=(
+                split(self.buffers.partial_sums)
+                if self.buffers.partial_sums is not None
+                else None
+            ),
+        )
+        context = _HCSumContext(self.operator, state, buffers)
+        context.sliced = True
+        return context
+
+    def combine(self, block_output):
+        if not self.sliced:
+            return self.operator.combine(self.state, self.buffers, block_output)
+        from sglang.kernels.ops.elementwise.hc_apply_sum import hc_apply_sum
+
+        # Projections already ran on the full rows; only Apply follows this slice.
+        hc_apply_sum(
+            block_output,
+            self.state.residual,
+            self.buffers.alpha,
+            out=self.buffers.output.residual,
+            sum_sq=self.buffers.output.sum_sq,
+            partial_sums=self.buffers.partial_sums,
+        )
+        return self.buffers.output
 
 
 class _PackedParameter(nn.Module):
@@ -55,6 +115,64 @@ class PackedGatedResidual(GatedResidual):
         self._install_weight_loaders()
         self.register_load_state_dict_pre_hook(self._before_native_state_load)
         self.register_load_state_dict_post_hook(self._after_native_state_load)
+
+    def can_use_sum_state(self, residual):
+        if (
+            torch.is_grad_enabled()
+            or self._sum_operators is None
+            or self._sum_weights_dirty
+        ):
+            return False
+        large = self._sum_operators[1]
+        w = large.weights
+        return (
+            residual.ndim == 2
+            and residual.shape[1] == 4 * self.hidden_size
+            and residual.shape[0] <= large.max_rows
+            and residual.device == w.matrix.device
+            and residual.dtype == w.matrix.dtype
+            and residual.is_contiguous()
+            and residual.data_ptr() % 32 == 0
+        )
+
+    def mix(self, hyper_input):
+        is_state = isinstance(hyper_input, _sum_state_type())
+        residual = hyper_input.residual if is_state else hyper_input
+        if not self.can_use_sum_state(residual):
+            raise ValueError(
+                "Packed HC requires prepared weights and supported inference input"
+            )
+        operator = self._sum_operators[int(residual.shape[0] > 24)]
+        state = hyper_input if is_state else operator.bootstrap(residual)
+        buffers = operator.allocate_buffers(residual.shape[0])
+        mixed, _ = operator.mix(state, buffers)
+        return mixed, _HCSumContext(operator, state, buffers)
+
+    def mix_prepared(self, residual, prepared_input=None):
+        if isinstance(prepared_input, _sum_state_type()):
+            previous = prepared_input.residual
+            same_rows = previous is residual or (
+                previous.shape == residual.shape
+                and previous.stride() == residual.stride()
+                and previous.dtype == residual.dtype
+                and previous.device == residual.device
+                and previous.data_ptr() == residual.data_ptr()
+            )
+            if same_rows:
+                # An odd row slice offsets [T,4] statistics by 16 bytes.
+                if prepared_input.sum_sq.data_ptr() % 32:
+                    prepared_input = prepared_input._replace(
+                        sum_sq=prepared_input.sum_sq.clone()
+                    )
+                return self.mix(prepared_input)
+        return self.mix(residual)
+
+    def combine(self, block_output, residuals):
+        return residuals.combine(block_output)
+
+    def combine_and_prepare(self, block_output, residuals, next_norm=None):
+        state = self.combine(block_output, residuals)
+        return state.residual, state
 
     @property
     def _hc_packed_down(self):
@@ -290,7 +408,7 @@ class PackedGatedResidual(GatedResidual):
                 deterministic=self._deterministic_hc,
             )
         else:
-            from sglang.kernels.ops.elementwise.hc_mix import permute_pad_up_weight
+            from sglang.kernels.ops.gemm.hc_mix_splitk import permute_pad_up_weight
 
             small = self._sum_operators[0]
             previous = small.weights
@@ -408,6 +526,73 @@ class PackedGatedResidual(GatedResidual):
         # views and loader callbacks as well as refreshing Up's derived layout.
         self.prepare_sum_state_weights(finalize=not self._hc_update_open)
         self._install_weight_loaders()
+
+
+class PackedHCModelMixin:
+    """Model-owned loading hooks for native HC parameters and their local views.
+
+    The generic loaders/updater dispatch model hooks, without inspecting HC
+    layers. Preprocessed native imports only rebind views; they must not rerun
+    checkpoint folding or other model/quantization postprocessing.
+    """
+
+    def _packed_hc_modules(self):
+        return (
+            (name, module)
+            for name, module in self.named_modules()
+            if isinstance(module, PackedGatedResidual)
+        )
+
+    def post_load_weights(self, *, force=True):
+        for _, module in self._packed_hc_modules():
+            module.prepare_sum_state_weights(force=force)
+
+    def post_load_weights_from_direct(self, *, force=False):
+        # Direct/custom loaders only changed parameter storage. Do not rerun
+        # unrelated checkpoint transformations on already-processed weights.
+        PackedHCModelMixin.post_load_weights(self, force=force)
+
+    def post_load_weights_from_preprocessed(self):
+        for _, module in self._packed_hc_modules():
+            module.restore_sum_state_from_ipc()
+
+    def begin_weight_update(self):
+        for _, module in self._packed_hc_modules():
+            module.begin_sum_state_update()
+
+    def validate_weight_update(self):
+        for name, module in self._packed_hc_modules():
+            try:
+                module.validate_sum_state_weights()
+            except ValueError as exc:
+                raise ValueError(f"{name or '<root>'}: {exc}") from exc
+
+    def end_weight_update(self, *, force=False):
+        self.validate_weight_update()
+        for _, module in self._packed_hc_modules():
+            module.finish_sum_state_update(force=force)
+
+    @contextmanager
+    def weight_update_context(self):
+        # Checkpoint-engine can deliver multiple buckets inside or outside an
+        # already-open update session. Only finish/abort sessions opened here.
+        owned = []
+        try:
+            for name, module in self._packed_hc_modules():
+                if module.begin_sum_state_update(reuse=True):
+                    owned.append((name, module))
+            yield
+            for name, module in owned:
+                try:
+                    module.validate_sum_state_weights()
+                except ValueError as exc:
+                    raise ValueError(f"{name or '<root>'}: {exc}") from exc
+            for _, module in owned:
+                module.finish_sum_state_update()
+        except Exception:
+            for _, module in owned:
+                module.abort_sum_state_update()
+            raise
 
 
 def create_gated_residual(config, use_mix=True, use_combine=True, role=None):

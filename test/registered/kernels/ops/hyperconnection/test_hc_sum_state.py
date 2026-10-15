@@ -13,12 +13,21 @@ from sglang.kernels.ops.elementwise.hc_sum_state import HCSumState, SmallTSumHCS
 from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 from sglang.srt.layers.hyperconnection_packed import (
     PackedGatedResidual,
+    PackedHCModelMixin,
     create_gated_residual,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+
+class _HCModel(PackedHCModelMixin, torch.nn.Module):
+    pass
+
+
+class _HCSequential(PackedHCModelMixin, torch.nn.Sequential):
+    pass
 
 
 def _checkpoint(h, lowrank, dtype, seed=311):
@@ -51,6 +60,12 @@ def _layer(h, lowrank, dtype, *, combine=True, eps=1e-6, meta=False):
     if not meta:
         layer.to(device="cuda", dtype=dtype)
     return layer.eval().requires_grad_(False)
+
+
+def _bootstrap_sum_state(layer, residual):
+    if not layer.can_use_sum_state(residual):
+        raise ValueError("HC sum-state weights/input are not prepared or supported")
+    return layer._sum_operators[int(residual.shape[0] > 24)].bootstrap(residual)
 
 
 def _native_checkpoint(checkpoint):
@@ -148,6 +163,20 @@ class TestHCSumState(CustomTestCase):
         self.addCleanup(setattr, torch.backends.cuda.matmul, "allow_tf32", old)
         torch.backends.cuda.matmul.allow_tf32 = False
         self.generator = torch.Generator(device="cuda").manual_seed(197)
+        self.hc_parallel = SimpleNamespace(
+            attn_dp_size=1, attn_cp_size=1, moe_ep_size=2
+        )
+        self.hc_tp = SimpleNamespace(input_scattered=False)
+        self.hc_a2a = Mock()
+        self.hc_a2a.is_none.return_value = True
+        for name, value in (
+            ("get_parallel", self.hc_parallel),
+            ("get_attn_tp_context", self.hc_tp),
+            ("get_moe_a2a_backend", self.hc_a2a),
+        ):
+            self.enterContext(
+                patch("sglang.srt.models.qwen4_exp." + name, return_value=value)
+            )
 
     @torch.no_grad()
     def test_qwen_attention_to_ffn_sum_handoff(self):
@@ -164,8 +193,9 @@ class TestHCSumState(CustomTestCase):
             hc.prepare_sum_state_weights()
         for t in (1, 24, 25, 40):
             with self.subTest(t=t):
-                prepared = layer.attn_hyper_connection.bootstrap_sum_state(
-                    self.tensor((t, 4 * 512), torch.bfloat16)
+                prepared = _bootstrap_sum_state(
+                    layer.attn_hyper_connection,
+                    self.tensor((t, 4 * 512), torch.bfloat16),
                 )
                 state = GatedResidualState(
                     lambda value: value,
@@ -197,6 +227,37 @@ class TestHCSumState(CustomTestCase):
         return torch.randn(shape, device="cuda", dtype=dtype, generator=self.generator)
 
     @torch.no_grad()
+    def test_guarded_handoff_bootstraps_after_in_place_change(self):
+        from sglang.srt.models.qwen4_exp import Qwen4ExpLayerExtensionMixin
+
+        h, lowrank, dtype = 512, 64, torch.bfloat16
+        checkpoint = _checkpoint(h, lowrank, dtype)
+        layer = Qwen4ExpLayerExtensionMixin()
+        layer.ple = None
+        layer.attn_hyper_connection = _layer(h, lowrank, dtype)
+        layer.attn_hyper_connection.load_state_dict(checkpoint)
+        for mode in ("dp", "cp", "scattered", "a2a"):
+            self.hc_parallel.attn_dp_size = 2 if mode == "dp" else 1
+            self.hc_parallel.attn_cp_size = 2 if mode == "cp" else 1
+            self.hc_tp.input_scattered = mode == "scattered"
+            self.hc_a2a.is_none.return_value = mode != "a2a"
+            for t in (24, 25):
+                with self.subTest(mode=mode, t=t):
+                    residual = self.tensor((t, 4 * h), dtype)
+                    stale = _bootstrap_sum_state(layer.attn_hyper_connection, residual)
+                    residual.add_(1)
+                    with layer.hc_inputs(stale, None):
+                        mixed, context = layer._attn_mix(residual)
+                    self.assertIsNot(context.state, stale)
+                    torch.testing.assert_close(
+                        context.state.sum_sq,
+                        residual.float().view(t, 4, h).square().sum(-1),
+                        rtol=3e-6,
+                        atol=1e-5,
+                    )
+                    self.check_mix(mixed, context, checkpoint)
+
+    @torch.no_grad()
     def test_deterministic_mode(self):
         """Flag-enabled HC is repeatable at fixed T, including Graph and slices.
 
@@ -219,8 +280,7 @@ class TestHCSumState(CustomTestCase):
                 hidden_size=512, hc_lowrank=64, hc_per_branch_norm=True
             )
             legacy = GatedResidual(config)
-            self.assertFalse(legacy.prepare_sum_state_weights())
-            self.assertIsNone(legacy._sum_operators)
+            self.assertFalse(hasattr(legacy, "_sum_operators"))
             final = create_gated_residual(config, use_combine=False)
             self.assertFalse(final._packed_sum_weights)
             for dtype in (torch.bfloat16, torch.float16):
@@ -229,8 +289,8 @@ class TestHCSumState(CustomTestCase):
                     layer = _layer(h, lowrank, dtype)
                     layer.load_state_dict(checkpoint)
                     for t in (0, 1, 24, 25, 80):
-                        state = layer.bootstrap_sum_state(
-                            self.tensor((t, 4 * h), dtype)
+                        state = _bootstrap_sum_state(
+                            layer, self.tensor((t, 4 * h), dtype)
                         )
                         # Reference runs before installing the framework overrides.
                         expected = _reference_mix(
@@ -390,7 +450,7 @@ class TestHCSumState(CustomTestCase):
                                 rtol=0.02 if dtype == torch.bfloat16 else 0.003,
                                 atol=0.004 if dtype == torch.bfloat16 else 0.0005,
                             )
-                        bootstrap = layer.bootstrap_sum_state(output.residual)
+                        bootstrap = _bootstrap_sum_state(layer, output.residual)
                         # For normal-range values rounded with unit roundoff u,
                         # |sum(round(x)^2) - sum(x^2)| <= (2u + u^2) * sum(x^2).
                         # Allow the two FP32 reductions' existing 3e-6 budgets.
@@ -440,7 +500,9 @@ class TestHCSumState(CustomTestCase):
         final = _layer(h, lowrank, dtype, combine=False)
         final.load_state_dict({name: checkpoint[name] for name in final.state_dict()})
         self.assertFalse(final._packed_sum_weights)
-        from_state, _ = final.mix(output)
+        from sglang.srt.models.qwen4_exp import _MixStreams
+
+        from_state = _MixStreams(final, output)(output.residual)
         from_tensor, saved = final.mix(output.residual)
         self.assertIsInstance(saved, tuple)
         self.assertEqual(len(saved), 3)
@@ -505,7 +567,7 @@ class TestHCSumState(CustomTestCase):
             for t in (24, 25):
                 with self.subTest(dtype=dtype, t=t):
                     residual = self.tensor((t, 4 * h), dtype)
-                    state = layer.bootstrap_sum_state(residual)
+                    state = _bootstrap_sum_state(layer, residual)
                     core = self.tensor((t, h), dtype)
 
                     def step():
@@ -530,11 +592,13 @@ class TestHCSumState(CustomTestCase):
                         self.check_mix(mixed, context, checkpoint)
                         self.check_apply(context, core, output)
 
-                    model = torch.nn.Module()
+                    model = _HCModel()
                     model.hc = layer
                     prepared = layer._sum_operators[0].weights
                     pointers = (prepared.up.data_ptr(), prepared.scratch.data_ptr())
-                    for i, route in enumerate(("loader", "direct", "state_dict")):
+                    for i, route in enumerate(
+                        ("loader", "direct", "state_dict", "state_dict_session")
+                    ):
                         with self.subTest(update=route):
                             checkpoint = _checkpoint(h, lowrank, dtype, seed=419 + i)
                             checkpoint["input_mix_weight_up.weight"] *= 4
@@ -558,6 +622,8 @@ class TestHCSumState(CustomTestCase):
                                         ).items()
                                     ],
                                 )
+                            elif route == "state_dict":
+                                layer.load_state_dict(checkpoint)
                             else:
                                 layer.begin_sum_state_update()
                                 for name, value in checkpoint.items():
@@ -793,7 +859,7 @@ class TestHCSumState(CustomTestCase):
 
         h, lowrank, dtype = 512, 8, torch.bfloat16
         checkpoint = _checkpoint(h, lowrank, dtype)
-        model = torch.nn.Module()
+        model = _HCModel()
         model.hc = _layer(h, lowrank, dtype)
 
         def load_raw(values):
@@ -916,7 +982,7 @@ class TestHCSumState(CustomTestCase):
             layer = _layer(h, lowrank, dtype)
             checkpoint = _checkpoint(h, lowrank, dtype)
             layer.load_state_dict(checkpoint)
-            model = torch.nn.Module()
+            model = _HCModel()
             model.hc = layer
             for native in (False, True):
                 orders = permutations((names[0], names[2]) if native else names)
@@ -1001,7 +1067,7 @@ class TestHCSumState(CustomTestCase):
 
         h, lowrank, dtype = 512, 8, torch.bfloat16
         checkpoint = _checkpoint(h, lowrank, dtype)
-        source = torch.nn.Sequential(_layer(h, lowrank, dtype))
+        source = _HCSequential(_layer(h, lowrank, dtype))
         source[0].load_state_dict(checkpoint)
         entries = {
             name: {"tensor": value.detach(), "is_param": True}
@@ -1025,7 +1091,7 @@ class TestHCSumState(CustomTestCase):
         with (
             patch(
                 "sglang.srt.weight_cache.ipc_loader._initialize_model",
-                side_effect=lambda *args: torch.nn.Sequential(
+                side_effect=lambda *args: _HCSequential(
                     _layer(h, lowrank, dtype, meta=True)
                 ),
             ),

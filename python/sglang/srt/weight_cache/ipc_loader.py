@@ -169,12 +169,11 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
-        # Rebuild only client-local HC operators over the mapped buffers;
-        # never repack daemon-shared weights or repeat quantization post-load.
-        for module in model.modules():
-            restore_hc = getattr(module, "restore_sum_state_from_ipc", None)
-            if restore_hc is not None:
-                restore_hc()
+        # A model may own additional local views over preprocessed parameters.
+        # Do not repeat checkpoint transforms on the daemon-shared storage.
+        from sglang.srt.model_loader.loader import post_load_weights
+
+        post_load_weights(model, weights_preprocessed=True)
 
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.

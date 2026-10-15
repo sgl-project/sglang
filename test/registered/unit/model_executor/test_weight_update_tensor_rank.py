@@ -8,7 +8,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.hyperconnection import HyperConnectionConfig
-from sglang.srt.layers.hyperconnection_packed import PackedGatedResidual
+from sglang.srt.layers.hyperconnection_packed import (
+    PackedGatedResidual,
+    PackedHCModelMixin,
+)
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
     WeightUpdater,
@@ -62,9 +65,37 @@ class TestTensorUpdateRank(unittest.TestCase):
         self.assertTrue(torch.equal(model.weight.detach(), per_rank[1]))
 
 
+class _HCModel(PackedHCModelMixin, torch.nn.Module):
+    pass
+
+
 class TestHCWeightUpdateCompletion(CustomTestCase):
+    def test_checkpoint_load_rejects_completely_missing_hc_weights(self):
+        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+        for model_type in (
+            Qwen4ExpForConditionalGeneration,
+            Qwen4ExpForCausalLMMTP,
+        ):
+            with self.subTest(model=model_type.__name__):
+                model = model_type.__new__(model_type)
+                torch.nn.Module.__init__(model)
+                model.config = SimpleNamespace()
+                model.hc = PackedGatedResidual(
+                    HyperConnectionConfig(
+                        hidden_size=512,
+                        hc_lowrank=8,
+                        hc_per_branch_norm=True,
+                        params_dtype=torch.bfloat16,
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "have not been loaded"):
+                    model.load_weights([])
+                self.assertFalse(model.hc._hc_weights_ready)
+
     def test_checkpoint_engine_buckets_finalize_once_and_recover(self):
-        model = torch.nn.Module()
+        model = _HCModel()
         model.hc = PackedGatedResidual(
             HyperConnectionConfig(
                 hidden_size=512,
@@ -170,7 +201,7 @@ class TestHCWeightUpdateCompletion(CustomTestCase):
         hc._hc_needs_full_reload = False
         hc._hc_update_open = True
         hc._hc_refresh_up = False
-        model = torch.nn.Module()
+        model = _HCModel()
         model.add_module("hc", hc)
         model.load_weights = lambda weights: None
         updater = WeightUpdater(

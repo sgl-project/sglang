@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -10,9 +11,9 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
-    _validate_hc_weights_after_loading,
     get_model_loader,
     post_load_weights,
+    validate_model_weights,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import (
@@ -312,22 +313,20 @@ class WeightUpdater:
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
-        for module in self.get_model().modules():
-            begin = getattr(module, "begin_sum_state_update", None)
-            if begin is not None:
-                begin()
+        begin = getattr(self.get_model(), "begin_weight_update", None)
+        if begin is not None:
+            begin()
 
     def validate_weight_update(self: WeightUpdater) -> None:
-        _validate_hc_weights_after_loading(self.get_model())
+        validate_model_weights(self.get_model())
 
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
         if run_post_load:
             post_load_weights(self.get_model())
         self.validate_weight_update()
-        for module in self.get_model().modules():
-            finish = getattr(module, "finish_sum_state_update", None)
-            if finish is not None:
-                finish(force=run_post_load)
+        finish = getattr(self.get_model(), "end_weight_update", None)
+        if finish is not None:
+            finish(force=run_post_load)
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
         )
@@ -385,7 +384,7 @@ class WeightUpdater:
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.get_model(), named_tensors)
-            _model_refresh_hc_weights(self.get_model(), force=True)
+            _model_post_direct_load(self.get_model(), force=True)
         elif load_format is None:
             self.get_model().load_weights(named_tensors)
         else:
@@ -431,7 +430,6 @@ class WeightUpdater:
         if error is not None:
             return False, error
 
-        owned_hc_updates = []
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
                 SGLangCheckpointEngineWorkerExtensionImpl,
@@ -441,34 +439,25 @@ class WeightUpdater:
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             # Checkpoint-engine may invoke model.load_weights for several IPC
             # buckets. Finalize the merged parameters only after the whole call.
-            for module in self.get_model().modules():
-                begin = getattr(module, "begin_sum_state_update", None)
-                if begin is not None and begin(reuse=True):
-                    owned_hc_updates.append(module)
-            worker.update_weights_from_ipc(recv_req.zmq_handles)
-            for module in owned_hc_updates:
-                module.validate_sum_state_weights()
-            for module in owned_hc_updates:
-                module.finish_sum_state_update()
+            update_context = getattr(
+                self.get_model(), "weight_update_context", nullcontext
+            )
+            with update_context():
+                worker.update_weights_from_ipc(recv_req.zmq_handles)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
-            for module in owned_hc_updates:
-                module.abort_sum_state_update()
             return False, f"IPC weight update failed: ImportError {e}"
         except Exception as e:
-            for module in owned_hc_updates:
-                module.abort_sum_state_update()
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
 
 
-def _model_refresh_hc_weights(model, *, force=False):
-    # Opt-in per-module hook. Other models/platforms must not import the
-    # optional HC/Triton backend just because they update their weights.
-    for module in model.modules():
-        prepare = getattr(module, "prepare_sum_state_weights", None)
-        if prepare is not None:
-            prepare(force=force)
+def _model_post_direct_load(model, *, force=False):
+    # Optional model-owned cache refresh. Other models retain direct-copy
+    # semantics, without checkpoint postprocessing or optional backend imports.
+    post_load = getattr(model, "post_load_weights_from_direct", None)
+    if post_load is not None:
+        post_load(force=force)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
@@ -494,7 +483,7 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
         loader(param, tensor)
     # Refresh complete pairs; incomplete pairs stay dirty until a later bucket.
     # Refresh HC layouts in place so existing captured graphs see the new weights.
-    _model_refresh_hc_weights(model)
+    _model_post_direct_load(model)
 
 
 def _unwrap_tensor(tensor, tp_rank, device):
