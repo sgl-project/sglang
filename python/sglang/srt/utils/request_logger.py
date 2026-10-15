@@ -274,7 +274,7 @@ def _dataclass_to_string_truncated(
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
         values = redact_watermark_secrets(
-            {f.name: getattr(data, f.name) for f in fields}
+            {f.name: getattr(data, f.name) for f in fields if f.name not in skip_names}
         )
         return (
             f"{data.__class__.__name__}("
@@ -314,7 +314,7 @@ def _transform_data_for_logging(
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
         values = redact_watermark_secrets(
-            {f.name: getattr(data, f.name) for f in fields}
+            {f.name: getattr(data, f.name) for f in fields if f.name not in skip_names}
         )
         return {
             f.name: _transform_data_for_logging(values[f.name], max_length)
