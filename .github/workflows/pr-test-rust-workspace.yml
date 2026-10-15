@@ -85,7 +85,7 @@ jobs:
       - name: Install CPU torch
         run: |
           TORCH_VERSION=$(grep -oE '"torch==[0-9.]+"' python/pyproject.toml | head -1 | tr -d '"' | cut -d= -f3)
-          python -m pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/test/cpu
 
       - name: Install Rust toolchain
         run: bash scripts/ci/utils/install_rustup.sh

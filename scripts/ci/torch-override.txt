@@ -1,0 +1,3 @@
+# Published sglang-kernel==0.4.9 and sgl-deep-ep==0.1.2.post1 pin torch==2.14.1; CI replaces that kernel anyway.
+# Remove once the pinned sglang-kernel and sgl-deep-ep pin this torch.
+torch==2.15.0
