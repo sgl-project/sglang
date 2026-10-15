@@ -405,9 +405,8 @@ class DllmManager:
             return True
 
         # No request decodes in dLLM mode.
-        running_bs = 0
         if (
-            self.beam_coordinator.get_num_allocatable_reqs(running_bs) <= 0
+            not self.beam_coordinator.has_room(1, 1)
             and self.is_empty()
             and not self.enable_priority_preemption
         ):
@@ -521,12 +520,15 @@ class DllmManager:
         res = AddReqResult.CONTINUE
         # Once set, every later request must preempt to be admitted.
         is_full = False
+        # The new request rows the admitted requests take; a staging request
+        # already holds its row.
+        num_admitted_rows = sum(map(self.beam_coordinator.num_rows, adder.can_run_list))
         for req in reqs:
-            # Check if batch is full
-            running_bs = 0
-            if len(
-                adder.can_run_list
-            ) >= self.beam_coordinator.get_num_allocatable_reqs(running_bs):
+            # No request decodes in dLLM mode.
+            rows_with_req = num_admitted_rows + self.beam_coordinator.num_rows(req)
+            if not self.beam_coordinator.has_room(
+                len(adder.can_run_list) + 1, rows_with_req
+            ):
                 is_full = True
 
             # Try preemption if batch is full
@@ -543,6 +545,8 @@ class DllmManager:
                 has_chunked_req=True,
                 truncation_align_size=self.truncation_align_size,
             )
+            if adder.can_run_list and req is adder.can_run_list[-1]:
+                num_admitted_rows = rows_with_req
 
             if res != AddReqResult.CONTINUE:
                 break

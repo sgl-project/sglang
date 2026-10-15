@@ -1,5 +1,6 @@
 """What one StepPlanner admission pass admits: preemption sizes a request by
-its current prefix match."""
+its current prefix match, and the row budget counts the new request rows the
+admitted requests take, not the requests."""
 
 import unittest
 from array import array
@@ -83,6 +84,11 @@ class _Adder(PrefillAdder):
         self.new_chunked_req = None
         self.rem_chunk_tokens = None
 
+    def add_chunked_req(self, req):
+        # The final chunk: it joins and finishes chunking.
+        self.can_run_list.append(req)
+        return None
+
     def add_one_req(self, req, **kwargs):
         self.can_run_list.append(req)
         return AddReqResult.CONTINUE
@@ -135,7 +141,9 @@ class _PlannerCase(CustomTestCase):
         s.truncation_align_size = None
         s.new_token_ratio_tracker = SimpleNamespace(current=1.0)
         s.policy = SimpleNamespace(
-            calc_priority=Mock(), enable_priority_scheduling=False
+            calc_priority=Mock(),
+            enable_priority_scheduling=False,
+            shortest_prefill_chunk_limit=lambda *args: None,
         )
         s.req_to_token_pool = SimpleNamespace(available_size=lambda: self.free_rows)
         s.token_to_kv_pool_allocator = None
@@ -203,6 +211,57 @@ class TestPreemptionSizesTheMatchedRequest(_PlannerCase):
                 preempted, admitted = self._verdict(matched_before)
                 self.assertEqual(preempted, [])
                 self.assertEqual(admitted, [])
+
+
+class TestHeldRowAdmission(_PlannerCase):
+    """A request that already holds a request row (#38118, #35537) and a beam
+    candidate's member rows are counted in rows against the free rows."""
+
+    _NUM_ROWS = 4
+
+    def test_final_chunk_leaves_the_free_row_to_a_waiting_request(self):
+        for mode in ("null", "prefill"):
+            with self.subTest(mode=mode):
+                enter_scope(
+                    self,
+                    published_topology(
+                        disaggregation_mode=mode,
+                        pp_max_micro_batch_size=self._NUM_ROWS,
+                    ),
+                )
+                running = [_req("r0", holds_row=True), _req("r1", holds_row=True)]
+                final_chunk = _req("chunk", holds_row=True)
+                waiting = _req("w")
+                self.planner.core_lists.decoding = list(running)
+                self.planner.core_lists.chunked_req = final_chunk
+                self.planner.core_lists.waiting_queue = [waiting]
+                # The chunk and the running requests hold rows; one is free.
+                self.free_rows = self._NUM_ROWS - len(running) - 1
+
+                adder = self._admit()
+
+                self.assertEqual(adder.can_run_list, [final_chunk, waiting])
+
+    def test_a_session_request_holding_a_row_runs_without_a_free_one(self):
+        self.planner.core_lists.decoding = [_req("r", holds_row=True)]
+        self.planner.core_lists.waiting_queue = [_req("s", holds_row=True)]
+        self.free_rows = 0
+
+        adder = self._admit()
+
+        self.assertEqual([r.rid for r in adder.can_run_list], ["s"])
+
+    def test_a_beam_candidate_takes_a_row_per_member(self):
+        # With five free rows, a request and a 4-wide beam fit; a third does
+        # not.
+        beam = _req("beam")
+        beam.beam_group = SimpleNamespace(beam_width=4, member_rows=None)
+        self.planner.core_lists.waiting_queue = [_req("a"), beam, _req("b")]
+        self.free_rows = 5
+
+        adder = self._admit()
+
+        self.assertEqual([r.rid for r in adder.can_run_list], ["a", "beam"])
 
 
 if __name__ == "__main__":

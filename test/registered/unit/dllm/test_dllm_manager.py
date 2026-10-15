@@ -6,6 +6,7 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.manager import DllmManager
 from sglang.srt.dllm.req_state import DllmReqPhase, DllmReqState
@@ -19,6 +20,18 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_request_lists import make_request_registry
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class _RowBudget:
+    """The admission gate of BeamCoordinator with row_budget() free rows."""
+
+    num_rows = staticmethod(BeamCoordinator.num_rows)
+
+    def __init__(self, row_budget):
+        self.row_budget = row_budget
+
+    def has_room(self, num_reqs, num_rows):
+        return num_rows <= self.row_budget()
 
 
 def _manager(**deps):
@@ -55,9 +68,7 @@ def _manager(**deps):
         enable_priority_scheduling=False,
         truncation_align_size=None,
         context_len=128,
-        beam_coordinator=SimpleNamespace(
-            get_num_allocatable_reqs=lambda running_bs: 64
-        ),
+        beam_coordinator=_RowBudget(lambda: 64),
         step_builder=SimpleNamespace(
             build_extend_step=_Step, build_sampling_info=Mock()
         ),
@@ -253,11 +264,7 @@ class TestDllmManagerLists(unittest.TestCase):
         self,
     ):
         allocatable = [0]
-        manager = _manager(
-            beam_coordinator=SimpleNamespace(
-                get_num_allocatable_reqs=lambda running_bs: allocatable[0]
-            )
-        )
+        manager = _manager(beam_coordinator=_RowBudget(lambda: allocatable[0]))
 
         step, rest = manager.schedule([_req("a")])
         self.assertIsNone(step)

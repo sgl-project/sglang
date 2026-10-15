@@ -28,6 +28,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_lora,
     get_memory,
+    get_parallel,
     get_schedule,
     hicache_storage_enabled,
 )
@@ -240,12 +241,10 @@ class StepPlanner:
             return None
         if len(self.core_lists.waiting_queue) == 0:
             return "no waiting request"
-        if (
-            not self.enable_priority_preemption
-            and self.beam_coordinator.get_num_allocatable_reqs(len(running_reqs)) <= 0
-        ):
-            # Every waiting request meets the request cap before it is added;
-            # with priority preemption it may free a running request's slot.
+        if not self.enable_priority_preemption and not self._room_for_one(running_reqs):
+            # Every waiting request meets the request cap and the row budget
+            # before it is added; with priority preemption it may free a
+            # running request's row.
             return "no request slot"
         no_kv_room = self._no_kv_room.get(slot.index)
         if no_kv_room is not None:
@@ -258,6 +257,17 @@ class StepPlanner:
                 return "no KV room"
             del self._no_kv_room[slot.index]
         return None
+
+    def _room_for_one(self, running_reqs: List[Req]) -> bool:
+        """Whether one more request fits next to running_reqs. A waiting
+        request that already holds a row (a session borrow) needs no free
+        one."""
+        num_reqs = len(running_reqs) + 1
+        if self.beam_coordinator.has_room(num_reqs, 1):
+            return True
+        return self.beam_coordinator.has_room(num_reqs, 0) and any(
+            req.kv.holds_kv for req in self.core_lists.waiting_queue
+        )
 
     def get_new_batch_prefill(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
@@ -310,8 +320,9 @@ class StepPlanner:
             and self.core_lists.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
-                num_allocatable_reqs=self.beam_coordinator.get_num_allocatable_reqs(
-                    running_bs
+                num_allocatable_reqs=min(
+                    get_parallel().pp_max_micro_batch_size - running_bs,
+                    self.beam_coordinator.row_budget(),
                 ),
             )
         ):
@@ -409,6 +420,8 @@ class StepPlanner:
         # Once set, every later request must preempt to be admitted.
         is_full = False
         no_kv_room = False
+        # The new request rows the admitted requests take (see num_rows).
+        num_admitted_rows = sum(map(self.beam_coordinator.num_rows, adder.can_run_list))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.core_lists.waiting_queue:
             if get_lora().enable_lora and not self.lora_admission.can_schedule_lora_req(
@@ -425,21 +438,18 @@ class StepPlanner:
             ):
                 continue
 
-            # Preemption below shrinks the requests still decoding.
+            # Preemption below shrinks the requests still decoding and frees
+            # their rows.
             running_bs = len(running_reqs) - len(adder.preempt_list)
-            candidate_beam_width = (
-                req.beam_group.beam_width if req.beam_group is not None else None
-            )
-            if len(
-                adder.can_run_list
-            ) >= self.beam_coordinator.get_num_allocatable_reqs(
-                running_bs, candidate_beam_width
+            rows_with_req = num_admitted_rows + self.beam_coordinator.num_rows(req)
+            if not self.beam_coordinator.has_room(
+                running_bs + len(adder.can_run_list) + 1, rows_with_req
             ):
                 is_full = True
             if is_pd_prefill:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if rows_with_req > self.req_to_token_pool.available_size():
                     is_full = True
 
             if is_full and not self.enable_priority_preemption:
@@ -488,10 +498,12 @@ class StepPlanner:
 
             if get_lora().enable_lora:
                 running_loras.add(req.lora_id)
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if added:
+                num_admitted_rows = rows_with_req
 
             if res != AddReqResult.CONTINUE:
                 no_kv_room = res == AddReqResult.NO_TOKEN
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     self._revert_match(req)
                 break
