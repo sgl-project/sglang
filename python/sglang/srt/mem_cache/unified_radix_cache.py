@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_call_guard import StorageCallKind
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -1979,7 +1980,15 @@ class UnifiedRadixCache(BasePrefixCache):
             last_hash,
             prefix_keys,
         )
-        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        try:
+            _, storage_hit_count = self.cache_controller._storage_hit_query(
+                operation, call_kind=StorageCallKind.PROBE
+            )
+        except Exception:
+            # The MIN below turns this rank's miss into a miss on every rank,
+            # instead of an exception out of the scheduler loop.
+            logger.exception("HiCache storage hit probe failed; treated as a miss")
+            storage_hit_count = 0
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce_attn_groups(
             storage_hit_count_tensor, torch.distributed.ReduceOp.MIN

@@ -1129,7 +1129,9 @@ class HybridCacheController(BaseHiCacheController):
         try:
             config = self.storage_config
             for pp_rank in range(config.tp_rank, config.pp_size, config.tp_size):
-                _, rank_hit_count = self._storage_hit_query(operation, pp_rank=pp_rank)
+                _, rank_hit_count = self._storage_hit_query(
+                    operation, pp_rank=pp_rank, call_kind=StorageCallKind.PROBE
+                )
                 storage_hit_count = min(storage_hit_count, rank_hit_count)
         except Exception:
             logger.exception("PP HiCache hit query failed for req=%s.", rid)
@@ -1390,7 +1392,10 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(
-        self, operation, pp_rank: Optional[int] = None
+        self,
+        operation,
+        pp_rank: Optional[int] = None,
+        call_kind: StorageCallKind = StorageCallKind.QUERY,
     ) -> tuple[list[str], int]:
         hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
@@ -1412,7 +1417,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         if operation.pool_transfers:
             hit_result = self._bounded_storage_call(
-                StorageCallKind.QUERY,
+                call_kind,
                 lambda: self.storage_backend.batch_exists_v2(
                     hash_value, operation.pool_transfers, extra_info
                 ),
@@ -1422,7 +1427,7 @@ class HybridCacheController(BaseHiCacheController):
             )
         else:
             kv_hit_count = self._bounded_storage_call(
-                StorageCallKind.QUERY,
+                call_kind,
                 lambda: self.storage_backend.batch_exists(hash_value, extra_info),
                 miss=lambda: 0,
                 op="batch_exists",

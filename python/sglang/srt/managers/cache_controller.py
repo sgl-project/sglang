@@ -577,6 +577,11 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        # Validated before any side effect: a bad value fails the attach with
+        # the controller untouched.
+        storage_call_timeouts = StorageCallTimeouts.pop_from_extra_config(
+            storage_backend_extra_config
+        )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -593,9 +598,6 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
-        storage_call_timeouts = StorageCallTimeouts.pop_from_extra_config(
-            storage_backend_extra_config
-        )
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
@@ -1311,7 +1313,12 @@ class HiCacheController:
         """Roll back a hit-sized host bounce before transfer ownership moves."""
         self.mem_pool_host.free(host_indices)
 
-    def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+    def _storage_hit_query(
+        self, operation, call_kind: StorageCallKind = StorageCallKind.QUERY
+    ) -> tuple[list[str], int]:
+        """Existence query for ``operation``; ``call_kind`` is the guard lane of
+        the calling thread (QUERY on the prefetch worker, PROBE on the
+        scheduler thread, which may run concurrently with it)."""
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys
@@ -1327,7 +1334,7 @@ class HiCacheController:
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self._bounded_storage_call(
-                StorageCallKind.QUERY,
+                call_kind,
                 lambda: self.storage_backend.batch_exists(batch_hashes, extra_info),
                 miss=lambda: 0,
                 op="batch_exists",
