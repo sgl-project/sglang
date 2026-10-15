@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 from array import array
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
@@ -28,11 +29,24 @@ from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
+
+
+class HeldKv(NamedTuple):
+    """The KV and slot a released request leaves to the pending step that may
+    still write them, freed at that step's host commit. ``kv`` is the request's
+    record as it was released; the rows from ``held_from`` (page-aligned) on
+    and the slot are held."""
+
+    kv: ReqKvInfo
+    held_from: int
+    # Row ranges, each freed by its own free_kv_row call as release_kv_cache
+    # would have.
+    row_frees: tuple[tuple[int, int], ...]
 
 
 class RetractionBackup(NamedTuple):
@@ -377,9 +391,21 @@ def discard_kv_cache_backup(
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    *,
+    checkpoint: bool,
+    hold: Optional[Callable[[HeldKv], None]] = None,
+):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
-    what it can key."""
+    what it can key.
+
+    ``hold`` is given when a pending step may still write the request's KV:
+    its forward writes from the committed length on (the next token, a draft)
+    and its slot. Those pages and the slot are handed to ``hold`` instead of
+    the pools, and free_held_kv frees them once the step commits; the tree
+    insert, the unlock and every page below them go now."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -409,24 +435,87 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
         tree_cache.checkpoint(req, up_to=owned_kv_len)
+    overallocated = _overallocated_range(
+        req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
+    )
+    if hold is not None:
+        _hold_kv(req, tree_cache, owned_kv_len, overallocated, checkpoint, hold)
+        return
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unlock(req.lock)
     req.lock = None
-    _release_overallocated_kv_indices(
-        req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
-    )
+    start_p, end_p = overallocated
+    if start_p < end_p:
+        # start_p is aligned to the allocator's page, so it never shares a
+        # page with the tail free_kv_row above.
+        tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
     tree_cache.on_release(req, checkpointed=checkpoint)
 
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
-    tree_cache.req_to_token_pool.free(req)
+    free_req_slot(tree_cache.req_to_token_pool, req)
     req.kv.mark_kv_released()
 
 
-def _release_overallocated_kv_indices(
-    req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
+def _hold_kv(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    owned_kv_len: int,
+    overallocated: tuple[int, int],
+    checkpointed: bool,
+    hold: Callable[[HeldKv], None],
 ) -> None:
+    """release_kv_cache's tail with a pending step still writing the row: the
+    pages below the committed length go now, the rest and the slot are held."""
+    kv = req.kv
+    page_size = tree_cache.token_to_kv_pool_allocator.page_size
+    held_from = max(
+        kv.cache_protected_len,
+        min(owned_kv_len, kv.kv_committed_len // page_size * page_size),
+    )
+    tree_cache.free_kv_row(kv, [(kv.cache_protected_len, held_from)])
+    tree_cache.unlock(req.lock)
+    req.lock = None
+    held = HeldKv(
+        kv=dataclasses.replace(
+            kv, component_evicted_seqlens=dict(kv.component_evicted_seqlens)
+        ),
+        held_from=held_from,
+        row_frees=((held_from, owned_kv_len), overallocated),
+    )
+    tree_cache.on_release(req, checkpointed=checkpointed)
+    # The request leaves its row and penalty row to the held record.
+    kv.req_pool_idx = None
+    kv.penalty_row = None
+    kv.mark_kv_released()
+    hold(held)
+
+
+def free_held_kv(held: HeldKv, tree_cache: BasePrefixCache) -> None:
+    """Free what release_kv_cache held for a pending step, once it commits."""
+    for start, end in held.row_frees:
+        if start < end:
+            tree_cache.free_kv_row(held.kv, [(start, end)])
+    free_req_slot(tree_cache.req_to_token_pool, _HeldRow(held.kv))
+
+
+class _HeldRow(NamedTuple):
+    # The slot holder free_req_slot and the pool's free() take.
+    kv: ReqKvInfo
+
+
+def free_req_slot(req_to_token_pool: ReqToTokenPool, holder: Any) -> None:
+    """Free the slot of `holder` (a request or a session slot) and the
+    penalty row its kv record holds."""
+    if holder.kv.penalty_row is not None:
+        holder.kv.penalty_row.store.free(holder.kv)
+    req_to_token_pool.free(holder)
+
+
+def _overallocated_range(
+    req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
+) -> tuple[int, int]:
     allocator = tree_cache.token_to_kv_pool_allocator
     page_size = allocator.page_size
     spec_algo = get_spec().speculative_algorithm
@@ -455,11 +544,7 @@ def _release_overallocated_kv_indices(
     # head rows are still live.
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
-
-    if start_p < end_p:
-        # start_p is aligned to the allocator's page above, so it never shares a
-        # page with the tail free_kv_row in this group.
-        tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
+    return start_p, end_p
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

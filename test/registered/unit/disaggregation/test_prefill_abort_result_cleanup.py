@@ -21,6 +21,7 @@ from sglang.test.disagg_owner_shells import (
     prefill_owner_shell,
     result_processor_shell,
 )
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -47,6 +48,8 @@ class _Req:
         self.grammar = None
         self.output_ids = []
         self.origin_input_ids = list(range(100))
+        self.session = None
+        self.media_released = 0
         self.extend_end = None
         self.time_stats = SimpleNamespace(
             set_prefill_finished_time=Mock(),
@@ -57,16 +60,21 @@ class _Req:
     def finished(self):
         return self.finished_reason is not None
 
+    def release_mm_inputs_on_abort(self):
+        self.media_released += 1
+
     def update_finish_state(self):
         self.finished_reason = self.to_finish
         self.to_finish = None
 
 
 def _owner():
+    tree_cache = Mock()
     return prefill_owner_shell(
         batch_result_processor=result_processor_shell(),
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
-        tree_cache=Mock(),
+        tree_cache=tree_cache,
+        request_retirer=make_request_retirer(kv=SimpleNamespace(tree_cache=tree_cache)),
         pending_chunk_rids={"aborted-prefill"},
         req_to_metadata_buffer_idx_allocator=Mock(),
         send_kv_chunk=Mock(),
@@ -97,7 +105,10 @@ def _free_req(req, _tree_cache, *, checkpoint):
     req.kv.mamba_pool_idx = None
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch(
+    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+    side_effect=_free_req,
+)
 @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
 def test_aborted_final_result_releases_hybrid_cache(
     checkpoint_kv_cache, release_kv_cache
@@ -126,7 +137,10 @@ def test_aborted_final_result_releases_hybrid_cache(
     assert req.rid not in owner.kv_senders
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch(
+    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+    side_effect=_free_req,
+)
 def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     owner = _owner()
     req = _Req()
@@ -139,7 +153,10 @@ def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     owner.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch(
+    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+    side_effect=_free_req,
+)
 def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     owner = _owner()
     req = _Req()
@@ -162,7 +179,7 @@ def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     owner.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache")
+@patch("sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache")
 def test_delayed_result_ignores_already_retired_request(release_kv_cache):
     owner = _owner()
     req = _Req(allocated=False)
@@ -175,7 +192,10 @@ def test_delayed_result_ignores_already_retired_request(release_kv_cache):
     owner.output_streamer.stream_output.assert_not_called()
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch(
+    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+    side_effect=_free_req,
+)
 def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     owner = _owner()
     req = _Req()
@@ -190,7 +210,10 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     assert req.finished()
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch(
+    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+    side_effect=_free_req,
+)
 @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
 def test_grammar_rejection_retires_prefill_before_transfer(
     checkpoint_kv_cache, release_kv_cache
@@ -232,7 +255,10 @@ def test_aborted_result_releases_mamba_allocated_before_kv():
     owner.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch(
+    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+    side_effect=_free_req,
+)
 def test_failed_kv_load_is_aborted_instead_of_sent_to_decode(release_kv_cache):
     owner = _owner()
     req = _Req()
@@ -261,7 +287,10 @@ def test_failed_kv_load_is_aborted_instead_of_sent_to_decode(release_kv_cache):
         (SamplingMaskStatus.INVALID, 500, "InternalServerError"),
     ],
 )
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch(
+    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+    side_effect=_free_req,
+)
 def test_sampling_mask_abort_preserves_error_and_releases_once(
     release_kv_cache, status, http_status, err_type, transport_error
 ):
@@ -351,7 +380,10 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertTrue(req.disagg.pending_bootstrap)
         owner.send_kv_chunk.assert_not_called()
 
-    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    @patch(
+        "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+        side_effect=_free_req,
+    )
     def test_aborted_final_result_never_publishes_ready(self, release):
         owner = _owner()
         req = _Req()

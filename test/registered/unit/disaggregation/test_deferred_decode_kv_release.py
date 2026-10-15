@@ -10,7 +10,7 @@ destinations may also release on timeout; host destinations require the ack.
 
 import threading
 import unittest
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, call, patch
 
@@ -28,11 +28,10 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.managers.scheduler_components import (
-    batch_result_processor as batch_result_processor_mod,
+    request_retirer as request_retirer_mod,
 )
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
-    SchedulerBatchResultProcessor,
-)
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
 from sglang.test.test_utils import CustomTestCase
@@ -673,7 +672,7 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.enable_staging = False
     q.staging_handler = None
     q.tree_cache = object()
-    q.batch_result_processor = SimpleNamespace(release_finished_req=tree_release(q))
+    q.request_retirer = SimpleNamespace(retire_finished=tree_release(q))
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.metrics_sink = SimpleNamespace(enable_metrics=enable_metrics)
@@ -725,7 +724,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             q._defer_release(entry)
         with (
             patch.object(decode_mod, "discard_kv_cache_backup") as discard,
-            patch.object(decode_mod, "release_kv_cache") as device_release,
+            patch.object(request_retirer_mod, "release_kv_cache") as device_release,
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.all_reduce") as reduce,
         ):
@@ -747,7 +746,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
     def test_noop_when_nothing_deferred(self):
         q = _make_queue()
-        with patch.object(decode_mod, "release_kv_cache") as rel:
+        with patch.object(request_retirer_mod, "release_kv_cache") as rel:
             q.owner.resolve_deferred_releases()
         rel.assert_not_called()
 
@@ -764,7 +763,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             decode_mod.time, "monotonic", side_effect=[10.0, 11.0, 12.0, 13.0]
         ):
             q._defer_release(dreq)
-            with patch.object(decode_mod, "release_kv_cache") as rel:
+            with patch.object(request_retirer_mod, "release_kv_cache") as rel:
                 # Not yet acked -> held, not released.
                 q.owner.resolve_deferred_releases()
                 rel.assert_not_called()
@@ -805,7 +804,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=42.0),
-            patch.object(decode_mod, "release_kv_cache") as rel,
+            patch.object(request_retirer_mod, "release_kv_cache") as rel,
         ):
             q.owner.resolve_deferred_releases()
             rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
@@ -827,7 +826,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=20.0),
-            patch.object(decode_mod, "release_kv_cache") as rel,
+            patch.object(request_retirer_mod, "release_kv_cache") as rel,
         ):
             q.owner.resolve_deferred_releases()
 
@@ -855,7 +854,9 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=40.0),
-            patch.object(decode_mod, "release_kv_cache", side_effect=fake_release),
+            patch.object(
+                request_retirer_mod, "release_kv_cache", side_effect=fake_release
+            ),
         ):
             q.owner.resolve_deferred_releases()  # must not raise
             # The good one still released despite the bad one throwing.
@@ -883,7 +884,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         _hold(q, retry, start_time=11.0, deadline=float("inf"))
         mgr.note_abort_ack(501, 0, mgr.register_deferred_abort_room(501))
 
-        with patch.object(decode_mod, "release_kv_cache") as rel:
+        with patch.object(request_retirer_mod, "release_kv_cache") as rel:
             q.owner.resolve_deferred_releases()
 
         rel.assert_called_once_with(retry.req, q.tree_cache, checkpoint=False)
@@ -1042,17 +1043,17 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         q = _make_pop_queue(mgr)
         q.enable_hisparse = True
         q.hisparse_coordinator = _FakeHiSparse({5: [100, 101]})
-        q.batch_result_processor = SimpleNamespace(
-            release_finished_req=MethodType(
-                SchedulerBatchResultProcessor.release_finished_req,
-                SimpleNamespace(
-                    hisparse_coordinator=q.hisparse_coordinator,
-                    kv=SimpleNamespace(tree_cache=q.tree_cache),
-                ),
-            )
+        q.request_retirer = RequestRetirer(
+            kv=SimpleNamespace(tree_cache=q.tree_cache),
+            beam_coordinator=None,
+            hisparse_coordinator=q.hisparse_coordinator,
+            decode_offload_manager=None,
+            pending=PendingSteps(),
+            output_streamer=None,
+            ipc_channels=None,
         )
         entry = _make_failed_req(mgr, room=11, idx=2, abort_notified=False)
-        entry.req.kv = SimpleNamespace(req_pool_idx=5)
+        entry.req.kv = SimpleNamespace(req_pool_idx=5, holds_kv=True)
         q.queue = [entry]
         return mgr, q, entry
 
@@ -1066,7 +1067,7 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         room = entry.req.bootstrap_room
         generation = mgr.register_deferred_abort_room(room)
 
-        with patch.object(batch_result_processor_mod, "release_kv_cache") as rel:
+        with patch.object(request_retirer_mod, "release_kv_cache") as rel:
             self._pop(q)
             self.assertEqual(len(q._deferred_releases), 1)
             self.assertTrue(hs.holds_rows(entry.req))
@@ -1090,7 +1091,7 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         _, q, entry = self._make(deferred=False)
         hs = q.hisparse_coordinator
 
-        with patch.object(batch_result_processor_mod, "release_kv_cache") as rel:
+        with patch.object(request_retirer_mod, "release_kv_cache") as rel:
             self._pop(q)
             rel.assert_called_once()
 

@@ -1,5 +1,5 @@
 """
-Unit tests for _release_finished_req in DecodeKVCacheOffloadManager.
+Unit tests for the decode KV offload release (RequestRetirer.retire_offloaded).
 
 Verifies that over-allocated KV cache slots (from speculative decoding v2)
 are correctly freed when a request finishes, preventing GPU memory leaks.
@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -133,13 +134,27 @@ def _make_manager(pool_size: int, page_size: int = 1):
     return manager, freed_indices
 
 
+def _retirer(manager):
+    return make_request_retirer(
+        kv=SimpleNamespace(
+            tree_cache=manager.tree_cache,
+            req_to_token_pool=manager.req_to_token_pool,
+        ),
+        decode_offload_manager=manager,
+    )
+
+
+def _retire_offloaded(manager, req):
+    _retirer(manager).retire_offloaded(req)
+
+
 class _FinishedEvent:
     def synchronize(self):
         pass
 
 
 class TestReleaseFinishedReq(unittest.TestCase):
-    """Tests for _release_finished_req overallocation cleanup."""
+    """Tests for RequestRetirer.retire_offloaded overallocation cleanup."""
 
     def test_decode_offload_hash_chain_matches_prefill(self):
         """Decode pages must keep the prefill namespace across offload chunks."""
@@ -172,7 +187,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             origin_len=8,
         )
 
-        manager._release_finished_req(req)
+        _retire_offloaded(manager, req)
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
@@ -188,7 +203,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             origin_len=8,
         )
 
-        manager._release_finished_req(req)
+        _retire_offloaded(manager, req)
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
@@ -205,7 +220,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             origin_len=4,
         )
 
-        manager._release_finished_req(req)
+        _retire_offloaded(manager, req)
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
@@ -222,7 +237,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         req.kv.cache_protected_len = 5
         lock = req.lock
 
-        manager._release_finished_req(req)
+        _retire_offloaded(manager, req)
 
         manager.tree_cache.unlock.assert_called_once_with(lock)
         self.assertIsNone(req.lock)
@@ -230,7 +245,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
     def test_release_finished_req_frees_prefill_and_pops_state(self):
         """
-        _release_finished_req frees the prefill-aligned slots in addition to
+        retire_offloaded frees the prefill-aligned slots in addition to
         the committed range; freeing them mid-decode instead races with
         concurrent admission and cross-pollinates KV reads.
         """
@@ -244,11 +259,11 @@ class TestReleaseFinishedReq(unittest.TestCase):
         )
         req.disagg.offload = OffloadedState(inc_len=4)
 
-        manager._release_finished_req(req)
+        _retire_offloaded(manager, req)
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
-        # The offload state is dropped at the end of _release_finished_req.
+        # The offload state is dropped at the end of retire_offloaded.
         self.assertIsNone(req.disagg.offload)
 
     def test_release_finished_req_skips_prefill_free_when_prompt_below_page(self):
@@ -265,7 +280,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             origin_len=3,  # 3 // 4 * 4 == 0
         )
 
-        manager._release_finished_req(req)
+        _retire_offloaded(manager, req)
 
         # Only the committed range [0:10] is freed.
         self.assertEqual(len(freed), 1)
@@ -273,9 +288,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
     def test_finalize_release_frees_prefill_without_prior_state(self):
         """
-        finalize_release_on_finish handles the case where no incremental
+        retire_offloaded handles the case where no incremental
         offload ever ran: the prefill-aligned slots must still be freed by
-        the consolidated free site in _release_finished_req.
+        its consolidated free site.
         """
         manager, freed = _make_manager(pool_size=32, page_size=4)
         req = _make_mock_req(
@@ -286,7 +301,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             origin_len=12,  # prefill_len = 12 // 4 * 4 = 12
         )
 
-        manager.finalize_release_on_finish(req)
+        _retire_offloaded(manager, req)
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 13, dtype=torch.int64)))
@@ -422,6 +437,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager._trigger_backup = MagicMock()
         # Both releasing under one rid, the new one first: the ack id decides.
         released = manager._check_offload_progress(1, [new_req, old_req])
+        for released_req in released:
+            _retire_offloaded(manager, released_req)
 
         self.assertEqual(released, [old_req])
         self.assertIsNone(old_req.disagg.offload)
@@ -436,7 +453,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         )
         _in_flight(manager, req, 1)
 
-        manager.finalize_release_on_finish(req)
+        _retire_offloaded(manager, req)
 
         self.assertEqual(freed, [])
         manager.req_to_token_pool.free.assert_not_called()
@@ -482,6 +499,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager._trigger_backup = MagicMock()
 
         self.assertEqual(manager._check_offload_progress(1, [req]), [req])
+        _retire_offloaded(manager, req)
 
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
@@ -516,7 +534,10 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 manager.req_to_token_pool.free.side_effect = lambda req: setattr(
                     req.kv, "req_pool_idx", None
                 )
-                processor = SimpleNamespace(decode_offload_manager=manager)
+                processor = SimpleNamespace(
+                    decode_offload_manager=manager,
+                    request_retirer=_retirer(manager),
+                )
                 if inflight:
                     _in_flight(manager, req, 1)
                     manager.cache_controller = MagicMock()
@@ -537,10 +558,11 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                     self.assertEqual(freed, [])
                     self.assertEqual(req.kv.req_pool_idx, 0)
                     self.assertEqual(manager._check_offload_progress(1, [req]), [req])
+                    _retire_offloaded(manager, req)
                 self.assertEqual(len(freed), 1)
                 self.assertTrue(torch.equal(freed[0], torch.arange(20)))
                 self.assertIsNone(req.kv.req_pool_idx)
-                manager.finalize_release_on_finish(req)
+                _retire_offloaded(manager, req)
                 self.assertEqual(len(freed), 1)
 
 

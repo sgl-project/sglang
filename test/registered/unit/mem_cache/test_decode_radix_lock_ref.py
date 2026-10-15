@@ -505,8 +505,10 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_tail_len = MagicMock(return_value=8)
         queue._prealloc_required_tokens = MagicMock(return_value=(8, 8))
-        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(8, 8))
-        queue._swa_tail_allocatable_token_budget = MagicMock(return_value=8)
+        # The snapshot admits the request; the refresh after the lock does not.
+        queue._swa_aware_allocatable_token_budgets = MagicMock(
+            side_effect=[(8, 8), (3, 8)]
+        )
         queue._match_prefix_and_lock = MagicMock(
             return_value=DecodePrefixMatch(
                 prefix_indices=torch.arange(4, dtype=torch.int64),
@@ -553,8 +555,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         # Admission rejection must release the matched-node lock, including
         # when the SWA lock was already released for fresh tail allocation.
-        queue._allocatable_token_budgets = MagicMock(return_value=3)
-
         preallocated, failed = queue.pop_preallocated(running_batch.reqs)
 
         self.assertEqual(preallocated, [])
@@ -570,7 +570,80 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         self.assertEqual(lock_calls, ["release_swa", "unlock"])
         self.assertIsNone(req.lock)
         queue._swa_tail_len.assert_called_with(8)
-        queue._allocatable_token_budgets.assert_called_once()
+        self.assertEqual(queue._swa_aware_allocatable_token_budgets.call_count, 2)
+
+    def test_pop_preallocated_rechecks_swa_budget_after_lock_without_tail(self):
+        # An allocator that prices prealloc after reclaim keeps an SWA budget
+        # even without SWA tail prealloc (e.g. a unified pool with page_size 1).
+        # The prefix match keeps its SWA lock there, so the SWA budget the
+        # admission check sees must be taken after the lock.
+        req = MagicMock()
+        req.rid = "req-1"
+        req.origin_input_ids = list(range(8))
+        req.output_ids = [99]
+        req.last_node = object()
+        req.finished_reason = None
+        req.lock = None
+        req.disagg = DisaggReqState()
+        req.sampling_params.max_new_tokens = 16
+        decode_req = MagicMock(req=req, waiting_for_input=True, is_rebootstrap=False)
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 0
+        queue.sliding_window_size = 16
+        queue.enable_hisparse = False
+        queue.enable_decode_hicache = False
+        queue.enable_priority_scheduling = False
+        queue.enable_lora = False
+        queue.get_ready = lambda: []
+        queue.transfer_queue = MagicMock(queue=[], enable_staging=False)
+        queue.req_to_token_pool = MagicMock(mamba_allocator=None)
+        queue.req_to_token_pool.available_size.return_value = 1
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=1000)
+        queue._prealloc_reservation_fits = MagicMock(return_value=False)
+
+        allocator = MagicMock(page_size=1, size_full=1000, size_swa=1000)
+        bind_separate_buffer_capacity(allocator)
+        allocator.prealloc_fits_assumes_reclaim = lambda: True
+        allocator.swa_available_size.return_value = 100
+        queue.token_to_kv_pool_allocator = allocator
+
+        swa_evictable = 40
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.swa_evictable_size.side_effect = lambda: swa_evictable
+
+        def match_prefix_and_lock(_req):
+            nonlocal swa_evictable
+            swa_evictable -= 30  # the matched prefix is no longer evictable
+            return DecodePrefixMatch(
+                prefix_indices=torch.arange(4, dtype=torch.int64),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=0,
+                last_device_node=req.last_node,
+            )
+
+        queue._match_prefix_and_lock = match_prefix_and_lock
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=True
+            ),
+        )
+
+        preallocated, failed = queue.pop_preallocated([])
+
+        self.assertEqual((preallocated, failed), ([], []))
+        fits_budgets = queue._prealloc_reservation_fits.call_args.kwargs
+        self.assertEqual(fits_budgets["swa_allocatable_tokens"], 100 + 10)
 
     def test_hicache_restore_commit_hands_over_lock(self):
         """The commit releases the prealloc lock and hands the restored lock to

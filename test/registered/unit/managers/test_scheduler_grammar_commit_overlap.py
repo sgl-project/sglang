@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -102,6 +103,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
         s.flags._engine_paused = False
         s._sched_idled = False
         s.pending = PendingSteps()
+        s.request_retirer = make_request_retirer(pending=s.pending)
         s.require_mlp_sync = False
         s.spec_algorithm = SpeculativeAlgorithm.EAGLE
         s.recv_skipper = None
@@ -118,7 +120,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
             commit_pending_grammar(s.pending)
             return results[step.forward_iter]
 
-        def process_batch_result(step, result, slot):
+        def process_batch_result(step, result):
             events.append(("commit", step.forward_iter))
             # The host commit runs the step's grammar commit if not done yet.
             advance_grammar_fsm(result, step)

@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -94,8 +94,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched.tree_cache = None
         sched.ipc_channels = Mock()
 
-        with patch("sglang.srt.managers.scheduler.release_kv_cache"):
-            sched.process_pending_chunked_abort()
+        sched.process_pending_chunked_abort()
 
         self.assertEqual(req.finished_reason.status_code, 503)
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args

@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import get_context
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
@@ -55,6 +56,9 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     request_retirer=RequestRetirer(
                         kv=MagicMock(),
                         beam_coordinator=MagicMock(),
+                        hisparse_coordinator=None,
+                        decode_offload_manager=None,
+                        pending=PendingSteps(),
                         output_streamer=output_streamer,
                         ipc_channels=MagicMock(),
                     ),

@@ -98,13 +98,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     TreeLock,
 )
-from sglang.srt.mem_cache.common import (
-    RetractionBackup,
-    backup_kv_cache,
-    evict_from_tree_cache,
-    match_kv_cache,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import RetractionBackup, match_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
@@ -128,6 +122,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.sampling.penalties import PenaltyRow
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -141,8 +136,10 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.req_state import DisaggReqState
     from sglang.srt.dllm.req_state import DllmReqState
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -940,6 +937,10 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
+
+    # Penalty history row, from PenaltyStore.alloc until the slot is freed
+    # (free_req_slot).
+    penalty_row: Optional[PenaltyRow] = None
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
@@ -2276,61 +2277,16 @@ def set_mamba_track_indices_from_reqs(
         batch.mamba_track_indices[untracked_rows] = -1
 
 
-def release_req(
-    *,
-    req: Req,
-    remaing_req_count: int,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
-    offload_kv: bool = True,
-) -> bool:
-    """Returns False when the KV backup failed and the request cannot be resumed."""
-    if hisparse_coordinator is not None and not req.finished():
-        hisparse_coordinator.retract_req(req)
-
-    # In decode disaggregation the retracted KV is offloaded to host so it can be
-    # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
-    # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
-    # pass offload_kv=False to skip the wasteful device->host copy.
-    backup_saved = True
-    # The config bag reflects role flips; server_args keeps the launch role.
-    if get_disagg().disaggregation_mode == "decode" and offload_kv:
-        backup_saved = backup_kv_cache(
-            req,
-            tree_cache,
-            req_to_token_pool,
-            token_to_kv_pool_allocator,
-            get_disagg().disaggregation_decode_retraction_backup,
-        )
-    # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, checkpoint=False)
-    # NOTE(lsyin): we should use the newly evictable memory instantly.
-    num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-    evict_from_tree_cache(tree_cache, num_tokens)
-
-    req.reset_for_retract()
-    return backup_saved
-
-
 def retract_all(
     *,
     reqs: List[Req],
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
+    request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> None:
     for idx in range(len(reqs)):
-        release_req(
-            req=reqs[idx],
-            remaing_req_count=len(reqs) - idx,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            hisparse_coordinator=hisparse_coordinator,
+        request_retirer.retract(
+            reqs[idx],
+            num_remaining_reqs=len(reqs) - idx,
             offload_kv=offload_kv,
         )
 
@@ -2400,10 +2356,10 @@ def check_decode_mem(
 def retract_decode(
     reqs: List[Req],
     *,
+    request_retirer: RequestRetirer,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
     spec_algorithm: SpeculativeAlgorithm,
 ) -> Tuple[List[Req], List[Req], List[Req]]:
     """Release decoding requests until the rest fit one decode step.
@@ -2422,14 +2378,8 @@ def retract_decode(
         )
 
     def release(req: Req, remaining: int, offload_kv: bool = True) -> bool:
-        return release_req(
-            req=req,
-            remaing_req_count=remaining,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            hisparse_coordinator=hisparse_coordinator,
-            offload_kv=offload_kv,
+        return request_retirer.retract(
+            req, num_remaining_reqs=remaining, offload_kv=offload_kv
         )
 
     retracted_reqs = []
@@ -2444,7 +2394,7 @@ def retract_decode(
         idx = sorted_indices.pop()
         req = reqs[idx]
         if req.beam_group is not None:
-            # Free member rows before release_req: they need the leader's kv
+            # Free member rows before the retraction: they need the leader's kv
             # info, which still carries the lockstep allocated length.
             req.to_finish = FINISH_ABORT(
                 "Beam search group aborted: KV cache pool is full. Beam "
@@ -2602,12 +2552,10 @@ def req_pool_indices_of(
 class DecodeRows:
     """The inputs a decode step takes from its requests alone: their slots and
     their sampling params. Consecutive decode steps share them while the same
-    requests stay in the same order, each in the same slot and penalty row."""
+    requests stay in the same order, each in the same slot."""
 
     reqs: List[Req]
     slots: List[int]
-    # PenaltyStore row of each slot, None for a request without penalties.
-    penalty_rows: List[Optional[int]]
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     sampling_info: SamplingBatchInfo

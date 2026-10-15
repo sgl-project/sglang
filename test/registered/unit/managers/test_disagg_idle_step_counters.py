@@ -31,6 +31,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import (
     CustomTestCase,
     enter_scope,
@@ -270,7 +271,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         return PendingStep(
             step=self.make_batch(mode, forward_iter, **kwargs),
             result=GenerationBatchResult(),
-            slot=ScheduleSlot(),
             launch_ts=launch_ts,
             after_idle_gap=False,
         )
@@ -311,7 +311,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             copy_events.append(copy_done)
             return GenerationBatchResult(copy_done=copy_done)
 
-        def process_batch_result(batch, result, slot):
+        def process_batch_result(batch, result):
             clock[0] = RESULT_TIMESTAMPS[batch.forward_iter - 1]
 
         step_counters = scheduler.step_counters
@@ -427,6 +427,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         launcher.launch_batch_sample_if_needed = Mock()
         scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
+        scheduler.request_retirer = make_request_retirer(pending=scheduler.pending)
         scheduler.recv_skipper = None
         scheduler.lists.chunked_req = None
         scheduler.lists.waiting_queue = []

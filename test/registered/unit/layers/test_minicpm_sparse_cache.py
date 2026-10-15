@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -198,6 +199,7 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         counters=LaunchCounters(),
         core_lists=CoreLists(),
+        pending=PendingSteps(),
         scheduler_stage_metrics=None,
     )
 
@@ -289,6 +291,7 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         ),
         counters=LaunchCounters(),
         core_lists=CoreLists(),
+        pending=PendingSteps(),
         scheduler_stage_metrics=None,
     )
 

@@ -39,6 +39,7 @@ from sglang.srt.speculative.spec_utils import (
     spec_prepare_for_decode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_retirer
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -91,15 +92,16 @@ def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
     metrics_sink = MagicMock()
     metrics_sink.num_generated_tokens = 0
     metrics_sink.forward_ct_decode = 0
+    kv = SimpleNamespace(
+        token_to_kv_pool_allocator=MagicMock(),
+        tree_cache=tree_cache or SimpleNamespace(page_size=TRACK_INTERVAL),
+        req_to_token_pool=None,
+    )
     return SchedulerBatchResultProcessor(
         is_generation=True,
         enable_overlap=True,
         model_config=SimpleNamespace(think_end_ids=None),
-        kv=SimpleNamespace(
-            token_to_kv_pool_allocator=MagicMock(),
-            tree_cache=tree_cache or SimpleNamespace(page_size=TRACK_INTERVAL),
-            req_to_token_pool=None,
-        ),
+        kv=kv,
         services=SimpleNamespace(
             metrics_sink=metrics_sink,
             output_streamer=MagicMock(),
@@ -112,6 +114,7 @@ def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
         model_worker=MagicMock(),
         logprob_result_processor=None,
         pending=PendingSteps(),
+        request_retirer=make_request_retirer(kv=kv),
     )
 
 
@@ -153,6 +156,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         scheduler.flags._engine_paused = False
         scheduler._sched_idled = False
         scheduler.pending = PendingSteps()
+        scheduler.request_retirer = make_request_retirer(pending=scheduler.pending)
         scheduler.recv_skipper = None
         scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
@@ -187,7 +191,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         scheduler.get_next_batch_to_run = get_next_batch_to_run
         state_at_commit = []
 
-        def process_batch_result(result_batch, batch_result, slot):
+        def process_batch_result(result_batch, batch_result):
             state_at_commit.append(
                 (req.kv.mamba_next_track_idx, req.kv.mamba_last_track_seqlen)
             )
@@ -272,7 +276,7 @@ class TestMambaSpecBoundaryCommit(unittest.TestCase):
             ),
             patch(
                 "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.release_kv_cache"
+                "request_retirer.release_kv_cache"
             ),
             patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
         ):
@@ -429,14 +433,12 @@ class TestMambaLazyFinishDonation(unittest.TestCase):
                 PendingStep(
                     step=pending_step,
                     result=None,
-                    slot=ScheduleSlot(),
                     launch_ts=0.0,
                     after_idle_gap=False,
                 )
             )
         with patch(
-            "sglang.srt.managers.scheduler_components."
-            "batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor._handle_finish_state_updated_req(
                 req, step, result, 0, LogitsProcessorOutput(next_token_logits=None)
@@ -529,7 +531,6 @@ class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
             PendingStep(
                 step=decode_step,
                 result=None,
-                slot=ScheduleSlot(),
                 launch_ts=0.0,
                 after_idle_gap=False,
             )
@@ -561,7 +562,7 @@ class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
             _lazy_overrides(),
             patch(
                 "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.release_kv_cache"
+                "request_retirer.release_kv_cache"
             ) as release,
         ):
             processor.process_batch_result_prefill(prefill_step, result)
