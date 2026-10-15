@@ -1,7 +1,7 @@
 // Image-only FLUX.3 diffusion command builder. Consumed by _deployment.jsx.
 
 export const config = (() => {
-const modelOf = (s) => s.model === "distilled"
+const modelOf = (s) => s.variant === "distilled"
   ? "black-forest-labs/flux-3-image-klein"
   : "black-forest-labs/flux-3-image-klein-base";
 const hardware = [
@@ -31,7 +31,7 @@ return {
       ],
     },
     {
-      id: "model",
+      id: "variant",
       title: "Model",
       scope: "serve",
       description:
@@ -48,7 +48,7 @@ return {
       ],
     },
     {
-      id: "precision",
+      id: "quant",
       title: "Precision",
       scope: "serve",
       description:
@@ -147,7 +147,7 @@ return {
       title: "Sampling",
       scope: "request",
       // The distilled flow map takes its 16 steps from the package and has no CFG.
-      showWhen: (s) => s.model !== "distilled",
+      showWhen: (s) => s.variant !== "distilled",
       default: "quality",
       options: [
         { id: "quality", label: "Quality · 50-step, CFG 3.5", flags: [], recommended: true },
@@ -223,7 +223,7 @@ return {
       const parallel = [];
       if (gpus > 1) parallel.push(`--num-gpus ${gpus}`, `--tp-size ${topology.tp_size}`);
       if (topology.ulysses_degree > 1) parallel.push(`--ulysses-degree ${topology.ulysses_degree}`);
-      if (s.precision !== "bf16") parallel.push(`--model-variant ${s.precision}`);
+      if (s.quant !== "bf16") parallel.push(`--model-variant ${s.quant}`);
       if (Number(s.batch_size) > 1) {
         parallel.push(`--batching-max-size ${Number(s.batch_size)}`, `--batching-delay-ms ${Number(s.batch_delay) || 0}`);
       }
@@ -260,7 +260,11 @@ return {
     },
   },
 
-  modelNames: { default: modelOf({ model: "base" }) },
+  modelNames: {
+    ...Object.fromEntries(["base", "distilled"].flatMap((variant) =>
+      ["bf16", "fp8r", "nvfp4"].map((quant) => [`${variant}|${quant}`, modelOf({ variant })]))),
+    default: modelOf({ variant: "base" }),
+  },
   placeholders: {
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30010" },
@@ -281,7 +285,7 @@ return {
           : "A red fox standing in fresh snow",
       // With a reference the output takes the reference's size.
       ...(s.mode === "i2i" ? {} : { size: "1024x1024" }),
-      ...(s.model === "base" ? { num_inference_steps: 50, guidance_scale: 3.5 } : {}),
+      ...(s.variant === "base" ? { num_inference_steps: 50, guidance_scale: 3.5 } : {}),
       seed: 0,
       quality: s.quality,
       n: Number(s.outputs) || 1,
