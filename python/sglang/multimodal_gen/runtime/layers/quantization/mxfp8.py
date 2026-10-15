@@ -76,6 +76,17 @@ class MXFP8Config(SRTFp8Config, QuantizationConfig):
         if self.layer_markers is not None and prefix not in self.layer_markers:
             return UnquantizedLinearMethod()
         if current_platform.is_npu():
+            from sglang.kernels.spec import PlatformInfo
+            from sglang.srt.hardware_backend.npu.quantization.mxfp_capabilities import (
+                W8A8,
+                get_mxfp_capability,
+                validate_mxfp_configuration,
+            )
+
+            cap = get_mxfp_capability("diffusion", "dense", W8A8, "online")
+            validate_mxfp_configuration(
+                cap, prefix=prefix, platform=PlatformInfo(device_type="npu")
+            )
             return NPUMXFP8LinearMethod(self)
         if not self.is_checkpoint_fp8_serialized:
             from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_online import (
