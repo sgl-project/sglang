@@ -2970,7 +2970,10 @@ class Scheduler(
                     logger.error(error_msg)
                     if not envs.SGLANG_RUST_SERVER.get():
                         recv_req.time_stats.trace_ctx.abort(
-                            abort_info={"reason": error_msg}
+                            abort_info={
+                                "reason": error_msg,
+                                "status_code": HTTPStatus.BAD_REQUEST,
+                            }
                         )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
@@ -3385,7 +3388,9 @@ class Scheduler(
         # `update_finish_state` returns early once `finished()`, so an already
         # set `finished_reason` is what the client receives; report the same.
         reason = req.finished_reason or req.to_finish
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={"reason": reason.message, "status_code": reason.status_code}
+        )
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
 
@@ -3425,7 +3430,9 @@ class Scheduler(
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
         """Return a sampling-mask validation error without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        req.time_stats.trace_ctx.abort(
+            abort_info={"reason": error_msg, "status_code": HTTPStatus.BAD_REQUEST}
+        )
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.output_streamer.stream_output([req], req.return_logprob)
 
@@ -3504,7 +3511,12 @@ class Scheduler(
             ),
             req_to_abort,
         )
-        req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        req_to_abort.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": message,
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+            }
+        )
         return req_to_abort.rid == recv_req.rid
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
@@ -3718,7 +3730,9 @@ class Scheduler(
 
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={"reason": reason.message, "status_code": reason.status_code}
+        )
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
