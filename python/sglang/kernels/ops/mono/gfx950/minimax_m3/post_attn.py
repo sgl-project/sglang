@@ -102,6 +102,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     THREADS,
     TOP_K,
     TOPK_BLOCKS,
+    TOTAL_INDEX_HEADS,
     TP,
     WAVES,
     IndexHeads,
@@ -121,6 +122,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     N_ROUTER,
     N_SPLIT,
     O_K,
+    O_K_SUB,
     O_ROW,
     O_ROWS,
     PAGES_PER_BLOCK,
@@ -129,11 +131,13 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     SH_ROWS,
     SH_TASKS,
     SPLIT_KEYS,
+    SPLIT_PASSES,
     UG_PER_SLOT,
     UG_ROWS,
     XN8_ROW,
     XSC_ROW,
     H,
+    H_SUB,
     pool_words,
     shared_after_routing,
     stage_bases,
@@ -197,7 +201,17 @@ assert N_SPLIT * THREADS * CAND_BATCH >= MAX_INDEX_BLOCKS
 # (``step_rows``; every long request context-parallel: no TP long selection in that
 # build), its rows ending less than a block apart are >= INDEX_CP_FROM_BLOCKS blocks
 # each, and a split task then scans >= TOPK_BLOCKS blocks
-assert N_SPLIT == 2 * TP
+# Two split tasks per index head (the comment above: task p takes head p // 2's
+# scores, half p % 2). The model has TOTAL_INDEX_HEADS of them at every TP, so
+# the invariant is 2 * TOTAL_INDEX_HEADS = 8 = N_SPLIT throughout. The original
+# `2 * TP` only coincided at TP4, where TP happens to equal TOTAL_INDEX_HEADS.
+#
+# This fixes the ASSERT, not the indexing it guards: the context-parallel
+# selection still divides and strides by TP where it means "index heads"
+# (`MAX_INDEX_BLOCKS // TP`, `b // TP`, `own0 + TP * j`, here and in
+# index_score.py), which is wrong at TP != 4. CP is only reached when
+# heads.count > 1, so a count == 1 build is unaffected by that.
+assert N_SPLIT == 2 * TOTAL_INDEX_HEADS
 assert N_SPLIT * TOPK_BLOCKS <= INDEX_CP_FROM_BLOCKS <= THREADS
 assert MAX_TOKENS <= SPARSE_BLOCK
 
@@ -240,7 +254,9 @@ def build_post_attn_kernel(
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         p8: fx.Array[fx.Int32, H * SPLIT_KEYS // 4, 16]
         q8: fx.Array[fx.Int32, O_K // 4, 16]
-        opart: fx.Array[fx.Float32, 1 if WIDE else WAVES * O_K, 16]  # PV partials
+        # PV partials, one split pass' heads (O_K_SUB == O_K at TP4). The wide
+        # MoE's up partials reuse this region through ``fpool`` instead.
+        opart: fx.Array[fx.Float32, 1 if WIDE else WAVES * O_K_SUB, 16]
         # wide MoE: the step's distinct experts (the shared one last), token masks
         uexp: fx.Array[fx.Int32, U_MAX + 2, 16]
         umask: fx.Array[fx.Int32, U_MAX + 2, 16]
@@ -756,7 +772,13 @@ def build_post_attn_kernel(
                 pages = [
                     uniform(fx.ptr_load(blk + (wave * PPW + j))) for j in range(PPW)
                 ]
-                qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
+                # Every pass' q heads, issued here with the page loads rather than
+                # inside the pass loop: the loads are the latency this block hides,
+                # and q8 is whole-H so all of them have somewhere to land.
+                qvs = [
+                    ld_bf16x4(rsrc(q), tok * O_K + p * O_K_SUB + tid * 4, CM_K1)
+                    for p in range(SPLIT_PASSES)
+                ]
                 # The wave's pages are consecutive: a 64-bit base at the first keeps
                 # the lane offsets 32-bit for a cache of any size.
                 page_base = fx.Int64(pages[0]) * PAGE_BYTES
@@ -801,126 +823,162 @@ def build_post_attn_kernel(
                 vs1 = fx.Float32(bo.buffer_load(r_vs, 0, vec_width=1, dtype=T.f32))
                 kss = [ks1] * PPW
                 vss = [vs1] * PPW
-                fx.ptr_store(fp8_pack4(qv[0], qv[1], qv[2], qv[3]), q8 + tid)
+                for p in range_constexpr(SPLIT_PASSES):
+                    qv = qvs[p]
+                    fx.ptr_store(
+                        fp8_pack4(qv[0], qv[1], qv[2], qv[3]),
+                        q8 + (p * (O_K_SUB // 4) + tid),
+                    )
                 gpu.barrier()
-                # QK per page j: A = q (heads), B = K (keys); lane holds heads 4 g4 + e, key l16
                 key0 = t * SPLIT_KEYS + wave * (PPW * PAGE16)
                 valid = [key0 + j * PAGE16 + l16 < n_ctx for j in range(PPW)]
-                sc = []
-                for j in range_constexpr(PPW):
-                    c = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for s in range_constexpr(HEAD_DIM // 32):
-                        qw = fx.Vector(
-                            fx.ptr_load(
-                                q8 + (l16 * 32 + 8 * s + 2 * g4), result_type=v2i
-                            )
-                        )
-                        c = mfma_fp8(
-                            qw.bitcast(fx.Int64)[0], kw[j * (HEAD_DIM // 32) + s], c
-                        )
-                    qk = sm_scale * kss[j]
-                    sc.append(
-                        [valid[j].select(qk * c[e], fx.Float32(NEG)) for e in range(4)]
-                    )
-                # partition max per head and max v_scale: in-wave butterfly, then LDS
-                vloc = fx.max(
-                    valid[0].select(vss[0], fx.Float32(0.0)),
-                    valid[1].select(vss[1], fx.Float32(0.0)),
-                )
-                vmax_w = wave_max(vloc)
-                for e in range_constexpr(4):
-                    mh = butterfly(fx.max(sc[0][e], sc[1][e]), (8, 4, 2, 1), fx.max)
-                    if l16 == 0:
-                        fx.ptr_store(mh, hst + (wave * H + g4 * 4 + e))
-                if lane == 0:
-                    fx.ptr_store(vmax_w, hst + (3 * WAVES * H + wave))
-                gpu.barrier()
-                # every wave partial is read before the first p8 store below: LDS
-                # stores in between serialize each read behind its own wait
-                vmax = fx.ptr_load(hst + 3 * WAVES * H)
-                for w in range_constexpr(1, WAVES):
-                    vmax = fx.max(vmax, fx.ptr_load(hst + (3 * WAVES * H + w)))
-                mxs = []
-                for e in range_constexpr(4):
-                    mx = fx.ptr_load(hst + (g4 * 4 + e))
-                    for w in range_constexpr(1, WAVES):
-                        mx = fx.max(mx, fx.ptr_load(hst + (w * H + g4 * 4 + e)))
-                    mxs.append(mx)
-                fscale = FP8_MAX * hw_rcp(vmax + 1e-8)
-                pscale = vmax * (1.0 / FP8_MAX)
-                for e in range_constexpr(4):
-                    head = g4 * 4 + e
-                    mx = mxs[e]
-                    ls = fx.Float32(0.0)
+                # The thread map below covers H_SUB heads: a lane holds heads
+                # 4 g4 + e of the pass, and the partial reduction walks O_K_SUB.
+                # SPLIT_PASSES is 1 at TP4, where h0 is 0 and every index is the
+                # original expression. K and V are head-independent and stay
+                # hoisted above this loop -- a pass costs MFMA and LDS traffic,
+                # not another trip to the KV cache.
+                for p in range_constexpr(SPLIT_PASSES):
+                    h0 = p * H_SUB  # this pass' first head, in the rank's H
+                    # QK per page j: A = q (heads), B = K (keys); lane holds heads 4 g4 + e, key l16
+                    sc = []
                     for j in range_constexpr(PPW):
-                        pj = hw_exp2((sc[j][e] - mx) * LOG2E)
-                        ls = ls + pj
-                        b8 = (
-                            fp8_pack4(
-                                (valid[j].select(vss[j], fx.Float32(0.0)) * fscale)
-                                * pj,
-                                0.0,
-                                0.0,
-                                0.0,
+                        c = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for s in range_constexpr(HEAD_DIM // 32):
+                            qw = fx.Vector(
+                                fx.ptr_load(
+                                    q8
+                                    + (
+                                        p * (O_K_SUB // 4)
+                                        + l16 * 32
+                                        + 8 * s
+                                        + 2 * g4
+                                    ),
+                                    result_type=v2i,
+                                )
                             )
-                            & 0xFF
+                            c = mfma_fp8(
+                                qw.bitcast(fx.Int64)[0], kw[j * (HEAD_DIM // 32) + s], c
+                            )
+                        qk = sm_scale * kss[j]
+                        sc.append(
+                            [
+                                valid[j].select(qk * c[e], fx.Float32(NEG))
+                                for e in range(4)
+                            ]
                         )
-                        w8 = b8 | (xshfl(b8, 1) << 8)
-                        w8 = w8 | (xshfl(w8, 2) << 16)
-                        if l16 % 4 == 0:
-                            kloc = wave * (PPW * PAGE16) + j * PAGE16 + l16
-                            fx.ptr_store(
-                                w8, p8 + (head * (SPLIT_KEYS // 4) + kloc // 4)
-                            )
-                    ls = butterfly(ls, (8, 4, 2, 1))
-                    if l16 == 0:
-                        fx.ptr_store(ls, hst + (WAVES * H + wave * H + head))
-                        fx.ptr_store(mx, hst + (2 * WAVES * H + head))
-                gpu.barrier()
-                # PV over this wave's 32 keys: A = P (heads), B = V (dims)
-                pw = fx.Vector(
-                    fx.ptr_load(
-                        p8
-                        + (
-                            l16 * (SPLIT_KEYS // 4)
-                            + (wave * (PPW * PAGE16) + 8 * g4) // 4
-                        ),
-                        result_type=v2i,
+                    # partition max per head and max v_scale: in-wave butterfly, then LDS
+                    vloc = fx.max(
+                        valid[0].select(vss[0], fx.Float32(0.0)),
+                        valid[1].select(vss[1], fx.Float32(0.0)),
                     )
-                ).bitcast(fx.Int64)[0]
-                # keys past the context carry P = 0, but a NaN V byte would still poison
-                nv = n_ctx - (key0 + 8 * g4)
-                vmask = (nv >= 8).select(
-                    fx.Int64(-1),
-                    (nv <= 0).select(
-                        fx.Int64(0), (fx.Int64(1) << (fx.Int64(nv) * 8)) - 1
-                    ),
-                )
-                for jd in range_constexpr(HEAD_DIM // 16):
-                    cv = mfma_fp8(
-                        pw, vw[jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
-                    )
+                    vmax_w = wave_max(vloc)
                     for e in range_constexpr(4):
-                        fx.ptr_store(
-                            cv[e],
-                            opart
-                            + (wave * O_K + (g4 * 4 + e) * HEAD_DIM + 16 * jd + l16),
-                        )
-                gpu.barrier()
-                # sum the waves' partials: acc = prob_scale * PV, then * (1 / exp_sum), bf16
-                e0 = tid * 4
-                head = e0 // HEAD_DIM
-                lsum = fx.ptr_load(hst + (WAVES * H + head))
-                for w in range_constexpr(1, WAVES):
-                    lsum = lsum + fx.ptr_load(hst + (WAVES * H + w * H + head))
-                inv_l = 1.0 / (lsum > 0.0).select(lsum, fx.Float32(1.0))
-                ov = []
-                for k in range_constexpr(4):
-                    acc = fx.ptr_load(opart + (e0 + k))
+                        mh = butterfly(fx.max(sc[0][e], sc[1][e]), (8, 4, 2, 1), fx.max)
+                        if l16 == 0:
+                            fx.ptr_store(mh, hst + (wave * H + h0 + g4 * 4 + e))
+                    if lane == 0:
+                        # head-independent: every pass recomputes the same value
+                        fx.ptr_store(vmax_w, hst + (3 * WAVES * H + wave))
+                    gpu.barrier()
+                    # every wave partial is read before the first p8 store below: LDS
+                    # stores in between serialize each read behind its own wait
+                    vmax = fx.ptr_load(hst + 3 * WAVES * H)
                     for w in range_constexpr(1, WAVES):
-                        acc = acc + fx.ptr_load(opart + (w * O_K + e0 + k))
-                    ov.append((pscale * acc) * inv_l)
-                mb_put_bf(mb("sp_o"), ts * O_K + e0, ov)
+                        vmax = fx.max(vmax, fx.ptr_load(hst + (3 * WAVES * H + w)))
+                    mxs = []
+                    for e in range_constexpr(4):
+                        mx = fx.ptr_load(hst + (h0 + g4 * 4 + e))
+                        for w in range_constexpr(1, WAVES):
+                            mx = fx.max(
+                                mx, fx.ptr_load(hst + (w * H + h0 + g4 * 4 + e))
+                            )
+                        mxs.append(mx)
+                    fscale = FP8_MAX * hw_rcp(vmax + 1e-8)
+                    pscale = vmax * (1.0 / FP8_MAX)
+                    for e in range_constexpr(4):
+                        head = h0 + g4 * 4 + e
+                        mx = mxs[e]
+                        ls = fx.Float32(0.0)
+                        for j in range_constexpr(PPW):
+                            pj = hw_exp2((sc[j][e] - mx) * LOG2E)
+                            ls = ls + pj
+                            b8 = (
+                                fp8_pack4(
+                                    (valid[j].select(vss[j], fx.Float32(0.0)) * fscale)
+                                    * pj,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                )
+                                & 0xFF
+                            )
+                            w8 = b8 | (xshfl(b8, 1) << 8)
+                            w8 = w8 | (xshfl(w8, 2) << 16)
+                            if l16 % 4 == 0:
+                                kloc = wave * (PPW * PAGE16) + j * PAGE16 + l16
+                                fx.ptr_store(
+                                    w8, p8 + (head * (SPLIT_KEYS // 4) + kloc // 4)
+                                )
+                        ls = butterfly(ls, (8, 4, 2, 1))
+                        if l16 == 0:
+                            fx.ptr_store(ls, hst + (WAVES * H + wave * H + head))
+                            fx.ptr_store(mx, hst + (2 * WAVES * H + head))
+                    gpu.barrier()
+                    # PV over this wave's 32 keys: A = P (heads), B = V (dims)
+                    pw = fx.Vector(
+                        fx.ptr_load(
+                            p8
+                            + (
+                                (h0 + l16) * (SPLIT_KEYS // 4)
+                                + (wave * (PPW * PAGE16) + 8 * g4) // 4
+                            ),
+                            result_type=v2i,
+                        )
+                    ).bitcast(fx.Int64)[0]
+                    # keys past the context carry P = 0, but a NaN V byte would still poison
+                    nv = n_ctx - (key0 + 8 * g4)
+                    vmask = (nv >= 8).select(
+                        fx.Int64(-1),
+                        (nv <= 0).select(
+                            fx.Int64(0), (fx.Int64(1) << (fx.Int64(nv) * 8)) - 1
+                        ),
+                    )
+                    for jd in range_constexpr(HEAD_DIM // 16):
+                        cv = mfma_fp8(
+                            pw, vw[jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
+                        )
+                        for e in range_constexpr(4):
+                            fx.ptr_store(
+                                cv[e],
+                                opart
+                                + (
+                                    wave * O_K_SUB
+                                    + (g4 * 4 + e) * HEAD_DIM
+                                    + 16 * jd
+                                    + l16
+                                ),
+                            )
+                    gpu.barrier()
+                    # sum the waves' partials: acc = prob_scale * PV, then * (1 / exp_sum), bf16
+                    e0 = tid * 4
+                    head = h0 + e0 // HEAD_DIM
+                    lsum = fx.ptr_load(hst + (WAVES * H + head))
+                    for w in range_constexpr(1, WAVES):
+                        lsum = lsum + fx.ptr_load(hst + (WAVES * H + w * H + head))
+                    inv_l = 1.0 / (lsum > 0.0).select(lsum, fx.Float32(1.0))
+                    ov = []
+                    for k in range_constexpr(4):
+                        acc = fx.ptr_load(opart + (e0 + k))
+                        for w in range_constexpr(1, WAVES):
+                            acc = acc + fx.ptr_load(opart + (w * O_K_SUB + e0 + k))
+                        ov.append((pscale * acc) * inv_l)
+                    mb_put_bf(mb("sp_o"), ts * O_K + p * O_K_SUB + e0, ov)
+                    if const_expr(SPLIT_PASSES > 1):
+                        # the next pass overwrites opart, which this one has just
+                        # read; at TP4 there is no next pass and no barrier
+                        gpu.barrier()
+                # every head's max and exp-sum, now that every pass has filled hst
                 if tid < H:
                     mb_put(
                         mb("sp_m"),

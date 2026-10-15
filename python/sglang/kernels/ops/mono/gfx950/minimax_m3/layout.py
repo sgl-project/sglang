@@ -29,6 +29,22 @@ H = LOCAL_Q_HEADS
 SPLIT_KEYS = 256  # keys per split task (one paged-attention context partition)
 N_SPLIT = MAX_SPARSE_KEYS // SPLIT_KEYS
 O_K = H * HEAD_DIM
+# The split stage's thread map covers exactly 16 q heads per pass: its MFMA A
+# operand is 16 rows, a lane holds heads 4 * (lane // 16) + e, and the partial
+# reduction walks O_K with THREADS * 4 = 2048 elements. At TP4 H is 16 and one
+# pass is the whole rank. Below TP4 the rank holds more heads than the map
+# covers, so the stage runs SPLIT_PASSES of H_SUB heads each
+# (post_attn.stage_split), and only the PV partials (``opart``) are sized for a
+# pass -- every other region stays whole-H and is indexed by absolute head.
+#
+# This is also what keeps K4 inside the 160 KB LDS below TP4: the partials are
+# WAVES * O_K, which at TP2's 32 heads alone is 131 072 B of a 163 840 B budget.
+# At TP4 H_SUB == H, so SPLIT_PASSES == 1 and every expression below is the
+# original value -- the TP4 build is unchanged byte for byte.
+H_SUB = min(H, 16)
+O_K_SUB = H_SUB * HEAD_DIM
+SPLIT_PASSES = H // H_SUB
+assert H % H_SUB == 0, f"H={H} is not a whole number of {H_SUB}-head passes"
 O_ROWS = 32  # hidden rows per o_proj / attention-reduce task
 # from this many tokens the attention all-reduce is a reduce-scatter to the row
 # group's owner rank (t % npes) plus an all-gather of the sums: half the bytes over
@@ -214,7 +230,8 @@ def pool_words(tokens: int) -> int:
         return HIDDEN // 2 * tokens
     rows = MOE_SLOTS * tokens + 1
     return max(
-        WAVES * O_K,
+        # the split's PV partials, one pass' worth (see H_SUB above)
+        WAVES * O_K_SUB,
         tokens * (XN8_ROW + XSC_ROW + N_ROUTED) + WAVES * 64 * 4,
         rows * (MID_ROW + MIDSC_ROW),
     )
