@@ -72,7 +72,7 @@ fn write_python_str(s: &str, ascii: bool, out: &mut String) {
 
 /// Python's `repr(float)`, as `json.dumps` prints it: the shortest digits that
 /// round-trip, ties to even, scientific outside 1e-4..1e16.
-fn python_float(f: f64) -> String {
+pub(crate) fn python_float(f: f64) -> String {
     if !f.is_finite() {
         return match f.is_nan() {
             true => "NaN".into(),
