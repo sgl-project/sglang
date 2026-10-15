@@ -27,6 +27,16 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         obj.topk = topk
         obj.speculative_num_steps = steps
         obj.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
+        obj.draft_window_size = obj.draft_sink_size = 0
+        obj.kv_index_translator = SimpleNamespace(
+            read_source=lambda plan, **kw: SimpleNamespace(
+                row_ids=kw["req_pool_indices"],
+                ids=pool,
+                row_stride=pool_len,
+                entry_page_size=1,
+                v2p=None,
+            )
+        )
         obj.page_size = page_size
         obj.pool_len = pool_len
         obj.req_to_token_pool = SimpleNamespace(req_to_token=pool)
@@ -39,6 +49,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         host = torch.tensor(lengths, dtype=torch.int64)
         seq = host.cuda()
         fb = SimpleNamespace(
+            kv_loc_plan=None,
             batch_size=n,
             seq_lens=seq,
             seq_lens_cpu=host,
@@ -106,6 +117,29 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
                     torch.testing.assert_close(
                         consumer_indptr, original_indptr, rtol=0, atol=0
                     )
+
+    def test_sliding_window_uses_bounded_device_metadata(self):
+        obj, indices, fb = self._build(1, 3, 1, [8192, 1024])
+        obj.draft_window_size = 256
+        obj.draft_sink_size = 16
+        with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(False):
+            obj.common_template(fb, indices, lambda i, batch: None)
+        expected = indices.clone()
+        expected_indptr = obj.kv_indptr.clone()
+        observed = []
+        indices.fill_(-17)
+        with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
+            obj.common_template(
+                fb,
+                indices,
+                lambda i, batch: observed.append(
+                    backend.global_override_indptr_cpu.clone()
+                ),
+            )
+        torch.testing.assert_close(indices, expected, rtol=0, atol=0)
+        torch.testing.assert_close(obj.kv_indptr, expected_indptr, rtol=0, atol=0)
+        for i, host in enumerate(observed):
+            torch.testing.assert_close(host, expected_indptr[i].cpu(), rtol=0, atol=0)
 
     def test_missing_host_mirror_and_failed_plan_restore_override(self):
         obj, indices, fb = self._build(1, 3, 1, [8192])

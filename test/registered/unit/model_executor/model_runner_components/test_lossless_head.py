@@ -72,7 +72,11 @@ class TestLosslessHeadSharing(CustomTestCase):
         worker = EagleDraftWorker.__new__(EagleDraftWorker)
         worker.draft_runner = SimpleNamespace(model=draft)
         worker.target_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(model=target)
+            model_runner=SimpleNamespace(
+                model=target,
+                model_config=SimpleNamespace(model_path="unused", revision=None),
+                load_config=None,
+            )
         )
         worker.speculative_algorithm = SimpleNamespace(is_eagle3=lambda: False)
         module = "sglang.srt.speculative.eagle_worker_v2"
@@ -104,10 +108,13 @@ class TestLosslessHeadSharing(CustomTestCase):
 
 class TestLosslessHeadUpdateGuard(CustomTestCase):
     def test_all_public_updates_reject_before_mutation(self):
-        fake = SimpleNamespace(_assert_weight_cache_inactive=Mock(), get_model=Mock())
+        model = SimpleNamespace(load_weights=Mock())
+        fake = SimpleNamespace(
+            _assert_weight_cache_inactive=Mock(), get_model=Mock(return_value=model)
+        )
         calls = (
             (WeightUpdater.update_weights_from_disk, ("unused", "auto")),
-            (WeightUpdater.update_weights_from_distributed, ([], [], [], "unused")),
+            (WeightUpdater.load_weights_from_distributed, ([],)),
             (WeightUpdater.update_weights_from_tensor, ([],)),
             (WeightUpdater.update_weights_from_ipc, (None,)),
         )
@@ -119,7 +126,7 @@ class TestLosslessHeadUpdateGuard(CustomTestCase):
                         success, error = method(fake, *args)
                         self.assertFalse(success)
                         self.assertIn("SGLANG_SM120_LOSSLESS_BF16_HEAD", error)
-                fake.get_model.assert_not_called()
+                model.load_weights.assert_not_called()
             finally:
                 lossless_bf16_head_enabled.cache_clear()
 

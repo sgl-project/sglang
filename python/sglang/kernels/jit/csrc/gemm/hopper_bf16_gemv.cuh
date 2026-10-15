@@ -140,10 +140,10 @@ struct HopperBf16GemvKernel {
     constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
     LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())
         .enable_pdl(kUsePDL)(
-        hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
-        static_cast<bf16_t*>(out.data_ptr()),
-        static_cast<const bf16_t*>(x.data_ptr()),
-        static_cast<const bf16_t*>(w.data_ptr()));
+            hopper_bf16_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
+            static_cast<bf16_t*>(out.data_ptr()),
+            static_cast<const bf16_t*>(x.data_ptr()),
+            static_cast<const bf16_t*>(w.data_ptr()));
   }
 };
 

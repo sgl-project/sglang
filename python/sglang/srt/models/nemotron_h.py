@@ -666,16 +666,17 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
 
                     hidden, residual = stream.export(hidden_states)
                     mega_result = maybe_run_sglang(
-                        self, hidden, residual, forward_batch,
+                        self,
+                        hidden,
+                        residual,
+                        forward_batch,
                         attn_backend.linear_attn_backend,
                     )
                     if mega_result is not None:
                         output, residual = mega_result
                         stream.write(residual)
                         return self.boundary.finish(output, forward_batch)
-        return super().forward(
-            hidden_states=hidden_states, forward_batch=forward_batch
-        )
+        return super().forward(hidden_states=hidden_states, forward_batch=forward_batch)
 
     def _forward_mixer(
         self,

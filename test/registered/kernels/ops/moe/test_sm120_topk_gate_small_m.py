@@ -9,7 +9,7 @@ from sglang.kernels.ops.moe import sm120_topk_gate_small_m as small
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(
@@ -88,6 +88,48 @@ class TestSmallMTop22(CustomTestCase):
                 self.route(scores.bfloat16(), bias, True),
                 self.route(scores.bfloat16(), bias, False),
             )
+
+    def test_new_router_options_fall_back(self):
+        scores = torch.randn(4, 512, device="cuda")
+        bias = torch.randn(512, device="cuda")
+        cases = [
+            dict(renormalize_epsilon=0.1),
+            dict(
+                num_token_non_padded=torch.tensor(2, device="cuda", dtype=torch.int32)
+            ),
+            dict(
+                input_ids=torch.tensor([0, 1, 0, 1], device="cuda"),
+                bias_alt=-bias,
+                bias_alt_token_id=1,
+            ),
+            dict(packed_out=torch.empty((4, 22), device="cuda", dtype=torch.int32)),
+        ]
+        for kwargs in cases:
+            with (
+                self.subTest(options=list(kwargs)),
+                patch.object(small, "topk_gate_small_m", side_effect=AssertionError),
+            ):
+                expected = self.route(scores, bias, False, **kwargs)
+                packed = kwargs.get("packed_out")
+                expected_packed = packed.clone() if packed is not None else None
+                if packed is not None:
+                    packed.zero_()
+                self.assert_bits(self.route(scores, bias, True, **kwargs), expected)
+                if packed is not None:
+                    self.assertTrue(torch.equal(packed, expected_packed))
+
+    def test_single_token_nonfinite_bias_and_unique_ties(self):
+        from sglang.kernels.ops.moe.sm120_topk_gate_m1 import topk_gate_m1
+
+        scores = torch.randn(1, 512, device="cuda")
+        for value in (0.0, -float("inf"), float("inf"), float("nan")):
+            bias = torch.full((512,), value, device="cuda")
+            bias[5:10] = 0.0
+            expected = self.route(scores, bias, False)
+            actual = topk_gate_m1(scores, bias, 22, True, 1.0, False)
+            self.assertTrue(torch.equal(actual[1], expected[1]))
+            self.assertEqual(actual[1].unique().numel(), 22)
+            torch.testing.assert_close(actual[0], expected[0], rtol=1e-6, atol=1e-7)
 
 
 if __name__ == "__main__":

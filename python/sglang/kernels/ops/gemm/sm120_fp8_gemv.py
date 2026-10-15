@@ -68,6 +68,7 @@ def sm120_fp8_gemv(
     module.run(x_fp8, w_fp8, alpha, out)
     return out
 
+
 @cache_once
 def _jit_sm120_fp8_gemv_bf16in_module(n: int, k: int) -> Module:
     rows, unroll, warps = _config(n)

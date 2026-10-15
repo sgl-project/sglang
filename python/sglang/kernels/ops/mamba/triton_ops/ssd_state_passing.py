@@ -233,7 +233,11 @@ def _state_passing_fwd(
     )
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), batch, nheads)
     with torch.get_device_module(states.device).device(states.device.index):
-        _state_passing_fwd_kernel[grid](
+        # Preserve upstream autotuning outside the explicit SM120 specialization.
+        kernel = (
+            _state_passing_fwd_kernel.fn if sm120_tiles else _state_passing_fwd_kernel
+        )
+        kernel[grid](
             states,
             out,
             final_states,
@@ -278,6 +282,6 @@ def _state_passing_fwd(
             HAS_INITSTATES=initial_states is not None,
             HAS_SEQ_IDX=seq_idx is not None,
             IS_CONT_BATCHED=is_cont_batched,
-            BLOCK_SIZE=256 if sm120_tiles else 16,
+            **({"BLOCK_SIZE": 256} if sm120_tiles else {}),
         )
     return out, final_states

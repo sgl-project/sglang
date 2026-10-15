@@ -12,7 +12,7 @@ from sglang.kernels.jit.utils import (
 )
 
 if TYPE_CHECKING:
-    from tvm_ffi.module import Module
+    pass
 
 # Single-token fused sigmoid+bias top-k router (see
 # csrc/moe/sm120_topk_gate_m1.cuh). The generic Triton router runs ~10us for
@@ -25,11 +25,11 @@ if TYPE_CHECKING:
 def _jit_topk_gate_m1(n, topk, renorm, apply_scale):
     args = make_cpp_args(n, topk, renorm, apply_scale, is_arch_support_pdl())
     return load_jit(
-        'sm120_topk_gate_m1',
+        "sm120_topk_gate_m1",
         *args,
-        cuda_files=['moe/sm120_topk_gate_m1.cuh'],
-        cuda_wrappers=[('run', f'sglang::Sm120TopkGateM1Kernel<{args}>::run')],
-        extra_cuda_cflags=['-O3'],
+        cuda_files=["moe/sm120_topk_gate_m1.cuh"],
+        cuda_wrappers=[("run", f"sglang::Sm120TopkGateM1Kernel<{args}>::run")],
+        extra_cuda_cflags=["-O3"],
     )
 
 

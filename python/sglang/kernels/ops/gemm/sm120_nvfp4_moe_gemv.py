@@ -12,7 +12,7 @@ from sglang.kernels.jit.utils import (
 )
 
 if TYPE_CHECKING:
-    from tvm_ffi.module import Module
+    pass
 
 # Decode (M=1) NVFP4 W4A4 grouped GEMV pair for the non-gated ReLU^2 latent
 # MoE (see csrc/gemm/sm120_nvfp4_moe_gemv.cuh). CUTLASS 128-row tiles waste
@@ -28,14 +28,14 @@ _buffer_cache: dict = {}
 def _jit_nvfp4_moe_gemv_module(n1, k1, n2, k2, topk):
     args = make_cpp_args(n1, k1, n2, k2, topk, is_arch_support_pdl())
     return load_jit(
-        'sm120_nvfp4_moe_gemv',
+        "sm120_nvfp4_moe_gemv",
         *args,
-        cuda_files=['gemm/sm120_nvfp4_moe_gemv.cuh'],
+        cuda_files=["gemm/sm120_nvfp4_moe_gemv.cuh"],
         cuda_wrappers=[
-            ('run_fc1', f'sglang::Sm120Nvfp4MoeGemvKernel<{args}>::run_fc1'),
-            ('run_fc2', f'sglang::Sm120Nvfp4MoeGemvKernel<{args}>::run_fc2'),
+            ("run_fc1", f"sglang::Sm120Nvfp4MoeGemvKernel<{args}>::run_fc1"),
+            ("run_fc2", f"sglang::Sm120Nvfp4MoeGemvKernel<{args}>::run_fc2"),
         ],
-        extra_cuda_cflags=['-O3'],
+        extra_cuda_cflags=["-O3"],
     )
 
 

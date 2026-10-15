@@ -192,7 +192,9 @@ def _config(in_fp8: bool, out_fp8: bool) -> tuple[int, int]:
     )
     if rc != 0:
         raise RuntimeError(f"mamba2_mega_config failed: cuda error {rc}")
-    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     resident = max(1, occ.value) * sms
     # Filling the residency limit is never the best grid.  Measured with
     # tools/grid_ab.py (5 interleaved repeats per point, so clock drift cancels):
@@ -236,7 +238,9 @@ def _scratch(device: torch.device, floats: int) -> torch.Tensor:
 # --------------------------------------------------------------- layer binding
 
 
-def _row_major(weight: torch.Tensor, out_features: int, in_features: int) -> torch.Tensor:
+def _row_major(
+    weight: torch.Tensor, out_features: int, in_features: int
+) -> torch.Tensor:
     """Return an [out_features, in_features] contiguous view of a linear weight."""
     if weight.shape == (out_features, in_features):
         if weight.is_contiguous():
@@ -296,7 +300,9 @@ def _bind(layer) -> dict:
     # conv1d.weight is [conv_dim, 1, conv_kernel] after MambaMixer2's unsqueeze.
     conv_w = mixer.conv1d.weight.data.reshape(CONVDIM, -1)
     if conv_w.shape[1] != CONVW or not conv_w.is_contiguous():
-        raise RuntimeError(f"unexpected conv1d weight {tuple(mixer.conv1d.weight.shape)}")
+        raise RuntimeError(
+            f"unexpected conv1d weight {tuple(mixer.conv1d.weight.shape)}"
+        )
     # The pre-norm and the gated norm share config.layer_norm_epsilon; the kernel
     # carries one value, so refuse to guess if the checkpoint ever splits them.
     eps = float(layer.norm.variance_epsilon)

@@ -18,10 +18,17 @@ def initialize_nvfp4_layout(model, *, is_draft_worker):
     from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
         _sm120_mtp_mma_supported,
     )
+    from sglang.srt.models.nano_nemotron_vl import NemotronH_Omni_Reasoning_V3
     from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 
+    language_model = (
+        model.language_model
+        if isinstance(model, NemotronH_Omni_Reasoning_V3)
+        else model
+    )
+
     if (
-        not isinstance(model, NemotronHForCausalLM)
+        not isinstance(language_model, NemotronHForCausalLM)
         or get_parallel().tp_size != 1
         or get_parallel().ep_size != 1
         or get_parallel().pp_size != 1
@@ -35,7 +42,7 @@ def initialize_nvfp4_layout(model, *, is_draft_worker):
         )
     experts = [
         module
-        for module in model.modules()
+        for module in language_model.modules()
         if getattr(module, "w2_weight", None) is not None
         and module.w2_weight.shape == (512, 1024, 1344)
         and module.w2_weight.dtype == torch.uint8
@@ -52,6 +59,9 @@ def initialize_nvfp4_layout(model, *, is_draft_worker):
     cycle = Nvfp4LayoutCycle([module.w2_weight for module in experts])
     for index, module in enumerate(experts):
         module._sglang_nvfp4_layout_slot = (cycle, index)
+    # Graph warmup calls the inner language model directly, whereas replay
+    # preparation uses the outer model. Both must transition the same cycle.
+    language_model._sglang_nvfp4_layout_cycle = cycle
     model._sglang_nvfp4_layout_cycle = cycle
     logger.info(
         "Prepared reversible NVFP4 FC2 layout cycle: %d layers, %d extra bytes",

@@ -1539,6 +1539,8 @@ def biased_topk_jit_kernel_impl(
             and num_fused_shared_experts == 0
             and num_token_non_padded is None
             and expert_location_dispatch_info is None
+            and packed_out is None
+            and not sqrtsoftplus_log1p
         ):
             from sglang.kernels.ops.moe.sm120_topk_gate_m1 import (
                 topk_gate_m1,

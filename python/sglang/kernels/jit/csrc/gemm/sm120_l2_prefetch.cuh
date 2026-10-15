@@ -16,8 +16,7 @@ using namespace device;
 // (evict-normal) policy so the consumer kernels a few microseconds later hit
 // L2 instead of DRAM. Launched on a low-priority side stream during the
 // DRAM-quiet compute phases of the mamba layers.
-__global__ void __launch_bounds__(256) sm120_l2_prefetch_kernel(
-    const uint4* __restrict__ p, const size_t n_vec) {
+__global__ void __launch_bounds__(256) sm120_l2_prefetch_kernel(const uint4* __restrict__ p, const size_t n_vec) {
   const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
   uint32_t sink = 0;
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_vec; i += stride) {
@@ -36,9 +35,7 @@ struct Sm120L2PrefetchKernel {
     TensorMatcher({nbytes}).with_dtype<uint8_t>().with_device(device).verify(t);
     const size_t n_vec = static_cast<size_t>(nbytes.unwrap()) / 16;
     LaunchKernel(static_cast<uint32_t>(num_blocks), 256, device.unwrap())(
-        sm120_l2_prefetch_kernel,
-        static_cast<const uint4*>(t.data_ptr()),
-        n_vec);
+        sm120_l2_prefetch_kernel, static_cast<const uint4*>(t.data_ptr()), n_vec);
   }
 };
 

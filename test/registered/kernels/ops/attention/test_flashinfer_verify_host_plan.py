@@ -155,9 +155,23 @@ class TestFlashInferVerifyHostPlan(CustomTestCase):
                         updater = FlashInferIndicesUpdaterPrefill.__new__(
                             FlashInferIndicesUpdaterPrefill
                         )
+
+                        def pack_read_stream(plan, **kw):
+                            lengths_cpu = kw["seq_lens"].cpu().tolist()
+                            rows_cpu = kw["req_pool_indices"].cpu().tolist()
+                            kw["out"].copy_(
+                                torch.cat(
+                                    [
+                                        pool[row, :n]
+                                        for row, n in zip(rows_cpu, lengths_cpu)
+                                    ]
+                                )
+                            )
+
                         updater.attn_backend = SimpleNamespace(
                             kv_index_translator=SimpleNamespace(
-                                reads_are_translated=False
+                                reads_are_translated=False,
+                                pack_read_stream=pack_read_stream,
                             )
                         )
                         updater.req_to_token = pool
@@ -183,6 +197,7 @@ class TestFlashInferVerifyHostPlan(CustomTestCase):
                             False,
                             spec,
                             seq_lens_cpu=committed,
+                            plan=None,
                         )
                     expected_bits, expected_ptr = segment_packbits(
                         mask, gpu_kv * width, bitorder="little"

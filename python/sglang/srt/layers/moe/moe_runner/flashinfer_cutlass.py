@@ -311,7 +311,7 @@ def _run_flashinfer_cutlass(
         and x.shape[1] == 1024
         and x_sf is None
         and x.dtype == output_dtype == torch.bfloat16
-        and quant_info.moe_ep_size == quant_info.moe_tp_size == 1
+        and runner_config.moe_ep_size == runner_config.moe_tp_size == 1
         and not enable_alltoall
         and quant_info.w13_weight.shape == (512, 2688, 512)
         and quant_info.w2_weight.shape == (512, 1024, 1344)
@@ -327,7 +327,7 @@ def _run_flashinfer_cutlass(
         )
 
         qs = quant_info.quant_scales
-        return nvfp4_moe_mtp_mma(
+        output = nvfp4_moe_mtp_mma(
             x,
             quant_info.w13_weight,
             qs[1],
@@ -344,6 +344,7 @@ def _run_flashinfer_cutlass(
             out=output,
             pair_layout=quant_info.pair_w2_weight is not None,
         )
+        return _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
 
     if quant_info.pair_w2_weight is not None:
         raise RuntimeError("A paired NVFP4 weight reached an unsupported MoE path")
@@ -358,8 +359,10 @@ def _run_flashinfer_cutlass(
         and x.shape[0] == 1
         and x_sf is None
         and x.dtype == torch.bfloat16
-        and quant_info.moe_ep_size == 1
-        and quant_info.moe_tp_size == 1
+        and runner_config.moe_ep_size == 1
+        and runner_config.moe_tp_size == 1
+        and is_sm120()
+        and not enable_alltoall
         and _sm120_moe_gemv_enabled()
     ):
         from sglang.kernels.ops.gemm.sm120_nvfp4_moe_gemv import (

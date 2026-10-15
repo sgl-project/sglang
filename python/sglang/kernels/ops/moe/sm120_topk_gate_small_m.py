@@ -35,8 +35,6 @@ def _sm120_router_top22_kernel(
     keys = (ordered.to(tl.uint64) << 32) | (0xFFFFFFFF - n.to(tl.uint32)).to(tl.uint64)
     winners = tl.topk(keys, 32)
     ids = (0xFFFFFFFF - (winners & 0xFFFFFFFF).to(tl.uint32)).to(tl.int32)
-    # The reference repeatedly picks ID0 once all remaining values are -inf.
-    ids = tl.where((winners >> 32) == 0x007FFFFF, 0, ids)
     k = tl.arange(0, 32)
     values = tl.gather(activated, ids, axis=0)
     values = tl.where(k < 22, values, 0.0)

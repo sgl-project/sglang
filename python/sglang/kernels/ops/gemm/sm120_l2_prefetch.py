@@ -18,10 +18,10 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_l2_prefetch() -> Module:
     return load_jit(
-        'sm120_l2_prefetch',
-        cuda_files=['gemm/sm120_l2_prefetch.cuh'],
-        cuda_wrappers=[('run', 'sglang::Sm120L2PrefetchKernel::run')],
-        extra_cuda_cflags=['-O3'],
+        "sm120_l2_prefetch",
+        cuda_files=["gemm/sm120_l2_prefetch.cuh"],
+        cuda_wrappers=[("run", "sglang::Sm120L2PrefetchKernel::run")],
+        extra_cuda_cflags=["-O3"],
     )
 
 

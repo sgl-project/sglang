@@ -428,6 +428,11 @@ def moe_fused_gate(
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
+        and input_ids is None
+        and num_token_non_padded is None
+        and renormalize_epsilon == 0.0
+        and packed_out is None
+        and not sqrtsoftplus_log1p
     ):
         from sglang.kernels.ops.moe.sm120_topk_gate_small_m import (
             topk_gate_small_m,

@@ -25,10 +25,10 @@ __device__ __forceinline__ uint32_t f32_sortable(float v) {
 
 template <uint32_t N, uint32_t kTopK, bool kRenorm, bool kApplyScale, bool kUsePDL>
 __global__ void __launch_bounds__(1024) sm120_topk_gate_m1_kernel(
-    float* __restrict__ out_w,          // [kTopK]
-    int32_t* __restrict__ out_i,        // [kTopK]
-    const float* __restrict__ scores,   // [N] raw router logits (fp32)
-    const float* __restrict__ bias,     // [N]
+    float* __restrict__ out_w,         // [kTopK]
+    int32_t* __restrict__ out_i,       // [kTopK]
+    const float* __restrict__ scores,  // [N] raw router logits (fp32)
+    const float* __restrict__ bias,    // [N]
     const float routed_scaling) {
   constexpr uint32_t kThreads = 1024;
   static_assert(N <= kThreads, "one score per thread");
@@ -45,19 +45,20 @@ __global__ void __launch_bounds__(1024) sm120_topk_gate_m1_kernel(
     const float sc = scores[tid];
     const float act = 1.0f / (1.0f + expf(-sc));
     s_act[tid] = act;
-    s_biased[tid] = act + bias[tid];
+    const float biased = act + bias[tid];
+    s_biased[tid] = isnan(biased) ? -1e30f : biased;
   }
   __syncthreads();
 
   const uint32_t lane = tid % 32;
   const uint32_t warp = tid / 32;
 
+  bool remaining = tid < N;
   for (uint32_t k = 0; k < kTopK; ++k) {
     // pack (biased value desc, id asc) into u64 and block-max it
     float v = (tid < N) ? s_biased[tid] : -__int_as_float(0x7f800000);
-    unsigned long long key =
-        (static_cast<unsigned long long>(f32_sortable(v)) << 32) |
-        (0xFFFFFFFFu - tid);
+    unsigned long long key = (static_cast<unsigned long long>(f32_sortable(v)) << 32) | (0xFFFFFFFFu - tid);
+    key = remaining ? key : 0ull;
 #pragma unroll
     for (uint32_t off = 16; off > 0; off >>= 1) {
       const unsigned long long other = __shfl_down_sync(0xffffffff, key, off);
@@ -68,9 +69,7 @@ __global__ void __launch_bounds__(1024) sm120_topk_gate_m1_kernel(
     }
     __syncthreads();
     if (warp == 0) {
-      unsigned long long bkey = (lane < kThreads / 32)
-                                    ? s_wmax[lane]
-                                    : 0ull;
+      unsigned long long bkey = (lane < kThreads / 32) ? s_wmax[lane] : 0ull;
 #pragma unroll
       for (uint32_t off = 16; off > 0; off >>= 1) {
         const unsigned long long other = __shfl_down_sync(0xffffffff, bkey, off);
@@ -80,10 +79,10 @@ __global__ void __launch_bounds__(1024) sm120_topk_gate_m1_kernel(
         const uint32_t win = 0xFFFFFFFFu - static_cast<uint32_t>(bkey & 0xFFFFFFFFu);
         s_idx[k] = static_cast<int32_t>(win);
         s_sel[k] = s_act[win];
-        s_biased[win] = -__int_as_float(0x7f800000);
       }
     }
     __syncthreads();
+    remaining = remaining && tid != static_cast<uint32_t>(s_idx[k]);
   }
 
   if (tid == 0) {
@@ -104,8 +103,8 @@ __global__ void __launch_bounds__(1024) sm120_topk_gate_m1_kernel(
 
 template <uint32_t N, uint32_t kTopK, bool kRenorm, bool kApplyScale, bool kUsePDL>
 struct Sm120TopkGateM1Kernel {
-  static void run(
-      const tvm::ffi::TensorView scores,
+  static void
+  run(const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView bias,
       const tvm::ffi::TensorView out_w,
       const tvm::ffi::TensorView out_i,
@@ -119,12 +118,12 @@ struct Sm120TopkGateM1Kernel {
     TensorMatcher({kTopK}).with_dtype<int32_t>().with_device(device).verify(out_i);
     LaunchKernel(1, 1024, device.unwrap())
         .enable_pdl(kUsePDL)(
-        sm120_topk_gate_m1_kernel<N, kTopK, kRenorm, kApplyScale, kUsePDL>,
-        static_cast<float*>(out_w.data_ptr()),
-        static_cast<int32_t*>(out_i.data_ptr()),
-        static_cast<const float*>(scores.data_ptr()),
-        static_cast<const float*>(bias.data_ptr()),
-        static_cast<float>(routed_scaling));
+            sm120_topk_gate_m1_kernel<N, kTopK, kRenorm, kApplyScale, kUsePDL>,
+            static_cast<float*>(out_w.data_ptr()),
+            static_cast<int32_t*>(out_i.data_ptr()),
+            static_cast<const float*>(scores.data_ptr()),
+            static_cast<const float*>(bias.data_ptr()),
+            static_cast<float>(routed_scaling));
   }
 };
 

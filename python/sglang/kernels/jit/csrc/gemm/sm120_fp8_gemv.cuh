@@ -150,14 +150,13 @@ struct Sm120Fp8GemvKernel {
     constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
     LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())
         .enable_pdl(kUsePDL)(
-        sm120_fp8_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
-        static_cast<bf16_t*>(out.data_ptr()),
-        static_cast<const uint8_t*>(x.data_ptr()),
-        static_cast<const uint8_t*>(w.data_ptr()),
-        static_cast<const float*>(alpha.data_ptr()));
+            sm120_fp8_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
+            static_cast<bf16_t*>(out.data_ptr()),
+            static_cast<const uint8_t*>(x.data_ptr()),
+            static_cast<const uint8_t*>(w.data_ptr()),
+            static_cast<const float*>(alpha.data_ptr()));
   }
 };
-
 
 // Same GEMV with fused static per-tensor activation quantization: reads the
 // bf16 activation row, quantizes it in-kernel (clamp to +-448 then
@@ -288,12 +287,12 @@ struct Sm120Fp8GemvBf16InKernel {
     constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
     LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())
         .enable_pdl(kUsePDL)(
-        sm120_fp8_gemv_bf16in_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
-        static_cast<bf16_t*>(out.data_ptr()),
-        static_cast<const bf16_t*>(x.data_ptr()),
-        static_cast<const uint8_t*>(w.data_ptr()),
-        static_cast<const float*>(alpha.data_ptr()),
-        static_cast<const float*>(input_scale.data_ptr()));
+            sm120_fp8_gemv_bf16in_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
+            static_cast<bf16_t*>(out.data_ptr()),
+            static_cast<const bf16_t*>(x.data_ptr()),
+            static_cast<const uint8_t*>(w.data_ptr()),
+            static_cast<const float*>(alpha.data_ptr()),
+            static_cast<const float*>(input_scale.data_ptr()));
   }
 };
 

@@ -39,8 +39,8 @@ __device__ __forceinline__ float dq_e4m3(uint8_t v) {
 // int8 lanes: mag2 table {0,1,2,3,4,6,8,12}, sign from nibble bit 3.
 __device__ __forceinline__ uint32_t nib4_lo_to_mag2(uint32_t w4) {
   const uint32_t idx = w4 & 0x07070707u;
-  const uint32_t u = idx | (idx >> 4);              // b0:i0|i1<<4, b2:i2|i3<<4
-  const uint32_t sel = __byte_perm(u, 0u, 0x5420u); // nibbles i0 i1 i2 i3
+  const uint32_t u = idx | (idx >> 4);               // b0:i0|i1<<4, b2:i2|i3<<4
+  const uint32_t sel = __byte_perm(u, 0u, 0x5420u);  // nibbles i0 i1 i2 i3
   const uint32_t mag = __byte_perm(0x03020100u, 0x0C080604u, sel);
   const uint32_t m = ((w4 >> 3) & 0x01010101u) * 0xFFu;
   return __vsub4(mag ^ m, m);
@@ -53,10 +53,9 @@ __device__ __forceinline__ uint32_t nib4_hi_to_mag2(uint32_t w4) {
 // (hi, lo) -> one packed e2m1x2 byte, exactly cvt.rn.satfinite.
 __device__ __forceinline__ uint32_t cvt_e2m1x2(float hi, float lo) {
   uint32_t d;
-  asm volatile(
-      "{\n\t.reg .b8 t;\n\tcvt.rn.satfinite.e2m1x2.f32 t, %1, %2;\n\tcvt.u32.u8 %0, t;\n\t}"
-      : "=r"(d)
-      : "f"(hi), "f"(lo));
+  asm volatile("{\n\t.reg .b8 t;\n\tcvt.rn.satfinite.e2m1x2.f32 t, %1, %2;\n\tcvt.u32.u8 %0, t;\n\t}"
+               : "=r"(d)
+               : "f"(hi), "f"(lo));
   return d;
 }
 
@@ -69,17 +68,17 @@ __device__ __forceinline__ uint8_t cvt_e4m3(float v) {
 // signed mag2 planes + fp32 group scales, ready for the fc2 dp4a.
 template <uint32_t N, uint32_t K, uint32_t kTopK, bool kUsePDL>
 __global__ void __launch_bounds__(256) nvfp4_moe_gemv_fc1_kernel(
-    int32_t* __restrict__ zev,          // [kTopK, N/8] even-elem mag2 planes
-    int32_t* __restrict__ zod,          // [kTopK, N/8]
-    float* __restrict__ zsf,            // [kTopK, N/16] fp32(e4m3 sf)
-    const bf16_t* __restrict__ x,       // [K]
-    const uint8_t* __restrict__ w,      // [E, N, K/2] packed fp4
-    const uint8_t* __restrict__ wsf,    // [E, N, K/16] e4m3
-    const float* __restrict__ alpha1,   // [E] = s_in1 * s_w1
-    const float* __restrict__ ga1,      // scalar = 1 / s_in1
-    const float* __restrict__ ga2,      // scalar = 1 / s_in2
+    int32_t* __restrict__ zev,         // [kTopK, N/8] even-elem mag2 planes
+    int32_t* __restrict__ zod,         // [kTopK, N/8]
+    float* __restrict__ zsf,           // [kTopK, N/16] fp32(e4m3 sf)
+    const bf16_t* __restrict__ x,      // [K]
+    const uint8_t* __restrict__ w,     // [E, N, K/2] packed fp4
+    const uint8_t* __restrict__ wsf,   // [E, N, K/16] e4m3
+    const float* __restrict__ alpha1,  // [E] = s_in1 * s_w1
+    const float* __restrict__ ga1,     // scalar = 1 / s_in1
+    const float* __restrict__ ga2,     // scalar = 1 / s_in2
     const int32_t* __restrict__ topk_ids) {
-  constexpr uint32_t kWords = K / 8;    // source packed u32 count
+  constexpr uint32_t kWords = K / 8;  // source packed u32 count
   constexpr uint32_t kGroups = K / 16;
   __shared__ int32_t sxe[kWords];
   __shared__ int32_t sxo[kWords];
@@ -209,13 +208,13 @@ __global__ void __launch_bounds__(256) nvfp4_moe_gemv_fc1_kernel(
 // ------------- Kernel B: fc2 + routed finalize -> bf16 out -------------
 template <uint32_t N, uint32_t K, uint32_t kTopK, uint32_t kNumWarps, bool kUsePDL>
 __global__ void __launch_bounds__(kNumWarps * 32, 2) nvfp4_moe_gemv_fc2_kernel(
-    bf16_t* __restrict__ out,             // [N]
-    const int32_t* __restrict__ zev,      // [kTopK, K/8]
-    const int32_t* __restrict__ zod,      // [kTopK, K/8]
-    const float* __restrict__ zsf,        // [kTopK, K/16]
-    const uint8_t* __restrict__ w,        // [E, N, K/2]
-    const uint8_t* __restrict__ wsf,      // [E, N, K/16]
-    const float* __restrict__ alpha2,     // [E] = s_in2 * s_w2
+    bf16_t* __restrict__ out,          // [N]
+    const int32_t* __restrict__ zev,   // [kTopK, K/8]
+    const int32_t* __restrict__ zod,   // [kTopK, K/8]
+    const float* __restrict__ zsf,     // [kTopK, K/16]
+    const uint8_t* __restrict__ w,     // [E, N, K/2]
+    const uint8_t* __restrict__ wsf,   // [E, N, K/16]
+    const float* __restrict__ alpha2,  // [E] = s_in2 * s_w2
     const int32_t* __restrict__ topk_ids,
     const float* __restrict__ topk_weights) {
   constexpr uint32_t kBytes = K / 2;
@@ -243,8 +242,7 @@ __global__ void __launch_bounds__(kNumWarps * 32, 2) nvfp4_moe_gemv_fc2_kernel(
     // dp4a/PRMT decode of the current one runs, so the DRAM stream does not
     // stall behind the ALU tail.
     uint32_t c = lane * 16;
-    uint4 wv = c < kBytes ? __ldcs(reinterpret_cast<const uint4*>(wr + c))
-                          : uint4{0u, 0u, 0u, 0u};
+    uint4 wv = c < kBytes ? __ldcs(reinterpret_cast<const uint4*>(wr + c)) : uint4{0u, 0u, 0u, 0u};
     while (c < kBytes) {
       const uint32_t cn = c + 32 * 16;
       uint4 wnext;
@@ -314,17 +312,17 @@ struct Sm120Nvfp4MoeGemvKernel {
     TensorMatcher({kTopK * (N1 / 16)}).with_dtype<fp32_t>().with_device(device).verify(zsf);
     LaunchKernel({N1 / 16, kTopK, 1}, 256, device.unwrap())
         .enable_pdl(kUsePDL)(
-        nvfp4_moe_gemv_fc1_kernel<N1, K1, kTopK, kUsePDL>,
-        static_cast<int32_t*>(zev.data_ptr()),
-        static_cast<int32_t*>(zod.data_ptr()),
-        static_cast<float*>(zsf.data_ptr()),
-        static_cast<const bf16_t*>(x.data_ptr()),
-        static_cast<const uint8_t*>(w.data_ptr()),
-        static_cast<const uint8_t*>(wsf.data_ptr()),
-        static_cast<const float*>(alpha1.data_ptr()),
-        static_cast<const float*>(ga1.data_ptr()),
-        static_cast<const float*>(ga2.data_ptr()),
-        static_cast<const int32_t*>(topk_ids.data_ptr()));
+            nvfp4_moe_gemv_fc1_kernel<N1, K1, kTopK, kUsePDL>,
+            static_cast<int32_t*>(zev.data_ptr()),
+            static_cast<int32_t*>(zod.data_ptr()),
+            static_cast<float*>(zsf.data_ptr()),
+            static_cast<const bf16_t*>(x.data_ptr()),
+            static_cast<const uint8_t*>(w.data_ptr()),
+            static_cast<const uint8_t*>(wsf.data_ptr()),
+            static_cast<const float*>(alpha1.data_ptr()),
+            static_cast<const float*>(ga1.data_ptr()),
+            static_cast<const float*>(ga2.data_ptr()),
+            static_cast<const int32_t*>(topk_ids.data_ptr()));
   }
 
   static void run_fc2(
@@ -347,16 +345,16 @@ struct Sm120Nvfp4MoeGemvKernel {
     constexpr uint32_t kNumWarps = kTopK;
     LaunchKernel({N2, 1, 1}, kNumWarps * 32, device.unwrap())
         .enable_pdl(kUsePDL)(
-        nvfp4_moe_gemv_fc2_kernel<N2, K2, kTopK, kNumWarps, kUsePDL>,
-        static_cast<bf16_t*>(out.data_ptr()),
-        static_cast<const int32_t*>(zev.data_ptr()),
-        static_cast<const int32_t*>(zod.data_ptr()),
-        static_cast<const float*>(zsf.data_ptr()),
-        static_cast<const uint8_t*>(w.data_ptr()),
-        static_cast<const uint8_t*>(wsf.data_ptr()),
-        static_cast<const float*>(alpha2.data_ptr()),
-        static_cast<const int32_t*>(topk_ids.data_ptr()),
-        static_cast<const float*>(topk_weights.data_ptr()));
+            nvfp4_moe_gemv_fc2_kernel<N2, K2, kTopK, kNumWarps, kUsePDL>,
+            static_cast<bf16_t*>(out.data_ptr()),
+            static_cast<const int32_t*>(zev.data_ptr()),
+            static_cast<const int32_t*>(zod.data_ptr()),
+            static_cast<const float*>(zsf.data_ptr()),
+            static_cast<const uint8_t*>(w.data_ptr()),
+            static_cast<const uint8_t*>(wsf.data_ptr()),
+            static_cast<const float*>(alpha2.data_ptr()),
+            static_cast<const int32_t*>(topk_ids.data_ptr()),
+            static_cast<const float*>(topk_weights.data_ptr()));
   }
 };
 

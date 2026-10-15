@@ -2519,6 +2519,7 @@ class FlashInferMultiStepDraftBackend:
         host_lengths = forward_batch.seq_lens_cpu
         use_host_indptr = (
             envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.get()
+            and self.draft_window_size == 0
             and host_lengths is not None
             and host_lengths.device.type == "cpu"
             and host_lengths.numel() == num_seqs
