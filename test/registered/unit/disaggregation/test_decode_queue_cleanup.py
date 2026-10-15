@@ -516,7 +516,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             req, queue.tree_cache, checkpoint=False
         )
 
-    def test_retracted_decode_requests_keep_scheduler_non_idle(self):
+    def _idle_decode_scheduler(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
@@ -531,15 +531,31 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            queue=[], retracted_queue=[object()]
+            queue=[], retracted_queue=[]
         )
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer_queue.queue = []
+        transfer_queue._deferred_releases = []
+        scheduler.disagg_decode_transfer_queue = transfer_queue
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
+        self.assertTrue(scheduler.is_fully_idle())
+        return scheduler
 
+    def test_retracted_decode_requests_keep_scheduler_non_idle(self):
+        scheduler = self._idle_decode_scheduler()
+        scheduler.disagg_decode_prealloc_queue.retracted_queue.append(object())
         self.assertFalse(scheduler.is_fully_idle())
+
+    def test_held_deferred_release_keeps_scheduler_non_idle(self):
+        # A flush here would clear the allocator under pages the hold still owns.
+        scheduler = self._idle_decode_scheduler()
+        transfer_queue = scheduler.disagg_decode_transfer_queue
+        transfer_queue._deferred_releases.append((object(), 0.0, 0.0, 0, 1))
+        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(scheduler.is_fully_idle(ignore_waiting=True))
 
 
 class _GateReceiver:
