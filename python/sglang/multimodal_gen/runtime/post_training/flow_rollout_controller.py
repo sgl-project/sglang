@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Union
 
 import torch
@@ -14,13 +15,33 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
-    RolloutSessionData,
 )
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
+
+
+@dataclass
+class RolloutSessionData:
+    """Per-batch rollout state created by prepare_rollout(), lives on the batch object.
+
+    Cleared by setting ``batch._rollout_session_data = None``.
+    """
+
+    pipeline_config: Any = None
+    sigma_max: float = 0.0
+    latents_shape: tuple | None = None
+    noise_buffer: torch.Tensor | None = None
+
+    local_log_prob_sum: list[torch.Tensor] = field(default_factory=list)
+    local_log_prob_count: list[torch.Tensor] = field(default_factory=list)
+
+    local_variance_noises: list[torch.Tensor] = field(default_factory=list)
+    local_prev_sample_means: list[torch.Tensor] = field(default_factory=list)
+    local_noise_std_devs: list[torch.Tensor] = field(default_factory=list)
+    local_model_outputs: list[torch.Tensor] = field(default_factory=list)
 
 
 class SchedulerRLDebugMixin:
