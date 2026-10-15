@@ -42,9 +42,26 @@ constexpr uint32_t kBlockSize = 512;
 #ifdef SGL_TOPK_DYNAMIC_SMEM_BYTES
 constexpr size_t kSMEM = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
 #else
-constexpr size_t kSMEM = 48 * 1024;  // bytes
+constexpr size_t kSMEM = 48 * 1024;  // bytes (conservative default for multi-arch)
 #endif
 static_assert(kSMEM % (2 * sizeof(int32_t)) == 0, "kSMEM must be a multiple of 8 bytes.");
+
+#ifdef USE_ROCM
+// Runtime GPU architecture detection for ROCm multi-arch shared memory sizing.
+// - gfx950 (MI350): 64KB dynamic smem for best performance
+// - gfx1250 (RDNA4): 40KB conservative to preserve occupancy
+// - gfx942 (MI300) and others: 48KB
+inline static size_t get_ksmem_size() {
+  static const size_t smem_size = [] {
+    hipDeviceProp_t prop;
+    hipGetDeviceProperties(&prop, 0);
+    if (strncmp(prop.gcnArchName, "gfx950", 6) == 0) return size_t(64 * 1024);
+    if (strncmp(prop.gcnArchName, "gfx1250", 7) == 0) return size_t(40 * 1024);
+    return size_t(48 * 1024);
+  }();
+  return smem_size;
+}
+#endif
 
 // seq_lens[b] must not exceed scores.size(1) or page_table.size(1) << page_bits: a row reads up to its length
 struct TopKParams {
@@ -102,11 +119,12 @@ __device__ void naive_paged_transform(
   }
 }
 
+template <size_t SMEM_SIZE>
 __device__ void
-radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, uint32_t length, uint32_t topk) {
+radix_topk_impl(const float* __restrict__ input, int32_t* __restrict__ output, uint32_t length, uint32_t topk) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t BLOCK_SIZE = kBlockSize;
-  constexpr uint32_t SMEM_INPUT_SIZE = kSMEM / (2 * sizeof(int32_t));
+  constexpr uint32_t SMEM_INPUT_SIZE = SMEM_SIZE / (2 * sizeof(int32_t));
 
   alignas(128) __shared__ uint32_t _s_histogram_buf[2][RADIX + 32];
   alignas(128) __shared__ uint32_t s_counter;
@@ -114,7 +132,8 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, uint32
   alignas(128) __shared__ uint32_t s_num_input[2];
   alignas(128) __shared__ int32_t s_last_remain;
 
-  extern __shared__ uint32_t s_input_idx[][SMEM_INPUT_SIZE];
+  extern __shared__ uint32_t s_input_idx_1d[];
+  uint32_t (*s_input_idx)[SMEM_INPUT_SIZE] = (uint32_t (*)[SMEM_INPUT_SIZE])s_input_idx_1d;
 
   const uint32_t tx = threadIdx.x;
   uint32_t remain_topk = topk;
@@ -364,6 +383,7 @@ __device__ __forceinline__ uint32_t next_pow2_at_least_64(uint32_t x) {
 }
 #endif  // USE_ROCM
 
+template <size_t SMEM_SIZE>
 __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(const TopKParams params) {
   const auto bid = blockIdx.x;
   const auto seq_len = params.seq_lens[bid];
@@ -391,7 +411,7 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(
       s_topk_indices[i] = static_cast<int32_t>(i);
     }
   } else {
-    radix_topk(score_ptr, s_topk_indices, static_cast<uint32_t>(seq_len), topk);
+    radix_topk_impl<SMEM_SIZE>(score_ptr, s_topk_indices, static_cast<uint32_t>(seq_len), topk);
   }
   __syncthreads();
 
@@ -440,15 +460,30 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(
   }
 }
 
-template <auto* f, size_t kMaxDynamicSMEM>
+template <auto* f, size_t max_dynamic_smem>
 void setup_kernel_smem_once() {
   [[maybe_unused]]
   static const auto result = [] {
 #ifdef USE_ROCM
     return ::cudaFuncSetAttribute(
-        reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+        reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
 #else
-    return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+    return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#endif
+  }();
+  TORCH_CHECK(
+      result == cudaSuccess, "deepseek_v4_topk_transform: cudaFuncSetAttribute failed: ", ::cudaGetErrorString(result));
+}
+
+template <auto* f>
+void setup_kernel_smem_runtime(size_t max_dynamic_smem) {
+  [[maybe_unused]]
+  static const auto result = [max_dynamic_smem] {
+#ifdef USE_ROCM
+    return ::cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#else
+    return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
 #endif
   }();
   TORCH_CHECK(
@@ -539,8 +574,22 @@ void deepseek_v4_topk_transform_512(
   const dim3 grid(static_cast<uint32_t>(B));
   const dim3 block(kBlockSize);
 
-  setup_kernel_smem_once<deepseek_v4_topk_transform_kernel, kSMEM>();
-  deepseek_v4_topk_transform_kernel<<<grid, block, kSMEM, stream>>>(params);
+#ifdef USE_ROCM
+  const size_t kSmem_runtime = get_ksmem_size();
+  if (kSmem_runtime == 64 * 1024) {
+    setup_kernel_smem_runtime<deepseek_v4_topk_transform_kernel<64 * 1024>>(kSmem_runtime);
+    deepseek_v4_topk_transform_kernel<64 * 1024><<<grid, block, kSmem_runtime, stream>>>(params);
+  } else if (kSmem_runtime == 40 * 1024) {
+    setup_kernel_smem_runtime<deepseek_v4_topk_transform_kernel<40 * 1024>>(kSmem_runtime);
+    deepseek_v4_topk_transform_kernel<40 * 1024><<<grid, block, kSmem_runtime, stream>>>(params);
+  } else {
+    setup_kernel_smem_runtime<deepseek_v4_topk_transform_kernel<48 * 1024>>(kSmem_runtime);
+    deepseek_v4_topk_transform_kernel<48 * 1024><<<grid, block, kSmem_runtime, stream>>>(params);
+  }
+#else
+  setup_kernel_smem_once<deepseek_v4_topk_transform_kernel<kSMEM>, kSMEM>();
+  deepseek_v4_topk_transform_kernel<kSMEM><<<grid, block, kSMEM, stream>>>(params);
+#endif
 
   const auto err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "deepseek_v4_topk_transform kernel launch failed: ", ::cudaGetErrorString(err));
