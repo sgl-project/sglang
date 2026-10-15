@@ -1,7 +1,17 @@
 import hashlib
 import logging
 import time
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import torch
 import torch.distributed as dist
@@ -54,6 +64,14 @@ class QuantizedWeight(NamedTuple):
     comparable_cls: type[ComparableWeight]
     scale_name: str
     is_shuffled: bool = False
+    global_scale_name: Optional[str] = None
+    # backend repacks derived from the weight; neither compared nor hashed
+    derived_names: Tuple[str, ...] = ()
+
+    def scale_names(self) -> Tuple[str, ...]:
+        if self.global_scale_name is None:
+            return (self.scale_name,)
+        return (self.scale_name, self.global_scale_name)
 
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
@@ -364,14 +382,16 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
             continue
         prefix = f"{module_name}." if module_name else ""
         own = dict(module.named_parameters(recurse=False))
-        for name, parameter in own.items():
-            scale = name.replace("weight", comparable_cls.SCALE_SUFFIX)
-            if name.endswith("weight") and scale in own:
-                quantized_set[prefix + name] = QuantizedWeight(
-                    comparable_cls,
-                    prefix + scale,
-                    getattr(parameter, "is_shuffled", False),
-                )
+        for names in comparable_cls.match_quantized_weights(own.keys()):
+            quantized_set[prefix + names.weight] = QuantizedWeight(
+                comparable_cls,
+                prefix + names.scale,
+                getattr(own[names.weight], "is_shuffled", False),
+                global_scale_name=(
+                    None if names.global_scale is None else prefix + names.global_scale
+                ),
+                derived_names=tuple(prefix + name for name in names.derived),
+            )
     return quantized_set
 
 
@@ -384,18 +404,23 @@ def _build_check_entries(
     else is raw."""
     skip_compare_names = set(skip_compare_names)
     quantized_set = quantized_set or {}
-    scale_names = {qw.scale_name for qw in quantized_set.values()}
+    scale_names = {name for qw in quantized_set.values() for name in qw.scale_names()}
+    derived_names = {name for qw in quantized_set.values() for name in qw.derived_names}
 
     for name, tensor in raw.items():
         if name in scale_names:
             continue  # compared via its weight's comparable
+        if name in derived_names:
+            continue  # recomputed from its weight, which is compared
         if name in quantized_set:
             qw = quantized_set[name]
             yield CheckEntry(
                 name,
                 True,
                 qw.comparable_cls(
-                    tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
+                    tensor,
+                    *(raw[scale] for scale in qw.scale_names()),
+                    is_shuffled=qw.is_shuffled,
                 ),
             )
         else:

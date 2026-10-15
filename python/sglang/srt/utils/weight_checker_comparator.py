@@ -1,4 +1,4 @@
-from typing import Iterable, NamedTuple, Optional, Tuple
+from typing import Collection, Iterable, Iterator, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -20,6 +20,9 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
     ModelOptNvFp4FusedMoEMethod,
 )
+from sglang.srt.layers.quantization.muse_spark_nvfp4_moe import (
+    MuseSparkNvFp4FusedMoEMethod,
+)
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
 # chunk to avoid too high GPU memory peak
@@ -33,11 +36,30 @@ class CompareResult(NamedTuple):
     num_exceed: int  # elements past the combined per-side tolerance
 
 
+class QuantizedNames(NamedTuple):
+    """Parameter names of one quantized weight on its module."""
+
+    weight: str
+    scale: str
+    global_scale: Optional[str] = None
+    # Backend repacks computed from this weight; neither compared nor hashed.
+    derived: Tuple[str, ...] = ()
+
+
 class ComparableWeight:
     """Base comparable-weight class; one subclass per precision or raw tensor."""
 
     # `<x>weight` pairs with `<x>SCALE_SUFFIX` on the same module
     SCALE_SUFFIX = "weight_scale_inv"
+
+    @classmethod
+    def match_quantized_weights(
+        cls, param_names: Collection[str]
+    ) -> Iterator[QuantizedNames]:
+        for name in param_names:
+            scale = name.replace("weight", cls.SCALE_SUFFIX)
+            if name.endswith("weight") and scale in param_names:
+                yield QuantizedNames(name, scale)
 
     @staticmethod
     def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
@@ -261,6 +283,143 @@ class Mxfp4MarlinComparable(ComparableWeight):
         return torch.cat(chunks).reshape(*self.w_q.shape[:-2], self.size_n, self.size_k)
 
 
+_NVFP4_GROUP_SIZE = 16
+
+
+class NvFp4Comparable(ComparableWeight):
+    """ModelOpt NVFP4 experts in checkpoint layout: e2m1 pairs `(E, N, K/2)` uint8, low
+    nibble first; e4m3 block scales `(E, N, K/16)`; fp32 global scales `(E,)`, or
+    `(E, S)` with one column per equal row block (gate/up halves of a fused w13).
+
+    Compared in dequantized space, so a re-quantization with different but equivalent
+    scales compares equal, and one that rounds differently stays within ULP tolerance.
+    The Marlin repack derived from these tensors is excluded from compare and checksum."""
+
+    SCALE_SUFFIX = "_weight_scale"
+    GLOBAL_SCALE_SUFFIX = "_weight_scale_2"
+    # Marlin repack (prepare_moe_nvfp4_layer_for_marlin) of each checkpoint-layout stack
+    _MARLIN_REPACK_PREFIX = {"gate_up_proj": "w13", "down_proj": "w2"}
+
+    def __init__(
+        self,
+        w_q: torch.Tensor,
+        w_s: torch.Tensor,
+        w_s2: torch.Tensor,
+        is_shuffled: bool = False,
+    ):
+        # the checker passes every quantized weight's AITER shuffle flag; NVFP4 never shuffles
+        assert not is_shuffled, "NVFP4 checkpoint-layout experts are never shuffled"
+        assert w_q.dtype == torch.uint8, f"expected packed e2m1 bytes, got {w_q.dtype}"
+        self.w_q = w_q
+        self.w_s = w_s
+        self.w_s2 = w_s2
+        self.size_n = w_q.shape[-2]
+        self.size_k = w_q.shape[-1] * 2
+        assert tuple(w_s.shape) == (
+            *w_q.shape[:-1],
+            self.size_k // _NVFP4_GROUP_SIZE,
+        ), (
+            f"scale shape {tuple(w_s.shape)} does not match weight shape {tuple(w_q.shape)}"
+        )
+        lead = tuple(w_q.shape[:-2])
+        self.num_shards = 1 if tuple(w_s2.shape) == lead else w_s2.shape[-1]
+        assert tuple(w_s2.shape) in (lead, (*lead, self.num_shards)) and (
+            self.size_n % self.num_shards == 0
+        ), (
+            f"global scale shape {tuple(w_s2.shape)} does not match weight shape "
+            f"{tuple(w_q.shape)}"
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"nvfp4(shape={tuple(self.w_q.shape)} dtype={self.w_q.dtype} "
+            f"shards={self.num_shards})"
+        )
+
+    @classmethod
+    def match_quantized_weights(
+        cls, param_names: Collection[str]
+    ) -> Iterator[QuantizedNames]:
+        for name in param_names:
+            scale = name + cls.SCALE_SUFFIX
+            global_scale = name + cls.GLOBAL_SCALE_SUFFIX
+            if scale not in param_names or global_scale not in param_names:
+                continue
+            prefix = cls._MARLIN_REPACK_PREFIX.get(name)
+            derived = (
+                ()
+                if prefix is None
+                else (
+                    f"{prefix}_weight",
+                    f"{prefix}_weight_scale",
+                    f"{prefix}_weight_scale_2",
+                )
+            )
+            yield QuantizedNames(
+                name,
+                scale,
+                global_scale,
+                tuple(n for n in derived if n in param_names),
+            )
+
+    def _dequantize_experts(self, w_q, w_s, w_s2):
+        """`(e, N, K/2)` uint8 + `(e, N, K/16)` e4m3 + `(e[, S])` fp32 -> dequantized and
+        ULP tensors `(e, N, K)` in fp32."""
+        num_experts = w_q.shape[0]
+        nibbles = torch.stack((w_q & 0xF, w_q >> 4), dim=-1)
+        magnitude = (nibbles & 0x7).long()
+        sign = 1.0 - 2.0 * ((nibbles >> 3) & 0x1).to(torch.float32)
+        values = torch.tensor(_E2M1_VALUES, device=w_q.device)[magnitude] * sign
+        spacing = torch.tensor(_E2M1_SPACING, device=w_q.device)[magnitude]
+        grouped = (
+            num_experts,
+            self.num_shards,
+            self.size_n // self.num_shards,
+            self.size_k // _NVFP4_GROUP_SIZE,
+            _NVFP4_GROUP_SIZE,
+        )
+        scale = w_s.to(torch.float32).reshape(*grouped[:-1], 1) * w_s2.to(
+            torch.float32
+        ).reshape(num_experts, self.num_shards, 1, 1, 1)
+        shape = (num_experts, self.size_n, self.size_k)
+        # +0.0 folds the -0 nibble into +0 so equal values hash equal
+        dequantized = (values.reshape(grouped) * scale).reshape(shape) + 0.0
+        ulp = (spacing.reshape(grouped) * scale.abs()).reshape(shape)
+        return dequantized, ulp
+
+    def _flat_experts(self):
+        return (
+            self.w_q.reshape(-1, *self.w_q.shape[-2:]),
+            self.w_s.reshape(-1, *self.w_s.shape[-2:]),
+            self.w_s2.reshape(-1, self.num_shards),
+        )
+
+    def _experts_per_chunk(self) -> int:
+        # the unpack holds several int64/float32 copies of every element
+        return max(1, CHUNK_NUMEL // (4 * self.size_n * self.size_k))
+
+    def iter_chunks(self):
+        q, s, s2 = self._flat_experts()
+        step = self._experts_per_chunk()
+        for e0 in range(0, q.shape[0], step):
+            yield self._dequantize_experts(
+                q[e0 : e0 + step].cuda(),
+                s[e0 : e0 + step].cuda(),
+                s2[e0 : e0 + step].cuda(),
+            )
+
+    def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        q, s, s2 = self._flat_experts()
+        step = self._experts_per_chunk()
+        chunks = [
+            self._dequantize_experts(
+                q[e0 : e0 + step], s[e0 : e0 + step], s2[e0 : e0 + step]
+            )[0].to(dtype)
+            for e0 in range(0, q.shape[0], step)
+        ]
+        return torch.cat(chunks).reshape(*self.w_q.shape[:-1], self.size_k)
+
+
 class RawComparable(ComparableWeight):
     """Bitwise equal compare on raw tensor."""
 
@@ -320,6 +479,16 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
+    if (
+        isinstance(quant_method, MuseSparkNvFp4FusedMoEMethod)
+        and quant_method.uses_marlin()
+    ):
+        if quant_method.keep_checkpoint_layout:
+            return NvFp4Comparable
+        raise NotImplementedError(
+            "weight checker needs the checkpoint-layout Muse Spark NVFP4 experts on "
+            "Marlin; restart with SGLANG_ENABLE_MUSE_SPARK_NVFP4_WEIGHT_UPDATE=1"
+        )
     if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
         if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):
             return None

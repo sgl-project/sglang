@@ -853,7 +853,6 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
-
             assert get_parallel().dp_size == 1, (
                 "data-parallel replicas are not supported for dynamic lora loading"
             )
