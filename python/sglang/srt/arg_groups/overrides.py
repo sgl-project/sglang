@@ -37,6 +37,7 @@ from sglang.srt.arg_groups.arg_utils import (
 # Compatibility re-exports; model providers import model_override_base directly.
 from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     _MODEL_OVERRIDE_FNS,
+    _MODEL_SAMPLING_OVERRIDE_FNS,
     _PREDICATE_OVERRIDE_FNS,
     MODEL_OVERRIDES,
     ResolvedView,
@@ -52,6 +53,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     record_of,
     register_model_override,
     register_model_override_predicate,
+    register_model_sampling_override,
     resolved_view,
     resolving_view,
     use_mla_backend,
@@ -77,6 +79,18 @@ from sglang.srt.utils.common import (
 # Registered post-process passes. This is a registry, not an execution order:
 # each pass is invoked from its own slot via run_post_process_pass.
 POST_PROCESS_PASSES: List[Callable[..., dict]] = []
+
+
+def apply_model_sampling_overrides(
+    sampling_params: Dict[str, Any], architectures: Optional[Sequence[str]]
+) -> Dict[str, Any]:
+    """Apply model declarations after defaults and request values are merged."""
+    for architecture in architectures or ():
+        for provider in _MODEL_SAMPLING_OVERRIDE_FNS.get(architecture, ()):
+            declared = provider(sampling_params)
+            if declared:
+                sampling_params = {**sampling_params, **declared}
+    return sampling_params
 
 
 def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:

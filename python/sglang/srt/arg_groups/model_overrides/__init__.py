@@ -1,4 +1,4 @@
-"""Per-model config-time override declarations, one module per family,
+"""Per-model override declarations, one module per family,
 mirroring the ``models/`` naming.
 
 Importing this package is what registers them. An architecture may be claimed
@@ -35,6 +35,7 @@ from sglang.srt.arg_groups.model_overrides import minimax_m2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import minimax_m3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import moss_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import muse_glimmer  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import muse_spark  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import nemotron_h  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import olmo2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_5  # noqa: F401

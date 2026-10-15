@@ -55,6 +55,7 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.arg_groups.overrides import apply_model_sampling_overrides
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
@@ -154,7 +155,6 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
-from sglang.srt.sampling.overrides import apply_model_sampling_overrides
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
