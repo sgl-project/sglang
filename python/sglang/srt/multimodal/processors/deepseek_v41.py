@@ -17,9 +17,9 @@ from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
     image_token_types,
+    num_image_tokens,
     patchify_image,
     patchify_image_rust,
-    num_image_tokens,
     prepare_image_gpu,
 )
 from sglang.srt.multimodal.processors.base_processor import (

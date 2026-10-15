@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -13,7 +14,6 @@ from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
-from sglang.srt.environ import envs
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -93,7 +93,7 @@ def _get_precomputed_embedding(
         host_offload_event.synchronize()
     precomputed_embeddings = []
     max_iterations = min(len(items_size) - 1, len(prefix_length))
-    fast_path=envs.SGLANG_EPD_PRECOMPUTED_EMBEDDING_FAST_PATH.get()
+    fast_path = envs.SGLANG_EPD_PRECOMPUTED_EMBEDDING_FAST_PATH.get()
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
@@ -139,7 +139,7 @@ def _get_precomputed_embedding(
         if fast_path and len(precomputed_embeddings) == 1:
             result = precomputed_embeddings[0]
             return result.reshape(-1, result.shape[-1])
-        
+
         # Normalize device across chunks before concat.
         target_device = next(
             (t.device for t in precomputed_embeddings if t.is_cuda),

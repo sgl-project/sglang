@@ -101,9 +101,8 @@ def load_media_item(
                 and img.mode != "RGB"
             ):
                 img = img.convert("RGB")
-            elif (
-                envs.SGLANG_ENCODER_EAGER_IMAGE_DECODE.get()
-                and not isinstance(img, torch.Tensor)
+            elif envs.SGLANG_ENCODER_EAGER_IMAGE_DECODE.get() and not isinstance(
+                img, torch.Tensor
             ):
                 # PIL decodes lazily; force it in the encoder I/O worker.
                 img.load()

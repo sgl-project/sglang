@@ -1864,7 +1864,7 @@ class Envs:
     # Force lazy PIL images to decode in the encoder I/O worker instead of
     # deferring that CPU work to the preprocessing/forward stage.
     SGLANG_ENCODER_EAGER_IMAGE_DECODE = EnvBool(True)
-    
+
     # Overlapped image loading: decode each batch's images in a pool of loader
     # processes off the GPU path so the next batch loads while the current one
     # encodes. When disabled, IMAGE batches decode inline on the dispatch path.
