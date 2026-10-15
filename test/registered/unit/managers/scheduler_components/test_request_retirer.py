@@ -375,7 +375,7 @@ class TestPreallocAbortLeavesThroughTheRetirer(CustomTestCase):
         queue.tree_cache = retirer.tree_cache
         queue.request_retirer = retirer
 
-        _, failed = queue.pop_preallocated([])
+        _, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         self.assertEqual(failed, [decode_req])
         retirer.tree_cache.finish.assert_called_once_with(

@@ -641,7 +641,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             ),
         )
 
-        preallocated, failed = queue.pop_preallocated([])
+        preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         self.assertEqual((preallocated, failed), ([], []))
         fits_budgets = queue._prealloc_reservation_fits.call_args.kwargs
