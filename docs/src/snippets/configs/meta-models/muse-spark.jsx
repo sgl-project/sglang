@@ -1,7 +1,11 @@
 // Muse Spark Open Deployment recipes preserve the original default commands.
 // Hardware and quantization are the only Deployment selectors; tuning lives
 // in Playground. NVIDIA uses FA4, MI355X uses Triton for DFlash draft attention.
-// Xeon keeps its CPU-engine INT4 recipe. H200 remains a placeholder.
+// Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node with
+// Marlin W4A16 experts and BF16 at TP16 across two nodes; it has no
+// SP/MegaMoE (SM100-only kernels). Every DFlash recipe sets
+// SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1: the draft config declares
+// 32768 positions and would otherwise cap the target's 1M context.
 export const config = {
   modelName: "Muse Spark Open",
   supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon"],
@@ -44,6 +48,7 @@ export const config = {
     b300: "lmsysorg/sglang:dev-muse-spark-open",
     gb300: "lmsysorg/sglang:dev-muse-spark-open",
     b200: "lmsysorg/sglang:dev-muse-spark-open",
+    h200: "lmsysorg/sglang:dev-muse-spark-open",
     mi355x: "lmsysorg/sglang-rocm:muse-spark-open",
     xeon: "lmsysorg/sglang:muse-spark-1.2-xeon",
   },
@@ -178,7 +183,11 @@ export const config = {
         showWhen: (s) => s.pdMode !== "decode",
         stripPrefixes: ["--enable-layernorm-sp"],
         options: [
-          { id: "on", label: "On", flags: ["--enable-layernorm-sp"] },
+          {
+            id: "on", label: "On", flags: ["--enable-layernorm-sp"],
+            disable: { hw: ["h200"] },
+            disableReason: "Layernorm SP needs SM100 collective GEMM kernels; unavailable on H200.",
+          },
           { id: "off", label: "Off" },
         ],
       },
@@ -189,8 +198,10 @@ export const config = {
         options: [
           {
             id: "on", label: "On", flags: ["--enable-megamoe-for-layernorm-sp"],
-            disable: { "flagSelect.prefillSp": ["off"] },
-            disableReason: "Enable Prefill Sequence Parallel first.",
+            disable: [
+              { when: { hw: ["h200"] }, reason: "Prefill MegaMoE needs SM100 kernels; unavailable on H200." },
+              { when: { "flagSelect.prefillSp": ["off"] }, reason: "Enable Prefill Sequence Parallel first." },
+            ],
           },
           { id: "off", label: "Off" },
         ],
@@ -280,12 +291,12 @@ export const config = {
 
   // One recipe per hardware/quantization pair, with the former Deployment
   // defaults baked in. Playground starts from these same flags and environment.
-  // H200 remains a placeholder; no verification badge is claimed.
+  // No verification badge is claimed.
   cells: [
     {
       match: { hw: "b300", quant: "nvfp4" },
       nnodes: 1,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
@@ -311,7 +322,7 @@ export const config = {
     {
       match: { hw: "b300", quant: "bf16" },
       nnodes: 1,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
@@ -336,7 +347,7 @@ export const config = {
     {
       match: { hw: "gb300", quant: "nvfp4" },
       nnodes: 1,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
@@ -362,7 +373,7 @@ export const config = {
     {
       match: { hw: "gb300", quant: "bf16" },
       nnodes: 2,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
@@ -387,7 +398,7 @@ export const config = {
     {
       match: { hw: "b200", quant: "nvfp4" },
       nnodes: 1,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
@@ -413,7 +424,7 @@ export const config = {
     {
       match: { hw: "b200", quant: "bf16" },
       nnodes: 1,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
@@ -435,6 +446,56 @@ export const config = {
         "--tool-call-parser muse",
       ],
     },
+    // H200: Hopper has no TRT-LLM FP4 MoE, so NVFP4 experts run as Marlin
+    // W4A16. BF16 leaves ~3.6 GB/GPU after weights, and the 1M-context verify
+    // graphs take ~2.9 GB of it, so it runs at 0.88 to keep a usable KV pool.
+    {
+      match: { hw: "h200", quant: "nvfp4" },
+      nnodes: 1,
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--quantization modelopt_fp4",
+        "--moe-runner-backend marlin",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path {{DRAFT_MODEL_ID}}",
+        "--speculative-draft-attention-backend fa4",
+        "--speculative-num-draft-tokens 8",
+        "--mm-feature-transport cpu",
+        "--enable-hierarchical-cache",
+        "--hicache-size 200",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
+      ],
+    },
+    {
+      match: { hw: "h200", quant: "bf16" },
+      nnodes: 2,
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 16",
+        "--ep-size 16",
+        "--dtype bfloat16",
+        "--mem-fraction-static 0.88",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path {{DRAFT_MODEL_ID}}",
+        "--speculative-draft-attention-backend fa4",
+        "--speculative-num-draft-tokens 8",
+        "--mm-feature-transport cpu",
+        "--enable-hierarchical-cache",
+        "--hicache-size 200",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
+      ],
+    },
     {
       match: { hw: "mi355x", quant: "mxfp4" },
       nnodes: 1,
@@ -442,6 +503,7 @@ export const config = {
         "SGLANG_USE_AITER=1",
         "SGLANG_USE_AITER_UNIFIED_ATTN=1",
         "MUSE_MOE_BACKEND=flydsl",
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -467,6 +529,7 @@ export const config = {
         "SGLANG_USE_AITER=1",
         "SGLANG_USE_AITER_UNIFIED_ATTN=1",
         "MUSE_MOE_BACKEND=flydsl",
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -493,6 +556,7 @@ export const config = {
         "SGLANG_USE_AITER=1",
         "SGLANG_USE_AITER_UNIFIED_ATTN=1",
         "MUSE_MOE_BACKEND=flydsl",
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",

@@ -1,6 +1,6 @@
 ---
 title: Muse Spark Open
-description: "Deploy Muse Spark Open with SGLang on B300, GB300, and B200 using NVFP4 or BF16 checkpoints, Dflash V2, and configurable prefill/decode disaggregation; For multi-platforms deployments, on MI355X using Quark MXFP4, the NVFP4 checkpoint requantized to MXFP4 at load, or BF16, with aiter attention, FlyDSL MoE and Dflash V2; and on Intel Xeon CPUs using INT4 checkpoints."
+description: "Deploy Muse Spark Open with SGLang on B300, GB300, B200, and H200 using NVFP4 or BF16 checkpoints, Dflash V2, and configurable prefill/decode disaggregation; For multi-platforms deployments, on MI355X using Quark MXFP4, the NVFP4 checkpoint requantized to MXFP4 at load, or BF16, with aiter attention, FlyDSL MoE and Dflash V2; and on Intel Xeon CPUs using INT4 checkpoints."
 tag: NEW
 ---
 
@@ -11,7 +11,7 @@ tag: NEW
 <Accordion title="Install SGLang">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-muse-spark-open     # NVIDIA B300 / GB300 / B200
+docker pull lmsysorg/sglang:dev-muse-spark-open     # NVIDIA B300 / GB300 / B200 / H200
 docker pull lmsysorg/sglang-rocm:muse-spark-open    # AMD MI355X
 docker pull lmsysorg/sglang:dev-muse-spark-xeon     # Intel Xeon CPU
 ```
@@ -20,7 +20,11 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
-Choose your **Hardware Platform** and **Quantization** below. The default is **B300 / NVFP4**. Each combination uses its default deployment recipe; use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation. **H200** is a placeholder; launch commands are not available yet.
+Choose your **Hardware Platform** and **Quantization** below. The default is **B300 / NVFP4**. Each combination uses its default deployment recipe; use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
+
+**H200:** NVFP4 runs on one 8x H200 node with Marlin W4A16 experts (`--moe-runner-backend marlin`), since Hopper has no TRT-LLM FP4 MoE. The BF16 checkpoint does not fit on one node, so it runs TP16/EP16 across two nodes; replace `<node-rank>` and `<node0-ip>` for each node. Prefill sequence parallel and MegaMoE need SM100 kernels and are unavailable on H200.
+
+**Dflash V2 context length:** the `RadixArk/Muse-Spark-Open-DFlash2` config declares 32768 positions, so every Dflash V2 recipe sets `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` to let the draft follow the target's native 1M context.
 
 **Xeon CPU service configuration:**
 
