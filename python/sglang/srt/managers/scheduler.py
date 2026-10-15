@@ -3972,12 +3972,13 @@ class Scheduler(
         """Waiting requests the admission loop can add next to the chunked request."""
         if running_batch.batch_is_full:
             return 0
-        # The chunked request takes one of the slots the admission loop counts.
+        # The chunked request takes one of the slots the admission loop counts,
+        # but it keeps its req_to_token row across chunks, so it needs no free row.
         slots = self.get_num_allocatable_reqs(
-            len(running_batch.reqs), running_batch=running_batch
+            len(running_batch.reqs),
+            running_batch=running_batch,
+            num_held_rows=int(self.chunked_req.kv.holds_kv),
         )
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            slots = min(slots, self.req_to_token_pool.available_size())
         if (prefill_max_requests := get_schedule().prefill_max_requests) is not None:
             slots = min(slots, prefill_max_requests)
         return slots - 1

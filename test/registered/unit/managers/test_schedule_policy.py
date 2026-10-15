@@ -3,7 +3,6 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler
@@ -431,21 +430,23 @@ class TestShortestPrefillFirst(CustomTestCase):
 class TestInterleavedWaitingRequestCap(CustomTestCase):
     """The chunk reservation must follow what admission can take this pass."""
 
-    def make_scheduler(self, *, available, mode=DisaggregationMode.NULL):
+    def make_scheduler(self, *, available, holds_kv=True):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.disaggregation_mode = mode
         scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: available)
         scheduler.beam_coordinator = SimpleNamespace(pending_member_rows=lambda b: 0)
+        scheduler.chunked_req = SimpleNamespace(kv=SimpleNamespace(holds_kv=holds_kv))
         return scheduler
 
     def test_cap_counts_the_chunked_request_slot(self):
         batch = SimpleNamespace(reqs=[], batch_is_full=False)
         for kwargs, prefill_max_requests, expected in (
-            (dict(available=8), None, 7),
+            # The chunked request keeps its row, so every free row admits a waiter.
+            (dict(available=8), None, 8),
             (dict(available=8), 3, 2),
-            # PD prefill counts every request against the free request slots.
-            (dict(available=8, mode=DisaggregationMode.PREFILL), None, 7),
-            (dict(available=1), None, 0),
+            (dict(available=1), None, 1),
+            (dict(available=0), None, 0),
+            # Without a held row the chunked request takes a free one itself.
+            (dict(available=1, holds_kv=False), None, 0),
         ):
             with self.subTest(**kwargs, prefill_max_requests=prefill_max_requests):
                 scheduler = self.make_scheduler(**kwargs)
