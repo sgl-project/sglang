@@ -240,7 +240,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
         self.layout = layout
-        self.size_per_token = item_bytes
+        self.size_per_token = self.layer_num * item_bytes // slot_page_size
         self.start_layer = 0
         self.end_layer = self.layer_num
         self.lock = threading.RLock()
@@ -411,10 +411,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return host_indices.numel() > 0
 
     def get_size_per_token(self):
-        return self.item_bytes
+        return self.layer_num * self.item_bytes // self.slot_page_size
 
     def get_ksize_per_token(self):
-        return self.item_bytes
+        return self.layer_num * self.item_bytes // self.slot_page_size
 
     def init_kv_buffer(self):
         return self.kv_buffer
@@ -756,7 +756,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.device_page_views = []
         self.gpu_device = device
         self._init_device_page_views()
-        self.size_per_token = self.state_page_bytes
+        self.size_per_token = self.layer_num * self.state_page_bytes // self.page_size
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
         available_bytes = host_memory_budget_bytes()
@@ -925,10 +925,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
         )
 
     def get_size_per_token(self):
-        return self.state_page_bytes
+        return self.layer_num * self.state_page_bytes // self.page_size
 
     def get_ksize_per_token(self):
-        return self.state_page_bytes
+        return self.layer_num * self.state_page_bytes // self.page_size
 
     def init_kv_buffer(self):
         return self.kv_buffer
