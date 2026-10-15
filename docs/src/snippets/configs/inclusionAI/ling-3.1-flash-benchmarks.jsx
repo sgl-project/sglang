@@ -4,15 +4,23 @@ export const benchmarks = [
     sglang_version: "dev-ling-3.1-flash",
     speed: [
       { workload: { dataset: "random", isl: 2048, osl: 512, max_concurrency: 1 },
-        ttft_ms: 217.91, tpot_ms: 3.63, tokens_per_sec_per_gpu: 156.7 },
+        ttft_ms: 230.5, tpot_ms: 3.29, tokens_per_sec_per_gpu: 166.1 },
+    ],
+    accuracy: { gsm8k_pct: 97.12, stop_rate_pct: 99.92 },
+    notes: "TP-only (EP=1) with NEXTN; full 1319-question GSM8K. bs=1 output 265.7 tok/s, acceptance length 2.58-2.60.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "dev-ling-3.1-flash",
+    speed: [
       { workload: { dataset: "random", isl: 4096, osl: 512, max_concurrency: 32 },
         ttft_ms: 680.80, tpot_ms: 19.06, tokens_per_sec_per_gpu: 1640.8 },
     ],
-    accuracy: { gsm8k_pct: 96.89, stop_rate_pct: 99.85 },
-    notes: "NEXTN. Matched standard-decoding control: GSM8K 96.97%, stop rate 99.77%. bs=1 output 250.7 tok/s, acceptance length 2.61 (random) / 2.13 (real text).",
+    accuracy: { gsm8k_pct: 96.89, stop_rate_pct: 99.77 },
+    notes: "EP8 with NEXTN. bs=1 250.7 tok/s (TPOT 3.63 ms); conc32 output 1458.5 tok/s. Matched standard-decoding control: 96.97% / 99.77%.",
   },
   {
-    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-ling-3.1-flash",
     speed: [
       { workload: { dataset: "random", isl: 2048, osl: 512, max_concurrency: 1 },

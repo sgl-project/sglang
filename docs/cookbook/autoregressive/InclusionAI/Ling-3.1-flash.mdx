@@ -37,7 +37,8 @@ RUN cd /sgl-workspace/sglang \
 
 Pick your hardware to generate the launch command:
 
-- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. Verified on H200 and GB300; H20-3e, H800, H100, and B200 recipes are provided unverified. On AMD MI300X/MI325X (gfx942) and MI350X/MI355X (gfx950), use the TP8 + EP8 AITER recipe (without speculative decoding). AMD MI325X and MI350X recipes (TP8 + EP8 with AITER, without speculative decoding) are provided unverified; the MI325X accuracy in the benchmark card was measured by AMD.
+- **Low-Latency** — TP-only (EP=1) with NEXTN speculative decoding for single-user chat and interactive requests. Verified on H200.
+- **High-Throughput** — expert-parallel (EP) serving for batch and multi-user traffic: TP8 + EP8 on H200/H800/H100/B200-class nodes, TP4 + EP4 on GB300, TP8 + EP8 with AITER on AMD MI300X/MI325X/MI350X/MI355X (without speculative decoding). Verified on H200 and GB300; other platforms are unverified. AMD MI325X and MI350X recipes (TP8 + EP8 with AITER, without speculative decoding) are provided unverified; the MI325X accuracy in the benchmark card was measured by AMD.
 
 For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. The combination is verified: prefix hits return from Mooncake L3 on every TP rank.
 
@@ -72,7 +73,7 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 - Leave `--mem-fraction-static` at its default. SGLang auto-selects the `ling3` reasoning and tool-call parsers for this architecture; you can change the parser settings in the Playground.
 - **NEXTN:** add `--speculative-algorithm NEXTN` for built-in MTP speculative decoding. Measured acceptance length is 2.61 on random tokens and 2.13 on real-text probes.
 - **Long context:** the checkpoint supports 262,144 tokens natively. For up to 1,048,576 tokens, add the YaRN override from §3.4.
-- **TP-only (EP=1) vs EP:** set **EP = 1** in the Playground for TP-only serving. On H200 it decodes about 9% faster at batch size 1 (TPOT 3.29 ms vs 3.63 ms, verified), while EP 8 leads at concurrency 32. TP-only relies on the loader's TP-requant support; it fails loudly at startup on builds without it.
+- **Topology:** the Low-Latency recipe runs TP-only (no `--ep-size`) and decodes about 9% faster at batch size 1 on H200 (TPOT 3.29 ms vs 3.63 ms, verified); the High-Throughput recipe adds `--ep 8` and leads at concurrency 32. TP-only relies on the loader's TP-requant support; it fails loudly at startup on builds without it.
 - For prefix-heavy, multi-turn workloads, select **Cache fork and tail** in the Playground. It combines `--mamba-radix-cache-strategy extra_buffer`, `--chunked-prefill-size 4096`, and `SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK=1`. GPU checks confirmed both fork and tail states are cached, saving about 576 tokens per subsequent turn in the measured workload.
 
 ### Playground support

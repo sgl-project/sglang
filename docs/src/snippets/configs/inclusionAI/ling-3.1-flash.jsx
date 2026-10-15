@@ -101,11 +101,6 @@ export const config = {
         label: "EP",
         values: [
           null,
-          {
-            value: 1,
-            disable: { hw: ["gb300"] },
-            disableReason: "TP-only needs eight GPUs; the GB300 recipe uses four.",
-          },
           4,
           {
             value: 8,
@@ -177,6 +172,18 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
+        "--speculative-algorithm NEXTN",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
         "--ep 8",
         "--speculative-algorithm NEXTN",
         "--host {{HOST_IP}}",
@@ -184,7 +191,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
@@ -197,7 +204,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h800", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h800", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
@@ -210,7 +217,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h100", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "h100", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: ["SGLANG_ENABLE_FP8_BLOCK_GEMV=1", "SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1"],
       flags: [
@@ -223,7 +230,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -235,7 +242,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -247,7 +254,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       warn: "Same TP8+EP8 AITER recipe as MI325X (both gfx942); not independently qualified. Requires the ROCm gated-MLA fix, which the listed nightly image predates; see [Install SGLang](#install).",
       env: ["SGLANG_USE_AITER=1"],
@@ -265,7 +272,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       warn: "AMD-validated recipe, not rerun by SGLang. Requires the ROCm gated-MLA fix, which the listed nightly image predates; see [Install SGLang](#install).",
       env: ["SGLANG_USE_AITER=1"],
@@ -283,7 +290,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       warn: "Same TP8+EP8 AITER recipe as MI325X with the gfx950 image; Ling-3.1-flash has not been qualified on this GPU. Requires the ROCm gated-MLA fix, which the listed nightly image predates; see [Install SGLang](#install).",
       env: ["SGLANG_USE_AITER=1"],
@@ -301,7 +308,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       warn: "Same TP8+EP8 AITER recipe as MI325X with the gfx950 MI35X image; bring-up only, not qualified. Requires the ROCm gated-MLA fix, which the listed nightly image predates; see [Install SGLang](#install).",
       env: ["SGLANG_USE_AITER=1"],
