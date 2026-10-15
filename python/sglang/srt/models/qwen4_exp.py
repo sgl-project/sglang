@@ -38,6 +38,7 @@ from sglang.srt.layers.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from sglang.srt.layers.hyperconnection_packed import PackedHCModelMixin
 from sglang.srt.layers.layer_boundary import (
     GatedResidualState,
     append_stages,
@@ -1433,9 +1434,14 @@ class _MixStreams:
         self.prepared_input = prepared_input
 
     def __call__(self, hidden_states):
-        return self.hyper_connection_mixer.mix_prepared(
-            hidden_states, self.prepared_input
-        )[0]
+        # The terminal, mix-only layer keeps the legacy tensor ABI and computes
+        # its own RMSNorm; packed sum state is only consumed by packed HC blocks.
+        prepared = (
+            self.prepared_input
+            if isinstance(self.prepared_input, torch.Tensor)
+            else None
+        )
+        return self.hyper_connection_mixer.mix_prepared(hidden_states, prepared)[0]
 
 
 @dataclass
@@ -1557,16 +1563,22 @@ class Qwen4ExpLayerExtensionMixin:
     @contextmanager
     def hc_inputs(self, prepared_input, next_norm):
         inputs = _HCInputs(prepared_input, next_norm)
-        # Sum-state checks its residual view; legacy norm reuse cannot move rows.
+        parallel = get_parallel()
+        # Matching storage metadata cannot detect in-place communication writes.
+        # Keep unvalidated DP/CP/A2A/scattered paths on fresh statistics. EP alone
+        # with replicated inputs and no A2A does not move the HC residual rows.
+        reuse_rows = (
+            parallel.attn_dp_size == 1
+            and parallel.attn_cp_size == 1
+            and not get_attn_tp_context().input_scattered
+            and get_moe_a2a_backend().is_none()
+        )
         self._hc_inputs = (
             inputs
-            if self.attn_hyper_connection._packed_sum_weights
-            or (
-                get_parallel().attn_dp_size == 1
-                and get_parallel().attn_cp_size == 1
-                and get_parallel().moe_ep_size == 1
-                and not get_attn_tp_context().input_scattered
-                and get_moe_a2a_backend().is_none()
+            if reuse_rows
+            and (
+                self.attn_hyper_connection._packed_sum_weights
+                or parallel.moe_ep_size == 1
             )
             else None
         )
@@ -2104,7 +2116,9 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         return model_output
 
 
-class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+class Qwen4ExpForConditionalGeneration(
+    PackedHCModelMixin, Qwen3VLForConditionalGeneration
+):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -2563,8 +2577,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
-            elif isinstance(module, GatedResidual):
-                module.prepare_sum_state_weights()
+
+        self.post_load_weights(force=False)
 
         return loaded_params
 

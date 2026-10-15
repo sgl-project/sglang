@@ -22,7 +22,7 @@ from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.hyperconnection import _HCSumContext
+    from sglang.srt.layers.hyperconnection_packed import _HCSumContext
 
 
 @dataclass
@@ -62,7 +62,7 @@ class GatedResidualState:
     sum_context: Optional["_HCSumContext"] = None
 
     def _read(self, mix, residual, out_norm):
-        from sglang.srt.layers.hyperconnection import _HCSumContext
+        from sglang.srt.layers.hyperconnection_packed import _HCSumContext
 
         if out_norm is not None:
             raise NotImplementedError(

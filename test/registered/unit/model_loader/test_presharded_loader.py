@@ -37,13 +37,12 @@ class TestPreshardedHCPreparation(CustomTestCase):
         }
         events = []
 
-        def prepare(*, force):
-            self.assertTrue(force)
+        def prepare():
             for name, weight in model.named_parameters():
                 torch.testing.assert_close(weight, checkpoint[name], rtol=0, atol=0)
             events.append("hc")
 
-        model.hc.prepare_sum_state_weights = mock.Mock(side_effect=prepare)
+        model.post_load_weights_from_preprocessed = mock.Mock(side_effect=prepare)
         model.hc.quant_method = mock.Mock()
         model.hc.quant_method.process_weights_after_loading.side_effect = (
             lambda module: events.append("quant")
@@ -86,7 +85,7 @@ class TestPreshardedHCPreparation(CustomTestCase):
         self.assertIs(result, model)
         self.assertFalse(model.training)
         self.assertEqual(events, ["quant", "aliases", "hc"])
-        model.hc.prepare_sum_state_weights.assert_called_once_with(force=True)
+        model.post_load_weights_from_preprocessed.assert_called_once_with()
         model.post_load_weights.assert_not_called()
 
 

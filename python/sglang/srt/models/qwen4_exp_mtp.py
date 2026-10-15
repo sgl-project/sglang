@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.hyperconnection_packed import PackedHCModelMixin
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -24,10 +25,8 @@ from sglang.srt.utils import add_prefix, is_npu
 logger = logging.getLogger(__name__)
 
 
-class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
+class Qwen4ExpForCausalLMMTP(PackedHCModelMixin, Qwen3_5ForCausalLMMTP):
     def load_weights(self, weights, is_mtp=False):
-        from sglang.srt.layers.hyperconnection import GatedResidual
-
         if any(getattr(p, "hc_merged_down_inject", False) for p in self.parameters()):
             weights = (
                 (
@@ -39,9 +38,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
                 for name, tensor in weights
             )
         loaded = super().load_weights(weights, is_mtp=is_mtp)
-        for module in self.modules():
-            if isinstance(module, GatedResidual):
-                module.prepare_sum_state_weights()
+        self.post_load_weights(force=False)
         return loaded
 
     def __init__(

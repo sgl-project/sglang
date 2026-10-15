@@ -79,6 +79,20 @@ class TestGatedResidualOps(CustomTestCase):
     def setUp(self):
         self.hidden = torch.arange(2 * HIDDEN, dtype=torch.float32).reshape(2, HIDDEN)
         self.output = torch.full((2, HIDDEN), 5.0)
+        self.hc_parallel = SimpleNamespace(
+            attn_dp_size=1, attn_cp_size=1, moe_ep_size=1
+        )
+        self.hc_tp = SimpleNamespace(input_scattered=False)
+        self.hc_a2a = Mock()
+        self.hc_a2a.is_none.return_value = True
+        for name, value in (
+            ("get_parallel", self.hc_parallel),
+            ("get_attn_tp_context", self.hc_tp),
+            ("get_moe_a2a_backend", self.hc_a2a),
+        ):
+            self.enterContext(
+                patch("sglang.srt.models.qwen4_exp." + name, return_value=value)
+            )
 
     def test_entry_widens_the_stack_input(self):
         ops = _state().residual_ops()
@@ -327,7 +341,7 @@ class TestGatedResidualOps(CustomTestCase):
 
     def _sum_context(self, rows=6):
         from sglang.kernels.ops.elementwise.hc_sum_state import HCSumBuffers, HCSumState
-        from sglang.srt.layers.hyperconnection import _HCSumContext
+        from sglang.srt.layers.hyperconnection_packed import _HCSumContext
 
         residual = torch.arange(rows * WIDE, dtype=torch.float32).view(rows, WIDE)
         state = HCSumState(residual, torch.ones(rows, 4))
@@ -393,25 +407,25 @@ class TestGatedResidualOps(CustomTestCase):
         self.assertIs(state.sum_context, context)
 
     def test_prepared_sum_reuse_requires_matching_residual_rows(self):
-        from sglang.srt.layers.hyperconnection import GatedResidual
+        from sglang.srt.layers.hyperconnection_packed import PackedGatedResidual
 
         context = self._sum_context()
         state = context.state
         layer = SimpleNamespace(mix=Mock())
-        GatedResidual.mix_prepared(layer, state.residual, state)
+        PackedGatedResidual.mix_prepared(layer, state.residual, state)
         layer.mix.assert_called_once_with(state)
         layer.mix.reset_mock()
         changed = state.residual + 1
-        GatedResidual.mix_prepared(layer, changed, state)
+        PackedGatedResidual.mix_prepared(layer, changed, state)
         layer.mix.assert_called_once_with(changed)
 
     def test_prepared_sum_odd_slice_preserves_values_when_realigning(self):
-        from sglang.srt.layers.hyperconnection import GatedResidual
+        from sglang.srt.layers.hyperconnection_packed import PackedGatedResidual
 
         state = self._sum_context().slice_rows(1, 2).state
         self.assertEqual(state.sum_sq.data_ptr() % 32, 16)
         layer = SimpleNamespace(mix=Mock())
-        GatedResidual.mix_prepared(layer, state.residual, state)
+        PackedGatedResidual.mix_prepared(layer, state.residual, state)
         used = layer.mix.call_args.args[0]
         self.assertIs(used.residual, state.residual)
         self.assertEqual(used.sum_sq.data_ptr() % 32, 0)
@@ -427,6 +441,33 @@ class TestGatedResidualOps(CustomTestCase):
                 self.assertIs(inputs.attn_input, prepared)
                 raise RuntimeError("failed core")
         self.assertIsNone(layer._hc_inputs)
+
+    def test_qwen_sum_handoff_guards_unvalidated_communication_modes(self):
+        for packed in (False, True):
+            for mode in ("plain", "ep", "dp", "cp", "scattered", "a2a"):
+                with self.subTest(packed=packed, mode=mode):
+                    self.hc_parallel.attn_dp_size = 2 if mode == "dp" else 1
+                    self.hc_parallel.attn_cp_size = 2 if mode == "cp" else 1
+                    self.hc_parallel.moe_ep_size = 2 if mode == "ep" else 1
+                    self.hc_tp.input_scattered = mode == "scattered"
+                    self.hc_a2a.is_none.return_value = mode != "a2a"
+                    layer = Qwen4ExpLayerExtensionMixin()
+                    layer.ple = None
+                    layer.attn_hyper_connection = SimpleNamespace(
+                        _packed_sum_weights=packed, mix_prepared=Mock()
+                    )
+                    prepared = self._sum_context().state
+                    # Pointer/shape/stride survive this write; metadata cannot
+                    # establish that the old sum still describes the residual.
+                    prepared.residual.add_(1)
+                    allowed = mode == "plain" or (packed and mode == "ep")
+                    with layer.hc_inputs(prepared, None) as inputs:
+                        layer._attn_mix(prepared.residual)
+                        layer.attn_hyper_connection.mix_prepared.assert_called_once_with(
+                            prepared.residual, prepared if allowed else None
+                        )
+                        self.assertEqual(layer._hc_inputs is inputs, allowed)
+                    self.assertIsNone(layer._hc_inputs)
 
     def test_qwen_ple_invalidates_prepared_statistics(self):
         layer = Qwen4ExpLayerExtensionMixin()

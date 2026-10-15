@@ -1637,32 +1637,28 @@ def _validate_branch_packed_tensors(a, b, out):
     return m, n, c * h
 
 
-def _validate_inv_rms(inv_rms, a, rows: int, group: int):
+def _validate_sum_sq(sum_sq, a, rows: int, group: int):
     if (
-        inv_rms.shape != (rows, group)
-        or inv_rms.dtype != _torch.float32
-        or inv_rms.device != a.device
-        or not inv_rms.is_contiguous()
-        or inv_rms.data_ptr() % 32
+        sum_sq.shape != (rows, group)
+        or sum_sq.dtype != _torch.float32
+        or sum_sq.device != a.device
+        or not sum_sq.is_contiguous()
+        or sum_sq.data_ptr() % 32
     ):
         raise ValueError(
             "RMS statistics must be aligned contiguous FP32 [M,C], matching a device"
         )
 
 
-def _raw_rms_input(inv_rms, sum_sq, a, rows, group, rms_eps):
-    """Exactly one read-only statistics representation; never an inv output."""
-    if inv_rms is not None and sum_sq is not None:
-        raise ValueError("provide inv_rms or sum_sq, not both")
+def _raw_sum_input(sum_sq, a, rows, group, rms_eps):
+    """Optional read-only sum statistics; inverse RMS is computed in the kernel."""
     if sum_sq is not None:
         import math
 
         if not math.isfinite(rms_eps) or rms_eps <= 0:
             raise ValueError("sum-state requires positive finite epsilon")
-    stats = sum_sq if sum_sq is not None else inv_rms
-    if stats is not None:
-        _validate_inv_rms(stats, a, rows, group)
-    return stats
+        _validate_sum_sq(sum_sq, a, rows, group)
+    return sum_sq
 
 
 def run_splitk_dense(
@@ -1728,7 +1724,6 @@ def run_splitk_dense_silu_aux(
     aux_start: int,
     aux_impl: str = "direct",
     *,
-    inv_rms=None,
     sum_sq=None,
     rms_eps=1e-6,
     branch_packed=False,
@@ -1740,8 +1735,8 @@ def run_splitk_dense_silu_aux(
     leave the trailing auxiliary slice of ``out`` untouched. In both modes, ``aux`` receives
     ``2 * sigmoid(scale * raw)`` directly from the FP32 accumulators before
     any output cast.
-    Raw callers provide either read-only ``inv_rms`` or read-only ``sum_sq``.
-    The latter computes its inverse RMS locally; no inv buffer is written.
+    Raw callers provide read-only ``sum_sq``. Inverse RMS is computed locally;
+    no inv buffer is written. Omit ``sum_sq`` for already-normalized inputs.
     ``branch_packed`` accepts the large-T weight view ``B[C,H,Npad]`` without
     repacking it. ``out.shape[1]`` supplies logical N; physical padding is not
     computed or stored. This mode requires raw RMS statistics and C=4.
@@ -1764,7 +1759,7 @@ def run_splitk_dense_silu_aux(
             "aux must be a 32-byte-aligned contiguous FP32 [M,width] tensor"
         )
     aux_width = aux.shape[1]
-    stats = _raw_rms_input(inv_rms, sum_sq, a, m, aux_width, rms_eps)
+    stats = _raw_sum_input(sum_sq, a, m, aux_width, rms_eps)
     if branch_packed and stats is None:
         raise ValueError("branch-packed Down requires raw RMS statistics")
     if stats is not None:
@@ -1825,7 +1820,6 @@ def run_splitk_dense_gate(
     scale: float,
     group: int,
     *,
-    inv_rms=None,
     norm_weight_permuted=None,
     sum_sq=None,
     next_sum_sq=None,
@@ -1834,8 +1828,9 @@ def run_splitk_dense_gate(
     """Fused ``logits = A @ B`` (B pre-permuted so ``n = j*group + g``) with
     ``out[m, j] = bf16(scale * sum_g sigmoid(logits[m, j*group+g]) *
     fp32(x[m, g*hs+j]))``; the logits matrix is never materialized and ``x``
-    doubles as its shape anchor. Raw callers supply read-only inv_rms OR
-    current sum_sq. next_sum_sq is a separate reset output, never that input.
+    doubles as its shape anchor. Raw callers supply read-only ``sum_sq``;
+    inverse RMS is computed locally. Omit ``sum_sq`` for already-normalized
+    inputs. ``next_sum_sq`` is a separate reset output, never that input.
     """
     m, n, k = _validate_runtime_tensors(a, b, None, x)
     validate_tactic(tactic, m, n, k)
@@ -1846,11 +1841,11 @@ def run_splitk_dense_gate(
             f"gate epilogue requires N={n} divisible by mma_m={tactic.mma_m}"
         )
     hs = n // group
-    stats = _raw_rms_input(inv_rms, sum_sq, a, m, group, rms_eps)
+    stats = _raw_sum_input(sum_sq, a, m, group, rms_eps)
     if next_sum_sq is not None:
         if stats is None:
             raise ValueError("sum reset requires raw gate")
-        _validate_inv_rms(next_sum_sq, a, m, group)
+        _validate_sum_sq(next_sum_sq, a, m, group)
         # Both statistics tensors are contiguous; reject partial overlap too.
         stat_bytes = stats.numel() * stats.element_size()
         if (
