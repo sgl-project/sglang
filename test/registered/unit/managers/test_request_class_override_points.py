@@ -68,6 +68,7 @@ def _scheduler(sessions, queued):
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.model_config = SimpleNamespace(hf_eos_token_id=None, vocab_size=VOCAB)
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
     scheduler.tokenizer = None
     scheduler.dllm_config = None
     scheduler._maybe_namespace_elastic_radix_cache = lambda req: None
