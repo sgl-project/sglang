@@ -641,14 +641,35 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        assert not getattr(self, "_is_dummy", False), (
-            "load on a dummy (non-src MLA) host pool"
-        )
         host_indices = maybe_dcp_kernel_indices(
             host_indices, self.dcp_size, self.dcp_rank
         )
         device_indices = maybe_dcp_kernel_indices(
             device_indices, self.dcp_size, self.dcp_rank
+        )
+        self._load_to_device_per_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
+        )
+
+    def _load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        # Indices arrive already translated by load_to_device_all_layer or the
+        # public load_to_device_per_layer wrapper; do NOT re-translate here.
+        assert not getattr(self, "_is_dummy", False), (
+            "load on a dummy (non-src MLA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
@@ -857,11 +878,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
-                self.load_to_device_per_layer(
+                self._load_to_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
                 )
             for draft_layer_id in range(len(self.mtp_draft_device_pools)):
-                self.load_to_device_per_layer(
+                self._load_to_device_per_layer(
                     self.mtp_draft_device_pools[draft_layer_id],
                     host_indices,
                     device_indices,
@@ -905,7 +926,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # for backup); no pf->lf all-layer counterpart exists. Fall back to
                 # the per-layer H2D loop (transfer_kv_per_layer_mla_pf_lf).
                 for layer_id in range(device_pool.layer_num):
-                    self.load_to_device_per_layer(
+                    self._load_to_device_per_layer(
                         device_pool, host_indices, device_indices, layer_id, io_backend
                     )
             else:
@@ -923,7 +944,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # transfer_kv_all_layer_direct_lf_pf is lf->pf (device->host) only;
                 # no all-layer pf->lf counterpart. Per-layer H2D fallback.
                 for layer_id in range(device_pool.layer_num):
-                    self.load_to_device_per_layer(
+                    self._load_to_device_per_layer(
                         device_pool, host_indices, device_indices, layer_id, io_backend
                     )
             else:
