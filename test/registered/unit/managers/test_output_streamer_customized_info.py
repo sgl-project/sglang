@@ -91,6 +91,9 @@ class _FakeReq:
     def finished(self):
         return self._finished
 
+    def get_mm_token_counts(self):
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
+
     def init_incremental_detokenize(self):
         return self.output_ids_through_stop, 0
 
@@ -98,7 +101,11 @@ class _FakeReq:
         return False
 
 
-def _accumulator(current_weight_version="default", return_sampling_mask=False):
+def _accumulator(
+    current_weight_version="default",
+    return_sampling_mask=False,
+    request_level_keys=frozenset(),
+):
     return _GenerationStreamAccumulator(
         return_logprob=False,
         return_hidden_states=False,
@@ -110,6 +117,7 @@ def _accumulator(current_weight_version="default", return_sampling_mask=False):
         default_stream_interval=1,
         default_force_stream_interval=1,
         get_cached_tokens_details=lambda req: None,
+        is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
     )
 
@@ -154,6 +162,105 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         self.assertEqual(
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
+        )
+
+    def test_request_level_value_is_preserved_for_finished_zero_token_request(self):
+        """A request that finishes with no output tokens still ships its value.
+
+        Token-sliced keys yield ``req_values[0:0]`` here, so without the
+        request-level path the one value a prefill-only request produced
+        would arrive as an empty list.
+        """
+        key = "prompt_score"
+        accumulator = _accumulator(request_level_keys=frozenset({key}))
+
+        accumulator.accept(
+            req=_FakeReq(
+                "prefill-only",
+                [],
+                customized_info={key: [386.25]},
+                finished=True,
+            )
+        )
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(
+            unwrap_from_pickle(payload.customized_info),
+            {key: [[386.25]]},
+        )
+
+    def test_request_level_customized_info_is_emitted_only_once(self):
+        """Streaming emits a request-level value with the first chunk only.
+
+        A later chunk that re-sends it would be appended by the receiver and
+        the client would read the same value twice.
+        """
+        key = "request_score"
+        req = _FakeReq("streaming", [10], customized_info={key: [386.25]})
+        req.stream = True
+
+        first = _accumulator(request_level_keys=frozenset({key}))
+        first.accept(req=req)
+        self.assertEqual(
+            unwrap_from_pickle(
+                first.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+            ),
+            {key: [[386.25]]},
+        )
+
+        req.output_ids.append(11)
+        second = _accumulator(request_level_keys=frozenset({key}))
+        second.accept(req=req)
+        self.assertIsNone(
+            second.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+        )
+
+    def test_nonstreaming_request_level_customized_info_waits_for_finish(self):
+        """Non-streaming requests emit the value with the terminal output only.
+
+        Intermediate outputs of a non-streaming request are coalesced on the
+        receiver, so emitting earlier would duplicate the value as well.
+        """
+        key = "request_score"
+        req = _FakeReq("nonstreaming", [10], customized_info={key: [386.25]})
+
+        intermediate = _accumulator(request_level_keys=frozenset({key}))
+        intermediate.accept(req=req)
+        self.assertIsNone(
+            intermediate.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+        )
+
+        req.output_ids.append(11)
+        req._finished = True
+        terminal = _accumulator(request_level_keys=frozenset({key}))
+        terminal.accept(req=req)
+        self.assertEqual(
+            unwrap_from_pickle(
+                terminal.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+            ),
+            {key: [[386.25]]},
+        )
+
+    def test_request_level_customized_info_uses_empty_list_for_missing_request(self):
+        """Requests without the key take an empty slot, not a ``None`` per token.
+
+        The per-request lists stay aligned with ``output_ids`` while the
+        receiver never sees token-shaped padding for a request-level key.
+        """
+        key = "request_score"
+        accumulator = _accumulator(request_level_keys=frozenset({key}))
+
+        without_score = _FakeReq("without-score", [10, 11])
+        without_score.stream = True
+        with_score = _FakeReq("with-score", [20], customized_info={key: [386.25]})
+        with_score.stream = True
+        accumulator.accept(req=without_score)
+        accumulator.accept(req=with_score)
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(
+            unwrap_from_pickle(payload.customized_info),
+            {key: [[], [386.25]]},
         )
 
     def test_additional_customized_info_uses_the_existing_payload(self):

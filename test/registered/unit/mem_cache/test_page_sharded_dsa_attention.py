@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveDSATokenToKVPool,
     PageInterleaveKVPoolMixin,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -30,6 +31,12 @@ register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestShardedDSAIndexerWrite(unittest.TestCase):
+    def setUp(self):
+        # Standalone pools size their index buffer from the DCP width.
+        cm = get_parallel().override(attn_dcp_size=1)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
     def test_cuda_writers_match_unsharded_bytes(self):
         from sglang.srt.layers.attention.dsa import dsa_indexer
 
@@ -154,6 +161,8 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.use_mha = False
     backend.use_fused_topk = False
     backend.num_q_heads = 8
+    backend.dcp_size = 1
+    backend.num_dcp_q_heads = backend.num_q_heads
     backend.kv_lora_rank = 512
     backend.qk_nope_head_dim = 128
     backend.qk_rope_head_dim = 64
@@ -498,7 +507,6 @@ def _run_attention(rank, world, init_method):
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from sglang.srt.runtime_context import get_parallel
     from sglang.test.test_utils import publish_build_topology
 
     os.environ.update(
