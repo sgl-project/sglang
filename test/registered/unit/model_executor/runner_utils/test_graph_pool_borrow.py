@@ -1,6 +1,7 @@
 """CUDA graph-pool borrowing allocator and lifetime regression tests."""
 
 import contextlib
+import dataclasses
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -10,7 +11,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.logprob_processor import InputLogprobProcessor
+from sglang.srt.layers.logprob_processor import (
+    DistributedLogprobContext,
+    InputLogprobProcessor,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -100,6 +104,162 @@ class TestGraphPoolBorrow(CustomTestCase):
                 ),
             ):
                 self.assertEqual(pool.graph_pool_borrow_can_fit(payload), expected)
+
+    def test_distributed_logprob_budget_and_symmetric_fallback(self):
+        processor = InputLogprobProcessor(vocab_size=1024)
+        context = DistributedLogprobContext(
+            tp_group=SimpleNamespace(world_size=4),
+            vocab_start_index=0,
+            vocab_end_index=120,
+            vocab_size=1024,
+            get_local_logits_fn=Mock(),
+            gather_sampled_logits_fn=Mock(),
+            local_vocab_size=128,
+            tp_size=4,
+        )
+        metadata = SimpleNamespace(
+            extend_return_top_logprob=True,
+            extend_token_ids_logprob=True,
+            top_logprobs_nums=[20, 0],
+            token_ids_logprobs=[list(range(9)), None],
+        )
+        bytes_per_row = processor._distributed_borrow_bytes_per_row(context, metadata)
+        self.assertEqual(
+            bytes_per_row,
+            2 * 128 * 4 + (160 + 16 * 4) * 10 + (160 + 64 * 4) * 20 + 96 + 32 * 4,
+        )
+
+        wider_probes = SimpleNamespace(
+            **(vars(metadata) | {"token_ids_logprobs": [list(range(100)), None]})
+        )
+        larger_topk = SimpleNamespace(
+            **(vars(metadata) | {"top_logprobs_nums": [200, 0]})
+        )
+        self.assertGreater(
+            processor._distributed_borrow_bytes_per_row(context, wider_probes),
+            bytes_per_row,
+        )
+        self.assertGreater(
+            processor._distributed_borrow_bytes_per_row(context, larger_topk),
+            bytes_per_row,
+        )
+        wider_probe_bytes = processor._distributed_borrow_bytes_per_row(
+            context, wider_probes
+        )
+        larger_topk_bytes = processor._distributed_borrow_bytes_per_row(
+            context, larger_topk
+        )
+
+        unknown_context = dataclasses.replace(context, local_vocab_size=None)
+        self.assertIsNone(
+            processor._distributed_borrow_bytes_per_row(unknown_context, metadata)
+        )
+        invalid_context = dataclasses.replace(context, local_vocab_size=119)
+        self.assertIsNone(
+            processor._distributed_borrow_bytes_per_row(invalid_context, metadata)
+        )
+
+        with (
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
+            patch.object(processor, "_can_borrow_logprob_memory") as can_borrow,
+        ):
+            self.assertFalse(
+                processor._can_borrow_distributed_logprob_memory(
+                    chunk_size=2048,
+                    context=context,
+                    logits_metadata=metadata,
+                    device=torch.device("cpu"),
+                )
+            )
+            can_borrow.assert_not_called()
+
+        with (
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
+            patch(
+                "sglang.srt.layers.logprob_processor.is_pin_memory_available",
+                return_value=True,
+            ),
+            patch.object(
+                processor, "_can_borrow_logprob_memory", return_value=False
+            ) as can_borrow,
+        ):
+            self.assertFalse(
+                processor._can_borrow_distributed_logprob_memory(
+                    chunk_size=2048,
+                    context=unknown_context,
+                    logits_metadata=metadata,
+                    device=torch.device("cpu"),
+                )
+            )
+            self.assertEqual(can_borrow.call_args.kwargs["bytes_per_row"], 0)
+
+        collective_processor = InputLogprobProcessor(
+            vocab_size=1024, chunking_group=object()
+        )
+        with (
+            patch("torch.distributed.all_reduce") as all_reduce,
+            patch(
+                "sglang.srt.layers.logprob_processor.graph_pool_borrow_largest_run",
+                side_effect=AssertionError("zero capacity must not inspect pool runs"),
+            ),
+        ):
+            self.assertFalse(
+                collective_processor._can_borrow_logprob_memory(
+                    chunk_size=2048,
+                    borrow_logits=True,
+                    bytes_per_row=0,
+                )
+            )
+            all_reduce.assert_called_once()
+
+        with (
+            patch(
+                "sglang.srt.layers.logprob_processor.graph_pool_borrow_largest_run",
+                return_value=bytes_per_row * 2048 + (64 << 20),
+            ),
+            patch(
+                "sglang.srt.layers.logprob_processor.is_symmetric_memory_enabled",
+                return_value=False,
+            ),
+        ):
+            self.assertTrue(
+                processor._can_borrow_logprob_memory(
+                    chunk_size=2048,
+                    borrow_logits=True,
+                    bytes_per_row=bytes_per_row,
+                )
+            )
+            self.assertFalse(
+                processor._can_borrow_logprob_memory(
+                    chunk_size=2048,
+                    borrow_logits=True,
+                    bytes_per_row=wider_probe_bytes,
+                )
+            )
+            self.assertFalse(
+                processor._can_borrow_logprob_memory(
+                    chunk_size=2048,
+                    borrow_logits=True,
+                    bytes_per_row=larger_topk_bytes,
+                )
+            )
+        with (
+            patch(
+                "sglang.srt.layers.logprob_processor.graph_pool_borrow_largest_run",
+                return_value=1 << 40,
+            ),
+            patch(
+                "sglang.srt.layers.logprob_processor.is_symmetric_memory_enabled",
+                return_value=True,
+            ),
+        ):
+            self.assertFalse(
+                processor._can_borrow_logprob_memory(
+                    chunk_size=2048,
+                    borrow_logits=True,
+                    bytes_per_row=bytes_per_row,
+                )
+            )
 
     def test_graph_replay_fails_during_active_pool_borrow(self):
         graph = Mock()

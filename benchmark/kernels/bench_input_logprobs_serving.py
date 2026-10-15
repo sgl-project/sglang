@@ -9,6 +9,8 @@ Example:
 The four logical cases are generation without logprobs, target plus explicit
 probes, prompt Top-N (which includes target scores), and probes plus Top-N.
 Raw responses, timings and commands are retained. No tail samples are discarded.
+GC freeze is verified after warmups, with an untimed FIFO request barrier, so
+startup's self-HTTP race cannot silently put the two paths in different states.
 """
 
 import argparse
@@ -38,7 +40,7 @@ def empty_gpus():
         raise RuntimeError(f"GPU processes present at server boundary: {apps}")
 
 
-def command(model, port):
+def command(model, port, args):
     cmd = [
         sys.executable,
         "-m",
@@ -52,7 +54,7 @@ def command(model, port):
         "--max-queued-requests",
         "4",
         "--chunked-prefill-size",
-        "2048",
+        str(args.prefill_chunk_size),
         "--disable-radix-cache",
         "--disable-cuda-graph",
         "--host",
@@ -65,6 +67,9 @@ def command(model, port):
         "--watchdog-timeout",
         "300",
     ]
+    if args.cuda_graph_config is not None:
+        cmd.remove("--disable-cuda-graph")
+        cmd += ["--cuda-graph-config", args.cuda_graph_config]
     if model == "qwen":
         cmd += ["--mem-fraction-static", "0.5", "--attention-backend", "triton"]
     else:
@@ -106,11 +111,13 @@ def cells(args, vocab):
         for n in args.top_n:
             configurations += [("topn", n, False), ("logprob_topn", n, True)]
         for name, n, probes in configurations:
+            if name not in args.cases:
+                continue
             payload = {
                 "input_ids": ids,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 1,
+                    "max_new_tokens": args.output_tokens,
                     "ignore_eos": True,
                 },
             }
@@ -144,7 +151,9 @@ def cells(args, vocab):
 
 
 def validate(data, cell):
-    assert len(data["output_ids"]) == 1
+    assert (
+        len(data["output_ids"]) == cell["payload"]["sampling_params"]["max_new_tokens"]
+    )
     meta = data["meta_info"]
     assert meta["prompt_tokens"] == cell["length"]
     if cell["name"] != "baseline":
@@ -169,10 +178,15 @@ def run_block(args, index, mode, matrix, output):
         PYTHONPATH=f"{TREE / 'python'}:{os.environ.get('PYTHONPATH', '')}",
         SGLANG_ENABLE_DISTRIBUTED_INPUT_LOGPROBS=str(mode),
         SGLANG_JIT_DEEPGEMM_PRECOMPILE="0",
+        SGLANG_ENABLE_FAST_INPUT_LOGPROBS="1",
+        SGLANG_ENABLE_LOGPROB_CHUNK="1",
+        SGLANG_LOGPROB_CHUNK_SIZE=str(args.logprob_chunk_size),
+        SGLANG_ENABLE_GRAPH_POOL_BORROW=str(int(args.graph_pool_borrow)),
     )
-    cmd = command(args.model, args.port)
+    cmd = command(args.model, args.port, args)
     logpath = block / "server.log"
     rows = []
+    verified_gc_freeze = None
     with logpath.open("w") as log:
         proc = subprocess.Popen(
             cmd,
@@ -207,6 +221,34 @@ def run_block(args, index, mode, matrix, output):
                 # Each cell gets identical warmups, then interleaved measurement rounds.
                 order = matrix if index % 2 == 0 else list(reversed(matrix))
                 for iteration in range(-args.warmups, args.samples):
+                    if iteration == 0 and not args.skip_gc_freeze:
+                        frozen = session.post(
+                            f"http://127.0.0.1:{args.port}/freeze_gc", timeout=60
+                        )
+                        frozen.raise_for_status()
+                        assert frozen.status_code == 200
+                        verified_gc_freeze = {
+                            "status_code": frozen.status_code,
+                            "response": frozen.text,
+                        }
+                        # The scheduler forwards freeze to the detokenizer in
+                        # FIFO order. Completion of this untimed request acts
+                        # as the barrier before the first measured request.
+                        barrier_cell = next(
+                            (cell for cell in matrix if cell["name"] == "baseline"),
+                            matrix[0],
+                        )
+                        barrier = session.post(
+                            f"http://127.0.0.1:{args.port}/generate",
+                            json=barrier_cell["payload"],
+                            timeout=300,
+                        )
+                        barrier.raise_for_status()
+                        barrier_data = barrier.json()
+                        validate(barrier_data, barrier_cell)
+                        (block / "freeze_barrier_response.json").write_text(
+                            json.dumps(barrier_data)
+                        )
                     rotated = (
                         order[iteration % len(order) :]
                         + order[: iteration % len(order)]
@@ -251,7 +293,12 @@ def run_block(args, index, mode, matrix, output):
                     proc.wait(timeout=30)
             (block / "result.json").write_text(
                 json.dumps(
-                    {"rows": rows, "returncode": proc.returncode, "command": cmd},
+                    {
+                        "rows": rows,
+                        "returncode": proc.returncode,
+                        "command": cmd,
+                        "verified_gc_freeze": verified_gc_freeze,
+                    },
                     indent=2,
                 )
             )
@@ -274,6 +321,28 @@ def main():
     )
     parser.add_argument("--lengths", nargs="+", type=int, default=[4096, 8192])
     parser.add_argument("--top-n", nargs="+", type=int, default=[5, 20])
+    parser.add_argument(
+        "--cases",
+        nargs="+",
+        choices=("baseline", "logprob", "topn", "logprob_topn"),
+        default=["baseline", "logprob", "topn", "logprob_topn"],
+    )
+    parser.add_argument("--output-tokens", type=int, default=1)
+    parser.add_argument("--prefill-chunk-size", type=int, default=2048)
+    parser.add_argument("--logprob-chunk-size", type=int, default=2048)
+    parser.add_argument(
+        "--cuda-graph-config",
+        help="Optional server graph configuration JSON; otherwise graphs are disabled",
+    )
+    parser.add_argument("--graph-pool-borrow", action="store_true")
+    parser.add_argument(
+        "--skip-gc-freeze",
+        action="store_true",
+        help="Diagnostic only: retain uncontrolled startup GC state",
+    )
+    parser.add_argument(
+        "--order", nargs="+", type=int, choices=(0, 1), default=[0, 1, 1, 0]
+    )
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--port", type=int, default=30582)
@@ -284,6 +353,14 @@ def main():
     MODELS[args.model] = args.model_path
     assert len(args.gpus.split(",")) == 4, "This benchmark is TP4"
     assert args.samples > 0 and args.warmups > 0 and all(n > 0 for n in args.top_n)
+    assert (
+        args.output_tokens > 0
+        and args.prefill_chunk_size > 0
+        and args.logprob_chunk_size > 0
+    )
+    assert 0 in args.order and 1 in args.order, "Both paths are required for comparison"
+    if args.cuda_graph_config is not None:
+        assert isinstance(json.loads(args.cuda_graph_config), dict)
     vocab = json.loads((Path(MODELS[args.model]) / "config.json").read_text())[
         "vocab_size"
     ]
@@ -299,10 +376,16 @@ def main():
         "source": source,
         "model": MODELS[args.model],
         "args": vars(args) | {"output": str(args.output), "worktree": str(TREE)},
-        "order": [0, 1, 1, 0],
+        "order": args.order,
         "cells": matrix,
         "api_note": "Prompt Top-N includes target-token logprobs; logprob cases additionally request nine explicit IDs.",
         "timing": "HTTP whole-response wall time, excludes JSON parsing and server startup; concurrency 1",
+        "server_environment": {
+            "SGLANG_ENABLE_FAST_INPUT_LOGPROBS": "1",
+            "SGLANG_ENABLE_LOGPROB_CHUNK": "1",
+            "SGLANG_LOGPROB_CHUNK_SIZE": str(args.logprob_chunk_size),
+            "SGLANG_ENABLE_GRAPH_POOL_BORROW": str(int(args.graph_pool_borrow)),
+        },
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     }
     if args.dry_run:
@@ -310,7 +393,7 @@ def main():
             json.dumps(
                 {
                     "cells": [c["id"] for c in matrix],
-                    "command": command(args.model, args.port),
+                    "command": command(args.model, args.port, args),
                 }
             )
         )
@@ -319,22 +402,30 @@ def main():
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2))
     blocks = [
         run_block(args, i, mode, matrix, args.output)
-        for i, mode in enumerate([0, 1, 1, 0])
+        for i, mode in enumerate(args.order)
     ]
     summary = []
     for cell in matrix:
         entry = {"cell": cell["id"]}
-        for mode, indices in [("gathered", [0, 3]), ("distributed", [1, 2])]:
+        for mode, value in [("gathered", 0), ("distributed", 1)]:
+            indices = [i for i, path in enumerate(args.order) if path == value]
             samples = [
                 r["seconds"]
                 for i in indices
                 for r in blocks[i]
                 if r["cell"] == cell["id"]
             ]
+            ordered = sorted(samples)
+            position = 0.9 * (len(ordered) - 1)
+            lower = int(position)
             entry[mode] = {
                 "samples": samples,
                 "median": statistics.median(samples),
                 "mean": statistics.mean(samples),
+                "p90": ordered[lower]
+                + (ordered[min(lower + 1, len(ordered) - 1)] - ordered[lower])
+                * (position - lower),
+                "maximum": max(samples),
             }
         entry["median_speedup"] = (
             entry["gathered"]["median"] / entry["distributed"]["median"]

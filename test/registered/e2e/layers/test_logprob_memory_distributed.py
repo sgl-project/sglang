@@ -1,6 +1,8 @@
 """Logprob memory budgets must preserve TP collectives and graph replay safety."""
 
+import dataclasses
 import sys
+import traceback
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,11 +13,31 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import InputLogprobProcessor
+from sglang.srt.layers import logprob_processor as logprob_module
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import (
+    DistributedLogprobContext,
+    InputLogprobProcessor,
+)
 from sglang.srt.model_executor.runner_utils import pool
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="2-gpu-large")
+
+
+class _NcclGroup:
+    def __init__(self, group):
+        self.device_group = group
+        self.world_size = dist.get_world_size(group)
+
+    def all_reduce(self, value):
+        dist.all_reduce(value, group=self.device_group)
+        return value
+
+    def all_gather(self, value, dim):
+        outputs = [torch.empty_like(value) for _ in range(self.world_size)]
+        dist.all_gather(outputs, value, group=self.device_group)
+        return torch.cat(outputs, dim=dim)
 
 
 def _run_rank(rank, rendezvous):
@@ -40,18 +62,25 @@ def _run_rank(rank, rendezvous):
         metadata = SimpleNamespace(
             sample_indices_cpu=sample_rows,
             input_logprob_indices_cpu=list(range(rows)),
-            extend_return_top_logprob=False,
-            extend_token_ids_logprob=False,
-            top_logprobs_nums=None,
+            extend_return_top_logprob=True,
+            extend_token_ids_logprob=True,
+            top_logprobs_nums=[20, 0],
             extend_logprob_pruned_lens_cpu=[rows // 2, rows // 2],
             extend_input_logprob_token_ids_gpu=token_ids,
-            token_ids_logprobs=None,
+            token_ids_logprobs=[[0, vocab // 2, vocab - 1], []],
         )
         chunk_rows = []
         allocations_borrowed = []
         runs = []
 
-        def get_logits(chunk, *_args, **_kwargs):
+        def is_borrowed(tensor):
+            return any(
+                lo <= tensor.data_ptr()
+                and tensor.data_ptr() + tensor.nbytes <= lo + size
+                for lo, size in runs
+            )
+
+        def get_gathered_logits(chunk, *_args, **_kwargs):
             chunk_rows.append(chunk.shape[0])
             local = torch.mm(chunk, local_weight.T)
             gathered = torch.empty(
@@ -65,37 +94,87 @@ def _run_rank(rank, rendezvous):
             )
             converted = reshaped.float()
             allocations_borrowed.extend(
-                any(
-                    lo <= tensor.data_ptr()
-                    and tensor.data_ptr() + tensor.nbytes <= lo + size
-                    for lo, size in runs
-                )
-                for tensor in (local, gathered, reshaped, converted)
+                is_borrowed(tensor) for tensor in (local, gathered, reshaped, converted)
             )
             return converted
 
+        def get_local_logits(chunk, *_args, **_kwargs):
+            chunk_rows.append(chunk.shape[0])
+            local = torch.mm(chunk, local_weight.T)
+            allocations_borrowed.append(is_borrowed(local))
+            return local
+
+        tp_group = _NcclGroup(nccl_group)
+        distributed_context = DistributedLogprobContext(
+            tp_group=tp_group,
+            vocab_start_index=rank * (vocab // 2),
+            vocab_end_index=(rank + 1) * (vocab // 2),
+            vocab_size=vocab,
+            get_local_logits_fn=get_local_logits,
+            gather_sampled_logits_fn=lambda value: tp_group.all_gather(value, 1),
+            local_vocab_size=vocab // 2,
+            tp_size=2,
+        )
+
         processor = InputLogprobProcessor(vocab, chunking_group=dist.group.WORLD)
-        args = dict(
+        common_args = dict(
             pruned_states=states,
             sample_indices=torch.tensor(sample_rows, device=device),
             input_logprob_indices=torch.arange(rows, device=device),
             token_to_seq_idx=[0] * (rows // 2) + [1] * (rows // 2),
             lm_head=None,
-            get_logits_fn=get_logits,
             logits_metadata=metadata,
         )
-        for fast in (False, True):
+        for path, fast in (
+            ("gathered", False),
+            ("gathered", True),
+            ("distributed", True),
+        ):
             processor.enable_fast_input_logprobs = fast
             processor.enable_logprobs_chunk = False
-            reference, reference_sampled = processor.forward(**args)
+            path_args = dict(
+                common_args,
+                get_logits_fn=get_gathered_logits,
+                distributed_context=(
+                    distributed_context if path == "distributed" else None
+                ),
+            )
+            reference, reference_sampled = processor.forward(**path_args)
+            reference_output = LogitsProcessorOutput(
+                next_token_logits=reference_sampled
+            )
+            reference.write_input_to(reference_output)
+            reference_output.finalize_input_logprobs()
             reference_logprobs = reference.token_logprobs.cpu()
+            reference_top_values = reference_output.input_top_logprobs_val
+            reference_top_indices = reference_output.input_top_logprobs_idx
+            reference_probe_values = reference_output.input_token_ids_logprobs_val
+            reference_probe_indices = reference_output.input_token_ids_logprobs_idx
             processor.enable_logprobs_chunk = True
-            for chunk_size, disabled_rank, borrowing in (
-                (128, None, True),
-                (256, None, False),
-                (128, 1, False),
-            ):
+            cases = (
+                (
+                    (128, None, None, True),
+                    (256, None, None, False),
+                    (128, 1, None, False),
+                )
+                if path == "gathered"
+                else (
+                    (512, None, None, True),
+                    (1024, None, None, False),
+                    (512, 1, None, False),
+                    (512, None, 1, False),
+                )
+            )
+            for chunk_size, disabled_rank, missing_width_rank, borrowing in cases:
                 processor.logprobs_chunk_size = chunk_size
+                case_args = path_args
+                if path == "distributed" and rank == missing_width_rank:
+                    case_args = dict(
+                        path_args,
+                        distributed_context=dataclasses.replace(
+                            distributed_context, local_vocab_size=None
+                        ),
+                    )
                 state = pool.GraphPoolBorrowState()
                 handle = torch.cuda.graph_pool_handle()
                 graph = torch.cuda.CUDAGraph()
@@ -132,14 +211,76 @@ def _run_rank(rank, rendezvous):
                     chunk_rows.clear()
                     allocations_borrowed.clear()
                     runs = pool.find_free_graph_pool_runs(handle)
-                    result, sampled = processor.forward(**args)
-                    with pool.graph_pool_replay_scope():
-                        graph.replay()
-                    if result.input_copy_done is not None:
-                        result.input_copy_done.synchronize()
-                    assert torch.equal(result.token_logprobs.cpu(), reference_logprobs)
+                    original_topk = logprob_module.get_distributed_topk
+                    original_compact = logprob_module.get_distributed_input_state
+
+                    def tracked_topk(local_logits, *args, **kwargs):
+                        allocations_borrowed.append(is_borrowed(local_logits))
+                        return original_topk(local_logits, *args, **kwargs)
+
+                    def tracked_compact(local_logits, *args, **kwargs):
+                        allocations_borrowed.append(is_borrowed(local_logits))
+                        return original_compact(local_logits, *args, **kwargs)
+
+                    with (
+                        patch.object(
+                            logprob_module,
+                            "get_distributed_topk",
+                            # A Mock call history would retain borrowed GPU tensors,
+                            # creating an artificial leak/OOM before graph replay.
+                            new=tracked_topk,
+                        ),
+                        patch.object(
+                            logprob_module,
+                            "get_distributed_input_state",
+                            new=tracked_compact,
+                        ),
+                    ):
+                        result, sampled = processor.forward(**case_args)
+                        output = LogitsProcessorOutput(next_token_logits=sampled)
+                        result.write_input_to(output)
+                        # Replay before host finalization: stream ordering must
+                        # protect every borrowed source and staged D2H.
+                        with pool.graph_pool_replay_scope():
+                            graph.replay()
+                        output.finalize_input_logprobs()
+                    assert torch.equal(
+                        result.token_logprobs.cpu(), reference_logprobs
+                    ), (
+                        path,
+                        chunk_size,
+                        borrowing,
+                        rank,
+                        (result.token_logprobs.cpu() - reference_logprobs)
+                        .abs()
+                        .max()
+                        .item(),
+                    )
                     assert torch.equal(sampled, reference_sampled)
-                    assert (result.input_copy_done is not None) == borrowing
+                    assert output.input_top_logprobs_val == reference_top_values
+                    assert [
+                        [len(row) for row in request_rows]
+                        for request_rows in output.input_top_logprobs_idx
+                    ] == [
+                        [len(row) for row in request_rows]
+                        for request_rows in reference_top_indices
+                    ]
+                    assert all(
+                        len(set(row)) == len(row)
+                        and all(0 <= token_id < vocab for token_id in row)
+                        for request_rows in output.input_top_logprobs_idx
+                        for row in request_rows
+                    )
+                    assert output.input_token_ids_logprobs_val == reference_probe_values
+                    assert (
+                        output.input_token_ids_logprobs_idx == reference_probe_indices
+                    )
+                    assert result.token_logprobs.is_pinned() == borrowing
+                    if path == "distributed":
+                        assert result.input_copy_done is not None
+                    else:
+                        assert (result.input_copy_done is not None) == borrowing
+                    assert allocations_borrowed
                     assert all(
                         borrowed == borrowing for borrowed in allocations_borrowed
                     )
@@ -149,6 +290,10 @@ def _run_rank(rank, rendezvous):
                     assert chunk_rows == [chunk_size] * (rows // chunk_size)
                     pool._teardown_borrow_pool()
                 del graph, keep
+    except BaseException:
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
     finally:
         dist.destroy_process_group(nccl_group)
         dist.destroy_process_group()

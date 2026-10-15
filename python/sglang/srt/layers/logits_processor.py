@@ -1005,6 +1005,8 @@ class LogitsProcessor(nn.Module):
             vocab_size=self.vocab_size,
             get_local_logits_fn=self._get_local_logits_for_distributed_logprobs,
             gather_sampled_logits_fn=self._gather_sampled_logits,
+            local_vocab_size=lm_head.num_embeddings_per_partition,
+            tp_size=tp_group.world_size,
         )
 
     def _get_local_logits_for_distributed_logprobs(
