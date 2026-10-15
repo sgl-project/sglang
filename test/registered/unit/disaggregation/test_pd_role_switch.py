@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.managers import scheduler_assembly  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
@@ -50,8 +51,8 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
-        # The rebuild steps, patched where the role switch calls them; each
-        # mock is kept on the scheduler double for the assertions.
+        # The rebuild steps, patched where rebuild_mode calls them; each mock
+        # is kept on the scheduler double for the assertions.
         for step in (
             "init_disaggregation",
             "maybe_init_disagg_prefill",
@@ -60,7 +61,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
             "init_mode_stages",
             "init_step_launcher",
         ):
-            patcher = patch.object(role_switch, step)
+            patcher = patch.object(scheduler_assembly, step)
             setattr(s, step, patcher.start())
             self.addCleanup(patcher.stop)
         s.init_disaggregation.return_value = (mode, None)
@@ -167,7 +168,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
             )
 
         self.assertTrue(out.success)
-        s.teardown_disaggregation.assert_called_once_with(s)
+        s.teardown_disaggregation.assert_called_once_with(s.parts)
 
     def test_successful_flip_orchestration(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
@@ -179,7 +180,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertEqual(out.old_role, "prefill")
         self.assertEqual(out.new_role, "decode")
         # Orchestration: drain -> teardown -> flip config bag -> rebuild -> signal.
-        s.teardown_disaggregation.assert_called_once_with(s)
+        s.teardown_disaggregation.assert_called_once_with(s.parts)
         self.assertEqual(rc.get_disagg().disaggregation_mode, "decode")
         # The pristine startup record is never mutated.
         self.assertEqual(s.parts.server_args.disaggregation_mode, "prefill")
@@ -581,15 +582,15 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         self.assertFalse(thread.is_alive(), "bootstrap thread leaked past stop")
 
 
-def _radix_scheduler(disable_radix_cache):
-    s = MagicMock()
-    s.parts.disable_radix_cache = disable_radix_cache
+def _radix_parts(disable_radix_cache):
+    parts = MagicMock()
+    parts.disable_radix_cache = disable_radix_cache
     tree = MagicMock()
     del tree.clear_storage_backend  # plain RadixCache has none
-    s.parts.kv.tree_cache = tree
-    s.parts.kv.req_to_token_pool = MagicMock()
-    s.parts.kv.token_to_kv_pool_allocator = MagicMock()
-    return s
+    parts.kv.tree_cache = tree
+    parts.kv.req_to_token_pool = MagicMock()
+    parts.kv.token_to_kv_pool_allocator = MagicMock()
+    return parts
 
 
 @unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
@@ -598,26 +599,26 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
     + KV pools when radix is on, and is a no-op on the radix-disabled path."""
 
     def test_noop_when_radix_disabled(self):
-        s = _radix_scheduler(disable_radix_cache=True)
-        _release_prefix_cache_for_role_switch(s)
-        s.parts.kv.tree_cache.reset.assert_not_called()
-        s.parts.kv.token_to_kv_pool_allocator.clear.assert_not_called()
+        parts = _radix_parts(disable_radix_cache=True)
+        _release_prefix_cache_for_role_switch(parts)
+        parts.kv.tree_cache.reset.assert_not_called()
+        parts.kv.token_to_kv_pool_allocator.clear.assert_not_called()
 
     def test_releases_when_radix_enabled(self):
-        s = _radix_scheduler(disable_radix_cache=False)
-        _release_prefix_cache_for_role_switch(s)
-        s.parts.kv.tree_cache.reset.assert_called_once_with()
-        s.parts.kv.req_to_token_pool.clear.assert_called_once_with()
-        s.parts.kv.token_to_kv_pool_allocator.clear.assert_called_once_with()
+        parts = _radix_parts(disable_radix_cache=False)
+        _release_prefix_cache_for_role_switch(parts)
+        parts.kv.tree_cache.reset.assert_called_once_with()
+        parts.kv.req_to_token_pool.clear.assert_called_once_with()
+        parts.kv.token_to_kv_pool_allocator.clear.assert_called_once_with()
 
     def test_teardown_invokes_release(self):
-        s = _radix_scheduler(disable_radix_cache=False)
+        parts = _radix_parts(disable_radix_cache=False)
         kv_manager = MagicMock()
-        s.parts.mode_owners.disagg_prefill = SimpleNamespace(kv_manager=kv_manager)
-        teardown_disaggregation(s)
+        parts.mode_owners.disagg_prefill = SimpleNamespace(kv_manager=kv_manager)
+        teardown_disaggregation(parts)
         kv_manager.teardown.assert_called_once_with()
-        self.assertIsNone(s.parts.mode_owners.disagg_prefill)
-        s.parts.kv.tree_cache.reset.assert_called_once_with()
+        self.assertIsNone(parts.mode_owners.disagg_prefill)
+        parts.kv.tree_cache.reset.assert_called_once_with()
 
 
 if __name__ == "__main__":

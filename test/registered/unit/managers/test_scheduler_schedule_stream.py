@@ -100,11 +100,8 @@ class TestScheduleStreamSettledAtInit(CustomTestCase):
             if isinstance(node, ast.Call)
         ]
         settle = calls.index("finalize_schedule_stream")
-        for owner in (
-            "Streams",
-            "maybe_init_disagg_prefill",
-            "maybe_init_disagg_decode",
-        ):
+        # build_mode builds the PD owners.
+        for owner in ("Streams", "build_mode"):
             self.assertLess(settle, calls.index(owner), owner)
 
 

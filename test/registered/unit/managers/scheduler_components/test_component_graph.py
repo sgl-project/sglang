@@ -379,16 +379,9 @@ _BELOW_MODE_OWNERS = (
 _SCHEDULER_REFS = {
     # The supervisor and handlers of a PD role switch drive the scheduler.
     ("disaggregation/role_switch.py", "", "import"): 1,
-    ("disaggregation/role_switch.py", "_current_kv_manager", "annotation"): 1,
     ("disaggregation/role_switch.py", "_reject_reason", "annotation"): 1,
-    (
-        "disaggregation/role_switch.py",
-        "_release_prefix_cache_for_role_switch",
-        "annotation",
-    ): 1,
     ("disaggregation/role_switch.py", "handle_pd_role_switch", "annotation"): 1,
     ("disaggregation/role_switch.py", "run_event_loop_supervisor", "annotation"): 2,
-    ("disaggregation/role_switch.py", "teardown_disaggregation", "annotation"): 1,
     # The actor process that hosts a scheduler.
     ("ray/scheduler_actor.py", "SchedulerActor.__init__", "import"): 1,
 }

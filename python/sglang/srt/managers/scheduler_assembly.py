@@ -900,19 +900,12 @@ def assemble_scheduler(
         step_counters=step_counters,
     )
 
-    # The mode: the PD owner, the move gate, the stages and the launcher.
-    maybe_init_disagg_prefill(
+    mode = build_mode(
         parts,
+        schedules,
+        request_registry.lora_ids_in_use,
         disaggregation_mode=disaggregation_mode,
         transfer_backend=transfer_backend,
-    )
-    maybe_init_disagg_decode(parts, disaggregation_mode=disaggregation_mode)
-    maybe_init_disagg_move_gate(parts)
-    stages = init_mode_stages(parts, schedules, request_registry.lora_ids_in_use)
-    mode = SchedulerMode(
-        disaggregation_mode=disaggregation_mode,
-        stages=stages,
-        step_launcher=init_step_launcher(parts, stages),
     )
 
     # The rest of the hub over the mode owners
@@ -1086,6 +1079,49 @@ def assemble_scheduler(
         internal_state=internal_state,
     )
     return parts, mode, hub
+
+
+def build_mode(
+    parts: SchedulerParts,
+    schedules: LoopSchedules,
+    lora_ids_in_use: Callable[[], Set[Optional[str]]],
+    *,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+) -> SchedulerMode:
+    """Build the parts of a disaggregation mode, in order: its PD owner (into
+    `ModeOwners`), the unified-memory move gate, its stages and the step
+    launcher that holds them."""
+    maybe_init_disagg_prefill(
+        parts,
+        disaggregation_mode=disaggregation_mode,
+        transfer_backend=transfer_backend,
+    )
+    maybe_init_disagg_decode(parts, disaggregation_mode=disaggregation_mode)
+    maybe_init_disagg_move_gate(parts)
+    stages = init_mode_stages(parts, schedules, lora_ids_in_use)
+    return SchedulerMode(
+        disaggregation_mode=disaggregation_mode,
+        stages=stages,
+        step_launcher=init_step_launcher(parts, stages),
+    )
+
+
+def rebuild_mode(
+    parts: SchedulerParts,
+    schedules: LoopSchedules,
+    lora_ids_in_use: Callable[[], Set[Optional[str]]],
+) -> SchedulerMode:
+    """Build the mode again for the role a PD role switch set in config; the
+    old PD owner is torn down already."""
+    disaggregation_mode, transfer_backend = init_disaggregation()
+    return build_mode(
+        parts,
+        schedules,
+        lora_ids_in_use,
+        disaggregation_mode=disaggregation_mode,
+        transfer_backend=transfer_backend,
+    )
 
 
 def build_pp_ring(parts: SchedulerParts, stages: ModeStages, ops: DriverOps) -> PPRing:

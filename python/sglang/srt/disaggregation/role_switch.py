@@ -13,20 +13,13 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
-from sglang.srt.managers.scheduler_assembly import (
-    SchedulerMode,
-    init_disaggregation,
-    init_mode_stages,
-    init_step_launcher,
-    maybe_init_disagg_decode,
-    maybe_init_disagg_move_gate,
-    maybe_init_disagg_prefill,
-)
+from sglang.srt.managers.scheduler_assembly import SchedulerParts, rebuild_mode
 from sglang.srt.runtime_context import get_context, get_device, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 
 logger = logging.getLogger(__name__)
 
@@ -127,26 +120,14 @@ def handle_pd_role_switch(
         # new role not up) and isn't safe to serve, so mark it unhealthy. There
         # is no in-place rollback.
         try:
-            teardown_disaggregation(scheduler)
+            teardown_disaggregation(scheduler.parts)
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
-            parts = scheduler.parts
-            disaggregation_mode, transfer_backend = init_disaggregation()
-            maybe_init_disagg_prefill(
-                parts,
-                disaggregation_mode=disaggregation_mode,
-                transfer_backend=transfer_backend,
-            )
-            maybe_init_disagg_decode(parts, disaggregation_mode=disaggregation_mode)
-            maybe_init_disagg_move_gate(parts)
-            stages = init_mode_stages(
-                parts,
+            # The new owner, its stages and the launcher that runs them replace
+            # the old role's as one.
+            scheduler.mode = rebuild_mode(
+                scheduler.parts,
                 scheduler.loop_schedules(),
                 scheduler.hub.request_registry.lora_ids_in_use,
-            )
-            scheduler.mode = SchedulerMode(
-                disaggregation_mode=disaggregation_mode,
-                stages=stages,
-                step_launcher=init_step_launcher(parts, stages),
             )
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
@@ -189,7 +170,7 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
     Table-driven: the first failing precondition's message is returned.
     """
     sa = scheduler.parts.server_args
-    km = _current_kv_manager(scheduler)
+    km = _current_kv_manager(scheduler.parts.mode_owners)
     # (failed?, safe to restore routing?, lazy message)
     checks = (
         (
@@ -242,17 +223,16 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
     )
 
 
-def _current_kv_manager(scheduler: Scheduler):
+def _current_kv_manager(owners: ModeOwners):
     """The KV manager of the current role's owner, or None."""
-    owners = scheduler.parts.mode_owners
     owner = owners.disagg_prefill or owners.disagg_decode
     return owner.kv_manager if owner is not None else None
 
 
-def teardown_disaggregation(scheduler: Scheduler) -> None:
+def teardown_disaggregation(parts: SchedulerParts) -> None:
     """Release the current role's owner (its queues, metadata buffers and KV
     transfer manager) so the other role can be rebuilt."""
-    owners = scheduler.parts.mode_owners
+    owners = parts.mode_owners
     if owners.disagg_prefill is not None:
         owners.disagg_prefill.kv_manager.teardown()
         owners.disagg_prefill = None
@@ -261,10 +241,10 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
         owners.disagg_decode = None
         # clear socket ctx in CommonKVReceiver
         CommonKVReceiver.close_all_sockets()
-    _release_prefix_cache_for_role_switch(scheduler)
+    _release_prefix_cache_for_role_switch(parts)
 
 
-def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
+def _release_prefix_cache_for_role_switch(parts: SchedulerParts) -> None:
     """Release the prefix (radix/hicache) cache so a flip works with radix ON.
 
     With radix disabled the flip needs nothing here: the disabled cache
@@ -280,9 +260,9 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     (the instance is already fully idle, checked before teardown) and, for
     hicache, best-effort clears the storage backend so it is released completely.
     """
-    if scheduler.parts.disable_radix_cache:
+    if parts.disable_radix_cache:
         return
-    tree_cache = scheduler.parts.kv.tree_cache
+    tree_cache = parts.kv.tree_cache
     if tree_cache is not None:
         clear_storage = getattr(tree_cache, "clear_storage_backend", None)
         if callable(clear_storage):
@@ -291,5 +271,5 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
             except Exception:
                 logger.exception("hicache storage release on role switch failed")
         tree_cache.reset()
-    scheduler.parts.kv.req_to_token_pool.clear()
-    scheduler.parts.kv.token_to_kv_pool_allocator.clear()
+    parts.kv.req_to_token_pool.clear()
+    parts.kv.token_to_kv_pool_allocator.clear()
