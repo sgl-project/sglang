@@ -11,7 +11,7 @@ one constructor each — so they travel as arguments to the runner that owns the
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import worker_setup
 from sglang.srt.model_executor.model_runner import (
     ModelRunner,
     resolve_draft_attention_backend,
@@ -151,21 +151,23 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         )
         self.assertEqual((draft.prefill, draft.decode), ("triton", "triton"))
 
-    # -- the scheduler hands over the process's own config ---------------------
+    # -- the worker startup hands over the process's own config ----------------
 
-    def _scheduler(self, server_args, create_worker):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.server_args = server_args
-        scheduler.tp_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(model_config=SimpleNamespace(context_len=4096))
+    def _start_draft_worker(self, server_args, create_worker):
+        return worker_setup.maybe_init_draft_worker(
+            server_args=server_args,
+            nccl_port=0,
+            spec_algorithm=SimpleNamespace(
+                is_none=lambda: False,
+                is_ngram=lambda: False,
+                create_worker=create_worker,
+            ),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model_config=SimpleNamespace(context_len=4096)
+                )
+            ),
         )
-        scheduler.nccl_port = 0
-        scheduler.spec_algorithm = SimpleNamespace(
-            is_none=lambda: False,
-            is_ngram=lambda: False,
-            create_worker=create_worker,
-        )
-        return scheduler
 
     def test_the_draft_worker_and_its_factory_get_the_published_config(self):
         server_args = self._seed(speculative_algorithm="EAGLE", load_format="auto")
@@ -181,7 +183,7 @@ class TestDraftPerRunnerConfig(CustomTestCase):
             return worker_class
 
         with self.assertRaises(_StopConstruction):
-            self._scheduler(server_args, create_worker).maybe_init_draft_worker()
+            self._start_draft_worker(server_args, create_worker)
 
         # No copy, and no publish switch: a registered algorithm picking its
         # worker class from the config it is handed sees the same object the
