@@ -15,6 +15,55 @@ def transform_index_page_table_decode(**kwargs):
 
 
 @triton.jit
+def transform_index_page_table_dcp_kernel(
+    page_table_ptr,
+    result_ptr,
+    counts_ptr,
+    row_stride: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_TOPK)
+    slots = tl.load(
+        page_table_ptr + row * row_stride + offsets, mask=offsets < TOPK, other=-1
+    )
+    owned = (slots >= 0) & (slots % DCP_SIZE == DCP_RANK)
+    packed_offsets = tl.cumsum(owned.to(tl.int32), axis=0) - 1
+    count = tl.sum(owned.to(tl.int32), axis=0)
+    tl.store(result_ptr + row * TOPK + packed_offsets, slots // DCP_SIZE, mask=owned)
+    tl.store(result_ptr + row * TOPK + count + offsets, -1, mask=offsets < TOPK - count)
+    tl.store(counts_ptr + row, count)
+
+
+def transform_index_page_table_dcp(
+    page_table: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_rows, topk = page_table.shape
+    result = torch.empty_like(page_table)
+    counts = torch.empty(num_rows, dtype=torch.int32, device=page_table.device)
+    if num_rows == 0 or topk == 0:
+        return result, counts.zero_()
+    assert page_table.stride(1) == 1
+    transform_index_page_table_dcp_kernel[(num_rows,)](
+        page_table,
+        result,
+        counts,
+        page_table.stride(0),
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        TOPK=topk,
+        BLOCK_TOPK=triton.next_power_of_2(topk),
+        num_warps=4,
+    )
+    return result, counts
+
+
+@triton.jit
 def prepare_trtllm_nope_sparse_metadata_kernel(
     page_table_ptr: torch.Tensor,
     topk_lens_ptr: torch.Tensor,
