@@ -73,7 +73,9 @@ def verify_model_params_match_for_rank(
 ):
     """Verify model parameters match for a specific rank by recreating a model shard."""
     transfer_info = get_transfer_engine_info(url, rank)
-    server_weights_info = transfer_info["remote_instance_transfer_engine_info"][1]
+    server_weights_info = transfer_info["remote_instance_transfer_engine_info"][
+        "weights_info_dict"
+    ]
 
     # Get parallelism config from running server
     parallelism_config_data = get_parallelism_config(url, rank)
