@@ -750,9 +750,13 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   if (plan.is_invalid()) return;
   const auto batch_id = plan.read_page_0;
   if (batch_id < 0 || static_cast<uint32_t>(batch_id) >= params.num_batch) {
-    // Do not leave an unfinalized plan for the downstream consumers.
-    *plan_ptr = CompressPlan::invalid();
-    return;
+    // Never skip a corrupted plan silently; trap instead of writing invalid().
+    printf("[c128_online_prefill] corrupted plan: read_page_0=%d not in [0, %u)\n", batch_id, params.num_batch);
+#ifndef USE_ROCM
+    __trap();
+#else
+    __builtin_trap();  // HIP/clang device-side trap; __trap() is CUDA-only.
+#endif
   }
   const auto rid = params.req_pool_indices[batch_id];
   const int32_t main_slot = static_cast<int32_t>(rid);
