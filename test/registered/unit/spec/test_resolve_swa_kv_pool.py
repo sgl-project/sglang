@@ -20,6 +20,10 @@ _RESOLVERS = (
     ("flashinfer", FlashInferAttnBackend._resolve_swa_kv_pool, BaseSWAKVPool),
     ("flashattention", FlashAttentionBackend._resolve_swa_kv_pool, SWAKVPool),
 )
+# FA only uses the allocator pool for the frozen-KV draft.
+_ALLOCATOR_FALLBACK_RESOLVERS = tuple(
+    r for r in _RESOLVERS if r[0] != "flashattention"
+)
 
 
 def _mock_runner(
@@ -46,7 +50,7 @@ class TestResolveSwaKvPool(CustomTestCase):
                 self.assertIs(resolve(runner), swa)
 
     def test_non_swa_active_pool_falls_through_to_allocator(self):
-        for name, resolve, pool_type in _RESOLVERS:
+        for name, resolve, pool_type in _ALLOCATOR_FALLBACK_RESOLVERS:
             with self.subTest(backend=name):
                 swa = MagicMock(spec=pool_type)
                 runner = _mock_runner(active_pool=MagicMock(), allocator_kvcache=swa)
@@ -84,7 +88,7 @@ class TestResolveSwaKvPool(CustomTestCase):
                 self.assertIs(resolve(runner), swa)
 
     def test_non_draft_worker_ignores_spec_algorithm(self):
-        for name, resolve, pool_type in _RESOLVERS:
+        for name, resolve, pool_type in _ALLOCATOR_FALLBACK_RESOLVERS:
             with self.subTest(backend=name):
                 swa = MagicMock(spec=pool_type)
                 runner = _mock_runner(
@@ -94,6 +98,14 @@ class TestResolveSwaKvPool(CustomTestCase):
                     allocator_kvcache=swa,
                 )
                 self.assertIs(resolve(runner), swa)
+
+    def test_flashattention_non_draft_never_uses_allocator(self):
+        resolve = FlashAttentionBackend._resolve_swa_kv_pool
+        runner = _mock_runner(
+            active_pool=MagicMock(),
+            allocator_kvcache=MagicMock(spec=SWAKVPool),
+        )
+        self.assertIsNone(resolve(runner))
 
 
 if __name__ == "__main__":
