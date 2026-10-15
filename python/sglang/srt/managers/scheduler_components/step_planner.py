@@ -599,14 +599,17 @@ class StepPlanner:
             and self.hisparse_coordinator is None
         ):
             # As the launch leaves them: the admitted requests out of the
-            # queue, and those without a row holding a new one. An admission
-            # that used up the budget may have taken the last waiting request;
-            # the next pass then skips on the empty queue.
+            # queue, and the new rows they take (see num_rows) gone from the
+            # free ones. An admission that used up the budget may have taken
+            # the last waiting request; the next pass then skips on the empty
+            # queue.
             admitted = set(adder.can_run_list)
             waiting_queue = self.core_lists.waiting_queue
             head = next((r for r in waiting_queue if r not in admitted), None)
             if head is not None:
-                num_new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
+                num_new_rows = sum(
+                    map(self.beam_coordinator.num_rows, adder.can_run_list)
+                )
                 self._no_kv_room[slot.index] = _NoKvRoom(
                     running=tuple(running_reqs),
                     num_free_req_slots=(

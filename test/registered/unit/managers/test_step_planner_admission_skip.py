@@ -466,6 +466,24 @@ class TestNoKvRoomAfterAdmitting(_AdmissionCase):
         self.free_rows += 1
         self.assertEqual(self._admit(), ["w1"])
 
+    def test_a_beam_launch_counts_its_member_rows(self):
+        # The admitted beam takes a row for itself and one for its member;
+        # once both are taken, a row that frees leaves the head room.
+        lists = self.planner.core_lists
+        beam = _req("beam")
+        beam.beam_group = SimpleNamespace(beam_width=2, member_rows=None)
+        lists.waiting_queue = [beam, _req("w1")]
+        self.assertEqual(self._admit(), ["beam", "w1"])
+        # The launch: the beam joins decoding and spawns its member's row.
+        lists.decoding.append(lists.waiting_queue.pop(0))
+        beam.beam_group.member_rows = [9]
+        self.free_rows -= 2
+
+        self.assertIsNone(self._admit())
+        # A request finishes in another slot: its row frees.
+        self.free_rows += 1
+        self.assertEqual(self._admit(), ["w1"])
+
     def test_no_record_when_the_last_waiting_request_used_up_the_budget(self):
         # The admission that ends the pass on NO_TOKEN took the only waiting
         # request; no request is left to head the queue.
