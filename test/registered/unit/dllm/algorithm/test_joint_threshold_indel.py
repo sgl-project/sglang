@@ -567,7 +567,7 @@ class TestJointThresholdInDelSync(CustomTestCase):
 
         result = algorithm.run(SimpleNamespace(forward=forward), batch)
 
-        self.assertEqual(result.block_tokens.tolist(), [[3, 4, 5]])
+        self.assertEqual(result.block_tokens.tolist(), [])
         self.assertIsNone(result.block_done)
         self.assertIsNone(result.algo_states)
         self.assertEqual(forward_inputs, [[3, 4, 5]])

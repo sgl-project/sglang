@@ -4653,11 +4653,6 @@ class Scheduler(
                         self.future_map.stash_dllm_block_tokens(
                             batch.req_pool_indices, batch_result.next_token_ids
                         )
-                    batch_result.copy_done = self.device_module.Event()
-                    batch_result.copy_to_cpu(
-                        return_logprob=batch.return_logprob,
-                        return_hidden_states=batch.return_hidden_states,
-                    )
                 elif batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(

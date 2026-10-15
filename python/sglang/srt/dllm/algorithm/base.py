@@ -114,9 +114,15 @@ class DllmAlgorithm:
         self.prepare_inputs(model_runner, forward_batch, states)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        # No mask to denoise: return empty so process_batch_result_dllm skips the
+        # stream branch (matches the pre-refactor behavior).
         if all(start == self.block_size for start in start_list):
             return DllmRunOutput(
-                out.logits_output, block_tokens.clone(), None, None, out.can_run_graph
+                out.logits_output,
+                block_tokens.new_empty((0, self.block_size)),
+                None,
+                None,
+                out.can_run_graph,
             )
 
         # The first forward has planned the fixed canvas's attention metadata.
