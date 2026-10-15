@@ -84,6 +84,29 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### LoRA cache identity
+
+LoRA routing requires workers that publish `BlockStored.lora_name`. Requests
+select the adapter through `model: "base:adapter"` on OpenAI routes, or
+`lora_path` on native routes. Salted generation requests also carry `cache_salt`.
+
+Worker block IDs are opaque and may differ across adapter loads or workers.
+The router derives adapter-aware lookup keys from event tokens and keeps a
+per-worker, per-DP-rank mapping for parent links and removals. Multiple block
+IDs can own the same lookup key; removing one leaves the other owners and
+storage tiers intact. The remote indexer bridge performs the same translation.
+Base-model events retain their existing published-key path.
+
+New replicas request `?include_lora=true` snapshots containing LoRA mappings
+(version 2). Legacy consumers receive a base-only version-1 view, so mixed
+snapshots do not prevent base-cache bootstrap during rolling upgrades. Base-only
+snapshots retain version 1 for every consumer. LoRA stores buffered during bootstrap retain their
+tokens; the original base-model buffering and replay behavior is unchanged.
+
+Reloading different adapter weights under the same public name can still
+credit stale engine blocks until their eviction. Names identify adapters;
+versioned names are needed to distinguish different weights.
+
 ### KV-event gap replay
 
 ZMQ drops KV events at the publisher's high-water mark, and a lost removal
@@ -260,11 +283,12 @@ client sent. The router picks the first of these that applies:
 1. A hash of the sticky routing key or session id, so a conversation keeps
    its rank and router replicas agree.
 2. The rank with the deepest cached prefix in the local KV tree.
-3. The rank with the fewest requests this router has in flight on it.
+3. The rank with the fewest requests this router has in flight on it, or with
+   `--dp-rank-policy round_robin`, the worker's ranks in turn.
 
-In PD mode, decode is ranked by load only. The bootstrap room satisfies
-`room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
-the prefill rank.
+In PD mode, decode is ranked by step 3 only. The decode request names the
+prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
+`room % prefill_dp_size == prefill_rank`.
 
 ### Retries
 
