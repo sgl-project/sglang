@@ -184,6 +184,37 @@ def test_retry_budget_preserves_failure_and_report(tmp_path, monkeypatch, capfd)
     assert "Pytest Tail Summary" in output
 
 
+def test_retry_exhaustion_preserves_failure_without_rerunning_passed_items(
+    tmp_path, monkeypatch, capfd
+):
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.delenv("SGLANG_DIFFUSION_RETRY_DEADLINE", raising=False)
+    test_file = tmp_path / "test_exhaustion.py"
+    test_file.write_text(
+        "from pathlib import Path\n"
+        "import pytest\n"
+        "@pytest.mark.parametrize('case_id', ['persistent_failure'])\n"
+        "def test_failure(case_id):\n"
+        "    with Path(__file__).with_suffix('.failed').open('a') as f:\n"
+        "        f.write('attempt\\n')\n"
+        "    assert False, '[performance] Validation failed for E2E Latency'\n"
+        "def test_passed():\n"
+        "    marker = Path(__file__).with_suffix('.passed')\n"
+        "    assert not marker.exists(), 'passing case must not rerun'\n"
+        "    marker.touch()\n"
+    )
+    report = tmp_path / "junit.xml"
+    code, executed, results = run_pytest([str(test_file)], junit_xml_path=str(report))
+    output = capfd.readouterr().out
+    assert code == 1
+    assert executed == ["persistent_failure"]
+    assert results == {"persistent_failure": "fail"}
+    assert test_file.with_suffix(".passed").exists()
+    assert len(test_file.with_suffix(".failed").read_text().splitlines()) == 7
+    assert output.count("Starting pytest attempt") == 7
+    assert "Max retry exceeded (6)" in output
+
+
 def test_retry_estimate_excludes_successful_cases(tmp_path):
     report = tmp_path / "junit.xml"
     report.write_text(
@@ -213,6 +244,9 @@ def test_retry_estimate_excludes_successful_cases(tmp_path):
 )
 def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
     # exercise the validator, request loop, pytest output and retry classifier together
+    # The lightweight exhaustion test above covers all seven attempts. Importing
+    # the full validator in seven fresh interpreters for every input case can
+    # exhaust this integration test's timeout before the assertions run.
     test_file = tmp_path / "test_guard.py"
     test_file.write_text(
         textwrap.dedent(
@@ -298,6 +332,7 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
         SGLANG_GEN_BASELINE="0",
         SGLANG_GEN_GT="0",
+        SGLANG_DIFFUSION_RETRY_DEADLINE=str(time.time() - 1),
     )
     command = (
         "from sglang.multimodal_gen.test.runner.pytest_runner import run_pytest; "
@@ -318,6 +353,6 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path, problem):
     assert "GUARD_REQUESTS=1 LORA_CHECKS=0" in output, output
     retained = 0 if problem in {"missing_record", "missing_e2e", "missing_log"} else 1
     assert f"RETAINED_METRICS={retained}" in output, output
-    assert output.count("Starting pytest attempt") == 7, output
-    assert "Max retry exceeded (6)" in output, output
+    assert output.count("Starting pytest attempt") == 1, output
+    assert "Retry budget exhausted" in output, output
     assert "'threshold_guard': 'fail'" in output, output
