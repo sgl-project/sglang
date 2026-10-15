@@ -979,6 +979,18 @@ def commit_mamba_states_after_verify(
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
+    if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        return
+    # `accept_lens` already includes the bonus token (drafts + 1 per req).
+    if prepared_step_indices is None:
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
+    else:
+        last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
@@ -988,25 +1000,12 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_spec_fold", False)
         and not getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-            return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        if prepared_step_indices is None:
-            last_correct_step_indices, mamba_steps_to_track = (
-                _verify_commit_step_indices(
-                    batch=batch,
-                    accept_index=accept_index,
-                    accept_lens=accept_lens,
-                    draft_token_num=draft_token_num,
-                )
-            )
-        else:
-            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
@@ -1024,8 +1023,6 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_cache_base", None) is not None
         and not getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-            return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_circular,
             commit_gdn_replayssm_spec,
@@ -1037,17 +1034,6 @@ def commit_mamba_states_after_verify(
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         replay_indices = batch.req_pool_indices
-        if prepared_step_indices is None:
-            last_correct_step_indices, mamba_steps_to_track = (
-                _verify_commit_step_indices(
-                    batch=batch,
-                    accept_index=accept_index,
-                    accept_lens=accept_lens,
-                    draft_token_num=draft_token_num,
-                )
-            )
-        else:
-            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
@@ -1109,8 +1095,6 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_spec_fold", False)
         and getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-            return
         from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
         )
@@ -1119,17 +1103,6 @@ def commit_mamba_states_after_verify(
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         # extra_buffer: commit_kda_replayssm_spec also folds the interval-crossing
         # step into the track slot, so `temporal` stays current without a flush.
-        if prepared_step_indices is None:
-            last_correct_step_indices, mamba_steps_to_track = (
-                _verify_commit_step_indices(
-                    batch=batch,
-                    accept_index=accept_index,
-                    accept_lens=accept_lens,
-                    draft_token_num=draft_token_num,
-                )
-            )
-        else:
-            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
@@ -1143,29 +1116,14 @@ def commit_mamba_states_after_verify(
         return
 
     attn_backend = model_runner.attn_backend
-
-    # `accept_lens` already includes the bonus token (drafts + 1 per req).
-    if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        if prepared_step_indices is None:
-            last_correct_step_indices, mamba_steps_to_track = (
-                _verify_commit_step_indices(
-                    batch=batch,
-                    accept_index=accept_index,
-                    accept_lens=accept_lens,
-                    draft_token_num=draft_token_num,
-                )
-            )
-        else:
-            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
-
-        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
-            attn_backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-                model=model_runner.model,
-                req_pool_indices=batch.req_pool_indices[:bs],
-            )
+    if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+        attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=model_runner.model,
+            req_pool_indices=batch.req_pool_indices[:bs],
+        )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
