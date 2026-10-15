@@ -1590,6 +1590,9 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.audio_data {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "audio_data", v)?;
         }
+        if let Some(v) = &self.extra_key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1628,6 +1631,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_mm_hashes = None;
                 let mut f_video_data = None;
                 let mut f_audio_data = None;
+                let mut f_extra_key = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -1784,6 +1788,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_audio_data = Some(map.next_value::<Option<MediaInput>>()?);
                         }
+                        "extra_key" => {
+                            if f_extra_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("extra_key"));
+                            }
+                            f_extra_key = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -1812,6 +1822,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     mm_hashes: f_mm_hashes.flatten(),
                     video_data: f_video_data.flatten(),
                     audio_data: f_audio_data.flatten(),
+                    extra_key: f_extra_key.flatten(),
                 })
             }
         }
