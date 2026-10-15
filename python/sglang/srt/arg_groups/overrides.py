@@ -931,10 +931,26 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution.
 
-    Auto selects MNNVL on Blackwell and TRTLLM on single-node SM90.
+    MiMo defaults to CuTeDSL on Blackwell; other supported models use auto.
     """
-    hf_config = model_config_of(view).hf_config
+    model_config = model_config_of(view)
+    hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
+    is_mimo = model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+    if is_mimo:
+        import torch
+
+        from sglang.srt.layers.flashinfer_mnnvl_cutedsl import SUPPORTED_TP_SIZES
+
+        if not (
+            get_platform().is_sm100
+            and model_config.dtype == torch.bfloat16
+            and view.tp_size in SUPPORTED_TP_SIZES
+            and view.attn_cp_size == 1
+            and not view.encoder_only
+            and not view.enable_pdmux
+        ):
+            return {}
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
     prefer_custom_dsv41 = (
         getattr(hf_config, "model_type", None) == "deepseek_v41"
@@ -946,7 +962,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     )
     if (
         view.flashinfer_allreduce_fusion_backend is None
-        and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and (is_mimo or model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS)
         and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
@@ -954,10 +970,11 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
+        backend = "cutedsl" if is_mimo else "auto"
         logger.info(
-            f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+            "Auto-enabling FlashInfer AllReduce Fusion (%s) for %s", backend, model_arch
         )
-        return {"flashinfer_allreduce_fusion_backend": "auto"}
+        return {"flashinfer_allreduce_fusion_backend": backend}
     return {}
 
 
@@ -1584,9 +1601,22 @@ def _pipeline_parallel_overlap_disable(view: Any) -> dict:
 def _speculative_moe_runner_default(view: Any) -> dict:
     """Default the speculative (draft) MoE runner backend to the resolved
     target-model backend. Invoked at the head of the speculative-decoding
-    hook, after the MoE kernel chain has resolved."""
+    hook, after the MoE kernel chain has resolved.
+
+    flashinfer_megamoe routes by global expert id inside the mega kernel and
+    only supports the quantized MoE layers it prepared weights for. Draft
+    (MTP/NextN) layers are typically unquantized and run through a regular
+    runner, so inheriting it would mismatch the draft's runner and corrupt
+    expert-id dispatch. Default the draft to flashinfer_trtllm instead; users
+    with a quantized draft can set --speculative-moe-runner-backend explicitly.
+    (DeepGEMM megamoe is selected via the a2a backend and falls back per-layer
+    when its weights are not prepared, so it needs no override.)
+    """
     if view.speculative_moe_runner_backend is None:
-        return {"speculative_moe_runner_backend": view.moe_runner_backend}
+        default = view.moe_runner_backend
+        if default == "flashinfer_megamoe":
+            default = "flashinfer_trtllm"
+        return {"speculative_moe_runner_backend": default}
     return {}
 
 

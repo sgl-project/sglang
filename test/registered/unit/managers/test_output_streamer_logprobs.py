@@ -59,6 +59,9 @@ class _FakeReq:
     def finished(self):
         return False
 
+    def get_mm_token_counts(self):
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
+
     def init_incremental_detokenize(self):
         return self.output_ids_through_stop, 0
 
@@ -74,6 +77,7 @@ def _make_accumulator() -> _GenerationStreamAccumulator:
         default_stream_interval=1,
         default_force_stream_interval=1,
         get_cached_tokens_details=lambda req: None,
+        is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
     )
 
