@@ -215,10 +215,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         return
     if (
         cfg.dsv4_attn_backend == "trtllm"
-        and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+        and cfg.cuda_graph_config.prefill.backend
+        not in (Backend.DISABLED, Backend.BREAKABLE)
     ):
         raise ValueError(
-            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill disabled"
+            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill "
+            "disabled or breakable"
         )
     if cfg.enable_encoder_swa_bounded_replay:
         incompatible = (
@@ -266,12 +268,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
         (
-            "TRT-LLM with SWA bounded replay",
-            cfg.dsv4_attn_backend == "trtllm"
-            and (
-                cfg.enable_encoder_swa_bounded_replay
-                or cfg.enable_decoder_swa_bounded_replay
-            ),
+            "TRT-LLM with encoder SWA bounded replay",
+            cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),

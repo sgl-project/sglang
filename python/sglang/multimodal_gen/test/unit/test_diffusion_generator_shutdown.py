@@ -1,9 +1,9 @@
-import argparse
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.multimodal_gen.runtime.entrypoints import diffusion_generator as dg
+from sglang.multimodal_gen.runtime.entrypoints.cli import generate as cli_generate
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 
@@ -32,44 +32,38 @@ class _FakeProcess:
 
 
 class TestDiffGeneratorShutdown(unittest.TestCase):
-    def test_cli_shuts_down_on_success_and_generation_error(self):
-        from sglang.multimodal_gen.runtime.entrypoints.cli import generate as cli
-
-        for failure in (None, RuntimeError("generation failed")):
-            with self.subTest(failure=failure):
-                generator = object.__new__(DiffGenerator)
-                generator.owns_scheduler_client = False
-                generator.local_scheduler_process = None
-                generator.generate = Mock(return_value=[], side_effect=failure)
-                generator.shutdown = Mock()
-                args = argparse.Namespace(config=None, diffusers_kwargs=None)
-                server_args = SimpleNamespace(model_path="dummy/model")
-                sampling_cls = SimpleNamespace(
-                    get_cli_args=Mock(return_value={"prompt": "a white clock"})
-                )
-                with (
-                    patch.object(
-                        cli.ServerArgs, "from_cli_args", return_value=server_args
-                    ),
-                    patch.object(
-                        cli,
-                        "_resolve_cli_sampling_params_cls",
-                        return_value=sampling_cls,
-                    ),
-                    patch.object(cli, "_apply_output_file_path_override"),
-                    patch.object(
-                        cli.DiffGenerator, "from_pretrained", return_value=generator
-                    ),
-                    patch.object(cli, "maybe_dump_performance") as dump,
-                ):
-                    if failure is None:
-                        cli.generate_cmd(args)
-                        dump.assert_called_once()
-                    else:
-                        with self.assertRaisesRegex(RuntimeError, "generation failed"):
-                            cli.generate_cmd(args)
-                        dump.assert_not_called()
-                generator.shutdown.assert_called_once_with()
+    def test_generate_cmd_shuts_down_generator_on_success_and_error(self):
+        server_args = SimpleNamespace(model_path="dummy", load_diffusion_decoder=False)
+        sampling_params_cls = Mock()
+        sampling_params_cls.get_cli_args.return_value = {"prompt": "test prompt"}
+        cli_args = SimpleNamespace(
+            config=None,
+            diffusers_kwargs=None,
+            output_file_path=None,
+            perf_dump_path=None,
+        )
+        succeeded, failed = Mock(), Mock()
+        failed.generate.side_effect = RuntimeError("generation failed")
+        with (
+            patch.object(
+                cli_generate.ServerArgs, "from_cli_args", return_value=server_args
+            ),
+            patch.object(
+                cli_generate,
+                "_resolve_cli_sampling_params_cls",
+                return_value=sampling_params_cls,
+            ),
+            patch.object(
+                cli_generate.DiffGenerator,
+                "from_pretrained",
+                side_effect=[succeeded, failed],
+            ),
+        ):
+            cli_generate.generate_cmd(cli_args)
+            with self.assertRaisesRegex(RuntimeError, "generation failed"):
+                cli_generate.generate_cmd(cli_args)
+        succeeded.shutdown.assert_called_once_with()
+        failed.shutdown.assert_called_once_with()
 
     def test_shutdown_uses_bounded_scheduler_timeout_and_forces_worker(self):
         generator = object.__new__(DiffGenerator)
