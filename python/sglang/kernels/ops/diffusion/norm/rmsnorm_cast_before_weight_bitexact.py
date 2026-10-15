@@ -83,7 +83,15 @@ def _ordered_norm_kernel(
 
 @triton.jit
 def _norm_modulate_kernel(
-    X, Weight, Scale, Shift, Out, M: tl.constexpr, SEQ: tl.constexpr
+    X,
+    Weight,
+    Scale,
+    Shift,
+    Out,
+    M: tl.constexpr,
+    SEQ: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
+    SHIFT_STRIDE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, 4096)
@@ -93,8 +101,8 @@ def _norm_modulate_kernel(
     weight = tl.load(Weight + cols, mask, 0).to(tl.float32)
     norm = mul_rn_f32(x, tl.sum(rstd, 0)).to(tl.bfloat16).to(tl.float32)
     norm = mul_rn_f32(norm, weight).to(tl.bfloat16).to(tl.float32)
-    scale = tl.load(Scale + (row // SEQ) * 3072 + cols, mask, 0).to(tl.float32)
-    shift = tl.load(Shift + (row // SEQ) * 3072 + cols, mask, 0).to(tl.float32)
+    scale = tl.load(Scale + (row // SEQ) * SCALE_STRIDE + cols, mask, 0).to(tl.float32)
+    shift = tl.load(Shift + (row // SEQ) * SHIFT_STRIDE + cols, mask, 0).to(tl.float32)
     factor = (1.0 + scale).to(tl.bfloat16).to(tl.float32)
     scaled = mul_rn_f32(norm, factor).to(tl.bfloat16).to(tl.float32)
     tl.store(Out + row * 3072 + cols, scaled + shift, mask)
@@ -218,8 +226,7 @@ def _valid_rmsnorm_cast_before_weight_modulate(x, weight, scale, shift):
         and scale.shape == shift.shape == (x.shape[0], 3072)
         and scale.dtype == shift.dtype == x.dtype
         and scale.device == shift.device == x.device
-        and scale.is_contiguous()
-        and shift.is_contiguous()
+        and scale.stride(-1) == shift.stride(-1) == 1
     )
 
 
@@ -263,6 +270,8 @@ def rmsnorm_cast_before_weight_modulate_bitexact(
             out,
             rows,
             x.shape[1],
+            scale.stride(0),
+            shift.stride(0),
             num_warps=4,
             enable_fp_fusion=False,
         )

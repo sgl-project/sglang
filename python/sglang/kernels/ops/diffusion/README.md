@@ -277,7 +277,8 @@ activations and `rmsnorm_cast_before_weight_rope_bitexact` for width-128 BSHD he
 Both retain the same ordered reduction and BF16 round-before-gamma contract,
 then preserve each modulation or rotate-half rounding boundary. Their guards
 require contiguous CUDA BF16 tensors, at least 16 normalization rows, and
-fewer than `2**29` elements. Model wrappers verify against the existing chain
+fewer than `2**29` elements. Modulation tensors may have a strided batch axis,
+as produced by `unbind`, with contiguous channels. Model wrappers verify against the existing chain
 before enabling either fusion and retain the separate operations on fallback.
 
 ## What is not a kernel

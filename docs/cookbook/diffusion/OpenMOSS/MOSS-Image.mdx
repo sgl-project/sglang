@@ -89,7 +89,29 @@ have validated recipes in this integration. Do not assume that a framework-wide
 flag establishes model support. See [performance optimization](/docs/sglang-diffusion/performance-optimization)
 for the shared feature contracts.
 
-## 5. Run in ComfyUI
+## 5. Batching
+
+Dynamic batching uses the shared scheduler and is opt-in through the maximum
+batch size. For example, on an H200:
+
+```bash
+sglang serve --model-path OpenMOSS-Team/MOSS-Image-Base \
+  --batching-max-size 4 --batching-delay-ms 20
+```
+
+Compatible requests may have different prompts and seeds; resolution, step count,
+negative prompt, and guidance settings must match. The maximum size limits total
+outputs, not just HTTP requests. A request can also use `n` to generate multiple
+images from one prompt. Higher batch sizes need more activation VRAM and can
+increase individual-request latency; the default remains one output at a time.
+
+The DiT groups samples by their actual text length, including text refinement,
+and restores their original output order. Different lengths run in separate
+groups without padding or switching attention backends. Empty negative prompts
+can share one group even when positive prompts differ. Batched GEMM shapes can
+change floating-point rounding; cross-batch-size pixel identity is not guaranteed.
+
+## 6. Run in ComfyUI
 
 import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
 

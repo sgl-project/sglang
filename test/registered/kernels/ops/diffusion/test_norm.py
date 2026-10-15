@@ -850,6 +850,26 @@ def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+def test_moss_image_norm_modulate_batched_views():
+    from sglang.kernels.ops.diffusion import (
+        rmsnorm_cast_before_weight_modulate_bitexact,
+    )
+
+    x = torch.randn(4, 17, 3072, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(3072, device="cuda", dtype=torch.bfloat16)
+    modulation = torch.randn(4, 6, 3072, device="cuda", dtype=torch.bfloat16)
+    shift, scale = modulation[:, 0], modulation[:, 1]
+    expected = _moss_image_norm_eager(x, weight) * (1 + scale[:, None]) + shift[:, None]
+    assert torch.equal(
+        rmsnorm_cast_before_weight_modulate_bitexact(x, weight, scale, shift), expected
+    )
+    with pytest.raises(ValueError, match="Unsupported MOSSImage"):
+        rmsnorm_cast_before_weight_modulate_bitexact(
+            x, weight, modulation.flatten(1)[:, ::6], shift
+        )
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
 @pytest.mark.parametrize("epilogue", ["modulate", "rope"])
 def test_moss_image_norm_epilogue_guards(epilogue):
     from sglang.kernels.ops.diffusion import (
