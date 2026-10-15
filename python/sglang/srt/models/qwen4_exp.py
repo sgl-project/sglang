@@ -783,7 +783,7 @@ def _gather_ple_embedding_from_pinned_kernel(
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """Host PLE table (pinned or mmap), gathered directly or staged on NPU.
+    """Host PLE table (pinned or mmap), gathered directly through UVA on NPU.
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
@@ -827,6 +827,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 "PLE embedding offload requires bfloat16 or fp8 weights, got "
                 f"{embedding.weight.dtype}"
             )
+        if _is_npu and embedding.weight.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "NPU PLE UVA requires bfloat16 storage; FP8 lookup is unsupported"
+            )
         if embedding.num_added_embeddings:
             raise NotImplementedError(
                 "PLE embedding offload does not support added vocabulary rows"
@@ -849,11 +853,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 f"-{self.shard_indices.org_vocab_end_index}"
             ),
         )
-        # Only the file backend has anything to prefetch (rows live on storage).
-        self._file_prefetcher = make_ple_file_prefetcher(host_table)
-        # ... and only it needs its resident set bounded: a fault maps a whole
-        # folio, so the mapping would otherwise creep towards the full table.
-        self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
         cpu_weight = nn.Parameter(host_table, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
@@ -861,23 +860,18 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_parameter("weight", cpu_weight)
         self._npu_uva_table = None
         self.npu_uva_enabled = False
-        self.npu_uva_fallback_reason = None
-        self.requires_npu_host_offload_graph = False
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.ple import try_create_ple_uva_table
+            from sglang.srt.hardware_backend.npu.ple import create_ple_uva_table
 
-            self._npu_uva_table, self.npu_uva_fallback_reason = (
-                try_create_ple_uva_table(self.weight, backend=backend)
-            )
-            self.npu_uva_enabled = self._npu_uva_table is not None
-            self.requires_npu_host_offload_graph = not self.npu_uva_enabled
-            if self.npu_uva_enabled:
-                logger.info("NPU PLE lookup route: uva")
-            else:
-                logger.info(
-                    "NPU PLE lookup route: cpu_staging (%s)",
-                    self.npu_uva_fallback_reason,
-                )
+            self._npu_uva_table = create_ple_uva_table(self.weight, backend=backend)
+            self.npu_uva_enabled = True
+            logger.info("NPU PLE lookup route: uva (backend=%s)", backend)
+        # The CUDA file kernel can issue CPU prefetch hints; NPU UVA lookup
+        # keeps IDs on the device and needs no CPU prefetch worker or ID copy.
+        self._file_prefetcher = (
+            None if _is_npu else make_ple_file_prefetcher(host_table)
+        )
+        self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
         # The scale is tiny; keep it with the model instead of offloading it
         # with the table.
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
@@ -917,26 +911,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         flat_ids = input_ids.reshape(-1)
         if flat_ids.numel():
             if input_ids.device.type == "npu":
-                from sglang.srt.hardware_backend.npu.ple import (
-                    gather_ple_host_rows,
-                    gather_ple_uva_rows,
-                )
+                from sglang.srt.hardware_backend.npu.ple import gather_ple_uva_rows
 
-                if self._npu_uva_table is not None:
-                    return gather_ple_uva_rows(
-                        self._npu_uva_table,
-                        flat_ids,
-                        output,
-                        vocab_start=self.shard_indices.org_vocab_start_index,
-                        vocab_end=self.shard_indices.org_vocab_end_index,
-                    )
-                return gather_ple_host_rows(
-                    self.weight,
+                return gather_ple_uva_rows(
+                    self._npu_uva_table,
                     flat_ids,
                     output,
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
-                    file_prefetcher=self._file_prefetcher,
                 )
             flat_ids = flat_ids.long()
             if self._file_prefetcher is not None:
@@ -1205,16 +1187,6 @@ class Qwen4ExpPLELayer(nn.Module):
         """Gather host PLE rows while the preceding decoder layer runs."""
         if self._prefetch_stream is None:
             return
-        if forward_batch.input_ids.device.type == "npu":
-            from sglang.srt.hardware_backend.npu.graph_runner.host_offload_graph import (
-                get_host_offload_graph,
-            )
-
-            if get_is_capture_mode() or get_host_offload_graph() is not None:
-                # Keep the host break on the capture stream. The normal layer
-                # forward records its lookup instead; hash/history and TP
-                # reduction remain in the surrounding device graph segments.
-                return
         if self._prefetch_state is not None:
             raise RuntimeError("PLE prefetch state was not consumed before reuse")
         if batch is None:

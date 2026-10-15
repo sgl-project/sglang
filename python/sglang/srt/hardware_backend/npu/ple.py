@@ -1,22 +1,17 @@
-"""NPU PLE host tables: mapped device lookup with a CPU staging fallback.
+"""NPU PLE UVA lookup for pinned and file-backed BF16 host tables.
 
-BF16 pinned tables use a registered NPU alias when the runtime supports it.
-Pageable file tables and unsupported runtimes retain explicit CPU row selection
-and segmented graphs. No allocator environment changes or Triton UVA are needed.
+UVA is required: unsupported storage, registration, or alias APIs raise during
+embedding construction. There is no CPU staging or segmented graph fallback.
+File mappings use MAPPED only; this module never silently locks the full table.
 """
 
 import ctypes
 import logging
 import weakref
-from functools import lru_cache, partial
+from functools import lru_cache
 from pathlib import Path
-from typing import Optional
 
 import torch
-
-from sglang.srt.hardware_backend.npu.graph_runner.host_offload_graph import (
-    get_host_offload_graph,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -139,20 +134,18 @@ class NpuUvaTable:
         self.tensor = None
 
 
-def try_create_ple_uva_table(weight, *, backend):
-    """Resolve the route before graph capture; return a precise fallback reason."""
-    if backend != "pinned":
-        return None, "file tables retain pageable CPU lookup"
+def create_ple_uva_table(weight: torch.Tensor, *, backend: str) -> NpuUvaTable:
+    """Register pinned/file host storage or fail before model graph capture."""
+    if backend not in ("pinned", "file"):
+        raise ValueError(f"Invalid NPU PLE backend: {backend}")
     if weight.dtype != torch.bfloat16:
-        return None, "UVA lookup currently requires bfloat16 storage"
-    if (
-        weight.device.type != "cpu"
-        or not weight.is_pinned()
-        or not weight.is_contiguous()
-    ):
-        return None, "UVA requires a contiguous pinned CPU table"
-    if not weight.numel():
-        return None, "empty PLE table"
+        raise NotImplementedError(
+            f"NPU PLE UVA requires bfloat16 storage, got {weight.dtype}"
+        )
+    if weight.device.type != "cpu" or not weight.is_contiguous() or not weight.numel():
+        raise ValueError("NPU PLE UVA requires a nonempty contiguous CPU table")
+    if backend == "pinned" and not weight.is_pinned():
+        raise ValueError("NPU PLE pinned backend requires pinned CPU storage")
     library, owned, base = None, False, weight.untyped_storage().data_ptr()
     try:
         device = torch.npu.current_device()
@@ -162,8 +155,8 @@ def try_create_ple_uva_table(weight, *, backend):
         if result or not mapped.value:
             nbytes = weight.untyped_storage().nbytes()
             if hasattr(library, "aclrtHostRegisterV2"):
-                # The table is already pinned; ACL_HOST_REG_PINNED must not be
-                # added. V2 uses MAPPED=2, while the legacy register type is 0.
+                # MAPPED only: do not convert the file backend into a locked
+                # whole-table allocation. Unsupported mappings must fail.
                 result = library.aclrtHostRegisterV2(base, nbytes, 0x2)
             else:
                 result = library.aclrtHostRegister(
@@ -177,7 +170,7 @@ def try_create_ple_uva_table(weight, *, backend):
                 raise RuntimeError(f"mapped device address query returned {result}")
         pointer = mapped.value + weight.storage_offset() * weight.element_size()
         tensor = _mapped_npu_tensor(weight, pointer, device)
-        return NpuUvaTable(weight, tensor, device, library, base, owned), None
+        return NpuUvaTable(weight, tensor, device, library, base, owned)
     except (OSError, AttributeError, RuntimeError) as error:
         if owned:
             result = library.aclrtHostUnregister(base)
@@ -185,7 +178,11 @@ def try_create_ple_uva_table(weight, *, backend):
                 raise RuntimeError(
                     f"PLE UVA rollback unregister returned {result}"
                 ) from error
-        return None, str(error)
+        raise RuntimeError(
+            f"NPU PLE backend={backend} requires UVA; mapping/alias setup failed: {error}. "
+            "CPU staging is not supported; check the installed CANN, driver, "
+            "OS kernel, torch_npu APIs, and host-memory mapping support."
+        ) from error
 
 
 def gather_ple_uva_rows(table, flat_ids, output, *, vocab_start, vocab_end):
@@ -199,45 +196,4 @@ def gather_ple_uva_rows(table, flat_ids, output, *, vocab_start, vocab_end):
     rows = output.view(flat_ids.numel(), -1)
     torch.index_select(table.tensor, 0, local_ids, out=rows)
     rows.masked_fill_(~in_range[:, None], 0)
-    return output
-
-
-def gather_ple_host_rows(
-    weight: torch.Tensor,
-    flat_ids: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    vocab_start: int,
-    vocab_end: int,
-    file_prefetcher: Optional[object] = None,
-) -> torch.Tensor:
-    """CPU staging fallback, rerun with fresh IDs on every segmented replay."""
-    graph = get_host_offload_graph()
-    if graph is not None:
-        graph.add_host_call(
-            partial(
-                gather_ple_host_rows,
-                weight,
-                flat_ids,
-                output,
-                vocab_start=vocab_start,
-                vocab_end=vocab_end,
-                file_prefetcher=file_prefetcher,
-            )
-        )
-        return output
-    if torch.npu.is_current_stream_capturing():
-        raise RuntimeError(
-            "NPU PLE host lookup requires NPUHostOffloadGraph for capture; "
-            "use NPUCudaGraphBackend to capture graph segments around the lookup."
-        )
-    ids = flat_ids.to("cpu").long()
-    if file_prefetcher is not None:
-        file_prefetcher.enqueue(ids, vocab_start=vocab_start, vocab_end=vocab_end)
-    in_range = (ids >= vocab_start) & (ids < vocab_end)
-    local_ids = torch.where(in_range, ids - vocab_start, 0)
-    rows = weight.index_select(0, local_ids).to(torch.bfloat16)
-    rows.masked_fill_(~in_range[:, None], 0)
-    staging = rows.reshape(output.shape).pin_memory()
-    output.copy_(staging, non_blocking=True)
     return output
