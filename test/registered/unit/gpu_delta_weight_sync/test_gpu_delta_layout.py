@@ -499,6 +499,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             ),
             byte_layout.ConsumerSnapshot(lambda: (root.tied, root.view)),
         ]
+        plan._prepare_identity_checks()
         storage = torch.Tensor.untyped_storage
         reads = []
 
@@ -533,11 +534,20 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         root.view.transpose_(0, 1)
         with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
             plan.check_identity()
+        with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
+            plan._consumers[0].check()
         root.view.transpose_(0, 1)
         plan.check_identity()
+        plan._consumers[0].check()
         root.weight.transpose_(0, 1)
         with self.assertRaisesRegex(RuntimeError, "parameter identity changed"):
             plan.check_identity()
+
+        # Never discard a different expectation for a repeated object. If a
+        # consumer was captured after geometry changed, admission must fail.
+        plan._consumers.append(byte_layout.ConsumerSnapshot(lambda: (root.weight,)))
+        with self.assertRaisesRegex(RuntimeError, "changed during admission"):
+            plan._prepare_identity_checks()
 
     def test_w4a16_calibration_is_static_but_weight_scales_remain_mutable(self):
         prefix = "model.layers.0.mlp.experts"

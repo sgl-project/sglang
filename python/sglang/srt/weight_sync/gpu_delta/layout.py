@@ -91,6 +91,7 @@ class GpuDeltaLayout:
             for name, tensor in module._parameters.items()
             if tensor is not None
         ]
+        self._prepare_identity_checks()
         self._reject_overlaps(mapping.aliases)
         self.rank_plan_digest = _digest(
             {
@@ -100,18 +101,45 @@ class GpuDeltaLayout:
             }
         )
 
+    def _prepare_identity_checks(self):
+        # Deduplicate geometry once, not in the per-update validation loop.
+        # Separate views sharing storage still require separate geometry checks.
+        checks = chain(
+            (
+                (tensor, expected, "parameter identity")
+                for _, _, tensor, expected in self._parameter_roots
+            ),
+            (
+                (consumer.objects[index], expected, "consumer storage")
+                for consumer in self._consumers
+                for index, expected in consumer.tensors
+            ),
+        )
+        unique = {}
+        for tensor, expected, kind in checks:
+            key = id(tensor)
+            prior = unique.get(key)
+            if prior is None:
+                unique[key] = (tensor, expected, kind)
+            elif prior[1] != expected:
+                raise RuntimeError(
+                    f"GPU delta {kind} changed during admission; readmission required"
+                )
+        self._tensor_checks = tuple(unique.values())
+
     def check_identity(self):
-        identities = {}
-        for module, name, tensor, expected in self._parameter_roots:
-            if (
-                module._parameters.get(name) is not tensor
-                or _tensor_identity(tensor, identities) != expected
-            ):
+        for module, name, tensor, _ in self._parameter_roots:
+            if module._parameters.get(name) is not tensor:
                 raise RuntimeError(
                     "GPU delta parameter identity changed; readmission required"
                 )
         for consumer in self._consumers:
-            consumer.check(identities)
+            consumer.check_objects()
+        for tensor, expected, kind in self._tensor_checks:
+            if _tensor_identity(tensor) != expected:
+                raise RuntimeError(
+                    f"GPU delta {kind} changed; readmission required"
+                )
 
     def _reject_overlaps(self, model_aliases):
         # Gate/up intentionally share one interleaved weight/scale allocation;

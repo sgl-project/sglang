@@ -318,15 +318,8 @@ class DerivedImage:
         return self.source.untyped_storage().data_ptr()
 
 
-def _tensor_identity(tensor, cache=None):
-    # Share geometry reads within one validation call, never across updates.
-    # Distinct views of the same storage must retain independent checks.
-    if cache is not None:
-        key = id(tensor)
-        identity = cache.get(key)
-        if identity is not None:
-            return identity
-    identity = (
+def _tensor_identity(tensor):
+    return (
         tensor.untyped_storage().data_ptr(),
         tensor.storage_offset(),
         tuple(tensor.shape),
@@ -334,9 +327,6 @@ def _tensor_identity(tensor, cache=None):
         tensor.dtype,
         tensor.device,
     )
-    if cache is not None:
-        cache[key] = identity
-    return identity
 
 
 def dense_target(name, meta, module, target, slices):
@@ -388,17 +378,21 @@ class ConsumerSnapshot:
             if isinstance(value, torch.Tensor)
         ]
 
-    def check(self, identities=None):
-        if identities is None:
-            identities = {}
+    def check_objects(self):
         current = self.read()
         if (
             len(current) != len(self.objects)
             or any(a is not b for a, b in zip(current, self.objects))
-            or any(
-                _tensor_identity(current[index], identities) != expected
-                for index, expected in self.tensors
+        ):
+            raise RuntimeError(
+                "GPU delta consumer storage changed; readmission required"
             )
+
+    def check(self):
+        self.check_objects()
+        if any(
+            _tensor_identity(self.objects[index]) != expected
+            for index, expected in self.tensors
         ):
             raise RuntimeError(
                 "GPU delta consumer storage changed; readmission required"
