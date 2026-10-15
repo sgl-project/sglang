@@ -29,6 +29,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     HEAD_DIM,
     HIDDEN,
     INTER,
+    LOCAL_KV_HEADS,
     LOCAL_Q_HEADS,
     N_ROUTED,
     O_K,
@@ -167,7 +168,7 @@ class SparseMoeLayer(msgspec.Struct, frozen=True):
         _need(
             (attn.num_heads, attn.num_kv_heads, attn.num_idx_heads, attn.head_dim,
              attn.idx_head_dim)
-            == (LOCAL_Q_HEADS, 1, heads.count, HEAD_DIM, HEAD_DIM),
+            == (LOCAL_Q_HEADS, LOCAL_KV_HEADS, heads.count, HEAD_DIM, HEAD_DIM),
             f"layer {layer_id}: heads {attn.num_heads}/{attn.num_kv_heads}/"
             f"{attn.num_idx_heads}, dims {attn.head_dim}/{attn.idx_head_dim}",
         )  # fmt: skip

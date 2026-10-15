@@ -1,4 +1,8 @@
-"""MiniMax-M3 mono spec (gfx950, TP4): one whole-layer launch for each sparse MoE layer.
+"""MiniMax-M3 mono spec (gfx950): one whole-layer launch for each sparse MoE layer.
+
+The kernels are built for one rank of a TP group whose size is fixed at import
+(``config.TP``); ``supported_tp`` reports it and ``Packed`` refuses a runtime TP
+that disagrees.
 
 A launch (``sglang.kernels.ops.mono.gfx950.minimax_m3``, from ROCm/aiter PR6047) is K1 fused in front of K4::
 
@@ -36,6 +40,8 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     ONE_INDEX_HEAD,
     SPARSE_BLOCK,
     TOP_K,
+    TOTAL_KV_HEADS,
+    TOTAL_Q_HEADS,
     TP,
 )
 from sglang.srt.environ import envs
@@ -85,8 +91,13 @@ def refuse_config(cfg, hf_config) -> list[str]:
         hidden_size=HIDDEN,
         num_local_experts=N_ROUTED,
         num_experts_per_tok=TOP_K,
-        num_attention_heads=TP * LOCAL_Q_HEADS,
-        num_key_value_heads=TP,
+        # The model's own totals, not this rank's share: these are compared
+        # against the checkpoint's config, which knows nothing about TP.
+        # ``num_key_value_heads`` was ``TP``, which is the model's 4 only at
+        # TP4 -- at TP2 it refused the very model it supports, and at TP8 the
+        # rank's single replicated head is not a total at all.
+        num_attention_heads=TOTAL_Q_HEADS,
+        num_key_value_heads=TOTAL_KV_HEADS,
         head_dim=HEAD_DIM,
         scoring_func="sigmoid",
         swiglu_alpha=SWIGLU_ALPHA,
