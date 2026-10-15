@@ -226,7 +226,7 @@ class TestHybridL3Restore(CustomTestCase):
                 ack.finish_event.synchronize()
             reader.loading_check()
             canonical = reader.tree_core.get_component_device_value(
-                dr.hicache_restored_node, ComponentType.MAMBA
+                dr.hicache_restore_lock.node, ComponentType.MAMBA
             )[0]
             for buffer, old, new in zip(buffers, old_state, incoming):
                 torch.testing.assert_close(buffer[:, canonical], old, rtol=0, atol=0)

@@ -1360,7 +1360,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 for dr in self.transfer_queue.queue
                 if dr.prefix_match is not None
                 and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
-                and dr.hicache_restored_node is None
+                and dr.hicache_restore_lock is None
             )
         full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the

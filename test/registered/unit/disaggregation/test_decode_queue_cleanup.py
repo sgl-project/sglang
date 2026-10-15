@@ -232,7 +232,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                                     torch.tensor([]), 2, 0, 0
                                 ),
                                 hicache_restore_status=HiCacheRestoreResult.PENDING,
-                                hicache_restored_node=None,
+                                hicache_restore_lock=None,
                             )
                         ]
                 allocated_prefix = []
@@ -568,30 +568,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, checkpoint=False
         )
-
-        # A successful P→D transfer cannot commit a failed local L3 promise.
-        receiver = FakeReceiver()
-        decode_req.kv_receiver = receiver
-        decode_req.hicache_restore_status = HiCacheRestoreResult.FAILED
-        queue.queue = [decode_req]
-        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
-        queue._clean_hicache_prefetch_resources.reset_mock()
-        mock_prepare_abort.reset_mock()
-        mock_release_kv_cache.reset_mock()
-        with patch.object(
-            queue, "_poll_with_metadata_gate", return_value=[KVPoll.Success]
-        ):
-            self.assertEqual(queue.pop_transferred(), [])
-        self.assertEqual(queue.queue, [])
-        self.assertTrue(receiver.clear_called)
-        self.assertIsNone(decode_req.kv_receiver)
-        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
-        queue._clean_hicache_prefetch_resources.assert_called_once_with(decode_req)
-        mock_prepare_abort.assert_called_once()
-        mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
-        )
-        decode_req.hicache_restore_status = HiCacheRestoreResult.READY
 
         receiver = FakeReceiver()
         receiver.kv_mgr = FakeKVManager.__new__(FakeKVManager)

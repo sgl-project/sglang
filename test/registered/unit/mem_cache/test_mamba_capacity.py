@@ -248,6 +248,7 @@ class TestMambaCapacity(unittest.TestCase):
         )
         queue.tree_cache = cache
         queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
             running_batch=SimpleNamespace(reqs=[]),
             enable_priority_scheduling=False,
             enable_hisparse=False,
