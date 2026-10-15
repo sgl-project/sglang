@@ -36,12 +36,6 @@ class TestMmProcessConfigValidation(CustomTestCase):
         args = self._validate_config({})
         self.assertEqual(resolution_result(args, "mm_process_config"), {})
 
-    def test_none_config_defaults_to_empty_dict(self):
-        args = self._validate_config(None)
-        # None is kept as-is for dummy models (default happens after early return)
-        # but for real models it would be set to {}
-        self.assertIsNone(resolution_result(args, "mm_process_config"))
-
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
             self._validate_config("bad")
@@ -444,6 +438,25 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
 
         with get_parallel().override(tp_rank=6, attn_tp_rank=2):
             self.assertEqual(resolve_consumer_rank(8), 6)
+
+    def test_attention_dp_uses_only_the_routed_scheduler_group(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            get_mm_feature_consumer_count,
+            resolve_consumer_rank,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        with get_parallel().override(
+            tp_size=8,
+            attn_dp_enabled=True,
+            num_dp_ranks=2,
+            tp_rank=6,
+            attn_tp_rank=0,
+            attn_dcp_size=2,
+        ):
+            count = get_mm_feature_consumer_count()
+            self.assertEqual(count, 4)
+            self.assertEqual(resolve_consumer_rank(count), 2)
 
     def test_complete_group_acknowledges_each_consumer_slot(self):
         from sglang.srt.multimodal.transport import memory_pool

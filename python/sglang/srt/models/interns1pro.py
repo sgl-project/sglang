@@ -5,9 +5,11 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeAttention, Qwen3MoeDecoderLayer
@@ -15,7 +17,6 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3MoeLLMModel,
     Qwen3VLMoeForConditionalGeneration,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -211,8 +212,8 @@ class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
 
     def _load_fope_weights(self, name: str, loaded_weight: torch.Tensor, params_dict):
         """load fope weights"""
-        attn_tp_size = get_parallel().attn_tp_size
-        attn_tp_rank = get_parallel().attn_tp_rank
+        qkv_proj = unwrap_lora_layer(self.model.layers[0].self_attn.qkv_proj)
+        attn_tp_rank, attn_tp_size = get_group_rank_size(qkv_proj.tp_group)
 
         num_key_value_heads = loaded_weight.size(0)
         # replicate head if necessary

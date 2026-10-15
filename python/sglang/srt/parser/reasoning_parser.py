@@ -396,6 +396,38 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
+class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
+    @staticmethod
+    def thinking_enabled(chat_kwargs):
+        thinking = chat_kwargs.get("thinking")
+        enable_thinking = chat_kwargs.get("enable_thinking")
+        return (
+            True
+            if thinking is None and enable_thinking is None
+            else bool(thinking or enable_thinking)
+        )
+
+    def __init__(
+        self,
+        stream_reasoning=True,
+        force_reasoning=True,
+        continue_final_message=False,
+        previous_content="",
+        force_nonempty_content=False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+        )
+
+
 class Qwen3Detector(BaseReasoningFormatDetector):
     """
     Detector for Qwen3 models (e.g., Qwen/Qwen3-235B-A22B).
@@ -2255,6 +2287,7 @@ class ReasoningParser:
         "gemma4": Gemma4Detector,
         "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
+        "iquest_q1": IQuestQ1ReasoningDetector,
         "cohere_command4": CohereCommand4Detector,
     }
 
@@ -2275,6 +2308,13 @@ class ReasoningParser:
             raise ValueError(f"Unsupported model type: {model_type}")
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+
+        if model_type.lower() == "iquest_q1" and (
+            request is not None or force_reasoning is None
+        ):
+            force_reasoning = IQuestQ1ReasoningDetector.thinking_enabled(
+                chat_template_kwargs
+            )
 
         # Special cases where we override force_reasoning
         if model_type.lower() in {

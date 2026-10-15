@@ -63,7 +63,6 @@ from .process_utils import (
     wait_for_health,
     wait_for_workers_ready,
 )
-from .run_eval import run_eval
 
 __all__ = [
     # Enums and Identity
@@ -139,6 +138,4 @@ __all__ = [
     "FUNCTION_CALLING_MODELS",
     # Third-party models
     "THIRD_PARTY_MODELS",
-    # Evaluation
-    "run_eval",
 ]

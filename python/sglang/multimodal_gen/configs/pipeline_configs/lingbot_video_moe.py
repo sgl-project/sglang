@@ -66,12 +66,6 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds[0]
 
-    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {}
-
-    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {}
-
     def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
         return torch.float32
 
@@ -84,3 +78,18 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
             1, -1, 1, 1, 1
         )
         return 1.0 / std, mean
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
+        LingBotVideoMoESamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LingBotVideoMoESamplingParams,
+        pipeline_config_cls=LingBotVideoMoEPipelineConfig,
+        model_detectors=[
+            lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
+        ],
+    )

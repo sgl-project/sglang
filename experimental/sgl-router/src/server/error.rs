@@ -9,13 +9,8 @@ use thiserror::Error;
 
 pub const X_ROUTER_ERROR_CODE: HeaderName = HeaderName::from_static("x-router-error-code");
 
-/// Carries the worker's *own* HTTP status when the router had to synthesize a
-/// status of its own over a worker that did respond (today: a mid-body drop,
-/// where headers arrived but the body did not). Lets a gateway / operator
-/// recover what the engine actually said instead of seeing only the router's
-/// synthesized 502. Absent on every other response: a forwarded worker response
-/// already carries the worker's status in the status line, and a router-only
-/// condition (no workers, breaker open, ...) has no upstream status to report.
+/// Original worker status when a failed prefill or incomplete body becomes a router 502.
+/// Absent when no upstream response arrived or its status was forwarded unchanged.
 pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
     HeaderName::from_static("x-router-upstream-status");
 
@@ -103,6 +98,9 @@ pub enum ApiError {
     #[error("upstream response body incomplete after status {status}")]
     UpstreamStatus { status: StatusCode },
 
+    #[error("prefill failed before KV transfer completed")]
+    PrefillFailed { status: Option<StatusCode> },
+
     /// Wall-clock timeout exceeded while waiting for the upstream worker's
     /// response (per-request `request_timeout`).
     ///
@@ -187,7 +185,9 @@ impl ApiError {
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
-            ApiError::UpstreamStatus { .. } => ErrorClass::Upstream,
+            ApiError::UpstreamStatus { .. } | ApiError::PrefillFailed { .. } => {
+                ErrorClass::Upstream
+            }
             ApiError::UpstreamTimeout { .. } => ErrorClass::Timeout,
             ApiError::NoHealthyWorkers { .. } => ErrorClass::NoTarget,
             ApiError::NoPrefillWorkersAvailable { .. } => ErrorClass::NoTarget,
@@ -218,6 +218,7 @@ impl ApiError {
             // didn't. We surface a 502 but echo the worker's status in
             // `x-router-upstream-status` (see `into_response`).
             ApiError::UpstreamStatus { .. } => "upstream_body_incomplete",
+            ApiError::PrefillFailed { .. } => "prefill_failed",
             ApiError::UpstreamTimeout { .. } => "upstream_timeout",
             ApiError::NoHealthyWorkers { .. } => "no_healthy_workers",
             ApiError::NoPrefillWorkersAvailable { .. } => "no_prefill_workers_available",
@@ -232,13 +233,14 @@ impl ApiError {
 
     /// The worker's *own* status to echo in `x-router-upstream-status`, for the
     /// case where the router synthesized its own status over a worker that did
-    /// respond. Today only the mid-body-drop (`UpstreamStatus`) carries one. This
+    /// respond, including a failed prefill or an incomplete response body. This
     /// is an exhaustive, wildcard-free match (not an `if let` at the call site) so
     /// a future "synthesized over a responding worker" variant is forced to decide
     /// whether it echoes a status, rather than silently inheriting `None`.
     fn upstream_status(&self) -> Option<StatusCode> {
         match self {
             ApiError::UpstreamStatus { status } => Some(*status),
+            ApiError::PrefillFailed { status } => *status,
             ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
@@ -311,6 +313,7 @@ impl IntoResponse for ApiError {
                 );
                 "upstream response was incomplete".to_string()
             }
+            ApiError::PrefillFailed { .. } => self.to_string(),
             ApiError::UpstreamTimeout { worker } => {
                 tracing::warn!(upstream = %worker, "upstream request timed out");
                 "upstream request timed out".to_string()
@@ -369,9 +372,7 @@ impl IntoResponse for ApiError {
             .into_response();
         resp.headers_mut()
             .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
-        // Preserve the worker's real status when we synthesized our own (today,
-        // only the mid-body-drop case: the worker sent a status, then dropped the
-        // body, so we report a 502 but don't throw away what it said).
+        // Preserve the worker's real status when we synthesized our own.
         if let Some(upstream) = self.upstream_status() {
             resp.headers_mut().insert(
                 X_ROUTER_UPSTREAM_STATUS,

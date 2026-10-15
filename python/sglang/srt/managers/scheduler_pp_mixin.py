@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
@@ -53,6 +54,14 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    if batch.spec_algorithm.is_none():
+        return None
+    fwd_batch = batch.copy()
+    fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
+    return fwd_batch
 
 
 def _pp_exchange_outputs_before_forward(
@@ -214,18 +223,15 @@ class SchedulerPPMixin:
         ====================================================================
         Stage P
         recv ith req from previous stage
-        recv ith bootstrap req from previous stage
+        pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
         recv ith transferred req from previous stage
         recv ith proxy from previous stage
         run ith batch
-        recv prev (i+1) % mb_size th consensus bootstrapped req from previous stage
-        local consensus on bootstrapped req
         recv prev (i+1) % mb_size th release req from previous stage
         local consensus on release req
         recv prev (i+1) % mb_size th outputs
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
-        send ith bootstrap req to next stage
         send ith transferred req to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage (can be stashed and delayed to send later)
@@ -233,23 +239,17 @@ class SchedulerPPMixin:
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
         ====================================================================
 
-        There are two additional elements compared to the regular schedule:
-
-        Bootstrap Requests + Release Requests:
-        - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
+        Release Requests still use the two-pass PP consensus. Bootstrap uses
+        PPConsensusStore instead of the legacy two-round RID sync.
 
         """
         self.init_pp_loop_state()
 
         # PD additional state initialization
-        bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
-        consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
-        send_bootstrapped_work = []
         send_transfer_work = []
-        send_consensus_bootstrapped_work = []
         send_release_work = []
 
         while True:
@@ -264,7 +264,6 @@ class SchedulerPPMixin:
 
                 next_pp_outputs = None
                 next_release_rids = None
-                next_consensus_bootstrapped_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -273,9 +272,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
-                bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
+                self.process_bootstrapped_queue()
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
@@ -323,28 +320,12 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
-                        bootstrapped_rids,
-                    )
-                )
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
 
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
@@ -363,9 +344,6 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -374,7 +352,6 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
-                consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
 
@@ -592,7 +569,7 @@ class SchedulerPPMixin:
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         self._pp_spec_relay = (
-            envs.SGLANG_ENABLE_PP_SPEC.get()
+            pp_spec_stable_rows_enabled()
             and get_parallel().pp_size > 1
             and not self.spec_algorithm.is_none()
         )
@@ -627,67 +604,9 @@ class SchedulerPPMixin:
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
 
-    def process_bootstrapped_queue(
-        self: Scheduler, bootstrapped_rids: Optional[List[str]]
-    ):
-        # finished consensus bootstrapped reqs and prepare the waiting queue
-        if bootstrapped_rids is not None:
-            (
-                good_consensus_bootstrapped_rids,
-                bad_consensus_bootstrapped_rids,
-            ) = bootstrapped_rids
-            good_reqs, failed_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                    return_failed_reqs=True,
-                    pp_good_rids=good_consensus_bootstrapped_rids,
-                    pp_bad_rids=bad_consensus_bootstrapped_rids,
-                )
-            )
-            self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
-        return None
-
-    def _pp_pd_get_bootstrapped_ids(self: Scheduler):
-        # communicate pre-consensus bootstrapp reqs
-        if self.pp_group.is_first_rank:
-            # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
-        else:
-            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
-                prev_bootstrapped_rids
-            )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
-            )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
-            )
-        # Route locally-aborted reqs through the bad-union consensus so every PP
-        # rank flushes them in the same consensus round, regardless of when the
-        # AbortReq reaches each rank and regardless of whether
-        # disagg_kv_sender.abort() drives the poll to Failed (it is optional).
-        aborted_rids = {
-            req.rid
-            for req in self.disagg_prefill_bootstrap_queue.queue
-            if isinstance(req.finished_reason, FINISH_ABORT)
-        }
-        good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
-            good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
-        )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+    def process_bootstrapped_queue(self: Scheduler):
+        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        self.waiting_queue.extend(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -879,12 +798,8 @@ class SchedulerPPMixin:
             tensor_dict["spec_accept_lens"] = result.accept_lens
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
-            if (
-                result.accept_index is not None
-                and get_spec().speculative_eagle_topk > 1
-            ):
-                # Only a tree needs it: a chain's accepted path is already the
-                # front of each block, so compacting it is an identity.
+            if result.accept_index is not None:
+                # Relayed recurrent commits also need chain accept indices.
                 tensor_dict["spec_accept_index"] = result.accept_index
             if result.next_verify_chain is not None:
                 # Tail-drafted tree for the next verify round (root = bonus),
@@ -1093,7 +1008,7 @@ class SchedulerPPMixin:
             new_seq_lens = pp_outputs["spec_new_seq_lens"]
             fwd_rids = [req.rid for req in fwd_batch.reqs]
             live_rids = [req.rid for req in batch.reqs]
-            self._pp_spec_compact_accept_kv(
+            self._pp_spec_commit_relayed_accept(
                 batch,
                 fwd_batch,
                 fwd_rids,
@@ -1229,7 +1144,7 @@ class SchedulerPPMixin:
     ):
         self.process_batch_result(batch, output_result)
 
-    def _pp_spec_compact_accept_kv(
+    def _pp_spec_commit_relayed_accept(
         self: Scheduler,
         batch: ScheduleBatch,
         fwd_batch: ScheduleBatch,
@@ -1238,47 +1153,60 @@ class SchedulerPPMixin:
         verify_out_cache_loc: Optional[torch.Tensor],
         pp_outputs,
     ) -> None:
-        """Move this stage's accepted-path KV to the front of each request block.
+        """Commit relayed recurrent state, then compact tree KV when present.
 
-        The verify forward writes one KV slot per tree node, in node order. The
-        committed prefix that every later read assumes is the accepted path laid
-        out contiguously, so the two have to be reconciled once per round -- and
-        each stage has to do it for its own layers, since KV is not relayed.
-        The last stage does it inside verify (_finalize_accept_tree_path); this
-        is the same step for the stages that only ran the target forward.
-
-        Must run before seq_lens advances: the move writes into the block that
-        starts at the pre-advance length.
+        Must run before the live batch advances ``seq_lens``.
         """
         accept_index = pp_outputs.tensors.get("spec_accept_index")
         if accept_index is None or fwd_batch.forward_mode.is_idle():
             return
-        if verify_out_cache_loc is None:
-            return
         from sglang.srt.speculative.spec_utils import (
+            commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
         )
 
-        # The destination base is the length each request had when the forward
-        # ran. ScheduleBatch.copy() drops seq_lens but keeps seq_lens_cpu, and
-        # that snapshot is already in the forward's row order -- the live batch
-        # may have been filtered or merged since, and reindexing it would skip
-        # exactly the rounds whose composition changed.
-        device = verify_out_cache_loc.device
+        # Preserve the forward batch's row order after live-batch recomposition.
+        device = (
+            verify_out_cache_loc.device
+            if verify_out_cache_loc is not None
+            else batch.seq_lens.device
+        )
         if fwd_batch.seq_lens_cpu is not None:
             seq_lens = fwd_batch.seq_lens_cpu.to(device=device, dtype=torch.int64)
         elif live_rids == fwd_rids:
             seq_lens = batch.seq_lens
         else:
-            return
+            raise RuntimeError(
+                "PP-spec delayed relay cannot commit a recomposed micro-batch "
+                "without its forward-time seq_lens_cpu snapshot"
+            )
         fwd_batch.seq_lens = seq_lens
+        # copy() drops tree_cache, which the tracking-grid commit needs.
+        fwd_batch.tree_cache = batch.tree_cache
+        accept_index = accept_index.to(device)
+        accept_lens = pp_outputs["spec_accept_lens"].to(device)
+
+        # The last stage already commits inside run_eagle_verify.
+        if not self.pp_group.is_last_rank:
+            commit_mamba_states_after_verify(
+                self.tp_worker,
+                fwd_batch,
+                accept_lens,
+                accept_index,
+                get_spec().speculative_num_draft_tokens,
+            )
+
+        if verify_out_cache_loc is None:
+            return
         fwd_batch.out_cache_loc = verify_out_cache_loc
-        move_accept_tokens_to_target_kvcache(
-            fwd_batch,
-            accept_index.to(device),
-            pp_outputs["spec_accept_lens"].to(device) - 1,
-            self.token_to_kv_pool_allocator,
-        )
+
+        if get_spec().speculative_eagle_topk > 1:
+            move_accept_tokens_to_target_kvcache(
+                fwd_batch,
+                accept_index,
+                accept_lens - 1,
+                self.token_to_kv_pool_allocator,
+            )
 
     def _pp_spec_adopt_relayed_tree(
         self: Scheduler,
@@ -1733,11 +1661,7 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
-                    fwd_batch=(
-                        cur_batch.copy()
-                        if not cur_batch.spec_algorithm.is_none()
-                        else None
-                    ),
+                    fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                 )
                 event = self.device_module.Event()

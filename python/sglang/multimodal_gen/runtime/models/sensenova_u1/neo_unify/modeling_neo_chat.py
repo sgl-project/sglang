@@ -13,6 +13,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
+
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
 from .modeling_fm_modules import (
@@ -20,7 +22,7 @@ from .modeling_fm_modules import (
     FlowMatchingHead,
     TimestepEmbedder,
 )
-from .modeling_neo_vit import NEOVisionModel
+from .modeling_neo_vit import NEOVisionModel, build_abs_positions_from_grid_hw
 from .modeling_qwen3 import (
     Qwen3ForCausalLM,
     create_block_causal_mask,
@@ -230,44 +232,6 @@ def _randn_with_seed(shape, *, device, dtype, seed: int | list[int]) -> torch.Te
             return torch.randn(shape, device=device, dtype=dtype)
     generator.manual_seed(seed)
     return torch.randn(shape, device=device, dtype=dtype, generator=generator)
-
-
-def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):
-    """
-    Compute patch coordinates (x, y)
-
-    Args:
-        grid_hw: (B, 2) tensor representing (H, W) per image
-    """
-    device = grid_hw.device
-    B = grid_hw.shape[0]
-
-    # Get the number of patches per image
-    H = grid_hw[:, 0]
-    W = grid_hw[:, 1]
-    N = H * W
-    N_total = N.sum()
-
-    # Create the batch index for each patch (B x patch count)
-    patch_to_sample = torch.repeat_interleave(
-        torch.arange(B, device=device), N
-    )  # (N_total,)
-
-    # Generate intra-image patch index (row-major order)
-    patch_id_within_image = torch.arange(N_total, device=device)
-    patch_id_within_image = (
-        patch_id_within_image
-        - torch.cumsum(torch.cat([torch.tensor([0], device=device), N[:-1]]), dim=0)[
-            patch_to_sample
-        ]
-    )
-
-    # Get H/W for each patch according to its image
-    W_per_patch = W[patch_to_sample]
-    abs_x = patch_id_within_image % W_per_patch
-    abs_y = patch_id_within_image // W_per_patch
-
-    return abs_x, abs_y
 
 
 class NEOChatModel(PreTrainedModel):
@@ -484,12 +448,16 @@ class NEOChatModel(PreTrainedModel):
                 grid_hw=grid_hw,
             ).last_hidden_state
         else:
-            return self.vision_model(
-                pixel_values=pixel_values,
-                output_hidden_states=False,
-                return_dict=True,
-                grid_hw=grid_hw,
-            ).last_hidden_state
+            return self._reference_image_features(pixel_values, grid_hw)
+
+    @cached_conditioning
+    def _reference_image_features(self, pixel_values, grid_hw):
+        return self.vision_model(
+            pixel_values=pixel_values,
+            output_hidden_states=False,
+            return_dict=True,
+            grid_hw=grid_hw,
+        ).last_hidden_state
 
     def batch_chat(
         self,
