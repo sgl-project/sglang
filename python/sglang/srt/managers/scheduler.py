@@ -3931,18 +3931,20 @@ class Scheduler(
         num_held_rows: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        # Requests the caller counts that already hold a row (a continuing
-        # chunk, a session borrow) need no free one; give their rows back.
-        available = self.req_to_token_pool.available_size() + num_held_rows
-
+        # Rows the counted requests may occupy: the free rows, plus the rows that
+        # counted requests already hold (a continuing chunk, a session borrow),
+        # minus the rows promised to beam members.
         active_batch = running_batch or self.running_batch
-        available = max(
-            available - self.beam_coordinator.pending_member_rows(active_batch), 0
+        row_budget = max(
+            self.req_to_token_pool.available_size()
+            + num_held_rows
+            - self.beam_coordinator.pending_member_rows(active_batch),
+            0,
         )
-        res = min(pp_budget, available)
+        res = min(pp_budget, row_budget)
         if beam_width is not None:
             # A beam candidate owns beam_width rows once decoding.
-            res = min(res, available // beam_width)
+            res = min(res, row_budget // beam_width)
 
         return res
 
