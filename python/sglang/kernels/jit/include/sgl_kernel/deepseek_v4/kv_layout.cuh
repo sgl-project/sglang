@@ -7,6 +7,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/deepseek_v4/kv_layout_id.cuh>
 
 #include <bit>
 #include <cstdint>
@@ -34,8 +35,6 @@
 namespace sglang {
 
 namespace deepseek_v4 {
-
-enum class KVLayout : int32_t { V4 = 0, V41 = 1, V41_FP4 = 2, UNIFORM_FP8 = 3 };
 
 template <KVLayout kLayout>
 struct KVLayoutTraits;
