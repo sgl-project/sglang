@@ -920,19 +920,26 @@ class HiSparseCoordinator:
         host_indices = self.req_to_host_pool[req.kv.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.kv.req_pool_idx, :n]
 
-        layer_ids = (
-            range(self.mem_pool_device.start_layer, self.mem_pool_device.end_layer)
-            if self.is_m3_hisparse
-            else range(self.mem_pool_device.layer_num)
+        if self.is_m3_hisparse:
+            # MHA host pool has no batched all-layer load; keep the per-layer loop.
+            for layer_id in range(
+                self.mem_pool_device.start_layer, self.mem_pool_device.end_layer
+            ):
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_locs,
+                    layer_id,
+                    io_backend="kernel",
+                )
+            return
+
+        self.mem_pool_host.load_to_device_all_layer(
+            self.mem_pool_device,
+            host_indices,
+            device_locs,
+            io_backend="kernel",
         )
-        for layer_id in layer_ids:
-            self.mem_pool_host.load_to_device_per_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_locs,
-                layer_id,
-                io_backend="kernel",
-            )
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
