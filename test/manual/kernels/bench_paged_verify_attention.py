@@ -60,6 +60,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=9)
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--reference", action="store_true")
+    parser.add_argument(
+        "--include-q-widening",
+        action="store_true",
+        help="Time exact Q widening in BF16-query arms.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-pages", action="store_true")
     parser.add_argument("--arms", default="stock")
@@ -265,7 +270,9 @@ def main():
                         functions = [
                             lambda kv=kv, o=o, q16=q16, selected_backend=selected_backend, probe_mask=probe_mask, transform_mode=transform_mode: (
                                 flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                                    q16,
+                                    q.to(torch.bfloat16)
+                                    if args.include_q_widening
+                                    else q16,
                                     kv,
                                     workspace,
                                     table,
@@ -556,7 +563,14 @@ def main():
                     ]
                     functions = [
                         lambda kv=kv, o=o, wrapper=wrapper, q16=q16: wrapper.run(
-                            q16, kv, out=o
+                            (
+                                q.to(torch.bfloat16)
+                                if args.include_q_widening
+                                and q16.dtype == torch.bfloat16
+                                else q16
+                            ),
+                            kv,
+                            out=o,
                         )
                         for kv, o in zip(banks, outputs)
                     ]
