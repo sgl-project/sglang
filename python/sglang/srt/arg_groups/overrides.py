@@ -81,6 +81,7 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_fi_a2a_supported,
     is_gfx95_supported,
+    is_gfx1250_supported,
     xpu_has_xmx_support,
 )
 
@@ -1421,6 +1422,19 @@ def _page_size_default(view: Any) -> dict:
             "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
         )
         return {"page_size": 64}
+    # On gfx1250 the aiter backend runs non-MLA attention through aiter
+    # unified_attention, whose tile width equals the page size (wrong output at
+    # page_size=1). Other backends and MLA keep their usual default.
+    if (
+        get_platform().is_hip
+        and is_gfx1250_supported()
+        and "aiter" in attention_backends_of(view)
+        and not use_mla_backend(view)
+    ):
+        logger.info(
+            "Setting page_size=32 as default for aiter unified attention on gfx1250."
+        )
+        return {"page_size": 32}
     if not get_platform().is_musa:
         return {"page_size": 1}
     return {"page_size": 64}
