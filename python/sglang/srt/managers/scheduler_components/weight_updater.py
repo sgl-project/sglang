@@ -17,6 +17,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -339,6 +340,8 @@ class SchedulerWeightUpdaterManager:
         assert self.is_fully_idle(
             ignore_waiting=scheduler is not None and scheduler._engine_paused
         ), "release_memory_occupation should be called only when server is idle."
+        # A weights-only release does not reach flush_cache.
+        mm_schedule.release_prefill_rows()
 
         tags = recv_req.tags
 

@@ -160,8 +160,6 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
-# model_specific_data key for encoder rows kept between prefill chunks.
-PREFILL_ROWS_KEY = "_sglang_prefill_rows"
 
 logger = logging.getLogger(__name__)
 
@@ -721,14 +719,8 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
-    def release_prefill_rows(self):
-        """Drop the encoder rows kept between prefill chunks."""
-        for item in self.mm_items:
-            item.model_specific_data.pop(PREFILL_ROWS_KEY, None)
-
     def release_features(self):
         """Release feature tensors to free GPU memory."""
-        self.release_prefill_rows()
         for item in self.mm_items:
             try:
                 # Release both deferred features that were never used and
@@ -1624,8 +1616,6 @@ class Req(ReqDllmMixin):
             if self.multimodal_inputs is not None:
                 self.multimodal_inputs.release_features()
         else:
-            if self.multimodal_inputs is not None:
-                self.multimodal_inputs.release_prefill_rows()
             for item in self._session_mm_items:
                 item.release_transport_proxies()
                 item.feature = None
@@ -2037,9 +2027,6 @@ class Req(ReqDllmMixin):
         self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
-        if self.multimodal_inputs is not None:
-            # A requeued request must not hold encoder rows.
-            self.multimodal_inputs.release_prefill_rows()
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.

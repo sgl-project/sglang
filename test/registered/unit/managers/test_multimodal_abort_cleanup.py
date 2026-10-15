@@ -5,7 +5,7 @@ import sys
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -18,7 +18,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import (
-    PREFILL_ROWS_KEY,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
@@ -384,57 +383,6 @@ def test_session_abort_preserves_shared_multimodal_features():
         req.set_finish_with_abort("invalid session turn")
 
     mm_inputs.release_features.assert_not_called()
-    assert req.multimodal_inputs is None
-
-
-def _inputs_with_kept_prefill_rows():
-    items = [
-        MultimodalDataItem(
-            modality=Modality.VIDEO,
-            feature=object(),
-            model_specific_data={PREFILL_ROWS_KEY: object()},
-        )
-        for _ in range(2)
-    ]
-    return MultimodalInputs(mm_items=items)
-
-
-def test_release_features_drops_kept_prefill_rows():
-    mm_inputs = _inputs_with_kept_prefill_rows()
-
-    mm_inputs.release_features()
-
-    for item in mm_inputs.mm_items:
-        assert PREFILL_ROWS_KEY not in item.model_specific_data
-        assert item.feature is None
-
-
-def test_retracted_request_drops_kept_prefill_rows():
-    mm_inputs = _inputs_with_kept_prefill_rows()
-    req = Mock(retraction_count=0, input_embeds=None, multimodal_inputs=mm_inputs)
-    req.kv.holds_kv = False
-
-    Req.reset_for_retract(req)
-
-    for item in mm_inputs.mm_items:
-        assert PREFILL_ROWS_KEY not in item.model_specific_data
-        # The features stay: the request is prefilled again from the queue.
-        assert item.feature is not None
-
-
-def test_aborted_session_request_drops_kept_prefill_rows():
-    mm_inputs = _inputs_with_kept_prefill_rows()
-    req = object.__new__(Req)
-    req.session = object()
-    req._session_mm_items = []
-    req.multimodal_inputs = mm_inputs
-
-    req.release_mm_inputs_on_abort()
-
-    for item in mm_inputs.mm_items:
-        assert PREFILL_ROWS_KEY not in item.model_specific_data
-        # The session still owns the features of its history.
-        assert item.feature is not None
     assert req.multimodal_inputs is None
 
 

@@ -106,6 +106,7 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
 )
+from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -117,6 +118,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -3864,6 +3866,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
+            self._release_kept_mm_rows_dllm()
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
@@ -3948,7 +3951,25 @@ class Scheduler(
 
         return res
 
+    def _release_kept_mm_rows(self) -> None:
+        """Drop kept encoder rows once no request is between two prefill chunks."""
+        if self.chunked_req is None:
+            mm_schedule.release_prefill_rows()
+
+    def _release_kept_mm_rows_dllm(self) -> None:
+        """Like _release_kept_mm_rows; dLLM requests encode their context over
+        several steps without becoming chunked_req."""
+        dllm = self.dllm_manager
+        if not any(
+            req.dllm_phase == DllmReqPhase.STAGING_PREFILL and req.prefix_len > 0
+            for req in (*dllm.waiting_queue, *dllm.staging_queue)
+        ):
+            mm_schedule.release_prefill_rows()
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        # Every prefill loop passes here after dropping chunked requests and
+        # before add_chunked_req ends the current one.
+        self._release_kept_mm_rows()
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -5379,6 +5400,7 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
+            mm_schedule.release_prefill_rows()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5728,6 +5750,8 @@ class Scheduler(
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
+        # Paused loops skip scheduling, so drop the rows here.
+        self._release_kept_mm_rows()
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,
