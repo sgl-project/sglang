@@ -513,14 +513,7 @@ class _GenerationStreamAccumulator:
         # already computed these and transferred them via the metadata buffer
         # (req.mm_*), so prefer the pre-stored values; otherwise compute them
         # from the request's multimodal items.
-        if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
-            image_t = req.mm_image_tokens
-            audio_t = req.mm_audio_tokens
-            video_t = req.mm_video_tokens
-        elif req.multimodal_inputs:
-            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
-        else:
-            image_t = audio_t = video_t = 0
+        image_t, audio_t, video_t = req.get_mm_token_counts()
         self.image_tokens.append(image_t)
         self.audio_tokens.append(audio_t)
         self.video_tokens.append(video_t)

@@ -376,7 +376,10 @@ class SchedulerDllmMixin:
         for req in reqs:
             # Check if batch is full
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, num_held_rows=num_held_rows
+            ):
                 running_batch.batch_is_full = True
 
             # Try preemption if batch is full

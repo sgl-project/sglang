@@ -18,8 +18,8 @@ mod tokenizer_manager;
 mod utils;
 
 pub use message::config::{
-    DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
-    RustServerServerArgs, ServerArgs,
+    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
+    ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::MmData;
@@ -314,6 +314,7 @@ impl Server {
                 from_scheduler_cap,
                 stage_channel_cap,
                 cores,
+                metrics_listener: port_offset.unwrap_or(0) == 0,
             },
             server_args: std::sync::Arc::new(server_args),
         };
@@ -357,6 +358,7 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DisaggregationMode>()?;
     m.add_class::<DefaultSamplingParams>()?;
     m.add_class::<ModelConfig>()?;
+    m.add_class::<MetricsConfig>()?;
     m.add_class::<ServerArgs>()?;
     m.add_class::<MmFamily>()?;
     m.add_class::<MmResample>()?;

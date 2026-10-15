@@ -427,11 +427,16 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            supported = {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
+            supported = {
+                ComponentType.FULL,
+                ComponentType.SWA,
+                ComponentType.AUXILIARY_SWA,
+                ComponentType.MAMBA,
+            }
             if not set(self.tree_components) <= supported:
                 raise ValueError(
                     "--hicache-host-memory-mode buffer_only supports only "
-                    "FULL/SWA/MAMBA unified trees; got components "
+                    "FULL/SWA/AUXILIARY_SWA/MAMBA unified trees; got components "
                     f"{sorted(ct.name for ct in self.tree_components)}."
                 )
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -490,21 +495,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_memory_mode == "buffer_only":
             self.tree_core.set_host_memory_buffer_only()
             swa = self.components.get(ComponentType.SWA)
+            auxiliary_swa = self.components.get(ComponentType.AUXILIARY_SWA)
             validate_buffer_only_stack(
                 sidecar_pool_specs=self.sidecar_pool_specs,
                 host_pool_group=self.host_pool_group,
                 swa_component=swa,
+                auxiliary_swa_component=auxiliary_swa,
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
             self.buffer_pipeline = self.components[
                 ComponentType.FULL
             ].create_buffer_pipeline(
                 max_context_len=get_model().context_length or 0,
-                swa_window_pages=(
-                    swa.full_window_pages
-                    if swa is not None and self.tree_core.has_swa_host_pool
-                    else 0
-                ),
+                swa_component=swa,
+                auxiliary_swa_component=auxiliary_swa,
                 # Leak backstop only: the queue is charged once per unique node
                 # span across pools; a cap binding on live content would
                 # drop-newest and punch storage holes.
@@ -1197,19 +1201,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        # The tree's own walk: a session slot must not answer for the insert.
-        match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
-        new_last_node = match_result.last_device_node
+        # With PD decode radix caching, SWA matching can stop short of the inserted path.
+        # Repoint from that path to protect all tree-owned KV.
+        new_last_node = result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
+        ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -2706,6 +2708,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         beliefs = self.storage_existence_cache
         verdicts = operation.query_pool_hit_pages
+        # No rank-agreed KV query evidence; leave beliefs unchanged.
+        if PoolName.KV not in verdicts:
+            return
         folded_pages = operation.storage_hit_count // self.page_size
 
         def verdict(pool: PoolName) -> tuple[int, bool]:
@@ -2850,7 +2855,6 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
-        self._invalidate_absent_from_hit_query(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -3011,13 +3015,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
                 if info is None:
-                    # Request already aborted/cleaned up; still flush the
-                    # query's absent-hash feedback.
-                    self._invalidate_absent_from_hit_query(operation)
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue
@@ -3051,7 +3053,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
-                self._invalidate_absent_from_hit_query(operation)
                 self._account_prefetch_outcome(operation, revoked=False)
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
@@ -3677,11 +3678,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_protected_size(self) -> int:
         return self.tree_core.swa_protected_size()
-
-    def swa_transient_size(self) -> int:
-        if self.buffer_pipeline is None:
-            return 0
-        return self.buffer_pipeline.swa_transient_size()
 
     def mamba_protected_size(self) -> int:
         return self.tree_core.mamba_protected_size()
