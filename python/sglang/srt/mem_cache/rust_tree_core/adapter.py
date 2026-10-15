@@ -520,8 +520,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
 
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
+        if component_type != ComponentType.SWA:
+            raise NotImplementedError("The Rust tree core supports one SWA window")
         return self._binding.swa_tombstone_ranges(
             self._bindings.MatchParamsBinding(
                 key=_radix_key_buffer(key),
@@ -538,7 +544,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
+        if component_type != ComponentType.SWA:
+            raise NotImplementedError("The Rust tree core supports one SWA window")
         return _cache_actions_from_tagged(
             self._binding.attach_swa_window(
                 self._bindings.MatchParamsBinding(
