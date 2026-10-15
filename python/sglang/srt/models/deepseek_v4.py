@@ -2466,6 +2466,8 @@ class MQALayer(MqaAttentionBase):
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                    # TRT-LLM returns BF16 even with FP8 queries.
+                    dtype=x.dtype,
                 )
                 bcg_deepseek_v4_attention_with_output(
                     attn_q,
@@ -4153,6 +4155,11 @@ class DeepseekV4Model(nn.Module):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+        tail_in_graph = (
+            tail is not None
+            and tail.scatter_indices is not None
+            and is_in_breakable_cuda_graph()
+        )
         late_dp_counts = None
         saved_dp = None
         if (
@@ -4167,12 +4174,8 @@ class DeepseekV4Model(nn.Module):
                     if tail is not None
                     else hidden_states.shape[0]
                 ),
+                in_graph=tail_in_graph,
             )
-        tail_in_graph = (
-            tail is not None
-            and tail.scatter_indices is not None
-            and is_in_breakable_cuda_graph()
-        )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
