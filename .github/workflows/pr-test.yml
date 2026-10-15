@@ -151,6 +151,9 @@ jobs:
           # 10 min under the 6h GitHub-hosted job cap: setup needs under 2 min, the rest is margin;
           # timeout-minutes cannot raise the cap, and a wait killed by it ends `cancelled`.
           max-wait-minutes: '350'
+          # pr-test-finish fails the run on any base-b failure, so this gate only saves GPU time;
+          # a slow base-b lets base-c start rather than costing the base-c run.
+          fail-on-timeout: 'false'
 
   # =============================================== PR Gate ====================================================
   call-gate:

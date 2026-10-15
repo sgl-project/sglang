@@ -167,7 +167,7 @@ describes what each one does.
 3. If any matched job has `conclusion === 'failure'` → fail immediately (fail-fast)
 4. If all matched jobs are completed and count matches `expected_count` → success
 5. Otherwise → sleep `poll-interval-seconds` (default: 60s) and retry
-6. Timeout after `max-wait-minutes` of wall-clock time (240 min for base-a, 350 min for base-b). Keep budgets under the 6h hard cap on GitHub-hosted runners: a wait killed by the cap ends `cancelled`, not `timeout`, and `timeout-minutes` cannot raise it.
+6. Timeout after `max-wait-minutes` of wall-clock time (240 min for base-a, 350 min for base-b). Keep budgets under the 6h hard cap on GitHub-hosted runners: a wait killed by the cap ends `cancelled`, not `timeout`, and `timeout-minutes` cannot raise it. The base-b wait sets `fail-on-timeout: 'false'`, so a timeout lets base-c start; `pr-test-finish` fails the run on any base-b failure regardless
 
 **Job specs example** (base-b):
 ```json

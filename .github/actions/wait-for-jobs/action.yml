@@ -19,6 +19,10 @@ inputs:
     description: 'Seconds between polling attempts'
     required: false
     default: '60'
+  fail-on-timeout:
+    description: 'Fail when max-wait-minutes runs out, unless set to `false`, which reports `timeout` as a warning so later stages proceed.'
+    required: false
+    default: 'true'
   github-token:
     description: 'GitHub token for API calls'
     required: false
@@ -40,6 +44,7 @@ runs:
         INPUT_JOBS: ${{ inputs.jobs }}
         INPUT_MAX_WAIT_MINUTES: ${{ inputs.max-wait-minutes }}
         INPUT_POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+        INPUT_FAIL_ON_TIMEOUT: ${{ inputs.fail-on-timeout }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -215,5 +220,9 @@ runs:
             await new Promise(resolve => setTimeout(resolve, sleepMs));
           }
 
-          core.setFailed(`Timeout waiting for ${stageName} jobs`);
           core.setOutput('result', 'timeout');
+          if (process.env.INPUT_FAIL_ON_TIMEOUT !== 'false') {
+            core.setFailed(`Timeout waiting for ${stageName} jobs`);
+          } else {
+            core.warning(`Timeout waiting for ${stageName} jobs; proceeding without the stage gate`);
+          }
