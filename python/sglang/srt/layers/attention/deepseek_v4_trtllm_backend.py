@@ -18,6 +18,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
+from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+    DeepseekV4MegaAttnBackend,
+)
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
@@ -535,20 +538,17 @@ def is_dsv4_trtllm_attn_enabled() -> bool:
     return get_exec().kernel.dsv4_attn_backend == "trtllm"
 
 
+def is_dsv4_mega_attn_enabled() -> bool:
+    return get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+
+
 def create_deepseek_v4_attn_backend(
     model_runner: ModelRunner, **kwargs
 ) -> DeepseekV4AttnBackend:
     """Construct the DSV4 backend matching --dsv4-attn-backend."""
     if is_dsv4_trtllm_attn_enabled():
         cls = DeepseekV4TrtllmAttnBackend
-    elif (
-        get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
-        and not model_runner.is_draft_worker
-    ):
-        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
-            DeepseekV4MegaAttnBackend,
-        )
-
+    elif is_dsv4_mega_attn_enabled() and not model_runner.is_draft_worker:
         cls = DeepseekV4MegaAttnBackend
     else:
         cls = DeepseekV4AttnBackend

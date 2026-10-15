@@ -1336,7 +1336,7 @@ class MQALayer(MqaAttentionBase):
     def setup_mega_attention(self) -> None:
         if not self.use_mega_attention:
             return
-        from sglang.srt.layers.attention.dsv4.mega_attention import (
+        from sglang.srt.layers.attention.dsv4.mega_attention_utils import (
             interleave_output_columns,
             interleave_query_rows,
             quantize_wo_a,
@@ -1370,7 +1370,7 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsv4.mega_attention import pack_query
+        from sglang.srt.layers.attention.dsv4.mega_attention_utils import pack_query
 
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
