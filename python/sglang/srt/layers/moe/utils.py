@@ -108,6 +108,11 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MORI,
         )
 
+    def low_latency_supports_extend(self) -> bool:
+        # MORI EPv2's AsyncLL kernels take extend batches, so low_latency
+        # does not have to block TBO on them.
+        return self.is_mori_epv2()
+
 
 class _MoeRunnerBackendPredicates:
     value: str
