@@ -22,11 +22,22 @@ Select **Docker** in the command panel to launch the matching image. The **Pytho
 The first launch in a fresh container spends about five extra minutes compiling JIT kernels for the speculative-decoding graphs (about 4–5 minutes once, then about 30 seconds). Mount a persistent cache volume, for example `-v ~/.cache:/root/.cache`, to skip it on later starts.
 </Note>
 
+<Note>
+**AMD MI325X / MI350X:** the published ROCm images predate the ROCm gated-MLA fix that Ling-3.1-flash needs; without it the server fails while capturing decode CUDA graphs. Until a ROCm image includes the fix, build a thin image that switches the nightly's editable SGLang source to the Ling-3.1-flash branch (use the `mi35x` base for MI350X), then substitute it for the image in the generated Docker command:
+
+```dockerfile Dockerfile
+FROM lmsysorg/sglang-rocm:v0.5.21-rocm724-mi30x-20261013
+RUN cd /sgl-workspace/sglang \
+ && git fetch https://github.com/sgl-project/sglang.git bailing-v3-day0 \
+ && git checkout FETCH_HEAD
+```
+</Note>
+
 </Accordion>
 
 Pick your hardware to generate the launch command:
 
-- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. Verified on H200 and GB300; H20-3e, H800, H100, and B200 recipes are provided unverified.
+- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. Verified on H200 and GB300; H20-3e, H800, H100, and B200 recipes are provided unverified. AMD MI325X and MI350X recipes (TP8 + EP8 with AITER, without speculative decoding) are provided unverified; the MI325X accuracy in the benchmark card was measured by AMD.
 
 For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. The combination is verified: prefix hits return from Mooncake L3 on every TP rank.
 
