@@ -1,0 +1,225 @@
+---
+title: FLUX.3
+description: Serve FLUX.3 text-to-image and image-to-image generation with SGLang Diffusion.
+tag: NEW
+metatags:
+    description: "Serve FLUX.3 image generation with SGLang Diffusion."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/black-forest-labs/flux3.jsx";
+
+<DiffusionModelTags tags={["image", "T2I / I2I", "50-step", "1024×1024"]} />
+
+## Quick start
+
+Install SGLang Diffusion:
+
+```bash
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+<Deployment config={config} />
+
+<Note>
+FLUX.3 image ships as two checkpoints: `black-forest-labs/flux-3-image-klein`,
+the step-distilled model, and `black-forest-labs/flux-3-image-klein-base`, the
+base model it was distilled from. `--model-path` takes either Hub id or a local
+copy of the repo; SGLang downloads only the files of the selected checkpoint
+and recognizes the package from its `config.json`, so no
+`--pipeline-class-name` is needed.
+</Note>
+
+<Warning>
+Review the Black Forest Labs license before production or commercial use.
+</Warning>
+
+For platform-specific installation, see the
+[SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## Model capabilities
+
+FLUX.3 image generates from a text prompt (text to image) or edits 1 to 10
+reference images (image to image). One server serves both: a request that
+carries reference images is an edit, any other request is text to image.
+
+| Task | Endpoint | Conditioning |
+| --- | --- | --- |
+| Text to image | `POST /v1/images/generations` | Text prompt |
+| Image to image | `POST /v1/images/edits` | Text prompt and 1 to 10 `image` uploads |
+
+Start the server:
+
+```bash
+sglang serve \
+  --model-path black-forest-labs/flux-3-image-klein \
+  --host 0.0.0.0 \
+  --port 30010
+```
+
+Sampling is set per request (`num_inference_steps`, `guidance_scale`, `size`,
+`seed`, `n`); unset fields take the checkpoint's defaults from its
+`config.json`. FLUX.3 processes one output per model forward; SGLang expands
+`n` into separate seeded requests.
+
+References are prepared as in the BFL reference pipeline. A single reference is
+fitted under 4 MP, reflect-padded to the 16-pixel grid and, when you set no
+output size, sets the output size; the padding is cropped from the result.
+With several references each is fitted under 1 MP and centre-cropped, and the
+output takes the first one's size.
+
+## Checkpoints
+
+| Model | `--model-path` | Default sampling |
+| --- | --- | --- |
+| Distilled | `black-forest-labs/flux-3-image-klein` | 16 steps, no CFG |
+| Base | `black-forest-labs/flux-3-image-klein-base` | 50 steps, CFG 3.5 |
+
+The distilled model is a step-distilled flow-map DiT: each step jumps straight
+to the next time of the schedule, so it samples without CFG. SGLang tells a
+flow map from its weights. It rejects `--enable-cfg-parallel`, a request
+`guidance_scale` other than 1, and a non-empty `negative_prompt`. Tensor
+parallelism, Ulysses SP and breakable CUDA graphs work as for the base model.
+On B200 (1024×1024, 16 steps) the distilled model runs at 15.2 it/s on one GPU
+and 26.7 it/s with `--enable-breakable-cuda-graph`.
+
+The base model samples with CFG against an empty negative prompt; a request's
+`guidance_scale` above 1 replaces the default scale of 3.5. The distilled repo
+may point at the base repo's text encoder and VAE with `hf://` paths; SGLang
+fetches them from there.
+
+## Quantized checkpoints
+
+Each repo ships quantized DiTs under `variants/`: select one with
+`--model-variant fp8r` or `--model-variant nvfp4` and keep `--model-path`
+pointing at the repo root. The text encoder and VAE stay BF16. The quantization
+comes from the variant's `hf_quant_config.json`, so do not also pass
+`--quantization`.
+
+```bash
+sglang serve \
+  --model-path black-forest-labs/flux-3-image-klein-base \
+  --model-variant fp8r \
+  --host 0.0.0.0 \
+  --port 30010
+```
+
+**FP8R** stores rowwise-FP8 weights. On Blackwell (SM10x) the FP8 projections
+run FlashInfer PrimsTS GEMMs with fused QK-norm/RoPE and SwiGLU epilogues
+(FlashInfer >= 0.7.1); set `SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE=1` to
+autotune them during warmup. Other GPUs use the generic rowwise-FP8 GEMM. On
+H200 (1024×1024, 50 steps) the base model runs at 9.4 it/s on one GPU (BF16:
+7.0), 13.7 it/s with TP 2 and 14.0 it/s with Ulysses SP 2 plus
+`--enable-breakable-cuda-graph`.
+
+**NVFP4** stores FP4 (E2M1) weights with FP8 block scales and needs a Blackwell
+GPU; it is verified on B200, where its projections run PrimsTS GEMMs like FP8R.
+Its DiT weighs 5.3 GB, against 6.3 GB for FP8R and 11.1 GB for BF16.
+
+Denoise throughput of the base model on one B200 (1024×1024, 50 steps):
+
+| Precision | it/s | it/s with `--enable-breakable-cuda-graph` |
+| --- | --- | --- |
+| BF16 | 12.3 | 13.7 |
+| FP8R | 16.4 | 20.2 |
+| NVFP4 | 13.5 | 21.3 |
+
+Both combine with the multi-GPU, offload and CUDA-graph flags below.
+
+## Multi-GPU and acceleration
+
+FLUX.3 shares its DiT with FLUX.3 Action, so the image pipeline supports
+tensor parallelism, Ulysses sequence parallelism, CFG parallelism, layerwise
+offload and breakable CUDA graphs. Denoise throughput for one 1024×1024 image
+(50 steps, CFG 3.5) on H200:
+
+| Setup | Flags | it/s |
+| --- | --- | --- |
+| 1 GPU | — | 7.0 |
+| 1 GPU, breakable CUDA graph | `--enable-breakable-cuda-graph` | 7.6 |
+| 1 GPU, layerwise offload | `--dit-layerwise-offload True` | 5.7 |
+| 2 GPUs, Ulysses SP | `--num-gpus 2 --ulysses-degree 2` | 8.4 |
+| 2 GPUs, Ulysses SP + CUDA graph | `--num-gpus 2 --ulysses-degree 2 --enable-breakable-cuda-graph` | 11.5 |
+| 2 GPUs, TP + CUDA graph | `--num-gpus 2 --tp-size 2 --enable-breakable-cuda-graph` | 12.4 |
+| 2 GPUs, CFG parallel | `--num-gpus 2 --enable-cfg-parallel` | 12.0 |
+
+<Note>
+Under sequence parallelism every rank holds the full DiT, so combining it with
+layerwise offload streams the whole model to each GPU every step (2.2 it/s on
+2× H200). Prefer tensor parallelism when offloading on several GPUs.
+</Note>
+
+## Cache-DiT
+
+[Cache-DiT](/docs/sglang-diffusion/cache_dit) skips the 28 single-stream blocks
+on steps where their input barely changes and reuses the cached residual. Turn
+it on for every request with `SGLANG_CACHE_DIT_ENABLED=true` on `sglang serve`,
+or per request with `"enable_cache_dit": true`. A request can also tune it, for
+example `"cache_dit_params": {"residual_diff_threshold": 0.12, "enable_taylorseer": true}`.
+
+End-to-end latency of one 1024×1024 image on one B200, and fidelity against the
+same request without Cache-DiT (three seeds):
+
+| Model | Cache-DiT | Latency | PSNR / SSIM |
+| --- | --- | --- | --- |
+| Base, 50 steps | off | 4.00 s | — |
+| Base, 50 steps | default (`residual_diff_threshold` 0.24) | 2.01 s | 30.8–34.1 dB / 0.87–0.96 |
+| Base, 50 steps | `residual_diff_threshold` 0.12 + TaylorSeer | 2.30 s | 36.5–40.4 dB / 0.97–0.98 |
+| Distilled, 16 steps | off | 0.75 s | — |
+| Distilled, 16 steps | default | 0.55 s | 34.0–35.3 dB / 0.95–0.96 |
+
+The default threshold can change the composition of some samples; the lower
+threshold with TaylorSeer keeps them close at about 1.75× instead of 2×.
+Cache-DiT combines with FP8R and NVFP4, tensor parallelism, CFG parallelism and
+layerwise offload. It is skipped, with a warning, under Ulysses sequence
+parallelism and breakable CUDA graphs, and for a request whose CFG pair has to
+run as two forwards to fit in device memory.
+
+## Request examples
+
+<Tabs>
+<Tab title="Text to image">
+
+```bash
+curl -sS -X POST http://localhost:30010/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "A red fox standing in fresh snow", "size": "1024x1024", "seed": 0, "response_format": "b64_json"}' \
+  -o flux3_t2i.json
+```
+
+</Tab>
+<Tab title="Image to image">
+
+```bash
+curl -sS -X POST http://localhost:30010/v1/images/edits \
+  -F "image=@/data/flux3/reference.png" \
+  -F "prompt=Render the reference as a winter wildlife photograph" \
+  -F "seed=0" \
+  -F "response_format=b64_json" \
+  -o flux3_i2i.json
+```
+
+</Tab>
+<Tab title="Offline generation">
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/flux-3-image-klein-base \
+  --height 1024 --width 1024 \
+  --num-inference-steps 50 \
+  --guidance-scale 3.5 \
+  --prompt "A red fox standing in fresh snow"
+```
+
+Pass `--image-path` (one or more images) to edit references instead.
+
+</Tab>
+</Tabs>
+
+## Validation
+
+The FLUX.3 image path is parity-tested against the BFL reference for BF16,
+rowwise FP8, and NVFP4 checkpoints. Native image-VAE and native DiT tests cover
+the SGLang execution path; the native DiT's packed CFG forward is checked
+against the shared FLUX 3 transformer run per sample.

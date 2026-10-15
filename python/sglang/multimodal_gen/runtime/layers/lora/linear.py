@@ -810,18 +810,28 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             end_idx = (tp_rank + 1) * shard_size
             return B[:, start_idx:end_idx, :]
 
-        # Native fused checkpoints (MiniMax H3, etc.) store one concatenated 2D
-        # lora_B matrix per logical layer; shard each section independently.
-        shards: list[torch.Tensor] = []
-        row_offset = 0
-        for full_size, part_size in zip(
-            self.base_layer.output_sizes,
-            self.base_layer.output_partition_sizes,
-        ):
-            local_start = tp_rank * part_size
-            local_end = (tp_rank + 1) * part_size
-            shards.append(B[row_offset + local_start : row_offset + local_end, :])
-            row_offset += full_size
+        # Native fused checkpoints (MiniMax H3, FLUX.3, etc.) store one
+        # concatenated 2D lora_B matrix per logical layer; shard each section
+        # independently, rejecting a matrix that does not match output_sizes.
+        return self._slice_fused_lora_b_weights(B, tp_rank)
+
+    def _slice_fused_lora_b_weights(
+        self, B: torch.Tensor, tp_rank: int
+    ) -> torch.Tensor:
+        """Slice fused ``B`` ``[sum(output_sizes), r]`` per output shard."""
+        output_sizes = self.base_layer.output_sizes
+        if B.shape[0] != sum(output_sizes):
+            raise ValueError(
+                f"fused LoRA B has {B.shape[0]} output rows, expected "
+                f"{sum(output_sizes)} for merged output sizes {output_sizes}"
+            )
+        shards = []
+        offset = 0
+        for shard_idx, output_size in enumerate(output_sizes):
+            shard_size = self.base_layer.output_partition_sizes[shard_idx]
+            start_idx = offset + tp_rank * shard_size
+            shards.append(B[start_idx : start_idx + shard_size])
+            offset += output_size
         return torch.cat(shards, dim=0)
 
 
