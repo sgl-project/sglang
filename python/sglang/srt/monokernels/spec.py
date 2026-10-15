@@ -53,7 +53,7 @@ class Requirements(msgspec.Struct, frozen=True):
     field accepts any value."""
 
     dtypes: frozenset[str] = frozenset()
-    # Checked against the decode-phase backend, which runs served steps.
+    # checked against the decode-phase backend, which runs the served steps
     attention_backends: frozenset[str] = frozenset()
     # a server argument -> its accepted values, as resolved for this server
     server_args: Mapping[str, frozenset] = {}
@@ -186,6 +186,7 @@ def find_spec(*, backend: str, architectures, isa: Optional[str]):
         if path is None:
             continue
         module, _, attr = path.partition(":")
+        # a broken plugin is a refusal every rank reports, not a crash on one
         try:
             spec = getattr(importlib.import_module(module), attr)
         except Exception as e:

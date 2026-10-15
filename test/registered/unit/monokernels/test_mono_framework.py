@@ -322,8 +322,7 @@ class TestMonokernelFramework(CustomTestCase):
             install(archs=[ARCH])
 
     def test_every_rank_takes_the_same_lookup_branch(self):
-        # a rank that failed to load the registered spec once returned alone while
-        # its peers entered the next collective; now every rank refuses together
+        # every rank refuses together: one returning alone would hang its peers
         ours = (True, True, "", (SPEC.name, SPEC.api))
         with self.assertRaisesRegex(ValueError, "rank 1: broken"):
             install(archs=[ARCH], lookups=[ours, (False, True, "broken", None)])

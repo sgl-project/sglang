@@ -342,7 +342,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Apply model-capability constraints after backend selection.
     run_hook(handle_model_capability_adjustments, server_args)
 
-    # After the CUDA graph, memory, model, attention-backend and speculative hooks.
+    # needs the resolved CUDA-graph, attention-backend and speculative settings
     from sglang.srt.monokernels.guards import handle_monokernel
 
     run_hook(handle_monokernel, server_args)

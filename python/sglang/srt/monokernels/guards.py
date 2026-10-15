@@ -90,7 +90,7 @@ def _ragged_verify(cfg) -> bool:
     return cfg.speculative_algorithm is not None and mode != "static"
 
 
-# Partitioned GPUs are refused at install, and weight updates by SGLang's weight updater.
+# PARTITIONED_GPU needs the device, so install checks it
 _PROBES = {
     Feature.PIPELINE_PARALLEL: lambda c: c.pp_size > 1,
     Feature.MULTI_NODE_TP: lambda c: c.nnodes > 1,
