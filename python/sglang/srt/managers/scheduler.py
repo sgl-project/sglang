@@ -3928,9 +3928,12 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        num_held_rows: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        available = self.req_to_token_pool.available_size()
+        # Requests the caller counts that already hold a row (a continuing
+        # chunk, a session borrow) need no free one; give their rows back.
+        available = self.req_to_token_pool.available_size() + num_held_rows
 
         active_batch = running_batch or self.running_batch
         available = max(
@@ -3985,8 +3988,8 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
         if running_batch.is_empty():
-            # An empty batch never reaches update_running_batch, the only
-            # other place that clears the flag, so admission would stay shut.
+            # An empty batch has no request left to leave, and only a leaving
+            # request clears the flag elsewhere, so admission would stay shut.
             running_batch.batch_is_full = False
 
         if (
@@ -4009,8 +4012,8 @@ class Scheduler(
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
+        # In the non-PP case, a chunked request keeps its req_to_token row across chunks,
+        # so continuing it needs no free row.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
@@ -4114,16 +4117,21 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                num_held_rows=num_held_rows,
             ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if (
+                    len(adder.can_run_list) - num_held_rows
+                    >= self.req_to_token_pool.available_size()
+                ):
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
