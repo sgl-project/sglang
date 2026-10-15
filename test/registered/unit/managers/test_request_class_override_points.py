@@ -140,6 +140,10 @@ class TestRequestClassOverridePoints(CustomTestCase):
             prepare_for_dispatch_async=AsyncMock(return_value=[]),
             cancel_for_dispatch=lambda items: None,
         )
+        manager.positional_embeds_transport = SimpleNamespace(
+            prepare_for_dispatch=lambda objs: [],
+            cancel_for_dispatch=lambda items: None,
+        )
         manager._dispatch_to_scheduler = sent.append
         manager._mark_state_dispatched = lambda rid: None
         asyncio.run(manager._send_batch_request([tokenized]))
