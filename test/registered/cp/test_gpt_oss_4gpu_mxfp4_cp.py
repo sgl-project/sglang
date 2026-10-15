@@ -22,8 +22,6 @@ class TestGptOss4GpuMxfp4CP(BaseTestGptOss):
                 "4",
                 "--cp-strategy",
                 "zigzag",
-                "--cuda-graph-backend-prefill",
-                "breakable",
                 "--cuda-graph-max-bs-decode",
                 "200",
             ],
