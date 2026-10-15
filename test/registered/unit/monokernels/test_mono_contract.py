@@ -13,22 +13,38 @@ register_cpu_ci(est_time=10, stage="base-a", runner_config="cpu")
 
 ROOT = Path(spec.__file__).resolve().parents[2]  # python/sglang
 
-
-@lru_cache(maxsize=None)
-def _tree(path: Path) -> ast.Module:
-    return ast.parse(path.read_text())
+# Names the framework reads that its CPU tests reach only through fakes: GPU runner,
+# batch and process-group attributes, string protocols, and server arguments read
+# only at launch. Imports and the rest fail the framework tests directly.
+READS = {
+    "srt/arg_groups/fields/*.py": (
+        "cuda_graph_config",
+        "speculative_algorithm",
+        "speculative_num_draft_tokens",
+    ),
+    "srt/configs/model_config.py": ("dtype", "hf_config"),
+    "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
+    "srt/layers/attention/base_attn_backend.py": ("decode_attention_backend_str",),
+    "srt/model_executor/forward_batch_info.py": (
+        "forward_mode",
+        "batch_size",
+        "input_ids",
+    ),
+    "srt/model_executor/model_runner_components/weight_updater.py": (
+        '"_derived_weight_cache_error"',
+    ),
+    "srt/model_executor/runner/decode_cuda_graph_runner.py": ("capture_bs",),
+    "srt/runtime_context.py": ('"tp_group"',),
+}
 
 
 @lru_cache(maxsize=None)
 def _provided(path: Path) -> frozenset:
-    """Names a file provides: definitions, attributes, imports, f(p), literals."""
+    """Names a file provides: definitions, attributes, imports and string literals."""
     names = set()
-    for node in ast.walk(_tree(path)):
+    for node in ast.walk(ast.parse(path.read_text())):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
-            if not isinstance(node, ast.ClassDef):
-                params = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
-                names.update(f"{node.name}({p.arg})" for p in params)
         elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
@@ -44,59 +60,18 @@ def _provided(path: Path) -> frozenset:
     return frozenset(names)
 
 
-def _declared(path: Path) -> dict:
-    """The module's SGLANG_READS, or {} without one."""
-    for node in _tree(path).body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "SGLANG_READS" for t in node.targets
-        ):
-            return ast.literal_eval(node.value)
-    return {}
-
-
-def _srt_imports(path: Path) -> set:
-    """The names a module imports from sglang.srt, outside the framework itself."""
-    return {
-        a.asname or a.name
-        for node in ast.walk(_tree(path))
-        if isinstance(node, ast.ImportFrom)
-        and (node.module or "").startswith("sglang.srt")
-        and not (node.module or "").startswith(spec.__package__)
-        for a in node.names
-    }
-
-
-READERS = [
-    p
-    for p in sorted((ROOT / "srt/monokernels").rglob("*.py"))
-    if _declared(p) or _srt_imports(p)
-]
-
-
 class TestSglangReads(CustomTestCase):
-    def test_every_srt_import_is_declared(self):
-        self.assertTrue(READERS, f"no framework module under {ROOT}")
-        for path in READERS:
-            with self.subTest(module=str(path.relative_to(ROOT))):
-                declared = {n for names in _declared(path).values() for n in names}
-                undeclared = _srt_imports(path) - declared
-                self.assertFalse(
-                    undeclared, f"declare {sorted(undeclared)} in SGLANG_READS"
-                )
-
     def test_sglang_provides_what_the_framework_reads(self):
-        for path in READERS:
-            with self.subTest(module=str(path.relative_to(ROOT))):
-                missing = []
-                for pattern, names in _declared(path).items():
-                    files = sorted(ROOT.glob(pattern))
-                    self.assertTrue(files, f"no file matches {pattern}")
-                    provided = frozenset().union(*map(_provided, files))
-                    missing += [f"{pattern}: {n}" for n in names if n not in provided]
+        for pattern, names in READS.items():
+            with self.subTest(pattern=pattern):
+                files = sorted(ROOT.glob(pattern))
+                self.assertTrue(files, f"no file matches {pattern}")
+                provided = frozenset().union(*map(_provided, files))
+                missing = [name for name in names if name not in provided]
                 self.assertFalse(
                     missing,
-                    "SGLang no longer provides what this module reads; repair it "
-                    "and its SGLANG_READS:\n  " + "\n  ".join(missing),
+                    f"SGLang no longer provides {missing} in {pattern}; repair the "
+                    "monokernel framework and READS",
                 )
 
 

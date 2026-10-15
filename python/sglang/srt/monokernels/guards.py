@@ -24,58 +24,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Source-contract inventory for test_mono_contract: f(p) is a parameter, "x" a literal.
-SGLANG_READS = {
-    "srt/arg_groups/fields/*.py": (
-        "monokernel_backend",
-        "cuda_graph_config",
-        "watchdog_timeout",
-        "speculative_algorithm",
-        "speculative_num_draft_tokens",
-        "tp_size",
-        "dtype",
-        # the probes of the refused-by-default features
-        "pp_size",
-        "nnodes",
-        "enable_dp_attention",
-        "attn_dp_size",
-        "ep_size",
-        "enable_eplb",
-        "attn_cp_size",
-        "dcp_size",
-        "enable_prefill_cp",
-        "enable_two_batch_overlap",
-        "enable_single_batch_overlap",
-        "enable_lora",
-        "lora_paths",
-        "disaggregation_mode",
-        "enable_return_routed_experts",
-        "enable_return_indexer_topk",
-        "enable_hierarchical_cache",
-        "disaggregation_decode_enable_offload_kvcache",
-        "enable_lmcache",
-        "enable_flexkv",
-        "enable_memory_saver",
-        "enable_weights_cpu_backup",
-        "cpu_offload_gb",
-        "offload_group_size",
-        "enable_torch_compile",
-        # the modes that accept only a BITWISE spec
-        "enable_deterministic_inference",
-        "rl_on_policy_target",
-    ),
-    "srt/arg_groups/overrides.py": (
-        "attention_backends_of",
-        "declare_resolution",
-        "model_config_of",
-        "resolving_view",
-    ),
-    "srt/configs/model_config.py": ("ModelConfig",),
-    "srt/environ.py": ("envs", "SGLANG_RAGGED_VERIFY_MODE"),
-    "srt/model_executor/cuda_graph_config.py": ("Phase", "DECODE", "with_phase"),
-    "srt/server_args.py": ("ServerArgs",),
-}
-
 # Leave time for peers to abort before the process watchdog fires.
 MAX_DEADLINE_S, MIN_DEADLINE_S = 60.0, 5.0
 

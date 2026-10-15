@@ -40,49 +40,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Source-contract inventory for test_mono_contract.
-SGLANG_READS = {
-    "srt/arg_groups/fields/*.py": (
-        "monokernel_backend",
-        "disable_cuda_graph",
-        "disable_decode_cuda_graph",
-        "cuda_graph_config",
-        "watchdog_timeout",
-        "speculative_algorithm",
-        "speculative_num_draft_tokens",
-    ),
-    "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
-    "srt/model_executor/forward_batch_info.py": (
-        "ForwardBatch",
-        "forward_mode",
-        "batch_size",
-        "input_ids",
-        "is_decode",
-        "is_target_verify",
-    ),
-    "srt/model_executor/model_runner.py": (
-        "capture_tail_hooks",
-        "decode_attention_backend_str",
-    ),
-    "srt/model_executor/model_runner_components/weight_updater.py": (
-        '"_derived_weight_cache_error"',
-    ),
-    "srt/model_executor/runner/decode_cuda_graph_runner.py": (
-        "DecodeCudaGraphRunner",
-        "capture_bs",
-        "model_runner",
-    ),
-    "srt/runtime_context.py": (
-        "get_context",
-        "get_device",
-        "get_exec",
-        "get_parallel",
-        "get_spec",
-        "is_config_namespace_published",
-        '"tp_group"',
-    ),
-}
-
 
 def _backend() -> Optional[str]:
     """Return the selected backend, or None without published server configuration."""
