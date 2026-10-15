@@ -87,6 +87,7 @@ class _RecordingTokenizerMetricsCollector(TokenizerMetricsCollector):
 
 class _RecordingStorageMetricsCollector(StorageMetricsCollector):
     _counter_cls = _RecordingMetric
+    _gauge_cls = _RecordingMetric
     _histogram_cls = _RecordingMetric
 
 

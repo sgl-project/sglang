@@ -4559,6 +4559,54 @@ class UnifiedRadixCacheSuite:
             self.assertEqual(self._host_avail_sizes(cache), avail0)
         cache.sanity_check()
 
+    def test_buffer_only_evicted_queued_write_is_labeled_and_warned(self):
+        """A queued write whose node the device LRU evicts before its D2H
+        launch must show up as hicache_backup_dropped_tokens_total with
+        reason=source_evicted plus a WARNING, not as an unexplained L3 miss."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = mock.MagicMock()
+
+        seq = self._buffer_swa_seq()
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        pipeline = cache.buffer_pipeline
+        _write_backup(cache, leaf)
+        expected = [
+            (len(intent.keys) * cache.page_size, "source_evicted")
+            for intent in pipeline.pending_write_queue
+        ]
+        self.assertTrue(expected)
+        # The write still waits for staging when the device LRU reclaims the node.
+        self.assertGreater(
+            cache.evict(EvictParams(num_tokens=len(seq))).num_tokens_evicted, 0
+        )
+        with self.assertLogs(
+            "sglang.srt.mem_cache.buffer_mode.pipeline", level="WARNING"
+        ) as logs:
+            pipeline.flush_pending_writes()
+        collector = cache.storage_metrics_collector
+        self.assertEqual(
+            sorted(
+                (call.args[0], call.args[1])
+                for call in collector.log_backup_dropped_tokens.call_args_list
+            ),
+            sorted(expected),
+        )
+        self.assertIn("reason=source_evicted", logs.records[0].getMessage())
+        self.assertFalse(pipeline.pending_write_queue)
+        self.assertFalse(pipeline.inflight_backup_node_ids)
+        self.assertEqual(pipeline.write_backlog_tokens_, 0)
+        self.assertTrue(pipeline.is_idle())
+        cache.sanity_check()
+
     def _drain_buffer_writes(self, cache):
         pipeline = cache.buffer_pipeline
         self._pump_hicache_until(
@@ -4747,7 +4795,7 @@ class UnifiedRadixCacheSuite:
                 expected_intents,
             )
             self.assertEqual(pipeline.write_backlog_tokens_, expected_backlog)
-            self.assertEqual(pipeline._backlog_cap_hits, 0)
+            self.assertEqual(pipeline.dropped_backup_tokens("backlog_cap"), 0)
             self.assertTrue(cache.buffer_backup_pending(leaf))
             self._pump_hicache_until(
                 cache,

@@ -2207,12 +2207,48 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.backup_dropped_tokens_total = Counter(
             name="sglang:hicache_backup_dropped_tokens_total",
-            documentation="Buffer-mode backup tokens that never reached L3 "
-            "because admission rejected them or the source became stale "
-            "before the D2H staging launched; the write path lagging device "
-            "churn is the common cause, and the span rewrites only on a "
-            "later recompute.",
+            documentation="Buffer-mode backup tokens that never reached L3, "
+            "by reason; the span rewrites only on a later recompute. "
+            "source_evicted means the device LRU evicted the span while its "
+            "write waited for staging (usually a store draining slower than "
+            "prefill produces KV); parent_uncovered and parent_cascade mean the "
+            "parent span is not stored, so the child is skipped instead of "
+            "leaving a prefix hole; oversize means the span cannot fit the "
+            "write staging window; backlog_cap is the leak backstop.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        for reason in (
+            "source_evicted",
+            "parent_uncovered",
+            "parent_cascade",
+            "oversize",
+            "backlog_cap",
+        ):
+            self.backup_dropped_tokens_total.labels(**self.labels, reason=reason)
+
+        self.backup_backlog_tokens = Gauge(
+            name="sglang:hicache_backup_backlog_tokens",
+            documentation="Buffer-mode backup tokens admitted but waiting for "
+            "write staging (D2H not launched). These spans are unpinned: a "
+            "device eviction before the launch drops them (source_evicted).",
             labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.backup_staged_tokens = Gauge(
+            name="sglang:hicache_backup_staged_tokens",
+            documentation="Host staging tokens held by launched buffer-mode "
+            "writes until their storage ack.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.backup_staging_cap_tokens = Gauge(
+            name="sglang:hicache_backup_staging_cap_tokens",
+            documentation="Host tokens the buffer-mode write window may hold "
+            "right now (host pool minus prefetch occupancy and margin). "
+            "staged at the cap means the store, not prefill, paces writes "
+            "and the backlog is exposed to device eviction.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
 
         self.prefetch_aux_alloc_failed_tokens_total = Counter(
@@ -2302,9 +2338,18 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                 **self.labels, reason=reason
             ).inc(num_tokens)
 
-    def log_backup_dropped_tokens(self, dropped_tokens: int):
+    def log_backup_dropped_tokens(self, dropped_tokens: int, reason: str) -> None:
         if dropped_tokens > 0:
-            self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
+            self.backup_dropped_tokens_total.labels(**self.labels, reason=reason).inc(
+                dropped_tokens
+            )
+
+    def log_backup_write_window(
+        self, *, backlog_tokens: int, staged_tokens: int, staging_cap_tokens: int
+    ) -> None:
+        self.backup_backlog_tokens.labels(**self.labels).set(backlog_tokens)
+        self.backup_staged_tokens.labels(**self.labels).set(staged_tokens)
+        self.backup_staging_cap_tokens.labels(**self.labels).set(staging_cap_tokens)
 
     def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
         if num_tokens > 0:

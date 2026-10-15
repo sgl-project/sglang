@@ -26,6 +26,7 @@ verification; a violation surfaces as an unexplained collective hang.
 from __future__ import annotations
 
 import logging
+import time
 from array import array
 from collections import deque
 from dataclasses import replace
@@ -173,6 +174,44 @@ class _AnchorLock(msgspec.Struct):
 
     node_id: NodeId
     tokens: int
+
+
+# Label values of sglang:hicache_backup_dropped_tokens_total{reason}; the
+# collector pre-seeds exactly this set.
+BACKUP_DROP_REASONS = (
+    "source_evicted",
+    "parent_uncovered",
+    "parent_cascade",
+    "oversize",
+    "backlog_cap",
+)
+_BACKUP_DROP_DETAILS = {
+    "source_evicted": (
+        "the device LRU evicted the source before its D2H launched; writes "
+        "wait behind the staging window below, so a store draining slower "
+        "than prefill produces KV is the usual cause"
+    ),
+    "parent_uncovered": (
+        "the parent span is neither stored nor in flight, so writing them "
+        "would leave a prefix hole"
+    ),
+    "parent_cascade": "the parent span's write was dropped after admission",
+    "oversize": "the span exceeds the write-usable host staging capacity",
+    "backlog_cap": (
+        "the write backlog cap was hit; the live backlog is bounded by the "
+        "device pool span, so this indicates a stale-sweep or accounting leak"
+    ),
+}
+
+
+class _BackupDropTally(msgspec.Struct):
+    """Drops of one reason since its last log line, plus the running total."""
+
+    spans: int = 0
+    tokens: int = 0
+    sample_node_ids: list[NodeId] = []
+    total_tokens: int = 0
+    last_logged_at: Optional[float] = None
 
 
 def validate_buffer_only_stack(
@@ -323,6 +362,9 @@ class BufferModePipeline:
     # Arbitrary: a deferral means the admission budget and the allocator disagree
     # about free slots, which waiting on decode rarely fixes.
     max_staged_admission_defers: int = 32
+    # Arbitrary: one summary line per drop reason per interval keeps a
+    # sustained drain deficit readable; the metric carries every span.
+    backup_drop_log_interval_s: float = 10.0
 
     def reset(self) -> None:
         # Load pipeline: hits awaiting a staging grant (park-and-retry),
@@ -350,7 +392,7 @@ class BufferModePipeline:
         self._backup_ack_seq = 0
         self.write_staged_tokens_ = 0
         self.write_backlog_tokens_ = 0
-        self._backlog_cap_hits = 0
+        self._backup_drop_tallies: dict[str, _BackupDropTally] = {}
         # Attempt-keyed locks stop stale completions from unlocking retries.
         self.anchor_locks: dict[CacheRequestHandle, _AnchorLock] = {}
         self.anchor_locked_tokens_ = 0
@@ -506,10 +548,89 @@ class BufferModePipeline:
             for component in self._cache.components.values()
         )
 
-    def _log_backup_dropped(self, num_tokens: int) -> None:
+    def _log_backup_dropped(
+        self, num_tokens: int, reason: str, node_id: NodeId
+    ) -> None:
+        """Count one dropped span under ``reason`` and tally it for the
+        per-tick, per-reason rate-limited log line (``_log_pending_backup_drops``;
+        the line is deferred so it reports the queue after the sweep). The
+        pages reach L3 only on a later recompute, and without the line a
+        lagging store shows up as an unexplained L3 miss rate."""
+        if num_tokens <= 0:
+            return
         cache = self._cache
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
-            cache.storage_metrics_collector.log_backup_dropped_tokens(num_tokens)
+            cache.storage_metrics_collector.log_backup_dropped_tokens(
+                num_tokens, reason
+            )
+        tally = self._backup_drop_tallies.get(reason)
+        if tally is None:
+            tally = self._backup_drop_tallies[reason] = _BackupDropTally()
+        tally.spans += 1
+        tally.tokens += num_tokens
+        tally.total_tokens += num_tokens
+        if len(tally.sample_node_ids) < 4:
+            tally.sample_node_ids.append(node_id)
+
+    def _log_pending_backup_drops(self) -> None:
+        """Once per tick: report each reason's spans tallied since its last
+        line, at most one line per reason per interval."""
+        if not self._backup_drop_tallies:
+            return
+        now = time.monotonic()
+        for reason, tally in self._backup_drop_tallies.items():
+            if not tally.spans or (
+                tally.last_logged_at is not None
+                and now - tally.last_logged_at < self.backup_drop_log_interval_s
+            ):
+                continue
+            tally.last_logged_at = now
+            logger.log(
+                logging.ERROR if reason == "backlog_cap" else logging.WARNING,
+                "HiCache buffer-mode backup dropped (reason=%s): %d span(s), %d "
+                "tokens since the last report (%d total), node_ids=%s; %s. Queue "
+                "%d intents / %d tokens (cap %d), staged %d of live cap %d host "
+                "tokens.",
+                reason,
+                tally.spans,
+                tally.tokens,
+                tally.total_tokens,
+                tally.sample_node_ids,
+                _BACKUP_DROP_DETAILS[reason],
+                len(self.pending_write_queue),
+                self.write_backlog_tokens_,
+                self.write_backlog_cap,
+                self.write_staged_tokens_,
+                self._write_staging_cap(),
+            )
+            tally.spans = 0
+            tally.tokens = 0
+            tally.sample_node_ids = []
+
+    def dropped_backup_tokens(self, reason: str) -> int:
+        """Tokens dropped under ``reason`` since the last reset."""
+        tally = self._backup_drop_tallies.get(reason)
+        return 0 if tally is None else tally.total_tokens
+
+    def _write_staging_cap(self) -> int:
+        """Host tokens launched writes may hold: loads have priority (writes
+        are deferrable), so the window is the pool minus prefetch occupancy
+        minus a 10% margin, floored at the configured fraction."""
+        cc = self._cache.cache_controller
+        pool_tokens = cc.mem_pool_host.size
+        return max(
+            int(HICACHE_WRITE_STAGING_POOL_FRACTION * pool_tokens),
+            pool_tokens - cc.prefetch_tokens_occupied - pool_tokens // 10,
+        )
+
+    def _log_write_window(self, live_cap: int) -> None:
+        cache = self._cache
+        if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
+            cache.storage_metrics_collector.log_backup_write_window(
+                backlog_tokens=self.write_backlog_tokens_,
+                staged_tokens=self.write_staged_tokens_,
+                staging_cap_tokens=live_cap,
+            )
 
     def _pool_covered(self, pool: PoolName, keys: list[str]) -> bool:
         """Beliefs plus content past a D2H launch (republished content must
@@ -683,25 +804,16 @@ class BufferModePipeline:
             ):
                 # The cap sits at 2x the intrinsic live-backlog ceiling (see
                 # init_hicache), so reaching it means leaked accounting or a
-                # broken stale sweep — a bug, not load.
-                self._backlog_cap_hits += 1
-                if self._backlog_cap_hits <= 3 or self._backlog_cap_hits % 1000 == 0:
-                    logger.error(
-                        "HiCache write backlog cap hit (occurrence %d): "
-                        "backlog=%d cap=%d queue=%d. Live backlog is bounded "
-                        "by the device pool span, so this indicates a "
-                        "stale-sweep or accounting leak.",
-                        self._backlog_cap_hits,
-                        self.write_backlog_tokens_,
-                        self.write_backlog_cap,
-                        len(self.pending_write_queue),
-                    )
-                self._log_backup_dropped(intent_tokens)
+                # broken stale sweep -- a bug, not load.
+                self._log_backup_dropped(intent_tokens, "backlog_cap", node_id)
+                continue
+            if not parent_covered:
+                self._log_backup_dropped(intent_tokens, "parent_uncovered", node_id)
                 continue
             # A span larger than the pool's whole staging capacity can never
             # stage; admitting it would wedge the head-of-line queue forever.
-            if not parent_covered or self._backup_oversize(*self._sizing(pool, keys)):
-                self._log_backup_dropped(intent_tokens)
+            if self._backup_oversize(*self._sizing(pool, keys)):
+                self._log_backup_dropped(intent_tokens, "oversize", node_id)
                 continue
             intent = _UnifiedBackupIntent(snapshot=snapshot, pool=pool, keys=list(keys))
             self.pending_write_queue.append(intent)
@@ -797,7 +909,6 @@ class BufferModePipeline:
         queued = {(i.snapshot.node_id, i.pool) for i in self.pending_write_queue}
         survivors: dict[tuple[NodeId, PoolName], _UnifiedBackupIntent] = {}
         states: dict[NodeId, BufferBackupState] = {}
-        swept_tokens = 0
         for intent in self.pending_write_queue:
             snapshot = intent.snapshot
             key = (snapshot.node_id, intent.pool)
@@ -814,7 +925,9 @@ class BufferModePipeline:
             self._release_queued_span(intent)
             pieces = self._split_pieces(snapshot)
             if pieces is None:
-                swept_tokens += len(intent.keys) * page_size
+                self._log_backup_dropped(
+                    len(intent.keys) * page_size, "source_evicted", snapshot.node_id
+                )
                 continue
             for piece in pieces:
                 key = (piece.node_id, intent.pool)
@@ -842,7 +955,6 @@ class BufferModePipeline:
                 )
                 self._retain_queued_span(repaired)
         self.pending_write_queue = deque(survivors.values())
-        self._log_backup_dropped(swept_tokens)
         return states
 
     def flush_pending_writes(self) -> None:
@@ -853,18 +965,15 @@ class BufferModePipeline:
         returning to scheduler admission, where L1 slots can be reused.
         Each staged source stays locked until its D2H ack.
         """
-        if not self.pending_write_queue:
-            return
         cc = self._cache.cache_controller
         states = self._refresh_pending_backup_intents()
-        # Loads have priority (writes are deferrable): the write window is
-        # the pool minus prefetch occupancy minus a 10% margin, floored at
-        # the configured fraction.
-        pool_tokens = cc.mem_pool_host.size
-        live_cap = max(
-            int(HICACHE_WRITE_STAGING_POOL_FRACTION * pool_tokens),
-            pool_tokens - cc.prefetch_tokens_occupied - pool_tokens // 10,
-        )
+        self._log_pending_backup_drops()
+        live_cap = self._write_staging_cap()
+        # Published every tick: staged at the cap means the store, not
+        # prefill, paces the write path and the queue behind it is exposed.
+        self._log_write_window(live_cap)
+        if not self.pending_write_queue:
+            return
         while self.pending_write_queue:
             intent = self.pending_write_queue[0]
             snapshot = intent.snapshot
@@ -874,7 +983,7 @@ class BufferModePipeline:
             if not self._backup_parent_covered(state, node_id):
                 # Cascade a dropped parent down the chain rather than creating
                 # a permanent storage hole.
-                self._drop_queue_head(intent_tokens, dropped=True)
+                self._drop_queue_head(intent_tokens, reason="parent_cascade")
                 continue
             if (
                 self.write_staged_tokens_ >= live_cap
@@ -890,14 +999,14 @@ class BufferModePipeline:
             if launch is None or all(
                 self._pool_covered(pool, keys) for pool, keys in launch[1].items()
             ):
-                self._drop_queue_head(intent_tokens, dropped=False)
+                self._drop_queue_head(intent_tokens, reason=None)
                 continue
             device_value, keys_by_pool, transfers = launch
             sizing_xfers = [t for t in transfers if t.indices_from_pool is None]
             kv_tokens = len(device_value)
             if self._backup_oversize(kv_tokens, sizing_xfers):
                 # A permanently unstageable head must not block the queue.
-                self._drop_queue_head(intent_tokens, dropped=True)
+                self._drop_queue_head(intent_tokens, reason="oversize")
                 continue
             shared_domain = self._shared_host_domain()
             staging_at_limit = (
@@ -929,15 +1038,15 @@ class BufferModePipeline:
         # Do not leave prepared copies deferred across scheduler admission.
         cc.start_writing()
 
-    def _drop_queue_head(self, intent_tokens: int, *, dropped: bool) -> None:
-        """Retire the FIFO head without a D2H launch; ``dropped`` feeds the
-        dropped-tokens metric (a pool with nothing left to write is not a
-        drop)."""
+    def _drop_queue_head(self, intent_tokens: int, *, reason: Optional[str]) -> None:
+        """Retire the FIFO head without a D2H launch; ``reason`` labels the
+        dropped-tokens metric (None: a pool with nothing left to write is not
+        a drop)."""
         intent = self.pending_write_queue.popleft()
         self._finish_inflight(intent.snapshot.node_id, intent.pool)
         self._release_queued_span(intent)
-        if dropped:
-            self._log_backup_dropped(intent_tokens)
+        if reason is not None:
+            self._log_backup_dropped(intent_tokens, reason, intent.snapshot.node_id)
 
     def _build_backup_transfers(
         self, node_id: NodeId, *, kv_only: bool = False
