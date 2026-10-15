@@ -68,14 +68,16 @@ class DenseBlocksBackend:
         candidate_topk_blocks: int,
         candidate_block_size: int,
         use_deep_gemm_prefill: bool,
-        use_triton_candidates: bool = False,
+        use_compact_candidates: bool = False,
     ) -> None:
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.topk_blocks = candidate_topk_blocks
         self.block_size = candidate_block_size
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
-        self.use_triton_candidates = use_triton_candidates and candidate_block_size == 8
+        self.use_compact_candidates = (
+            use_compact_candidates and candidate_block_size == 8
+        )
 
     def publish_prefill(self, inputs: PrefillInputs):
         if self.use_deep_gemm_prefill:
@@ -109,7 +111,7 @@ class DenseBlocksBackend:
                 blocks=blocks,
                 decode_mask=(
                     None
-                    if self.use_triton_candidates
+                    if self.use_compact_candidates
                     else candidate_block_mask(blocks, d.lmax, self.block_size)
                 ),
             )
@@ -136,12 +138,12 @@ class DenseBlocksBackend:
             req_to_token=self.req_to_token,
             candidate_mask=(
                 published.decode_mask
-                if published is not None and not self.use_triton_candidates
+                if published is not None and not self.use_compact_candidates
                 else None
             ),
             candidate_blocks=(
                 published.blocks
-                if published is not None and self.use_triton_candidates
+                if published is not None and self.use_compact_candidates
                 else None
             ),
         )
@@ -242,7 +244,7 @@ class DenseBlocksBackend:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-            candidate_blocks=published.blocks if self.use_triton_candidates else None,
+            candidate_blocks=published.blocks if self.use_compact_candidates else None,
             block_size=self.block_size,
         ):
             for chunk in chunks:

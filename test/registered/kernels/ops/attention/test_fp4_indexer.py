@@ -596,7 +596,8 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
 )
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("compact", [False, True])
-def test_hopper_indexer_backends_replay(ratio, compact):
+@pytest.mark.parametrize("deep_select", [False, True])
+def test_hopper_indexer_backends_replay(ratio, compact, deep_select):
     from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         DenseBlocksBackend,
@@ -606,6 +607,8 @@ def test_hopper_indexer_backends_replay(ratio, compact):
         DecodeInputs,
     )
 
+    # A non-aligned logical width exercises the scorer's 128-byte row padding
+    # with both DeepSelect and the top-k v2 fallback.
     batch, width, capacity, topk = 12, 193, 32772, 64
     q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
     consumer_q = -q
@@ -642,11 +645,12 @@ def test_hopper_indexer_backends_replay(ratio, compact):
         token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
     )
     full = FullTopKIndexer(**kwargs, use_deep_gemm_decode=False)
+    full.use_deep_select_decode = deep_select
     candidates = DenseBlocksBackend(
         **kwargs,
         candidate_topk_blocks=4,
         candidate_block_size=8,
-        use_triton_candidates=compact,
+        use_compact_candidates=compact,
     )
     # DeepSelect fills a full top-k buffer of exactly live rows by topk, as at
     # runtime; the candidate paths also clear padded rows and columns.
@@ -750,8 +754,8 @@ def test_hopper_indexer_backends_replay(ratio, compact):
             if not compact:
                 torch.testing.assert_close(mask[row, :width], keep)
             consumer_scores[row].masked_fill_(~keep, -torch.inf)
-            for out, scores in zip(
-                outputs, (source_scores, source_scores, consumer_scores)
+            for i, (out, scores) in enumerate(
+                zip(outputs, (source_scores, source_scores, consumer_scores))
             ):
                 pages = out.page_indices[row]
                 pages = pages[pages >= 0]
@@ -769,7 +773,13 @@ def test_hopper_indexer_backends_replay(ratio, compact):
                 expected_pages[:count] = current_slots[
                     row, selected.sort().values
                 ].int()
-                torch.testing.assert_close(out.page_indices[row], expected_pages)
+                # DeepSelect full-topk permits unordered positions; candidate
+                # selection still promises sorted logical positions and padding.
+                actual_pages = out.page_indices[row]
+                if i == 0 and deep_select:
+                    actual_pages = actual_pages.sort().values
+                    expected_pages = expected_pages.sort().values
+                torch.testing.assert_close(actual_pages, expected_pages)
                 if out.raw_indices is not None:
                     expected_raw = torch.full_like(out.raw_indices[row], -1)
                     expected_raw[:count] = selected.sort().values.int()

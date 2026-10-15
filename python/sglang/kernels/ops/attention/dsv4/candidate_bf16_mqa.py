@@ -56,6 +56,22 @@ def _candidate_bf16_mqa(
     )
 
 
+def can_use_candidate_bf16_mqa(q, keys, weights, block_size):
+    """Whether the operands fit the compact prefill scorer; otherwise use Torch."""
+    return (
+        q.is_cuda
+        and torch.version.cuda is not None
+        and q.ndim == 3
+        and q.shape[1:] == (32, 128)
+        and keys.ndim == 2
+        and keys.shape[1] == 128
+        and weights.shape == q.shape[:2]
+        and q.dtype == keys.dtype == weights.dtype == torch.bfloat16
+        and q.device == keys.device == weights.device
+        and block_size == 8
+    )
+
+
 def candidate_bf16_mqa_logits(q, keys, weights, blocks, visible_lens):
     """Score candidate blocks without a per-query K copy.
 

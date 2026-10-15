@@ -316,15 +316,6 @@ def prefill_requests(
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
-    # Unsupported shapes keep the independent Torch scoring/selection path.
-    if candidate_blocks is not None and not (
-        q.is_cuda
-        and torch.version.cuda is not None
-        and q.shape[1:] == (32, 128)
-        and q.dtype == weights.dtype == torch.bfloat16
-        and block_size == 8
-    ):
-        candidate_blocks = None
     for r in torch.unique_consecutive(req).tolist():
         tok = (req == r).nonzero().squeeze(1)
         lens = compress_lens[tok]
@@ -347,6 +338,7 @@ def prefill_requests(
                 index_k=index_k,
                 request=request,
                 candidate_blocks=candidate_blocks,
+                block_size=block_size,
             ),
         )
 
@@ -359,21 +351,24 @@ def _score_chunks(
     index_k: torch.Tensor,
     request: RequestScores,
     candidate_blocks: Optional[torch.Tensor] = None,
+    block_size: int = 8,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
     rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
-    if candidate_blocks is not None and index_k.dtype == torch.bfloat16:
+    if candidate_blocks is not None:
         from sglang.kernels.ops.attention.dsv4.candidate_bf16_mqa import (
+            can_use_candidate_bf16_mqa,
             candidate_bf16_mqa_logits,
         )
 
+        if not can_use_candidate_bf16_mqa(q, index_k, weights, block_size):
+            candidate_blocks = None
+    if candidate_blocks is not None:
         # No [rows, heads, lc] or per-query K tensor on this path. Bound the
         # FP32 output and the logical-index/top-k temporaries instead.
         width = candidate_blocks.shape[1] * 8
         rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // max(1, width * 32))
-    else:
-        candidate_blocks = None
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]

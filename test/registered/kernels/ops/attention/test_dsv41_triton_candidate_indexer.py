@@ -179,14 +179,14 @@ def test_prefill_protocol_matches_torch(ratio, tail, budget, write_pages):
         inputs.rows_per_request = [2, 1]
     rows = inputs.positions.numel()
     outputs = []
-    for triton in (False, True):
+    for compact in (False, True):
         backend = DenseBlocksBackend(
             token_to_kv_pool=pool,
             req_to_token=slots,
             candidate_topk_blocks=3,
             candidate_block_size=8,
             use_deep_gemm_prefill=False,
-            use_triton_candidates=triton,
+            use_compact_candidates=compact,
         )
         inputs.out_raw_indices = torch.empty(rows, 8, dtype=torch.int32, device="cuda")
         inputs.out_page_indices = (
@@ -196,7 +196,7 @@ def test_prefill_protocol_matches_torch(ratio, tail, budget, write_pages):
 
         # A compact consumer must not call the dense Torch scorer.
         with patch.object(scoring, "_TORCH_SCORE_BUDGET_BYTES", budget):
-            if triton:
+            if compact:
                 with patch.object(
                     indexer, "scores", side_effect=AssertionError("dense scoring")
                 ):
@@ -418,3 +418,54 @@ def test_decode_plan_and_scorer_dispatch(compact):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/Triton")
+@pytest.mark.parametrize(
+    "heads,dim,dtype,block_size",
+    [
+        (16, 128, torch.bfloat16, 8),
+        (32, 64, torch.bfloat16, 8),
+        (32, 128, torch.float32, 8),
+        (32, 128, torch.bfloat16, 4),
+    ],
+)
+def test_unsupported_compact_prefill_falls_back(heads, dim, dtype, block_size):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+
+    q = torch.ones(2, heads, dim, dtype=dtype, device="cuda")
+    keys = torch.ones(16, dim, dtype=dtype, device="cuda")
+    weights = torch.ones(2, heads, dtype=dtype, device="cuda")
+    request = SimpleNamespace(
+        lc=16,
+        columns=torch.arange(16, device="cuda"),
+        tok=torch.arange(2, device="cuda"),
+        lens=torch.tensor([5, 13], device="cuda"),
+    )
+
+    def scores(q, k, w):
+        return (torch.einsum("rhd,nd->rhn", q, k).relu() * w[..., None]).sum(1).float()
+
+    expected = scores(q, keys, weights).masked_fill(
+        request.columns[None, :] >= request.lens[:, None], -torch.inf
+    )
+    with patch(
+        "sglang.kernels.ops.attention.dsv4.candidate_bf16_mqa.candidate_bf16_mqa_logits",
+        side_effect=AssertionError("unsupported compact scorer"),
+    ):
+        chunks = list(
+            scoring._score_chunks(
+                indexer=SimpleNamespace(scores=scores),
+                q=q,
+                weights=weights,
+                index_k=keys,
+                request=request,
+                candidate_blocks=torch.zeros(2, 1, dtype=torch.int32, device="cuda"),
+                block_size=block_size,
+            )
+        )
+    assert all(chunk.candidate_blocks is None for chunk in chunks)
+    torch.testing.assert_close(torch.cat([chunk.scores for chunk in chunks]), expected)

@@ -105,7 +105,7 @@ def make_candidate_indexer(
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
         use_deep_gemm_prefill=use_deep_gemm_prefill,
-        use_triton_candidates=(
+        use_compact_candidates=(
             torch.version.cuda is not None
             and torch.cuda.get_device_capability()[0] == 9
         ),
