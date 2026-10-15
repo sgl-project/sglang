@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from enum import IntEnum
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -702,6 +703,9 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+_PACKED_VERIFY_BCAST = os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
+
+
 def _verify_uses_greedy(
     *,
     is_all_greedy: bool,
@@ -852,11 +856,27 @@ def eagle_sample(
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
-    )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+    verify_out = None
+    if _PACKED_VERIFY_BCAST:
+        # One int32 block so a sampled verify result goes to the TP group in one broadcast.
+        n_predict = math.prod(predict_shape)
+        n_index = bs * verify_input.max_tree_depth
+        verify_out = torch.empty(
+            (n_predict + n_index + bs,), dtype=torch.int32, device=device
+        )
+        predict = verify_out[:n_predict]
+        predict.zero_()
+        accept_index = verify_out[n_predict : n_predict + n_index].view(
+            bs, verify_input.max_tree_depth
+        )
+        accept_index.fill_(-1)
+        num_correct_drafts = verify_out[n_predict + n_index :]
+    else:
+        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        accept_index = torch.full(
+            (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
     target_predict = None
@@ -929,9 +949,12 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     else:
         if _is_npu:
             from sgl_kernel_npu.sample import (
@@ -1058,9 +1081,12 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
