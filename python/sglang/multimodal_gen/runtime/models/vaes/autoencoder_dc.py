@@ -7,6 +7,7 @@ from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
@@ -155,6 +156,7 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         self._ensure_inner_model()
         self._inner_model.disable_tiling()
 
+    @cached_vae_encode
     def encode(self, x: torch.Tensor, **kwargs):
         self._ensure_inner_model()
         return self._inner_model.encode(x, **kwargs)

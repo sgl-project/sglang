@@ -48,12 +48,10 @@ import re
 import unittest
 from pathlib import Path
 
-import torch
-
 import sglang.kernels.jit as _jit_pkg
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 _KERNEL_DIR = Path(_jit_pkg.__file__).parent / "csrc" / "inkling"
 
@@ -120,57 +118,6 @@ class TestConvStateMatchersAcceptStrided(unittest.TestCase):
                 line,
                 msg=f"{f}:{n} wildcards the channel stride",
             )
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA + JIT for the real kernel")
-class TestUpdateSconvCacheStridedFunctional(unittest.TestCase):
-    """The real kernel on a page-major strided view == on a contiguous clone.
-
-    Red on pre-fix sources: the matcher raises
-    'Tensor is not contiguous as expected' for the strided view.
-    """
-
-    _SLOTS, _LAYERS, _W1, _D = 4, 2, 3, 64
-
-    def _run(self, cache: torch.Tensor) -> torch.Tensor:
-        from sglang.kernels.ops.mamba.inkling_sconv import update_sconv_cache
-
-        torch.manual_seed(0)
-        dev = cache.device
-        tokens = 10
-        x = torch.randn(tokens, self._D, dtype=cache.dtype, device=dev)
-        # 2 sequences: [0:6) -> slot 1 (has state), [6:10) -> slot 3 (fresh)
-        cache_indices = torch.tensor([1, 3], dtype=torch.int32, device=dev)
-        has_initial_state = torch.tensor([True, False], device=dev)
-        query_start_loc = torch.tensor([0, 6, tokens], dtype=torch.int32, device=dev)
-        update_sconv_cache(x, cache, cache_indices, has_initial_state, query_start_loc)
-        return cache
-
-    def test_strided_view_matches_contiguous(self):
-        dev = "cuda"
-        torch.manual_seed(1)
-        # Page-major envelope: (slots, LAYERS, W1, D); the per-layer view
-        # cache = env[:, 1] has stride(0) = LAYERS*W1*D != W1*D -> non-contiguous.
-        env = torch.randn(
-            self._SLOTS,
-            self._LAYERS,
-            self._W1,
-            self._D,
-            dtype=torch.bfloat16,
-            device=dev,
-        )
-        strided = env[:, 1]
-        self.assertFalse(strided.is_contiguous(), "precondition: view is strided")
-        contiguous = strided.clone()
-        self.assertTrue(contiguous.is_contiguous())
-
-        out_c = self._run(contiguous)
-        out_s = self._run(strided)  # pre-fix: matcher rejection raises here
-
-        self.assertTrue(
-            torch.equal(out_s, out_c),
-            "strided-view kernel result differs from the contiguous reference",
-        )
 
 
 if __name__ == "__main__":

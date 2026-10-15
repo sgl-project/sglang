@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.runtime_context import attn_dp_enabled_of
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
-        "candidate_steps": [1, 3, 7],
+        "candidate_steps": [1, 3, 5, 7],
         "up_hysteresis": 0.0,
         "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
@@ -66,9 +67,9 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             f"speculative_eagle_topk={cfg.speculative_eagle_topk} "
             "(only topk=1 is supported)"
         )
-    if resolved_view(server_args).enable_dp_attention:
+    if attn_dp_enabled_of(resolved_view(server_args)):
         return (
-            "enable_dp_attention=True is not supported "
+            "attention DP is not supported "
             "(adaptive tier decisions are not synchronized across DP ranks)"
         )
     if resolved_view(server_args).enable_multi_layer_eagle:

@@ -11,7 +11,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _BUNDLED_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 _PLAIN_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
@@ -98,9 +98,8 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
-        server_args.enable_dp_attention = True
         server_args.enable_dp_lm_head = True
-        server_args.dp_size = 2
+        server_args.attn_dp_size = 2
         server_args.tp_size = 2
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args

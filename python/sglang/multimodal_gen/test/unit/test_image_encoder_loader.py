@@ -41,9 +41,13 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             ),
             component_weights_paths={},
             component_quantizations={},
+            component_quantization_ignored_layers={},
+            component_paths={},
+            batching_max_size=1,
             component_precisions={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
+            resolve_component_backend_by_role=lambda *_names: {},
             requested_component_attention_backend=lambda _name: None,
             should_direct_gpu_weight_load_component=lambda _name: False,
             should_use_fsdp_for_component=lambda _name: False,
@@ -61,7 +65,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
     def _config_patch(self, config):
         return mock.patch(
             "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "image_encoder_loader.get_diffusers_component_config",
+            "text_encoder_loader.get_diffusers_component_config",
             return_value=config,
         )
 
@@ -265,6 +269,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
                 native_only_components=(),
             ),
             resolve_component_attention_backend=lambda _name: (None, None),
+            resolve_component_backend_by_role=lambda *_names: {},
             requested_component_attention_backend=lambda _name: None,
             explicit_residency_mode=lambda _name: None,
             require_component_resident=mock.Mock(),

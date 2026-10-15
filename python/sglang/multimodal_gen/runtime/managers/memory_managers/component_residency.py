@@ -18,11 +18,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
 
 RESIDENT = "resident"
 COMPONENT_OFFLOAD = "component-offload"
+SNAPSHOT_OFFLOAD = "snapshot-offload"
 LAYERWISE_OFFLOAD = "layerwise-offload"
 COMPONENT_RESIDENCY_MODES = frozenset(
     (
         RESIDENT,
         COMPONENT_OFFLOAD,
+        SNAPSHOT_OFFLOAD,
         LAYERWISE_OFFLOAD,
     )
 )
@@ -151,6 +153,10 @@ def resolve_diffusers_pipeline_offload(
             "--component-residency layerwise-offload requires the native SGLang backend"
         )
 
+    if SNAPSHOT_OFFLOAD in assignments.values():
+        raise ComponentResidencyError(
+            "--component-residency snapshot-offload requires the native SGLang backend"
+        )
     pipeline_mode = assignments.get(LAYERWISE_OFFLOAD_ALL_COMPONENTS)
     if len(assignments) == 1 and pipeline_mode is not None:
         return pipeline_mode == COMPONENT_OFFLOAD

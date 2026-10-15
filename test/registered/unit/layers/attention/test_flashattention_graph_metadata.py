@@ -9,7 +9,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=2, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):
@@ -23,6 +23,17 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.req_to_token = torch.zeros((1, 4), dtype=torch.int32)
         backend.token_to_kv_pool = SimpleNamespace(
             translate_loc_from_full_to_swa=lambda locations: locations
+        )
+        # The metadata builder reads `is_translating` to choose between the
+        # translated block table and the strided one this test covers, so the
+        # source has to be real; the stub pools disable translation, which is
+        # the static-pool view the assertions below are written against.
+        backend.kv_index_translator = KVIndexTranslator(
+            req_to_token=backend.req_to_token,
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=backend.page_size,
+            device="cpu",
         )
         forward_batch = SimpleNamespace(
             batch_size=1,
@@ -75,6 +86,59 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend.init_forward_metadata(forward_batch)
 
         self.assertEqual(backend.forward_metadata.max_seq_len_k, 16)
+
+
+class TestSpecReadSeqLenDelta(CustomTestCase):
+    """How far past seq_lens each spec mode's translated read table reaches;
+    too short silently leaves the verify or draft tail stale."""
+
+    def _backend(self, *, topk=1, num_steps=3, step_id=1, num_draft=4):
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.topk = topk
+        b.speculative_num_steps = num_steps
+        b.speculative_step_id = step_id
+        b.speculative_num_draft_tokens = num_draft
+        return b
+
+    def test_mode_to_delta_map(self):
+        b = self._backend()
+        spec = object()
+        # Verify reads [prefix + drafts]; draft decode step i reads
+        # [prefix + i + 1] (both write the drafts into the pool first).
+        self.assertEqual(b._spec_read_seq_len_delta(ForwardMode.TARGET_VERIFY, spec), 4)
+        self.assertEqual(b._spec_read_seq_len_delta(ForwardMode.DECODE, spec), 2)
+        # Prefix-only shapes stay un-widened.
+        self.assertEqual(
+            b._spec_read_seq_len_delta(ForwardMode.DRAFT_EXTEND_V2, spec), 0
+        )
+        self.assertEqual(b._spec_read_seq_len_delta(ForwardMode.DECODE, None), 0)
+        self.assertEqual(b._spec_read_seq_len_delta(ForwardMode.EXTEND, spec), 0)
+        # Draft-extend's idle batch carries no live draft chain.
+        idle = self._backend(num_steps=0)
+        self.assertEqual(idle._spec_read_seq_len_delta(ForwardMode.IDLE, spec), 0)
+        # topk>1 reads the drafts via the expand metadata - prefix only.
+        tree = self._backend(topk=2)
+        self.assertEqual(
+            tree._spec_read_seq_len_delta(ForwardMode.TARGET_VERIFY, spec), 0
+        )
+        self.assertEqual(tree._spec_read_seq_len_delta(ForwardMode.DECODE, spec), 0)
+
+
+class TestDraftExtendInGraph(CustomTestCase):
+    """A translating fa3 must not record the in-graph draft-extend gather: it
+    reads raw (virtual) req_to_token ids over the tables rebuilt out of graph."""
+
+    def _run(self, *, translating):
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.kv_index_translator = SimpleNamespace(is_translating=translating)
+        b.draft_extend_metadata = {}  # any metadata access raises KeyError
+        fb = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2, batch_size=2)
+        b.init_forward_metadata_in_graph(fb)
+
+    def test_only_a_static_backend_builds_in_graph(self):
+        self._run(translating=True)
+        with self.assertRaises(KeyError):
+            self._run(translating=False)
 
 
 if __name__ == "__main__":

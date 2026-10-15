@@ -11,56 +11,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""KVIndexTranslator -- the read-path id translator.
+"""KVIndexTranslator -- what a runner reads and writes an iteration's plan
+through: the plan's read table and write ids per disposition, the readers
+(`read_source`, `pack_read_stream`, `copy_page_table`), and the boot-time
+dispositions.
 
-Covers, CPU-only (the builder's pure-torch reference path; GPU parity of the
-Triton kernel is a later CUDA CI pin):
-  - strict passthrough: a non-unified source returns the SAME req_to_token /
-    req_pool_indices objects -- zero tensor ops, no copies (the property that
-    makes backend re-pointing byte-identical for every non-unified server);
-  - static SWA pools keep their legacy full->swa mapping on the view;
-  - the read table matches the hand formula
-        entry[b, c] = clamp(v2p[req_to_token[req[b], c*ps] // ps] * mult, 0)
-    over the REAL SWA composite's tables (full AND swa, ps in {1, 4},
-    multiplier in {1, 2L}), with the swa table built from VIRTUAL ids;
-  - sink routing: dead lanes (seq_len 0), -1 req_to_token entries, and
-    tombstoned v2p pages all read entry 0;
-  - the capture contract: buffers are zero-filled and idempotent; a refresh
-    updates ONLY the live prefix (stale tails and rows beyond bs keep prior
-    contents); the returned table is the WHOLE buffer (pointer-stable);
-  - the eager-view memo: a single source-resident slot keyed by batch
-    identity (same batch shares one build; the next batch replaces it; a
-    dead batch never matches);
-  - the two-phase write contract: the rebind touches only the full side, and
-    the sliding-window write loc derives POINTWISE from the kernel-facing values
-    (pads, slices, and fresh copies included), for both pool families.
-
-    python -m pytest test/registered/unit/mem_cache/test_kv_index_translator.py -v
+CPU-only: these exercise the builder's pure-torch reference path, not the
+Triton kernel.
 """
 
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
 
 import torch
-from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
+from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
 
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator, KVReadTables
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.state_capturer.base import BaseTopkCapturer
+from sglang.test.test_utils import CustomTestCase
 
 _DEV = "cpu"
 _FULL_L = 2
 _SWA_L = 3
 
 
-def _build_composite(ps, collapse=False, n_full_pages=16, n_swa_pages=8):
+def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=_FULL_L,
@@ -97,11 +84,6 @@ def _build_composite(ps, collapse=False, n_full_pages=16, n_swa_pages=8):
         need_sort=False,
         forward_stream=None,
     )
-    if collapse:
-        # The multiplier-1 arm, where kernel-facing ids ARE the physical ones.
-        # No unified sub-pool reports 1 today, so pin the regime here.
-        allocator.full_attn_allocator.kernel_page_multiplier = 1
-        allocator.swa_attn_allocator.kernel_page_multiplier = 1
     # The fake IS the runner's token_to_kv_pool, and the real UnifiedSWAKVPool
     # carries the pool-level full->swa translate, so the fake must too.
     kvcache.translate_loc_from_full_to_swa = allocator.translate_loc_from_full_to_swa
@@ -121,7 +103,7 @@ def _make_source(allocator, req_to_token, ps):
     )
 
 
-def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, mult, ps, width):
+def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, ps, width):
     """Independent python derivation of the read-table formula."""
     bs = req_pool_indices.numel()
     out = torch.zeros((bs, width), dtype=torch.int32)
@@ -131,15 +113,34 @@ def _reference_table(req_to_token, req_pool_indices, seq_lens, v2p, mult, ps, wi
         for c in range(min(n_pages, width)):
             tok = int(req_to_token[req, c * ps])
             page = 0 if tok < 0 else tok // ps
-            out[b, c] = max(int(v2p[page]) * mult, 0)
+            out[b, c] = max(int(v2p[page]), 0)
     return out
 
 
+def _publish():
+    # The code under test reads its config from the bags.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+
+def _plan(src, rows, seq_lens, *, write_virtual=None, read_extent=0):
+    return src.plan(
+        req_pool_indices=rows,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        write_virtual=write_virtual,
+        read_extent=read_extent,
+    )
+
+
 class TestPassthrough(unittest.TestCase):
+    def setUp(self):
+        _publish()
+        self.addCleanup(reset_context)
+
     def test_non_unified_returns_same_objects(self):
-        """The strict-passthrough property: no copy, no branch, the exact
-        tensors backends read today. A regression here (any tensor op on the
-        non-unified path) breaks byte-identity for every static-pool server."""
+        """Strict passthrough: no copy, no branch. Any tensor op on the
+        non-unified path breaks byte-identity for every static-pool server."""
         req_to_token = torch.arange(64, dtype=torch.int64).reshape(4, 16)
         src = KVIndexTranslator(
             req_to_token=req_to_token,
@@ -149,24 +150,22 @@ class TestPassthrough(unittest.TestCase):
             device=_DEV,
         )
         self.assertFalse(src.is_translating)
+        self.assertEqual(src.capture_token_capacity(17), 18)
         rows = torch.tensor([2, 0])
-        view = src.build_index_table(
-            req_pool_indices=rows, seq_lens=torch.tensor([5, 3])
-        )
+        loc = torch.tensor([1, 2, 3])
+        plan = _plan(src, rows, torch.tensor([5, 3]), write_virtual=loc)
+        self.assertIs(plan.write_ids(src), loc)
+        view = src.read_source(plan, req_pool_indices=rows, bs=2)
         self.assertIs(view.ids, req_to_token)
         self.assertIs(view.row_ids, rows)
         self.assertEqual(view.row_stride, req_to_token.stride(0))
         self.assertEqual(view.entry_page_size, 1)
         self.assertFalse(view.is_translated)
-        self.assertIsNone(view.sliding_window_ids)
-        # And the translate surface is the identity, not a wrapped copy.
-        t = torch.tensor([1, 2, 3])
-        self.assertIs(src.translate_full_attn_ids(t), t)
 
 
 def _alloc_and_fill(allocator, ps, lens):
     """Allocate per-request virtual runs and write them into a fake
-    req_to_token; returns (req_to_token, req_pool_indices, seq_lens)."""
+    req_to_token."""
     width = 16 * ps
     req_to_token = torch.full((len(lens), width), -1, dtype=torch.int64)
     for r, n in enumerate(lens):
@@ -182,96 +181,47 @@ def _alloc_and_fill(allocator, ps, lens):
 
 
 class TestReadTableBuild(unittest.TestCase):
-    def test_read_table_matches_reference_across_multipliers(self):
-        """The load-bearing formula pin: full AND swa read tables equal
-        the independent per-element derivation, across page sizes and both
-        multiplier regimes (MLA=1, MHA=2L). The swa table agreeing with
-        a formula over VIRTUAL ids is also the never-chained-through-
-        full-physical proof."""
-        for ps in (1, 4):
-            for collapse in (True, False):
-                allocator = _build_composite(ps, collapse=collapse)
-                full_mult = allocator.kernel_page_multiplier
-                swa_mult = allocator.swa_kernel_page_multiplier
-                req_to_token, rows, seq_lens = _alloc_and_fill(
-                    allocator, ps, lens=[5 * ps, 2 * ps, 3 * ps - 1]
-                )
-                src = _make_source(allocator, req_to_token, ps)
-                self.assertTrue(src.is_translating)
-                width = 6
-                view = src.build_index_table(
-                    req_pool_indices=rows, seq_lens=seq_lens, max_pages=width
-                )
-                self.assertTrue(view.is_translated)
-                self.assertEqual(view.entry_page_size, ps)
-                self.assertTrue(
-                    torch.equal(view.row_ids, torch.arange(3, dtype=torch.int64))
-                )
-                want_full = _reference_table(
-                    req_to_token,
-                    rows,
-                    seq_lens,
-                    allocator.full_v2p_page_table,
-                    full_mult,
-                    ps,
-                    width,
-                )
-                want_swa = _reference_table(
-                    req_to_token,
-                    rows,
-                    seq_lens,
-                    allocator.swa_v2p_page_table,
-                    swa_mult,
-                    ps,
-                    width,
-                )
-                self.assertTrue(
-                    torch.equal(view.ids, want_full),
-                    f"full read table off-formula (ps={ps}, mult={full_mult})",
-                )
-                self.assertTrue(
-                    torch.equal(view.sliding_window_ids, want_swa),
-                    f"swa read table off-formula (ps={ps}, mult={swa_mult})",
-                )
+    def setUp(self):
+        _publish()
+        self.addCleanup(reset_context)
 
-    def test_packed_stream_equals_the_rectangle_it_replaces(self):
-        """The packed builder and the rectangle must agree element for element:
-        packed[indptr[b] + p] == ids[b, p // ps] * ps + p % ps. Consumers that
-        plan over the stream and consumers that read the page table have to see
-        the same KV, so a change to either builder alone turns this red."""
+    def test_read_table_matches_reference(self):
+        """Both read tables must equal the independent per-element derivation
+        across page sizes; the swa table agreeing over VIRTUAL ids proves it is
+        never chained through full-physical."""
         for ps in (1, 4):
             allocator = _build_composite(ps)
             req_to_token, rows, seq_lens = _alloc_and_fill(
                 allocator, ps, lens=[5 * ps, 2 * ps, 3 * ps - 1]
             )
             src = _make_source(allocator, req_to_token, ps)
-            view = src.build_index_table(
-                req_pool_indices=rows, seq_lens=seq_lens, max_pages=6
+            self.assertTrue(src.is_translating)
+            plan = _plan(src, rows, seq_lens)
+            view = src.read_table(plan)
+            width = view.ids.shape[1]
+            self.assertEqual(width, 5)  # the widest row's pages
+            self.assertTrue(view.is_translated)
+            self.assertEqual(view.entry_page_size, ps)
+            self.assertTrue(
+                torch.equal(view.row_ids, torch.arange(3, dtype=torch.int64))
             )
-            indptr = torch.zeros(len(seq_lens) + 1, dtype=torch.int32)
-            indptr[1:] = torch.cumsum(seq_lens, dim=0)
-            total = int(indptr[-1])
-            packed = torch.zeros(total, dtype=torch.int32)
-            translated = src.fill_packed_read_stream(
-                req_pool_indices=rows,
-                seq_lens=seq_lens,
-                indptr=indptr,
-                total_tokens=total,
-                out=packed,
-            )
-            self.assertTrue(translated)
-            for b, n in enumerate(seq_lens.tolist()):
-                for pos in range(n):
-                    self.assertEqual(
-                        int(packed[int(indptr[b]) + pos]),
-                        int(view.ids[b, pos // ps]) * ps + pos % ps,
-                        f"packed stream off the page table (ps={ps}, b={b}, {pos=})",
-                    )
+            for table, v2p, side in (
+                (view.ids, allocator.full_v2p_page_table, "full"),
+                (
+                    src.read_table(plan, kind=IdSpaceKind.SLIDING_WINDOW).ids,
+                    allocator.swa_v2p_page_table,
+                    "swa",
+                ),
+            ):
+                want = _reference_table(req_to_token, rows, seq_lens, v2p, ps, width)
+                self.assertTrue(
+                    torch.equal(table, want), f"{side} read table off-formula (ps={ps})"
+                )
 
     def test_sink_routing(self):
-        """Dead lanes (seq_len 0), -1 slots inside the live prefix, and
-        tombstoned v2p pages must ALL read entry 0 -- one wild entry is a
-        captured-graph OOB read at replay."""
+        """Dead lanes, -1 slots inside the live prefix, and tombstoned v2p
+        pages must ALL read entry 0; one wild entry is a captured-graph OOB
+        read at replay."""
         ps = 4
         allocator = _build_composite(ps)
         req_to_token, rows, seq_lens = _alloc_and_fill(
@@ -284,63 +234,112 @@ class TestReadTableBuild(unittest.TestCase):
         allocator.full_v2p_page_table[tomb_page] = -1
         allocator.swa_v2p_page_table[tomb_page] = -1
         src = _make_source(allocator, req_to_token, ps)
-        view = src.build_index_table(
-            req_pool_indices=rows, seq_lens=seq_lens, max_pages=4
-        )
-        for table in (view.ids, view.sliding_window_ids):
+        plan = _plan(src, rows, seq_lens)
+        for kind in (IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW):
+            table = src.read_table(plan, kind=kind).ids
             self.assertTrue(bool((table >= 0).all()))
             self.assertTrue(bool((table[1] == 0).all()), "dead lane not sunk")
             self.assertEqual(int(table[0, 1]), 0, "-1 slot not sunk")
             self.assertEqual(int(table[2, 0]), 0, "tombstone not sunk")
 
 
-class TestBuildInto(unittest.TestCase):
-    """fill_read_table fills a backend-owned padded block table's live prefix with
-    FULL-side read-table entries -- the trtllm_mla / flashmla consumption route
-    (their rows ARE the read table's rows)."""
+class TestReadExtent(unittest.TestCase):
+    """A forward that reads past its lengths (a verify's draft tail) plans its
+    table that far: `seq_lens + read_extent`, capped at the request row."""
 
-    def test_prefix_filled_tail_sentinel_preserved_width_capped(self):
-        """Three contracts in one batch: entries equal the read-table formula,
-        lanes past each row's live pages keep the backend's -1 sentinel
-        (prefix-only -- a tail write scatters the trtllm sentinel contract),
-        and a table padded WIDER than the req_to_token page span (trtllm's
-        LCM alignment) is capped instead of tripping the builder's width
-        assert."""
+    def setUp(self):
+        _publish()
+        self.addCleanup(reset_context)
+
+    def test_table_covers_the_extent(self):
+        window = 3
+        for ps in (1, 4):
+            allocator = _build_composite(ps)
+            req_to_token, rows, live = _alloc_and_fill(
+                allocator, ps, lens=[5 * ps, 2 * ps, 3 * ps - 1]
+            )
+            src = _make_source(allocator, req_to_token, ps)
+            view = src.read_table(_plan(src, rows, live, read_extent=window))
+            width = -(-(int(live.max()) + window) // ps)
+            self.assertEqual(tuple(view.ids.shape), (rows.numel(), width))
+            want = _reference_table(
+                req_to_token,
+                rows,
+                live + window,
+                allocator.full_v2p_page_table,
+                ps,
+                width,
+            )
+            self.assertTrue(torch.equal(view.ids, want), f"ps={ps}")
+
+    def test_width_never_exceeds_the_request_row(self):
+        """Near the context limit the host bound plus the extent can pass the
+        end of the `req_to_token` row; the table stops at the row instead of
+        tripping the read-table width assert."""
+        window = 6
+        allocator = _build_composite(1)
+        req_to_token, rows, live = _alloc_and_fill(allocator, 1, lens=[6, 1])
+        row_pages = req_to_token.shape[1]
+        src = _make_source(allocator, req_to_token, 1)
+        plan = src.plan(
+            req_pool_indices=rows,
+            seq_lens=live,
+            seq_lens_cpu=live + 2 * window,
+            write_virtual=None,
+            read_extent=window,
+        )
+        self.assertGreater(int(live.max()) + 3 * window, row_pages)
+        self.assertEqual(src.read_table(plan).ids.shape[1], row_pages)
+
+
+class TestCopyPageTable(unittest.TestCase):
+    """`copy_page_table`: a captured graph's own table takes the plan's rows,
+    padded lanes reading the sink; columns past the plan's width keep their
+    values (the kernels bound their reads by their own lengths)."""
+
+    def setUp(self):
+        _publish()
+        self.addCleanup(reset_context)
+
+    def test_rows_copied_tail_kept_padded_lanes_sunk(self):
         ps = 4
         allocator = _build_composite(ps)
-        full_mult = allocator.kernel_page_multiplier
-        lens = [5, 2 * ps + 1, 1]
+        lens = [5, 2 * ps + 1]
         req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=lens)
         src = _make_source(allocator, req_to_token, ps)
-        self.assertTrue(src.is_translating)
+        plan = _plan(src, rows, seq_lens)
+        width = src.read_table(plan).ids.shape[1]
+        # Wider than the req_to_token span and one lane more than the batch.
+        out = torch.full((3, req_to_token.shape[1] // ps + 3), 7, dtype=torch.int32)
+        out_swa = torch.full_like(out, 7)
+        src.copy_page_table(plan, out=out)
+        src.copy_page_table(plan, out=out_swa, kind=IdSpaceKind.SLIDING_WINDOW)
+        for v2p, got in (
+            (allocator.full_v2p_page_table, out),
+            (allocator.swa_v2p_page_table, out_swa),
+        ):
+            want = _reference_table(req_to_token, rows, seq_lens, v2p, ps, width)
+            self.assertTrue(torch.equal(got[:2, :width], want))
+            self.assertTrue(bool((got[2, :width] == 0).all()), "padded lane")
+            self.assertTrue(bool((got[:, width:] == 7).all()), "tail clobbered")
 
-        width_pages = req_to_token.shape[1] // ps + 3  # wider than the span
-        out = torch.full((len(lens), width_pages), -1, dtype=torch.int32)
-        src.fill_read_table(out=out, req_pool_indices=rows, seq_lens=seq_lens)
-
-        want = _reference_table(
-            req_to_token,
-            rows,
-            seq_lens,
-            allocator.full_v2p_page_table,
-            full_mult,
-            ps,
-            width_pages,
-        )
-        for b, n in enumerate(lens):
-            n_pages = -(-n // ps)
-            self.assertTrue(
-                torch.equal(out[b, :n_pages], want[b, :n_pages]),
-                f"row {b} live prefix off-formula",
-            )
-            self.assertTrue(
-                bool((out[b, n_pages:] == -1).all()),
-                f"row {b} tail sentinel clobbered",
-            )
+    def test_row_ids_not_reallocated_across_plans(self):
+        """`row_ids` is one arange sized from the request pool and sliced per
+        table; a per-table `torch.arange` would cost an allocation and a launch
+        on every replay prep."""
+        allocator = _build_composite(1)
+        req_to_token, rows, seq_lens = _alloc_and_fill(allocator, 1, lens=[4, 2, 3])
+        src = _make_source(allocator, req_to_token, 1)
+        first = src.read_table(_plan(src, rows[:2], seq_lens[:2]))
+        second = src.read_table(_plan(src, rows, seq_lens))
+        self.assertEqual(first.row_ids.data_ptr(), second.row_ids.data_ptr())
+        self.assertTrue(torch.equal(first.row_ids, torch.arange(2, device=_DEV)))
+        self.assertTrue(torch.equal(second.row_ids, torch.arange(3, device=_DEV)))
+        self.assertGreaterEqual(src._rows.numel(), req_to_token.shape[0])
 
     def test_passthrough_source_refuses(self):
-        """Callers dispatch on `enabled`; a passthrough source has no v2p to
-        build from and must fail loud, not fill garbage."""
+        """Callers dispatch on `reads_are_translated`; a passthrough source has
+        no plan table to copy and must fail loud, not fill garbage."""
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(),
@@ -348,33 +347,33 @@ class TestBuildInto(unittest.TestCase):
             page_size=1,
             device=_DEV,
         )
+        plan = _plan(src, torch.tensor([0]), torch.tensor([1]))
         with self.assertRaises(AssertionError):
-            src.fill_read_table(
-                out=torch.zeros((1, 4), dtype=torch.int32),
-                req_pool_indices=torch.tensor([0]),
-                seq_lens=torch.tensor([1]),
-            )
+            src.copy_page_table(plan, out=torch.zeros((1, 4), dtype=torch.int32))
 
 
 class TestPoolOwnership(unittest.TestCase):
-    """A runner only gets the kernel-facing id space when the pool IT reads and
+    """A runner only gets the physical id space when the pool IT reads and
     writes is the one the allocator's ids address.
 
-    Guarded shape: a runner handed a SHARED allocator (one slot index space,
-    one req_to_token) while owning a SEPARATE KV buffer sized to the
-    allocator's SLOT count. Probing the allocator alone reports "unified" for
-    that runner, so its indices would be mapped into the composite's
-    kernel-facing space (kernel-facing ids up to num_pages * multiplier) and then used
-    to address a buffer with only num_slots rows -- out of bounds on both the
-    read gather and the KV store.
+    Guarded shape: a runner handed a SHARED allocator while owning a SEPARATE
+    KV buffer sized to the allocator's SLOT count. Probing the allocator alone
+    reports "unified" for that runner, so its indices would be translated into
+    physical ids of the composite -- a pool this runner neither reads nor
+    writes -- and used to address its own buffer of num_slots rows.
     """
 
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_real_factory_bundle_satisfies_the_ownership_identity(self):
-        """The guard rests on `allocator.get_kvcache() is token_to_kv_pool`
-        holding for a REAL target bundle. If a factory ever returned a pool
-        the allocator does not hold, the guard would silently disable the
-        unified path for EVERY model -- so pin it against the real factory
-        rather than against this file's own construction."""
+        """The guard rests on `allocator.get_kvcache() is token_to_kv_pool`, so
+        a factory returning a pool the allocator does not hold would silently
+        disable the unified path for EVERY model. Pinned against the real
+        factory, not this file's own construction."""
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
         bundle = init_unified_swa_pools(
@@ -424,9 +423,9 @@ class TestPoolOwnership(unittest.TestCase):
         self.assertFalse(src.is_translating)
 
     def test_disabled_source_is_strict_passthrough(self):
-        """Consequence of the guard: such a runner must see RAW virtual ids on
-        the read table -- they index its own pool directly. A translate here is
-        the out-of-bounds bug the ownership identity exists to prevent."""
+        """Such a runner must see RAW virtual ids: they index its own pool
+        directly, and a translate here is the out-of-bounds bug the ownership
+        identity exists to prevent."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.arange(16, dtype=torch.int32, device=_DEV).view(2, 8)
         src = KVIndexTranslator(
@@ -437,78 +436,26 @@ class TestPoolOwnership(unittest.TestCase):
             device=_DEV,
         )
         rows = torch.tensor([1, 0], dtype=torch.int32, device=_DEV)
-        view = src.build_index_table(
-            req_pool_indices=rows,
-            seq_lens=torch.tensor([3, 2], dtype=torch.int32, device=_DEV),
+        loc = torch.tensor([5, 6], dtype=torch.int64, device=_DEV)
+        plan = _plan(
+            src,
+            rows,
+            torch.tensor([3, 2], dtype=torch.int32, device=_DEV),
+            write_virtual=loc,
         )
-        # Read table: the EXACT objects a static-pool backend reads today.
+        # Writes and reads: the EXACT objects a static-pool backend uses.
+        self.assertIs(plan.write_ids(src), loc)
+        view = src.read_source(plan, req_pool_indices=rows, bs=2)
         self.assertIs(view.ids, req_to_token)
         self.assertIs(view.row_ids, rows)
         self.assertFalse(view.is_translated)
-        # And the token-level surface is the identity, same guard.
-        t = torch.tensor([5, 6], dtype=torch.int64, device=_DEV)
-        self.assertIs(src.translate_full_attn_ids(t), t)
-
-
-class TestCaptureContract(unittest.TestCase):
-    def test_caller_owned_table_is_returned_whole_and_filled_prefix_only(self):
-        ps = 4
-        allocator = _build_composite(ps)
-        req_to_token = torch.full((4, 16 * ps), -1, dtype=torch.int64)
-        v = allocator.alloc(2 * ps)
-        req_to_token[1, : 2 * ps] = v
-        src = _make_source(allocator, req_to_token, ps)
-
-        # A page-table consumer owns its buffers; entry 0 is the reserved sink
-        # in every id space, so zeros are what an unfilled column must read as.
-        cap = torch.zeros((4, 8), dtype=torch.int32, device=_DEV)
-        cap_swa = torch.zeros((4, 8), dtype=torch.int32, device=_DEV)
-        tables = KVReadTables(full=cap, sliding_window=cap_swa)
-
-        # Poison everything, then refresh a 1-row batch: ONLY its live prefix
-        # may change -- stale tails and other rows are the fa3 contract.
-        cap.fill_(7)
-        cap_swa.fill_(7)
-        view = src.build_index_table(
-            req_pool_indices=torch.tensor([1]),
-            seq_lens=torch.tensor([2 * ps]),
-            into=tables,
-        )
-        self.assertIs(view.ids, cap, "the caller's table comes back WHOLE")
-        want = allocator.full_v2p_page_table[req_to_token[1, ::ps][:2] // ps] * (
-            2 * _FULL_L
-        )
-        self.assertTrue(torch.equal(cap[0, :2], want.to(torch.int32)))
-        self.assertTrue(bool((cap[0, 2:] == 7).all()), "stale tail was cleared")
-        self.assertTrue(bool((cap[1:] == 7).all()), "rows beyond bs were touched")
-
-    def test_row_ids_not_reallocated_across_builds(self):
-        """`row_ids` is a constant arange sized once from the request pool, so
-        builds at different batch sizes hand back slices of ONE buffer. A
-        per-build `torch.arange` would be correct but would spend an allocation
-        and a launch on every replay prep."""
-        allocator = _build_composite(1)
-        req_to_token, rows, seq_lens = _alloc_and_fill(allocator, 1, lens=[4, 2, 3])
-        src = _make_source(allocator, req_to_token, 1)
-        self.assertTrue(src.is_translating)
-        first = src.build_index_table(
-            req_pool_indices=rows[:2], seq_lens=seq_lens[:2], max_pages=4
-        )
-        second = src.build_index_table(
-            req_pool_indices=rows, seq_lens=seq_lens, max_pages=4
-        )
-        self.assertEqual(first.row_ids.data_ptr(), second.row_ids.data_ptr())
-        self.assertTrue(torch.equal(first.row_ids, torch.arange(2, device=_DEV)))
-        self.assertTrue(torch.equal(second.row_ids, torch.arange(3, device=_DEV)))
-        # Sized to bound any batch the request pool can hold.
-        self.assertGreaterEqual(src._rows.numel(), req_to_token.shape[0])
 
 
 class _FakeForwardBatch:
-    """Weakref-able stand-in (SimpleNamespace is not) carrying the fields
-    `index_table_for_batch` and `rebind_write_loc` read. `seq_lens_sum`
-    defaults to the real sum: it is the signal that the CPU mirror is live,
-    and a real ForwardBatch always carries it (None only when gpu_only)."""
+    """Stand-in carrying the fields a plan of its own (`own_plan`) and the
+    capturers read. `seq_lens_sum` defaults to the real sum: it is the signal
+    that the CPU mirror is live, and a real ForwardBatch always carries it
+    (None only when gpu_only)."""
 
     def __init__(
         self,
@@ -518,11 +465,13 @@ class _FakeForwardBatch:
         seq_lens_cpu=None,
         out_cache_loc=None,
         seq_lens_sum=-1,
+        spec_info=None,
     ):
         self.req_pool_indices = req_pool_indices
         self.seq_lens = seq_lens
         self.seq_lens_cpu = seq_lens_cpu
         self.out_cache_loc = out_cache_loc
+        self.spec_info = spec_info
         self.seq_lens_sum = (
             (None if seq_lens is None else int(seq_lens.sum()))
             if seq_lens_sum == -1
@@ -530,143 +479,185 @@ class _FakeForwardBatch:
         )
 
 
-class TestViewMemo(unittest.TestCase):
-    """The eager view is memoized ON THE SOURCE in a single slot keyed by
-    batch identity -- per-batch state stays out of the ForwardBatch (it does
-    not scale with the number of id spaces), and one metadata build's many
-    consumers still share one table build."""
+class TestWriteIds(CustomTestCase):
+    """A plan translates its write window once, into a fresh tensor, and
+    derives the sliding-window ids from the virtual window -- pads and
+    tombstones landing on the sink."""
 
-    def _fb(self, allocator, ps, lens):
-        req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=lens)
-        fb = _FakeForwardBatch(
-            req_pool_indices=rows,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens,
-        )
-        return fb, req_to_token
-
-    def test_same_batch_returns_the_memoized_view(self):
-        ps = 1
-        allocator = _build_composite(ps)
-        fb, req_to_token = self._fb(allocator, ps, lens=[3, 2])
-        src = _make_source(allocator, req_to_token, ps)
-        v1 = src.index_table_for_batch(fb)
-        v2 = src.index_table_for_batch(fb)
-        self.assertIs(v1, v2)
-
-    def test_next_batch_replaces_the_single_slot(self):
-        ps = 1
-        allocator = _build_composite(ps)
-        fb1, req_to_token = self._fb(allocator, ps, lens=[3, 2])
-        src = _make_source(allocator, req_to_token, ps)
-        v1 = src.index_table_for_batch(fb1)
-        fb2 = _FakeForwardBatch(
-            req_pool_indices=fb1.req_pool_indices,
-            seq_lens=fb1.seq_lens,
-            seq_lens_cpu=fb1.seq_lens_cpu,
-        )
-        v2 = src.index_table_for_batch(fb2)
-        self.assertIsNot(v1, v2)
-        # Single slot: fb1 no longer matches and rebuilds.
-        v1_again = src.index_table_for_batch(fb1)
-        self.assertIsNot(v1_again, v1)
-
-    def test_dead_batch_never_matches(self):
-        """A garbage-collected batch's slot must not serve a later batch: the
-        weakref key goes dead and the build runs fresh."""
-        import gc
-
-        ps = 1
-        allocator = _build_composite(ps)
-        fb1, req_to_token = self._fb(allocator, ps, lens=[3, 2])
-        src = _make_source(allocator, req_to_token, ps)
-        v1 = src.index_table_for_batch(fb1)
-        del fb1
-        gc.collect()
-        fb2, _ = self._fb(allocator, ps, lens=[2])
-        v2 = src.index_table_for_batch(fb2)
-        self.assertIsNot(v2, v1)
-        self.assertEqual(v2.ids.shape[0], 1)
-
-
-class TestWriteLoc(unittest.TestCase):
-    """The two-phase write contract: phase 1 (`rebind_write_loc`) rebinds the
-    full side once at ForwardBatch construction; phase 2 derives the
-    sliding-window write loc on demand, POINTWISE from the full-side
-    values. Value-based derivation is the property under test: pads, slices,
-    and fresh copies of the loc must all derive correctly with no handover
-    and no stored per-forward state."""
+    def setUp(self):
+        _publish()
+        self.addCleanup(reset_context)
 
     def _built(self, ps=1, n=4):
         allocator = _build_composite(ps)
         req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=[max(n, 1)])
         src = _make_source(allocator, req_to_token, ps)
         virt = allocator.alloc(-(-n // ps) * ps)[:n]
-        want_full = allocator.translate_kv_loc_for_kernel(virt)
+        want_full = allocator.translate_kv_loc(virt)
         want_swa = allocator.translate_loc_from_full_to_swa(virt)
         return src, allocator, rows, seq_lens, virt, want_full, want_swa
 
-    def _field(self, src, rows, seq_lens, kernel_loc):
-        return src.sliding_window_write_loc_for(kernel_loc)
-
-    def test_rebind_translates_full_side_only(self):
+    def test_own_plan_translates_full_side_only(self):
         for ps in (1, 4):
             src, _, _, _, virt, want_full, _ = self._built(ps=ps, n=3 * ps)
             keep = virt.clone()
             fb = _FakeForwardBatch(out_cache_loc=virt)
-            src.rebind_write_loc(fb)
-            # Full side: rebound to a FRESH kernel-facing tensor; the
-            # ScheduleBatch's aliased virtual tensor is untouched.
+            src.bind_own_plan(fb)
+            # Full side: a FRESH physical tensor; the ScheduleBatch's aliased
+            # virtual tensor is untouched and mirrored for its bookkeeping.
             self.assertIsNot(fb.out_cache_loc, virt)
             self.assertTrue(torch.equal(fb.out_cache_loc, want_full))
             self.assertTrue(torch.equal(virt, keep))
+            self.assertIs(fb.out_cache_loc_virtual, virt)
 
-    def test_swa_write_loc_round_trips_from_full_side(self):
-        """The derived property behind phase 2: for any virtual run t,
-        deriving from the kernel-facing full-side values must equal the direct
-        virtual->swa translate — `field(full(t)) == swa(t)` across page sizes
-        and multipliers."""
+    def test_capture_capacity_covers_dcp_widened_mamba_ids(self):
+        """A capturer must store the highest virtual IDs issued under DCP."""
+        from sglang.srt.mem_cache.allocator.unified_mamba import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+        from sglang.srt.runtime_context import get_parallel
+
+        for dcp_size in (1, 2, 4):
+            with (
+                self.subTest(dcp_size=dcp_size),
+                get_parallel().override(attn_dcp_size=dcp_size),
+            ):
+                pool = UnifiedKVPool(
+                    total_bytes=2048,
+                    sub_pool_specs=[
+                        MHASubPoolSpec(
+                            name="full",
+                            layer_num=1,
+                            head_num=1,
+                            head_dim=8,
+                            store_dtype=torch.float16,
+                            grow_direction="up",
+                        ),
+                        MambaSubPoolSpec(
+                            name="mamba",
+                            layer_num=1,
+                            conv_state_shapes=((2, 2),),
+                            conv_dtype=torch.float16,
+                            temporal_state_shape=(2, 2),
+                            temporal_dtype=torch.float16,
+                            grow_direction="down",
+                        ),
+                    ],
+                    device="cpu",
+                    enable_memory_saver=False,
+                    page_size=4,
+                )
+                allocator = UnifiedMambaTokenToKVPoolAllocator(
+                    unified_buffer=pool,
+                    kvcache=SimpleNamespace(
+                        full_kv_pool=_FakeKVCache(pool.max_slots("full")),
+                        mamba_pool=_FakeKVCache(pool.max_slots("mamba")),
+                    ),
+                    device="cpu",
+                    page_size=4,
+                )
+                virt = allocator.alloc(allocator.available_size())
+                self.assertIsNotNone(virt)
+                src = _make_source(allocator, virt[None, :], 4)
+                cap = object.__new__(BaseTopkCapturer)
+                cap.topk_size = 1
+                expected = torch.arange(len(virt), dtype=torch.int32).reshape(-1, 1, 1)
+                cap.device_cache = SimpleNamespace(buffer=expected)
+                cap.host_cache = SimpleNamespace(
+                    buffer=torch.zeros(
+                        src.capture_token_capacity(1), 1, 1, dtype=torch.int32
+                    )
+                )
+                fb = _FakeForwardBatch(out_cache_loc=virt)
+                fb.out_cache_loc_virtual = virt
+                cap.on_forward_end(fb, False, None, no_copy_to_cpu=False)
+                req_pool = SimpleNamespace(req_to_token=virt[None, :])
+                self.assertTrue(
+                    torch.equal(cap.get_topk(0, len(virt) + 1, req_pool), expected)
+                )
+
+    def test_topk_capture_round_trips_request_token_ids(self):
         for ps in (1, 4, 64):
-            src, _, rows, seq_lens, _, want_full, want_swa = self._built(
-                ps=ps, n=3 * ps
-            )
-            got = self._field(src, rows, seq_lens, want_full)
-            self.assertTrue(torch.equal(got, want_swa))
+            for translating in (False, True):
+                for overlap in (False, True):
+                    with self.subTest(
+                        page_size=ps, translating=translating, overlap=overlap
+                    ):
+                        src, _, _, _, virt, _, _ = self._built(ps=ps, n=3 * ps)
+                        req_pool = SimpleNamespace(req_to_token=virt.clone()[None, :])
+                        fb = _FakeForwardBatch(out_cache_loc=virt.clone())
+                        if translating:
+                            src.bind_own_plan(fb)
+                            fb.out_cache_loc = torch.cat(
+                                [fb.out_cache_loc, virt.new_zeros(2)]
+                            )
+                        else:
+                            fb.out_cache_loc_virtual = None
 
-    def test_pad_lanes_derive_to_sink(self):
-        """The DP pad appends zeros; kernel-facing 0 is the reserved padding slot in
-        every id space, so pad lanes must derive to swa slot 0 with no
-        `num_live` bookkeeping."""
-        src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=3)
-        padded = torch.cat([want_full, want_full.new_zeros(2)])
-        got = self._field(src, rows, seq_lens, padded)
+                        # Admission may be capped below IDs issued after reuse.
+                        capacity = src.capture_token_capacity(ps)
+                        self.assertGreater(capacity, int(virt.max()))
+                        expected = (
+                            torch.arange(len(virt) * 4, dtype=torch.int32).reshape(
+                                -1, 2, 2
+                            )
+                            + 1
+                        )
+                        cap = object.__new__(BaseTopkCapturer)
+                        cap.topk_size = 2
+                        cap.device_cache = SimpleNamespace(
+                            buffer=torch.cat([expected, expected.new_zeros(2, 2, 2)])
+                        )
+                        cap.host_cache = SimpleNamespace(
+                            buffer=torch.zeros(capacity, 2, 2, dtype=torch.int32)
+                        )
+                        result = cap.on_forward_end(
+                            fb, False, None, no_copy_to_cpu=overlap
+                        )
+                        if overlap:
+                            fb.out_cache_loc.zero_()
+                            if translating:
+                                fb.out_cache_loc_virtual.zero_()
+                            cap.device_cache.buffer.zero_()
+                            result.map_device_tensors(lambda value: value.cpu())
+                            result.finalize()
+                        self.assertTrue(
+                            torch.equal(
+                                cap.get_topk(0, len(virt) + 1, req_pool), expected
+                            )
+                        )
+
+    def test_swa_ids_come_from_the_virtual_ids(self):
+        for ps in (1, 4, 64):
+            src, _, rows, seq_lens, virt, _, want_swa = self._built(ps=ps, n=3 * ps)
+            plan = _plan(src, rows, seq_lens, write_virtual=virt)
+            self.assertTrue(
+                torch.equal(
+                    plan.write_ids(src, kind=IdSpaceKind.SLIDING_WINDOW), want_swa
+                )
+            )
+
+    def test_pad_lanes_read_the_sink(self):
+        """The DP pad appends zeros, and id 0 is the reserved padding slot in
+        every id space, so pad lanes land on swa slot 0."""
+        src, _, rows, seq_lens, virt, _, want_swa = self._built(n=3)
+        padded = torch.cat([virt, virt.new_zeros(2)])
+        plan = _plan(src, rows, seq_lens, write_virtual=padded)
+        got = plan.write_ids(src, kind=IdSpaceKind.SLIDING_WINDOW)
         self.assertTrue(torch.equal(got[:3], want_swa))
         self.assertTrue(bool((got[3:] == 0).all()), "pad lanes must land on slot 0")
 
-    def test_slice_and_copy_derive_pointwise_without_handover(self):
-        """REGRESSION (design): the retired identity-resolver refused any
-        tensor it had not been handed -- a TBO child's re-padded slice or a
-        registry's fresh copy raised. Value-based derivation must accept
-        both, pointwise, with no adopt/handover call."""
-        src, _, rows, seq_lens, _, want_full, want_swa = self._built(n=4)
-        padded = torch.cat([want_full, want_full.new_zeros(2)])
-        # TBO-child shape: a slice crossing the pad boundary.
-        got = self._field(src, rows, seq_lens, padded[2:6])
-        self.assertTrue(torch.equal(got[:2], want_swa[2:4]))
-        self.assertTrue(bool((got[2:] == 0).all()))
-        # Registry shape: a fresh equal-value copy.
-        got2 = self._field(src, rows, seq_lens, want_full.clone())
-        self.assertTrue(torch.equal(got2, want_swa))
-
-    def test_tombstoned_swa_page_clamps_to_sink(self):
-        src, allocator, rows, seq_lens, virt, want_full, _ = self._built(ps=1, n=2)
+    def test_tombstoned_swa_page_reads_the_sink(self):
+        src, allocator, rows, seq_lens, virt, _, _ = self._built(ps=1, n=2)
         allocator.swa_v2p_page_table[int(virt[0])] = -1
-        got = self._field(src, rows, seq_lens, want_full[:1])
-        self.assertEqual(int(got[0]), 0)
+        plan = _plan(src, rows, seq_lens, write_virtual=virt[:1])
+        swa_ids = plan.write_ids(src, kind=IdSpaceKind.SLIDING_WINDOW)
+        self.assertEqual(int(swa_ids[0]), 0)
 
     def test_static_swa_pool_derives_via_pool_translate(self):
-        """Static SWA pools: the field is the pool's own legacy full->swa
-        translate, computed at the same build; the rebind stays a no-op."""
+        """Static SWA pools: the swa ids are the pool's own full->swa
+        translate; the write ids stay the batch's own."""
         pool = SWAKVPool.__new__(SWAKVPool)
         pool.full_to_swa_index_mapping = torch.arange(10, dtype=torch.int64)
         pool.translate_loc_from_full_to_swa = lambda t: t + 100
@@ -679,14 +670,18 @@ class TestWriteLoc(unittest.TestCase):
         )
         loc = torch.tensor([5, 6], dtype=torch.int64)
         fb = _FakeForwardBatch(out_cache_loc=loc)
-        src.rebind_write_loc(fb)
-        self.assertIs(fb.out_cache_loc, loc, "disabled rebind must be a no-op")
-        self.assertTrue(torch.equal(src.sliding_window_write_loc_for(loc), loc + 100))
+        src.bind_own_plan(fb)
+        self.assertIs(fb.out_cache_loc, loc, "a static pool's ids are its own")
+        self.assertTrue(
+            torch.equal(src.write_ids(fb, IdSpaceKind.SLIDING_WINDOW), loc + 100)
+        )
 
     def test_no_loc_or_no_swa_side_yields_none(self):
         # Unified swa composite, but there is no write loc this forward.
         src, _, rows, seq_lens, _, _, _ = self._built(n=2)
-        self.assertIsNone(src.sliding_window_write_loc_for(None))
+        self.assertIsNone(
+            _plan(src, rows, seq_lens).write_ids(src, kind=IdSpaceKind.SLIDING_WINDOW)
+        )
         # Passthrough on a non-SWA pool: a loc is given, but there is no swa
         # id space to derive into.
         plain = KVIndexTranslator(
@@ -696,22 +691,12 @@ class TestWriteLoc(unittest.TestCase):
             page_size=1,
             device=_DEV,
         )
+        loc = torch.tensor([3], dtype=torch.int64)
         self.assertIsNone(
-            plain.sliding_window_write_loc_for(torch.tensor([3], dtype=torch.int64))
+            _plan(
+                plain, torch.tensor([0]), torch.tensor([1]), write_virtual=loc
+            ).write_ids(plain, kind=IdSpaceKind.SLIDING_WINDOW)
         )
-
-    def test_rebind_retires_the_view_memo(self):
-        ps = 1
-        allocator = _build_composite(ps)
-        req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=[3, 2])
-        src = _make_source(allocator, req_to_token, ps)
-        fb = _FakeForwardBatch(
-            req_pool_indices=rows, seq_lens=seq_lens, seq_lens_cpu=seq_lens
-        )
-        v1 = src.index_table_for_batch(fb)
-        src.rebind_write_loc(_FakeForwardBatch(out_cache_loc=None))
-        v2 = src.index_table_for_batch(fb)
-        self.assertIsNot(v2, v1, "rebind starts the next forward: stale views die")
 
 
 if __name__ == "__main__":

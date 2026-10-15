@@ -19,9 +19,10 @@ from sglang.srt.layers.mova import (
     mova_router_topk,
     routed_linear,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def test_router_bias_changes_selection_but_not_mixture_weights():
@@ -97,13 +98,28 @@ def test_routed_linear_cpu_matches_independent_expected_math():
 
 
 def test_value_expert_loader_shards_output_dimension():
-    experts = RoutedValueExperts(
-        num_experts=2,
-        input_size=3,
-        output_size=4,
+    with get_parallel().override(
         tp_rank=1,
         tp_size=2,
-    )
+        attn_tp_rank=1,
+        attn_tp_size=2,
+        attn_dp_size=1,
+        attn_dp_rank=0,
+        attn_cp_size=1,
+        attn_cp_rank=0,
+        moe_tp_size=2,
+        moe_ep_size=1,
+        moe_dp_size=1,
+        tp_group=None,
+        attn_tp_group=None,
+        moe_ep_group=None,
+    ):
+        experts = RoutedValueExperts(
+            num_experts=2,
+            input_size=3,
+            output_size=4,
+            parallel_group="tp",
+        )
     packed = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
     experts.weight_loader(experts.weight, packed)
     torch.testing.assert_close(experts.weight, packed[:, 2:])

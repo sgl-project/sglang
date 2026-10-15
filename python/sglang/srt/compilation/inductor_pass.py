@@ -9,10 +9,9 @@ import logging
 import time
 import types
 from contextlib import contextmanager
-from typing import Any, Callable, Optional, Union
+from typing import Any, Optional, Union
 
 import torch
-from torch import fx
 from torch._dynamo.utils import lazy_format_graph_code
 from torch._inductor.custom_graph_pass import CustomGraphPass
 
@@ -93,25 +92,6 @@ class InductorPass(CustomGraphPass):
         return True
 
 
-class CallableInductorPass(InductorPass):
-    """
-    This class is a wrapper for a callable that automatically provides an
-    implementation of the UUID.
-    """
-
-    def __init__(
-        self, callable: Callable[[fx.Graph], None], uuid: Optional[Any] = None
-    ):
-        self.callable = callable
-        self._uuid = self.hash_source(callable) if uuid is None else uuid
-
-    def __call__(self, graph: torch.fx.Graph):
-        self.callable(graph)
-
-    def uuid(self) -> Any:
-        return self._uuid
-
-
 class SGLangInductorPass(InductorPass):
     def __init__(
         self,
@@ -128,12 +108,3 @@ class SGLangInductorPass(InductorPass):
         self._end_time = time.perf_counter_ns()
         duration_ms = float(self._end_time - self._start_time) / 1.0e6
         logger.debug("%s completed in %.1f ms", self.pass_name, duration_ms)
-
-
-class PrinterInductorPass(SGLangInductorPass):
-    def __init__(self, name: str):
-        super().__init__()
-        self.name = name
-
-    def __call__(self, graph: torch.fx.Graph):
-        self.dump_graph(graph, self.name)

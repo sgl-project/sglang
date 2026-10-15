@@ -11,31 +11,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MHA K/V views for the unified memory pool (uniform-row hybrid models).
+"""MHA K/V views for the unified memory pool (token-major dense views), CPU-only.
 
-Covers, CPU-only (pure torch — no GPU / Triton kernels):
-  - `build_mha_views` refuses an asymmetric-KV spec: its addressing
-    assumes one uniform row width, so it is the boundary that checks;
-  - `build_mha_views` addressing: view_l[kernel_id(t)] must land exactly at
-    the page-major envelope byte offset the STRIDED builder assigns to the same
-    (page, slot, layer, K|V) cell — the two builders are views over one truth;
-  - K and V of one token share ONE kernel-facing id (per-layer origin shift does the
-    disambiguation), with no aliasing across the 2*L overlapping views;
-  - the missing-tail-pad and asymmetric-dims cases fail loud at construction.
+Addressing law under test:
 
-Addressing law under test (the derived property everything else builds on):
-
-    kernel_id(t) = (t // ps) * (ps * 2L) + t % ps
-    K of layer l at block 2l, V at block 2l+1, blocks are ps rows of
-    head_num*head_dim elements — offsets identical to
-    MHASubPoolSpec.layer_k/v_offset_in_page when rows are uniform.
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_mha_views.py -v
+    byte(t, l, K) = t * entry_bytes + l * (k_row + v_row)
+    byte(t, l, V) = byte(t, l, K) + k_row
+    t = page * page_size + slot      (the physical token id IS the kernel id)
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -43,10 +30,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.layout.page_major import (
-    build_mha_views,
-    mha_entry_bytes,
-)
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.layout.paged_view import paged_view
+from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
@@ -55,19 +42,29 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
-# import), not on the tensors it is handed, so cases driving it must build on
-# the platform's device. The rest of this file is byte arithmetic, so CPU.
+# import), not on the tensors it is handed, so cases driving it build there.
 _STORE_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Small-but-nontrivial MHA geometry: L=2 layers, H=2 heads, D=4, so every byte
-# offset is hand-checkable. blocks = 2L = 4 per page.
+# Geometry kept tiny so every byte offset is hand-checkable.
 _L = 2
 _H = 2
 _D = 4
-_ROW = _H * _D  # row elements
 _DTYPE = torch.bfloat16
 _ITEM = _DTYPE.itemsize
-_BLOCKS = 2 * _L
+_HAS_FP8 = hasattr(torch, "float8_e4m3fn")
+_K_ROW = _H * _D * _ITEM
+_V_ROW = _H * _D * _ITEM
+
+
+def _entry_bytes(head_dim=_D, v_head_dim=_D):
+    """One slot's K and V rows across every layer, rounded up to the entry
+    alignment -- derived here, not read back from the spec under test."""
+    rows = _L * _H * (head_dim + v_head_dim) * _ITEM
+    return -(-rows // ENTRY_ALIGN_BYTES) * ENTRY_ALIGN_BYTES
+
+
+_ENTRY = _entry_bytes()
+assert _ENTRY == _L * (_K_ROW + _V_ROW)  # no alignment pad at this geometry
 
 
 def _mha_spec(head_dim=_D, v_head_dim=None, layer_num=_L, grow="down"):
@@ -82,220 +79,226 @@ def _mha_spec(head_dim=_D, v_head_dim=None, layer_num=_L, grow="down"):
     )
 
 
-def _kernel_id(t, ps):
-    return (t // ps) * (ps * _BLOCKS) + t % ps
+def _make_raw(ps, num_pages, entry=_ENTRY, short=0):
+    n = num_pages * ps * entry - short
+    return torch.zeros(n, dtype=torch.uint8, device=_DEV)
 
 
-def _make_raw(ps, num_pages, pad_pages=1):
-    page_bytes = ps * _BLOCKS * _ROW * _ITEM
-    raw = torch.zeros(
-        (num_pages + pad_pages) * page_bytes, dtype=torch.uint8, device=_DEV
-    )
-    return raw
-
-
-def _build_views(raw, ps, num_pages, head_dim=_D, v_head_dim=_D, layer_num=_L):
-    return build_mha_views(
-        raw,
-        layer_num=layer_num,
-        head_num=_H,
-        head_dim=head_dim,
-        v_head_dim=v_head_dim,
-        store_dtype=_DTYPE,
-        page_size=ps,
-        num_pages=num_pages,
+def _build_views(raw, ps, num_pages, head_dim=_D, v_head_dim=None, layer_num=_L):
+    layout = _mha_spec(head_dim, v_head_dim, layer_num).layout()
+    kw = dict(layout=layout, num_slots=num_pages * ps)
+    return (
+        build_dense_views(raw, part_name="k", **kw),
+        build_dense_views(raw, part_name="v", **kw),
     )
 
 
-def _reference_strided_views(raw, *, page_size, num_pages, anchor_bytes=0):
-    """Independent 4-D strided description of the page-major envelope.
-
-    This is the retired production strided builder, kept here as the oracle:
-    per-layer ``(num_pages, page_size, head_num, head_dim)`` views addressed by
-    ``(page, slot)``, so the builder's addressing can be cross-checked
-    against a second, independently-derived description of the same bytes.
-    """
-    k_row_bytes = _ROW * _ITEM
-    v_row_bytes = _ROW * _ITEM
-    page_bytes = page_size * _L * (k_row_bytes + v_row_bytes)
+def _reference_paged_views(
+    raw, *, page_size, num_pages, anchor_bytes=0, head_dim=_D, v_head_dim=_D
+):
+    """Independent 4-D description of the token-major envelope: per-layer
+    ``(num_pages, page_size, head_num, head_dim)`` views addressed by
+    ``(page, slot)``, so the flat builder's addressing can be cross-checked
+    against a second, independently derived description of the same bytes."""
+    k_row = _H * head_dim * _ITEM
+    v_row = _H * v_head_dim * _ITEM
+    entry = _entry_bytes(head_dim, v_head_dim)
     as_dtype_view = raw.view(_DTYPE)
-    k_stride = (page_bytes // _ITEM, k_row_bytes // _ITEM, _D, 1)
-    v_stride = (page_bytes // _ITEM, v_row_bytes // _ITEM, _D, 1)
-    shape = (num_pages, page_size, _H, _D)
     k_views, v_views = [], []
     for layer in range(_L):
-        k_base = anchor_bytes + layer * page_size * (k_row_bytes + v_row_bytes)
-        v_base = k_base + page_size * k_row_bytes
-        k_views.append(
-            torch.as_strided(
-                as_dtype_view,
-                size=shape,
-                stride=k_stride,
-                storage_offset=k_base // _ITEM,
+        k_base = anchor_bytes + layer * (k_row + v_row)
+        v_base = k_base + k_row
+        parts = ((k_base, head_dim, k_views), (v_base, v_head_dim, v_views))
+        for base, dim, out in parts:
+            out.append(
+                torch.as_strided(
+                    as_dtype_view,
+                    size=(num_pages, page_size, _H, dim),
+                    stride=(page_size * entry // _ITEM, entry // _ITEM, dim, 1),
+                    storage_offset=base // _ITEM,
+                )
             )
-        )
-        v_views.append(
-            torch.as_strided(
-                as_dtype_view,
-                size=shape,
-                stride=v_stride,
-                storage_offset=v_base // _ITEM,
-            )
-        )
     return k_views, v_views
 
 
 class TestMHASpecSurface(unittest.TestCase):
-    def test_asymmetric_rows_refused_by_the_view_builder(self):
-        """The row-block array exists only for uniform rows, so the builder
-        whose addressing depends on it is the one that refuses (the MiMoV2
-        shape, scaled down). ServerArgs screens such models out of
-        --enable-unified-memory long before we get here; this is the check for
-        a caller that reaches the builder directly."""
+    def test_layout_parts_match_the_entry_formula(self):
+        """Every per-layer view is built through the layout descriptor, so its
+        part offsets are pinned against the closed-form entry math. The page
+        size never enters (a page is page_size entries back to back)."""
         spec = _mha_spec()
-        raw = torch.zeros(1 << 16, dtype=torch.uint8)
-        with self.assertRaises(AssertionError):
-            build_mha_views(
-                raw,
-                layer_num=spec.layer_num,
-                head_num=spec.head_num,
-                head_dim=6,
-                v_head_dim=4,
-                store_dtype=spec.store_dtype,
-                page_size=1,
-                num_pages=4,
+        layout = spec.layout()
+        self.assertEqual(layout.entry_bytes, spec.entry_bytes())
+        for l in range(_L):
+            self.assertEqual(
+                layout.part("k").layer_offset_bytes(l), l * (_K_ROW + _V_ROW)
+            )
+            self.assertEqual(
+                layout.part("v").layer_offset_bytes(l), l * (_K_ROW + _V_ROW) + _K_ROW
             )
 
-    def test_spec_offsets_equal_block_origins(self):
-        """The spec's byte math and the view builder's origins are two
-        independent derivations of the envelope; under uniform rows they must
-        agree: layer_k_offset(l) == (2l)*ps*row, layer_v_offset(l) == (2l+1)*ps*row."""
-        spec = _mha_spec()
-        for ps in (1, 4):
-            row = spec.k_row_bytes()
-            for l in range(_L):
-                self.assertEqual(spec.layer_k_offset_in_page(l, ps), (2 * l) * ps * row)
-                self.assertEqual(
-                    spec.layer_v_offset_in_page(l, ps), (2 * l + 1) * ps * row
-                )
-
-    def test_entry_bytes_matches_layout_helper(self):
-        spec = _mha_spec()
-        self.assertEqual(
-            spec.entry_bytes(),
-            mha_entry_bytes(
-                layer_num=_L, head_num=_H, head_dim=_D, v_head_dim=_D, itemsize=_ITEM
-            ),
+    def test_entry_bytes_matches_the_closed_form_and_is_aligned(self):
+        self.assertEqual(_mha_spec().entry_bytes(), _ENTRY)
+        # 48 B of rows round up to one 64 B entry; the parts still fit inside.
+        padded = MHASubPoolSpec(
+            name="full",
+            layer_num=1,
+            head_num=1,
+            head_dim=16,
+            v_head_dim=8,
+            store_dtype=_DTYPE,
+            grow_direction="down",
         )
+        self.assertEqual(padded.entry_bytes(), ENTRY_ALIGN_BYTES * 2)
+        self.assertEqual(padded.entry_bytes() % ENTRY_ALIGN_BYTES, 0)
+        padded.layout()  # validates
+
+    def test_asymmetric_rows_are_admitted(self):
+        """K and V are two parts of one entry at their own offsets; they no
+        longer have to be the same kind of row (the MiMoV2 shape, scaled)."""
+        spec = _mha_spec(head_dim=8, v_head_dim=4)
+        layout = spec.layout()
+        self.assertEqual(layout.part("k").row_bytes(), _H * 8 * _ITEM)
+        self.assertEqual(layout.part("v").row_bytes(), _H * 4 * _ITEM)
+        self.assertEqual(layout.part("v").offset_bytes, _H * 8 * _ITEM)
+
+    def test_misaligned_rows_are_refused(self):
+        """Entry parts are laid out in 16-byte units (the write kernels'
+        vector stores), so a model whose per-rank row is not cannot run."""
+        with self.assertRaisesRegex(ValueError, "24-byte K row"):
+            _mha_spec(head_dim=6, v_head_dim=6).layout()
 
 
 class TestMHAViews(unittest.TestCase):
-    def test_view_shapes_are_stock_mha(self):
+    def test_view_shapes_and_strides(self):
         ps, num_pages = 4, 6
         k_views, v_views = _build_views(_make_raw(ps, num_pages), ps, num_pages)
-        n_rows = num_pages * _BLOCKS * ps
+        n_rows = num_pages * ps
         self.assertEqual(len(k_views), _L)
         self.assertEqual(len(v_views), _L)
         for v in (*k_views, *v_views):
-            # The stock MHATokenToKVPool per-layer signature: 3-D, packed rows.
+            # The stock MHATokenToKVPool per-layer signature: 3-D, one row per
+            # physical token, the slot stride being the whole entry.
             self.assertEqual(tuple(v.shape), (n_rows, _H, _D))
-            self.assertEqual(v.stride(), (_ROW, _D, 1))
+            self.assertEqual(v.stride(), (_ENTRY // _ITEM, _D, 1))
+        for l in range(_L):
+            self.assertEqual(
+                (v_views[l].storage_offset() - k_views[l].storage_offset()) * _ITEM,
+                _K_ROW,
+            )
 
-    def test_addressing_matches_strided_reference(self):
-        """Cross-readback: bytes written through the reference STRIDED views at
-        (page, slot) must be read back through the views at kernel_id(t),
-        for both K and V of every layer — and vice versa. This pins that the
-        view builder and the independent strided description agree on the
-        same physical envelope."""
+    def test_addressing_matches_paged_reference(self):
+        """Cross-readback: bytes written through the reference (page, slot)
+        views must be read back through the flat views at t = page*ps+slot,
+        for both K and V of every layer -- and vice versa."""
         for ps in (1, 4):
             num_pages = 5
             raw = _make_raw(ps, num_pages)
-            sk, sv = _reference_strided_views(raw, page_size=ps, num_pages=num_pages)
+            sk, sv = _reference_paged_views(raw, page_size=ps, num_pages=num_pages)
             dk, dv = _build_views(raw, ps, num_pages)
             probes = [(0, 0, 0), (1, 1, ps - 1), (4, 0, ps // 2), (3, 1, 0)]
-            # strided-write -> view-read
             for p, l, s in probes:
                 t = p * ps + s
-                d = _kernel_id(t, ps)
                 sk[l][p, s] = float(p * 100 + l * 10 + s + 1)
                 sv[l][p, s] = float(p * 100 + l * 10 + s + 2)
                 self.assertTrue(
-                    torch.all(dk[l][d] == float(p * 100 + l * 10 + s + 1)),
+                    torch.all(dk[l][t] == float(p * 100 + l * 10 + s + 1)),
                     f"K (p={p}, l={l}, s={s}, ps={ps}) view readback off-formula",
                 )
                 self.assertTrue(
-                    torch.all(dv[l][d] == float(p * 100 + l * 10 + s + 2)),
+                    torch.all(dv[l][t] == float(p * 100 + l * 10 + s + 2)),
                     f"V (p={p}, l={l}, s={s}, ps={ps}) view readback off-formula",
                 )
-            # view-write -> strided-read
             for p, l, s in probes:
                 t = p * ps + s
-                d = _kernel_id(t, ps)
-                dk[l][d] = float(p * 100 + l * 10 + s + 3)
-                dv[l][d] = float(p * 100 + l * 10 + s + 4)
-                self.assertTrue(
-                    torch.all(sk[l][p, s] == float(p * 100 + l * 10 + s + 3))
-                )
-                self.assertTrue(
-                    torch.all(sv[l][p, s] == float(p * 100 + l * 10 + s + 4))
-                )
+                dk[l][t] = float(p * 100 + l * 10 + s + 3)
+                dv[l][t] = float(p * 100 + l * 10 + s + 4)
+                want_k = float(p * 100 + l * 10 + s + 3)
+                want_v = float(p * 100 + l * 10 + s + 4)
+                self.assertTrue(torch.all(sk[l][p, s] == want_k))
+                self.assertTrue(torch.all(sv[l][p, s] == want_v))
 
     def test_byte_addresses_match_envelope_formula(self):
-        """The per-layer view's byte address for token ``t``, layer ``L`` must equal
-        the hand-computed envelope formula: page origin + layer-block origin +
-        slot offset. Independent of any view builder — this is the raw layout
-        contract every envelope consumer (moves, sizing, transfer math) relies
-        on."""
-        k_row = _ROW * _ITEM
-        v_row = _ROW * _ITEM
+        """The per-layer view's byte address for token ``t``, layer ``l`` must
+        equal the hand-computed envelope formula. Independent of any view
+        builder -- this is the raw layout contract every envelope consumer
+        (moves, sizing, transfer math) relies on."""
         for ps in (1, 4):
             num_pages = 5
-            page_bytes = ps * _L * (k_row + v_row)
             dk, dv = _build_views(_make_raw(ps, num_pages), ps, num_pages)
             for t in (0, 1, ps, 3 * ps + (ps - 1), 4 * ps):
-                d = _kernel_id(t, ps)
-                for L in range(_L):
-                    expected_k = (
-                        (t // ps) * page_bytes
-                        + L * ps * (k_row + v_row)
-                        + (t % ps) * k_row
-                    )
-                    expected_v = (
-                        (t // ps) * page_bytes
-                        + L * ps * (k_row + v_row)
-                        + ps * k_row
-                        + (t % ps) * v_row
-                    )
-                    got_k = (dk[L].storage_offset() + d * dk[L].stride(0)) * _ITEM
-                    got_v = (dv[L].storage_offset() + d * dv[L].stride(0)) * _ITEM
-                    self.assertEqual(got_k, expected_k, f"K t={t} L={L} ps={ps}")
-                    self.assertEqual(got_v, expected_v, f"V t={t} L={L} ps={ps}")
+                for l in range(_L):
+                    expected_k = t * _ENTRY + l * (_K_ROW + _V_ROW)
+                    expected_v = expected_k + _K_ROW
+                    got_k = (dk[l].storage_offset() + t * dk[l].stride(0)) * _ITEM
+                    got_v = (dv[l].storage_offset() + t * dv[l].stride(0)) * _ITEM
+                    self.assertEqual(got_k, expected_k, f"K t={t} l={l} ps={ps}")
+                    self.assertEqual(got_v, expected_v, f"V t={t} l={l} ps={ps}")
 
-    def test_k_and_v_share_one_kernel_id_without_aliasing(self):
-        """One kernel-facing id, 2L distinct cells (K and V of every layer): writes
-        through all 2L views at the SAME id must not clobber each other."""
+    def test_k_and_v_share_one_id_without_aliasing(self):
+        """One id, 2L distinct cells (K and V of every layer): writes through
+        all 2L views at the SAME id must not clobber each other."""
         ps, num_pages = 4, 4
         dk, dv = _build_views(_make_raw(ps, num_pages), ps, num_pages)
         t = 2 * ps + 1  # page 2, slot 1
-        d = _kernel_id(t, ps)
         for l in range(_L):
-            dk[l][d] = float(2 * l + 1)
-            dv[l][d] = float(2 * l + 2)
+            dk[l][t] = float(2 * l + 1)
+            dv[l][t] = float(2 * l + 2)
         for l in range(_L):
-            self.assertTrue(torch.all(dk[l][d] == float(2 * l + 1)))
-            self.assertTrue(torch.all(dv[l][d] == float(2 * l + 2)))
+            self.assertTrue(torch.all(dk[l][t] == float(2 * l + 1)))
+            self.assertTrue(torch.all(dv[l][t] == float(2 * l + 2)))
 
-    def test_missing_tail_pad_fails_loud(self):
-        ps, num_pages = 2, 4
-        raw = _make_raw(ps, num_pages, pad_pages=0)
-        with self.assertRaises(AssertionError):
-            _build_views(raw, ps, num_pages)
+    def test_asymmetric_views_address_their_own_rows(self):
+        head_dim, v_head_dim = 8, 4
+        k_row, v_row = _H * head_dim * _ITEM, _H * v_head_dim * _ITEM
+        entry = _entry_bytes(head_dim, v_head_dim)
+        ps, num_pages = 4, 3
+        raw = _make_raw(ps, num_pages, entry=entry)
+        dk, dv = _build_views(raw, ps, num_pages, head_dim, v_head_dim)
+        self.assertEqual(tuple(dk[0].shape[1:]), (_H, head_dim))
+        self.assertEqual(tuple(dv[0].shape[1:]), (_H, v_head_dim))
+        t = 2 * ps + 3
+        for l in range(_L):
+            dk[l][t] = float(l + 1)
+            dv[l][t] = float(l + 11)
+        flat = raw.view(_DTYPE)
+        for l in range(_L):
+            k0 = (t * entry + l * (k_row + v_row)) // _ITEM
+            v0 = k0 + k_row // _ITEM
+            self.assertTrue(torch.all(flat[k0 : k0 + k_row // _ITEM] == float(l + 1)))
+            self.assertTrue(torch.all(flat[v0 : v0 + v_row // _ITEM] == float(l + 11)))
 
-    def test_asymmetric_dims_rejected(self):
+    def test_views_fill_the_buffer_exactly(self):
+        """No tail pad: the last view's last byte is the buffer's last byte."""
         ps, num_pages = 2, 4
         raw = _make_raw(ps, num_pages)
+        _, dv = _build_views(raw, ps, num_pages)
+        last = dv[_L - 1]
+        end = (last.storage_offset() + (last.shape[0] - 1) * last.stride(0)) * _ITEM
+        self.assertEqual(end + _V_ROW, raw.numel())
+
+    def test_short_buffer_fails_loud(self):
+        ps, num_pages = 2, 4
         with self.assertRaises(AssertionError):
-            _build_views(raw, ps, num_pages, head_dim=6, v_head_dim=4)
+            _build_views(_make_raw(ps, num_pages, short=1), ps, num_pages)
+
+    def test_paged_view_regroups_by_page(self):
+        """BUG REGRESSION at page_size 1: a `view`-built split gives the size-1
+        slot dim the ROW stride, not the entry stride, so the paged view
+        misreported the slot stride of every MHA/SWA layer at ps=1."""
+        num_pages = 3
+        for ps in (1, 4):
+            dk, _ = _build_views(_make_raw(ps, num_pages), ps, num_pages)
+            paged = paged_view(dk[1], ps)
+            self.assertEqual(
+                tuple(paged.stride()),
+                (ps * _ENTRY // _ITEM, _ENTRY // _ITEM, _D, 1),
+                ps,
+            )
+            for t in range(num_pages * ps):
+                self.assertEqual(
+                    paged[t // ps, t % ps].data_ptr(), dk[1][t].data_ptr(), (ps, t)
+                )
 
 
 # ---- pool level ----
@@ -330,35 +333,26 @@ def _make_pool(ps=1, full_spec=None, device=_DEV):
 
 
 class TestUnifiedKVPoolViews(unittest.TestCase):
-    def test_every_mha_sub_pool_is_per_layer_contiguous(self):
+    def test_every_mha_sub_pool_is_a_slot_strided_view(self):
         """The unified pool has ONE MHA layout: both sub-pools come back as
-        stock 3-D per-layer views, whatever their page size."""
+        3-D per-layer views whose slot stride is their own entry."""
         for ps in (1, 4):
             pool = _make_pool(ps=ps)
-            for name in ("full", "swa"):
+            for name, spec in (("full", _mha_spec()), ("swa", _swa_spec())):
                 k, v = pool.mha_views_for(name)
-                self.assertEqual(k[0].dim(), 3, f"{name} K at ps={ps}")
-                self.assertEqual(v[0].dim(), 3, f"{name} V at ps={ps}")
-                self.assertTrue(k[0].is_contiguous())
+                for t in (k[0], v[0], k[-1], v[-1]):
+                    self.assertEqual(t.dim(), 3, f"{name} at ps={ps}")
+                    self.assertEqual(t.stride(0) * _ITEM, spec.entry_bytes())
 
-    def test_tail_pad_is_derived_from_the_specs(self):
-        """The per-layer views hang past the last page envelope, so the pool
-        over-allocates one envelope of the widest sub-pool. Derived here, not
-        passed in, so no construction site can under-allocate it."""
+    def test_raw_is_exactly_the_budget(self):
+        """The views end at the last slot, so the pool allocates exactly the
+        byte budget: no tail pad, nothing to under-allocate."""
         for ps in (1, 4):
             kv = _make_pool(ps)
-            full, swa = _mha_spec(), _swa_spec()
-            self.assertEqual(
-                kv.view_tail_pad_bytes,
-                ps * max(full.entry_bytes(), swa.entry_bytes()),
-                f"tail pad at ps={ps}",
-            )
             self.assertEqual(
                 kv._raw.numel(),
-                full.entry_bytes() * _N_FULL
-                + swa.entry_bytes() * _N_SWA
-                + kv.view_tail_pad_bytes,
-                "the pad extends the allocation only",
+                _mha_spec().entry_bytes() * _N_FULL
+                + _swa_spec().entry_bytes() * _N_SWA,
             )
 
 
@@ -377,25 +371,23 @@ def _make_pool_and_kv(ps, device=_DEV):
 
 
 class TestUnifiedMHATokenToKVPool(unittest.TestCase):
-    def test_size_is_view_row_bound(self):
+    def test_size_is_slot_bound(self):
         """`size` drives BOTH the python OOB check and the store kernel's
-        device-side size_limit; it must be the view row bound, not slot count."""
+        device-side size_limit; `size + page_size` must be the view row count."""
         for ps in (1, 4):
             unified_kv, pool_under_test = _make_pool_and_kv(ps)
-            n_rows = (unified_kv.max_slots("full") // ps) * _BLOCKS * ps
+            n_rows = (unified_kv.max_slots("full") // ps) * ps
             self.assertEqual(pool_under_test.size, n_rows - ps)
+            self.assertEqual(pool_under_test.k_buffer[0].shape[0], n_rows)
 
     def test_stock_write_lands_on_envelope_truth(self):
-        """Byte-identity: the pool's stock inherited `set_kv_buffer` at kernel-facing
-        locs must produce exactly the bytes that direct writes through STRIDED
-        views over the same envelope produce at the same (page, slot, layer)
-        cells. The strided views are built here purely as the independent
-        description of the envelope — pins the whole write path (loc -> view ->
-        raw bytes) end to end."""
+        """Byte-identity: the pool's stock inherited `set_kv_buffer` at physical
+        token ids must produce exactly the bytes that direct writes through
+        the reference (page, slot) views produce at the same cells -- pins the
+        whole write path (loc -> strided view -> raw bytes) end to end."""
         for ps in (1, 4):
             kv, pool = _make_pool_and_kv(ps, device=_STORE_DEV)
-            # An independent strided view of the SAME sub-pool region.
-            sk, sv = _reference_strided_views(
+            sk, sv = _reference_paged_views(
                 kv._raw,
                 page_size=ps,
                 num_pages=kv.max_slots("full") // ps,
@@ -406,20 +398,10 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                 toks = torch.tensor(
                     [p * ps + s for (p, s) in probes], device=_STORE_DEV
                 )
-                kernel_locs = (toks // ps) * (ps * _BLOCKS) + toks % ps
-                k = torch.full(
-                    (len(probes), _H, _D),
-                    float(l + 1),
-                    dtype=_DTYPE,
-                    device=_STORE_DEV,
-                )
-                v = torch.full(
-                    (len(probes), _H, _D),
-                    float(l + 101),
-                    dtype=_DTYPE,
-                    device=_STORE_DEV,
-                )
-                pool.set_kv_buffer(_layer(l), kernel_locs, k, v)
+                shape = (len(probes), _H, _D)
+                k = torch.full(shape, float(l + 1), dtype=_DTYPE, device=_STORE_DEV)
+                v = torch.full(shape, float(l + 101), dtype=_DTYPE, device=_STORE_DEV)
+                pool.set_kv_buffer(_layer(l), KVWriteLoc(toks, physical=True), k, v)
                 for p, s in probes:
                     self.assertTrue(
                         torch.all(sk[l][p, s] == float(l + 1)),
@@ -431,15 +413,13 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                     )
 
     def test_move_kv_cache_relocates_whole_envelopes(self):
-        """Compaction hands PHYSICAL token runs, not kernel-facing ids. The override
-        must relocate exactly the page envelopes those runs name — red if it is
-        lost, since the inherited per-layer move would apply physical ids to
-        the row space."""
+        """Compaction hands PHYSICAL token runs. The override must relocate
+        exactly the page envelopes those runs name."""
         ps = 4
         kv, pool = _make_pool_and_kv(ps)
-        live = kv._raw.numel() - kv.view_tail_pad_bytes
+        live = kv._raw.numel()
         seed = (torch.arange(live, dtype=torch.float32) % 251).to(torch.uint8)
-        kv._raw[:live] = seed
+        kv._raw[:] = seed
         page_bytes = ps * _mha_spec().entry_bytes()
 
         src_pages, tgt_pages = torch.tensor([5, 6]), torch.tensor([2, 3])
@@ -453,23 +433,33 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
                 sp * page_bytes : (sp + 1) * page_bytes
             ]
         self.assertTrue(
-            torch.equal(kv._raw[:live], want),
+            torch.equal(kv._raw, want),
             "envelope move did not relocate exactly the named pages",
         )
 
-    def test_transfer_entry_points_fail_loud(self):
-        """PD / CPU-copy entry points assume per-layer buffers indexed by TOKEN
-        id; against the row space they would silently mis-index (or hit a
-        missing-attr AttributeError). Every one of them must raise."""
+    def test_prefix_valid_entry_point_fails_loud(self):
+        """Prefix-valid writes still assume token-major buffer indexing."""
         _, pool = _make_pool_and_kv(1)
         with self.assertRaises(NotImplementedError):
-            pool.get_contiguous_buf_infos()
-        with self.assertRaises(NotImplementedError):
-            pool.get_cpu_copy(torch.tensor([1]))
-        with self.assertRaises(NotImplementedError):
-            pool.load_cpu_copy(None, torch.tensor([1]))
-        with self.assertRaises(NotImplementedError):
             pool.set_kv_buffer_prefix_valid()
+
+    def test_pd_registration_is_one_whole_envelope(self):
+        """PD registers ONE region -- the whole raw buffer -- with the page
+        envelope as the item, so the transfer engine addresses it as
+        `raw_ptr + physical_page * page_envelope_bytes`. Per-layer regions
+        would be wrong here: the per-layer views overlap inside the envelope
+        and index in kernel-facing ids, not token ids."""
+        kv, pool = _make_pool_and_kv(1)
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        self.assertEqual(len(ptrs), 1)
+        self.assertEqual(len(lens), 1)
+        self.assertEqual(len(item_lens), 1)
+        self.assertEqual(ptrs[0], kv._raw.data_ptr())
+        self.assertEqual(lens[0], kv._raw.numel())
+        self.assertEqual(item_lens[0], pool._page_bytes)
+        # The whole addressable page range must fit the registered region, or
+        # the last page's write would run off the end of the RDMA mapping.
+        self.assertLessEqual(pool._num_pages * item_lens[0], lens[0])
 
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven
@@ -483,17 +473,25 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
 
 
 class TestFactoryViews(unittest.TestCase):
-    """The real SWA factory builds the sub-pools and wires the matching
-    kernel-facing multipliers into the composite allocator. End-to-end over
-    that factory, the rebind must emit BOTH kernel-facing write locs."""
+    """The real SWA factory builds the sub-pools and the composite allocator.
+    End-to-end over that factory, kernel-facing ids are the physical ones and
+    the rebind must emit BOTH write locs."""
 
-    # _swa_factory geometry: L_full = L_swa = 2, uniform 8/8 dims, ps = 1.
-    FULL_MULT = 4  # 2 * L_full
-    SWA_MULT = 4  # 2 * L_swa
+    def setUp(self):
+        # `KVIndexTranslator.__init__` asks the parallel context for
+        # `attn_dcp_size`, which is a quotient of the configured leaves and is
+        # computed at publish. A bare process has none, so state one the way a
+        # real process does.
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
 
     def _bundle(self):
         # Self-contained tiny SWA-factory bundle (L_full = L_swa = 2, uniform
-        # 8/8 dims, ps = 1) — small enough that per-layer views build on CPU.
+        # 8/8 dims, ps = 1) -- small enough that per-layer views build on CPU.
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
         return init_unified_swa_pools(
@@ -516,52 +514,84 @@ class TestFactoryViews(unittest.TestCase):
             need_sort=False,
         )
 
-    def test_factory_wires_matching_multipliers(self):
+    def test_factory_builds_per_layer_views(self):
         b = self._bundle()
-        pool = b.unified_memory_pool
-        alloc = b.token_to_kv_pool_allocator
-        self.assertEqual(alloc.kernel_page_multiplier, self.FULL_MULT)
-        self.assertEqual(alloc.swa_kernel_page_multiplier, self.SWA_MULT)
         # Sub-pools expose stock 3-D per-layer views.
         self.assertEqual(b.token_to_kv_pool.full_kv_pool.k_buffer[0].dim(), 3)
         self.assertEqual(b.token_to_kv_pool.swa_kv_pool.k_buffer[0].dim(), 3)
-        self.assertGreater(pool.view_tail_pad_bytes, 0)
 
-    def test_rebind_emits_kernel_facing_full_and_build_derives_swa(self):
-        """End-to-end over the real factory: rebind_write_loc rebinds
-        out_cache_loc to FULL-kernel-facing ids (phase 1), and the per-batch build
-        derives the SWA write loc pointwise from those kernel-facing values
-        (phase 2) — both checked against the formulas over the VIRTUAL
-        ids."""
+    @unittest.skipUnless(_HAS_FP8, "requires torch.float8_e4m3fn")
+    def test_swa_factory_preserves_fp8_logical_dtype(self):
+        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+
+        b = init_unified_swa_pools(
+            device="cpu",
+            kv_cache_dtype=torch.float8_e4m3fn,
+            head_num=2,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_num=2,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            page_size=1,
+            start_layer=0,
+            end_layer=4,
+            swa_attention_layer_ids=[1, 3],
+            full_attention_layer_ids=[0, 2],
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            enable_memory_saver=False,
+            need_sort=False,
+        )
+
+        self.assertEqual(b.token_to_kv_pool.dtype, torch.float8_e4m3fn)
+        for pool in (b.token_to_kv_pool.full_kv_pool, b.token_to_kv_pool.swa_kv_pool):
+            self.assertEqual(pool.dtype, torch.float8_e4m3fn)
+            self.assertEqual(pool.store_dtype, torch.uint8)
+            self.assertEqual(pool.k_buffer[0].dtype, torch.uint8)
+
+    def test_rebind_emits_physical_full_and_build_derives_swa(self):
+        """End-to-end over the real factory: a batch's own plan binds
+        out_cache_loc to FULL-side physical ids and derives the SWA write ids
+        from the virtual window -- both checked against the v2p tables over
+        the VIRTUAL ids."""
         from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.runtime_context import get_parallel
 
         b = self._bundle()
         alloc = b.token_to_kv_pool_allocator
         v = alloc.alloc(4)
         self.assertIsNotNone(v)
-        expected_full = alloc.full_v2p_page_table[v] * self.FULL_MULT  # ps=1
-        expected_swa = alloc.swa_v2p_page_table[v] * self.SWA_MULT
+        expected_full = alloc.full_v2p_page_table[v]  # ps=1
+        expected_swa = alloc.swa_v2p_page_table[v]
 
         class _FB:
             pass
 
         fb = _FB()
         fb.out_cache_loc = v.clone()
-        source = KVIndexTranslator(
-            req_to_token=torch.zeros((2, 8), dtype=torch.int64),
-            token_to_kv_pool_allocator=alloc,
-            token_to_kv_pool=b.token_to_kv_pool,
-            page_size=1,
-            device="cpu",
-        )
-        self.assertTrue(source.is_translating)
-        source.rebind_write_loc(fb)
-        self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
-        self.assertTrue(
-            torch.equal(
-                source.sliding_window_write_loc_for(fb.out_cache_loc), expected_swa
+        # The translating paths read the DCP topology twice: construction reads
+        # `attn_dcp_size` to decide whether the read translate defers, and the
+        # write translate reads `attn_dcp_rank`, which derives from
+        # `dcp_enabled`. Neither has a pre-publish default and nothing is
+        # published in a unit test, so state both and hold the scope across
+        # every call that translates.
+        with get_parallel().override(attn_dcp_size=1, dcp_enabled=False):
+            source = KVIndexTranslator(
+                req_to_token=torch.zeros((2, 8), dtype=torch.int64),
+                token_to_kv_pool_allocator=alloc,
+                token_to_kv_pool=b.token_to_kv_pool,
+                page_size=1,
+                device="cpu",
             )
-        )
+            self.assertTrue(source.is_translating)
+            source.bind_own_plan(fb)
+            self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
+            self.assertTrue(
+                torch.equal(
+                    source.write_ids(fb, IdSpaceKind.SLIDING_WINDOW), expected_swa
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+    peek_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -189,6 +190,20 @@ class ImageEncodingStage(PipelineStage):
         return postprocess_funcs[0](outputs, image_inputs)
 
     @staticmethod
+    def _prepare_text_encoder_inputs(image_inputs) -> dict[str, Any]:
+        inputs = {
+            "input_ids": image_inputs.input_ids,
+            "attention_mask": image_inputs.attention_mask,
+            "pixel_values": image_inputs.pixel_values,
+            "image_grid_thw": image_inputs.image_grid_thw,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if "mm_token_type_ids" in image_inputs:
+            inputs["mm_token_type_ids"] = image_inputs["mm_token_type_ids"]
+        return inputs
+
+    @staticmethod
     def _split_text_conditioning_output(output):
         if isinstance(output, TextConditioningOutput):
             return (
@@ -334,21 +349,11 @@ class ImageEncodingStage(PipelineStage):
                         )
                     with set_forward_context(current_timestep=0, attn_metadata=None):
                         outputs = self.text_encoder(
-                            input_ids=image_inputs.input_ids,
-                            attention_mask=image_inputs.attention_mask,
-                            pixel_values=image_inputs.pixel_values,
-                            image_grid_thw=image_inputs.image_grid_thw,
-                            output_hidden_states=True,
-                            use_cache=False,
+                            **self._prepare_text_encoder_inputs(image_inputs)
                         )
                         if batch.do_classifier_free_guidance:
                             neg_outputs = self.text_encoder(
-                                input_ids=neg_image_inputs.input_ids,
-                                attention_mask=neg_image_inputs.attention_mask,
-                                pixel_values=neg_image_inputs.pixel_values,
-                                image_grid_thw=neg_image_inputs.image_grid_thw,
-                                output_hidden_states=True,
-                                use_cache=False,
+                                **self._prepare_text_encoder_inputs(neg_image_inputs)
                             )
 
                 prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
@@ -544,9 +549,15 @@ class LTX2ImageEncodingStage(PipelineStage):
             "condition_image_encoder"
         ):
             modules = {"condition_image_encoder": self._condition_image_encoder}
+            residency_manager = peek_global_component_residency_manager()
             configure_layerwise_offload_modules(
                 modules,
                 server_args,
+                pin_budget=(
+                    residency_manager.host_pin_budget
+                    if residency_manager is not None
+                    else None
+                ),
                 component_names=(
                     None
                     if server_args.component_residency is not None

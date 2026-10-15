@@ -6,7 +6,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.multimodal_gen.runtime.layers.attention import layer as layer_module
+from sglang.multimodal_gen.runtime.layers.attention.backends import (
+    flash_attn as flash_attn_module,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionImpl,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     denoising as denoising_module,
 )
@@ -30,7 +38,9 @@ def _fake_backend_cls(enum, *, ring_capable=True):
     )
 
 
-def _fake_layer(default=AttentionBackendEnum.FA) -> SimpleNamespace:
+def _fake_layer(
+    default=AttentionBackendEnum.FA, *, is_cross_attention=False
+) -> SimpleNamespace:
     return SimpleNamespace(
         backend=default,
         _default_attn_backend=default,
@@ -39,9 +49,36 @@ def _fake_layer(default=AttentionBackendEnum.FA) -> SimpleNamespace:
         _required_attention_backend=None,
         _attn_impl_ctor_kwargs={"num_heads": 2},
         attn_impl=f"{default.name.lower()}_impl",
-        head_size=64,
-        dtype="bf16",
+        head_size=128,
+        dtype=torch.bfloat16,
+        is_cross_attention=is_cross_attention,
     )
+
+
+class TestSkipSoftmaxDispatch(unittest.TestCase):
+    def test_dense_trtllm_precedes_skip_threshold(self):
+        impl = FlashAttentionImpl(
+            num_heads=2,
+            head_size=128,
+            causal=False,
+            softmax_scale=128**-0.5,
+        )
+        params = SimpleNamespace(start_step=14, threshold_scale_factor=500.0)
+        with patch.object(
+            flash_attn_module, "get_request_skip_softmax_params", return_value=params
+        ):
+            with patch.object(
+                flash_attn_module,
+                "get_forward_context",
+                return_value=SimpleNamespace(current_timestep=13),
+            ):
+                self.assertEqual(impl._request_skip_softmax_threshold(), (True, None))
+            with patch.object(
+                flash_attn_module,
+                "get_forward_context",
+                return_value=SimpleNamespace(current_timestep=14),
+            ):
+                self.assertEqual(impl._request_skip_softmax_threshold(), (True, 500.0))
 
 
 class TestMaybeOverrideAttentionBackend(unittest.TestCase):
@@ -59,6 +96,7 @@ class TestMaybeOverrideAttentionBackend(unittest.TestCase):
         self.stage._attn_backend_default = self.default_backend_cls
         self.stage._attn_metadata_head_size = 64
         self.stage._attention_backend_active_override = None
+        self.stage._skip_softmax_forced_fa = False
 
         self.layers = [_fake_layer(), _fake_layer()]
         self.prepare_calls = []
@@ -121,6 +159,38 @@ class TestMaybeOverrideAttentionBackend(unittest.TestCase):
         )
         self.assertIs(self.stage.attn_backend, self.default_backend_cls)
         self.assertIsNone(self.stage._attention_backend_active_override)
+
+    def test_skip_softmax_forces_fa_only_for_self_attention(self):
+        self.layers[1] = _fake_layer(is_cross_attention=True)
+        self.stage._maybe_override_attention_backend(
+            _batch(None), force_fa_for_self_attention=True
+        )
+        self.assertEqual(
+            self.prepare_calls,
+            [(self.layers[0], AttentionBackendEnum.FA)],
+        )
+        self.assertEqual(
+            self.apply_calls,
+            [
+                (self.layers[0], AttentionBackendEnum.FA),
+                (self.layers[1], None),
+            ],
+        )
+
+    def test_skip_softmax_rejects_non_fa_override(self):
+        with self.assertRaisesRegex(ValueError, "requires the FA attention backend"):
+            self.stage._maybe_override_attention_backend(
+                _batch("sage_attn"), force_fa_for_self_attention=True
+            )
+
+    def test_skip_softmax_uses_custom_model_fa_without_shared_layers(self):
+        self.layers.clear()
+        self.stage._maybe_override_attention_backend(
+            _batch(None), force_fa_for_self_attention=True
+        )
+        self.assertEqual(self.prepare_calls, [])
+        self.assertEqual(self.apply_calls, [])
+        self.assertIs(self.stage.attn_backend, self.default_backend_cls)
 
     def test_unknown_backend_name_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unknown attention_backend_override"):

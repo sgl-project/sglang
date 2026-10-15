@@ -32,7 +32,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 
 logger = logging.getLogger(__name__)
 
-register_xpu_ci(est_time=3600, suite="nightly-xpu-4-gpu", nightly=True)
+register_xpu_ci(est_time=3600, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 XPU_FLUX2_CASES = [
     DiffusionTestCase(
@@ -164,7 +164,7 @@ class TestFlux2DevXPU(DiffusionServerBase):
             diffusion_server, case.id, generate_fn
         )
 
-        self._validate_and_record(case, perf_record)
+        self._validate_and_record(diffusion_server, case, perf_record)
         self._test_v1_models_endpoint(diffusion_server, case)
 
         prompt = case.sampling_params.prompt or ""

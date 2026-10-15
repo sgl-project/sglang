@@ -171,6 +171,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     a,
     mixed_qkvz,
     mixed_ba,
+    qkvz_row_stride,
+    ba_row_stride,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
@@ -185,19 +187,19 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-    TOTAL_QKVZ: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V + TOTAL_V
-    TOTAL_BA: tl.constexpr = NUM_HEADS_V * 2
 
     # ── Output dimensions ──
     QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
 
     # ── Read from contiguous input ──
     # q for head group i_qk: in the all_q region, offset i_qk * HEAD_QK
-    blk_q_ptr = mixed_qkvz + i_bs * TOTAL_QKVZ + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    blk_q_ptr = (
+        mixed_qkvz + i_bs * qkvz_row_stride + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    )
     # k for head group i_qk: in the all_k region
     blk_k_ptr = (
         mixed_qkvz
-        + i_bs * TOTAL_QKVZ
+        + i_bs * qkvz_row_stride
         + TOTAL_Q
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
@@ -209,7 +211,11 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     # vector access. V_POW2 arrives as a wrapper-computed constexpr so the
     # dead branch is pruned before tl.arange validation.
     v_ld_base = (
-        mixed_qkvz + i_bs * TOTAL_QKVZ + TOTAL_Q + TOTAL_K + i_qk * V_PER_GROUP * HEAD_V
+        mixed_qkvz
+        + i_bs * qkvz_row_stride
+        + TOTAL_Q
+        + TOTAL_K
+        + i_qk * V_PER_GROUP * HEAD_V
     )
     z_ld_base = v_ld_base + TOTAL_V
 
@@ -250,12 +256,14 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
 
     # ── b and a from contiguous [all_b | all_a] ──
     for i in tl.static_range(V_PER_GROUP):
-        blk_b_ptr = mixed_ba + i_bs * TOTAL_BA + i_qk * V_PER_GROUP + i
+        blk_b_ptr = mixed_ba + i_bs * ba_row_stride + i_qk * V_PER_GROUP + i
         blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
 
     for i in tl.static_range(V_PER_GROUP):
-        blk_a_ptr = mixed_ba + i_bs * TOTAL_BA + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        blk_a_ptr = (
+            mixed_ba + i_bs * ba_row_stride + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        )
         blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
@@ -319,6 +327,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         a,
         mixed_qkvz,
         mixed_ba,
+        mixed_qkvz.stride(0),
+        mixed_ba.stride(0),
         num_heads_qk,
         num_heads_v,
         head_qk,
@@ -327,6 +337,24 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         num_warps=num_warps,
         num_stages=3,
     )
+    return mixed_qkv, z, b, a
+
+
+def qwen3_5_gdn_prefill_projection_views(
+    mixed_qkvz,
+    mixed_ba,
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+):
+    """Return strided views accepted by the prefill GDN consumers."""
+    tokens = mixed_qkvz.shape[0]
+    qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    mixed_qkv = mixed_qkvz[:, :qkv_dim]
+    z = mixed_qkvz[:, qkv_dim:].view(tokens, num_heads_v, head_v)
+    b = mixed_ba[:, :num_heads_v]
+    a = mixed_ba[:, num_heads_v : 2 * num_heads_v]
     return mixed_qkv, z, b, a
 
 
@@ -483,41 +511,15 @@ def can_use_fused_qkvzba_causal_conv1d_update_contiguous(
     conv_state: torch.Tensor,
     conv_weight: torch.Tensor,
     conv_bias: torch.Tensor | None,
-    conv_state_indices: torch.Tensor,
     *,
-    qkv_dim: int,
-    v_dim: int,
-    num_v_heads: int,
     activation: str | None,
 ) -> tuple[bool, str]:
-    """Return an explicit eligibility decision for the decode fusion."""
-    tensors = (mixed_qkvz, mixed_ba, conv_state, conv_weight, conv_state_indices)
-    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
-        return False, "all inputs must be torch.Tensor instances"
-    if not all(tensor.is_cuda for tensor in tensors):
+    """Select the fused decode path for supported dtypes and layouts."""
+    if not mixed_qkvz.is_cuda:
         return False, "CUDA tensors are required"
-    if mixed_qkvz.ndim != 2 or mixed_ba.ndim != 2:
-        return False, "projection outputs must be rank-2"
-    if conv_state.ndim != 3 or conv_weight.ndim != 2:
-        return False, "Conv1D state/weight ranks must be 3/2"
-    if conv_state_indices.ndim != 1:
-        return False, "conv_state_indices must be rank-1"
-    batch = mixed_qkvz.shape[0]
-    if mixed_ba.shape[0] != batch or conv_state_indices.shape[0] != batch:
-        return False, "batch dimensions must match"
-    if qkv_dim <= 0 or v_dim <= 0 or num_v_heads <= 0:
-        return False, "TP-local dimensions must be positive"
-    if mixed_qkvz.shape[1] != qkv_dim + v_dim:
-        return False, "qkvz layout is not contiguous [Q|K|V|Z]"
-    if mixed_ba.shape[1] != 2 * num_v_heads:
-        return False, "ba layout is not contiguous [B|A]"
-    if conv_state.shape[1] != qkv_dim or conv_weight.shape[0] != qkv_dim:
-        return False, "Conv1D feature dimension does not match packed QKV"
-    width = conv_weight.shape[1]
+    width = conv_weight.shape[-1]
     if width < 2 or width > 4:
         return False, "only Conv1D widths 2 through 4 are supported"
-    if conv_state.shape[2] < width - 1:
-        return False, "Conv1D state is shorter than width - 1"
     supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
     if mixed_qkvz.dtype not in supported_dtypes:
         return False, "QKVZ activation dtype must be FP16, BF16, or FP32"
@@ -525,23 +527,14 @@ def can_use_fused_qkvzba_causal_conv1d_update_contiguous(
         return False, "QKVZ, Conv1D state, and weight dtypes must match"
     if mixed_ba.dtype not in supported_dtypes:
         return False, "BA activation dtype must be FP16, BF16, or FP32"
-    if conv_bias is not None:
-        if (
-            not isinstance(conv_bias, torch.Tensor)
-            or not conv_bias.is_cuda
-            or conv_bias.ndim != 1
-            or conv_bias.shape[0] != qkv_dim
-            or conv_bias.dtype != mixed_qkvz.dtype
-        ):
-            return False, "Conv1D bias contract is incompatible"
+    if conv_bias is not None and conv_bias.dtype != mixed_qkvz.dtype:
+        return False, "Conv1D bias dtype must match QKVZ"
     if activation not in (None, "silu", "swish"):
         return False, "activation must be None, silu, or swish"
-    if mixed_qkvz.stride(1) != 1 or mixed_ba.stride(1) != 1:
+    if mixed_qkvz.stride(-1) != 1 or mixed_ba.stride(-1) != 1:
         return False, "projection feature dimensions must be contiguous"
-    if conv_weight.stride(1) != 1:
+    if conv_weight.stride(-1) != 1:
         return False, "Conv1D weight width dimension must be contiguous"
-    if conv_state_indices.dtype not in (torch.int32, torch.int64):
-        return False, "conv_state_indices must be int32 or int64"
     return True, "eligible"
 
 
@@ -561,27 +554,34 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
     pad_slot_id: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Decode-only fused Qwen3.5 projection unpack and Conv1D state update."""
+    batch = mixed_qkvz.shape[0]
+    assert qkv_dim > 0 and v_dim > 0 and num_v_heads > 0
+    assert v_dim == num_v_heads * head_v_dim
+    assert mixed_qkvz.shape == (batch, qkv_dim + v_dim)
+    assert mixed_ba.shape == (batch, 2 * num_v_heads)
+    assert conv_state.ndim == 3 and conv_state.shape[1] == qkv_dim
+    assert conv_weight.ndim == 2 and conv_weight.shape[0] == qkv_dim
+    assert conv_state.shape[2] >= conv_weight.shape[1] - 1
+    assert conv_state_indices.shape == (batch,)
+    assert conv_state_indices.dtype in (torch.int32, torch.int64)
+    assert all(
+        t.device == mixed_qkvz.device
+        for t in (mixed_ba, conv_state, conv_weight, conv_state_indices)
+    )
+    if conv_bias is not None:
+        assert conv_bias.shape == (qkv_dim,)
+        assert conv_bias.device == mixed_qkvz.device
+
     eligible, reason = can_use_fused_qkvzba_causal_conv1d_update_contiguous(
         mixed_qkvz,
         mixed_ba,
         conv_state,
         conv_weight,
         conv_bias,
-        conv_state_indices,
-        qkv_dim=qkv_dim,
-        v_dim=v_dim,
-        num_v_heads=num_v_heads,
         activation=activation,
     )
     if not eligible:
         raise ValueError(f"Ineligible fused GDN decode projection/Conv1D: {reason}")
-    if v_dim != num_v_heads * head_v_dim:
-        raise ValueError(
-            "Ineligible fused GDN decode projection/Conv1D: "
-            "v_dim must equal num_v_heads * head_v_dim"
-        )
-
-    batch = mixed_qkvz.shape[0]
     mixed_qkv = torch.empty(
         (batch, qkv_dim), dtype=mixed_qkvz.dtype, device=mixed_qkvz.device
     )

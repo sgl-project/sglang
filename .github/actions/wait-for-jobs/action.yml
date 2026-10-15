@@ -1,5 +1,5 @@
 name: Wait for Jobs
-description: Poll and wait for specified jobs in the current workflow run to complete. Returns success immediately when the PR carries the `bypass-fastfail` label, letting downstream stages dispatch in parallel (same effect as scheduled runs).
+description: Poll and wait for specified jobs in the current workflow run to complete. Returns success immediately when the PR carries the `parallel-stages` label (or `highest-priority`, which implies it), letting downstream stages dispatch in parallel (same effect as scheduled runs).
 
 inputs:
   stage-name:
@@ -49,28 +49,12 @@ runs:
           const pollIntervalSeconds = parseInt(process.env.INPUT_POLL_INTERVAL_SECONDS);
           const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
-          // bypass-fastfail label opts the PR out of stage-to-stage waiting,
-          // letting all stages dispatch in parallel like scheduled runs do.
-          let labels = [];
-          if (context.payload.pull_request?.labels) {
-            labels = context.payload.pull_request.labels.map(l => l.name);
-          } else {
-            const ref = context.payload.pull_request?.head?.sha || context.sha;
-            try {
-              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: ref,
-              });
-              if (prs.length > 0) {
-                labels = prs[0].labels.map(l => l.name);
-              }
-            } catch (e) {
-              console.log(`Could not fetch PR labels for ${ref}: ${e.message}`);
-            }
-          }
-          if (labels.includes('bypass-fastfail')) {
-            console.log(`Skipping ${stageName} wait (bypass-fastfail label present)`);
+          const { resolveCiLabels } = require(
+            `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
+          );
+          const { parallelStages } = await resolveCiLabels(github, context);
+          if (parallelStages) {
+            console.log(`Skipping ${stageName} wait (parallel-stages label present)`);
             core.setOutput('result', 'success');
             return;
           }
@@ -182,15 +166,15 @@ runs:
               if (matchingJobs.length < spec.expected_count) {
                 // Job-level `if:` is evaluated before matrix expansion. When it
                 // evaluates false, GitHub emits exactly one "skipped" entry
-                // without a "(shard)" suffix instead of N matrix entries. Two
-                // shapes are possible:
+                // instead of N matrix entries. Shapes include:
                 //   - inline matrix:     `<prefix>`
                 //   - reusable workflow: `<prefix> / <called-job>`
-                // Both lack the ` (` shard marker. Detect that precise shape so
-                // we don't poll forever — and so we don't mistake a partially
-                // materialized dynamic/reusable matrix for a skipped one.
+                // Reusable workflows can also retain an unevaluated matrix
+                // expression in the shard suffix. Recognize that placeholder,
+                // while still waiting for missing shards of an expanded matrix.
                 const unexpandedSkip = matchingJobs.length === 1 &&
-                  !matchingJobs[0].name.includes(' (') &&
+                  (!matchingJobs[0].name.includes(' (') ||
+                    /\(\$\{\{\s*matrix\.partition\s*\}\}\)$/.test(matchingJobs[0].name)) &&
                   matchingJobs[0].status === 'completed' &&
                   matchingJobs[0].conclusion === 'skipped';
                 if (unexpandedSkip) {
@@ -198,7 +182,7 @@ runs:
                   totalCount += missing;
                   completedCount += missing;
                   if (!cached) {
-                    console.log(`${spec.prefix}: job-level skip (bare entry, conclusion=skipped); treating as all ${spec.expected_count} skipped`);
+                    console.log(`${spec.prefix}: job-level skip (unexpanded entry, conclusion=skipped); treating as all ${spec.expected_count} skipped`);
                   }
                 } else {
                   console.log(`${spec.prefix}: found ${matchingJobs.length}/${spec.expected_count} jobs (waiting for more)`);

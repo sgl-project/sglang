@@ -30,7 +30,11 @@ class CustomLogitProcessor(ABC):
         logits: torch.Tensor,
         custom_param_list: Optional[List[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
-        """Define the callable behavior."""
+        """Define the callable behavior.
+
+        The returned tensor must have the same shape as `logits`: the caller
+        writes it back row for row and does not broadcast a reduced result.
+        """
         raise NotImplementedError
 
     @classmethod
@@ -56,6 +60,17 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
         )
         logits[..., disallowed_token_ids] = -float("inf")
         return logits
+
+
+def supports_sampling_mask(serialized_processor: str) -> bool:
+    """Hard exclusion preserves the relative logits needed for mask-based replay."""
+    try:
+        return isinstance(
+            CustomLogitProcessor.from_str(serialized_processor),
+            DisallowedTokensLogitsProcessor,
+        )
+    except Exception:
+        return False
 
 
 def _open_thinking_start(ids: list[int], start_id: int, end_id: int) -> int:

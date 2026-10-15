@@ -692,6 +692,94 @@ def test_mamba_chunk_scan_intermediate_states(
         )
 
 
+@pytest.mark.parametrize("chunk_size", [64, 128])
+@pytest.mark.parametrize(
+    "seqlens",
+    [
+        (500, 700, 900),
+        (256, 300, 400),
+        (130, 200, 300),
+    ],
+)
+def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, itype = 8, 64, torch.float32
+    A, dt, X, B, C = generate_random_inputs(
+        1, sum(seqlens), n_heads, d_head, itype, device
+    )
+    starts = [sum(seqlens[:i]) for i in range(len(seqlens) + 1)]
+
+    def run(x, d, b, c, lens, **kwargs):
+        cu_seqlens = torch.tensor(
+            [sum(lens[:i]) for i in range(len(lens) + 1)],
+            dtype=torch.int32,
+            device=device,
+        )
+        seq_idx = torch.repeat_interleave(
+            torch.arange(len(lens), dtype=torch.int32, device=device),
+            torch.tensor(lens, dtype=torch.int32, device=device),
+        ).unsqueeze(0)
+        return mamba_chunk_scan_combined(
+            x,
+            d,
+            A,
+            b,
+            c,
+            chunk_size,
+            D=None,
+            cu_seqlens=cu_seqlens,
+            seq_idx=seq_idx,
+            initial_states=None,
+            out=torch.empty_like(x),
+            return_varlen_states=True,
+            **kwargs,
+        )
+
+    tracked = [
+        (i, (ln // chunk_size) * chunk_size)
+        for i, ln in enumerate(seqlens)
+        if ln >= chunk_size and ln % chunk_size != 0
+    ]
+    assert tracked, "case must exercise the unaligned path"
+
+    _, _, track_states = run(
+        X,
+        dt,
+        B,
+        C,
+        list(seqlens),
+        return_track_states=True,
+        track_seq_idx=torch.tensor(
+            [i for i, _ in tracked], dtype=torch.int64, device=device
+        ),
+        track_end_locs=torch.tensor(
+            [starts[i] + n for i, n in tracked], dtype=torch.int32, device=device
+        ),
+    )
+    assert track_states.shape == (1, len(tracked), n_heads, d_head, d_head)
+    track_states = track_states.squeeze(0)
+
+    for j, (i, n) in enumerate(tracked):
+        sl = slice(starts[i], starts[i] + n)
+        expected = run(
+            X[:, sl].contiguous(),
+            dt[:, sl].contiguous(),
+            B[:, sl].contiguous(),
+            C[:, sl].contiguous(),
+            [n],
+        )
+        torch.testing.assert_close(
+            track_states[j],
+            expected[0],
+            atol=1e-2,
+            rtol=5e-3,
+            msg=lambda m, i=i, n=n: f"request {i} snapshot at {n} tokens: " + m,
+        )
+
+
 if __name__ == "__main__":
     import sys
 

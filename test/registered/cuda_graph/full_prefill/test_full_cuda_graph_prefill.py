@@ -33,7 +33,7 @@ from sglang.test.test_utils import (
 
 # OSS FA4 coverage requires Blackwell. The PP test uses two GPUs; the other
 # tests use one GPU.
-register_cuda_ci(est_time=300, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=251, stage="base-b", runner_config="4-gpu-b200")
 
 
 def _prefill_graph_count(base_url: str) -> float:

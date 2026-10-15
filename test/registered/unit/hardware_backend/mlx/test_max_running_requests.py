@@ -23,11 +23,8 @@ from unittest import mock
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
@@ -35,6 +32,9 @@ _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
+    from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
+        MlxAuxiliaryStateComponent,
+    )
     from sglang.srt.hardware_backend.mlx.model_runner_stub import (
         MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO as RATIO,
     )
@@ -61,6 +61,9 @@ def _published(stub):
     """Publish the config the resolver reads (get_schedule() /
     get_memory())."""
     return get_context().override_server_args(
+        # One attention replica per TP rank gives the stub's attention-DP width.
+        tp_size=stub._attn_dp_size,
+        attn_dp_size=stub._attn_dp_size,
         max_running_requests=stub._max_running_requests,
         max_mamba_cache_size=stub._max_mamba_cache_size,
         disable_radix_cache=stub._disable_radix_cache,
@@ -87,7 +90,7 @@ def _stub(
     stub._max_mamba_cache_size = max_mamba_cache_size
     stub._disable_radix_cache = disable_radix_cache
     stub.max_total_num_tokens = max_total_num_tokens
-    stub.ps = SimpleNamespace(attn_dp_size=dp_size)
+    stub._attn_dp_size = dp_size
     return stub
 
 
@@ -97,7 +100,7 @@ def _hybrid_stub_for_initialize(
     """A stub carrying what the real initialize() reads (hybrid path)."""
     stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
     stub._mlx_pool_size = pool
-    stub.ps = SimpleNamespace(attn_dp_size=1)
+    stub._attn_dp_size = 1
     stub.device = "cpu"  # read by init_ngram_embedding_manager
     # Evaluated as a call argument in init_ngram_embedding_manager before
     # the use_ngram_embedding short-circuit; never read.
@@ -114,6 +117,8 @@ def _hybrid_stub_for_initialize(
         num_attention_layers=1,
         context_len=64,
         use_ngram_embedding=False,  # short-circuits NgramEmbeddingManager
+        ngram_embedding_n=0,
+        use_engram=False,
     )
     return stub
 
@@ -263,15 +268,8 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 3)
 
     def test_radix_disabled_sequential_requests_release_their_aux_slot(self):
-        # THE LEAK: with radix disabled, release_kv_cache's free_mamba_cache
-        # fallback never fires (the MLX pool is not a HybridReqToTokenPool)
-        # and ChunkCache frees token KV only, so pool.free(req) was the only
-        # release hook left -- and it freed just the request row. Every
-        # finished request permanently consumed one auxiliary slot and the
-        # (cap + 1)-th SEQUENTIAL request crashed with "Not enough MLX
-        # auxiliary state slots" even at concurrency 1. The pool now owns
-        # auxiliary release in this configuration: allocate/free/reallocate
-        # far past the pool size must succeed, with every slot returned.
+        # With radix disabled the component cleanup still frees the slot on finish;
+        # sequential requests far past the pool size must get every slot back.
         stub = _hybrid_stub_for_initialize(
             max_running_requests=2,
             max_mamba_cache_size=2,
@@ -280,11 +278,16 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         with _arch(hybrid=True), _published(stub):
             stub.initialize()
         pool = stub.req_to_token_pool
+        component = MlxAuxiliaryStateComponent(
+            SimpleNamespace(req_to_token_pool=pool),
+            SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
         aux_capacity = pool.auxiliary_state_pool.available_size()
         for _ in range(3 * aux_capacity):
             req = _fake_req()
             self.assertIsNotNone(pool.alloc([req]))
-            pool.free(req)  # as release_kv_cache does after ChunkCache
+            component.cleanup_after_caching_req(req=req, is_finished=True)
+            pool.free(req)
             self.assertIsNone(req.kv.mamba_pool_idx)
             self.assertEqual(pool.auxiliary_state_pool.available_size(), aux_capacity)
 

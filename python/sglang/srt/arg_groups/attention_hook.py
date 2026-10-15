@@ -9,7 +9,6 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
-    _attention_backend_dual_chunk,
     _attention_backend_fa3_fp8_fallback,
     _attention_backend_platform_fallbacks,
     _cutedsl_prefill_backend_fill,
@@ -29,8 +28,10 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
     use_mla_backend,
 )
+from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
@@ -38,6 +39,71 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Largest GQA group DISPATCH_DECODE instantiates in sgl-kernel-xpu flash_attention.cpp.
+XPU_DECODE_MAX_Q_GROUP_SIZE = 16
+
+
+def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
+    from sglang.srt.configs.model_config import is_qwen3_5
+
+    view = resolved_view(server_args)
+    tp_size, dcp_size = view.tp_size, view.dcp_size
+    if set(attention_backends_of(view)) != {"intel_xpu"}:
+        raise ValueError(
+            "--dcp-size > 1 on Intel XPU needs --attention-backend intel_xpu."
+        )
+    if use_mla_backend(server_args):
+        raise ValueError("--dcp-size > 1 is not supported for MLA models on Intel XPU.")
+    # Other ranks' rows are written at -1, which only store_cache_xpu skips; unequal
+    # K/V widths fall back to an indexed write that would hit the last slot.
+    if model_config.v_head_dim != model_config.head_dim:
+        raise ValueError("--dcp-size > 1 on Intel XPU needs equal K and V head dims.")
+    if tp_size % dcp_size != 0:
+        raise ValueError(f"--dcp-size {dcp_size} must divide --tp-size {tp_size}.")
+    # Every rank of a DCP group must hold the same KV heads: qwen3_5 shards qkv that
+    # way, other models only when kv_heads <= tp / dcp. Otherwise KV silently corrupts.
+    kv_head_layout_supported = is_qwen3_5(model_config.hf_config) or (
+        model_config.get_num_kv_heads(tp_size, dcp_size)
+        == model_config.get_num_kv_heads(tp_size)
+    )
+    if not kv_head_layout_supported:
+        raise ValueError(
+            f"--dcp-size {dcp_size} at --tp-size {tp_size} needs each rank to hold "
+            f"its DCP group's KV heads, which "
+            f"{model_config.hf_config.architectures[0]} does not. Use a smaller "
+            "--dcp-size."
+        )
+
+    attn_tp_size = (
+        tp_size
+        // (view.dp_size if view.enable_dp_attention else 1)
+        // view.attn_cp_size
+    )
+    q_heads = max(1, model_config.get_max_num_attention_heads() // attn_tp_size)
+    kv_heads = max(1, model_config.get_num_kv_heads(attn_tp_size, dcp_size))
+    q_group = q_heads * dcp_size // kv_heads
+    if q_group > XPU_DECODE_MAX_Q_GROUP_SIZE:
+        raise ValueError(
+            f"--dcp-size {dcp_size} gives the intel_xpu decode kernel a GQA group of "
+            f"{q_group}, above the {XPU_DECODE_MAX_Q_GROUP_SIZE} it is built for. Use "
+            "a smaller --dcp-size or a larger --tp-size."
+        )
+
+    if view.speculative_algorithm is not None:
+        raise ValueError(
+            "--dcp-size > 1 with speculative decoding is not supported on Intel XPU."
+        )
+    if model_config.attention_chunk_size is not None:
+        raise ValueError(
+            "--dcp-size > 1 is not supported on Intel XPU for models with chunked "
+            "local attention."
+        )
+    if model_config.is_encoder_decoder:
+        raise ValueError(
+            "--dcp-size > 1 is not supported on Intel XPU for encoder-decoder models."
+        )
 
 
 def handle_attention_backend_compatibility(server_args: Any):
@@ -161,7 +227,7 @@ def handle_attention_backend_compatibility(server_args: Any):
         if (
             prefill_backend == "trtllm_mha"
             and not get_platform().is_sm100
-            and (cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1)
+            and cfg.attn_cp_size > 1
         ):
             raise ValueError(
                 "Prefill context parallelism with the TRTLLM MHA prefill backend "
@@ -176,6 +242,8 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
+            # Check whether the operator supplied a memory fraction using
+            # the raw input snapshot; resolution may have filled the value in.
             explicit_mem_fraction = (
                 getattr(server_args, "_raw_input", None) or {}
             ).get("mem_fraction_static") is not None
@@ -202,30 +270,11 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
-    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
-    if use_mla_backend(server_args) and prefill_backend == "intel_xpu":
-        raise ValueError(
-            "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
-        )
+    # XPU platforms backends
+    if cfg.dcp_size > 1 and get_platform().is_xpu:
+        _check_xpu_dcp(server_args, model_config)
 
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
-
-    # Dual chunk flash attention backend
-    run_post_process_pass(server_args, _attention_backend_dual_chunk)
-    if resolved_view(server_args).attention_backend == "dual_chunk_flash_attn":
-        logger.warning(
-            "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            enable_mixed_chunk=False,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            disable_radix_cache=True,
-        )
 
 
 def handle_linear_attn_backend(server_args: Any):
@@ -297,6 +346,23 @@ def handle_linear_attn_backend(server_args: Any):
     verify = cfg.linear_attn_verify_backend
     if verify is None and decode == "flashinfer":
         verify = "flashinfer"
+    if (
+        pp_spec_stable_rows_enabled()
+        and verify == "flashinfer"
+        and uses_kda_attention(model_config_of(server_args).hf_config)
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            linear_attn_verify_backend="triton",
+        )
+        verify = "triton"
+        logger.warning(
+            "SGLANG_ENABLE_PP_SPEC with KDA does not support the FlashInfer "
+            "target-verify row layout; falling back "
+            "--linear-attn-verify-backend to triton. FlashInfer decode is "
+            "unchanged."
+        )
     if (
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
@@ -371,9 +437,9 @@ def handle_linear_attn_backend(server_args: Any):
             )
 
     # ReplaySSM spec-verify (Part B of #28511): linear-chain target verify via
-    # fold-every-commit -- the verify stores each draft step's raw inputs into
-    # the per-slot (rawv, rawk, g, beta) window and the commit replays the
-    # accepted prefix into the fp32 checkpoint. The intra-window interaction
+    # compact cached replay. Verify stores normalized keys, update vectors,
+    # and fp32 log-decays; accepted BF16 windows are materialized with
+    # compensated hi/lo accumulation. The intra-window interaction
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
     # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
@@ -439,8 +505,8 @@ def handle_linear_attn_backend(server_args: Any):
         if cfg.mamba_ssm_dtype is None:
             logger.info(
                 "--enable-linear-replayssm-spec: setting --mamba-ssm-dtype "
-                "float32 (the closed-loop exact fold keeps the SSM checkpoint "
-                "bit-identical to the recurrent baseline)."
+                "float32 (cached replay uses compensated checkpoint "
+                "projection and materialization)."
             )
             declare_resolution(
                 server_args,
@@ -450,10 +516,8 @@ def handle_linear_attn_backend(server_args: Any):
         elif cfg.mamba_ssm_dtype != "float32":
             logger.warning(
                 "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
-                "closed-loop fold re-quantizes the committed state each "
-                "commit/flush (fp32 keeps it bit-exact to the fp32 recurrent "
-                "baseline), so it may drift over long sequences. Validate "
-                "accuracy for your model.",
+                "compact checkpoint is materialized after each accepted "
+                "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
             )
 
@@ -566,6 +630,7 @@ def handle_deterministic_inference(server_args: Any):
                     "PixtralForConditionalGeneration",
                     "GlmMoeDsaForCausalLM",
                     "Glm4MoeLiteForCausalLM",
+                    "Glm5NextForConditionalGeneration",
                 ]
             except Exception:
                 pass

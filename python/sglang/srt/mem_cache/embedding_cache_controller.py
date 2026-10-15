@@ -18,6 +18,7 @@ except ImportError:
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.mem_cache.embedding_store import EmbeddingStore
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -344,20 +345,18 @@ class EmbeddingInsertOperation:
 class EmbeddingCacheController:
     def __init__(
         self,
-        tp_rank,
-        tp_size,
         embedding_store: EmbeddingStore,
         max_pool_size_gb=4.0,
         hidden_dims: dict = None,
-        tp_group=None,
         all_rank_get=False,
         enable_eviction: bool = True,
         max_eviction_batch: int = 100,
         dtype: torch.dtype = torch.float32,
     ):
-        self.tp_world_size = tp_size
-        self.tp_group = tp_group
-        self.tp_rank = tp_rank
+        parallel = get_parallel()
+        self.tp_world_size = parallel.tp_size
+        self.tp_group = parallel.tp_group.cpu_group
+        self.tp_rank = parallel.tp_rank
         self.all_rank_get = all_rank_get
         self.hidden_dims = hidden_dims or {}
         # Pool dtype must match the model's embedding dtype so that pool views,
@@ -979,13 +978,32 @@ class EmbeddingCacheController:
         handles: List[Tuple["EmbeddingCacheEntry", "AsyncCopyHandle"]],
     ):
         """Wait for async D2H copies and mark entries READY."""
+        completed = []
+        errors = []
         for entry, handle in handles:
-            handle.wait()
+            try:
+                handle.wait()
+                completed.append(True)
+            except BaseException as error:
+                completed.append(False)
+                errors.append(error)
+
         with self.lock:
-            for entry, handle in handles:
+            for (entry, _), success in zip(handles, completed, strict=True):
                 current = self.entries.get(entry.hash)
                 if current is entry and current.state == EntryState.FILLING:
-                    self._mark_ready(current)
+                    if success:
+                        self._mark_ready(current)
+                    else:
+                        self._evict_entry(entry.hash)
+
+        if errors:
+            first_error = errors[0]
+            if len(errors) > 1:
+                first_error.add_note(
+                    f"{len(errors) - 1} additional embedding copy operation(s) failed"
+                )
+            raise first_error
 
     def _copy_tensor_to_pool(
         self, tensor: torch.Tensor, entry: EmbeddingCacheEntry, pool: EmbeddingPool

@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 )
 
 # tp=1 pp=2 -- two GPUs.
-register_cuda_ci(est_time=220, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=221, stage="base-b", runner_config="2-gpu-large")
 
 
 @unittest.skipIf(

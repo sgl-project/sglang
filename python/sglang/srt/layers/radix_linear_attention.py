@@ -93,7 +93,7 @@ class RadixLinearAttention(nn.Module):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            if is_in_breakable_cuda_graph():
+            if is_in_breakable_cuda_graph() and not _linear_extend_in_graph():
                 bcg_unified_linear_attention_with_output(
                     mixed_qkv,
                     a,
@@ -117,7 +117,7 @@ class RadixLinearAttention(nn.Module):
             is_extend and not forward_batch.forward_mode.is_target_verify()
         )
         real_num_tokens = (
-            getattr(forward_batch, "num_token_non_padded_cpu", None)
+            getattr(forward_batch, "global_num_token_non_padded_cpu", None)
             if should_trim_padded_extend
             else None
         )
@@ -148,6 +148,20 @@ class RadixLinearAttention(nn.Module):
         )
 
 
+def _linear_extend_in_graph() -> bool:
+    """Whether the backend runs this breakable prefill capture's linear extend
+    on static tables inside the graph (no eager break at the layer)."""
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    backend = get_attn_backend()
+    return (
+        isinstance(backend, HybridLinearAttnBackend)
+        and backend.linear_extend_in_graph()
+    )
+
+
 def _linear_attention_with_output_impl(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -157,7 +171,14 @@ def _linear_attention_with_output_impl(
     forward_batch: ForwardBatch,
 ) -> None:
     """Run linear attention on the real prefix and initialize physical padding."""
-    real_num_tokens = min(forward_batch.num_token_non_padded_cpu, mixed_qkv.shape[0])
+    real_num_tokens = min(
+        forward_batch.global_num_token_non_padded_cpu, mixed_qkv.shape[0]
+    )
+    if real_num_tokens == 0:
+        # A fully masked batch (an idle DP rank) needs no attention or state
+        # update, and GDN prefill kernels reject an empty varlen batch.
+        output.zero_()
+        return
 
     original_out_cache_loc = forward_batch.out_cache_loc
     # Keep the original ForwardBatch object and only narrow cache locations for
@@ -169,8 +190,8 @@ def _linear_attention_with_output_impl(
             layer=attention_layer,
             forward_batch=forward_batch,
             mixed_qkv=mixed_qkv[:real_num_tokens],
-            a=a[:real_num_tokens],
-            b=b[:real_num_tokens],
+            a=a.narrow(0 if a.ndim == 2 else 1, 0, real_num_tokens),
+            b=b.narrow(0 if b.ndim == 2 else 1, 0, real_num_tokens),
             linear_attn_output=logical_output,
         )
     finally:
@@ -227,6 +248,16 @@ def unified_linear_attention_with_output(
     )
 
 
-bcg_unified_linear_attention_with_output = eager_on_graph(True)(
-    unified_linear_attention_with_output
-)
+def _linear_attention_capture_stub(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    output.zero_()
+
+
+bcg_unified_linear_attention_with_output = eager_on_graph(
+    True, capture_stub=_linear_attention_capture_stub
+)(unified_linear_attention_with_output)

@@ -8,7 +8,7 @@ from sglang.srt.parser.reasoning_parser import K2V3Detector, ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestK2V3ReasoningParser(CustomTestCase):
