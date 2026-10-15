@@ -242,6 +242,43 @@ class TestKVCRStorage(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "startup_timeout_seconds"):
                     KVCRStore(self.config, self.pool)
 
+    def test_logical_anchor_queries_intersect_physical_all_page_pools(self):
+        """A DSv4 logical anchor proves nothing without its physical sidecars."""
+        backend = KVCRStore(self.config, SimpleNamespace(kv_buffer=None))
+        for name in (
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+        ):
+            backend.register_mem_host_pool_v2(_HostPool(), name)
+        backend._namespace = storage_namespace(self.config, backend._layouts)
+        transport = backend._runner = _CopyTransport(backend._layouts)
+        self.assertEqual(backend.batch_exists(self.keys), 0)
+
+        for name, count in (
+            (PoolName.DEEPSEEK_V4_C4, 4),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER, 2),
+        ):
+            for key in self.keys[:count]:
+                transport.storage[block_key(key, backend._namespace, str(name))] = {}
+        # Missing SWA/state pages do not constrain the bare all-pages probe.
+        result = backend.batch_exists_v2(self.keys)
+        self.assertEqual(result.kv_hit_pages, 2)
+        self.assertEqual(result.restorable_prefix_pages, [1, 2])
+
+    def test_bare_logical_anchor_without_all_page_evidence_is_a_miss(self):
+        """Empty or trailing-only registrations cannot prove a full prefix."""
+        for pools in ((), (PoolName.SWA, PoolName.MAMBA)):
+            with self.subTest(pools=pools):
+                backend = KVCRStore(self.config, SimpleNamespace(kv_buffer=None))
+                for name in pools:
+                    backend.register_mem_host_pool_v2(_HostPool(), name)
+                backend._namespace = storage_namespace(self.config, backend._layouts)
+                backend._runner = _CopyTransport(backend._layouts)
+                self.assertEqual(backend.batch_exists(self.keys), 0)
+                self.assertEqual(backend.batch_exists([]), 0)
+
     def test_constructor_failure_is_fatal_and_retains_unsafe_mappings(self):
         """A startup error cannot leave wait_complete behind a dead IO thread.
 

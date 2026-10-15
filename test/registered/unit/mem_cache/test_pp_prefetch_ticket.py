@@ -6,6 +6,7 @@ import unittest
 from array import array
 from contextlib import nullcontext
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -36,6 +37,26 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestPPPrefetchTicket(CustomTestCase):
+    def test_decode_storage_query_delivers_hint_to_controller(self):
+        hint = {"protocol_version": "0.1", "message_id": "decode-query"}
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True, is_eagle=False)
+        cache.page_size = cache.prefetch_threshold = 4
+
+        def query(operation):
+            # Observable hit length changes only if the request envelope
+            # survives UnifiedRadixCache -> PrefetchOperation -> controller.
+            return [], 8 if operation.kv_hints == hint else 0
+
+        cache.cache_controller = SimpleNamespace(
+            prefetch_rate_limited=lambda: False, _storage_hit_query=query
+        )
+        cache._all_reduce_attn_groups = Mock()
+        self.assertEqual(
+            cache.query_storage_hit_length(0, list(range(8)), kv_hints=hint), 8
+        )
+        self.assertEqual(cache.query_storage_hit_length(0, list(range(8))), 0)
+
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4

@@ -820,6 +820,10 @@ class KVCRStore(HiCacheStorage):
                 for name in self._layouts
                 if name not in _TRAILING_POOLS
             ]
+        if not required or not keys:
+            # An empty intersection is not evidence of stored data. In
+            # particular, trailing-only layouts cannot prove a bare prefix.
+            return PoolTransferResult(0, {}, [])
         with self._lock:
             self._start()
             identities = [
