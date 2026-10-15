@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use tracing::debug;
 
-use super::{PeerSnapshot, SnapshotOutcome, SNAPSHOT_FORMAT};
+use super::{PeerSnapshot, SnapshotOutcome, LORA_SNAPSHOT_FORMAT, SNAPSHOT_FORMAT};
 use crate::state::kv_events::tree::{
     HashTree, KvWorkerId, RestoreError, ShapeViolation, SnapshotNode,
 };
@@ -45,6 +45,7 @@ pub enum VetError {
         local: u32,
     },
     ProducerCold,
+    InvalidLoraMapping,
     /// The snapshot was well formed, but nothing in it survives vetting for this
     /// replica — every carrier was a worker we do not know, or held the node
     /// only on tiers this build does not rank. Unlike `ProducerCold`, the peer
@@ -92,6 +93,7 @@ impl std::fmt::Display for VetError {
                 "none of the peer's {wire_nodes} nodes survive vetting \
                  ({dropped_workers} of its workers are unknown here)",
             ),
+            Self::InvalidLoraMapping => write!(f, "invalid LoRA external-ID mapping in peer snapshot"),
             Self::ProducerCold => write!(
                 f,
                 "peer is not a usable source (still bootstrapping, or settled with an empty tree)",
@@ -133,6 +135,7 @@ pub struct VettedSnapshot {
     /// during a rolling worker change; logged, and worth watching if
     /// persistently large.
     dropped_workers: usize,
+    lora_blocks: Vec<(KvWorkerId, Vec<sgl_kv_indexer::lora::LoraBlock>)>,
 }
 
 impl VettedSnapshot {
@@ -171,7 +174,9 @@ impl VettedSnapshot {
     /// precondition the restore path trusts. Call it from the tree's single
     /// writer, like every tree mutation.
     pub fn graft_into(&self, tree: &HashTree) -> Result<usize, RestoreError> {
-        tree.restore_snapshot(&self.worker_table, &self.nodes)
+        let restored = tree.restore_snapshot(&self.worker_table, &self.nodes)?;
+        tree.restore_lora(&self.lora_blocks);
+        Ok(restored)
     }
 
     /// Build one directly, for tests that need a specific shape without a
@@ -188,6 +193,7 @@ impl VettedSnapshot {
             nodes,
             cursors,
             dropped_workers,
+            lora_blocks: Vec::new(),
         }
     }
 
@@ -207,6 +213,7 @@ impl VettedSnapshot {
             node.retain_carriers(|w, _| is_allowed(w).then_some(w));
         }
         self.cursors.retain(|(w, _)| keep.contains(w));
+        self.lora_blocks.retain(|(w, _)| keep.contains(w));
         let pruned = self.prune_carrier_less();
         if pruned > 0 {
             debug!(
@@ -300,11 +307,14 @@ impl VettedSnapshot {
         live: &HashSet<KvWorkerId>,
         local_block_size: Option<u32>,
     ) -> Result<Self, VetError> {
-        if snap.format != SNAPSHOT_FORMAT {
+        if snap.format != SNAPSHOT_FORMAT && snap.format != LORA_SNAPSHOT_FORMAT {
             return Err(VetError::UnknownFormat {
                 got: snap.format,
                 want: SNAPSHOT_FORMAT,
             });
+        }
+        if (snap.format == LORA_SNAPSHOT_FORMAT) == snap.lora_blocks.is_empty() {
+            return Err(VetError::InvalidLoraMapping);
         }
         // Refuse a producer that reports not-ready, or whose tree is empty
         // whatever it reports.
@@ -391,12 +401,67 @@ impl VettedSnapshot {
             cursors.push((worker_table[slot as usize].clone(), seq));
         }
 
+        let mut carrier_tiers = std::collections::HashMap::<(u32, i64), u8>::new();
+        if !snap.lora_blocks.is_empty() {
+            for node in &nodes {
+                for (k, &worker) in node.workers.iter().enumerate() {
+                    *carrier_tiers.entry((worker, node.block_hash)).or_default() |=
+                        node.carrier_tiers(k).bits();
+                }
+            }
+        }
+        let mut lora_blocks = Vec::new();
+        let mut mapped_workers = HashSet::new();
+        for (idx, blocks) in snap.lora_blocks {
+            let Some(slot) = resolve(idx) else { continue };
+            if !mapped_workers.insert(slot) {
+                return Err(VetError::InvalidLoraMapping);
+            }
+            let ids: std::collections::HashMap<_, _> =
+                blocks.iter().map(|b| (b.external, b)).collect();
+            if ids.len() != blocks.len() {
+                return Err(VetError::InvalidLoraMapping);
+            }
+            let mut checked = HashSet::new();
+            for block in &blocks {
+                if block.name.is_empty()
+                    || block.lookup != sgl_kv_indexer::lora::lookup_hash(&block.digest, &block.name)
+                    || block.tiers & !15 != 0
+                    || carrier_tiers
+                        .get(&(slot, block.lookup))
+                        .copied()
+                        .unwrap_or(0)
+                        & block.tiers
+                        != block.tiers
+                {
+                    return Err(VetError::InvalidLoraMapping);
+                }
+                let mut parent = Some(block.external);
+                let mut path = HashSet::new();
+                while let Some(id) = parent {
+                    if checked.contains(&id) {
+                        break;
+                    }
+                    let Some(p) = ids.get(&id) else {
+                        return Err(VetError::InvalidLoraMapping);
+                    };
+                    if !path.insert(id) || p.name != block.name || p.salt != block.salt {
+                        return Err(VetError::InvalidLoraMapping);
+                    }
+                    parent = p.parent;
+                }
+                checked.extend(path);
+            }
+            lora_blocks.push((worker_table[slot as usize].clone(), blocks));
+        }
+
         let wire_nodes = nodes.len();
         let mut vetted = Self {
             worker_table,
             nodes,
             cursors,
             dropped_workers,
+            lora_blocks,
         };
         let pruned = vetted.prune_carrier_less();
         if pruned > 0 {
@@ -437,6 +502,8 @@ mod tests {
 
     fn snapshot(workers: Vec<WireWorker>, nodes: Vec<SnapshotNode>) -> PeerSnapshot {
         PeerSnapshot {
+            lora_blocks: Vec::new(),
+
             format: SNAPSHOT_FORMAT,
             block_size: 64,
             is_bigram: false,
@@ -457,12 +524,12 @@ mod tests {
     #[test]
     fn vet_rejects_unknown_format() {
         let mut snap = snapshot(vec![], vec![]);
-        snap.format = SNAPSHOT_FORMAT + 1;
+        snap.format = LORA_SNAPSHOT_FORMAT + 1;
         let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64)).unwrap_err();
         assert_eq!(
             err,
             VetError::UnknownFormat {
-                got: SNAPSHOT_FORMAT + 1,
+                got: LORA_SNAPSHOT_FORMAT + 1,
                 want: SNAPSHOT_FORMAT
             }
         );
@@ -713,6 +780,7 @@ mod tests {
     #[test]
     fn prune_remaps_parent_indices() {
         let mut vetted = VettedSnapshot {
+            lora_blocks: Vec::new(),
             worker_table: vec![KvWorkerId::new("http://a".into(), 0)],
             nodes: vec![
                 node(None, 10, vec![]),     // 0: dead leaf, pruned
