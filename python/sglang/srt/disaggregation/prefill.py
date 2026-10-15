@@ -1181,7 +1181,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if sampling_mask_finish_reason is not None:
                     req.request_finish(sampling_mask_finish_reason)
                     req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": sampling_mask_finish_reason.message}
+                        abort_info={
+                            "reason": sampling_mask_finish_reason.message,
+                            "status_code": sampling_mask_finish_reason.status_code,
+                        }
                     )
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
@@ -1485,7 +1488,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_message,
+                "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1526,7 +1534,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_message,
+                "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.release_prefill_sender(req, abort_sender=False)
         self.request_retirer.release(req, checkpoint=False)

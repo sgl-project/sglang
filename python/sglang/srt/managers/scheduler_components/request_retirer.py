@@ -78,7 +78,9 @@ class RequestRetirer:
         retry and a retracted request's host KV backup."""
         # An already set `finished_reason` is what the client receives.
         reason = req.finished_reason or req.to_finish
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={"reason": reason.message, "status_code": reason.status_code}
+        )
         req.update_finish_state()
         self.release(req, checkpoint=False)
         # Like `find_active_slot`, the detached request also leaves its session.

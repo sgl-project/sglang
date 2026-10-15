@@ -3880,16 +3880,19 @@ class Scheduler(
         return True
 
     def _abort_unavailable(self, req: Req, *, message: str) -> None:
+        status_code = HTTPStatus.SERVICE_UNAVAILABLE
         self.request_retirer.abort(
             req,
-            reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
+            reason=FINISH_ABORT(message, status_code),
             finished_reason={
                 "type": "abort",
-                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "status_code": status_code,
                 "message": message,
             },
         )
-        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={"reason": message, "status_code": status_code}
+        )
 
     def _abort_uocr_doc_windows(
         self,
@@ -4155,7 +4158,9 @@ class Scheduler(
 
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={"reason": reason.message, "status_code": reason.status_code}
+        )
         req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.release_prefill_sender(req, abort_sender=True)
