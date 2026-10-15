@@ -86,6 +86,7 @@ def _assert_nonneg_and_invalidate(
 
 # Decode relay recorded by the scheduler: (future_indices, draft_input) of the last stash.
 _SKIP_SAME_BATCH_REGATHER = envs.SGLANG_Q35MF_ARRIVE_SKIP_REGATHER.get()
+_SEQ_LENS_INDEX_SELECT = envs.SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT.get()
 _last_relay: Optional[tuple] = None
 
 
@@ -597,7 +598,10 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        if _SEQ_LENS_INDEX_SELECT:
+            batch.seq_lens = torch.index_select(self.new_seq_lens_buf, 0, fi)
+        else:
+            batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);

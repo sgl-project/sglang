@@ -95,11 +95,35 @@ struct SmallFieldCopy {
   static int64_t run(tvm::ffi::TensorView anchor, tvm::ffi::Array<int64_t> desc) {
     using namespace host;
 
+    const int64_t num_entries = static_cast<int64_t>(desc.size());
+    CHECK_HOST(num_entries <= kSmallFieldCopyMaxFields * kSmallFieldCopyEntries)
+        << "too many fields " << num_entries / kSmallFieldCopyEntries;
+    int64_t entries[kSmallFieldCopyMaxFields * kSmallFieldCopyEntries];
+    for (int64_t i = 0; i < num_entries; ++i) {
+      entries[i] = desc[i];
+    }
+    return launch(anchor, entries, num_entries);
+  }
+
+  /// \brief Same as `run`, with the descriptor in a host int64 tensor of 7 entries per field.
+  static int64_t run_host_desc(tvm::ffi::TensorView anchor, tvm::ffi::TensorView desc) {
+    using namespace host;
+
+    CHECK_HOST(
+        desc.device().device_type == kDLCPU && is_type<int64_t>(desc.dtype()) && desc.ndim() == 1 &&
+        (desc.size(0) <= 1 || desc.stride(0) == 1))
+        << "descriptor must be a contiguous host int64 vector";
+    return launch(anchor, static_cast<const int64_t*>(desc.data_ptr()), desc.size(0));
+  }
+
+ private:
+  static int64_t launch(tvm::ffi::TensorView anchor, const int64_t* desc, int64_t num_entries) {
+    using namespace host;
+
     SymbolicDevice device_;
     device_.set_options<kDLCUDA, kDLROCM>();
     device_.verify(anchor.device());
 
-    const int64_t num_entries = static_cast<int64_t>(desc.size());
     CHECK_HOST(num_entries % kSmallFieldCopyEntries == 0) << "bad descriptor length " << num_entries;
     const int64_t num_described = num_entries / kSmallFieldCopyEntries;
     CHECK_HOST(num_described <= kSmallFieldCopyMaxFields) << "too many fields " << num_described;
@@ -153,8 +177,9 @@ struct SmallFieldCopy {
     // Every field gets the same block count; the grid-stride loop covers larger fields, so a
     // small cap keeps the idle blocks of the small fields cheap. Tunable, not measured.
     const int64_t blocks = div_ceil(largest, kSmallFieldCopyBlock);
-    const dim3 grid(static_cast<uint32_t>(blocks < kSmallFieldCopyMaxBlocks ? blocks : kSmallFieldCopyMaxBlocks),
-                    static_cast<uint32_t>(num_fields));
+    const dim3 grid(
+        static_cast<uint32_t>(blocks < kSmallFieldCopyMaxBlocks ? blocks : kSmallFieldCopyMaxBlocks),
+        static_cast<uint32_t>(num_fields));
     LaunchKernel(grid, static_cast<uint32_t>(kSmallFieldCopyBlock), device_.unwrap())(small_field_copy_kernel, params);
     return 0;
   }

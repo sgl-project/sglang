@@ -4,7 +4,10 @@ import unittest
 import torch
 
 from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
-from sglang.kernels.ops.memory.small_field_copy import small_field_copy
+from sglang.kernels.ops.memory.small_field_copy import (
+    SmallFieldCopyPlan,
+    small_field_copy,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -172,7 +175,9 @@ class TestSmallFieldCopy(CustomTestCase):
                     refs.append(torch.zeros_like(dsts[-1]))
                 for chunk in range(0, len(dsts), 5):
                     self.assertTrue(
-                        small_field_copy(dsts[chunk : chunk + 5], srcs[chunk : chunk + 5])
+                        small_field_copy(
+                            dsts[chunk : chunk + 5], srcs[chunk : chunk + 5]
+                        )
                     )
                     self.assertTrue(
                         try_small_copy(refs[chunk : chunk + 5], srcs[chunk : chunk + 5])
@@ -219,6 +224,31 @@ class TestSmallFieldCopy(CustomTestCase):
         a = torch.empty(2)
         self.assertFalse(small_field_copy([a, a], [a, a]))
         self.assertTrue(small_field_copy([x, y], [x, y]))
+
+    def test_plan_refreshes_sources_and_revalidates(self):
+        """A plan copies from each call's sources, re-validates a source whose layout
+        changed, and still refuses overlaps and foreign devices without writing."""
+        plan = SmallFieldCopyPlan()
+        d0 = torch.empty(8, device="cuda", dtype=torch.int64)
+        d1 = torch.empty((2, 4), device="cuda", dtype=torch.int32)
+        for step in range(4):
+            s0 = torch.randint(
+                -(2**31), 2**31 - 1, (8,), device="cuda", dtype=torch.int32
+            )
+            s1 = torch.randint(0, 100, (2, 4), device="cuda", dtype=torch.int32)
+            if step == 2:
+                s1 = torch.randint(0, 100, (4, 4), device="cuda", dtype=torch.int32)[
+                    ::2
+                ]
+            self.assertTrue(plan([d0, d1], [s0, s1]))
+            self.assertTrue(torch.equal(d0, s0.long()))
+            self.assertTrue(torch.equal(d1, s1))
+        before0, before1 = d0.clone(), d1.clone()
+        self.assertFalse(plan([d0, d1], [d1.view(-1), s1]))
+        self.assertFalse(plan([d0, d1], [s0.cpu(), s1]))
+        self.assertTrue(torch.equal(d0, before0) and torch.equal(d1, before1))
+        self.assertTrue(plan([d0, d1], [s0, s1]))
+        self.assertTrue(torch.equal(d0, s0.long()))
 
 
 if __name__ == "__main__":

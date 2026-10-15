@@ -1573,6 +1573,10 @@ class Envs:
     SGLANG_Q35MF_ARRIVE_DECODE_PREP = EnvBool(False)
     # Draft cache locations and the draft-extend layout come from one JIT launch each.
     SGLANG_Q35MF_ARRIVE_DRAFT_PREP = EnvBool(False)
+    # Decode seq_lens are gathered with index_select instead of advanced indexing.
+    SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT = EnvBool(False)
+    # The fused draft input copies (DRAFT_COPY) reuse one descriptor per input layout.
+    SGLANG_Q35MF_ARRIVE_COPY_PLAN = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

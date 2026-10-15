@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.kernels.ops.memory.small_field_copy import (
+    SmallFieldCopyPlan,
+    small_field_copy,
+)
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -21,7 +25,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.kernels.ops.memory.small_field_copy import small_field_copy
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
@@ -137,6 +140,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.attn_backend = self.draft_extend_attn_backend
         self._fused_input_copy = envs.SGLANG_Q35MF_ARRIVE_DRAFT_COPY.get()
         self._input_views_cache = {}
+        self._copy_plans = {} if envs.SGLANG_Q35MF_ARRIVE_COPY_PLAN.get() else None
 
         # Disable parent paths that don't apply.
         self.compile_bs = []
@@ -573,6 +577,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.positions,
             forward_batch.req_pool_indices,
         ]
+        layout = 0
         if views[5] is not None:
             if (
                 bs * self.captured_req_width != num_tokens
@@ -582,9 +587,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             if forward_batch.mrope_positions is not None:
                 dsts.append(views[5])
                 srcs.append(forward_batch.mrope_positions)
+                layout |= 1
         if forward_batch.extend_seq_lens is not None:
             dsts.append(views[6])
             srcs.append(forward_batch.extend_seq_lens)
+            layout |= 2
         else:
             views[6].fill_(self.captured_req_width)
         if spec_info.num_correct_drafts is not None:
@@ -592,6 +599,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             srcs.append(spec_info.num_correct_drafts)
             dsts.append(views[8])
             srcs.append(spec_info.num_accept_tokens)
+            layout |= 4
         dsts.append(views[9])
         srcs.append(select_index)
         if (
@@ -601,7 +609,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             dsts.append(views[10])
             srcs.append(forward_batch.mamba_track_indices)
+            layout |= 8
         else:
+            num_fields = len(dsts)
             refresh_track_indices(
                 buffers.mamba_track_indices,
                 forward_batch.mamba_track_indices,
@@ -610,6 +620,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 copy_dsts=dsts,
                 copy_srcs=srcs,
             )
+            if len(dsts) > num_fields:
+                layout |= 16
         if (
             views[11] is not None
             and spec_info.hidden_states is not None
@@ -617,7 +629,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             dsts.append(views[11])
             srcs.append(spec_info.hidden_states)
-        return small_field_copy(dsts, srcs)
+            layout |= 32
+        if self._copy_plans is None:
+            return small_field_copy(dsts, srcs)
+        return self._copy_plan((raw_bs, num_tokens, bs, layout))(dsts, srcs)
+
+    def _copy_plan(self, key) -> SmallFieldCopyPlan:
+        # A key fixes every destination view, as long as the static buffers stay the same.
+        entry = self._copy_plans.get(key)
+        if entry is None or entry[0] is not self.buffers:
+            entry = self._copy_plans[key] = (self.buffers, SmallFieldCopyPlan())
+        return entry[1]
 
     def execute(self, forward_batch: ForwardBatch, select_index: torch.Tensor):
         assert forward_batch.out_cache_loc is not None

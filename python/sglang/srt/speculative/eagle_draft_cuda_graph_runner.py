@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.kernels.ops.memory.small_field_copy import (
+    SmallFieldCopyPlan,
+    small_field_copy,
+)
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -19,7 +23,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.kernels.ops.memory.small_field_copy import small_field_copy
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
@@ -136,6 +139,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
         self._fused_input_copy = envs.SGLANG_Q35MF_ARRIVE_DRAFT_COPY.get()
         self._input_views_cache = {}
+        self._copy_plans = {} if envs.SGLANG_Q35MF_ARRIVE_COPY_PLAN.get() else None
 
         # Patch_model in parent's capture() needs an attn_backend reference.
         # EAGLE doesn't use it (capture_one_shape calls draft_forward instead),
@@ -598,25 +602,39 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info.topk_index,
             forward_batch.req_pool_indices,
         ]
+        layout = 0
         if views[6] is not None:
             if bs != raw_bs or forward_batch.mrope_positions is None:
                 buffers.mrope_positions.zero_()
             if forward_batch.mrope_positions is not None:
                 dsts.append(views[6])
                 srcs.append(forward_batch.mrope_positions)
+                layout |= 1
         if buffers.rids_int is not None and forward_batch.rids_int is not None:
             dsts.append(buffers.rids_int[:raw_bs])
             srcs.append(forward_batch.rids_int)
+            layout |= 2
         if (
             buffers.bootstrap_room_ids_int is not None
             and forward_batch.bootstrap_room_ids_int is not None
         ):
             dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             srcs.append(forward_batch.bootstrap_room_ids_int)
+            layout |= 4
         if views[7] is not None and spec_info.hidden_states is not None:
             dsts.append(views[7])
             srcs.append(spec_info.hidden_states)
-        return small_field_copy(dsts, srcs)
+            layout |= 8
+        if self._copy_plans is None:
+            return small_field_copy(dsts, srcs)
+        return self._copy_plan((raw_bs, layout))(dsts, srcs)
+
+    def _copy_plan(self, key) -> SmallFieldCopyPlan:
+        # A key fixes every destination view, as long as the static buffers stay the same.
+        entry = self._copy_plans.get(key)
+        if entry is None or entry[0] is not self.buffers:
+            entry = self._copy_plans[key] = (self.buffers, SmallFieldCopyPlan())
+        return entry[1]
 
     def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
