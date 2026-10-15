@@ -60,8 +60,8 @@ class AscendTransferEngine(MooncakeTransferEngine):
         from sglang.srt.runtime_context import get_parallel
 
         transfer_protocol = self._get_transfer_protocol()
-        if transfer_protocol == "device_rdma":
-            # with device RDMA for PD transfer: initialize hccl in advance
+        if transfer_protocol in ("device_rdma", "device_urma"):
+            # with device RDMA/URMA for PD transfer: initialize hccl in advance
             # through all_gather to avoid conflicts with rdma initialization.
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [

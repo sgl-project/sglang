@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as KDA_CHUNK_SIZE
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
@@ -452,7 +453,11 @@ class MambaAttnBackendBase(AttentionBackend):
             return self._init_track_ssm_indices_from_cpu(
                 mamba_cache_indices, forward_batch
             )
-        state_chunk_size = self.mamba_chunk_size
+        state_chunk_size = (
+            KDA_CHUNK_SIZE
+            if getattr(self.req_to_token_pool.mamba_pool, "is_kda", False)
+            else self.mamba_chunk_size
+        )
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -534,12 +539,17 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _init_track_ssm_indices_from_cpu(self, mamba_cache_indices, forward_batch):
         is_mamba2 = isinstance(self, Mamba2AttnBackend)
+        state_chunk_size = (
+            KDA_CHUNK_SIZE
+            if getattr(self.req_to_token_pool.mamba_pool, "is_kda", False)
+            else self.mamba_chunk_size
+        )
         plan = build_prefill_track_plan(
             forward_batch.mamba_prefill_track_mask_cpu,
             forward_batch.mamba_track_seqlens_cpu,
             forward_batch.extend_seq_lens_cpu,
             forward_batch.extend_prefix_lens_cpu,
-            self.mamba_chunk_size,
+            state_chunk_size,
             mamba2=is_mamba2,
         )
         to_device = self._track_indices_to_device

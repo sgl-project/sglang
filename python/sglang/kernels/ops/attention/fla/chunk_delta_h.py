@@ -185,26 +185,32 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             )
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
-        if TRACK_STATE and i_t == i_track:
-            p_t1 = tl.make_block_ptr(
-                p_track_base, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
-            )
-            tl.store(p_t1, b_h1, boundary_check=(0, 1))
-            if K > 64:
-                p_t2 = tl.make_block_ptr(
-                    p_track_base, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+        # Nested ifs instead of `if TRACK_STATE and i_t == i_track:`:
+        # triton-ascend does not short-circuit `constexpr and runtime`, so the
+        # combined form compiles the body even when TRACK_STATE is False and
+        # crashes on make_block_ptr(p_track_base=None). A pure-constexpr outer
+        # if is pruned reliably on every Triton backend.
+        if TRACK_STATE:
+            if i_t == i_track:
+                p_t1 = tl.make_block_ptr(
+                    p_track_base, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
                 )
-                tl.store(p_t2, b_h2, boundary_check=(0, 1))
-            if K > 128:
-                p_t3 = tl.make_block_ptr(
-                    p_track_base, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
-                )
-                tl.store(p_t3, b_h3, boundary_check=(0, 1))
-            if K > 192:
-                p_t4 = tl.make_block_ptr(
-                    p_track_base, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
-                )
-                tl.store(p_t4, b_h4, boundary_check=(0, 1))
+                tl.store(p_t1, b_h1, boundary_check=(0, 1))
+                if K > 64:
+                    p_t2 = tl.make_block_ptr(
+                        p_track_base, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                    )
+                    tl.store(p_t2, b_h2, boundary_check=(0, 1))
+                if K > 128:
+                    p_t3 = tl.make_block_ptr(
+                        p_track_base, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                    )
+                    tl.store(p_t3, b_h3, boundary_check=(0, 1))
+                if K > 192:
+                    p_t4 = tl.make_block_ptr(
+                        p_track_base, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                    )
+                    tl.store(p_t4, b_h4, boundary_check=(0, 1))
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)

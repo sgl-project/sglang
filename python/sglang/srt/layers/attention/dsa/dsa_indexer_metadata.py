@@ -70,6 +70,14 @@ class BaseIndexerMetadata(ABC):
         Return: batch idx for each token.
         """
 
+    def get_pooled_cache_seqlens(self) -> Optional[torch.Tensor]:
+        """Return precomputed pool-granularity seqlens, or None if not available."""
+        return None
+
+    def get_pooled_page_table(self) -> Optional[torch.Tensor]:
+        """Return precomputed pool-granularity page table, or None if not available."""
+        return None
+
     @abstractmethod
     def topk_transform(
         self,

@@ -10,6 +10,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import kpool_plan
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -141,6 +142,72 @@ class TestKPoolPlannerCpuMirror(unittest.TestCase):
         self.assertEqual(plan.ragged_paged_page_table_row_index.tolist(), [9, 2, 2])
         self.assertEqual(plan.ragged_paged_page_table_row_index.dtype, torch.int32)
         self.assertIs(plan.ragged_paged_page_table, req_to_token)
+
+
+class TestNPUKPoolWritePlanAdapter(CustomTestCase):
+    def test_reused_plan_kernel_keeps_npu_physical_page_ids(self):
+        """NPU page IDs must survive the generic kernel's pooled-page division."""
+        plan = kpool_plan._alloc_kpool_write_plan_buffers(
+            max_bs=2,
+            num_draft_tokens=3,
+            kpool=4,
+            device=torch.device("cpu"),
+            is_verify=True,
+        )
+        metadata = SimpleNamespace(kpool_write_plan=plan)
+        mode = SimpleNamespace(
+            is_target_verify=lambda: True,
+            is_decode_or_idle=lambda: False,
+            is_draft_extend_v2=lambda: False,
+        )
+
+        def run_generic_plan(
+            write_start,
+            req_pool_indices,
+            real_page_table,
+            *,
+            req_out,
+            write_start_out,
+            tail_logical_start_out,
+            write_loc_out,
+            pool_seqlens_per_q_out,
+            seqlens_per_q_out,
+            kpool,
+            num_draft_tokens,
+            index_page_size,
+        ):
+            for batch in range(write_start.shape[0]):
+                start = int(write_start[batch])
+                pool_id = start // kpool
+                token_page_row = (pool_id // index_page_size) * kpool
+                page = int(real_page_table[batch * num_draft_tokens, token_page_row])
+                write_loc_out[batch, 0] = (
+                    page // kpool * index_page_size + pool_id % index_page_size
+                )
+
+        with (
+            patch.object(kpool_plan, "is_npu", return_value=True),
+            patch.object(
+                kpool_plan,
+                "update_kpool_write_plan_cuda_graph",
+                side_effect=run_generic_plan,
+            ),
+        ):
+            kpool_plan.update_kpool_write_plan_npu(
+                metadata,
+                write_start=torch.tensor([5, 517], dtype=torch.int32),
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                real_page_table=torch.tensor(
+                    [[1, 0, 0, 0, 0], [2, 0, 0, 0, 7]], dtype=torch.int32
+                ),
+                pool_size=4,
+                real_page_size=128,
+                num_draft_tokens=3,
+                forward_mode=mode,
+                slots_per_page=128,
+            )
+
+        self.assertEqual(plan.write_loc[:, 0].tolist(), [129, 897])
 
 
 if __name__ == "__main__":

@@ -368,7 +368,6 @@ def npu_w8a8_mxfp8_linear(
         output_dtype=original_dtype,
         group_sizes=(1, 1, MXFP8_BLOCK_SIZE),
     )
-
     return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
 
 

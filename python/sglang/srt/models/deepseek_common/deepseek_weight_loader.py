@@ -572,6 +572,14 @@ class DeepseekV2WeightLoaderMixin:
                         layer_id = int(name.split(".")[2])
                         if self.model.start_layer <= layer_id < self.model.end_layer:
                             layer_ids.add(layer_id)
+                if not layer_ids:
+                    logger.warning(
+                        "post_load_weights: no kv_b_proj weights matched layers "
+                        "[%d, %d) among %d loaded names; w_kc/w_vc stay unset",
+                        self.model.start_layer,
+                        self.model.end_layer,
+                        len(weight_names),
+                    )
 
         for layer_id in layer_ids:
             self_attn = (

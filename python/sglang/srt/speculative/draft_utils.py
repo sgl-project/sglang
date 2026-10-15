@@ -1,5 +1,6 @@
 from typing import Optional
 
+from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.common import (
@@ -412,15 +413,20 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_decode_backend(self):
-        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-            AscendAttnMultiStepDraftBackend,
-        )
+        # DSA draft decode must generate indexer/KPool metadata for each step
+        # and cannot use the regular backend.
+        if is_deepseek_dsa(self.draft_model_runner.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+                AscendDSAAttnMultiStepDraftBackend as backend_cls,
+            )
+        else:
+            from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+                AscendAttnMultiStepDraftBackend as backend_cls,
+            )
 
         return (
             "ascend",
-            AscendAttnMultiStepDraftBackend(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
-            ),
+            backend_cls(self.draft_model_runner, self.topk, self.speculative_num_steps),
         )
 
     def _create_dsv4_decode_backend(self):
@@ -557,11 +563,14 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_prefill_backend(self):
-        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
-            AscendAttnBackend,
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
         )
 
-        return ("ascend", AscendAttnBackend(self.draft_model_runner))
+        # Draft extend reuses the main model-aware factory so DSA models select
+        # AscendDSAAttnBackend, which generates indexer/KPool metadata, instead
+        # of falling back to the regular forward_mtp path.
+        return ("ascend", ATTENTION_BACKENDS["ascend"](self.draft_model_runner))
 
     def _create_flashmla_prefill_backend(self):
         from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend

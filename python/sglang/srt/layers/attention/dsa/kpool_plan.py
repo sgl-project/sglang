@@ -17,7 +17,8 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -118,6 +119,8 @@ class KPoolWritePlan:
 
 
 def _is_kpool_layout_enabled(kpool: int, physical_page_size: int) -> bool:
+    if is_npu():
+        return kpool > 1 and physical_page_size % kpool == 0
     return kpool > 1 and physical_page_size == 64 and physical_page_size % kpool == 0
 
 
@@ -847,3 +850,316 @@ def init_kpool_write_plan(
         effective_n_per_batch=effective_n_per_batch,
     )
     return metadata
+
+
+# ── NPU variants ──────────────────────────────────────────────────────────
+def init_kpool_extend_metadata_npu(
+    metadata,
+    forward_batch: ForwardBatch,
+    *,
+    pool_size: int,
+    real_page_size: int,
+    slots_per_page: int,
+    full_real_page_table: torch.Tensor,
+    local_seqlens_expanded: torch.Tensor,
+) -> DSAMetadata:
+    """NPU variant of init_kpool_extend_metadata.
+
+    Reuses the platform-agnostic CPU plan (_kpool_cpu_plan) and the PyTorch
+    write-location computation from _kpool_plan_to_gpu, but skips the
+    ragged-layout construction (Triton kernel) since the NPU read path uses
+    npu_lightning_indexer instead of deep_gemm.fp8_mqa_logits.
+    """
+    if (
+        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        or not is_npu()
+        or forward_batch.extend_seq_lens_cpu is None
+        or forward_batch.seq_lens_cpu is None
+    ):
+        rank0_log(
+            f"===<<<< {forward_batch.extend_seq_lens_cpu=}, "
+            f"{forward_batch.seq_lens_cpu=}"
+        )
+        return metadata
+
+    cpu = _kpool_cpu_plan(forward_batch, pool_size, slots_per_page)
+
+    device = forward_batch.seq_lens.device
+    n_pool = len(cpu.pool_pool_id)
+    n_tail = len(cpu.tail_req)
+
+    # ── Pack int64 tensors (req, pool_id, chunk_src, batch_idx, tail_req, tail_chunk_src) ──
+    i64_total = 4 * n_pool + 2 * n_tail
+    if i64_total > 0:
+        i64_cpu = torch.tensor(
+            cpu.pool_req
+            + cpu.pool_pool_id
+            + cpu.pool_chunk_src
+            + cpu.pool_batch_idx
+            + cpu.tail_req
+            + cpu.tail_chunk_src,
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        i64_gpu = i64_cpu.to(device, non_blocking=True)
+        c = 0
+        pool_req_t = i64_gpu[c : c + n_pool]
+        c += n_pool
+        pool_pool_id_t = i64_gpu[c : c + n_pool]
+        c += n_pool
+        pool_chunk_src_t = i64_gpu[c : c + n_pool]
+        c += n_pool
+        pool_batch_idx_t = i64_gpu[c : c + n_pool]
+        c += n_pool
+        tail_req_t = i64_gpu[c : c + n_tail]
+        c += n_tail
+        tail_chunk_src_t = i64_gpu[c : c + n_tail]
+    else:
+        empty_i64 = torch.empty((0,), dtype=torch.int64, device=device)
+        pool_req_t = pool_pool_id_t = pool_chunk_src_t = pool_batch_idx_t = empty_i64
+        tail_req_t = tail_chunk_src_t = empty_i64
+
+    # ── Pack int32 tensors (n_from_tail, tail_logical_base, dst_logical_start, n_write) ──
+    i32_total = 2 * n_pool + 2 * n_tail
+    if i32_total > 0:
+        i32_cpu = torch.tensor(
+            cpu.pool_n_from_tail
+            + cpu.pool_tail_logical_base
+            + cpu.tail_dst_logical_start
+            + cpu.tail_n_write,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        i32_gpu = i32_cpu.to(device, non_blocking=True)
+        c = 0
+        pool_n_from_tail_t = i32_gpu[c : c + n_pool]
+        c += n_pool
+        pool_tail_logical_base_t = i32_gpu[c : c + n_pool]
+        c += n_pool
+        tail_dst_logical_start_t = i32_gpu[c : c + n_tail]
+        c += n_tail
+        tail_n_write_t = i32_gpu[c : c + n_tail]
+    else:
+        empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
+        pool_n_from_tail_t = pool_tail_logical_base_t = empty_i32
+        tail_dst_logical_start_t = tail_n_write_t = empty_i32
+
+    # ── Compute write locations (PyTorch, same as _kpool_plan_to_gpu) ──
+    if n_pool > 0:
+        pool_page_group = torch.div(
+            pool_pool_id_t, slots_per_page, rounding_mode="floor"
+        )
+        token_page_row = pool_page_group * pool_size
+        packed_page = full_real_page_table[pool_batch_idx_t, token_page_row].to(
+            torch.int64
+        )
+        pool_write_locs = packed_page * slots_per_page + torch.remainder(
+            pool_pool_id_t, slots_per_page
+        )
+    else:
+        pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
+
+    # pooled_seq_lens_expanded = torch.div(
+    #     local_seqlens_expanded, pool_size, rounding_mode="floor"
+    # ).to(torch.int32)
+
+    empty_i32_dev = torch.empty((0,), dtype=torch.int32, device=device)
+
+    plan = KPoolExtendPlan(
+        writes=PoolWriteRows(
+            req=pool_req_t,
+            pool_id=pool_pool_id_t,
+            n_from_tail=pool_n_from_tail_t,
+            chunk_src=pool_chunk_src_t,
+            tail_logical_base=pool_tail_logical_base_t,
+            write_loc=pool_write_locs,
+        ),
+        tails=TailWriteRows(
+            req=tail_req_t,
+            dst_logical_start=tail_dst_logical_start_t,
+            chunk_src=tail_chunk_src_t,
+            n_write=tail_n_write_t,
+        ),
+        pooled_seq_lens_expanded=None,
+        seq_lens_expanded=local_seqlens_expanded,
+        ragged_concat_page_table=empty_i32_dev,
+        ragged_q_ks=empty_i32_dev,
+        ragged_q_ke=empty_i32_dev,
+        ragged_total_k_rows=0,
+        ragged_k_u8=None,
+        ragged_k_scale=None,
+        ragged_paged_page_table=None,
+        ragged_paged_page_table_row_index=None,
+        cp=None,
+    )
+    # rank0_log(f"===>init_kpool_extend_metadata_npu: {plan=}")
+    metadata.kpool_extend_plan = plan
+    # data_ret = dataclasses.replace(metadata, kpool_extend_plan=plan)
+    # rank0_log(f"===>init_kpool_extend_metadata_npu: {metadata.kpool_extend_plan=}")
+    return
+
+
+def update_kpool_write_plan_npu(
+    metadata,
+    *,
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    pool_size: int,
+    real_page_size: int,
+    num_draft_tokens: int,
+    forward_mode: ForwardMode,
+    slots_per_page: int,
+    effective_n_per_batch: Optional[torch.Tensor] = None,
+) -> None:
+    """NPU variant of update_kpool_write_plan, selected by SGLANG_NPU_KPOOL_PLAN_MODE.
+
+    Modes:
+      "npu"   — (default) fused NPU-specific Triton kernel with a Vector-Core
+                grid-stride loop (update_kpool_write_plan_triton_npu). Fuses the
+                7+ small PyTorch ops into one kernel, no intermediate tensors.
+      "reuse" — directly reuse the GPU _update_kpool_write_plan_kernel via
+                update_kpool_write_plan_cuda_graph ([(bs,)] grid, one program per
+                batch element). Provided for benchmarking/parity validation; the
+                kernel itself is platform-agnostic Triton but the grid form is
+                not tuned for the Ascend Vector Core count.
+      "off"   — vectorised PyTorch fallback (no Triton), for environments where
+                triton-ascend is unavailable or buggy.
+
+    ``effective_n_per_batch`` masks tokens that were not accepted during draft extend v2.
+    """
+    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_npu():
+        return
+    is_verify = forward_mode.is_target_verify()
+    is_decode = forward_mode.is_decode_or_idle()
+    is_v2 = forward_mode.is_draft_extend_v2()
+    if not (is_verify or is_decode or is_v2):
+        return
+
+    plan = metadata.kpool_write_plan
+    assert plan is not None, "kpool_write_plan must be allocated before update"
+
+    bs = write_start.shape[0]
+    if bs == 0 or num_draft_tokens == 0:
+        return
+    assert real_page_table.shape[0] == bs, (
+        "NPU kpool write plan expects one real_page_table row per request; "
+        f"got {real_page_table.shape[0]} rows for batch size {bs}."
+    )
+    expected_write_loc_shape = (
+        bs,
+        kpool_max_closed_pools(num_draft_tokens, pool_size),
+    )
+    assert plan.write_loc.shape == expected_write_loc_shape, (
+        "NPU kpool graph replay must update the capture-time plan in place; "
+        f"captured write_loc shape={plan.write_loc.shape}, "
+        f"replay shape={expected_write_loc_shape}."
+    )
+
+    has_per_q = plan.pool_seqlens_per_q is not None and plan.seqlens_per_q is not None
+    per_q_out = plan.pool_seqlens_per_q if has_per_q else None
+    seq_per_q_out = plan.seqlens_per_q if has_per_q else None
+
+    # Graph replay reuses fixed-size plan buffers. Refresh the accepted-token
+    # counts before selecting the Triton/PyTorch implementation so early-return
+    # branches cannot miss draft-v2 valid-row masking.
+    if is_v2 and plan.effective_n_per_batch is not None:
+        plan.effective_n_per_batch[:bs].zero_()
+        if effective_n_per_batch is not None:
+            effective_bs = min(bs, effective_n_per_batch.shape[0])
+            plan.effective_n_per_batch[:effective_bs].copy_(
+                effective_n_per_batch[:effective_bs].to(
+                    device=plan.effective_n_per_batch.device,
+                    dtype=torch.int32,
+                )
+            )
+
+    # The current NPU environment always uses the validated generic Triton plan
+    # kernel; keep the other implementations as fallbacks.
+    mode = "reuse"
+
+    if mode == "reuse":
+        # ── Mode A: reuse the GPU Triton kernel directly ──
+        # update_kpool_write_plan_cuda_graph has no is_cuda() guard; the underlying
+        # _update_kpool_write_plan_kernel uses only platform-agnostic Triton ops
+        # (tl.load/store, //, %, tl.minimum/maximum, tl.static_range), so it is
+        # compilable by triton-ascend. The [(bs,)] grid is CUDA-tuned; switch to
+        # "npu" mode for the Vector-Core-strided grid.
+        # The generic kernel retains the GPU b * N row indexing, while NPU
+        # metadata now uses one row per request. Expand the input only in this
+        # compatibility branch; plan outputs and other NPU paths keep the new contract.
+        # The generic kernel divides table entries by kpool, while the NPU
+        # table already contains physical page IDs. Convert at this boundary.
+        reuse_page_table = torch.repeat_interleave(
+            real_page_table * pool_size, num_draft_tokens, dim=0
+        ).contiguous()
+        update_kpool_write_plan_cuda_graph(
+            write_start,
+            req_pool_indices,
+            reuse_page_table,
+            req_out=plan.req,
+            write_start_out=plan.write_start,
+            tail_logical_start_out=plan.tail_logical_start,
+            write_loc_out=plan.write_loc,
+            pool_seqlens_per_q_out=per_q_out,
+            seqlens_per_q_out=seq_per_q_out,
+            kpool=pool_size,
+            num_draft_tokens=num_draft_tokens,
+            index_page_size=slots_per_page,
+        )
+        return
+
+    if mode != "off":
+        # ── Mode C (default "npu"): fused NPU-specific Triton kernel ──
+        from sglang.srt.layers.attention.dsa.kpool_index_npu import (
+            update_kpool_write_plan_triton_npu,
+        )
+
+        update_kpool_write_plan_triton_npu(
+            write_start,
+            req_pool_indices,
+            real_page_table,
+            req_out=plan.req,
+            write_start_out=plan.write_start,
+            tail_logical_start_out=plan.tail_logical_start,
+            write_loc_out=plan.write_loc,
+            pool_seqlens_per_q_out=per_q_out,
+            seqlens_per_q_out=seq_per_q_out,
+            pool_size=pool_size,
+            num_draft_tokens=num_draft_tokens,
+            slots_per_page=slots_per_page,
+        )
+        return
+
+    # ── Mode "off": vectorised PyTorch fallback (no Triton) ──
+    ws = write_start.to(torch.int32)
+    base_pool = torch.div(ws, pool_size, rounding_mode="floor")
+
+    # ── Per-query outputs (verify / v2) ──
+    if has_per_q:
+        seqlen_per_q = ws.unsqueeze(1) + torch.arange(
+            1, num_draft_tokens + 1, device=ws.device
+        ).unsqueeze(0)
+        flat = seqlen_per_q.reshape(-1)[: bs * num_draft_tokens]
+        seq_per_q_out[: bs * num_draft_tokens] = flat
+        per_q_out[: bs * num_draft_tokens] = (flat // pool_size).to(torch.int32)
+
+    # ── Write location (vectorised) ──
+    max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool_size)
+    pool_offsets = torch.arange(max_closed_pools, device=ws.device, dtype=torch.int32)
+    pool_ids = base_pool.unsqueeze(1) + pool_offsets.unsqueeze(0)
+    pool_page_group = torch.div(pool_ids, slots_per_page, rounding_mode="floor")
+    token_page_row = pool_page_group * pool_size
+    token_page_row = token_page_row.clamp(0, real_page_table.shape[1] - 1)
+
+    # NPU real_page_table has one row per request, including verify / draft-v2.
+    row_idx = torch.arange(bs, device=ws.device, dtype=torch.int64).unsqueeze(1)
+    packed_page = real_page_table[row_idx, token_page_row.to(torch.int64)].to(
+        torch.int64
+    )
+    write_loc = packed_page * slots_per_page + torch.remainder(pool_ids, slots_per_page)
+
+    plan.req[:bs] = req_pool_indices[:bs].to(torch.int64)
+    plan.write_start[:bs] = ws[:bs]
+    plan.tail_logical_start[:bs] = (base_pool[:bs] * pool_size).to(torch.int32)
+    plan.write_loc[:bs].copy_(write_loc[:bs])
