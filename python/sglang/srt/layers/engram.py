@@ -16,6 +16,7 @@ from torch import nn
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import (
+    ENGRAM_NUM_COLS,
     engram_gather_bf16,
     engram_gather_triton,
 )
@@ -534,6 +535,13 @@ class EngramEmbedding(nn.Module):
         assert dim % FP8_BLOCK_SIZE == 0
         super().__init__()
         self.dim = dim
+        # The shape and int32 ids engram_gather_bf16 is built for.
+        self._gather_bf16_fits = (
+            is_cuda()
+            and len(bounds) - 1 == ENGRAM_NUM_COLS
+            and dim == 256
+            and num_embeddings < 2**31
+        )
         parallel = get_parallel()
         self.tp_size = parallel.tp_size
         self.use_host = envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
@@ -585,8 +593,8 @@ class EngramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Every row read in place: no collective, so each rank may pass its own
         indices (DP attention, CP) and look up only those."""
-        if len(view.w_ptrs) == 1:
-            # This rank stores every row.
+        if not (self._gather_bf16_fits and indices.is_cuda):
+            # Any other shape is a one-shard view; the Triton kernel takes any shape.
             return self._lookup_local(indices)
         out = indices.new_empty(*indices.shape, self.dim, dtype=torch.bfloat16)
         if indices.shape[0] == 0:
