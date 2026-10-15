@@ -123,6 +123,7 @@ class TestSwaBackupAfterCompaction(unittest.TestCase):
         )
         component = SimpleNamespace(
             component_type=ComponentType.SWA,
+            pool_name=PoolName.SWA,
             tree_core=SimpleNamespace(has_swa_host_pool=True),
             _collect_unbacked_swa_nodes=lambda n: [n],
             _unified_allocator=lambda: object(),
@@ -173,6 +174,8 @@ class TestTriPoolAssembly(unittest.TestCase):
                 )
                 composite = SimpleNamespace(swa_attn_allocator=swa_allocator)
                 params = SimpleNamespace(
+                    mtp_draft_device_pools=(),
+                    mtp_draft_mamba_pools=(),
                     token_to_kv_pool_allocator=composite,
                     req_to_token_pool=SimpleNamespace(
                         mamba_allocator=SimpleNamespace(alloc=Mock(), free=Mock())
@@ -193,7 +196,7 @@ class TestTriPoolAssembly(unittest.TestCase):
                         params=params,
                         full_kv_pool=object(),
                         swa_kv_pool=object(),
-                        mamba_pool=object(),
+                        mamba_pool=SimpleNamespace(num_mamba_layers=1),
                         full_layer_mapping={0: 0},
                         swa_layer_mapping={1: 0},
                         mamba_layer_mapping={2: 0},
