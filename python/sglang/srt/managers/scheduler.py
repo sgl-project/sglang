@@ -4095,12 +4095,18 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
+        # The resumed chunk or the mixed decode rows can spend the prefill budget
+        # before the queue: the first candidate would match, prefetch and stage
+        # only to be rejected, as add_one_req's OTHER verdict stops the loop later.
+        waiting_reqs = (
+            [] if adder.budget_state() == AddReqResult.OTHER else self.waiting_queue
+        )
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            mamba_allocator.alloc_group_begin(len(waiting_reqs))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in waiting_reqs:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
