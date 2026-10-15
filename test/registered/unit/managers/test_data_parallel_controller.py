@@ -11,10 +11,12 @@ is exercised as the real method, no mock. The refresh-throttle tests inject
 `load_snapshot_reader` and `_last_refresh_time` on top of those.
 """
 
+import threading
 import time
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
 
@@ -27,8 +29,10 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    WorkerPortHandshake,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -50,18 +54,190 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(num_dp_ranks)]
     ctl.status = [True] * num_dp_ranks
     ctl._active_workers = list(range(num_dp_ranks))
+    ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
+    ctl.health_round_robin_counter = 0
     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
     return ctl
 
 
-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
+def _req(
+    routed_dp_rank=None,
+    bootstrap_room=None,
+    input_ids=None,
+    rid="USER",
+    time_stats=None,
+):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
+        time_stats=time_stats,
+        rid=rid,
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
     )
+
+
+class TestJoinerWorkerPortAdmission(CustomTestCase):
+    def _launch_joiner(self, parallel, handshake, launch):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller._receive_ports_as_client = MagicMock(return_value=handshake)
+        controller.launch_tensor_parallel_group = launch
+        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=True))
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_exec",
+                return_value=execution,
+            ),
+        ):
+            controller.launch_dp_attention_schedulers(
+                SimpleNamespace(), SimpleNamespace()
+            )
+
+    def test_topology_mismatch_is_rejected_before_scheduler_launch(self):
+        mismatches = [
+            # A wider joiner would map physical offset 4 onto active primary slot 2.
+            ((1, 1), (2, 1), 1),
+            # A narrower joiner would select beyond the primary's reserved slots.
+            ((2, 1), (1, 1), 2),
+        ]
+        for primary, joining, num_dp_ranks in mismatches:
+            with self.subTest(primary=primary, joining=joining):
+                parallel = SimpleNamespace(
+                    dist_init_addr="127.0.0.1:20000",
+                    ep_join_rank_offset=4,
+                    num_dp_ranks=num_dp_ranks,
+                    attn_tp_size=joining[0],
+                    attn_cp_size=joining[1],
+                )
+                handshake = WorkerPortHandshake(
+                    worker_ports=[1000, 1001, 1002, 1003],
+                    attn_tp_size=primary[0],
+                    attn_cp_size=primary[1],
+                )
+                launch = MagicMock()
+
+                with self.assertRaisesRegex(ValueError, "same attention topology"):
+                    self._launch_joiner(parallel, handshake, launch)
+
+                launch.assert_not_called()
+
+    def test_matching_topology_selects_reserved_logical_dp_slot(self):
+        parallel = SimpleNamespace(
+            dist_init_addr="127.0.0.1:20000",
+            ep_join_rank_offset=4,
+            num_dp_ranks=1,
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        handshake = WorkerPortHandshake(
+            worker_ports=[1000, 1001, 1002, 1003],
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        launch = MagicMock()
+
+        self._launch_joiner(parallel, handshake, launch)
+
+        self.assertEqual(launch.call_args.args[-1], [1002])
+
+
+class TestLocalKvEventSources(CustomTestCase):
+    @staticmethod
+    def _source(rank, block_size=64):
+        return {
+            "dp_rank": rank,
+            "endpoint": f"tcp://127.0.0.1:{5557 + rank}",
+            "topic": "kv",
+            "block_size": block_size,
+        }
+
+    def test_scheduler_reports_logical_block_size_or_no_source(self):
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+            SchedulerKvEventsPublisher,
+        )
+
+        component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_total_num_tokens = 64
+        scheduler.max_req_input_len = 32
+        scheduler.startup_time = {}
+        scheduler.page_size = 64
+        scheduler.kv_events_publisher = component
+        publisher = MagicMock()
+        publisher.describe_local_source.return_value = self._source(4, 256)
+        for owned_publisher, expected in (
+            (publisher, [self._source(4, 256)]),
+            (None, []),
+        ):
+            with (
+                self.subTest(has_publisher=owned_publisher is not None),
+                get_context().override_server_args(grpc_port=50051, dcp_size=4),
+            ):
+                component.kv_event_publisher = owned_publisher
+                self.assertEqual(
+                    scheduler.get_init_info()["kv_event_sources"], expected
+                )
+        publisher.describe_local_source.assert_called_once_with(256)
+
+    def test_controller_collects_all_scheduler_sources(self):
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = DataParallelController.__new__(DataParallelController)
+        controller.env_lock = threading.Lock()
+        controller.scheduler_procs = []
+        controller.local_kv_event_sources = []
+        controller.run_scheduler_process_func = MagicMock()
+        controller.attn_replica_size = 1
+        controller.prelaunched_schedulers = None
+        # TP8/DP4 over two nodes: this follower's four schedulers own ranks 2,3.
+        readers = [
+            MagicMock(
+                recv=MagicMock(
+                    return_value={
+                        "max_total_num_tokens": 64,
+                        "max_req_input_len": 32,
+                        "kv_event_sources": sources,
+                    }
+                )
+            )
+            for sources in ([self._source(2)], [], [self._source(3)], [])
+        ]
+        with (
+            get_context().override_server_args(
+                tp_size=8,
+                dp_size=4,
+                enable_dp_attention=True,
+                nnodes=2,
+                node_rank=1,
+                pp_size=1,
+                attn_cp_size=1,
+            ),
+            patch.object(module.mp, "Process"),
+            patch.object(
+                module.mp,
+                "Pipe",
+                side_effect=[(reader, MagicMock()) for reader in readers],
+            ),
+            patch.object(module.PortArgs, "init_new", return_value=MagicMock()),
+            patch.object(module.TorchMemorySaverAdapter, "create"),
+            patch.object(module.numa_utils, "configure_subprocess"),
+            patch.object(
+                module, "maybe_reindex_device_id", return_value=nullcontext(0)
+            ),
+        ):
+            controller.launch_tensor_parallel_group(
+                MagicMock(), MagicMock(), 0, None, [7000, 7001, 7002, 7003]
+            )
+        self.assertEqual(
+            controller.local_kv_event_sources, [self._source(2), self._source(3)]
+        )
 
 
 class TestDPBudgetUpdateBudget(CustomTestCase):
@@ -208,6 +384,88 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+
+class TestDispatchingWithTrace(CustomTestCase):
+    def _make_traced_controller(self) -> DataParallelController:
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.refresh_load_budget_on_dispatch = True
+        ctl.refresh_load_budget = MagicMock()
+        ctl.dispatching = MagicMock()
+        ctl.dispatch_health_check = MagicMock()
+        return ctl
+
+    def test_health_and_user_dispatch_use_separate_state(self):
+        for rid, is_health in [("HEALTH_CHECK_dispatch", True), ("user", False)]:
+            with self.subTest(rid=rid):
+                ctl = self._make_traced_controller()
+                req = _req(rid=rid)
+                ctl.dispatching_with_trace(req)
+                self.assertEqual(ctl.refresh_load_budget.call_count, int(not is_health))
+                self.assertEqual(
+                    ctl.dispatching.call_args_list, [] if is_health else [call(req)]
+                )
+                self.assertEqual(
+                    ctl.dispatch_health_check.call_args_list,
+                    [call(req)] if is_health else [],
+                )
+
+    def test_batch_refreshes_budget_only_for_user_requests(self):
+        for rids, refreshes in [
+            (["HEALTH_CHECK_batch"], 0),
+            (["HEALTH_CHECK_batch", "user"], 1),
+        ]:
+            with self.subTest(rids=rids):
+                ctl = self._make_traced_controller()
+                ctl.dispatching_with_trace = MagicMock()
+                reqs = [_req(rid=rid) for rid in rids]
+                ctl.dispatch_batch_generate(reqs)
+                self.assertEqual(ctl.refresh_load_budget.call_count, refreshes)
+                self.assertEqual(
+                    ctl.dispatching_with_trace.call_args_list,
+                    [call(req, refresh_load_budget=False) for req in reqs],
+                )
+
+
+class TestHealthCheckScheduler(CustomTestCase):
+    def test_health_and_user_round_robin_state_are_independent(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.round_robin_scheduler(_req())
+        self.assertEqual(ctl.health_round_robin_counter, 0)
+        ctl.dispatch_health_check(_req(rid="HEALTH_CHECK"))
+        self.assertEqual(ctl.round_robin_counter, 1)
+        self.assertEqual(ctl.health_round_robin_counter, 1)
+        ctl.round_robin_scheduler(_req())
+        self.assertEqual(ctl.round_robin_counter, 2)
+        self.assertEqual(ctl.health_round_robin_counter, 1)
+
+    def test_health_round_robin_uses_only_active_workers(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl._active_workers = [1, 3]
+        for _ in range(4):
+            ctl.dispatch_health_check(_req(rid="HEALTH_CHECK_active"))
+        ctl.workers[0].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.workers[1].send_pyobj.call_count, 2)
+        ctl.workers[2].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.workers[3].send_pyobj.call_count, 2)
+
+    def test_external_routing_does_not_advance_health_counter(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        req = _req(routed_dp_rank=2, rid="HEALTH_CHECK_routed")
+        ctl.dispatch_health_check(req)
+        ctl.workers[2].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.health_round_robin_counter, 0)
+
+    def test_health_preserves_follow_bootstrap_room_routing(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.load_balance_method = LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM
+
+        req = _req(rid="HEALTH_CHECK_pd", bootstrap_room=3)
+
+        ctl.dispatch_health_check(req)
+
+        ctl.workers[3].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.health_round_robin_counter, 0)
 
 
 class TestFollowBootstrapRoomScheduler(CustomTestCase):
