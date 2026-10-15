@@ -252,6 +252,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     backend = SimpleNamespace(
         token_to_kv_pool=pool,
         req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        _kv_shard_pool=None,
         _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
     )
     batch = SimpleNamespace(

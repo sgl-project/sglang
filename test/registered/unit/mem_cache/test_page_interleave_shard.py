@@ -44,6 +44,7 @@ GPU tests skip when too few CUDA devices are visible, so the same file runs
 in both CPU and CUDA CI suites.
 """
 
+import functools
 import os
 import shutil
 import tempfile
@@ -65,6 +66,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.allocator.page_interleave import (
@@ -96,6 +98,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -1808,6 +1811,115 @@ def _run_mha(rank, world, port):
         print("PASS: MHA page-interleave shard (attn-CP axis)")
 
 
+def _run_qsa(rank, world, port):
+    """Qwen4-Exp's QSA hybrid pool over a striped full-attention pool."""
+    _dist_init(rank, world, port, attn_cp_size=world)
+
+    group = get_parallel().attn_cp_group
+    spec = _gather_make_spec(shard_rank=group.rank_in_group)
+    ratio = 4
+    # Global ids of the full-attention layers; the wrapper maps them to the
+    # dense ids the striped pool's slots and layer-ahead gather run on.
+    full_layer_ids = [3, 7]
+    pool = QSATokenToKVPool(
+        size=_GATHER_SIZE,
+        dtype=_GATHER_DTYPE,
+        page_size=_GATHER_PAGE_SIZE,
+        head_num=_GATHER_HEAD_NUM,
+        head_dim=_GATHER_HEAD_DIM,
+        full_attention_layer_ids=full_layer_ids,
+        device=f"cuda:{rank}",
+        mamba_pool=None,
+        qsa_index_kv_heads=1,
+        qsa_index_head_dim=16,
+        qsa_compress_ratio=ratio,
+        qsa_token_topk=64,
+        num_request_slots=4,
+        full_kv_pool_class=functools.partial(
+            PageInterleaveMHATokenToKVPool, shard_spec=spec, shard_group=group
+        ),
+    )
+    shard_pool = get_kv_shard_pool(pool)
+    assert shard_pool is pool.full_kv_pool
+    device = shard_pool.k_buffer[0].device
+
+    # Every rank compresses the whole chunk, so the compressed keys stay
+    # replicated over the widened logical slots, up to the last logical page.
+    last_slot = (world * (_GATHER_SIZE + _GATHER_PAGE_SIZE) - 1) // ratio
+    assert pool.qsa_compressed_capacity == last_slot + 1
+    key = torch.full((1, 1, 16), 3.0, dtype=torch.bfloat16, device=device)
+    loc = torch.tensor([last_slot], device=device)
+    pool.set_qsa_compressed_k_buffer(full_layer_ids[-1], loc, key)
+    _check(
+        rank,
+        "qsa compressed last slot",
+        pool.get_qsa_compressed_k_buffer(full_layer_ids[-1])[loc],
+        key,
+    )
+
+    def kv_value(locs, layer_id, is_v):
+        base = locs.to(torch.float32) + layer_id * 1000 + (500000 if is_v else 0)
+        return (
+            base.view(-1, 1, 1)
+            + torch.arange(_GATHER_HEAD_NUM, device=device).view(1, -1, 1) * 0.01
+            + torch.arange(_GATHER_HEAD_DIM, device=device).view(1, 1, -1) * 0.0001
+        ).to(_GATHER_DTYPE)
+
+    def extend(groups, prefix_len, seq_len):
+        req_to_token = _fake_req_to_token(groups, seq_len, device)
+        chunk_locs = req_to_token[0, prefix_len:seq_len].long()
+        shard_pool.begin_shard_extend(
+            req_to_token, torch.tensor([0]), [prefix_len], [seq_len]
+        )
+        for layer_id in full_layer_ids:
+            layer = SimpleNamespace(layer_id=layer_id)
+            pool.set_kv_buffer(
+                layer,
+                chunk_locs,
+                kv_value(chunk_locs, layer_id, False),
+                kv_value(chunk_locs, layer_id, True),
+            )
+            # The backend reads [prefix | chunk] by the translated slot table.
+            all_locs = req_to_token[0, :seq_len].long()
+            rows = shard_pool.translate_loc_to_scratch(all_locs)
+            for is_v, buffer in (
+                (False, pool.get_key_buffer(layer_id)),
+                (True, pool.get_value_buffer(layer_id)),
+            ):
+                _check(
+                    rank,
+                    f"qsa seq read {'v' if is_v else 'k'} l{layer_id}",
+                    buffer[rows],
+                    kv_value(all_locs, layer_id, is_v),
+                )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    extend([7, 3], 0, 2 * _GATHER_GRANULE)
+    # Only the owned stripe persists: group q is local page q on every rank.
+    for q in (7, 3):
+        owned_locs = (
+            q * _GATHER_GRANULE
+            + group.rank_in_group * _GATHER_PAGE_SIZE
+            + torch.arange(_GATHER_PAGE_SIZE, device=device)
+        )
+        local_rows = torch.arange(
+            q * _GATHER_PAGE_SIZE, (q + 1) * _GATHER_PAGE_SIZE, device=device
+        )
+        _check(
+            rank,
+            f"qsa owned stripe g{q}",
+            shard_pool.k_buffer[1][local_rows],
+            kv_value(owned_locs, full_layer_ids[1], False),
+        )
+    # The next chunk reads the prefix gathered from both ranks.
+    extend([7, 3, 11], 2 * _GATHER_GRANULE, 3 * _GATHER_GRANULE)
+
+    torch.distributed.barrier()
+    if rank == 0:
+        print("PASS: QSA hybrid pool over a page-interleave full pool")
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
 )
@@ -1823,6 +1935,9 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
     def test_mha_shard_over_attention_cp(self):
         mp.spawn(_run_mha, args=(_GATHER_WORLD, 29812), nprocs=_GATHER_WORLD, join=True)
+
+    def test_qsa_hybrid_pool_over_attention_cp(self):
+        mp.spawn(_run_qsa, args=(_GATHER_WORLD, 29813), nprocs=_GATHER_WORLD, join=True)
 
 
 # =============================================================================
