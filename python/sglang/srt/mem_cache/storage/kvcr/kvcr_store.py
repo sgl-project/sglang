@@ -43,6 +43,20 @@ from sglang.srt.mem_cache.storage.kvcr.layout import (
 
 logger = logging.getLogger(__name__)
 
+# Pools HiCache restores as TRAILING_PAGES windows (SWA, its DeepSeek V4
+# compressor states, Mamba): a page need not have state in them.
+_TRAILING_POOLS = frozenset(
+    str(name)
+    for name in (
+        PoolName.SWA,
+        PoolName.DRAFT_SWA,
+        PoolName.MAMBA,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    )
+)
+
 
 class _NoFrameworkPinning:
     """Answer misses when a peer asks for a non-KVCR-owned source."""
@@ -798,6 +812,14 @@ class KVCRStore(HiCacheStorage):
         required = list(pool_transfers or [])
         if str(PoolName.KV) in self._layouts:
             required = [PoolTransfer(PoolName.KV)] + required
+        elif not required:
+            # A logical KV anchor has no payload to prove a page. Answer a
+            # bare KV query from the pools that hold every stored page.
+            required = [
+                PoolTransfer(name)
+                for name in self._layouts
+                if name not in _TRAILING_POOLS
+            ]
         with self._lock:
             self._start()
             identities = [
