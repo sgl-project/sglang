@@ -1770,23 +1770,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _deterministic_attention_backend(view)
 
     def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
-        """AITER decode attention is batch-invariant only for non-MLA models on gfx950;
-        AITER prefill attention never is."""
+        """AITER decode attention is batch-invariant only for non-MLA models on gfx950,
+        and its speculative verify path is not; AITER prefill attention never is."""
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _deterministic_attention_backend,
         )
 
         cases = [
-            # (gfx950, MLA model, prefill backend, accepted)
-            (True, False, "triton", True),
-            (False, False, "triton", False),
-            (True, True, "triton", False),
-            (True, False, "aiter", False),
+            # (gfx950, MLA model, prefill backend, speculative algorithm, accepted)
+            (True, False, "triton", None, True),
+            (False, False, "triton", None, False),
+            (True, True, "triton", None, False),
+            (True, False, "aiter", None, False),
+            (True, False, "triton", "EAGLE", False),
         ]
-        for gfx950, mla, prefill, accepted in cases:
+        for gfx950, mla, prefill, spec, accepted in cases:
             with (
-                self.subTest(gfx950=gfx950, mla=mla, prefill=prefill),
+                self.subTest(gfx950=gfx950, mla=mla, prefill=prefill, spec=spec),
                 patch(
                     "sglang.srt.arg_groups.overrides.is_gfx95_supported",
                     return_value=gfx950,
@@ -1801,6 +1802,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         attention_backend="triton",
                         prefill_attention_backend=prefill,
                         decode_attention_backend="aiter",
+                        speculative_algorithm=spec,
                     )
                 )
                 if accepted:

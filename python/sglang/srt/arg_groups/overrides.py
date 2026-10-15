@@ -1054,29 +1054,43 @@ def _deterministic_attention_backend(view: Any) -> dict:
     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
     decode_choices = list(DETERMINISTIC_ATTENTION_BACKEND_CHOICES)
-    # AITER paged decode reduces fixed 256-token KV partitions per request, so it is
-    # batch-invariant (verified on gfx950); MLA decode sizes its KV splits by batch size.
-    if (
-        view.decode_attention_backend == "aiter"
-        and is_gfx95_supported()
-        and not use_mla_backend(view)
-    ):
-        decode_choices.append("aiter")
+    decode_note = ""
+    if view.decode_attention_backend == "aiter":
+        # AITER paged decode reduces fixed 256-token KV partitions per request, so it is
+        # batch-invariant (verified on gfx950); MLA decode sizes its KV splits by batch
+        # size, and speculative decoding would run AITER's unverified verify kernels.
+        if (
+            is_gfx95_supported()
+            and not use_mla_backend(view)
+            and view.speculative_algorithm is None
+        ):
+            decode_choices.append("aiter")
+        else:
+            decode_note = (
+                " (aiter decode is accepted only on gfx950, for non-MLA models and "
+                "without speculative decoding)"
+            )
 
     # A per-phase backend overrides --attention-backend for its phase. Unset (None)
     # means the phase uses --attention-backend, which is checked below.
-    for flag, backend, choices in (
+    for flag, backend, choices, note in (
         (
             "--prefill-attention-backend",
             view.prefill_attention_backend,
             DETERMINISTIC_ATTENTION_BACKEND_CHOICES,
+            "",
         ),
-        ("--decode-attention-backend", view.decode_attention_backend, decode_choices),
+        (
+            "--decode-attention-backend",
+            view.decode_attention_backend,
+            decode_choices,
+            decode_note,
+        ),
     ):
         if backend is not None and backend not in choices:
             raise ValueError(
                 f"Currently only {choices} attention backends are supported for deterministic inference, "
-                f"but {flag} is '{backend}'."
+                f"but {flag} is '{backend}'{note}."
             )
 
     if view.attention_backend is None:
