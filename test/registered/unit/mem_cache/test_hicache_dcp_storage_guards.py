@@ -44,17 +44,6 @@ def _args(**changes):
 
 
 class TestDcpStorageGuards(CustomTestCase):
-    def test_pd_storage_stays_gated_until_transfer_support(self):
-        with mock.patch(
-            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
-        ):
-            for role in ("prefill", "decode"):
-                with (
-                    self.subTest(role=role),
-                    self.assertRaisesRegex(NotImplementedError, "aggregated serving"),
-                ):
-                    resolve_hicache_dcp_compatibility(_args(disaggregation_mode=role))
-
     def test_materialized_mamba_registration_preserves_independent_slot_pool(self):
         pool = _make_host_pool(0, dcp_size=2, layout="page_first")
         state = _mamba_pool()
@@ -188,6 +177,8 @@ class TestDcpStorageGuards(CustomTestCase):
             dict(dp_size=2),
             dict(attn_cp_size=2),
             dict(dp_size=2, enable_dp_attention=True),
+            dict(disaggregation_mode="prefill"),
+            dict(disaggregation_mode="decode"),
         )
         with mock.patch(
             "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
@@ -225,6 +216,103 @@ class TestDcpStorageGuards(CustomTestCase):
             resolve_hicache_dcp_compatibility(
                 _args(speculative_algorithm="DSPARK", hicache_storage_backend=None)
             )
+
+    def test_decode_offload_cannot_bypass_guard_without_hicache(self):
+        with (
+            mock.patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+            ),
+            self.assertRaisesRegex(NotImplementedError, "decode offload"),
+        ):
+            resolve_hicache_dcp_compatibility(
+                _args(
+                    enable_hierarchical_cache=False,
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_offload_kvcache=True,
+                )
+            )
+
+    def test_decode_runtime_uses_effective_prefetch_policy(self):
+        for attached in (False, True):
+            for startup, current, requested, accepted in (
+                ("wait_complete", "wait_complete", "best_effort", False),
+                ("wait_complete", "wait_complete", "timeout", False),
+                ("wait_complete", "timeout", None, False),
+                ("timeout", "timeout", "wait_complete", True),
+                ("timeout", "wait_complete", None, True),
+            ):
+                controller = SimpleNamespace(
+                    storage_backend_type="file",
+                    write_policy="write_back",
+                    attach_storage_backend=mock.Mock(),
+                    mem_pool_host=SimpleNamespace(entries=[]),
+                )
+                cache = SimpleNamespace(
+                    cache_controller=controller,
+                    enable_storage=attached,
+                    prefetch_stop_policy=current,
+                    write_through_threshold=2,
+                    is_write_back=True,
+                    sliding_window_size=None,
+                    _enable_metrics_flag=False,
+                    extra_metric_labels=None,
+                )
+                attachment = StorageAttachment(cache)
+                with (
+                    self.subTest(
+                        attached=attached, current=current, requested=requested
+                    ),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_parallel",
+                        return_value=SimpleNamespace(attn_dcp_size=2),
+                    ),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_server_args",
+                        return_value=_args(
+                            disaggregation_mode="decode",
+                            hicache_storage_prefetch_policy=startup,
+                        ),
+                    ),
+                    mock.patch(
+                        "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                        return_value=True,
+                    ),
+                    mock.patch.object(attachment, "apply_runtime_config"),
+                ):
+                    ok, reason = attachment.attach(
+                        "file",
+                        hicache_storage_prefetch_policy=requested,
+                        hicache_write_policy="write_through",
+                    )
+                    self.assertEqual(ok, accepted, reason)
+                    if accepted:
+                        self.assertEqual(cache.prefetch_stop_policy, "wait_complete")
+                    else:
+                        self.assertIn("wait_complete", reason)
+                        self.assertEqual(cache.prefetch_stop_policy, current)
+                        self.assertEqual(controller.write_policy, "write_back")
+                        self.assertEqual(cache.write_through_threshold, 2)
+                        self.assertTrue(cache.is_write_back)
+                        controller.attach_storage_backend.assert_not_called()
+
+    def test_decode_storage_keeps_promised_prefetches_complete(self):
+        # Decode promises the probed L3 span to prefill before the read runs;
+        # early-stopping policies turn a short read into an aborted request.
+        with mock.patch(
+            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+        ):
+            for options in (
+                dict(hicache_storage_prefetch_policy="best_effort"),
+                dict(hicache_storage_prefetch_policy="timeout"),
+                dict(disaggregation_decode_enable_offload_kvcache=True),
+            ):
+                with (
+                    self.subTest(options=options),
+                    self.assertRaises(NotImplementedError),
+                ):
+                    validate_hicache_dcp_storage(
+                        _args(disaggregation_mode="decode", **options)
+                    )
 
     def test_runtime_rejection_has_no_side_effects(self):
         for attached in (False, True):

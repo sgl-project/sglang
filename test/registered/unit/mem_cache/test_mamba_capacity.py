@@ -58,6 +58,19 @@ def make_cache(pool, held, release):
 
 
 class TestMambaCapacity(unittest.TestCase):
+    def test_pending_restore_capacity_survives_request_allocation(self):
+        pool, held = make_pool(3)
+        req = make_req()
+        self.assertFalse(ensure_mamba_capacity(pool, [req], None, reserved_slots=1))
+        cache = make_cache(pool, held, release=1)
+        self.assertTrue(ensure_mamba_capacity(pool, [req], cache, reserved_slots=1))
+        live = pool.mamba_allocator.alloc(1)
+        pool._alloc_ping_pong_buffer(req)
+        checkpoint = pool.mamba_allocator.alloc(1)
+        self.assertIsNotNone(live)
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(pool.mamba_allocator.available_size(), 0)
+
     def test_admission_matches_tracking_allocation(self):
         for extra_buffer, overlap, lazy, expected in [
             (False, False, False, 0),

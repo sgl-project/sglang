@@ -3,6 +3,8 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
@@ -11,6 +13,7 @@ from sglang.srt.disaggregation.decode import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodePrefixMatch,
     HiCacheRestoreGatedKVReceiver,
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
@@ -20,6 +23,9 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -112,6 +118,153 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(physical_available, 3 * page_size)
         self.assertEqual(queue._pre_alloc.call_count, 3)
 
+    def test_declined_l3_prefetch_is_excluded_from_transfer_promise(self):
+        """A positive probe cannot omit transfer rows when prefetch is declined."""
+        override = get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        for admission in (
+            "accepted",
+            "declined",
+            "error",
+            "state_full",
+            "state_reclaim",
+            "state_pending",
+        ):
+            with self.subTest(admission=admission):
+                req = SimpleNamespace(
+                    rid="prefetch-admission",
+                    cache_request_handle=CacheRequestHandle("prefetch-admission", 0),
+                    origin_input_ids=list(range(8)),
+                    output_ids=[],
+                    finished_reason=None,
+                    sampling_params=SimpleNamespace(max_new_tokens=1),
+                    kv=SimpleNamespace(
+                        req_pool_idx=0,
+                        cache_protected_len=0,
+                        holds_mamba=False,
+                        mamba_ping_pong_track_buffer=None,
+                    ),
+                    extra_key=None,
+                    cache_salt=None,
+                )
+                dr = SimpleNamespace(
+                    req=req, waiting_for_input=True, is_rebootstrap=False
+                )
+                pm = DecodePrefixMatch(
+                    prefix_indices=torch.tensor([10, 11]),
+                    l2_host_hit_length=2,
+                    l3_storage_hit_length=2,
+                    last_device_node=11,
+                    last_host_node=22,
+                )
+                queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+                queue.pp_size = 1
+                queue.queue = [dr]
+                queue.pending_reqs = []
+                queue.retracted_queue = []
+                queue.num_reserved_decode_tokens = 0
+                queue._resolve_pending_reqs = lambda: None
+                queue._update_handshake_waiters = lambda *_: None
+                queue._uses_swa_tail_prealloc = lambda: False
+                queue._uses_swa_reservation = lambda: False
+                queue._allocatable_token_budgets = lambda **_: 1024
+                queue._hicache_pending_restore_tokens = lambda: 0
+                queue._match_prefix_and_lock = lambda _: pm
+                queue.scheduler = SimpleNamespace(
+                    running_batch=SimpleNamespace(reqs=[]),
+                    enable_priority_scheduling=False,
+                    enable_hisparse=False,
+                    enable_lora=False,
+                    enable_decode_hicache=True,
+                )
+                queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+                    available_size=lambda: 1
+                )
+                queue.req_to_token_pool = SimpleNamespace(
+                    available_size=lambda: 1,
+                    mamba_allocator=None,
+                    req_to_token=torch.arange(10, 18).reshape(1, 8),
+                )
+                queue.token_to_kv_pool_allocator = SimpleNamespace(
+                    page_size=1, translate_kv_indices_for_transfer=lambda x: x
+                )
+                bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+                queue.kv_manager = SimpleNamespace(
+                    kv_args=SimpleNamespace(state_types=[])
+                )
+                queue.tree_cache = SimpleNamespace(
+                    hicache_storage_pass_prefix_keys=False,
+                    get_last_hash_value=lambda _: "h2",
+                    prefetch_from_storage=MagicMock(
+                        side_effect=RuntimeError("store unavailable")
+                        if admission == "error"
+                        else None
+                    ),
+                    has_ongoing_prefetch=lambda _: admission == "accepted",
+                )
+                queue.transfer_queue = SimpleNamespace(queue=[])
+                if admission.startswith("state_"):
+                    pool = object.__new__(HybridReqToTokenPool)
+                    pool.__dict__.update(queue.req_to_token_pool.__dict__)
+                    pool.mamba_allocator = MambaSlotAllocator(3, "cpu")
+                    pool.mamba_initial_tracking_slots = 0
+                    held = pool.mamba_allocator.alloc(
+                        1 if admission == "state_pending" else 2
+                    )
+                    queue.req_to_token_pool = pool
+                    queue.tree_cache.supports_mamba = lambda: True
+
+                    def evict(params):
+                        nonlocal held
+                        if admission == "state_reclaim":
+                            pool.mamba_allocator.free(held[: params.mamba_num])
+                            held = held[params.mamba_num :]
+
+                    queue.tree_cache.evict_for_alloc = evict
+                    queue.tree_cache.has_ongoing_prefetch = lambda _: True
+                    if admission == "state_pending":
+                        queue.transfer_queue.queue = [
+                            SimpleNamespace(
+                                prefix_match=DecodePrefixMatch(
+                                    torch.tensor([]), 2, 0, 0
+                                ),
+                                hicache_restore_status=HiCacheRestoreResult.PENDING,
+                                hicache_restored_node=None,
+                            )
+                        ]
+                allocated_prefix = []
+                sent = []
+
+                def allocate(_req, _indices, _l1, total):
+                    allocated_prefix.append(total)
+                    return torch.arange(10 + total, 18)
+
+                def send(_dr, indices, _page, _state, **metadata):
+                    sent.append((indices.tolist(), metadata["decode_prefix_len"]))
+
+                queue._pre_alloc = allocate
+                queue._send_kv_metadata = send
+                admitted, failed = queue.pop_preallocated()
+                expected = {
+                    "accepted": 6,
+                    "declined": 4,
+                    "error": 4,
+                    "state_full": 2,
+                    "state_reclaim": 6,
+                    "state_pending": 2,
+                }[admission]
+                self.assertEqual(admitted, [dr])
+                self.assertEqual(failed, [])
+                self.assertEqual(allocated_prefix, [expected])
+                self.assertEqual(sent, [(list(range(10 + expected, 18)), expected)])
+                self.assertEqual(req.kv.cache_protected_len, expected)
+                self.assertEqual(pm.decode_prefix_len, expected)
+                if expected == 2:
+                    queue.tree_cache.prefetch_from_storage.assert_not_called()
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(
@@ -140,6 +293,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.req_to_token_pool = SimpleNamespace(mamba_allocator=None)
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
@@ -200,6 +354,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.req_to_token_pool = SimpleNamespace(mamba_allocator=None)
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
@@ -413,6 +568,30 @@ class TestDecodeQueueCleanup(CustomTestCase):
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, checkpoint=False
         )
+
+        # A successful P→D transfer cannot commit a failed local L3 promise.
+        receiver = FakeReceiver()
+        decode_req.kv_receiver = receiver
+        decode_req.hicache_restore_status = HiCacheRestoreResult.FAILED
+        queue.queue = [decode_req]
+        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
+        queue._clean_hicache_prefetch_resources.reset_mock()
+        mock_prepare_abort.reset_mock()
+        mock_release_kv_cache.reset_mock()
+        with patch.object(
+            queue, "_poll_with_metadata_gate", return_value=[KVPoll.Success]
+        ):
+            self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(queue.queue, [])
+        self.assertTrue(receiver.clear_called)
+        self.assertIsNone(decode_req.kv_receiver)
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        queue._clean_hicache_prefetch_resources.assert_called_once_with(decode_req)
+        mock_prepare_abort.assert_called_once()
+        mock_release_kv_cache.assert_called_once_with(
+            req, queue.tree_cache, is_insert=False
+        )
+        decode_req.hicache_restore_status = HiCacheRestoreResult.READY
 
         receiver = FakeReceiver()
         receiver.kv_mgr = FakeKVManager.__new__(FakeKVManager)
