@@ -4,11 +4,12 @@ import unittest
 
 from sglang.srt.layers.attention.dsa.prefill_tp_rows import shard_row_chunks
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestPrefillTPRows(unittest.TestCase):
+class TestPrefillTPRows(CustomTestCase):
     def test_chunks_reassemble_without_missing_or_duplicate_rows(self):
         for num_rows in (8, 17, 4097, 16384):
             for world_size in (2, 4, 8):
