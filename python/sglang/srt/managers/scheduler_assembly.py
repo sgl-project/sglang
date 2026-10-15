@@ -919,7 +919,6 @@ def assemble_scheduler(
         request_registry=request_registry,
         beam_coordinator=beam_coordinator,
         step_builder=step_builder,
-        hisparse_coordinator=mode_owners.hisparse_coordinator,
         request_retirer=request_retirer,
         grammar_manager=grammar_manager,
         metrics_sink=metrics_sink,

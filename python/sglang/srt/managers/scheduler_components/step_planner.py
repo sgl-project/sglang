@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.prefill_delayer import PrefillDelayer
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -195,7 +194,6 @@ class StepPlanner:
         request_registry: RequestRegistry,
         beam_coordinator: BeamCoordinator,
         step_builder: StepBuilder,
-        hisparse_coordinator: Optional[HiSparseCoordinator],
         request_retirer: RequestRetirer,
         grammar_manager: GrammarManager,
         metrics_sink: MetricsSink,
@@ -235,7 +233,7 @@ class StepPlanner:
         self.lora_admission = lora_admission
         self.beam_coordinator = beam_coordinator
         self.step_builder = step_builder
-        self.hisparse_coordinator = hisparse_coordinator
+        self.hisparse_coordinator = mode_owners.hisparse_coordinator
         self.request_retirer = request_retirer
         self.grammar_manager = grammar_manager
         self.metrics_sink = metrics_sink

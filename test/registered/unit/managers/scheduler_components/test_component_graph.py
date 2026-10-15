@@ -182,7 +182,6 @@ _DECLARED = {
         "RequestRegistry",
         "BeamCoordinator",
         "StepBuilder",
-        "HiSparse",
         "RequestRetirer",
         "GrammarManager",
         "MetricsSink",
