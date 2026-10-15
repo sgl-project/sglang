@@ -3005,6 +3005,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(

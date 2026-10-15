@@ -3931,18 +3931,20 @@ class Scheduler(
         num_held_rows: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        # Requests the caller counts that already hold a row (a continuing
-        # chunk, a session borrow) need no free one; give their rows back.
-        available = self.req_to_token_pool.available_size() + num_held_rows
-
+        # Rows the counted requests may occupy: the free rows, plus the rows that
+        # counted requests already hold (a continuing chunk, a session borrow),
+        # minus the rows promised to beam members.
         active_batch = running_batch or self.running_batch
-        available = max(
-            available - self.beam_coordinator.pending_member_rows(active_batch), 0
+        row_budget = max(
+            self.req_to_token_pool.available_size()
+            + num_held_rows
+            - self.beam_coordinator.pending_member_rows(active_batch),
+            0,
         )
-        res = min(pp_budget, available)
+        res = min(pp_budget, row_budget)
         if beam_width is not None:
             # A beam candidate owns beam_width rows once decoding.
-            res = min(res, available // beam_width)
+            res = min(res, row_budget // beam_width)
 
         return res
 
@@ -4011,11 +4013,9 @@ class Scheduler(
         ):
             return None, running_batch
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, a chunked request keeps its req_to_token row across chunks,
-        # so continuing it needs no free row.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        # A chunked request skips this check: it keeps its req_to_token row across
+        # chunks, and under PP it (or a dllm request) may finish in another
+        # microbatch, so holding it back here would leak its memory.
         if (
             self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
             and self.chunked_req is None
@@ -4101,6 +4101,10 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # A spent pass budget admits no one, even before the first
+            # candidate: the resumed chunk or mixed decode rows can spend it.
+            if adder.budget_state() == AddReqResult.OTHER:
+                break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4125,14 +4129,6 @@ class Scheduler(
                 num_held_rows=num_held_rows,
             ):
                 running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if (
-                    len(adder.can_run_list) - num_held_rows
-                    >= self.req_to_token_pool.available_size()
-                ):
-                    running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
