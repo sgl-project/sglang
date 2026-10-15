@@ -3951,14 +3951,10 @@ class Scheduler(
 
         return res
 
-    def _release_kept_mm_rows(self) -> None:
-        """Drop kept encoder rows once no request is between two prefill chunks."""
-        if self.chunked_req is None:
-            mm_schedule.release_prefill_rows()
-
     def _release_kept_mm_rows_dllm(self) -> None:
-        """Like _release_kept_mm_rows; dLLM requests encode their context over
-        several steps without becoming chunked_req."""
+        """Drop kept encoder rows unless a dLLM request is part-way through its
+        context; dLLM requests encode it over several steps without becoming
+        chunked_req."""
         dllm = self.dllm_manager
         if not any(
             req.dllm_phase == DllmReqPhase.STAGING_PREFILL and req.prefix_len > 0
@@ -3968,8 +3964,10 @@ class Scheduler(
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         # Every prefill loop passes here after dropping chunked requests and
-        # before add_chunked_req ends the current one.
-        self._release_kept_mm_rows()
+        # before add_chunked_req ends the current one: drop kept encoder rows
+        # once no request is between two prefill chunks.
+        if self.chunked_req is None:
+            mm_schedule.release_prefill_rows()
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -5750,8 +5748,9 @@ class Scheduler(
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
-        # Paused loops skip scheduling, so drop the rows here.
-        self._release_kept_mm_rows()
+        # Paused loops skip scheduling, so drop the kept encoder rows here.
+        if self.chunked_req is None:
+            mm_schedule.release_prefill_rows()
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,
