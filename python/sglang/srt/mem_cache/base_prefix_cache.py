@@ -676,10 +676,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # nothing deeper than the tail to protect.
         return None
 
-    def swa_reprefill_tail_tokens(self) -> int:
-        # Only the unified_kv compress-only HiCache layout needs to hold back a
-        # trailing sliding window for re-prefill; every other cache keeps SWA
-        # content-stable and overrides this where relevant.
+    def swa_reprefill_tail_tokens(self, req=None) -> int:
+        # Only caches whose matched SWA is not reusable as is (the unified_kv
+        # ring, decoder bounded replay) hold back a trailing window for
+        # re-prefill; they override this. req is the request being matched.
         return 0
 
     def supports_mamba(self) -> bool:

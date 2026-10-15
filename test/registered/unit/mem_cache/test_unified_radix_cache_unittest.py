@@ -12275,6 +12275,29 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         self.assertNotIn("s", cache.session.slots)
         cache.sanity_check()
 
+    def test_bounded_replay_turn_borrows_record_without_hold_back(self):
+        """Under decoder SWA bounded replay a short turn still borrows its whole
+        record: the record's last window is the request's own, already written.
+        A one-window hold-back would end the match inside the published prompt,
+        which the slot cannot rewind."""
+        cache, allocator, pool = build_fixture(
+            replace(self.cfg, decoder_swa_bounded_replay=True)
+        )
+        session = self._session("s")
+        first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
+        cache.maybe_hand_to_session(first)
+        cache.checkpoint(first, up_to=8)
+        first.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(first))
+
+        req = self._turn(list(range(1, 11)), session)
+        req.init_next_round_input(cache)
+        self.assertIn("s", cache.session.slots)
+        self.assertEqual(req.prefix_len, 8)
+
+        cache.session.release_session("s")
+        cache.sanity_check()
+
 
 class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
     """Decoder SWA bounded replay attends over only the last window of each
@@ -12289,7 +12312,7 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
         req.init_next_round_input(cache)
-        return len(req.prefix_indices)
+        return req.prefix_len
 
     def test_match_stops_one_window_short_under_bounded_replay(self):
         cfg = CacheConfig(

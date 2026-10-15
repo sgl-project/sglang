@@ -3601,7 +3601,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def sliding_window_size(self):
         return self._sliding_window_size
 
-    def swa_reprefill_tail_tokens(self) -> int:
+    def swa_reprefill_tail_tokens(self, req=None) -> int:
         """
         unified_kv needs this: SWA lives in a per-request ring
         (state_slot/pos), not content-stable and never stored in the tree, so a
@@ -3609,15 +3609,15 @@ class UnifiedRadixCache(BasePrefixCache):
         stale ring slots. Re-prefilling that window rewrites this request's ring.
 
         Applies to plain radix reuse as well as HiCache -- the ring is stale
-        either way. Returns 0 once SWA has a host pool to restore exact contents
-        from, and for every non-unified_kv layout, whose SWA slots are
-        content-stable.
+        either way. Without decoder bounded replay, returns 0 once SWA has a host
+        pool to restore exact contents from, and for every non-unified_kv layout,
+        whose SWA slots are content-stable.
 
-        DeepSeek-V4.1 decoder SWA bounded replay needs it too: late-layer window
-        KV is written only for the tail rows of an extend, and the cache cannot
-        differentiate which rows of a matched prefix were tails, so the layers
-        after the last kv_source layer have no usable window KV in the prefix.
-        Holding one window back keeps every hit extend at least a window long.
+        DeepSeek-V4.1 decoder SWA bounded replay writes late-layer window KV only
+        for an extend's tail rows, so a matched prefix may lack it; holding one
+        window back keeps every hit extend at least a window long. A streaming
+        turn that borrows its session's record needs no hold-back: that record
+        is the request's own KV, whose last window is written.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -3626,7 +3626,7 @@ class UnifiedRadixCache(BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0
-        if self.decoder_swa_bounded_replay:
+        if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
             return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0
