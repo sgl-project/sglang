@@ -374,6 +374,11 @@ pub struct GenerateRequest {
     pub video_data: ::core::option::Option<MediaInput>,
     #[prost(message, optional, tag = "22")]
     pub audio_data: ::core::option::Option<MediaInput>,
+    /// Prefix-cache namespace: requests share cached prefixes only under the same
+    /// key. One key for every batch item, or one per item; an empty key means
+    /// none.
+    #[prost(message, optional, tag = "23")]
+    pub extra_key: ::core::option::Option<StringOrList>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParamsOrList {
