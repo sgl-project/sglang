@@ -4085,6 +4085,8 @@ dependencies = [
 [[package]]
 name = "toktier"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4d0207ec9a27931528a8e4c24bfa3abe54e04e99bb11275a507aa7a650d9c28"
 dependencies = [
  "flate2",
  "fs2",
@@ -4102,6 +4104,8 @@ dependencies = [
 [[package]]
 name = "toktier-cuda-driver"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ba269f9fee6d1d0b0c4fc5892d88abaa979a1f41ac44f72d5b2439ac7e29931"
 dependencies = [
  "libc",
 ]
@@ -4109,6 +4113,8 @@ dependencies = [
 [[package]]
 name = "toktier-gigatoken-core"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e597c8d020aa707ea5b63df63a76b3a28793b9bad196884331103f73e702bff"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -4129,6 +4135,8 @@ dependencies = [
 [[package]]
 name = "toktier-routing-core"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32f2fa5d00c0b2f178ff20acebd2256864e1a393345dfcdbb3ff48a209c1470c"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -4146,6 +4154,8 @@ dependencies = [
 [[package]]
 name = "toktier-store-core"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22d643e0899ffe924ca633edfe79eb3e809891d2c8a572a78c28154fb0b90918"
 dependencies = [
  "blake2b_simd",
  "sha2 0.11.1",

@@ -66,10 +66,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 
 # Session-delta encoding behind the `toktier` feature. CPU only: no prebuilt
 # CUDA kernels, no SQLite session persistence.
-# TODO(toktier 0.3.0): a local snapshot of the 0.3.0 release branch (dev-030-rc
-# d157952) until 0.3.0 is on crates.io; the published line is
-# `toktier = { version = "0.3", default-features = false, features = ["serving"], optional = true }`.
-toktier = { path = "../../../../toktier_d157952/crates/toktier", version = "0.3.0", default-features = false, features = ["serving"], optional = true }
+toktier = { version = "0.3", default-features = false, features = ["serving"], optional = true }
 
 # Tokenizer auto-download from HuggingFace when --tokenizer-path is omitted.
 # Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so
