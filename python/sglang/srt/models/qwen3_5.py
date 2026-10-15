@@ -150,6 +150,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     make_pp_layers,
+    print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -1028,8 +1029,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+            use_strided_prefill_z = _is_cuda and (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or (
+                    forward_batch.forward_mode.is_target_verify()
+                    and envs.SGLANG_Q35MF_GDN_VIEWS.get()
+                )
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1088,6 +1093,38 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
+        if (
+            _is_cuda
+            and forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_Q35MF_GDN_NORM_FP8.get()
+        ):
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                ModelOptFp8LinearMethod,
+            )
+
+            method = self.out_proj.quant_method
+            if (
+                isinstance(method, ModelOptFp8LinearMethod)
+                and not method.use_marlin
+                and not method.use_sm120_fp8
+                and self.out_proj.input_scale.numel() == 1
+                and core_attn_out.dtype == torch.bfloat16
+            ):
+                (fp8, _), _, _ = _layer_norm_fwd(
+                    core_attn_out,
+                    self.norm.weight,
+                    None,
+                    self.norm.eps,
+                    z=z,
+                    is_rms_norm=True,
+                    activation=self.norm.activation,
+                    static_quant_scale=self.out_proj.input_scale,
+                )
+                fp8 = fp8.reshape(-1, nv * self.head_v_dim)
+                return self.out_proj(fp8)[0]
+            print_warning_once(
+                "GDN static FP8 norm is unsupported; using the original path"
+            )
         if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,

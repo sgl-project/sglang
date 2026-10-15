@@ -3,6 +3,7 @@
 # Copyright (c) 2024, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+# Modified by NVIDIA: expose output layout and channel tiling for verify.
 
 from typing import List, Optional, Union
 
@@ -1035,6 +1036,8 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    token_major_out=False,
+    block_n=256,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1097,7 +1100,13 @@ def causal_conv1d_update(
         assert cache_seqlens is None  # not needed for vLLM - circular buffer
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
-    out = torch.empty_like(x)
+    out = (
+        torch.empty((batch, seqlen, dim), dtype=x.dtype, device=x.device).transpose(
+            1, 2
+        )
+        if token_major_out
+        else torch.empty_like(x)
+    )
     stride_w_dim, stride_w_width = weight.stride()
 
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
@@ -1221,7 +1230,7 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=block_n,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         **pdl_kwargs,

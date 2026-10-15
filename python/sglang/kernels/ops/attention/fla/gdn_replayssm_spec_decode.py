@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Modified by NVIDIA: add an optional forward substitution for verify deltas.
 """ReplaySSM speculative-decode verify kernel for GDN (Gated DeltaNet).
 
 Ported from the vLLM ReplaySSM reference implementation
@@ -1081,6 +1082,8 @@ def _launch_gdn_spec(
     bs_min,
     null_block_id,
     dot_precision,
+    direct_solve=False,
+    history_stats=None,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1111,8 +1114,22 @@ def _launch_gdn_spec(
     rawk_buf = rawk_cache if rawk_cache is not None else k_cache
     beta_buf = beta_cache if beta_cache is not None else g_cache
 
+    kernel = gdn_replayssm_spec_circular_kernel
+    solve_options = {}
+    if direct_solve or history_stats is not None:
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_verify_direct import (
+            gdn_replayssm_verify_direct_kernel,
+        )
+
+        kernel = gdn_replayssm_verify_direct_kernel
+        solve_options = dict(
+            DIRECT_SOLVE=direct_solve,
+            SPEC_TOKENS=max_spec_len,
+            CHECK_EMPTY_HISTORY=history_stats is not None,
+            HISTORY_STATS=history_stats,
+        )
     grid = (triton.cdiv(V, BV), B, HV)
-    gdn_replayssm_spec_circular_kernel[grid](
+    kernel[grid](
         q,
         k,
         v,
@@ -1171,6 +1188,7 @@ def _launch_gdn_spec(
         IS_FLUSH=is_flush_kernel,
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION=dot_precision,
+        **solve_options,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1276,6 +1294,8 @@ def gdn_replayssm_spec_decode(
     launch_mode: str = "both",
     # Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
+    direct_solve: bool = False,
+    history_stats: torch.Tensor | None = None,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1363,6 +1383,8 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
+            direct_solve,
+            history_stats,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -1399,6 +1421,8 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
+            direct_solve,
+            history_stats,
         )
     return out
 

@@ -1877,7 +1877,13 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_Q35MF_GDN_VIEWS = EnvBool(False)
+    SGLANG_Q35MF_GDN_LAZY_VALID = EnvBool(False)
+    SGLANG_Q35MF_GDN_CONV_TILE = EnvBool(False)
     SGLANG_Q35MF_GDN_TILED_VERIFY = EnvBool(False)
+    SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
+    SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
+    SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
 
     # ===================================================================
     # Plugin system

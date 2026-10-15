@@ -24,9 +24,19 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_exec,
+    get_memory,
+    get_resources,
+    get_schedule,
+)
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import is_pin_memory_available, rank0_log
+from sglang.srt.utils.common import (
+    is_pin_memory_available,
+    print_warning_once,
+    rank0_log,
+)
 
 _is_hip = is_hip()
 
@@ -52,6 +62,18 @@ _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get(
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
+
+
+def gdn_verify_history_stats():
+    """Read optional verify counters when an explicit diagnostic requests them."""
+    result = {}
+    for name, counts in get_resources().buffers.items():
+        if name.startswith("gdn.verify.history_stats."):
+            with torch.cuda.device(counts.device):
+                torch.cuda.synchronize(counts.device)
+                fast, fallback = counts.cpu().tolist()
+            result[name] = dict(fast=fast, fallback=fallback)
+    return result
 
 
 class GDNMISMetadata(msgspec.Struct, frozen=True):
@@ -525,6 +547,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
+        self.gdn_verify_history_stats = (
+            get_buffer(
+                f"gdn.verify.history_stats.{model_runner.device}",
+                lambda: torch.zeros(2, device=model_runner.device, dtype=torch.int64),
+            )
+            if envs.SGLANG_Q35MF_GDN_EMPTY_HISTORY.get()
+            else None
+        )
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -991,12 +1021,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = select_verify_intermediate_state_indices(
-                self.verify_intermediate_state_indices,
-                forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-                self.req_to_token_pool.size,
-            )
+            if (
+                envs.SGLANG_Q35MF_GDN_LAZY_VALID.get()
+                and not pp_spec_stable_rows_enabled()
+            ):
+                intermediate_state_indices = self.verify_intermediate_state_indices
+            else:
+                intermediate_state_indices = select_verify_intermediate_state_indices(
+                    self.verify_intermediate_state_indices,
+                    forward_batch.req_pool_indices,
+                    cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                    self.req_to_token_pool.size,
+                )
             mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
@@ -1057,6 +1093,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
+                token_major_out=envs.SGLANG_Q35MF_GDN_VIEWS.get(),
+                block_n=128 if envs.SGLANG_Q35MF_GDN_CONV_TILE.get() else 256,
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
@@ -1487,8 +1525,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
         max_cache_len = d_cache.shape[-2]  # ring length L
         out = q.new_empty(seq_len, HV, V)
         verify_options = {}
-        if envs.SGLANG_Q35MF_GDN_TILED_VERIFY.get():
-            verify_options = dict(block_v=32, num_warps=2)
+        tiled_verify = envs.SGLANG_Q35MF_GDN_TILED_VERIFY.get()
+        direct_solve = envs.SGLANG_Q35MF_GDN_DIRECT_SOLVE.get()
+        empty_history = envs.SGLANG_Q35MF_GDN_EMPTY_HISTORY.get()
+        if tiled_verify or direct_solve or empty_history:
+            if (
+                q.is_cuda
+                and q.dtype == torch.bfloat16
+                and layer_cache.temporal.dtype == torch.bfloat16
+                and K == V == 128
+                and max_cache_len == 16
+                and draft_token_num <= 8
+            ):
+                verify_options = dict(
+                    block_v=16 if direct_solve else 32,
+                    num_warps=2,
+                    direct_solve=direct_solve,
+                )
+                if empty_history:
+                    verify_options["history_stats"] = self.gdn_verify_history_stats
+            else:
+                print_warning_once(
+                    "GDN verify tiling is unsupported; using the original path"
+                )
         gdn_replayssm_spec_decode(
             q=q,
             k=k,

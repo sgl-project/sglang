@@ -4,6 +4,7 @@
 # For the backward pass, we keep weight_grad and bias_grad in registers and accumulate.
 # This backward pass is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
+# Modified by NVIDIA: add static FP8 output after activation-dtype rounding.
 
 
 from contextlib import nullcontext
@@ -101,6 +102,7 @@ def _layer_norm_fwd_1pass_kernel(
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
+    STATIC_QUANT: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -195,7 +197,12 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
-    if QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
+    if STATIC_QUANT:
+        y = y.to(Y.dtype.element_ty).to(tl.float32)
+        y_s = tl.load(S).to(tl.float32)
+        y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
+        tl.store(Q + rows[:, None] * stride_y_row + col_offsets, y_q, mask=mask)
+    elif QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
         y = tl.where(mask, y.to(Y.dtype.element_ty).to(tl.float32), 0.0)
         y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
         y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
@@ -243,6 +250,7 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
     quant_heads: int = 0,
+    static_quant_scale=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -285,6 +293,11 @@ def _layer_norm_fwd(
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
     quant = {}
+    if static_quant_scale is not None:
+        assert not quant_heads and static_quant_scale.numel() == 1
+        q = torch.empty_like(out, dtype=torch.float8_e4m3fn)
+        s = static_quant_scale
+        quant = {"Q": q, "S": s, "STATIC_QUANT": True}
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:
         assert ngroups == 1 and M % quant_heads == 0
@@ -345,7 +358,11 @@ def _layer_norm_fwd(
             **pdl_kwargs,
             **quant,
         )
-    return ((q, s) if quant_heads else out), mean, rstd
+    return (
+        ((q, s) if quant_heads or static_quant_scale is not None else out),
+        mean,
+        rstd,
+    )
 
 
 if _is_npu:
