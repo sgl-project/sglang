@@ -27,17 +27,8 @@ _LENGTH_FIELDS = {
 _DICT_MUTATORS = {"clear", "pop", "popitem", "setdefault", "update"}
 
 # {(path relative to python/sglang, enclosing scope): reason}. Expected to
-# stay empty or shrink.
-_ALLOWED_WRITERS = {
-    (
-        "srt/mem_cache/unified_cache/unified_cache_linker.py",
-        "UnifiedCacheLinkerWrapper.load_back",
-    ): "builds a record when req.kv is None, which a Req never has",
-    (
-        "srt/mem_cache/unified_cache/components/swa.py",
-        "SWAComponent.update_external_linker_load",
-    ): "builds a record when req.kv is None, which a Req never has",
-}
+# stay empty.
+_ALLOWED_WRITERS: dict[tuple[str, str], str] = {}
 
 
 def _writes(node):

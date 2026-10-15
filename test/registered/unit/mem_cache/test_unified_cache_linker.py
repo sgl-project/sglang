@@ -1343,7 +1343,7 @@ def test_linker_load_preserves_swa_boundaries(
         device_hit_len=0,
     )
     kv = (
-        None
+        ReqKvInfo()
         if previous_boundary is None
         else ReqKvInfo(
             kv_allocated_len=previous_boundary,
@@ -1376,7 +1376,8 @@ def test_linker_load_preserves_swa_boundaries(
     assert torch.equal(wrapper.private_load_indices["rid"], restored)
     assert req.swa_branching_seqlen is None
     assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
-    assert req.kv.kv_allocated_len == (previous_boundary or 4)
+    # Only a participating SWA component's PREPARE replaces the record.
+    assert req.kv.kv_allocated_len == (previous_boundary or (4 if participates else 0))
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
     ]
