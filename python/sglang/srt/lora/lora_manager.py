@@ -117,6 +117,7 @@ class LoRAManager:
                 f"size {get_parallel().attn_cp_size})"
             )
         self.pending_lora_load_events = {}
+        self.lora_unmerge_mode = get_lora().lora_unmerge_mode
         self.merged_lora_id: Optional[str] = None
         self.merged_lora_weights: list[tuple[torch.Tensor, torch.Tensor]] = []
 

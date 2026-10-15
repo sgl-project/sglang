@@ -38,6 +38,8 @@ def check_lora_server_args(server_args: Any):
             raise ValueError("LoRA merging requires the Python frontend")
         if not cfg.enable_lora:
             raise ValueError("--enable-lora-merge requires --enable-lora")
+        if cfg.lora_unmerge_mode not in ("restore", "subtract"):
+            raise ValueError("--lora-unmerge-mode must be 'restore' or 'subtract'")
         if (
             cfg.dp_size != 1
             or cfg.pp_size != 1

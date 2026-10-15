@@ -29,6 +29,7 @@ MODEL = os.environ.get("SGLANG_LORA_MERGE_MODEL", "Qwen/Qwen3-0.6B")
 TP = int(os.environ.get("SGLANG_LORA_MERGE_TP", "1"))
 BACKEND = os.environ.get("SGLANG_LORA_MERGE_BACKEND", "triton")
 PREFILL_BACKEND = os.environ.get("SGLANG_LORA_MERGE_PREFILL", "disabled")
+UNMERGE_MODE = os.environ.get("SGLANG_LORA_UNMERGE_MODE", "restore")
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 URL = "http://127.0.0.1:30000"
 
@@ -119,6 +120,8 @@ class TestLoRAMerge(CustomTestCase):
             args = [
                 "--enable-lora",
                 "--enable-lora-merge",
+                "--lora-unmerge-mode",
+                UNMERGE_MODE,
                 "--lora-backend",
                 BACKEND,
                 "--lora-paths",
@@ -163,6 +166,7 @@ class TestLoRAMerge(CustomTestCase):
                 "tp": TP,
                 "backend": BACKEND,
                 "prefill_backend": PREFILL_BACKEND,
+                "unmerge_mode": UNMERGE_MODE,
             }
             try:
                 base = post("/generate", request)
@@ -202,6 +206,8 @@ class TestLoRAMerge(CustomTestCase):
                     post("/generate", dict(request, lora_path="b"), success=False)
                     post("/unload_lora_adapter", {"lora_name": "a"}, success=False)
                     merged = post("/generate", dict(request, lora_path="a"))
+                    if cycle == 0:
+                        first_merged = merged
                     difference = (
                         input_logprobs(merged) - input_logprobs(adapted)
                     ).abs()
@@ -250,21 +256,39 @@ class TestLoRAMerge(CustomTestCase):
                             future.result()["meta_info"]["completion_tokens"], 128
                         )
                     restored = post("/generate", request)
-                    torch.testing.assert_close(
-                        input_logprobs(restored), input_logprobs(base), rtol=0, atol=0
-                    )
-                    self.assertEqual(restored["output_ids"], base["output_ids"])
+                    restore_difference = (
+                        input_logprobs(restored) - input_logprobs(base)
+                    ).abs()
+                    if UNMERGE_MODE == "restore":
+                        torch.testing.assert_close(
+                            input_logprobs(restored),
+                            input_logprobs(base),
+                            rtol=0,
+                            atol=0,
+                        )
+                        self.assertEqual(restored["output_ids"], base["output_ids"])
+                    else:
+                        # Subtraction is approximate. Record its error and catch
+                        # gross mistakes such as leaving the adapter merged.
+                        self.assertLess(restore_difference.mean().item(), 0.03)
+                        self.assertLess(restore_difference.max().item(), 0.25)
                     post("/flush_cache")
                     again = post("/generate", dict(request, lora_path="a"))
-                    torch.testing.assert_close(
-                        input_logprobs(again), input_logprobs(adapted), rtol=0, atol=0
-                    )
+                    if UNMERGE_MODE == "restore":
+                        torch.testing.assert_close(
+                            input_logprobs(again),
+                            input_logprobs(adapted),
+                            rtol=0,
+                            atol=0,
+                        )
                     transitions.append(
                         {
                             "merge_s": merge_s,
                             "drain_and_unmerge_s": drain_and_unmerge_s,
                             "mean_logprob_delta": difference.mean().item(),
                             "max_logprob_delta": difference.max().item(),
+                            "restore_mean_logprob_delta": restore_difference.mean().item(),
+                            "restore_max_logprob_delta": restore_difference.max().item(),
                         }
                     )
                 # A second adapter must also merge correctly after restoration.
@@ -315,7 +339,14 @@ class TestLoRAMerge(CustomTestCase):
             # a fresh SGLang server. This keeps attention and normalization
             # kernels the same on both sides of the correctness comparison.
             metrics["peft_reference"] = {}
-            for name, actual in [("a", merged), ("b", merged_b)]:
+            # Only the first merge starts from the original checkpoint in
+            # subtraction mode; later merges include round-trip error.
+            references = (
+                [("a", first_merged)]
+                if UNMERGE_MODE == "subtract"
+                else [("a", merged), ("b", merged_b)]
+            )
+            for name, actual in references:
                 model = AutoModelForCausalLM.from_pretrained(
                     MODEL, torch_dtype=torch.bfloat16
                 )

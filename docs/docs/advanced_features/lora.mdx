@@ -14,6 +14,7 @@ The following server arguments are relevant for multi-LoRA serving:
 * `enable_lora`: Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.
 
 * `enable_lora_merge`: Enable the merge/unmerge endpoints and capture decode graphs without LoRA kernels. See [Merge an adapter into a replica](#merge-an-adapter-into-a-replica) for memory requirements and restrictions.
+* `lora_unmerge_mode`: `restore` (default) saves original affected weights on CPU for exact restoration. `subtract` keeps no backup and subtracts the adapter update on unmerge, allowing rounding error.
 
 * `enable_lora_overlap_loading`: Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.
 
@@ -70,17 +71,24 @@ a merge for the same adapter, or unmerging an already unmerged replica, succeeds
 without changing the weights.
 
 Merge computes the dense update in FP32 and writes it into the existing weight
-storage. A GPU copy of each affected base-weight slice is retained until unmerge,
-which restores it exactly. Provision memory for these copies; merging an adapter
-that targets every linear layer can require nearly another model's worth of
-weight memory. Lower `--mem-fraction-static` if needed. A failed allocation
-restores the unmerged state on every tensor-parallel rank.
+storage. By default, a pinned CPU copy of each affected base-weight slice is
+retained until unmerge, which copies it back exactly. These snapshots require
+host memory proportional to the adapted base weights, with no persistent GPU
+backup. Merge still needs temporary GPU memory for FP32 arithmetic on individual
+weight slices. A failed merge restores the unmerged state across tensor-parallel ranks.
+
+Set `--lora-unmerge-mode subtract` to keep no base-weight backup. Unmerge then
+subtracts the scaled adapter update with `addmm_`. BF16/FP16 rounding means this
+does not restore the base weights exactly, and repeated transitions can accumulate
+error. A failure during a partial merge without a backup stops the workers rather
+than serving partially modified weights.
 
 Merged decode uses a separately captured graph without LoRA kernels. Merged
 prefill runs eagerly. The flag adds graph capture work at startup; transitions
 do not recapture graphs. Merge and unmerge flush the replica's prefix cache,
 including recurrent state, because BF16/FP16 merged execution can round differently
-from the unmerged computation. Unmerge does not accumulate rounding error.
+from the unmerged computation. The default `restore` mode does not accumulate
+rounding error on unmerge.
 
 This implementation supports unquantized dense linear adapters, fused QKV/MLP
 projections, and tensor parallelism. Expert layers, embedding/LM-head adapters,

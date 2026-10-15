@@ -11,7 +11,11 @@ import torch
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.lora.layers import QKVParallelLinearWithLoRA, RowParallelLinearWithLoRA
-from sglang.srt.lora.merge import merge_weights, unmerge_weights
+from sglang.srt.lora.merge import (
+    LoRAMergeUnrecoverableError,
+    merge_weights,
+    unmerge_weights,
+)
 from sglang.srt.managers.io_struct import LoRAMergeOutput, MergeLoRAWeightsReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
@@ -22,7 +26,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def make_manager(fused=False):
+def make_manager(fused=False, unmerge_mode="restore", device="cpu"):
     torch.manual_seed(123)
     rank, max_rank, in_dim = 3, 8, 7
     sizes = [6, 2, 2] if fused else [9]
@@ -32,15 +36,15 @@ def make_manager(fused=False):
     torch.nn.Module.__init__(module)
     module.base_layer = torch.nn.Module()
     module.base_layer.weight = torch.nn.Parameter(
-        torch.randn(sum(sizes), in_dim).bfloat16()
+        torch.randn(sum(sizes), in_dim, device=device).bfloat16()
     )
     module.base_layer.quant_method = UnquantizedLinearMethod()
     offsets = [0]
     for size in sizes:
         offsets.append(offsets[-1] + size)
     module.output_offset_cpu = torch.tensor(offsets)
-    a = torch.randn(1, max_rank * len(sizes), in_dim).bfloat16()
-    b = torch.randn(1, sum(sizes), max_rank).bfloat16()
+    a = torch.randn(1, max_rank * len(sizes), in_dim, device=device).bfloat16()
+    b = torch.randn(1, sum(sizes), max_rank, device=device).bfloat16()
     pool = SimpleNamespace(
         target_modules={target},
         max_lora_rank=max_rank,
@@ -62,6 +66,7 @@ def make_manager(fused=False):
         fetch_new_loras=Mock(),
         reset_lora_batch=Mock(),
         pending_lora_load_events={},
+        lora_unmerge_mode=unmerge_mode,
         merged_lora_id=None,
         merged_lora_weights=[],
     )
@@ -88,11 +93,97 @@ class TestMergeArithmetic(unittest.TestCase):
             )
             for _ in range(10):
                 merge_weights(manager, "a")
+                for source, backup in manager.merged_lora_weights:
+                    self.assertEqual(backup.device.type, "cpu")
+                    self.assertNotEqual(source.data_ptr(), backup.data_ptr())
                 torch.testing.assert_close(weight, expected.bfloat16(), rtol=0, atol=0)
                 self.assertEqual(weight.data_ptr(), address)
                 unmerge_weights(manager)
                 self.assertTrue(torch.equal(weight, original))
             self.assertEqual(manager.merged_lora_weights, [])
+
+    def test_subtraction_keeps_no_backup_and_uses_scaled_fused_slices(self):
+        for fused in (False, True):
+            manager, weight, a, b, offsets = make_manager(fused, "subtract")
+            original = weight.detach().clone()
+            address = weight.data_ptr()
+            merge_weights(manager, "a")
+            self.assertEqual(manager.merged_lora_weights, [])
+            expected = weight.detach().clone()
+            for i, (start, end) in enumerate(zip(offsets, offsets[1:])):
+                expected[start:end].addmm_(
+                    b[0, start:end, :3], a[0, i * 3 : (i + 1) * 3], alpha=-0.7
+                )
+            unmerge_weights(manager)
+            torch.testing.assert_close(weight, expected, rtol=0, atol=0)
+            self.assertFalse(torch.equal(weight, original))
+            self.assertEqual(weight.data_ptr(), address)
+            self.assertIsNone(manager.merged_lora_id)
+            unmerge_weights(manager)  # Must not subtract twice.
+            torch.testing.assert_close(weight, expected, rtol=0, atol=0)
+
+    def test_partial_merge_without_backup_requires_restart(self):
+        manager, *_ = make_manager(True, "subtract")
+        addmm = torch.addmm
+        with patch(
+            "sglang.srt.lora.merge.torch.addmm",
+            side_effect=[
+                addmm(torch.ones(6, 7), torch.ones(6, 3), torch.ones(3, 7)),
+                RuntimeError("injected failure"),
+            ],
+        ):
+            with self.assertRaisesRegex(
+                LoRAMergeUnrecoverableError, "without a base-weight backup"
+            ):
+                merge_weights(manager, "a")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_cuda_backups_stay_on_cpu_and_restore_exactly(self):
+        manager, weight, *_ = make_manager(True, device="cuda")
+        original = weight.detach().clone()
+        for _ in range(3):
+            merge_weights(manager, "a")
+            torch.cuda.synchronize()
+            for source, backup in manager.merged_lora_weights:
+                self.assertEqual(backup.device.type, "cpu")
+                self.assertTrue(backup.is_pinned())
+                self.assertNotEqual(source.data_ptr(), backup.data_ptr())
+            unmerge_weights(manager)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(weight, original, rtol=0, atol=0)
+
+    def test_unrecoverable_failure_on_any_rank_stops_tensor_parallel_group(self):
+        manager, *_ = make_manager(True, "subtract")
+        scheduler = SimpleNamespace(
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(lora_manager=manager)
+            ),
+            is_fully_idle=lambda: True,
+            weight_updater=SimpleNamespace(_session=None),
+        )
+        group = SimpleNamespace(
+            all_gather_object=Mock(
+                side_effect=[
+                    [None, None],
+                    [(None, False), ("partial merge failed", True)],
+                ]
+            )
+        )
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_lora",
+                return_value=SimpleNamespace(enable_lora_merge=True),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=SimpleNamespace(tp_group=group),
+            ),
+            patch("sglang.srt.managers.scheduler.torch.cuda.synchronize"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unsafe to serve"):
+                Scheduler.merge_lora_weights(
+                    scheduler, MergeLoRAWeightsReqInput(lora_name="a", lora_id="a")
+                )
 
     def test_failure_restores_already_changed_slices(self):
         manager, weight, *_ = make_manager(True)
@@ -125,7 +216,10 @@ class TestMergeArithmetic(unittest.TestCase):
         )
         group = SimpleNamespace(
             all_gather_object=Mock(
-                side_effect=[[None, None], [None, "rank 1 allocation failed"]]
+                side_effect=[
+                    [None, None],
+                    [(None, False), ("rank 1 allocation failed", False)],
+                ]
             )
         )
         with (
@@ -157,12 +251,27 @@ class TestMergeArithmetic(unittest.TestCase):
 
 
 class TestMergeConfiguration(unittest.TestCase):
+    def test_rejects_invalid_unmerge_mode_from_python_api(self):
+        config = SimpleNamespace(
+            max_loras_per_batch=8,
+            lora_paths=None,
+            enable_lora=True,
+            enable_lora_merge=True,
+            lora_unmerge_mode="invalid",
+        )
+        with patch(
+            "sglang.srt.arg_groups.lora_hook.resolving_view", return_value=config
+        ):
+            with self.assertRaisesRegex(ValueError, "lora-unmerge-mode"):
+                check_lora_server_args(config)
+
     def test_rejects_shared_weights_and_external_caches(self):
         base = dict(
             max_loras_per_batch=8,
             lora_paths=None,
             enable_lora=True,
             enable_lora_merge=True,
+            lora_unmerge_mode="restore",
             dp_size=1,
             pp_size=1,
             attn_dp_size=1,

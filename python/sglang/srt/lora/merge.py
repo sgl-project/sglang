@@ -19,6 +19,10 @@ if TYPE_CHECKING:
     from sglang.srt.lora.lora_manager import LoRAManager
 
 
+class LoRAMergeUnrecoverableError(RuntimeError):
+    """A failed transition left weights unsafe to serve."""
+
+
 def merge_slices(manager: "LoRAManager", lora_id: str):
     """Use the same TP shards, padded ranks, and fused slices as unmerged LoRA."""
     adapter = manager.loras[lora_id]
@@ -84,9 +88,14 @@ def merge_weights(manager: "LoRAManager", lora_id: str):
     manager.pending_lora_load_events.clear()
     manager.fetch_new_loras({lora_id})
     slices = merge_slices(manager, lora_id)
-    # Allocate every restore copy before changing any weight. Keeping these on
-    # device makes unmerge a copy, and avoids BF16 drift from subtracting B @ A.
-    originals = [(weight, weight.clone()) for weight, _, _ in slices]
+    # Allocate every CPU snapshot before mutation. Copies use the compute stream,
+    # so each snapshot finishes before its source weight is overwritten.
+    originals = []
+    if manager.lora_unmerge_mode == "restore":
+        for weight, _, _ in slices:
+            original = torch.empty_like(weight, device="cpu", pin_memory=weight.is_cuda)
+            original.copy_(weight, non_blocking=True)
+            originals.append((weight, original))
     precision = torch.get_float32_matmul_precision()
     try:
         torch.set_float32_matmul_precision("highest")
@@ -98,9 +107,20 @@ def merge_weights(manager: "LoRAManager", lora_id: str):
                 alpha=manager.loras[lora_id].scaling,
             )
             weight.copy_(merged)
-    except Exception:
-        for weight, original in originals:
-            weight.copy_(original)
+    except Exception as e:
+        if manager.lora_unmerge_mode == "subtract":
+            raise LoRAMergeUnrecoverableError(
+                f"LoRA merge failed without a base-weight backup: {e}"
+            ) from e
+        try:
+            for weight, original in originals:
+                weight.copy_(original, non_blocking=True)
+            if originals[0][0].is_cuda:
+                torch.cuda.current_stream(originals[0][0].device).synchronize()
+        except Exception as restore_error:
+            raise LoRAMergeUnrecoverableError(
+                f"LoRA merge rollback failed: {restore_error}"
+            ) from restore_error
         raise
     finally:
         torch.set_float32_matmul_precision(precision)
@@ -111,8 +131,15 @@ def merge_weights(manager: "LoRAManager", lora_id: str):
 
 @torch.no_grad()
 def unmerge_weights(manager: "LoRAManager"):
-    for weight, original in manager.merged_lora_weights:
-        weight.copy_(original)
+    if manager.merged_lora_id is None:
+        return
+    if manager.lora_unmerge_mode == "subtract":
+        scaling = manager.loras[manager.merged_lora_id].scaling
+        for weight, a, b in merge_slices(manager, manager.merged_lora_id):
+            weight.addmm_(b, a, alpha=-scaling)
+    else:
+        for weight, original in manager.merged_lora_weights:
+            weight.copy_(original, non_blocking=True)
     manager.merged_lora_weights.clear()
     manager.merged_lora_id = None
     manager.reset_lora_batch()

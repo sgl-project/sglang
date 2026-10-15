@@ -117,7 +117,11 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.lora.merge import merge_weights, unmerge_weights
+from sglang.srt.lora.merge import (
+    LoRAMergeUnrecoverableError,
+    merge_weights,
+    unmerge_weights,
+)
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -5880,6 +5884,7 @@ class Scheduler(
             return LoRAMergeOutput(
                 success=False, error_message="; ".join(e for e in errors if e)
             )
+        unrecoverable = False
         try:
             if isinstance(recv_req, MergeLoRAWeightsReqInput):
                 if manager.merged_lora_id != recv_req.lora_id:
@@ -5887,15 +5892,20 @@ class Scheduler(
             else:
                 unmerge_weights(manager)
             torch.cuda.synchronize()
+        except LoRAMergeUnrecoverableError as e:
+            error = str(e)
+            unrecoverable = True
         except Exception as e:
             error = str(e)
         # A failed allocation on one TP rank must not leave the other ranks
         # serving merged weights. All ranks reach this collective on failure.
-        errors = get_parallel().tp_group.all_gather_object(error)
+        outcomes = get_parallel().tp_group.all_gather_object((error, unrecoverable))
+        errors = [error for error, _ in outcomes]
+        if any(fatal for _, fatal in outcomes):
+            raise RuntimeError(f"LoRA merge left weights unsafe to serve: {errors}")
         if any(errors):
             if isinstance(recv_req, UnmergeLoRAWeightsReqInput):
-                # Restoration only copies existing allocations. A device failure
-                # here leaves the TP group unsafe to serve; stop the worker.
+                # A partial restore/subtraction leaves the TP group unsafe to serve.
                 raise RuntimeError(f"LoRA restoration failed: {errors}")
             if (
                 was_merged is None
@@ -5904,6 +5914,9 @@ class Scheduler(
             ):
                 unmerge_weights(manager)
                 torch.cuda.synchronize()
+            if manager is not None and manager.lora_unmerge_mode == "subtract":
+                # Subtraction rollback may round differently from the original.
+                self.flush_cache(empty_cache=False)
         elif manager.merged_lora_id != was_merged:
             self.flush_cache(empty_cache=False)
         name = (
