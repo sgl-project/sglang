@@ -1110,7 +1110,7 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg,
-    int64_t block_size_K,  // not used, only for compatibility with the MoE interface
+    int64_t block_size_K,  // only for compatibility with the MoE interface
     bool do_unpack) {
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
     tinygemm_kernel2<scalar_t, at::Float8_e4m3fn, has_bias>(

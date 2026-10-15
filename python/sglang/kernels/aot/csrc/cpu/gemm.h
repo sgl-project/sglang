@@ -333,7 +333,7 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg,
-    int64_t block_size_K = 0,
+    int64_t block_size_K = 0,  // only for compatibility with the MoE interface
     bool do_unpack = true);
 
 // mxfp4
