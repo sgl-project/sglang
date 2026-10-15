@@ -1113,7 +1113,7 @@ at::Tensor fused_experts_cpu(
         TORCH_CHECK(w2s.scalar_type() == at::kFloat, "expect per-tensor fp8 w2_scale to be float32.");
         TORCH_CHECK(w1s.numel() == E, "expect per-tensor fp8 w1_scale.numel() == num_experts.");
         TORCH_CHECK(w2s.numel() == E, "expect per-tensor fp8 w2_scale.numel() == num_experts.");
-        fused_experts_fp8_pertensor_kernel_impl<scalar_t>(
+        fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false, true>(
             out_hidden_states.data_ptr<scalar_t>(),
             intermediate_cache0,
             intermediate_cache1,
@@ -1128,6 +1128,8 @@ at::Tensor fused_experts_cpu(
             with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
             w1s.data_ptr<float>(),
             w2s.data_ptr<float>(),
+            0,
+            0,
             topk_weights_.data_ptr<float>(),
             sorted_ids,
             expert_ids,

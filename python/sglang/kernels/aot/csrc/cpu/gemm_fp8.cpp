@@ -1110,6 +1110,7 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg,
+    int64_t block_size_K,  // not used, only for compatibility with the MoE interface
     bool do_unpack) {
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
     tinygemm_kernel2<scalar_t, at::Float8_e4m3fn, has_bias>(
@@ -1229,7 +1230,7 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
       TYPE* __restrict__ Btmp,                         \
       float* __restrict__ Ctmp,                        \
       const float* __restrict__ bias,                  \
-      float scale,                                     \
+      const float scale,                               \
       int64_t M,                                       \
       int64_t N,                                       \
       int64_t K,                                       \
@@ -1237,6 +1238,7 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
       int64_t ldb,                                     \
       int64_t ldc,                                     \
       bool brg,                                        \
+      int64_t block_size_K,                            \
       bool do_unpack)
 
 INSTANTIATE_TINYGEMM_TEMPLATE_PER_TENSOR(at::BFloat16);
