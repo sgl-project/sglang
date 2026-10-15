@@ -1120,6 +1120,10 @@ class Envs:
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
+    # Fixed CuTe DSL MoE tactic for small token counts instead of the autotuned one:
+    # "tile,g1_n,g1_cm,g1_cn,g2_n,g2_cm,g2_cn" (e.g. "128,128,1,1,256,1,2"); empty = autotune.
+    SGLANG_Q35MF_EXPERT_TACTIC = EnvStr("")
+    SGLANG_Q35MF_EXPERT_TACTIC_MAX_TOKENS = EnvInt(16)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

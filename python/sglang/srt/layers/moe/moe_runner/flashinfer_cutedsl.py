@@ -36,6 +36,27 @@ logger = logging.getLogger(__name__)
 
 _FP4_SF_VEC_SIZE = 16
 _cutedsl_logged_scalarize: set = set()
+_small_m_tactic_cache: list = []
+
+
+def _small_m_tactic(num_tokens: int) -> Optional[tuple]:
+    """Tactic from SGLANG_Q35MF_EXPERT_TACTIC for num_tokens <= the max; None keeps autotuning."""
+    if not _small_m_tactic_cache:
+        spec = envs.SGLANG_Q35MF_EXPERT_TACTIC.get().strip()
+        tactic = None
+        if spec:
+            tile, g1n, g1cm, g1cn, g2n, g2cm, g2cn = (int(v) for v in spec.split(","))
+            tactic = (
+                tile,
+                ((tile, g1n), (g1cm, g1cn), False),
+                ((tile, g2n), (g2cm, g2cn), False),
+            )
+            log_info_on_rank0(logger, f"CuteDSL MoE: fixed small-M tactic {tactic}")
+        _small_m_tactic_cache.append(tactic)
+    tactic = _small_m_tactic_cache[0]
+    if tactic is None or num_tokens > envs.SGLANG_Q35MF_EXPERT_TACTIC_MAX_TOKENS.get():
+        return None
+    return tactic
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +527,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        tactic=_small_m_tactic(hidden_states.shape[0]),
         per_token_scale=per_token_scale,
     )
 
