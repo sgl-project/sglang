@@ -409,7 +409,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._route_front_static_ok = (
             None if envs.SGLANG_Q35MF_ROUTE_FUSED.get() and not is_nextn else False
         )
-        if self._route_front_static_ok is None:
+        self._route_topk_static_ok = (
+            None if envs.SGLANG_Q35MF_ROUTE_DRAFT.get() and is_nextn else False
+        )
+        if self._route_front_static_ok is None or self._route_topk_static_ok is None:
             self.register_buffer(
                 "_route_arrival", torch.zeros(1, dtype=torch.int32), persistent=False
             )
@@ -724,9 +727,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
             if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
                 return self.experts(hidden_states, topk_output)
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        if (
+            self._route_topk_static_ok is not False
+            and not defer_finalize
+            and qwen_router_front.supported_topk(self, hidden_states)
+        ):
+            topk_output = qwen_router_front.route_topk(self, hidden_states)
+        else:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
                 raise RuntimeError(

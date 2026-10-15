@@ -38,7 +38,10 @@ def _jit_module(max_m: int, trace: bool = False) -> Module:
         "qwen_router_front",
         *args,
         cuda_files=["moe/qwen_router_front.cuh"],
-        cuda_wrappers=[("run", f"RouterFrontKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"RouterFrontKernel<{args}>::run"),
+            ("run_topk", f"RouterFrontKernel<{args}>::run_topk"),
+        ],
         # No fast-math: the top-k and quantization arithmetic is pinned to
         # explicit instructions and must not be contracted or flushed.
         extra_cuda_cflags=["-O3"],
@@ -122,3 +125,22 @@ def router_front(
         out.tile_log2,
     )
     return out
+
+
+def router_topk(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    arrival: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Router logits + softmax top-10 + renormalize only: (weights fp32 [M, 10], ids int32 [M, 10]).
+
+    ``arrival`` is the call site's persistent int32 [1] counter (see RouterFrontBuffers).
+    """
+    m = x.shape[0]
+    logits = torch.empty((m, NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
+    topk_weights = torch.empty((m, TOP_K), dtype=torch.float32, device=x.device)
+    topk_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=x.device)
+    _jit_module(_max_m_bucket(m)).run_topk(
+        x, weight, logits, topk_weights, topk_ids, arrival
+    )
+    return topk_weights, topk_ids

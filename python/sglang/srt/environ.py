@@ -1127,6 +1127,9 @@ class Envs:
     # Qwen MoE blocks on the CuTe DSL NVFP4 runner: router GEMV, top-k, input
     # quantization and routing tables as one kernel at decode token counts.
     SGLANG_Q35MF_ROUTE_FUSED = EnvBool(False)
+    # Draft (MTP) Qwen MoE blocks: router GEMV and top-k as one kernel at decode
+    # token counts; the experts runner is unchanged.
+    SGLANG_Q35MF_ROUTE_DRAFT = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

@@ -62,6 +62,7 @@ struct Params {
   uint64_t* trace;                   // optional %globaltimer stamps (instrumented build only)
   uint32_t num_tokens;
   uint32_t tile_log2;
+  uint32_t full;  // 0: logits and top-k only (no input quantization, no routing tables)
 };
 
 SGL_DEVICE float bf16_lo(uint32_t v) {
@@ -584,6 +585,7 @@ SGL_DEVICE void topk_and_tables(const Params& p, uint32_t* s_mask, int16_t* s_ti
   }
   __syncthreads();
   trace_stamp<kTrace>(p, kNumCtas * 8 + 2);
+  if (!p.full) return;
 
   // Tiles in ascending expert order; with M <= 16 every active expert owns one tile.
   const uint32_t e0 = 2 * threadIdx.x;
@@ -702,7 +704,7 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
 
   // Row blockIdx.x is quantized by this CTA, one 16-element block per thread,
   // loaded now so the latency overlaps the GEMV.
-  const bool quant_row = blockIdx.x < M;
+  const bool quant_row = p.full && blockIdx.x < M;
   const uint32_t qk = warp * kKPerWarp + lane * kKPerLane;
   U32x8 qv{make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
   if (quant_row) qv = ld_produced32(p.x + static_cast<size_t>(blockIdx.x) * kHidden + qk);
@@ -832,9 +834,44 @@ struct RouterFrontKernel {
         kTrace ? static_cast<uint64_t*>(trace.data_ptr()) : nullptr,
         M,
         static_cast<uint32_t>(tile_log2),
+        1u,
     };
     LaunchKernel(kNumCtas, kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, kTrace>, params);
+  }
+
+  /// \brief Logits and softmax top-k only (for runners that take ids / weights directly).
+  static void run_topk(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView topk_weights,
+      const tvm::ffi::TensorView topk_ids,
+      const tvm::ffi::TensorView arrival) {
+    using namespace host;
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
+    TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(weight);
+    TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
+    TensorMatcher({M_, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
+    TensorMatcher({M_, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(arrival);
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    CHECK_HOST(M <= kMaxM && kMaxM <= kMaxTokens) << "router_topk: num_tokens " << M << " exceeds " << kMaxM;
+    if (M == 0) return;
+    Params params{};
+    params.x = static_cast<const bf16_t*>(x.data_ptr());
+    params.weight = static_cast<const bf16_t*>(weight.data_ptr());
+    params.logits = static_cast<bf16_t*>(logits.data_ptr());
+    params.topk_weights = static_cast<float*>(topk_weights.data_ptr());
+    params.topk_ids = static_cast<int32_t*>(topk_ids.data_ptr());
+    params.arrival = static_cast<uint32_t*>(arrival.data_ptr());
+    params.num_tokens = M;
+    params.full = 0;
+    LaunchKernel(kNumCtas, kThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, false>, params);
   }
 };
 
