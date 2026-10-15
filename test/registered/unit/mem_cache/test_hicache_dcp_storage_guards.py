@@ -253,6 +253,8 @@ class TestDcpStorageGuards(CustomTestCase):
                     prefetch_stop_policy=current,
                     write_through_threshold=2,
                     is_write_back=True,
+                    host_memory_mode="cache",
+                    tree_core=SimpleNamespace(is_write_through_compatible=lambda: True),
                     sliding_window_size=None,
                     _enable_metrics_flag=False,
                     extra_metric_labels=None,
