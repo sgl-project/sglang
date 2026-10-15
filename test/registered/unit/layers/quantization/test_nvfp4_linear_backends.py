@@ -2,8 +2,7 @@
 
 Real layer path (ColumnParallelLinear -> weight_loader -> weight processing
 -> forward) per SM100 backend vs a dequantized-reference matmul; a merged
-two-shard case guards the per-partition scale gathering of fused layers, and
-an online case guards the per-token activation scales of `nvfp4_online`.
+two-shard case guards the per-partition scale gathering of fused layers.
 """
 
 import unittest
@@ -45,7 +44,6 @@ SHAPES = [
 
 ACT_SCALE = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
 
-# The online path has no padding step, so K must already suit the FP4 GEMM.
 ONLINE_SHAPES = [
     (64, 256, 512),
     (5, 160, 512),
@@ -125,7 +123,6 @@ def _make_merged_layer(n_half: int, k: int):
 
 
 def _make_online_layer(n: int, k: int):
-    """BF16 checkpoint weights, converted to NVFP4 at load time."""
     layer = make_tp1_column_parallel_linear(NvFp4OnlineConfig(), n, k)
     w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
     load_linear_weights(layer, weight=w)
@@ -133,7 +130,6 @@ def _make_online_layer(n: int, k: int):
 
 
 def _online_reference(layer, x: torch.Tensor) -> torch.Tensor:
-    """Matmul of the same NVFP4 values the layer holds, dequantized in fp32."""
     x_q, x_sf, per_token_scale = nvfp4_quantize(
         x,
         torch.full((1,), 1.0 / NVFP4_MAX, dtype=torch.float32, device=x.device),
@@ -196,11 +192,6 @@ class TestNvFp4LinearBackends(CustomTestCase):
             self._assert_matches(layer, x, out, w_dequant)
 
     def test_online_per_token_activation_scale(self):
-        """`nvfp4_online` gives each activation row its own dequant scale, so
-        the GEMM alpha is a vector. Reusing one row's scale for the batch --
-        a scalar alpha, or a per-row alpha read at the wrong coordinate --
-        rescales every other row by the ratio of their amaxes, which the
-        decade-spread rows below turn into a large per-row error."""
         torch.manual_seed(7)
         with mock.patch.object(
             fp4_utils,
