@@ -1144,6 +1144,9 @@ class Envs:
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE = EnvBool(False)
+    SGLANG_OPT_FLUX3_PRIMS_TS_TUNING_BUCKETS = EnvTuple(tuple())
+    SGLANG_USE_SAGE_ATTENTION_IMPL = EnvStr("")
 
     # ===================================================================
     # Triton and Torch compilation
