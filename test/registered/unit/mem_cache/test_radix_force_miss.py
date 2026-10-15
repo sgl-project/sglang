@@ -58,8 +58,8 @@ class TestZeroMatchResult(unittest.TestCase):
         self.assertIs(zeroed.best_match_node, tree.root_node)
         self.assertEqual(zeroed.host_hit_length, 0)
 
-    def test_chunk_cache_is_passthrough(self):
-        class _StubChunkCache:
+    def test_non_sharing_cache_is_passthrough(self):
+        class _StubNonSharingCache:
             def supports_prefix_sharing(self) -> bool:
                 return False
 
@@ -70,7 +70,7 @@ class TestZeroMatchResult(unittest.TestCase):
             best_match_node=None,
             host_hit_length=0,
         )
-        self.assertIs(zero_match_result(_StubChunkCache(), original), original)
+        self.assertIs(zero_match_result(_StubNonSharingCache(), original), original)
 
 
 class TestMatchKvCacheForceMiss(unittest.TestCase):

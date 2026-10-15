@@ -79,10 +79,6 @@ class RocmPlatform(Platform):
         return True
 
     @classmethod
-    def log_warnings(cls) -> None:
-        pass  # ROCm-specific warnings can be added here
-
-    @classmethod
     def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
         torch.cuda.reset_peak_memory_stats(device)
         return float(torch.cuda.max_memory_allocated(device))

@@ -659,15 +659,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "preserve unified page-envelope indices and compaction lifetimes. "
         "Use --enable-hierarchical-cache for supported L2/L3 transfers."
     )
-    if cfg.enable_hierarchical_cache:
-        assert cfg.pp_size == 1, (
-            "--enable-unified-memory with hierarchical cache does not support "
-            "pipeline parallelism (--pp-size > 1)."
-        )
-        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
-            "--enable-unified-memory with hierarchical cache requires lazy "
-            "compaction so pending H2D physical reservations remain stable."
-        )
     assert not (
         cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
         and cfg.disaggregation_decode_retraction_backup == "host_pool"

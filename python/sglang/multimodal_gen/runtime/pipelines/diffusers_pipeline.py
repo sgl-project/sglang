@@ -721,9 +721,6 @@ class DiffusersPipeline(ComposedPipelineBase):
             stage=DiffusersExecutionStage(self.diffusers_pipe),
         )
 
-    def initialize_pipeline(self, server_args: ServerArgs) -> None:
-        pass
-
     def post_init(self) -> None:
         """Post initialization hook."""
         if self.post_init_called:

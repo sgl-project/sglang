@@ -1,6 +1,6 @@
 //! The shared handle: submission with admission and cancellation ownership,
 //! runtime-to-semantic event translation, and the typed control operations
-//! (model info, server info, detokenize, health probe).
+//! (model info, server info, weights check, detokenize, health probe).
 
 use std::collections::BTreeMap;
 use std::sync::{
@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
-use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
+use crate::message::io_struct::{CheckWeightsReqInput, ControlRequest, GetInternalStateReq};
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
@@ -121,9 +121,8 @@ impl CoreHandle {
         self.inner.startup_ready.load(Ordering::Acquire)
     }
 
-    /// Record successful completion of the main process's startup warmup.
-    /// The adapter decides which response qualifies as that warmup; the state
-    /// itself is shared by every transport.
+    /// Record successful completion of the startup warmup. The state is
+    /// shared by every transport.
     pub(crate) fn mark_ready(&self) {
         self.inner.startup_ready.store(true, Ordering::Release);
     }
@@ -218,6 +217,31 @@ impl CoreHandle {
             })
     }
 
+    /// Ask every scheduler rank to run the weight checker's `action` on the
+    /// runners `selector` names, and relay each rank's checksum record.
+    pub(crate) async fn check_weights(
+        &self,
+        action: String,
+        allow_quant_error: bool,
+        skip_tensor_list: Option<Vec<String>>,
+        selector: String,
+    ) -> Result<CheckWeightsOutcome, CoreError> {
+        let bytes = self
+            .control(ControlRequest::CheckWeightsReqInput(
+                CheckWeightsReqInput::new(
+                    Rid::new().to_string(),
+                    action,
+                    allow_quant_error,
+                    skip_tensor_list,
+                    selector,
+                ),
+            ))
+            .await?;
+        rmp_serde::from_slice::<CheckWeightsOutcome>(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid weights-check response: {error}"))
+        })
+    }
+
     async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
         let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
         match call.recv().await {
@@ -291,6 +315,43 @@ impl CoreHandle {
                 return Ok(HealthStatus::Stalled);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// One generation mirroring the Python `_execute_server_warmup` text request;
+    /// VLMs warm only the text path. The caller decides readiness.
+    pub(crate) async fn warm_up(&self, skip_tokenizer_init: bool) -> Result<(), CoreError> {
+        let (text, input_ids) = if skip_tokenizer_init {
+            (None, Some(vec![10, 11, 12]))
+        } else {
+            (Some("The capital city of France is".to_string()), None)
+        };
+        let mut call = self
+            .generate(GenerateRequest {
+                rid: Rid::new(),
+                text,
+                input_ids,
+                sampling_params: SamplingParams {
+                    max_new_tokens: Some(8),
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+                stream: false,
+                bootstrap_host: self
+                    .inner
+                    .is_disaggregation
+                    .then(|| FAKE_BOOTSTRAP_HOST.into()),
+                bootstrap_room: self.inner.is_disaggregation.then_some(0),
+                ..Default::default()
+            })
+            .await?;
+        loop {
+            match call.recv().await {
+                Some(CoreEvent::Finished(_)) => return Ok(()),
+                Some(CoreEvent::Failed(e)) => return Err(e),
+                Some(CoreEvent::Delta(_)) => {}
+                None => return Err(CoreError::ResponseTruncated),
+            }
         }
     }
 
@@ -469,6 +530,17 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
             CoreError::InvalidResponse("unexpected non-generation response".into()),
         ),
     }
+}
+
+/// The scheduler's `CheckWeightsReqOutput`: whether every rank succeeded, why
+/// not, and one checksum record per rank (`None` when no rank produced one).
+#[derive(Debug, serde::Deserialize, PartialEq)]
+pub(crate) struct CheckWeightsOutcome {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) payload: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
 }
 
 /// Private scheduler response envelope. This MessagePack shape is decoded at
@@ -959,6 +1031,60 @@ mod tests {
             abort_rx.recv().unwrap(),
             AbortSource::Guard(aborted) if aborted == rid
         ));
+    }
+
+    #[tokio::test]
+    async fn warm_up_succeeds_on_finished_generation() {
+        let harness = Harness::unbounded(8);
+        let handle = harness.handle.clone();
+        let warm_up = tokio::spawn(async move { handle.warm_up(false).await });
+
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        let RequestKind::Generate(warmup) = &request.kind else {
+            panic!("warmup must submit a generation request");
+        };
+        assert_eq!(
+            warmup.text.as_deref(),
+            Some("The capital city of France is")
+        );
+        assert_eq!(warmup.input_ids, None);
+        assert_eq!(warmup.sampling_params.max_new_tokens, Some(8));
+        assert_eq!(warmup.bootstrap_host, None);
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent::default()))
+            .unwrap();
+
+        assert!(warm_up.await.unwrap().is_ok());
+        assert!(!harness.handle.is_ready());
+    }
+
+    #[tokio::test]
+    async fn pd_warm_up_without_tokenizer_fails_on_truncated_stream() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle = configured_handle(
+            intake_tx,
+            abort_tx,
+            8,
+            Default::default(),
+            false,
+            true,
+            BTreeMap::new(),
+        );
+        let warm_up = tokio::spawn(async move { handle.warm_up(true).await });
+
+        let request = accept_intake(intake_rx.recv_async().await.unwrap());
+        let RequestKind::Generate(warmup) = &request.kind else {
+            panic!("warmup must submit a generation request");
+        };
+        assert_eq!(warmup.text, None);
+        assert_eq!(warmup.input_ids, Some(vec![10, 11, 12]));
+        assert_eq!(warmup.bootstrap_host.as_deref(), Some(FAKE_BOOTSTRAP_HOST));
+        assert_eq!(warmup.bootstrap_room, Some(0));
+        drop(request);
+
+        assert!(warm_up.await.unwrap().is_err());
     }
 
     #[tokio::test]

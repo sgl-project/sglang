@@ -80,6 +80,7 @@ class StreamingSession:
         if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             req.session = None
             return None
@@ -160,6 +161,7 @@ class StreamingSession:
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             return False
 
@@ -280,9 +282,9 @@ class StreamingSession:
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
         """Free [ceil_align(target), end): paged free returns whole pages, so
         the partial page stays until release_session."""
-        if end <= target:
-            return
         start = target
         if self.cache.page_size > 1:
             start = ceil_align(start, self.cache.page_size)
+        if end <= start:
+            return
         self.cache.free_kv_row(kv, [(start, end)])

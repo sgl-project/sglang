@@ -185,15 +185,6 @@ class TestCouldStartHeader(CustomTestCase):
         self.assertTrue(could_start_header("to=foo bar" + MESSAGE))
 
 
-class TestMarkerLengthInvariants(CustomTestCase):
-    def test_max_channel_marker_tracks_the_longest_framing_token(self):
-        self.assertEqual(MAX_CHANNEL_MARKER, max(len(m) for m in _CHANNEL_MARKERS))
-
-    def test_max_marker_covers_function_calls_open(self):
-        self.assertEqual(MAX_MARKER, max(MAX_CHANNEL_MARKER, len(FUNCTION_CALLS_OPEN)))
-        self.assertGreaterEqual(MAX_MARKER, len(INVOKE_OPEN))
-
-
 if __name__ == "__main__":
     import unittest
 

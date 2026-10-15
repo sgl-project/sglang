@@ -4,10 +4,12 @@ import json
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler as ReferenceFlowMatchScheduler
 from diffusers.image_processor import VaeImageProcessor
 from PIL import Image
 from transformers import BatchFeature
@@ -31,6 +33,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _resolve_image_output_format,
 )
+from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ResidencyState,
 )
@@ -38,12 +41,18 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     ComponentOffloadStrategy,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
-from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+    QwenImage21Attention,
+    build_layout,
+)
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
@@ -52,6 +61,7 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import
     _patchify,
     _unpatchify,
 )
+from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
@@ -61,9 +71,97 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
     QwenImage21EncodingStage,
     QwenImage21InputValidationStage,
     collapse_image_slots,
+    prepare_qwen21_mu,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
+    TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+@pytest.mark.parametrize("steps", [2, 40])
+@pytest.mark.parametrize("preset", [False, True])
+@pytest.mark.parametrize("explicit_sigmas", [None, [1.0, 0.7, 0.3]])
+@pytest.mark.parametrize("dynamic_shifting", [False, True])
+def test_checkpoint_sigma_grid_reaches_request_scheduler(
+    tmp_path, monkeypatch, steps, preset, explicit_sigmas, dynamic_shifting
+):
+    sample_sigmas = [
+        1.0,
+        0.978453,
+        0.95418,
+        0.926626,
+        0.89508,
+        0.845148,
+        0.704534,
+        0.414568,
+    ]
+    model_index = {
+        "_class_name": "QwenImage21Pipeline",
+        "_diffusers_version": "0.41.0.dev0",
+        "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+    }
+    if preset:
+        model_index["sample_sigmas"] = sample_sigmas
+    (tmp_path / "model_index.json").write_text(json.dumps(model_index))
+    (tmp_path / "scheduler").mkdir()
+    config = QwenImage21PipelineConfig()
+    args = SimpleNamespace(
+        pipeline_config=config,
+        model_subfolder=None,
+        revision=None,
+        enable_cfg_parallel=False,
+    )
+    pipeline = object.__new__(QwenImage21Pipeline)
+    pipeline.model_path = str(tmp_path)
+    pipeline.server_args = args
+    loaded_config = pipeline._load_config()
+    assert "sample_sigmas" not in loaded_config
+    assert config.sample_sigmas == (sample_sigmas if preset else None)
+
+    batch = Req(
+        sampling_params=QwenImage21SamplingParams(
+            prompt="a ceramic teapot",
+            height=1024,
+            width=1024,
+            num_inference_steps=steps,
+        ),
+        sigmas=explicit_sigmas,
+    )
+    QwenImage21InputValidationStage().forward(batch, args)
+    batch.extra["qwen21_mu"] = 0.7
+    scheduler_kwargs = dict(
+        use_dynamic_shifting=dynamic_shifting,
+        shift=1.0,
+        shift_terminal=0.02 if dynamic_shifting else None,
+    )
+    scheduler = FlowMatchEulerDiscreteScheduler(**scheduler_kwargs)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation.get_local_torch_device",
+        lambda: torch.device("cpu"),
+    )
+    TimestepPreparationStage(scheduler, [prepare_qwen21_mu]).forward(batch, args)
+    expected_sigmas = explicit_sigmas
+    if expected_sigmas is None:
+        expected_sigmas = sample_sigmas if preset else np.linspace(1, 1 / steps, steps)
+    # preserve the native scheduler's existing dynamic-shift rounding; Turbo's
+    # unshifted grid must also match the Diffusers scheduler bit for bit
+    scheduler_cls = (
+        FlowMatchEulerDiscreteScheduler
+        if dynamic_shifting
+        else ReferenceFlowMatchScheduler
+    )
+    reference = scheduler_cls(**scheduler_kwargs)
+    reference.set_timesteps(sigmas=expected_sigmas, mu=0.7, device="cpu")
+    torch.testing.assert_close(batch.timesteps, reference.timesteps, atol=0, rtol=0)
+    torch.testing.assert_close(batch.scheduler.sigmas, reference.sigmas, atol=0, rtol=0)
+    assert batch.num_inference_steps == len(expected_sigmas)
+    assert batch.scheduler.num_inference_steps == len(expected_sigmas)
+    assert isinstance(batch.sigmas, list)
+    # request-local schedules must not mutate the checkpoint's preset
+    batch.sigmas[0] = 0.9
+    assert config.sample_sigmas == (sample_sigmas if preset else None)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -583,6 +681,10 @@ def test_architecture_derived_dimensions():
 
 def test_registry_routes_local_checkpoint_and_preserves_legacy():
     assert (
+        _get_config_info("Qwen/Qwen-Image-2.1-Turbo").pipeline_config_cls
+        is QwenImage21PipelineConfig
+    )
+    assert (
         _get_config_info("Qwen/Qwen-Image-2.1").pipeline_config_cls
         is QwenImage21PipelineConfig
     )
@@ -596,3 +698,21 @@ def test_registry_routes_local_checkpoint_and_preserves_legacy():
         _get_config_info("Qwen/Qwen-Image").pipeline_config_cls
         is not QwenImage21PipelineConfig
     )
+
+
+def test_packed_qkv_weight_skips_offloaded_placeholders():
+    # Layerwise offload swaps every weight for one shared 1-D placeholder; the
+    # packing check runs from _apply and must not unpack it as [rows, cols].
+    placeholder = torch.empty((1,), dtype=torch.bfloat16)
+    projection = SimpleNamespace(
+        quant_method=UnquantizedLinearMethod(), weight=placeholder
+    )
+    attention = SimpleNamespace(to_q=projection, to_k=projection, to_v=projection)
+    assert QwenImage21Attention.packed_qkv_weight(attention) is None
+
+
+def test_packed_qkv_projection_is_skipped_under_compile():
+    # Its storage-identity checks cannot be traced; compiled graphs keep the
+    # plain projections instead of breaking in every attention.
+    with patch.object(torch.compiler, "is_compiling", return_value=True):
+        assert QwenImage21Attention._project_qkv_packed(object(), None, [], []) is None

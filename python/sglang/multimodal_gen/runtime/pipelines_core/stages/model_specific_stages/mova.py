@@ -168,7 +168,6 @@ class MOVADenoisingStage(PipelineStage):
         self.dual_tower_bridge = dual_tower_bridge
         self.scheduler = scheduler
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._torch_compiled = False
 
     def component_uses(
