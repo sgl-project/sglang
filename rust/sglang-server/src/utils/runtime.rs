@@ -348,6 +348,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         http_listener,
                         core,
                         cfg.server_args.clone(),
+                        cfg.rust_server_args.metrics_listener,
                         http_layer,
                         shutdown_rx.clone(),
                     );
@@ -554,6 +555,37 @@ mod tests {
             "shutdown took {elapsed:?} with an in-flight request (deadlock?)",
         );
         drop(conn);
+    }
+
+    /// Only the base listener serves the node's `/metrics`; a DP rank's
+    /// offset listener answers 404, as it would without metrics.
+    #[test]
+    fn only_the_metrics_listener_serves_metrics() {
+        use std::io::{Read, Write};
+
+        let dir = std::env::temp_dir().join(format!("runtime-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (metrics_listener, expected) in [(true, "200"), (false, "404")] {
+            let (addr, _) = free_loopback_addrs();
+            let mut cfg = test_config(addr, None);
+            cfg.rust_server_args.metrics_listener = metrics_listener;
+            cfg.server_args = Arc::new(ServerArgs {
+                metrics: Some(crate::message::config::MetricsConfig {
+                    multiproc_dir: dir.to_string_lossy().into_owned(),
+                }),
+                ..test_server_args()
+            });
+            let rt = start(cfg, None).expect("start runtime");
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            conn.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            rt.request_shutdown();
+            let status = response.split(' ').nth(1).unwrap_or_default();
+            assert_eq!(status, expected, "metrics_listener={metrics_listener}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Regression: a >2MB body must reach the JSON layer and fail on its
