@@ -201,9 +201,9 @@ class TestDisableHealthCheck:
                     worker.metadata.get("disable_health_check"),
                 )
                 # Worker should be healthy immediately
-                assert (
-                    worker.status == "healthy"
-                ), "Worker should be healthy when health checks disabled"
+                assert worker.status == "healthy", (
+                    "Worker should be healthy when health checks disabled"
+                )
         finally:
             gateway.shutdown()
             http_instance.release()

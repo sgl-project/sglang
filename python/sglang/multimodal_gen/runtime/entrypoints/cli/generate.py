@@ -20,13 +20,13 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     PerformanceLogger,
     RequestMetrics,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
@@ -163,9 +163,12 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     # respect config file by overriding args with args parsed from it
     if config_file:
         config_args = ServerArgs.load_config_file(config_file) or {}
-        sampling_param_fields = {
-            field.name for field in dataclasses.fields(sampling_params_cls)
-        }
+        if hasattr(sampling_params_cls, "supported_override_fields"):
+            sampling_param_fields = sampling_params_cls.supported_override_fields()
+        else:
+            sampling_param_fields = {
+                field.name for field in dataclasses.fields(sampling_params_cls)
+            }
         sampling_params_kwargs.update(
             {
                 key: value
@@ -177,6 +180,8 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
     _apply_output_file_path_override(args, sampling_params_kwargs)
     sampling_params_kwargs["request_id"] = generate_request_id()
+    if sampling_params_kwargs.get("use_diffusion_decoder", False):
+        server_args.load_diffusion_decoder = True
 
     # Handle diffusers-specific kwargs passed via CLI
     if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:
@@ -210,16 +215,6 @@ class GenerateSubcommand(CLISubcommand):
     def __init__(self) -> None:
         self.name = "generate"
         super().__init__()
-        self.init_arg_names = self._get_init_arg_names()
-        self.generation_arg_names = self._get_generation_arg_names()
-
-    def _get_init_arg_names(self) -> list[str]:
-        """Get names of arguments for DiffGenerator initialization"""
-        return ["num_gpus", "tp_size", "sp_size", "model_path"]
-
-    def _get_generation_arg_names(self) -> list[str]:
-        """Get names of arguments for generate_video method"""
-        return [field.name for field in dataclasses.fields(SamplingParams)]
 
     def cmd(
         self, args: argparse.Namespace, unknown_args: list[str] | None = None

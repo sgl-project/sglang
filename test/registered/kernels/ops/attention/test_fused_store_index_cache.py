@@ -251,6 +251,10 @@ def test_fused_kernel_matches_own_algorithm(num_tokens: int, base_index: int):
     device = torch.device("cuda")
 
     key = torch.randn((num_tokens, HEAD_DIM), device=device, dtype=torch.bfloat16)
+    # Include a rounding tie between adjacent FP8 subnormals.
+    key[0].zero_()
+    key[0, 0] = 2.0
+    key[0, 1] = 2**-15
     loc = (
         base_index + torch.randperm(num_tokens, device=device, dtype=torch.int64)
     ).contiguous()
@@ -279,17 +283,14 @@ def test_fused_kernel_matches_own_algorithm(num_tokens: int, base_index: int):
         f"(expected < 1% from rounding tie-breaks)"
     )
 
-    # 3) Where codes differ, the difference should be exactly 1 ULP.
-    #    In FP8 E4M3: if the float-cast value is V, the adjacent value
-    #    differs by ~V * 0.1 (relative) at most.
+    # 3) Compare representable steps directly: a subnormal ULP can exceed 15%.
     if mismatch.any():
-        diff = (out_f[mismatch] - ref_f[mismatch]).abs()
-        rel_diff = diff / ref_f[mismatch].abs().clamp(min=1e-6)
-        # 1-ULP relative difference for E4M3 is at most ~12.5% (2^-3)
-        assert rel_diff.max().item() <= 0.15, (
-            f"FP8 code difference exceeds 1-ULP: max relative diff = "
-            f"{rel_diff.max().item():.4f}"
-        )
+        out_codes = out_f[mismatch].to(FP8_DTYPE).view(torch.uint8).to(torch.int16)
+        ref_codes = ref_f[mismatch].to(FP8_DTYPE).view(torch.uint8).to(torch.int16)
+        # Order the sign-magnitude codes numerically, with both zeros at 0.
+        out_codes = torch.where(out_codes < 128, out_codes, 128 - out_codes)
+        ref_codes = torch.where(ref_codes < 128, ref_codes, 128 - ref_codes)
+        torch.testing.assert_close(out_codes, ref_codes, rtol=0, atol=1)
 
     # 4) Dequantized values should be close.
     #    Max error from 1-ULP: scale * fp8_ulp ≈ (abs_max/448) * 32
@@ -392,9 +393,9 @@ def test_roundtrip_reconstruction(num_tokens: int):
     per_row_energy = reconstructed.abs().sum(dim=-1)
     orig_energy = original.abs().sum(dim=-1)
     mask = orig_energy > 0.1
-    assert (
-        per_row_energy[mask] > 0.01
-    ).all(), "Some tokens have zero reconstruction — kernel may not be writing output"
+    assert (per_row_energy[mask] > 0.01).all(), (
+        "Some tokens have zero reconstruction — kernel may not be writing output"
+    )
 
 
 # TEST 4: Boundary conditions

@@ -7,11 +7,21 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
+
 logger = logging.getLogger(__name__)
 
 CONTROL_WORD_BYTES = 4
 DATA_ALIGNMENT = 256
 DEFAULT_MAX_INFLIGHT_SLICES = 4096
+
+
+def get_mm_feature_consumer_count() -> int:
+    """Number of scheduler ranks receiving one routed multimodal request."""
+    parallel = get_parallel()
+    if parallel.attn_dp_enabled:
+        return parallel.tp_size // parallel.num_dp_ranks
+    return parallel.tp_size
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -21,7 +31,7 @@ def align_up(value: int, alignment: int) -> int:
 def _driver_modules():
     from cuda.bindings import driver as cuda
 
-    from sglang.srt.cuda_vmm_utils import check_drv
+    from sglang.srt.utils.cuda_vmm_utils import check_drv
 
     return cuda, check_drv
 
@@ -57,11 +67,8 @@ def resolve_consumer_rank(
         return 0
     if consumer_rank is None:
         try:
-            from sglang.srt.runtime_context import get_parallel
-
-            # Use the global TP rank. An attention/DCP subgroup rank can alias
-            # another consumer's acknowledgement slot.
-            rank = int(get_parallel().tp_rank)
+            # DP groups are contiguous; attention/DCP subgroup ranks can alias
+            rank = int(get_parallel().tp_rank) % total_consumer_count
         except Exception as exc:
             raise RuntimeError(
                 f"Cannot resolve the {transport_name} consumer rank before "
@@ -360,6 +367,50 @@ class StreamOrderedMmFeaturePool:
                 self._merge_ranges_locked()
             raise
         return lease, destination
+
+    def cancel_lease(
+        self,
+        *,
+        ready_byte_offset: int,
+        ack_byte_offset: int,
+        generation: int,
+    ) -> None:
+        """Acknowledge every consumer for a lease that was not dispatched."""
+        slot_stride = self.control_words_per_slot * CONTROL_WORD_BYTES
+        if (
+            ready_byte_offset % slot_stride != 0
+            or ack_byte_offset != ready_byte_offset + CONTROL_WORD_BYTES
+        ):
+            raise RuntimeError(f"Invalid {self.transport_name} pool lease offsets")
+        slot = ready_byte_offset // slot_stride
+
+        with self._lock:
+            lease = self._occupied.get(slot)
+            if (
+                lease is None
+                or lease.generation != generation
+                or lease.ready_byte_offset != ready_byte_offset
+                or lease.ack_byte_offset != ack_byte_offset
+            ):
+                raise RuntimeError(
+                    f"Cannot cancel inactive {self.transport_name} pool lease "
+                    f"(slot={slot}, generation={generation})"
+                )
+
+            with torch.cuda.device(self.device_id):
+                stream_wait_value32(
+                    self.device_id,
+                    self.base_address + ready_byte_offset,
+                    generation,
+                    self.transport_name,
+                )
+                for rank in range(self.consumer_count):
+                    stream_write_value32(
+                        self.device_id,
+                        self.base_address + ack_byte_offset + rank * CONTROL_WORD_BYTES,
+                        generation,
+                        self.transport_name,
+                    )
 
     def shutdown(self) -> None:
         self._recycler_stop_event.set()

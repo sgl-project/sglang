@@ -20,7 +20,7 @@ from sglang.test.test_deterministic_utils import (
 )
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
-register_cuda_ci(est_time=900, stage="nightly", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=360, stage="nightly", runner_config="4-gpu-b200")
 
 GLM_MODEL = "zai-org/GLM-4.7-Flash"
 

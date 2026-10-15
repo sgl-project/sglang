@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import torch
 
+from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -20,11 +21,12 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
-from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 HIDDEN_DIM = 4
 
@@ -45,6 +47,12 @@ def _vec2d(val: float = 1.0) -> torch.Tensor:
 
 
 class TestPositionalEmbeds(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_from_list_of_1d_tensors(self):
         pe = PositionalEmbeds(embeds=[_vec(1), _vec(2)], positions=[0, 5])
         self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
@@ -75,6 +83,12 @@ class TestPositionalEmbeds(CustomTestCase):
 
 
 class TestConvertEmbedsToTensors(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_none_returns_none(self):
         self.assertIsNone(convert_embeds_to_tensors(None))
 
@@ -110,6 +124,12 @@ class TestConvertEmbedsToTensors(CustomTestCase):
 
 
 class TestResolveEmbedOverrides(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_basic_resolution(self):
         embeds = [_vec(1), _vec(2)]
         pe = TokenizerManager._resolve_embed_overrides(
@@ -144,6 +164,12 @@ class TestResolveEmbedOverrides(CustomTestCase):
 
 
 class TestGenerateReqInputEmbedOverride(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_single_override_in_getitem(self):
         """Single PositionalEmbeds is shared across all items in __getitem__."""
         pe = PositionalEmbeds(embeds=[_vec()], positions=[0])
@@ -176,6 +202,12 @@ class TestGenerateReqInputEmbedOverride(CustomTestCase):
 
 
 class TestEmbeddingReqInputEmbedOverride(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def test_override_fields_in_getitem(self):
         """embed_override_token_id, embed_overrides, and positional_embed_overrides
         are correctly sliced in __getitem__."""
@@ -220,6 +252,9 @@ class _FakeMixin(TokenizerManagerScoreMixin):
 
 class TestResolveOverridesForSequence(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.mixin = _FakeMixin()
 
     def test_none_embeds_returns_empty(self):
@@ -276,6 +311,9 @@ class TestResolveOverridesForSequence(CustomTestCase):
 
 class TestResolveEmbedOverridesForRequest(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.mixin = _FakeMixin()
 
     def test_no_overrides_returns_none(self):
@@ -339,6 +377,9 @@ DELIM_TOKEN = MIS_DELIMITER_TOKEN_ID
 
 class TestBuildTokenIdInputs(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.mixin = _FakeMixin(enable_mis=True)
 
     # --- single-item mode, no embeds ---
@@ -497,6 +538,59 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
 
 # ========================================================================
+# Score mixin: _build_token_id_inputs stacked path
+# ========================================================================
+
+
+def _stacked(n_rows: int, val: float = 1.0) -> torch.Tensor:
+    return torch.full((n_rows, HIDDEN_DIM), val, dtype=torch.float32)
+
+
+class TestBuildTokenIdInputsStacked(CustomTestCase):
+    def setUp(self):
+        self.mixin = _FakeMixin()
+
+    def test_single_item_stacked_none_slot(self):
+        stacked = _stacked(2, 5.0)
+        _, input_ids, pe_overrides, _ = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 50], [30, 40]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+            stacked_query_item_embed_overrides=[stacked, None],
+        )
+        self.assertEqual(input_ids, [[50, 10, 20, 50], [50, 10, 30, 40]])
+        self.assertEqual(len(pe_overrides), 2)
+        self.assertIs(pe_overrides[0].embeds, stacked)
+        self.assertEqual(pe_overrides[0].positions, [0, 3])
+        self.assertIsNone(pe_overrides[1])
+
+    def test_multi_item_stacked_used_as_is(self):
+        # One fused sequence; placeholders: query pos 0, item[0] pos 4
+        # (query_len 2 + delim 1 + idx 1). item[1] has no placeholder.
+        stacked = _stacked(2, 9.0)
+        _, input_ids, pe_overrides, delim = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 50], [30, 40]],
+            item_first=False,
+            use_multi_item_scoring=True,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+            stacked_query_item_embed_overrides=[stacked],
+        )
+        self.assertEqual(
+            input_ids, [[50, 10, DELIM_TOKEN, 20, 50, DELIM_TOKEN, 30, 40, DELIM_TOKEN]]
+        )
+        self.assertEqual(len(pe_overrides), 1)
+        self.assertEqual(pe_overrides[0].positions, [0, 4])
+        self.assertIs(pe_overrides[0].embeds, stacked)
+
+
+# ========================================================================
 # Score mixin: score_request validation
 # ========================================================================
 
@@ -505,6 +599,9 @@ class TestScoreRequestValidation(CustomTestCase):
     """Test validation guards in score_request without running full pipeline."""
 
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.mixin = _FakeMixin()
 
     def _call(self, **kwargs):

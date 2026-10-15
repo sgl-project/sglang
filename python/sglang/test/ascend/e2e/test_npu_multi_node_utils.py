@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -961,7 +962,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
             num_questions=num_questions,
             max_new_tokens=max_new_tokens,
             parallel=parallel,
-            host=f"http://{self.host}",
+            host=self.host,
             port=self.port,
         )
         logger.info("Starting gsm8k test...")
@@ -969,7 +970,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["accuracy"],
             expect_accuracy,
-            f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
+            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
         )
 
 
@@ -987,7 +988,9 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.role = (
             "router"
             if "router" in cls.hostname
-            else "prefill" if "prefill" in cls.hostname else "decode"
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
         cls.sglang_thread = None
@@ -1069,7 +1072,7 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
             num_questions=num_questions,
             max_new_tokens=max_new_tokens,
             parallel=parallel,
-            host=f"http://{self.host}",
+            host=self.host,
             port=self.port,
         )
         logger.info("Starting gsm8k test...")
@@ -1077,5 +1080,24 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["accuracy"],
             expect_accuracy,
-            f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
+            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
         )
+
+
+def kill_process_group(process):
+    """SIGKILL the whole process group led by ``process.pid`` (== pgid).
+
+    ``process`` is a ``subprocess.Popen`` launched with ``start_new_session=True``,
+    so its pid equals the process-group id. A ``None`` process is ignored.
+    """
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+        logger.info(f"killed process group pgid={process.pid}")
+    except ProcessLookupError:
+        logger.info(f"process group pgid={process.pid} already gone")
+    except PermissionError:
+        logger.warning(f"no permission to kill process group pgid={process.pid}")
+    except OSError as e:
+        logger.warning(f"failed to kill process group pgid={process.pid}: {e}")

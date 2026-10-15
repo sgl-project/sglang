@@ -20,12 +20,11 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=387, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=276, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=261, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSRTEngine(CustomTestCase):
-
     def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

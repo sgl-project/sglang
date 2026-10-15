@@ -108,6 +108,14 @@ num_threads = 4
 # Override endpoint (useful for non-AWS S3 services)
 endpoint_override = ""
 
+# Minimum object size (bytes) that uses the high-performance S3 CRT client.
+# Disabled by default. AWS S3 multipart uploads require parts of at least 5 MiB.
+crtMinLimit = 5242880
+
+# Target throughput for the S3 CRT client in whole Gbps, default: 10.
+# The CRT scheduler uses this value to size its parallel connection count.
+throughput_target_gbps = 25
+
 # Connection scheme: http or https, default: http
 scheme = "http"
 

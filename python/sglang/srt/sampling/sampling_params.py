@@ -15,9 +15,14 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
+
+from sglang.srt.sampling.watermarking.core import (
+    WatermarkRequestConfig,
+    normalize_watermark_request,
+)
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:
@@ -25,10 +30,8 @@ try:
 except ImportError:
     import sre_parse  # Python < 3.11
 
-# JSON-safe value types for custom_params.  Must survive msgpack IPC
-# without PickleWrapper.  After deserialization on the scheduler side,
-# Req.__init__ injects "__req__" (a Req object) into the dict in-process;
-# that augmented dict is never re-serialized.
+# JSON-safe value types for custom_params. Must survive msgpack IPC
+# without PickleWrapper.
 _JsonScalar = Union[None, bool, int, float, str]
 CustomParamValue = Union[
     _JsonScalar,
@@ -38,8 +41,77 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+MAX_STOP_COUNT = 32
+MAX_STOP_REGEX_LEN = 256
+MAX_STOP_REGEX_COUNT = 32
 
 logger = logging.getLogger(__name__)
+
+
+# Private transport from the OpenAI request renderer to scheduler-side
+# reasoning grammar/accounting.  It lives in custom_params so the selected
+# delimiter follows every existing tokenizer/session/disaggregation path
+# without changing the public SamplingParams wire layout.
+REQUEST_REASONING_END_TOKEN_IDS_KEY = "__sglang_reasoning_end_token_ids"
+MAX_REQUEST_REASONING_END_TOKEN_IDS = 32
+
+
+def get_request_reasoning_end_token_ids(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+    *,
+    allowed_sequences: Optional[Sequence[Sequence[int]]] = None,
+    vocab_size: Optional[int] = None,
+    strict: bool = False,
+) -> Optional[List[int]]:
+    """Return a validated request-selected reasoning terminator, if present."""
+    if not isinstance(custom_params, dict):
+        return None
+    if REQUEST_REASONING_END_TOKEN_IDS_KEY not in custom_params:
+        return None
+    token_ids = custom_params.get(REQUEST_REASONING_END_TOKEN_IDS_KEY)
+    invalid = (
+        not isinstance(token_ids, list)
+        or not token_ids
+        or len(token_ids) > MAX_REQUEST_REASONING_END_TOKEN_IDS
+        or any(type(token_id) is not int or token_id < 0 for token_id in token_ids)
+        or (
+            vocab_size is not None
+            and isinstance(token_ids, list)
+            and any(
+                type(token_id) is int and token_id >= vocab_size
+                for token_id in token_ids
+            )
+        )
+    )
+    if invalid:
+        if strict:
+            raise ValueError(
+                "request reasoning end token IDs must be a non-empty, "
+                f"vocabulary-bounded list of at most "
+                f"{MAX_REQUEST_REASONING_END_TOKEN_IDS} integers"
+            )
+        return None
+    if allowed_sequences is None or tuple(token_ids) not in {
+        tuple(sequence) for sequence in allowed_sequences
+    }:
+        return None
+    return list(token_ids)
+
+
+def set_request_reasoning_end_token_ids(
+    sampling_params: Dict,
+    token_ids: Optional[List[int]],
+) -> None:
+    """Attach the renderer-selected reasoning terminator to a request."""
+    if token_ids is None:
+        return
+    if not token_ids or any(
+        type(token_id) is not int or token_id < 0 for token_id in token_ids
+    ):
+        raise ValueError("reasoning end token IDs must be non-empty integers")
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_REASONING_END_TOKEN_IDS_KEY] = list(token_ids)
+    sampling_params["custom_params"] = custom_params
 
 
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
@@ -68,6 +140,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     repetition_penalty: float = 1.0
     min_new_tokens: int = 0
     n: int = 1
+    # beam_width > 1 turns the request into a beam search request; n then means
+    # "number of returned sequences" rather than parallel samples (n <= beam_width).
+    beam_width: Optional[int] = None
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
@@ -80,6 +155,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    watermark: Optional[WatermarkRequestConfig] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -87,6 +163,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     stop_str_max_len: int = 0  # set by normalize()
     stop_regex_max_len: int = 0  # set by normalize()
     is_normalized: bool = False  # set by normalize()
+    ebnf_full_assistant: bool = False
 
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
@@ -133,6 +210,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.no_stop_trim = (
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
+        self.watermark = normalize_watermark_request(self.watermark)
 
         # An empty grammar constraint means "unset", not "constrain to nothing".
         self.json_schema = self.json_schema or None
@@ -149,6 +227,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if self.beam_width is not None and self.beam_width < 1:
+            raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
@@ -163,12 +243,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
-                "frequency_penalty must be in [-2, 2], got "
-                f"{self.frequency_penalty}."
+                f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
             )
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(
-                "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
+                f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
             )
         if not 0.0 < self.repetition_penalty <= 2.0:
             raise ValueError(
@@ -197,6 +276,23 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        if self.sampling_seed is not None:
+            if not isinstance(self.sampling_seed, int):
+                raise ValueError(
+                    "sampling_seed must be an integer, got "
+                    f"{type(self.sampling_seed).__name__}."
+                )
+            if not -(2**63) <= self.sampling_seed <= 2**63 - 1:
+                raise ValueError(
+                    "sampling_seed must be in [-2**63, 2**63 - 1], got "
+                    f"{self.sampling_seed}."
+                )
+
+        get_request_reasoning_end_token_ids(
+            self.custom_params,
+            vocab_size=vocab_size,
+            strict=True,
+        )
 
         grammars = [
             self.json_schema,
@@ -217,6 +313,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             if isinstance(self.stop_strs, str):
                 self.stop_strs = [self.stop_strs]
+            if len(self.stop_strs) > MAX_STOP_COUNT:
+                raise ValueError(
+                    f"at most {MAX_STOP_COUNT} stop strings are allowed, "
+                    f"got {len(self.stop_strs)}"
+                )
 
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
@@ -234,9 +335,20 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             if isinstance(self.stop_regex_strs, str):
                 self.stop_regex_strs = [self.stop_regex_strs]
+            if len(self.stop_regex_strs) > MAX_STOP_REGEX_COUNT:
+                raise ValueError(
+                    f"at most {MAX_STOP_REGEX_COUNT} stop_regex patterns are allowed, "
+                    f"got {len(self.stop_regex_strs)}"
+                )
 
             stop_regex_max_len = 0
             for stop_regex in self.stop_regex_strs:
+                stop_regex_len = len(stop_regex.encode("utf-8"))
+                if stop_regex_len > MAX_STOP_REGEX_LEN:
+                    raise ValueError(
+                        f"stop_regex is {stop_regex_len} bytes, over the "
+                        f"{MAX_STOP_REGEX_LEN}-byte limit"
+                    )
                 stop_regex_max_len = max(
                     stop_regex_max_len, get_max_seq_length(stop_regex)
                 )

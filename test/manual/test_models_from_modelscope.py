@@ -9,7 +9,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestDownloadFromModelScope(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = "iic/nlp_lstmcrf_word-segmentation_chinese-news"

@@ -8,8 +8,9 @@ decoder module family (``ResnetBlock2D`` GroupNorm+SiLU chains,
 
 All rewrites are mathematically exact re-associations of the original
 operators. Wrappers are installed once at VAE load and dispatch on a
-decode-scoped :class:`VaeFastPathGate`: ``quality == "high"`` runs the fast
-paths, the ``"lossless"`` default runs the original module path bit-for-bit.
+decode-scoped :class:`VaeFastPathGate`: ``quality="lossless"`` and
+``quality="high"`` run the fast paths, while the ``"exact"`` default runs
+the original module path bit-for-bit.
 
 - channels_last: run the decoder in NHWC so cuDNN convs skip the transpose
   kernels; parameter layout is swapped at decode entry to match the gate.
@@ -27,6 +28,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
+    fold_upsample2x_conv2d_weight,
+)
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
     register_vae_fast_path_gate,
@@ -36,7 +40,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 try:
-    from sglang.kernels.ops.diffusion.triton.group_norm_silu_twopass import (
+    from sglang.kernels.ops.diffusion import (
+        can_use_group_norm_silu_4d,
+        can_use_group_norm_silu_rows,
         group_norm_silu_4d,
         group_norm_silu_rows,
     )
@@ -70,8 +76,12 @@ class FusedGroupNormSiLU(nn.Module):
         self._sgl_gate = gate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._sgl_gate.enabled and x.dim() == 4:
-            y = group_norm_silu_4d(
+        if (
+            self._sgl_gate.enabled
+            and x.dim() == 4
+            and can_use_group_norm_silu_4d(x, self.weight, self.bias, self.num_groups)
+        ):
+            return group_norm_silu_4d(
                 x,
                 self.weight,
                 self.bias,
@@ -79,8 +89,6 @@ class FusedGroupNormSiLU(nn.Module):
                 self.eps,
                 apply_silu=True,
             )
-            if y is not None:
-                return y
         return F.silu(
             F.group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
         )
@@ -129,25 +137,7 @@ def _install_norm_silu(decoder, resnet_cls, gate: VaeFastPathGate) -> int:
 # ---------------------------------------------------------------------------
 
 # Which 3x3 conv taps sum into each 4x4 transposed-conv tap (per spatial axis).
-_UPSAMPLE_TAP_MAP = {0: (2,), 1: (1, 2), 2: (0, 1), 3: (0,)}
-
-
-def _fold_upsample2x_conv2d_weight(conv: nn.Conv2d) -> torch.Tensor:
-    """Sum the 3x3 conv taps into the equivalent ConvTranspose2d(k4) kernel."""
-    w = conv.weight.detach().float()  # [Cout, Cin, 3, 3]
-    cout, cin = w.shape[:2]
-    wt = w.new_zeros(cin, cout, 4, 4)  # ConvTranspose2d layout
-    for a in range(4):
-        for b in range(4):
-            acc = w.new_zeros(cout, cin)
-            for i in _UPSAMPLE_TAP_MAP[a]:
-                for j in _UPSAMPLE_TAP_MAP[b]:
-                    acc += w[:, :, i, j]
-            wt[:, :, a, b] = acc.t()
-    wt = wt.to(conv.weight.dtype)
-    if conv.weight.is_contiguous(memory_format=torch.channels_last):
-        wt = wt.contiguous(memory_format=torch.channels_last)
-    return wt.to(conv.weight.device)
+_fold_upsample2x_conv2d_weight = fold_upsample2x_conv2d_weight
 
 
 class FusedUpsample2xConv2d(nn.Module):
@@ -257,10 +247,12 @@ def _attn_fast_forward(
 
     if self.group_norm is not None:
         gn = self.group_norm
-        y = group_norm_silu_rows(
-            hs, gn.weight, gn.bias, gn.num_groups, gn.eps, apply_silu=False
-        )
-        hs = y if y is not None else gn(hs.transpose(1, 2)).transpose(1, 2)
+        if can_use_group_norm_silu_rows(hs, gn.weight, gn.bias, gn.num_groups):
+            hs = group_norm_silu_rows(
+                hs, gn.weight, gn.bias, gn.num_groups, gn.eps, apply_silu=False
+            )
+        else:
+            hs = gn(hs.transpose(1, 2)).transpose(1, 2)
 
     query = self.to_q(hs)
     key = self.to_k(hs)

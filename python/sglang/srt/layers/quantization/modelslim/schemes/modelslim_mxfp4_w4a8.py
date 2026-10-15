@@ -12,7 +12,7 @@ scheme: weights are 4-bit FP4, activations are dynamically quantised to MXFP8.
 This is NOT the same layout as ``W8A8_MXFP8`` (which stores float8_e4m3fn weights
 of shape [out, in]) — so weight creation and the forward pass differ from MXFP8.
 Weight post-processing and the matmul are delegated to ``NPUMXFP4W4A8OfflineLinearMethod``
-(``self.kernel``), mirroring vllm-ascend's ``AscendW4A8MXFPDynamicLinearMethod``:
+(``self.kernel``):
 ``npu_format_cast`` the packed FP4 to FRACTAL_NZ + transpose, then ``x2_dtype=
 float4_e2m1fn_x2`` matmul with ``group_sizes=[0, 0, 32]``. Requires a recent
 torch_npu for the FP4 matmul on Ascend 950/A5 (older builds reject the NZ weight) —

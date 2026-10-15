@@ -4,11 +4,18 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -30,12 +37,9 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.spec_attn_is_decode = (
-            model_runner.server_args.speculative_attention_mode == "decode"
-        )
-        self.spec_attn_is_prefill = (
-            model_runner.server_args.speculative_attention_mode == "prefill"
-        )
+        self.kv_index_translator = model_runner.kv_index_translator
+        self.spec_attn_is_decode = get_spec().speculative_attention_mode == "decode"
+        self.spec_attn_is_prefill = get_spec().speculative_attention_mode == "prefill"
         # Gates the FutureMap's per-step seq_lens D2H (decide_needs_cpu_seq_lens
         # ORs it across backends). Count only what runs in the spec decode loop:
         # decode always, prefill only when mode=prefill routes verify to it --
@@ -83,9 +87,25 @@ class HybridAttnBackend(AttentionBackend):
         else:
             return self.prefill_backend
 
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return self._select_backend(fm).shared_read_ends(fm)
+
+    def get_fused_kv_write_buffers(self, layer, forward_batch):
+        return self._select_backend(
+            forward_batch.forward_mode
+        ).get_fused_kv_write_buffers(layer, forward_batch)
+
     @property
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
+
+    @property
+    def dllm_attention(self):
+        return self.prefill_backend.dllm_attention
+
+    @property
+    def supports_prefill_cuda_graph_max_context_size(self) -> bool:
+        return self.prefill_backend.supports_prefill_cuda_graph_max_context_size
 
     def prepare_full_cuda_graph_chunked_prefix(
         self,
@@ -115,15 +135,15 @@ class HybridAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
-        if (
-            self.model_runner.server_args.speculative_algorithm is not None
-            and self.spec_attn_is_prefill
+        if get_exec().dllm.dllm_algorithm is not None or (
+            get_spec().speculative_algorithm is not None and self.spec_attn_is_prefill
         ):
-            # When speculative decoding is enabled, we need to initialize the backend
-            # that will be used for target_verify.
+            # DLLM and prefill-backed verification capture the prefill backend.
             self.prefill_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def get_cuda_graph_seq_len_fill_value(self):
+        if get_exec().dllm.dllm_algorithm is not None:
+            return self.prefill_backend.get_cuda_graph_seq_len_fill_value()
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
     def init_mha_chunk_metadata(
@@ -151,33 +171,13 @@ class HybridAttnBackend(AttentionBackend):
             ForwardMode.TARGET_VERIFY
         ).update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
-    def forward(
-        self,
-        q: Optional[torch.Tensor] = None,  # For full attention
-        k: Optional[torch.Tensor] = None,  # For full attention
-        v: Optional[torch.Tensor] = None,  # For full attention
-        layer: Optional[RadixAttention] = None,
-        forward_batch: Optional[ForwardBatch] = None,
-        save_kv_cache: bool = True,
-        *,
-        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
-        a: Optional[torch.Tensor] = None,  # For linear attention
-        b: Optional[torch.Tensor] = None,  # For linear attention
-        **kwargs,
-    ):
-        """Forward method that supports both regular attention (q, k, v) and linear attention (mixed_qkv, a, b)."""
-        backend = self._select_backend(forward_batch.forward_mode)
-        if mixed_qkv is not None:
-            return backend.forward(
-                layer=layer,
-                forward_batch=forward_batch,
-                save_kv_cache=save_kv_cache,
-                mixed_qkv=mixed_qkv,
-                a=a,
-                b=b,
-                **kwargs,
-            )
-        return backend.forward(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        backend = (
+            self.prefill_backend
+            if get_exec().dllm.dllm_algorithm is not None
+            else self.decode_backend
+        )
+        backend.validate_elastic_cuda_graph_recapture()
 
     def forward_decode(
         self,

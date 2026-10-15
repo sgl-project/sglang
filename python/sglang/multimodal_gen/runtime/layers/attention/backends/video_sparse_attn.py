@@ -98,9 +98,7 @@ def construct_variable_block_sizes(
         t_sizes[:, None, None]  # [n_t, 1,   1]
         * h_sizes[None, :, None]  # [1,   n_h, 1]
         * w_sizes[None, None, :]  # [1,   1,   n_w]
-    ).reshape(
-        -1
-    )  # [n_t * n_h * n_w]
+    ).reshape(-1)  # [n_t * n_h * n_w]
 
     return block_sizes
 
@@ -176,12 +174,6 @@ def _compute_cur_topk(attn_metadata: VideoSparseAttentionMetadata) -> int:
 
 
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self):
-        pass
-
-    def prepare(self):
-        pass
-
     def build(  # type: ignore
         self,
         current_timestep: int,
@@ -191,7 +183,6 @@ class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
         **kwargs: dict[str, Any],
     ) -> VideoSparseAttentionMetadata:
-        patch_size = patch_size
         dit_seq_shape = (
             raw_latent_shape[0] // patch_size[0],
             raw_latent_shape[1] // patch_size[1],

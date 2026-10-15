@@ -15,6 +15,7 @@
 
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
@@ -28,7 +29,6 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
@@ -59,12 +59,20 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
-from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
+from sglang.srt.models.gemma4_causal import (
+    Gemma4TextModel,
+    load_tied_lm_head,
+    pp_filter_load_weight,
+)
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.utils import add_prefix
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -180,7 +188,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
 
@@ -241,9 +249,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # while logits run on the last rank, so we can't reuse the embedding
         # module directly.  For PP=1 keep the original tying; for PP>1
         # materialize a real ParallelLMHead on the last rank and route the
-        # checkpoint embedding into it during load_weights.
+        # checkpoint embedding into it during load_weights.  CPU with AMX does
+        # the same: the packed head weights cannot alias the embedding table.
         text_tie = getattr(text_config, "tie_word_embeddings", True)
-        if self.pp_group.world_size == 1 and text_tie:
+        self.lm_head_is_tied = (
+            self.pp_group.world_size == 1
+            and text_tie
+            and not (_is_cpu and _is_cpu_amx_available)
+        )
+        if self.lm_head_is_tied:
             self.lm_head = self.language_model.embed_tokens
         elif self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -283,9 +297,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def pad_input_ids(
         self,
-        input_ids: List[int],
+        input_ids: array,
         mm_inputs: MultimodalInputs,
-    ) -> List[int]:
+    ) -> array:
         """Pad input IDs with image and audio tokens."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -321,11 +335,51 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         during prefill. Following the HF implementation, bidirectional attention
         is only enabled within each individual image group (same-item
         tokens), not across items.
-        Currently only the TritonAttnBackend supports this.
+        Triton and FA4 use causal attention for image spans split across chunks.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
-        if not isinstance(get_attn_backend(), TritonAttnBackend):
+        attn_backend = get_attn_backend()
+        prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
+        if getattr(prefill_backend, "fa_impl_ver", None) == 4:
+            # O(query tokens) metadata instead of a dense Q x KV mask. Keep
+            # absolute ranges so cached text prefixes retain the right offset.
+            lengths = forward_batch.extend_seq_lens_cpu
+            prefixes = forward_batch.extend_prefix_lens_cpu
+            ranges = torch.full((sum(lengths), 2), -1, dtype=torch.int32)
+            offset = 0
+            split_images = []
+            for i, (length, prefix) in enumerate(zip(lengths, prefixes)):
+                mm_inputs = forward_batch.mm_inputs[i]
+                if mm_inputs is not None:
+                    for item in mm_inputs.mm_items:
+                        if not item.is_image():
+                            continue
+                        for begin, end in item.offsets:
+                            if end < prefix or begin >= prefix + length:
+                                continue
+                            if begin < prefix or end >= prefix + length:
+                                # Match Triton: leave split image rows at the
+                                # causal sentinel instead of granting partial
+                                # bidirectional attention within this chunk.
+                                split_images.append((i, begin, end))
+                                continue
+                            ranges[
+                                offset + begin - prefix : offset + end + 1 - prefix
+                            ] = torch.tensor([begin, end], dtype=torch.int32)
+                offset += length
+            if split_images:
+                logger.warning_once(
+                    f"{len(split_images)} images are split across chunk boundaries. "
+                    f"First 5 split images (batch, begin, end): {split_images[:5]}. "
+                    "Those images will receive causal attention. Disable chunked "
+                    "prefill (--chunked-prefill-size=-1) for full bidirectional attention."
+                )
+            prefill_backend.forward_metadata.image_token_ranges = ranges.to(
+                input_ids.device, non_blocking=True
+            )
+            return
+        if not isinstance(prefill_backend, TritonAttnBackend):
             logger.warning_once(
                 "Bidirectional attention for image tokens requires TritonAttnBackend. "
                 "Falling back to causal attention, which may degrade image quality."
@@ -399,10 +453,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            get_attn_backend().forward_metadata.mask_indptr = (
+            prefill_backend.forward_metadata.mask_indptr = (
                 bidirectional_attn_mask_indptr
             )
-            get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
+            prefill_backend.forward_metadata.custom_mask = bidirectional_attn_masks
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
@@ -668,13 +722,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        # PP=1 keeps the original tied-weight behavior of using embed_tokens
-        # directly; under PP we route through the dedicated lm_head module.
         head = (
-            self.language_model.embed_tokens
-            if self.pp_group.world_size == 1
-            and getattr(self.config.text_config, "tie_word_embeddings", True)
-            else self.lm_head
+            self.language_model.embed_tokens if self.lm_head_is_tied else self.lm_head
         )
         return self.logits_processor(
             input_ids,
@@ -1016,6 +1065,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+                        if (
+                            text_tie
+                            and not self.lm_head_is_tied
+                            and name == "language_model.embed_tokens.weight"
+                        ):
+                            load_tied_lm_head(
+                                loaded_weight,
+                                params_dict=params_dict,
+                                loaded_params=loaded_params,
+                            )
                         loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
@@ -1040,12 +1099,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     logger.log(level, "%s: %s", msg, names)
         return loaded_params
 
-    lora_pattern = re.compile(
-        r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-    )
-
     def should_apply_lora(self, module_name: str) -> bool:
-        return bool(self.lora_pattern.match(module_name))
+        return module_name.startswith("language_model.layers.")
 
     def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim
@@ -1095,7 +1150,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "--pp-size 1 if you need this API."
             )
         embed = self.language_model.embed_tokens.weight
-        # Gemma4 ties word embeddings, so embed_tokens serves as lm_head
+        # a materialized lm_head is loaded from this very tensor, so it is exact
         return embed, embed
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
