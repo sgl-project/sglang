@@ -1,5 +1,6 @@
 ---
 title: LongCat-Image
+description: "Deploy LongCat-Image with SGLang Diffusion and its native in-process Qwen2.5-VL prompt rewriter."
 metatags:
     description: "Deploy LongCat-Image with SGLang Diffusion and its native in-process Qwen2.5-VL prompt rewriter."
 ---
@@ -8,7 +9,20 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "prompt rewriting", "Qwen2.5-VL"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/LongCat/longcat-image.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [LongCat-Image](https://huggingface.co/meituan-longcat/LongCat-Image) is a
 text-to-image model from Meituan. SGLang runs its Qwen2.5-VL prompt rewriter
@@ -17,10 +31,6 @@ in process with the native SGLang runtime before text encoding and denoising.
 The native pipeline keeps prompt rewriting and diffusion behind one OpenAI-compatible
 image endpoint. Rewriting is enabled by default for stronger prompt expansion, but
 each request can disable it when lower latency matters more than the rewritten prompt.
-
-## 2. Installation
-
-Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
 
 ## 3. Serve the model
 

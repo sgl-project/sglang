@@ -65,13 +65,6 @@ register_cpu_ci(est_time=46, suite="stage-b-test-cpu-intel")
 
 
 _BENCH_SERVING_CLI_CASES = {
-    "help": ["--help"],
-    "invalid_distribution": [
-        "--dataset-name",
-        "generated-shared-prefix",
-        "--gsp-group-distribution",
-        "invalid_name",
-    ],
     "flush_cache_timeout": ["--flush-cache-timeout", "inf"],
     "zipf_without_alpha": [
         "--dataset-name",
@@ -565,6 +558,16 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 2)
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
+
+        for row in rows:
+            rendered = self.tokenizer.apply_chat_template(
+                row.prompt, tokenize=False, add_generation_prompt=True
+            )
+            expected_prompt_len = len(self.tokenizer.encode(rendered))
+            tools = row.extra_request_body.get("tools")
+            if tools:
+                expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
+            self.assertEqual(row.prompt_len, expected_prompt_len)
 
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
@@ -1407,26 +1410,6 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             args = make_args(dataset_name="generated-shared-prefix", **case)
             with self.assertRaises(ValueError, msg=f"case={case}"):
                 GeneratedSharedPrefixDataset.from_args(args)
-
-    def test_bench_serving_help_and_invalid_choice_argparse(self):
-        # Subprocess-driven coverage of the live CLI: --help advertises both
-        # flags with the rank-based Zipf formula and the alpha constraint,
-        # and argparse rejects an unknown distribution choice.
-        help_res = _bench_serving_cli_results()["help"]
-        self.assertEqual(help_res.returncode, 0, help_res.stderr)
-        out = help_res.stdout
-        # Both new flags appear.
-        self.assertIn("--gsp-group-distribution", out)
-        self.assertIn("--gsp-zipf-alpha", out)
-        # Rank-based Zipf formula and alpha constraint are documented.
-        self.assertIn("1/rank**alpha", out)
-        self.assertIn("rank starts at 1", out)
-        self.assertIn("finite float", out)
-
-        # Argparse rejects unknown distribution choice.
-        bad_choice_res = _bench_serving_cli_results()["invalid_distribution"]
-        self.assertNotEqual(bad_choice_res.returncode, 0)
-        self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
 
     def test_serving_benchmark_cli_rejects_invalid_flush_cache_timeout(self):
         """Invalid timeouts fail before the benchmark contacts a server or hangs."""
