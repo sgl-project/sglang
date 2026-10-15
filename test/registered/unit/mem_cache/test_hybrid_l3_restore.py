@@ -183,7 +183,7 @@ class TestHybridL3Restore(CustomTestCase):
             self._fill_full_kv(
                 wa, wp.req_to_token[req.kv.req_pool_idx, :depth], marker=7
             )
-            writer.cache_unfinished_req(req)
+            writer.checkpoint(req, up_to=req.extend_end)
             self._backup_node(writer, req.last_node)
             self._write_path_to_l3(writer, req.last_node)
             self._flush_l3_backups(writer)
@@ -210,7 +210,7 @@ class TestHybridL3Restore(CustomTestCase):
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:depth])))
             )
             pm = DecodePrefixMatch(
-                prefix_indices=match.device_indices,
+                prefix_indices=reader.path_device_indices(match.last_device_node),
                 l2_host_hit_length=depth,
                 l3_storage_hit_length=0,
                 last_device_node=reader.root_node_handle(),
