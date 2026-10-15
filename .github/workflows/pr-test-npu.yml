@@ -382,7 +382,7 @@ jobs:
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         # bash only: the k8s runner pool defaults to `sh -e`, which lacks
         # `[[` and mapfile — under sh the coverage branch silently falls
-        # through to the PR-mode path below
+        # through to the PR-mode path below.
         shell: bash
         run: |
           # Coverage mode: enumerate case-level pytest node ids and run each
@@ -390,6 +390,10 @@ jobs:
           # the 800t shared disk). PR mode below stays unchanged.
           if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
             pip install coverage==7.8.*
+            # Coverage tracing inflates Python-heavy stage timings (e.g. text
+            # encoding ~2.5x); widen the non-denoise stage tolerance so
+            # coverage runs collect data without perf-gating.
+            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=3.0
             python3 scripts/ci/npu/precise-test/list_tests.py --hw npu --suite multimodal-gen-test-1-npu-a3 \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size 2 \
@@ -484,6 +488,10 @@ jobs:
           # the 800t shared disk). PR mode below stays unchanged.
           if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
             pip install coverage==7.8.*
+            # Coverage tracing inflates Python-heavy stage timings (e.g. text
+            # encoding ~2.5x); widen the non-denoise stage tolerance so
+            # coverage runs collect data without perf-gating.
+            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=3.0
             python3 scripts/ci/npu/precise-test/list_tests.py --hw npu --suite multimodal-gen-test-4-npu-a3 \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size 2 \
