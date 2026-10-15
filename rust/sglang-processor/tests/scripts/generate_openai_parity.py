@@ -159,6 +159,8 @@ def record_frames(engine_url, body):
     for line in response.iter_lines(decode_unicode=True):
         if line.startswith("data: ") and line != "data: [DONE]":
             frames.append(json.loads(line[len("data: ") :]))
+    # Unread keys can appear in one frame only, which deltas cannot express.
+    trim_meta({"frames": frames})
     return {"status": 200, "frames": stream_frames(frames, store=True)}
 
 
@@ -304,6 +306,15 @@ def generate(path, model, engine_url):
     config = model.template_manager and model.template_manager.reasoning_config
     if config is not None and config.special_case == "always":
         fixture["chat_model"]["always_thinks"] = True
+    elif (
+        config is not None
+        and config.toggle_param
+        and config.default_enabled is not None
+    ):
+        fixture["chat_model"]["reasoning_toggle"] = {
+            "toggle_param": config.toggle_param,
+            "default_enabled": config.default_enabled,
+        }
     defaults = generate_defaults()
     fixture["generate_defaults"] = {
         name: value for name, value in defaults.items() if name not in SKIPPED_FIELDS
