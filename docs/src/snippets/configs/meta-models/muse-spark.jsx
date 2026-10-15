@@ -289,10 +289,10 @@ export const config = {
 
   // One recipe per hardware/quantization pair, with the former Deployment
   // defaults baked in. Playground starts from these same flags and environment.
-  // No verification badge is claimed.
   cells: [
     {
       match: { hw: "b300", quant: "nvfp4" },
+      verified: true,
       nnodes: 1,
       env: [],
       flags: [
