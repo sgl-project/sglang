@@ -83,7 +83,7 @@ def per_tensor_quant_fp8_native(
     output_s: torch.Tensor,
     is_static: bool = False,
 ) -> None:
-    fp8_max = 224.0
+    fp8_max = torch.finfo(output_q.dtype).max
     fp8_min = -fp8_max
     if not is_static:
         # Calculate scale on the fly for dynamic
