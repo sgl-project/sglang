@@ -243,6 +243,7 @@ def forward_layer_fused_boundary(
         prev_pre=state.pre,
         pending_post=tuple(state.streams) if pending else None,
         defer_post=defer_post,
+        mono_plan=model.mono_plan,
     )
     return HcState(
         hidden_states if pending_post is None else HcPending(*pending_post),

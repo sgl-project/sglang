@@ -64,6 +64,12 @@ dispatch stays in `srt`; the K3 communication adapters live in
 runtime subsystem, even when they need a GPU. Kernel inventory/dispatch tests
 belong in `test/registered/unit/kernels/`.
 
+`mono` is a deliberate exception (RFC #43949): monokernels are one plugin, so
+`ops/mono/` holds the framework (`hooks.py`, the calls SGLang makes; `spec.py`,
+what a model declares), the shared HIP device runtime (`common_hip/`), and each
+model's kernels, runner, spec, and glue (`<model>_<vendor>/`). `srt/` only calls
+the hooks.
+
 When moving an operator, update its callers, lazy `KernelSpec` targets and op
 ids, tests, benchmark imports, and tuning-data paths together. Preserve CI
 stage/runner registrations and test cases when splitting files. See the

@@ -391,6 +391,13 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_monokernel: A[
+        bool,
+        "Run the decode and speculative-verify steps the model's monokernel spec covers as persistent kernels "
+        "that each run most of a decoder layer, its tensor-parallel all-reduce included; every other step runs "
+        "the normal path. A model without a spec, or a deployment the spec does not support, is refused at "
+        "startup with every reason listed.",
+    ] = False
 
 
 class ExecMamba(msgspec.Struct):
