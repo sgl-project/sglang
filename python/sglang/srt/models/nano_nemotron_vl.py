@@ -58,9 +58,20 @@ class NemotronH_Nano_VL_V2(EVS):
         },
     )
 
+    supported_lora_modules = NemotronHForCausalLM.supported_lora_modules
+
     @staticmethod
     def create_evs_config(config: NemotronH_Nano_VL_V2_Config):
         return EVSConfig(video_pruning_rate=config.video_pruning_rate)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return module_name.startswith("language_model.")
+
+    def get_hidden_dim(self, module_name, layer_idx):
+        return self.language_model.get_hidden_dim(module_name, layer_idx)
+
+    def get_stacked_multiply(self, module_name):
+        return self.language_model.get_stacked_multiply(module_name)
 
     def __init__(
         self,
@@ -116,6 +127,16 @@ class NemotronH_Nano_VL_V2(EVS):
             )
 
         self.config = config
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.language_model.routed_experts_weights_of_layer
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return NemotronHForCausalLM.get_model_config_for_expert_location(
+            config.llm_config
+        )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         im_start_id: int = mm_inputs.im_start_id

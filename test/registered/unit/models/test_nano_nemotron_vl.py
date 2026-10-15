@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
+from sglang.srt.configs import NemotronHConfig
+from sglang.srt.configs.nemotron_h import MOE
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -138,6 +140,36 @@ class TestNemotronHOmniModel(CustomTestCase):
         self.assertIs(model_class, NemotronH_Omni_Reasoning_V3)
         self.assertEqual(architecture, "NemotronH_Omni_Reasoning_V3")
 
+    def test_lora_scope_excludes_the_vision_tower(self):
+        """RADIO qkv_proj under a layers.<i>. path is outside the LoRA scope."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+
+        self.assertTrue(
+            model.should_apply_lora("language_model.model.layers.7.mixer.qkv_proj")
+        )
+        self.assertFalse(
+            model.should_apply_lora(
+                "vision_model.radio_model.model.encoder.layers.7.attn.attn.qkv_proj"
+            )
+        )
+
+    def test_lora_shape_hooks_reach_the_language_model(self):
+        """The LoRA shape hooks forward to the inner language model."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        model.language_model = SimpleNamespace(
+            get_hidden_dim=lambda module_name, layer_idx: (module_name, layer_idx),
+            get_stacked_multiply=lambda module_name: (module_name, "mult"),
+        )
+
+        self.assertEqual(model.get_hidden_dim("out_proj", 5), ("out_proj", 5))
+        self.assertEqual(
+            model.get_stacked_multiply("gate_up_proj_moe"),
+            ("gate_up_proj_moe", "mult"),
+        )
+        self.assertIn("in_proj", NemotronH_Omni_Reasoning_V3.supported_lora_modules)
+
     def test_vision_final_layernorm_is_loaded_and_applied(self):
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)
@@ -250,6 +282,35 @@ class TestNemotronHOmniModel(CustomTestCase):
             [name for name, _ in loaded_sound_weights],
             ["sound_encoder.projection.weight"],
         )
+
+    def test_expert_location_config_spans_full_hybrid_stack(self):
+        """The VL wrapper exposes the full-stack expert-location config for EPLB."""
+        pattern = "ME*E-E"
+        llm_config = NemotronHConfig(
+            hybrid_override_pattern=pattern, n_routed_experts=8, n_group=1
+        )
+
+        expert_config = (
+            NemotronH_Omni_Reasoning_V3.get_model_config_for_expert_location(
+                SimpleNamespace(llm_config=llm_config)
+            )
+        )
+
+        self.assertEqual(expert_config.num_layers, len(pattern))
+        moe_layer_ids = [i for i, c in enumerate(pattern) if c == MOE]
+        self.assertLess(max(moe_layer_ids), expert_config.num_layers)
+        self.assertEqual(expert_config.num_logical_experts, 8)
+
+    def test_routed_expert_weights_come_from_language_model(self):
+        """The VL wrapper exposes the language model's expert weights for EPLB."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        weights_of_layer = {1: [torch.ones(1)]}
+        model.language_model = SimpleNamespace(
+            routed_experts_weights_of_layer=weights_of_layer
+        )
+
+        self.assertIs(model.routed_experts_weights_of_layer, weights_of_layer)
 
 
 if __name__ == "__main__":
