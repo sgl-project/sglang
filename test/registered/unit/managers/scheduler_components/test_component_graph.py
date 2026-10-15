@@ -413,12 +413,7 @@ _CALLBACK_SITES = {
     ("handle_pd_role_switch", "role_switch.handle_pd_role_switch", "", _SELF): 1,
     ("run_event_loop", "dispatch_event_loop", "", _SELF): 1,
     # The scripted runtime's test hook.
-    (
-        "maybe_init_scripted_scheduler_hook",
-        "ScriptedSchedulerHook",
-        "scheduler",
-        _SELF,
-    ): 1,
+    ("__init__", "hook.attach", "", _SELF): 1,
     # To be removed.
     (
         "init_dp_attn_adapter",

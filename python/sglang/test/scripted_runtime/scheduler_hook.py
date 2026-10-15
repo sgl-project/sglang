@@ -126,10 +126,11 @@ class ScriptedSchedulerHook:
     def __init__(
         self,
         *,
-        scheduler: Scheduler,
         tokenizer_recv_proxy: Optional[ScriptedTokenizerRecvProxy],
     ) -> None:
-        self.scheduler = scheduler
+        # Set by attach: the scheduler is built after its components.
+        self.scheduler: Optional[Scheduler] = None
+        self._tokenizer_recv_proxy = tokenizer_recv_proxy
         self._is_driver = (
             get_parallel().pp_rank == 0
             and get_parallel().tp_rank == 0
@@ -137,22 +138,27 @@ class ScriptedSchedulerHook:
         )
         self._batch_log: List[ScriptedBatchRecord] = []
         self._trace: Optional[SchedulingTraceWriter] = None
+        self._context: Optional[ScriptedContext] = None
+        self._script_fn_generator: Optional[Generator] = None
 
         if self._is_driver:
             ensure_script_importable(
                 envs.SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY.get()
             )
             self._http_poster: Optional[BackgroundHttpPoster] = BackgroundHttpPoster()
-            self._context: Optional[ScriptedContext] = ScriptedContext(
-                scheduler_hook=self,
-                tokenizer_recv_proxy=tokenizer_recv_proxy,
-                http_poster=self._http_poster,
-            )
-            self._script_fn_generator: Optional[Generator] = self._run_dispatch_loop()
         else:
             self._http_poster = None
-            self._context = None
-            self._script_fn_generator = None
+
+    def attach(self, scheduler: Scheduler) -> None:
+        """Bind the scheduler the scripts drive, once it is built."""
+        self.scheduler = scheduler
+        if self._is_driver:
+            self._context = ScriptedContext(
+                scheduler_hook=self,
+                tokenizer_recv_proxy=self._tokenizer_recv_proxy,
+                http_poster=self._http_poster,
+            )
+            self._script_fn_generator = self._run_dispatch_loop()
 
     def _run_dispatch_loop(self) -> Generator:
         endpoint = envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.get()

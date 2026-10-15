@@ -503,6 +503,8 @@ class Scheduler:
         self.init_startup_timing_summary()
         # Reads the startup time.
         self.init_internal_state()
+        if (hook := self.scripted_scheduler_hook) is not None:
+            hook.attach(self)
 
     def init_engine_state(self) -> None:
         self.counters = LaunchCounters()
@@ -1947,8 +1949,8 @@ class Scheduler:
                 ScriptedSchedulerHook,
             )
 
+            # The scheduler attaches itself once it is built.
             self.scripted_scheduler_hook = ScriptedSchedulerHook(
-                scheduler=self,
                 tokenizer_recv_proxy=self.ipc_channels.recv_from_tokenizer,
             )
         else:
