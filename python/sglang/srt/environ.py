@@ -562,8 +562,8 @@ class Envs:
     # Greedy draft steps select the token on vocab shards and exchange one packed
     # row (argmax + embedding) instead of all-gathering the logits.
     SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
-    # Row-parallel MTP fc: each rank multiplies its input-column slice (one
-    # normalized half) and the partial outputs are all-reduced.
+    # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
+    # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)
 
     # ===================================================================

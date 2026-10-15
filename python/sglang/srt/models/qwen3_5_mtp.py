@@ -23,11 +23,12 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.speculative.ordered_partial_sum import ordered_partial_sum
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
-from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -45,6 +46,8 @@ from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip, is_npu
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+# Draft decode and draft-extend widths; larger (prefill) batches keep the replicated fc.
+_FC_SPLIT_MAX_TOKENS = 16
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -127,19 +130,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
+        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.fc_split_slice = self._fc_split_slice(config.hidden_size)
-        if self.fc_split_slice is not None:
-            self.fc = RowParallelLinear(
-                2 * config.hidden_size,
-                config.hidden_size,
-                bias=False,
-                input_is_parallel=True,
-                reduce_results=True,
-                quant_config=None,
-                prefix=add_prefix("fc", prefix),
+        # This rank's fc input-column slice, copied on the first eager split call.
+        self._fc_shard: Optional[torch.Tensor] = None
+        self._fc_gather = (
+            triton_symm_mem_ag.MultimemAllGatherer(
+                max_tokens=_FC_SPLIT_MAX_TOKENS, enabled=True, skip_entry_sync=True
             )
-        else:
-            self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+            if self.fc_split_slice is not None
+            else None
+        )
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
@@ -178,12 +179,31 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         rank, size = get_parallel().tp_rank, get_parallel().tp_size
         width = 2 * hidden_size // size
         if size == 1 or (2 * hidden_size) % size != 0 or hidden_size % width != 0:
-            logger.warning("MTP fc split disabled for tp_size=%d; using the replicated fc.", size)
+            logger.warning(
+                "MTP fc split disabled for tp_size=%d; using the replicated fc.", size
+            )
             return None
         start = rank * width
         return (start >= hidden_size, start % hidden_size, width)
 
+    def _fc_split_ready(self, num_tokens: int) -> bool:
+        if self.fc_split_slice is None or not 0 < num_tokens <= _FC_SPLIT_MAX_TOKENS:
+            return False
+        if self._fc_shard is None:
+            if torch.cuda.is_current_stream_capturing():
+                logger.warning(
+                    "MTP fc split first reached inside graph capture; "
+                    "using the replicated fc."
+                )
+                return False
+            use_hidden, start, width = self.fc_split_slice
+            col = start + (self.config.hidden_size if use_hidden else 0)
+            self._fc_shard = self.fc.weight[:, col : col + width].contiguous()
+        return True
+
     def _split_fc(self, input_embeds, hidden_states, forward_batch):
+        """fp32 partial of this rank's input-column slice, all-gathered and summed in
+        rank order, rounded once to bf16 (the replicated fc's rounding points)."""
         use_hidden, start, width = self.fc_split_slice
         x = hidden_states if use_hidden else input_embeds
         if not forward_batch.forward_mode.is_idle():
@@ -194,8 +214,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             slot = x.new_zeros((input_embeds.shape[0], x.shape[1]))
             slot[:rows] = x[:rows]
             x = slot
-        out, _ = self.fc(x[:, start : start + width])
-        return out
+        partial = torch.mm(
+            x[:, start : start + width], self._fc_shard.T, out_dtype=torch.float32
+        )
+        gathered = self._fc_gather(partial.view(torch.bfloat16))
+        out = partial.new_empty(partial.shape, dtype=torch.bfloat16)
+        return ordered_partial_sum(
+            gathered.view(torch.float32), get_parallel().tp_size, out
+        )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -273,7 +299,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = forward_batch.spec_info.hidden_states
 
-            if self.fc_split_slice is not None:
+            if self._fc_split_ready(input_embeds.shape[0]):
                 hidden_states = self._split_fc(
                     input_embeds, hidden_states, forward_batch
                 )
