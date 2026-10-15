@@ -407,7 +407,9 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
 
         def own_pending_tensor(tensor: torch.Tensor) -> torch.Tensor:
             # RunAI reuses its buffers between yields; paired tensors can cross files.
-            if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+            if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False) or getattr(
+                tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, False
+            ):
                 return tensor.detach().to("cpu", copy=True)
             return tensor
 
