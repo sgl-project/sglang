@@ -396,6 +396,19 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        """Load KV data from the host memory pool to the device memory pool for all layers.
+
+        Default: per-layer loop. Subclasses with a batched all-layer kernel
+        (e.g. MLATokenToKVPoolHost) override to avoid N kernel launches.
+        """
+        for layer_id in range(device_pool.layer_num):
+            self.load_to_device_per_layer(
+                device_pool, host_indices, device_indices, layer_id, io_backend
+            )
+
     @abc.abstractmethod
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
