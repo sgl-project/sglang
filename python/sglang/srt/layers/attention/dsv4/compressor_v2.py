@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_forward,
     compress_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -49,83 +50,6 @@ def _extract_positions_from_plan(
     return positions
 
 
-def _compress_forward_c128_fallback(
-    kv_score_buffer: torch.Tensor,
-    kv_score_input: torch.Tensor,
-    ape: torch.Tensor,
-    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
-    head_dim: int,
-) -> torch.Tensor:
-    """PyTorch fallback for C128 compress_forward on HIP (wave64).
-
-    Fully vectorized, compatible with CUDA graph capture.
-    kv_score_buffer: [num_pages, 128, head_dim * 2]
-    ape: [128, head_dim]
-
-    IMPORTANT: This also performs the write to state buffer (like the JIT kernel).
-    The JIT kernel does: (1) write kv_score_input to buffer, (2) compress from buffer.
-    """
-    num_total_slots = kv_score_buffer.shape[0] * kv_score_buffer.shape[1]
-    num_pages = kv_score_buffer.shape[0]
-    last_dim = kv_score_buffer.shape[-1]
-
-    # Step 1: WRITE kv_score_input to state buffer
-    if num_total_slots > 0:
-        buf_flat = kv_score_buffer.view(-1, last_dim)
-        if plan.is_decode:
-            # Decode: plan_d has write_loc per batch item
-            plan_raw = plan[1].view(torch.int32)  # [bs, 4]
-            write_locs = plan_raw[:, 1].long()
-            # Only write valid locations (>= 0 and < buffer size)
-            valid_write = (write_locs >= 0) & (write_locs < num_total_slots)
-            if valid_write.any():
-                buf_flat[write_locs[valid_write]] = kv_score_input[valid_write]
-        else:
-            # Prefill: plan_w has {ragged_id, write_loc} per write entry
-            plan_w = plan[2]  # [num_w, 8] uint8 = WritePlan
-            if plan_w.shape[0] > 0:
-                plan_w_raw = plan_w.view(torch.int32)  # [num_w, 2]
-                ragged_ids = plan_w_raw[:, 0].long() & 0xFFFF
-                write_locs = plan_w_raw[:, 1].long()
-                valid_write = (write_locs >= 0) & (write_locs < num_total_slots)
-                ragged_ids_safe = ragged_ids.clamp(
-                    min=0, max=kv_score_input.shape[0] - 1
-                )
-                if valid_write.any():
-                    buf_flat[write_locs[valid_write]] = kv_score_input[
-                        ragged_ids_safe[valid_write]
-                    ]
-
-    # Step 2: COMPRESS (read from buffer page and do softmax-pool)
-    plan_c = plan[1]  # plan_d for decode, plan_c for prefill
-    num_tokens = plan_c.shape[0]
-    if num_pages == 0 or num_tokens == 0:
-        return kv_score_input.new_zeros(num_tokens, head_dim)
-
-    plan_c_raw = plan_c.view(torch.int32)  # [N, 4]
-    read_page_0 = plan_c_raw[:, 2].long()
-    # Use torch.where instead of clamp to handle -1 (invalid) gracefully
-    valid_read = (read_page_0 >= 0) & (read_page_0 < num_pages)
-    read_page_0_safe = torch.where(
-        valid_read, read_page_0, torch.zeros_like(read_page_0)
-    )
-
-    gathered = kv_score_buffer[read_page_0_safe]  # [N, 128, head_dim*2]
-    kv = gathered[:, :, :head_dim].float()
-    score = gathered[:, :, head_dim:].float() + ape.float().unsqueeze(0)
-    weights = score.softmax(dim=1)
-    out = (weights * kv).sum(dim=1)
-
-    # For decode: zero out non-boundary tokens (seq_len % 128 != 0)
-    # so they don't corrupt kvcache location 0 when stored.
-    if plan.is_decode:
-        seq_lens = plan_c_raw[:, 0].to(torch.int32)
-        is_boundary = (seq_lens % 128 == 0).unsqueeze(-1)  # [N, 1]
-        out = torch.where(is_boundary, out, torch.zeros_like(out))
-
-    return out.to(kv_score_input.dtype)
-
-
 class CompressorBackendMixin:
     def __init__(self):
         super().__init__()
@@ -158,6 +82,7 @@ class CompressorBackendMixin:
         bf16_store: bool = False,
         kv_scale_cache: Optional[torch.Tensor] = None,
         rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_layout: KVLayout = KVLayout.V4,
         fp8_2buff: bool = False,
         kv_cache_rope: Optional[torch.Tensor] = None,
     ) -> None:
@@ -215,6 +140,7 @@ class CompressorBackendMixin:
             bf16_store=bf16_store,
             kvcache_scale=kv_scale_cache,
             rope_cache=rope_cache,
+            layout=kv_layout,
             # Derived once per forward by the backend; every C4 layer writes the
             # same rows to the same slots.
             fp4_k_write_metadata=(
@@ -268,6 +194,7 @@ class CompressorBackendMixin:
         )
         use_hip_fp4 = _is_hip and use_fp4_indexer
         bf16_store = False
+        kv_layout = KVLayout.V4
         kv_scale_cache = None
         fp8_2buff = False
         kv_cache_rope = None
@@ -295,6 +222,8 @@ class CompressorBackendMixin:
             assert compress_kv_pool is not None
             kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            # The pool's page format (V4, or the V4.1 fp8 / fp4 layouts).
+            kv_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
             if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                 out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
         self._forward_compress_all_in_one(
@@ -316,6 +245,7 @@ class CompressorBackendMixin:
             rope_cache=(
                 (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
             ),
+            kv_layout=kv_layout,
             fp8_2buff=fp8_2buff,
             kv_cache_rope=(
                 None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)

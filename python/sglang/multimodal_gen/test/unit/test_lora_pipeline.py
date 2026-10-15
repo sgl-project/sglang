@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from prometheus_client import CollectorRegistry
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
@@ -13,6 +15,8 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     wrap_with_lora_layer,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -54,6 +58,66 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     return pipeline
 
 
+def test_worker_metrics_count_individual_adapters_in_multi_lora():
+    pipeline = _make_pipeline(_make_layer())
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    pipeline.loaded_adapter_paths["second"] = "/second"
+    pipeline.loaded_adapter_alphas["second"] = None
+    pipeline.lora_adapters["second"] = pipeline.lora_adapters["adapter"]
+    registry = CollectorRegistry()
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.pipeline = pipeline
+    worker.metrics = DiffusionMetrics(role="monolithic", replica="0", registry=registry)
+    with patch(_RANK_PATCH, return_value=0):
+        worker.set_lora(
+            ["adapter", "second"],
+            [None, None],
+            target="transformer",
+            strength=[0.5, 0.5],
+            merge_mode="merge",
+        )
+    assert (
+        registry.get_sample_value(
+            "sglang:diffusion_lora_active_adapters",
+            {"role": "monolithic", "replica": "0"},
+        )
+        == 2
+    )
+    assert pipeline.get_lora_status()["active"]["transformer"][0]["nicknames"] == [
+        "adapter",
+        "second",
+    ]
+
+
+@pytest.mark.parametrize("operation", ["set", "merge", "unmerge", "deactivate"])
+@torch.no_grad()
+def test_lora_mutations_preserve_independent_conditioning(operation):
+    layer = _make_layer()
+    pipeline = _make_pipeline(layer)
+    pipeline.modules["transformer"].add_module("linear", layer)
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    encoder = torch.nn.Linear(2, 2).eval()
+    cache = ConditioningCache(1024)
+    x = torch.ones(1, 2)
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", merge_mode="dynamic")
+        cache.run(encoder, "forward", (x,), {}, lambda: encoder(x))
+        cache.run(layer, "forward", (x,), {}, lambda: x.clone())
+        if operation == "set":
+            pipeline.set_lora("adapter", strength=0.5, merge_mode="dynamic")
+        elif operation == "merge":
+            pipeline.merge_lora_weights()
+        elif operation == "unmerge":
+            pipeline.unmerge_lora_weights()
+        else:
+            pipeline.deactivate_lora_weights()
+        cached = cache.run(encoder, "forward", (x,), {}, lambda: encoder(x))
+        cache.run(layer, "forward", (x,), {}, lambda: x.clone())
+    torch.testing.assert_close(cached, encoder(x), rtol=0, atol=0)
+    assert cache.hits == 1
+    assert cache.misses == 3
+
+
 def test_merge_cache_only_accepts_cpu_backed_weights():
     pipeline = _make_pipeline(_make_layer())
     cpu_cache = pipeline._merge_cache_for(
@@ -82,6 +146,7 @@ def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
     assert not _use_owned_base_snapshot(False, "cpu")
     assert not _use_owned_base_snapshot(False, "meta")
     assert _use_owned_base_snapshot(False, "cuda")
+    assert not _use_owned_base_snapshot(False, "cuda", numel=1)
     assert _use_owned_base_snapshot(True, "cpu")
 
     cpu_layer = wrap_with_lora_layer(
@@ -289,3 +354,51 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
         "*.json",
         "adapter.safetensors",
     ]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("offloaded", [False, True])
+def test_view_merge_restores_exact_base_after_strength_changes(dtype, offloaded):
+    torch.manual_seed(0)
+    base = torch.nn.Linear(4, 4, bias=False, dtype=dtype)
+    original = base.weight.detach().clone()
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    assert layer is not None
+    assert layer._base_is_view
+    stored = base.weight.detach()
+    if offloaded:
+        base._packed_weight_cpu = stored
+        base.weight.data = torch.empty(1, dtype=dtype)
+    A = torch.randn(2, 4)
+    B = torch.randn(4, 2)
+    layer.set_lora_weights(A, B, clear_existing=True, merge_weights=False)
+    assert layer._base_is_view
+    for strength in (1.0, 0.0, 0.5, 1.0):
+        layer.set_lora_weights(
+            A, B, strength=strength, clear_existing=True, merge_weights=True
+        )
+        assert layer.merged
+        assert not layer._base_is_view
+        torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
+        if strength == 0:
+            torch.testing.assert_close(stored, original, rtol=0, atol=0)
+        else:
+            assert not torch.equal(stored, original)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(stored, original, rtol=0, atol=0)
+    assert not layer.merged
+
+
+def test_cached_merge_restores_untouched_base_view():
+    base = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+    original = base.weight.detach().clone()
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    layer.set_lora_weights(torch.ones(2, 4), torch.ones(4, 2), merge_weights=False)
+    layer.install_merged_weight(original + 2, base.weight.detach())
+    assert layer._base_is_view
+    torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+    layer.merge_lora_weights(strength=0.5)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)

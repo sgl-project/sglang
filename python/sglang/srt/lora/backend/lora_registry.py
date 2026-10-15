@@ -51,13 +51,6 @@ def create_uno_cublas_backend():
     return UnoCublasLoRABackend
 
 
-@register_lora_backend("flashinfer")
-def create_flashinfer_backend():
-    raise ValueError(
-        "FlashInfer LoRA backend has been deprecated, please use `triton` instead."
-    )
-
-
 def get_backend_from_name(name: str) -> Type[BaseLoRABackend]:
     """
     Get corresponding backend class from backend's name

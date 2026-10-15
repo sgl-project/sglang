@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch.nn import Module
@@ -7,15 +7,103 @@ _NPU_ARCH35_MXFP8_BLOCK_SIZE = 32
 
 
 def process_npu_arch35_mxfp8_linear_weights(
-    layer: Module, weight_block_size: List[int], scale_fmt: str
+    layer: Module, weight_block_size: List[int], scale_fmt: Optional[str]
 ) -> None:
-    """Convert UE8M0 block-FP8 weights to the NPU arch35 MXFP8 layout."""
-    if scale_fmt != "ue8m0":
+    """Convert a linear layer's weights to the NPU arch35 MXFP8 layout.
+
+    UE8M0 checkpoints (scales already powers of two) only need re-layout:
+    the 128-group scale can be duplicated to its 1x32 sub-groups exactly.
+    Plain block-FP8 checkpoints carry arbitrary fp32 scales, so the payload
+    must be dequantized and requantized via npu_dynamic_mx_quant instead.
+    """
+    if scale_fmt == "ue8m0":
+        _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
+    else:
+        _layout_npu_arch35_e4m3_weights(layer, weight_block_size)
+
+
+def _dequant_e4m3fn_to_float32(u8: torch.Tensor) -> torch.Tensor:
+    """Decode float8_e4m3fn payload bytes to FP32 by explicit bit layout.
+
+    Direct ``.to(torch.float32)`` on NPU fp8 tensors fails on some CANN builds
+    (aclnnInplaceCopy error 561103), so decode manually. Only used at
+    weight-load time, where the extra elementwise ops are irrelevant.
+    """
+    bits = u8.view(torch.uint8).to(torch.int32)
+    sign = torch.where(bits >= 0x80, -1.0, 1.0)
+    e = ((bits >> 3) & 0xF).to(torch.float32)
+    m = (bits & 0x7).to(torch.float32)
+    mag = torch.where(
+        e == 0.0,
+        m * (1.0 / 512.0),  # subnormal: m * 2^-9
+        (1.0 + m / 8.0) * torch.pow(2.0, e - 7.0),
+    )
+    # e4m3fn reserves S.1111.111 for NaN (no infinities); max finite is 448.
+    mag = torch.where((e == 15.0) & (m == 7.0), float("nan"), mag)
+    return sign * mag
+
+
+def _layout_npu_arch35_e4m3_weights(
+    layer: Module, weight_block_size: List[int]
+) -> None:
+    """Requantize an e4m3 block-FP8 weight (fp32 block scales) to MXFP8 layout.
+
+    Dequantizes the fp8 payload with the expanded block scales to BF16, then
+    requantizes to MXFP8 (fp8 payload + 1x32 UE8M0 scale via
+    npu_dynamic_mx_quant) so the native A5 quantized GEMM
+    (``npu_w8a8_mxfp8_linear``) can run the layer. Chunked over rows to cap
+    peak memory; runs once at load time.
+    """
+    block_n, block_k = weight_block_size
+    group_size = _NPU_ARCH35_MXFP8_BLOCK_SIZE
+    weight = layer.weight.data
+    n_dim, k_dim = weight.shape
+    if k_dim % (2 * group_size) != 0:
         raise ValueError(
-            "NPU arch35 MXFP8 weight loading requires scale_fmt='ue8m0', "
-            f"got {scale_fmt!r}."
+            "NPU arch35 MXFP8 linear requires K to be divisible by "
+            f"{2 * group_size}, got {k_dim}."
         )
-    _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
+    device = f"npu:{torch.npu.current_device()}"
+    if not weight.is_npu:
+        weight = weight.to(device)
+    scale = layer.weight_scale_inv.data.to(device)
+
+    # Chunked over rows to cap peak memory: the BF16 intermediate is
+    # chunk-sized, and only the new fp8 payload (the final weight itself) is
+    # materialized in full. Row chunking never crosses the 32-element quant
+    # groups (they run along K), so per-chunk results equal whole-tensor ones.
+    rows_per_chunk = block_n * max(1, 1024 // block_n)
+    qw = torch.empty(n_dim, k_dim, dtype=torch.float8_e4m3fn, device=weight.device)
+    w_scale = None
+    for r0 in range(0, n_dim, rows_per_chunk):
+        r1 = min(r0 + rows_per_chunk, n_dim)
+        s = scale[r0 // block_n : (r1 + block_n - 1) // block_n]
+        s = s.repeat_interleave(block_n, dim=0)[: r1 - r0].repeat_interleave(
+            block_k, dim=1
+        )[:, :k_dim]
+        bf16 = (_dequant_e4m3fn_to_float32(weight[r0:r1]) * s).to(torch.bfloat16)
+        qw_c, ws_c = torch.ops.npu.npu_dynamic_mx_quant(
+            bf16, dst_type=torch.float8_e4m3fn
+        )
+        qw[r0:r1] = qw_c
+        if w_scale is None:
+            w_scale = torch.empty(
+                n_dim, *ws_c.shape[1:], dtype=ws_c.dtype, device=weight.device
+            )
+        w_scale[r0:r1] = ws_c
+
+    if w_scale.dim() == 2:
+        # Older torch_npu builds return [out, in//32]; reshape to 3D.
+        w_scale = w_scale.reshape(w_scale.shape[0], w_scale.shape[1] // 2, 2)
+
+    # Layout mirrors _layout_npu_arch35_ue8m0_weights: weight [in, out] and
+    # scale [in//64, out, 2] as strided transpose views — DO NOT call
+    # .contiguous() (the A5 kernel scans the row-major source K-major).
+    layer.weight.data = qw.transpose(0, 1)
+    if w_scale.dim() == 2:
+        # Older torch_npu builds return [out, in//32]; reshape to 3D.
+        w_scale = w_scale.reshape(w_scale.shape[0], w_scale.shape[1] // 2, 2)
+    layer.weight_scale_inv.data = w_scale.transpose(0, 1)
 
 
 def _layout_npu_arch35_ue8m0_weights(

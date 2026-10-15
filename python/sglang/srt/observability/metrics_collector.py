@@ -23,9 +23,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
+import msgspec
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
+    FORWARD_OVERLAP_CATEGORIES,
+    FORWARD_OVERLAP_NONE,
     SCHEDULER_STAGE_CATEGORIES,
 )
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
@@ -34,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
     get_observability,
+    get_parallel,
     get_schedule,
     get_serving,
 )
@@ -134,6 +139,8 @@ class SchedulerStats:
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_host_receive_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_deferred_kv_release_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -196,6 +203,76 @@ class DPCooperationInfo:
 
     def to_labels(self):
         return dataclasses.asdict(self)
+
+
+class DPBalanceStats(msgspec.Struct, frozen=True):
+    """Token balance across the attention-DP ranks of one MLP-sync step.
+
+    DP attention runs the ranks in lockstep, so the step costs what the
+    busiest rank costs. ``max_tokens - local_tokens`` is the capacity this
+    rank gives up on the step: computed as padding rows under MAX_LEN
+    padding, or spent waiting for the busiest rank under SUM_LEN. Counts are
+    the gathered MLP-sync values, so on speculative-decode steps they are
+    batch rows (requests); the verify width is uniform across ranks, which
+    leaves the ratios unchanged.
+
+    ``*_attention_pairs`` are the causal (query, key) pairs the step attends
+    (``dp_attn._local_attention_pairs``). Tokens price the MoE and the
+    projections, which run on the gathered padded rows; pairs price attention,
+    which runs on local rows, so pair skew is what shows up as sync wait.
+    """
+
+    local_tokens: int
+    max_tokens: int
+    sum_tokens: int
+    local_attention_pairs: int
+    max_attention_pairs: int
+    num_ranks: int
+    # Wall time of this rank's scheduler MLP-sync all-gather. On the gloo path
+    # (the default with overlap scheduling) this is waiting for the slowest
+    # rank; on the device-group paths it also includes the gather's stream sync.
+    sync_wait_seconds: float
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        local_tokens: int,
+        global_num_tokens: List[int],
+        local_attention_pairs: int,
+        global_attention_pairs: List[int],
+        sync_wait_seconds: float,
+    ) -> DPBalanceStats:
+        max_tokens = max(global_num_tokens)
+        if max_tokens == 0:
+            raise ValueError("DP balance stats need a rank with tokens")
+        max_attention_pairs = max(global_attention_pairs)
+        if max_attention_pairs == 0:
+            # Every row attends at least one key, so this is a gather or
+            # pair-count bug, not a quiet step.
+            raise ValueError("A rank with tokens attends at least one pair")
+        return cls(
+            local_tokens=local_tokens,
+            max_tokens=max_tokens,
+            sum_tokens=sum(global_num_tokens),
+            local_attention_pairs=local_attention_pairs,
+            max_attention_pairs=max_attention_pairs,
+            num_ranks=len(global_num_tokens),
+            sync_wait_seconds=sync_wait_seconds,
+        )
+
+    @property
+    def imbalance_tokens(self) -> int:
+        return self.max_tokens - self.local_tokens
+
+    @property
+    def imbalance_attention_pairs(self) -> int:
+        return self.max_attention_pairs - self.local_attention_pairs
+
+    @property
+    def max_over_mean(self) -> float:
+        """Busiest rank's tokens over the per-rank mean; 1.0 is perfectly balanced."""
+        return self.max_tokens * self.num_ranks / self.sum_tokens
 
 
 # Role keys used by ServerArgs.stat_loggers to look up collector overrides.
@@ -517,6 +594,37 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of requests in the decode transfer queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_queue_reqs = Gauge(
+            name="sglang:num_decode_host_receive_queue_reqs",
+            documentation="Requests in the decode transfer queue receiving into host memory or waiting for device admission.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_decode_host_receive_reqs = Counter(
+            name="sglang:num_decode_host_receive_reqs_total",
+            documentation="Total requests admitted to receive prefill KV in host memory.",
+            labelnames=labels.keys(),
+        )
+        self.num_decode_deferred_kv_release_reqs = Gauge(
+            name="sglang:num_decode_deferred_kv_release_reqs",
+            documentation=(
+                "The number of failed decode requests whose KV allocations are "
+                "held pending transfer drain acknowledgement or timeout."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_deferred_kv_release_seconds = Histogram(
+            name="sglang:decode_deferred_kv_release_seconds",
+            documentation="Histogram of time spent holding deferred decode KV releases.",
+            labelnames=labels.keys(),
+            buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60),
+        )
+        self.decode_deferred_kv_release_total = Counter(
+            name="sglang:decode_deferred_kv_release_total",
+            documentation="Total deferred decode KV release resolution attempts.",
+            labelnames=list(labels.keys()) + ["outcome"],
         )
         self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
@@ -937,13 +1045,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:scheduler_stage_seconds_total",
             documentation=(
                 "Total scheduler-loop wall time exclusively attributed to each stage."
+                f" forward_overlap ({', '.join(FORWARD_OVERLAP_CATEGORIES)}):"
+                " full=both endpoints active, partial=one, none=no observed overlap"
+                " (including unavailable timing). Not exact overlapped/exposed seconds."
             ),
-            labelnames=list(labels.keys()) + ["category"],
+            labelnames=list(labels.keys()) + ["category", "forward_overlap"],
         )
         self.scheduler_idle_seconds_total.labels(**labels)
         self.scheduler_process_cpu_seconds_total.labels(**labels)
         for category in SCHEDULER_STAGE_CATEGORIES:
-            self.scheduler_stage_seconds_total.labels(**labels, category=category)
+            self.scheduler_stage_seconds_total.labels(
+                **labels, category=category, forward_overlap=FORWARD_OVERLAP_NONE
+            )
         self.estimated_flops_per_gpu_total = Counter(
             name="sglang:estimated_flops_per_gpu_total",
             documentation=(
@@ -985,6 +1098,111 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 "Refer to ForwardMode for category labels."
             ),
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
+        )
+        self.dp_attention_tokens_total = Counter(
+            name="sglang:dp_attention_tokens_total",
+            documentation=(
+                "Tokens of MLP-sync steps on this DP rank. kind=scheduled: tokens "
+                "this rank ran; kind=imbalance: tokens the busiest rank ran beyond "
+                "this rank, i.e. capacity lost to DP imbalance on this rank. "
+                "On speculative-decode steps the unit is batch rows (requests)."
+            ),
+            labelnames=list(labels.keys()) + ["kind"],
+        )
+        self.dp_attention_steps_total = Counter(
+            name="sglang:dp_attention_steps_total",
+            documentation=(
+                "MLP-sync steps on this DP rank. rank_state=idle: this rank had no "
+                "tokens and only ran to keep the DP collectives in lockstep."
+            ),
+            labelnames=list(labels.keys()) + ["rank_state"],
+        )
+        self.dp_attention_pairs_total = Counter(
+            name="sglang:dp_attention_pairs_total",
+            documentation=(
+                "Causal (query, key) pairs attended by MLP-sync steps on this DP "
+                "rank, pricing every layer as full attention: a decode row reads "
+                "its sequence, a prefill chunk its prefix plus the pairs within "
+                "the chunk. kind=scheduled: this rank; kind=imbalance: the busiest "
+                "rank's excess over this rank. The context-length counterpart of "
+                "sglang:dp_attention_tokens_total; like it, speculative-decode "
+                "steps count one query per row. Sliding-window layers execute "
+                "fewer pairs than counted, so on hybrid-SWA models long rows are "
+                "overstated."
+            ),
+            labelnames=list(labels.keys()) + ["kind"],
+        )
+        self.dp_attention_token_imbalance_ratio = Histogram(
+            name="sglang:dp_attention_token_imbalance_ratio",
+            documentation=(
+                "Per MLP-sync step, max tokens over mean tokens across the DP "
+                "ranks (1.0 = balanced, num_dp_ranks = one busy rank). Reported "
+                "once per engine, by the scheduler of DP rank 0."
+            ),
+            labelnames=labels.keys(),
+            # Coarse, widely supported boundaries: downstream metrics gateways
+            # with a fixed bucket preset drop the series when a boundary is not in it.
+            buckets=(
+                1.0,
+                1.5,
+                2.0,
+                2.5,
+                3.0,
+                4.0,
+                5.0,
+                7.5,
+                10.0,
+                15.0,
+                20.0,
+                30.0,
+                45.0,
+                60.0,
+            ),
+        )
+        self.dp_attention_sync_wait_seconds = Histogram(
+            name="sglang:dp_attention_sync_wait_seconds",
+            documentation=(
+                "Wall time of this DP rank's scheduler MLP-sync all-gather per step. "
+                "On the gloo path (the default with overlap scheduling) this is "
+                "waiting for the slowest rank; on the device-group paths it also "
+                "includes the gather's stream sync."
+            ),
+            labelnames=labels.keys(),
+            buckets=(
+                0.0001,
+                0.00025,
+                0.0005,
+                0.001,
+                0.0025,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+            ),
+        )
+        # Pre-seed and cache the children: every step observes them, and a
+        # ratio chart needs both kinds / states present from the start.
+        self._dp_attention_tokens = {
+            kind: self.dp_attention_tokens_total.labels(**labels, kind=kind)
+            for kind in ("scheduled", "imbalance")
+        }
+        self._dp_attention_steps = {
+            state: self.dp_attention_steps_total.labels(**labels, rank_state=state)
+            for state in ("active", "idle")
+        }
+        self._dp_attention_pairs = {
+            kind: self.dp_attention_pairs_total.labels(**labels, kind=kind)
+            for kind in ("scheduled", "imbalance")
+        }
+        self._dp_attention_token_imbalance_ratio = (
+            self.dp_attention_token_imbalance_ratio.labels(**labels)
+        )
+        self._dp_attention_sync_wait_seconds = (
+            self.dp_attention_sync_wait_seconds.labels(**labels)
         )
 
         # =================================================================
@@ -1102,42 +1320,42 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         cls,
         *,
         server_args: ServerArgs,
-        ps: Any,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
         enable_priority_scheduling: bool,
         enable_lora: bool,
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
-        is_stats_logging_rank = ps.attn_tp_rank == 0
+        parallel = get_parallel()
+        is_stats_logging_rank = parallel.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
         )
         enable_kv_cache_events = bool(
             get_observability().kv_events_config
-            and ps.pp_rank == 0
-            and ps.attn_tp_rank == 0
-            and ps.attn_cp_rank == 0
+            and get_parallel().pp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
         )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
-            engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
+            # Keep one metric series across role flips.
+            engine_type = (
+                "dynamic"
+                if get_disagg().enable_pd_role_switch
+                else DisaggregationMode.to_engine_type(get_disagg().disaggregation_mode)
             )
             labels = {
                 "model_name": get_serving().served_model_name,
                 "engine_type": engine_type,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
-                "moe_ep_rank": ps.moe_ep_rank,
+                "tp_rank": parallel.tp_rank,
+                "pp_rank": parallel.pp_rank,
+                "moe_ep_rank": parallel.moe_ep_rank,
             }
             if enable_priority_scheduling:
                 labels["priority"] = ""
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
+            if parallel.dp_rank is not None:
+                labels["dp_rank"] = parallel.dp_rank
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(
@@ -1184,6 +1402,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def increment_decode_host_receive_reqs(self) -> None:
+        self.num_decode_host_receive_reqs.labels(**self.labels).inc(1)
+
+    def observe_decode_deferred_kv_release(
+        self, duration_seconds: float, outcome: str
+    ) -> None:
+        if outcome not in ("drained", "timeout", "error"):
+            raise ValueError(f"Invalid deferred KV release outcome: {outcome}")
+        self._log_histogram(self.decode_deferred_kv_release_seconds, duration_seconds)
+        self.decode_deferred_kv_release_total.labels(
+            **self.labels, outcome=outcome
+        ).inc(1)
 
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
@@ -1274,6 +1505,22 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             balancedness
         )
 
+    def observe_dp_balance(self, stats: DPBalanceStats) -> None:
+        if stats.local_tokens:
+            self._dp_attention_tokens["scheduled"].inc(stats.local_tokens)
+        if stats.imbalance_tokens:
+            self._dp_attention_tokens["imbalance"].inc(stats.imbalance_tokens)
+        if stats.local_attention_pairs:
+            self._dp_attention_pairs["scheduled"].inc(stats.local_attention_pairs)
+        if stats.imbalance_attention_pairs:
+            self._dp_attention_pairs["imbalance"].inc(stats.imbalance_attention_pairs)
+        rank_state = "idle" if stats.local_tokens == 0 else "active"
+        self._dp_attention_steps[rank_state].inc(1)
+        self._dp_attention_sync_wait_seconds.observe(stats.sync_wait_seconds)
+
+    def observe_dp_token_imbalance_ratio(self, stats: DPBalanceStats) -> None:
+        self._dp_attention_token_imbalance_ratio.observe(stats.max_over_mean)
+
     def increment_realtime_tokens(
         self,
         dp_cooperation_info: Optional[DPCooperationInfo],
@@ -1336,10 +1583,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_scheduler_process_cpu_seconds(self, t: float) -> None:
         self.scheduler_process_cpu_seconds_total.labels(**self.labels).inc(t)
 
-    def increment_scheduler_stage_seconds(self, stage: str, seconds: float) -> None:
-        self.scheduler_stage_seconds_total.labels(**self.labels, category=stage).inc(
-            seconds
-        )
+    def increment_scheduler_stage_seconds(
+        self, stage: str, seconds: float, forward_overlap: str = FORWARD_OVERLAP_NONE
+    ) -> None:
+        self.scheduler_stage_seconds_total.labels(
+            **self.labels, category=stage, forward_overlap=forward_overlap
+        ).inc(seconds)
 
     def increment_estimated_perf(
         self,
@@ -1413,6 +1662,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
+        self._log_gauge_queue_count(
+            self.num_decode_host_receive_queue_reqs,
+            stats.num_decode_host_receive_queue_reqs,
+        )
+        self._log_gauge(
+            self.num_decode_deferred_kv_release_reqs,
+            stats.num_decode_deferred_kv_release_reqs,
+        )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
@@ -1461,31 +1718,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.last_log_time = time.perf_counter()
-
-    def log_grammar_stats(self, grammar_stats) -> None:
-        if grammar_stats.compilation_time is not None:
-            self._log_histogram(
-                self.grammar_compilation_time, grammar_stats.compilation_time
-            )
-        if grammar_stats.schema_count is not None:
-            self._log_histogram(self.grammar_schema_count, grammar_stats.schema_count)
-        if grammar_stats.ebnf_size is not None:
-            self._log_histogram(self.grammar_ebnf_size, grammar_stats.ebnf_size)
-        tree_times = grammar_stats.tree_traversal_time
-        if tree_times:
-            max_time = max(tree_times)
-            avg_time = sum(tree_times) / len(tree_times)
-            self._log_histogram(self.grammar_tree_traversal_time_max, max_time)
-            self._log_histogram(self.grammar_tree_traversal_time_avg, avg_time)
-        if grammar_stats.is_cache_hit:
-            self.num_grammar_cache_hit.labels(**self.labels).inc(1)
-        if grammar_stats.is_grammar_aborted:
-            self.num_grammar_aborted.labels(**self.labels).inc(1)
-        if grammar_stats.num_timeout > 0:
-            self.num_grammar_timeout.labels(**self.labels).inc(
-                grammar_stats.num_timeout
-            )
-        self.num_grammar_total.labels(**self.labels).inc(1)
 
     def emit_constants(
         self,
@@ -1757,6 +1989,16 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_inter_token_latency,
         )
 
+        self.histogram_request_time_per_output_token = Histogram(
+            name="sglang:request_time_per_output_token_seconds",
+            documentation=(
+                "Per-request TPOT in seconds: (finished_time - "
+                "first_token_time) / (completion_tokens - 1)."
+            ),
+            labelnames=[*labels.keys(), "is_streaming"],
+            buckets=bucket_inter_token_latency,
+        )
+
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
@@ -1793,6 +2035,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         spec_verify_ct: int = 0,
         is_streaming: bool = False,
+        time_per_output_token: Optional[float] = None,
     ):
         stream_labels = {
             **labels,
@@ -1831,6 +2074,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_e2e_request_latency.labels(**stream_labels).observe(
             float(e2e_latency)
         )
+        if time_per_output_token is not None:
+            self.histogram_request_time_per_output_token.labels(
+                **stream_labels
+            ).observe(float(time_per_output_token))
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
         self.uncached_prompt_tokens_histogram.labels(**labels).observe(
             float(prompt_tokens - cached_tokens)
@@ -1846,28 +2093,11 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             **labels, is_streaming="true" if stream else "false"
         ).observe(value)
 
-    def check_time_to_first_token_straggler(self, value: float) -> bool:
-        # Injected backends (e.g. Ray) route metrics out of process and can't
-        # introspect prometheus_client buckets here.
-        if self._histogram_cls is not None:
-            return False
-        his = self.histogram_time_to_first_token.labels(
-            **self.labels, is_streaming="true"
-        )
-        total_observations = sum(bucket._value for bucket in his._buckets)
-        if total_observations < 100:
-            return False
-        p99_threshold = total_observations * 0.99
-        cumulative_count = 0
-        for i, bucket in enumerate(his._buckets):
-            cumulative_count += bucket._value
-            if cumulative_count > p99_threshold:
-                return value >= his._upper_bounds[i]
-        return False
-
     def observe_inter_token_latency(
         self, labels: Dict[str, str], internval: float, num_new_tokens: int
     ):
+        if num_new_tokens <= 0:
+            return
         adjusted_interval = internval / num_new_tokens
         his = self.histogram_inter_token_latency.labels(**labels)
 

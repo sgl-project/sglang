@@ -11,14 +11,19 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.utils import is_gfx95_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
+    from sglang.kernels.ops.attention.fla import (
+        fused_sigmoid_gating_recurrent as recurrent_module,
+    )
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_update,
     )
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        _select_recurrent_launch_config,
         fused_sigmoid_gating_delta_rule_update,
     )
 
@@ -178,6 +183,125 @@ def test_fused_gdn_mtp_precision(N: int, T: int):
     )
 
     torch.testing.assert_close(out_ref, out_fused, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
+@pytest.mark.parametrize("N", [1, 3, 16])
+def test_qwen35_tp4_fused_gdn_mtp_precision(N: int):
+    """Exercise the gfx950 TP4 launch shape against the reference path."""
+    T, H, HV, K, V = 4, 4, 16, 128, 128
+    A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+
+    out_ref = run_reference(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        state.clone(),
+        indices,
+        cu_seqlens,
+        disable_state_update=True,
+    )
+    out_fused = run_fused_mtp(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        state.clone(),
+        indices,
+        cu_seqlens,
+        disable_state_update=True,
+    )
+
+    torch.testing.assert_close(out_ref, out_fused, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    not (torch.version.hip and is_gfx95_supported()), reason="requires AMD gfx95"
+)
+def test_qwen35_tp4_launch_config_is_narrow():
+    assert _select_recurrent_launch_config(1, 4, 16, 128, 128, False) == (8, 4)
+    assert _select_recurrent_launch_config(3, 4, 16, 128, 128, False) == (16, 2)
+    assert _select_recurrent_launch_config(32, 4, 16, 128, 128, False) == (16, 2)
+    assert _select_recurrent_launch_config(33, 4, 16, 128, 128, False) == (32, 1)
+    assert _select_recurrent_launch_config(3, 8, 32, 128, 128, False) == (32, 1)
+    assert _select_recurrent_launch_config(3, 4, 16, 128, 128, True) == (32, 1)
+
+
+_requires_sm90 = pytest.mark.skipif(
+    torch.version.hip is not None or not is_sm90_supported(), reason="requires SM90"
+)
+
+
+@_requires_sm90
+def test_sm90_verify_launch_config_is_narrow():
+    assert _select_recurrent_launch_config(1, 16, 32, 128, 128, False, True) == (4, 1)
+    assert _select_recurrent_launch_config(64, 4, 8, 128, 128, False, True) == (4, 1)
+    assert _select_recurrent_launch_config(65, 16, 32, 128, 128, False, True) == (32, 1)
+    assert _select_recurrent_launch_config(1, 16, 32, 128, 128, False, False) == (32, 1)
+    assert _select_recurrent_launch_config(1, 16, 32, 128, 128, True, True) == (32, 1)
+    assert _select_recurrent_launch_config(1, 16, 32, 64, 64, False, True) == (32, 1)
+
+
+@_requires_sm90
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+@pytest.mark.parametrize("N", [1, 3, 16, 64])
+@pytest.mark.parametrize("T", [4, 16])
+@pytest.mark.parametrize("H,HV", [(16, 32), (4, 16)])
+@pytest.mark.parametrize("tree", [False, True])
+def test_sm90_verify_launch_is_bit_exact(
+    N: int, T: int, H: int, HV: int, tree: bool, monkeypatch
+):
+    """The tuned SM90 verify launch matches the BV=32 launch bit for bit."""
+    K = V = 128
+    A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+    retrieve_parent_token = None
+    if tree:
+        # Random draft tree: token i > 0 reads the cached state of an earlier token.
+        steps = torch.arange(T, device="cuda")
+        retrieve_parent_token = (torch.rand(N, T, device="cuda") * steps).long()
+        retrieve_parent_token[:, 0] = -1
+
+    def run(launch_config):
+        monkeypatch.setattr(
+            recurrent_module, "_select_recurrent_launch_config", launch_config
+        )
+        buffer = torch.zeros(N, T, HV, V, K, dtype=torch.float32, device="cuda")
+        out = run_fused_mtp(
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            a,
+            b,
+            state.clone(),
+            indices,
+            cu_seqlens,
+            disable_state_update=True,
+            intermediate_states_buffer=buffer,
+            intermediate_state_indices=indices,
+            cache_steps=T,
+            retrieve_parent_token=retrieve_parent_token,
+        )
+        return out, buffer
+
+    out_tuned, states_tuned = run(_select_recurrent_launch_config)
+    out_default, states_default = run(lambda *args, **kwargs: (32, 1))
+
+    assert _select_recurrent_launch_config(N, H, HV, K, V, False, True) == (4, 1)
+    assert torch.equal(out_tuned, out_default)
+    assert torch.equal(states_tuned, states_default)
 
 
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")

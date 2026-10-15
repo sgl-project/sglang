@@ -3,7 +3,7 @@
 
 //! In-flight HTTP accounting, for the termination drain to report on.
 //!
-//! [`ActiveLoadRegistry`](crate::policies::active_load::ActiveLoadRegistry)
+//! [`RouterInflightLoadRegistry`](crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry)
 //! counts *proxied* requests — what the workers are busy with. Axum's graceful
 //! shutdown waits on something different and larger: every HTTP exchange still
 //! open on an accepted connection, on any route, until its response body has

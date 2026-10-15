@@ -385,6 +385,7 @@ def create_grammar_backend(
                 vocab_size=vocab_size,
                 model_eos_token_ids=eos_list,
                 any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
+                max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
             )
         except TokenizerNotSupportedError as e:
             if get_serving().enable_strict_thinking:

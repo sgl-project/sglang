@@ -13,12 +13,12 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
-    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
@@ -28,6 +28,20 @@ from sglang.srt.utils.common import (
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def handle_watermark_config(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.watermark_config is None:
+        return
+    config = load_watermark_config(cfg.watermark_config)
+    resolved = {
+        f"watermark_{field}": getattr(config, field)
+        for field in config.__struct_fields__
+        if getattr(config, field) is not None
+    }
+    if resolved:
+        declare_resolution(server_args, "handle_watermark_config", **resolved)
 
 
 def handle_ssl_validation(server_args: Any):
@@ -335,6 +349,9 @@ def handle_deprecated_args(server_args: Any):
             grpc_port=cfg.port + 10000,
         )
 
+    if cfg.grpc_response_timeout_secs <= 0:
+        raise ValueError("--grpc-response-timeout-secs must be positive")
+
     if cfg.grpc_port is not None:
         if not (1 <= cfg.grpc_port <= 65535):
             raise ValueError(
@@ -366,6 +383,11 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "--sidecar is not yet supported with SGLANG_RUST_SERVER: "
+                "Rust-server mode does not run the Python sidecar lifecycle."
+            )
     if native_grpc:
         if cfg.use_ray:
             raise ValueError(
@@ -425,10 +447,10 @@ def handle_environment_variables(server_args: Any):
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
         )
-    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
-    # it, mirroring the forward scale split: the ue8m0 path
-    # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
-    # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+    # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
+    # run it, mirroring the forward scale split: the default sm100 UE8M0
+    # path, or explicit opt-in on sm90 (FP32 scales) and sm120 (UE8M0).
+    # SM120 API compatibility is centralized in deep_gemm_wrapper.configurer.
     if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
@@ -442,7 +464,7 @@ def handle_environment_variables(server_args: Any):
         if not supported and explicit:
             logger.warning(
                 "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
-                "and sm100+ (Blackwell), or explicit opt-in on sm90; "
+                "and a compatible sm100/sm120 build, or explicit opt-in on sm90; "
                 "detected sm%d.",
                 sm,
             )
@@ -466,28 +488,36 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
-        elif cfg.enable_hierarchical_cache and (
-            cfg.hicache_storage_backend is not None
-            or cfg.hicache_write_policy != "write_back"
+        elif cfg.enable_hierarchical_cache and not (
+            (
+                cfg.hicache_storage_backend is None
+                and cfg.hicache_write_policy in ("write_back", "write_through")
+            )
+            or (
+                cfg.hicache_storage_backend is not None
+                and cfg.hicache_host_memory_mode == "buffer_only"
+                and cfg.hicache_write_policy == "write_through"
+            )
         ):
             logger.warning(
-                "Optimistic prefill only supports L2 hierarchical cache "
-                "with write-back policy"
+                "Optimistic prefill supports L2 write-back/write-through or "
+                "L3 buffer-only write-through hierarchical cache"
             )
             declare_resolution(
                 server_args,
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
-        elif resolved_view(server_args).uses_mamba_radix_cache:
-            logger.warning(
-                "Optimistic prefill does not support models that use mamba radix cache."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_other_validations",
-                optimistic_prefill_attempts=0,
-            )
+
+    if (
+        cfg.disaggregation_decode_allocation_policy == "prefill_complete"
+        and cfg.disaggregation_mode == "prefill"
+        and resolving_view(server_args).optimistic_prefill_attempts <= 0
+    ):
+        raise ValueError(
+            "prefill_complete requires optimistic prefill, but the resolved "
+            "model/cache configuration disabled it."
+        )
 
     # Handle model inference tensor dump.
     if cfg.debug_tensor_dump_output_folder is not None:
@@ -555,19 +585,25 @@ def handle_other_validations(server_args: Any):
                     )
 
     # Validate preferred_sampling_params
-    if cfg.preferred_sampling_params:
-        if isinstance(cfg.preferred_sampling_params, str):
+    preferred_sampling_params = cfg.preferred_sampling_params
+    if preferred_sampling_params:
+        if isinstance(preferred_sampling_params, str):
+            preferred_sampling_params = json.loads(preferred_sampling_params)
             declare_resolution(
                 server_args,
                 "_handle_other_validations",
-                preferred_sampling_params=json.loads(cfg.preferred_sampling_params),
+                preferred_sampling_params=preferred_sampling_params,
+            )
+        if "watermark" in preferred_sampling_params:
+            raise ValueError(
+                "watermark is not supported in --preferred-sampling-params"
             )
 
         # Validate preferred_sampling_params doesn't use tokenizer-dependent features
         if cfg.skip_tokenizer_init:
             from sglang.srt.sampling.sampling_params import SamplingParams
 
-            test_params = SamplingParams(**cfg.preferred_sampling_params)
+            test_params = SamplingParams(**preferred_sampling_params)
             # raises if tokenizer-dependent features used
             test_params.normalize(None)
 
@@ -745,27 +781,14 @@ def handle_multimodal_feature_transport(server_args: Any):
 
     CUDA IPC is opt-in because its fixed pool on ``base_gpu_id`` reduces the
     memory left for model/KV-cache allocations. Multi-node MNNVL deployments
-    may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
-    variable remain supported so existing deployments map to this policy.
+    may still auto-select CUDA VMM. The legacy CUDA IPC environment variable
+    remains supported so existing deployments map to this policy.
     """
 
     cfg = resolving_view(server_args)
     requested_transport = cfg.mm_feature_transport
     legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
     legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
-
-    if cfg.keep_mm_feature_on_device:
-        if requested_transport not in (None, "cuda_ipc"):
-            raise ValueError(
-                "--keep-mm-feature-on-device conflicts with "
-                f"--mm-feature-transport={requested_transport}. Use only "
-                "--mm-feature-transport=cuda_ipc."
-            )
-        requested_transport = "cuda_ipc"
-        logger.warning(
-            "--keep-mm-feature-on-device is deprecated; using "
-            "--mm-feature-transport=cuda_ipc instead."
-        )
 
     if requested_transport is None:
         if legacy_ipc_is_set:
@@ -892,13 +915,6 @@ def handle_multimodal_feature_transport(server_args: Any):
         server_args,
         "_handle_multimodal_feature_transport",
         mm_feature_transport=requested_transport,
-    )
-    # The bounded IPC pool owns device residency. Do not retain unpooled
-    # tensors after a pool miss, which would make HBM use request-dependent.
-    declare_resolution(
-        server_args,
-        "_handle_multimodal_feature_transport",
-        keep_mm_feature_on_device=False,
     )
     envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
         "1" if requested_transport == "cuda_ipc" else "0"
