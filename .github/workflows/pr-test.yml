@@ -346,7 +346,8 @@ jobs:
   base-b-test:
     name: base-b-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
+    # A cancelled need is neither failure() nor cancelled(), so check it explicitly.
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' }}
     strategy:
       fail-fast: false
       matrix:
@@ -390,8 +391,10 @@ jobs:
 
   base-c-test:
     name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() }}
+    # wait-for-base-a is listed only to read its result: when it is cancelled,
+    # wait-for-base-b ends `skipped`, which alone would let this stage through.
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     strategy:
       fail-fast: false
       matrix:
@@ -433,8 +436,8 @@ jobs:
   # the aarch64 build, and neither table should wait on the other's.
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
-    if: ${{ !failure() && !cancelled() }}
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
+    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     strategy:
       fail-fast: false
       matrix:
