@@ -1338,6 +1338,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            self._release_mm_inputs(req)
 
         self.disagg_prefill_transfer_queue = undone_reqs
 
@@ -1437,6 +1438,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
+        self._release_mm_inputs(req)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
