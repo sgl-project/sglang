@@ -6,7 +6,7 @@ import math
 import tempfile
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
@@ -39,6 +39,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     logs_expert_balancedness_to_server_log,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -65,9 +66,6 @@ if TYPE_CHECKING:
         RequestRegistry,
     )
     from sglang.srt.managers.utils import EmbeddingBatchResult
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -630,8 +628,13 @@ class SchedulerMetricsReporter:
     capacity: KvCapacity
     workers: Workers
     model_config: ModelConfig
-    spec_algorithm: SpeculativeAlgorithm
     device: str
+    spec_algorithm: SpeculativeAlgorithm = field(
+        init=False,
+        default_factory=lambda: SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ),
+    )
 
     @property
     def disaggregation_mode(self) -> DisaggregationMode:

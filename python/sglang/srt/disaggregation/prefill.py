@@ -91,7 +91,9 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -120,8 +122,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerStats
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
 logger = logging.getLogger(__name__)
 
 # TP=1 yield between polls of a pending result. An initial heuristic rather
@@ -601,24 +601,26 @@ class DisaggPrefill:
         *,
         server_args: ServerArgs,
         model_config: ModelConfig,
-        spec_algorithm: SpeculativeAlgorithm,
         kv: KvResources,
         capacity: KvCapacity,
         streams: Streams,
         services: SchedulerServices,
         workers: Workers,
         rust_http_port: Optional[int],
-        transfer_backend: TransferBackend,
-        attn_cp_cpu_group: Any,
-        attn_tp_cpu_group: Any,
-        pp_group: Any,
-        tp_size: int,
-        tp_cpu_group: Any,
-        enable_overlap: bool,
         batch_result_processor: SchedulerBatchResultProcessor,
         counters: LaunchCounters,
         request_retirer: RequestRetirer,
     ):
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
+        transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
+        attn_cp_cpu_group = get_parallel().attn_cp_group.cpu_group
+        attn_tp_cpu_group = get_parallel().attn_tp_group.cpu_group
+        pp_group = get_parallel().pp_group
+        tp_size = get_parallel().tp_size
+        tp_cpu_group = get_parallel().tp_group.cpu_group
+        enable_overlap = not get_schedule().disable_overlap_schedule
         token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         draft_token_to_kv_pool = kv.draft_token_to_kv_pool
         req_to_token_pool = kv.req_to_token_pool

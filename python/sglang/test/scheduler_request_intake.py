@@ -15,7 +15,9 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 def make_request_intake(**deps) -> RequestIntake:
     """An intake over empty core lists, with no mode owners and inert
-    collaborators; `deps` replaces any constructor argument or request limit."""
+    collaborators; `deps` replaces any constructor argument, request limit, or
+    config value the intake reads (spec algorithm, transfer backend, sampling
+    mask cap)."""
     args = dict(
         core_lists=CoreLists(),
         counters=LaunchCounters(),
@@ -30,15 +32,12 @@ def make_request_intake(**deps) -> RequestIntake:
         request_retirer=MagicMock(),
         mode_owners=ModeOwners(),
         model_config=MagicMock(),
-        spec_algorithm=SpeculativeAlgorithm.NONE,
-        transfer_backend=TransferBackend.MOONCAKE,
         tokenizer=None,
         mm_processor=None,
         workers=SimpleNamespace(
             tp_worker=SimpleNamespace(get_pad_input_ids_func=lambda: None)
         ),
         dp_tp_group=SimpleNamespace(cpu_group=None, rank_in_group=0, first_rank=0),
-        sampling_mask_max_tokens=64,
     )
     limits = dict(
         max_req_len=4096,
@@ -50,5 +49,17 @@ def make_request_intake(**deps) -> RequestIntake:
         if name in deps:
             limits[name] = deps.pop(name)
     args["limits"] = SimpleNamespace(**limits)
+    # Config the intake reads from the bags, pinned here as the tests expect.
+    config = dict(
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        transfer_backend=TransferBackend.MOONCAKE,
+        sampling_mask_max_tokens=64,
+    )
+    for name in config:
+        if name in deps:
+            config[name] = deps.pop(name)
     args.update(deps)
-    return RequestIntake(**args)
+    intake = RequestIntake(**args)
+    for name, value in config.items():
+        setattr(intake, name, value)
+    return intake

@@ -42,7 +42,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import require_mlp_sync, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
@@ -651,7 +651,7 @@ class SchedulerDPAttnAdapter:
     spec_algorithm: SpeculativeAlgorithm
     # Builds the idle step.
     step_builder: StepBuilder
-    get_require_mlp_sync: Callable[[], bool]
+    mlp_sync_required: bool = field(init=False, default_factory=require_mlp_sync)
     sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
 
     def drop_sync_wait_carry(self) -> None:
@@ -692,9 +692,9 @@ class SchedulerDPAttnAdapter:
 
         Args:
             batch: The batch to process
-            need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
+            need_sync: If specified, overrides self.mlp_sync_required for prepare_mlp_sync_batch decision
         """
-        if need_sync if need_sync is not None else self.get_require_mlp_sync():
+        if need_sync if need_sync is not None else self.mlp_sync_required:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 

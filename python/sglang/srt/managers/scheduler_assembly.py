@@ -49,16 +49,13 @@ from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer_or_none
-from sglang.srt.managers.min_free_slots_delayer import create_min_free_slots_delayer
 from sglang.srt.managers.overlap_utils import create_future_map
 from sglang.srt.managers.prefill_delayer import (
-    RecentPrefillBatchSizeTracker,
     create_prefill_delayer,
 )
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
-    priority_preemption_enabled,
 )
 from sglang.srt.managers.scheduler_components import worker_setup
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -591,7 +588,7 @@ def assemble_scheduler(
         )
         # Park the idle loop on the request ring within the rank-0 rust-server
         idle_sleeper = RustServerIdleSleeper(rust_server, flags=flags)
-    disaggregation_mode, transfer_backend = init_disaggregation()
+    disaggregation_mode = init_disaggregation()
     # The receiver of encoder embeddings in EPD language-only mode.
     mm_receiver = None
     if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
@@ -644,8 +641,6 @@ def assemble_scheduler(
             streams=streams,
             future_map=future_map,
             workers=workers,
-            pp_group=pp_group,
-            spec_algorithm=spec_algorithm,
         )
         if get_parallel().pp_size > 1 and not spec_algorithm.is_none()
         else None
@@ -715,7 +710,6 @@ def assemble_scheduler(
         counters=counters,
         workers=workers,
         model_config=model_config,
-        spec_algorithm=spec_algorithm,
         device=device,
     )
     # Spec workers have no .model_runner of their own; the prefill graph
@@ -728,18 +722,15 @@ def assemble_scheduler(
         flags=flags,
         spec_algorithm=spec_algorithm,
         step_builder=step_builder,
-        get_require_mlp_sync=lambda: requires_mlp_sync,
     )
     pool_stats_observer = SchedulerPoolStatsObserver(
         kv=kv,
         session_controller=session_controller,
         hisparse_coordinator=mode_owners.hisparse_coordinator,
         capacity=capacity,
-        enable_hisparse=get_memory().enable_hisparse,
         # Match the allocator and radix counters' logical units.
     )
     kv_events_publisher = SchedulerKvEventsPublisher(
-        kv_events_config=get_observability().kv_events_config,
         kv=kv,
         send_metrics_from_scheduler=ipc_channels.send_metrics_from_scheduler,
         capacity=capacity,
@@ -780,7 +771,6 @@ def assemble_scheduler(
     )
     batch_result_processor = SchedulerBatchResultProcessor(
         is_generation=is_generation,
-        enable_overlap=(not get_schedule().disable_overlap_schedule),
         model_config=model_config,
         kv=kv,
         services=services,
@@ -808,7 +798,6 @@ def assemble_scheduler(
     )
     invariant_checker = SchedulerInvariantChecker(
         capacity=capacity,
-        page_size=get_schedule().page_size,
         kv=kv,
         pool_stats_observer=pool_stats_observer,
         counters=counters,
@@ -829,13 +818,7 @@ def assemble_scheduler(
             services=services,
             policy=policy,
             new_token_ratio_tracker=new_token_ratio_tracker,
-            page_size=get_schedule().page_size,
             limits=limits,
-            priority_scheduling_preemption_threshold=(
-                get_schedule().priority_scheduling_preemption_threshold
-            ),
-            enable_priority_preemption=priority_preemption_enabled(),
-            enable_priority_scheduling=get_schedule().enable_priority_scheduling,
             context_len=model_config.context_len,
             beam_coordinator=beam_coordinator,
             step_builder=step_builder,
@@ -900,7 +883,6 @@ def assemble_scheduler(
         schedules,
         request_registry.lora_ids_in_use,
         disaggregation_mode=disaggregation_mode,
-        transfer_backend=transfer_backend,
     )
 
     # The rest of the hub over the mode owners
@@ -918,14 +900,11 @@ def assemble_scheduler(
         request_retirer=request_retirer,
         mode_owners=mode_owners,
         model_config=model_config,
-        spec_algorithm=spec_algorithm,
-        transfer_backend=transfer_backend,
         tokenizer=tokenizer,
         mm_processor=mm_processor,
         workers=workers,
         dp_tp_group=dp_tp_group,
         limits=limits,
-        sampling_mask_max_tokens=server_args.sampling_mask_max_tokens,
     )
     step_planner = StepPlanner(
         core_lists=lists,
@@ -951,22 +930,10 @@ def assemble_scheduler(
         mode_owners=mode_owners,
         request_intake=request_intake,
         prefill_delayer=prefill_delayer,
-        prefill_bs_tracker=RecentPrefillBatchSizeTracker(
-            window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
-        ),
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
-        min_free_slots_delayer=create_min_free_slots_delayer(
-            get_schedule().min_free_slots_delay,
-            max_running_requests,
-            is_dflash_family=spec_algorithm.is_dflash_family(),
-        ),
         dynamic_chunk_sizer=dynamic_chunk_sizer,
-        spec_algorithm=spec_algorithm,
-        require_mlp_sync=requires_mlp_sync,
         limits=limits,
-        prefill_decode_interval=get_schedule().prefill_decode_interval or 0,
-        enable_priority_preemption=priority_preemption_enabled(),
     )
     # Built after the request registry and the mode owners, which they read.
     weight_updater = SchedulerWeightUpdaterManager(
@@ -989,7 +956,6 @@ def assemble_scheduler(
         pool_stats_observer=pool_stats_observer,
         workers=workers,
         kv=kv,
-        spec_algorithm=spec_algorithm,
         policy=policy,
         metrics_sink=metrics_sink,
         request_registry=request_registry,
@@ -1009,7 +975,6 @@ def assemble_scheduler(
         capacity=capacity,
         workers=workers,
         model_config=model_config,
-        spec_algorithm=spec_algorithm,
         device=device,
     )
     groups = []
@@ -1038,7 +1003,6 @@ def assemble_scheduler(
     internal_state = SchedulerInternalStateController(
         workers=workers,
         kv=kv,
-        spec_algorithm=spec_algorithm,
         capacity=capacity,
         startup_available_gpu_memory_gb=startup_available_gpu_memory_gb,
         metrics_sink=metrics_sink,
@@ -1067,16 +1031,11 @@ def build_mode(
     lora_ids_in_use: Callable[[], Set[Optional[str]]],
     *,
     disaggregation_mode: DisaggregationMode,
-    transfer_backend: TransferBackend,
 ) -> SchedulerMode:
     """Build the parts of a disaggregation mode, in order: its PD owner (into
     `ModeOwners`), the unified-memory move gate, its stages and the step
     launcher that holds them."""
-    maybe_init_disagg_prefill(
-        parts,
-        disaggregation_mode=disaggregation_mode,
-        transfer_backend=transfer_backend,
-    )
+    maybe_init_disagg_prefill(parts, disaggregation_mode=disaggregation_mode)
     maybe_init_disagg_decode(parts, disaggregation_mode=disaggregation_mode)
     maybe_init_disagg_move_gate(parts)
     stages = init_mode_stages(parts, schedules, lora_ids_in_use)
@@ -1094,22 +1053,17 @@ def rebuild_mode(
 ) -> SchedulerMode:
     """Build the mode again for the role a PD role switch set in config; the
     old PD owner is torn down already."""
-    disaggregation_mode, transfer_backend = init_disaggregation()
     return build_mode(
         parts,
         schedules,
         lora_ids_in_use,
-        disaggregation_mode=disaggregation_mode,
-        transfer_backend=transfer_backend,
+        disaggregation_mode=init_disaggregation(),
     )
 
 
 def build_pp_ring(parts: SchedulerParts, stages: ModeStages, ops: DriverOps) -> PPRing:
     """Build the ring driver and its PP channel, once per ring loop."""
     channel = PPChannel(
-        pp_group=get_parallel().pp_group,
-        world_group=get_parallel().world_group,
-        attn_tp_group=get_parallel().attn_tp_group,
         device_module=parts.device_module,
         streams=parts.streams,
     )
@@ -1121,7 +1075,6 @@ def build_pp_ring(parts: SchedulerParts, stages: ModeStages, ops: DriverOps) -> 
         ops=ops,
         counters=parts.counters,
         pp_spec_forward=parts.pp_spec_forward,
-        pp_group=get_parallel().pp_group,
         device_module=parts.device_module,
         kv=parts.kv,
         streams=parts.streams,
@@ -1240,10 +1193,9 @@ def _hosts_rust_server() -> bool:
     return envs.SGLANG_RUST_SERVER.get() and is_entry_rank()
 
 
-def init_disaggregation() -> Tuple[DisaggregationMode, TransferBackend]:
-    """The configured disaggregation mode and transfer backend."""
+def init_disaggregation() -> DisaggregationMode:
+    """The configured disaggregation mode."""
     disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
-    transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
 
     # In rust-server mode the KV bootstrap registry is already serving on
     # the rust api listener (the rust server launches before this runs —
@@ -1253,9 +1205,11 @@ def init_disaggregation() -> Tuple[DisaggregationMode, TransferBackend]:
     # which start_disagg_service would otherwise create, is left to do.
     if disaggregation_mode == DisaggregationMode.PREFILL and _hosts_rust_server():
         maybe_create_ascend_config_store(
-            transfer_backend=transfer_backend,
+            transfer_backend=TransferBackend(
+                get_disagg().disaggregation_transfer_backend
+            ),
         )
-    return disaggregation_mode, transfer_backend
+    return disaggregation_mode
 
 
 def finalize_schedule_stream(*, schedule_stream, forward_stream, device, device_module):
@@ -1276,10 +1230,7 @@ def finalize_schedule_stream(*, schedule_stream, forward_stream, device, device_
 
 
 def maybe_init_disagg_prefill(
-    parts: SchedulerParts,
-    *,
-    disaggregation_mode: DisaggregationMode,
-    transfer_backend: TransferBackend,
+    parts: SchedulerParts, *, disaggregation_mode: DisaggregationMode
 ) -> None:
     if disaggregation_mode != DisaggregationMode.PREFILL:
         parts.mode_owners.disagg_prefill = None
@@ -1287,7 +1238,6 @@ def maybe_init_disagg_prefill(
     parts.mode_owners.disagg_prefill = DisaggPrefill(
         server_args=parts.server_args,
         model_config=parts.model_config,
-        spec_algorithm=parts.spec_algorithm,
         kv=parts.kv,
         capacity=parts.capacity,
         streams=parts.streams,
@@ -1296,13 +1246,6 @@ def maybe_init_disagg_prefill(
         rust_http_port=(
             parts.rust_server.http_port if parts.rust_server is not None else None
         ),
-        transfer_backend=transfer_backend,
-        attn_cp_cpu_group=get_parallel().attn_cp_group.cpu_group,
-        attn_tp_cpu_group=get_parallel().attn_tp_group.cpu_group,
-        pp_group=get_parallel().pp_group,
-        tp_size=get_parallel().tp_size,
-        tp_cpu_group=get_parallel().tp_group.cpu_group,
-        enable_overlap=(not get_schedule().disable_overlap_schedule),
         batch_result_processor=parts.batch_result_processor,
         counters=parts.counters,
         request_retirer=parts.request_retirer,
@@ -1318,7 +1261,6 @@ def maybe_init_disagg_decode(
     parts.mode_owners.disagg_decode = DisaggDecode(
         server_args=parts.server_args,
         model_config=parts.model_config,
-        spec_algorithm=parts.spec_algorithm,
         kv=parts.kv,
         capacity=parts.capacity,
         streams=parts.streams,
@@ -1456,7 +1398,6 @@ def init_step_launcher(parts: SchedulerParts, stages: ModeStages) -> StepLaunche
         stages=stages,
         scripted_scheduler_hook=parts.scripted_scheduler_hook,
         workers=parts.workers,
-        spec_algorithm=parts.spec_algorithm,
         is_generation=parts.is_generation,
         device_module=parts.device_module,
     )

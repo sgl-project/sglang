@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 from sglang.test.scheduler_request_lists import make_request_registry
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -42,6 +47,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestCheckTreeCacheGate(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     @contextmanager
     def _without_explicit_sanity_check_setting(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -61,7 +69,6 @@ class TestCheckTreeCacheGate(CustomTestCase):
                 swa_tokens_per_layer=None,
                 widened_max_total_num_tokens=1024,
             ),
-            page_size=1,
             kv=SimpleNamespace(
                 tree_cache=tree_cache,
                 token_to_kv_pool_allocator=MagicMock(),
@@ -126,6 +133,9 @@ class TestCheckTreeCacheGate(CustomTestCase):
 
 
 class TestPrivateSwaTokens(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_floor_shielded_prefix_stays_private(self):
         # A prefill-aware SWA request with radix off: the window cursor jumps to
         # the floor (278) without freeing it, then frees [278, 300).
@@ -147,6 +157,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
 
     def setUp(self):
         super().setUp()
+        enter_scope(self, published_topology(page_size=self.PAGE_SIZE))
         parallel = patch.object(
             invariant_checker,
             "get_parallel",
@@ -199,7 +210,6 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 swa_tokens_per_layer=None,
                 widened_max_total_num_tokens=self.allocator.size,
             ),
-            enable_hisparse=False,
         )
         return SchedulerInvariantChecker(
             capacity=SimpleNamespace(
@@ -209,7 +219,6 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 swa_tokens_per_layer=None,
                 widened_max_total_num_tokens=self.allocator.size,
             ),
-            page_size=self.PAGE_SIZE,
             kv=SimpleNamespace(
                 tree_cache=self.cache,
                 token_to_kv_pool_allocator=self.allocator,
@@ -423,6 +432,9 @@ class TestShardedFullPoolInvariant(CustomTestCase):
 
 
 class TestNoFinishedRequestInLists(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_only_a_releasing_list_holds_finished_requests(self):
         live = SimpleNamespace(rid="live", finished=lambda: False)
         done = SimpleNamespace(rid="done", finished=lambda: True)

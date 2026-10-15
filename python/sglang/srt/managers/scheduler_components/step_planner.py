@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.managers.min_free_slots_delayer import create_min_free_slots_delayer
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayerSinglePassExecutor,
+    RecentPrefillBatchSizeTracker,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     check_decode_mem,
@@ -16,7 +20,11 @@ from sglang.srt.managers.schedule_batch import (
     retract_all,
     retract_decode,
 )
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    priority_preemption_enabled,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -29,8 +37,11 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
     hicache_storage_enabled,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import require_mlp_sync
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -39,11 +50,7 @@ if TYPE_CHECKING:
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.min_free_slots_delayer import MinFreeSlotsDelayer
-    from sglang.srt.managers.prefill_delayer import (
-        PrefillDelayer,
-        RecentPrefillBatchSizeTracker,
-    )
+    from sglang.srt.managers.prefill_delayer import PrefillDelayer
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.schedule_policy import SchedulePolicy
@@ -83,8 +90,6 @@ if TYPE_CHECKING:
         RequestRetirer,
     )
     from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -200,15 +205,22 @@ class StepPlanner:
         mode_owners: ModeOwners,
         request_intake: RequestIntake,
         prefill_delayer: Optional[PrefillDelayer],
-        prefill_bs_tracker: RecentPrefillBatchSizeTracker,
-        min_free_slots_delayer: Optional[MinFreeSlotsDelayer],
         dynamic_chunk_sizer: Optional[DynamicChunkSizer],
-        spec_algorithm: SpeculativeAlgorithm,
-        require_mlp_sync: bool,
         limits: RequestLimits,
-        prefill_decode_interval: int,
-        enable_priority_preemption: bool,
     ):
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
+        prefill_decode_interval = get_schedule().prefill_decode_interval or 0
+        enable_priority_preemption = priority_preemption_enabled()
+        prefill_bs_tracker = RecentPrefillBatchSizeTracker(
+            window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
+        )
+        min_free_slots_delayer = create_min_free_slots_delayer(
+            get_schedule().min_free_slots_delay,
+            capacity.max_running_requests,
+            is_dflash_family=spec_algorithm.is_dflash_family(),
+        )
         self.core_lists = core_lists
         self.pending = pending
         self.flags = flags
@@ -241,7 +253,7 @@ class StepPlanner:
         self.dynamic_chunk_sizer = dynamic_chunk_sizer
         self.spec_algorithm = spec_algorithm
         self.is_hybrid_swa = capacity.is_hybrid_swa
-        self.require_mlp_sync = require_mlp_sync
+        self.require_mlp_sync = require_mlp_sync()
         self.chunked_prefill_size = limits.chunked_prefill_size
         self.is_mixed_chunk = limits.is_mixed_chunk
         self.prefill_decode_interval = prefill_decode_interval

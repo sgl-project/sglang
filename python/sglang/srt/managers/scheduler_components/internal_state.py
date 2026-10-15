@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -15,8 +15,15 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
-from sglang.srt.runtime_context import get_context, get_disagg, get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.server_args import compute_world_size
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
@@ -31,8 +38,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.request_registry import (
         RequestRegistry,
     )
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
 logger = logging.getLogger(__name__)
 
 # The CUDA graph phases whose captured memory a PD router attributes to decode.
@@ -48,13 +53,18 @@ class SchedulerInternalStateController:
     workers: Workers
     kv: KvResources
     capacity: KvCapacity
-    spec_algorithm: SpeculativeAlgorithm
     startup_available_gpu_memory_gb: float
     metrics_sink: MetricsSink
     rust_server: Any
     request_registry: RequestRegistry
     startup_time: Any
     record_step_time: bool
+    spec_algorithm: SpeculativeAlgorithm = field(
+        init=False,
+        default_factory=lambda: SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ),
+    )
 
     # ---------------------------------------------------------------- readback
 

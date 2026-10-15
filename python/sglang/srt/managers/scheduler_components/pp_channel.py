@@ -29,12 +29,12 @@ class PPChannel:
     def __init__(
         self,
         *,
-        pp_group,
-        world_group,
-        attn_tp_group,
         device_module,
         streams: Streams,
     ):
+        pp_group = get_parallel().pp_group
+        world_group = get_parallel().world_group
+        attn_tp_group = get_parallel().attn_tp_group
         device = streams.device
         schedule_stream = streams.schedule_stream
         forward_stream = streams.forward_stream

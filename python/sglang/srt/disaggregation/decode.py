@@ -129,6 +129,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.common import is_pin_memory_available
@@ -139,6 +140,8 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -178,8 +181,6 @@ if TYPE_CHECKING:
         SchedulerStats,
     )
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
@@ -3089,7 +3090,6 @@ class DisaggDecode:
         *,
         server_args: ServerArgs,
         model_config: ModelConfig,
-        spec_algorithm: SpeculativeAlgorithm,
         kv: KvResources,
         capacity: KvCapacity,
         streams: Streams,
@@ -3106,6 +3106,9 @@ class DisaggDecode:
         future_map: Any,
         ngram_embedding_manager: Any,
     ):
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
         req_to_token_pool = kv.req_to_token_pool
         penalty_store = kv.penalty_store
         token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator

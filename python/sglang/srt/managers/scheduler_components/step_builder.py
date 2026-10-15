@@ -12,8 +12,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     req_pool_indices_of,
 )
-from sglang.srt.runtime_context import get_memory, get_schedule
+from sglang.srt.runtime_context import get_memory, get_schedule, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -22,7 +23,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.engine_state import (
         LaunchCounters,
     )
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class StepBuilder:
@@ -37,9 +37,11 @@ class StepBuilder:
         counters: LaunchCounters,
         workers: Workers,
         model_config: ModelConfig,
-        spec_algorithm: SpeculativeAlgorithm,
         device: str,
     ):
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
         self.req_to_token_pool = kv.req_to_token_pool
         self.token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         self.tree_cache = kv.tree_cache

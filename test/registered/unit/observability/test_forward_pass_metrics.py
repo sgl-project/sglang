@@ -162,7 +162,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
             tp_worker=scheduler.tp_worker, draft_worker=scheduler.draft_worker
         ),
         model_config=None,
-        spec_algorithm=None,
         device=getattr(scheduler, "device", ""),
     )
 

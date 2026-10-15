@@ -44,10 +44,12 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_serving,
+    get_spec,
     hicache_storage_enabled,
 )
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
 )
@@ -77,8 +79,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
 logger = logging.getLogger(__name__)
 
 
@@ -113,15 +113,17 @@ class RequestIntake:
         request_retirer: RequestRetirer,
         mode_owners: ModeOwners,
         model_config: ModelConfig,
-        spec_algorithm: SpeculativeAlgorithm,
-        transfer_backend: TransferBackend,
         tokenizer: Any,
         mm_processor: Any,
         workers: Workers,
         dp_tp_group: Any,
         limits: RequestLimits,
-        sampling_mask_max_tokens: int,
     ):
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
+        transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
+        sampling_mask_max_tokens = get_exec().features.sampling_mask_max_tokens
         self.lists = core_lists
         self.counters = counters
         self.tree_cache = kv.tree_cache

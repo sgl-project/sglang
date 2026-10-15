@@ -29,7 +29,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils.common import (
     ceil_align,
     raise_error_or_warn,
@@ -62,7 +62,6 @@ CHECK_REQUEST_LISTS = envs.SGLANG_CHECK_REQUEST_LIST_INVARIANTS.get()
 class SchedulerInvariantChecker:
     kv: KvResources
     capacity: KvCapacity
-    page_size: int
     pool_stats_observer: SchedulerPoolStatsObserver
     # The step this iteration launched; None when it launched nothing.
     counters: LaunchCounters
@@ -71,6 +70,7 @@ class SchedulerInvariantChecker:
     # Released requests' rows held for a pending step's commit.
     pending: PendingSteps
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
+    page_size: int = field(init=False, default_factory=lambda: get_schedule().page_size)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(

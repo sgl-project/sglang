@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -12,6 +12,7 @@ from typing import (
 
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -173,7 +174,9 @@ class SchedulerPoolStatsObserver:
     capacity: KvCapacity
     session_controller: Any
     hisparse_coordinator: Any
-    enable_hisparse: bool
+    enable_hisparse: bool = field(
+        init=False, default_factory=lambda: get_memory().enable_hisparse
+    )
 
     def streaming_session_count(self) -> int:
         return sum(

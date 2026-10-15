@@ -10,6 +10,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt import runtime_context
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
@@ -295,13 +296,14 @@ class TestDPBalanceStats(CustomTestCase):
         self.assertEqual(dp_attn._local_attention_pairs(fast), 17)
 
     def _adapter(self):
-        return dp_attn.SchedulerDPAttnAdapter(
-            model_runner=object(),
-            flags=EngineFlags(),
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            step_builder=None,
-            get_require_mlp_sync=lambda: True,
-        )
+        # The adapter reads whether the MLP layers sync from the parallel config.
+        with runtime_context.get_parallel().override(attn_dp_enabled=True):
+            return dp_attn.SchedulerDPAttnAdapter(
+                model_runner=object(),
+                flags=EngineFlags(),
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                step_builder=None,
+            )
 
     def test_batchless_gathers_carry_wait_until_recorded_or_idle(self):
         adapter = self._adapter()

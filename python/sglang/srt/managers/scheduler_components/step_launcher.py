@@ -20,8 +20,10 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.speculative.forward_batch_view import worker_forward_batch
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -54,9 +56,7 @@ if TYPE_CHECKING:
     from sglang.srt.observability.scheduler_stage_metrics import (
         SchedulerStageMetricsRecorder,
     )
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
-
 _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
@@ -84,10 +84,12 @@ class StepLauncher:
         stages: ModeStages,
         scripted_scheduler_hook: Optional[ScriptedSchedulerHook],
         workers: Workers,
-        spec_algorithm: SpeculativeAlgorithm,
         is_generation: bool,
         device_module,
     ):
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
         self.token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         self.tree_cache = kv.tree_cache
         self.schedule_stream = streams.schedule_stream

@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_request_lists import make_request_retirer
+from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -109,13 +110,9 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         ),
         policy=None,
         new_token_ratio_tracker=None,
-        page_size=1,
         limits=SimpleNamespace(
             max_prefill_tokens=0, chunked_prefill_size=None, truncation_align_size=None
         ),
-        priority_scheduling_preemption_threshold=0,
-        enable_priority_preemption=False,
-        enable_priority_scheduling=False,
         context_len=context_len,
         beam_coordinator=None,
         step_builder=None,
@@ -134,6 +131,12 @@ def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
 
 
 class TestGemma4ContextLifecycle(unittest.TestCase):
+    def setUp(self):
+        enter_scope(
+            self,
+            published_topology(page_size=1, priority_scheduling_preemption_threshold=0),
+        )
+
     def test_scheduler_uses_standard_extend_for_context_only(self):
         manager = SimpleNamespace(
             dllm_config=SimpleNamespace(requires_separate_context_encoding=True),
@@ -359,6 +362,12 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
 
 
 class TestGemma4RequestValidation(unittest.TestCase):
+    def setUp(self):
+        enter_scope(
+            self,
+            published_topology(page_size=1, priority_scheduling_preemption_threshold=0),
+        )
+
     def _validate(
         self,
         sampling_params=None,

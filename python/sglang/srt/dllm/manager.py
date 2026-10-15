@@ -11,7 +11,11 @@ from sglang.srt.dllm.prefill_adder import DllmPrefillAdder
 from sglang.srt.dllm.req_state import DllmReqPhase, DllmReqState
 from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult, SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    SchedulePolicy,
+    priority_preemption_enabled,
+)
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -54,16 +58,18 @@ class DllmManager:
         services: SchedulerServices,
         policy: SchedulePolicy,
         new_token_ratio_tracker: NewTokenRatioTracker,
-        page_size: int,
         limits: RequestLimits,
-        priority_scheduling_preemption_threshold: int,
-        enable_priority_preemption: bool,
-        enable_priority_scheduling: bool,
         context_len: int,
         beam_coordinator: BeamCoordinator,
         step_builder: StepBuilder,
         request_retirer: RequestRetirer,
     ):
+        page_size = get_schedule().page_size
+        priority_scheduling_preemption_threshold = (
+            get_schedule().priority_scheduling_preemption_threshold
+        )
+        enable_priority_preemption = priority_preemption_enabled()
+        enable_priority_scheduling = get_schedule().enable_priority_scheduling
         tree_cache = kv.tree_cache
         req_to_token_pool = kv.req_to_token_pool
         token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator

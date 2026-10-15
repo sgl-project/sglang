@@ -1,8 +1,14 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.runtime_context import get_spec
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -32,7 +38,6 @@ def _controller(registry: RequestRegistry) -> SchedulerInternalStateController:
     return SchedulerInternalStateController(
         workers=SimpleNamespace(tp_worker=None, draft_worker=None),
         kv=SimpleNamespace(token_to_kv_pool_allocator=None),
-        spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
         capacity=SimpleNamespace(
             max_running_requests=0, max_total_num_tokens=0, swa_tokens_per_layer=0
         ),
@@ -46,6 +51,11 @@ def _controller(registry: RequestRegistry) -> SchedulerInternalStateController:
 
 
 class TestAcceptThresholdSamplingMaskGate(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+        # The DFlash acceptance threshold is the one the gate guards.
+        enter_scope(self, get_spec().override(speculative_algorithm="DFLASH"))
+
     def test_pd_prefill_transfer_request_blocks_a_relaxed_threshold(self):
         """A sampling-mask request still sending its KV describes the exact
         target policy; relaxing acceptance under it must be rejected."""

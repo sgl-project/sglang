@@ -17,7 +17,6 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.penalties import PenaltyStore
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -34,7 +33,6 @@ def _new_step_builder() -> StepBuilder:
         counters=LaunchCounters(),
         workers=SimpleNamespace(tp_worker=None, model_worker=None),
         model_config=None,
-        spec_algorithm=SpeculativeAlgorithm.NONE,
         device="cpu",
     )
     builder.build_sampling_info = MagicMock(

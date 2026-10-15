@@ -24,7 +24,7 @@ from sglang.srt.sampling.sampling_params import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_request_lists import make_request_retirer
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -76,7 +76,6 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     )
     return SchedulerBatchResultProcessor(
         is_generation=True,
-        enable_overlap=False,
         model_config=SimpleNamespace(think_end_ids=None),
         kv=kv,
         services=SimpleNamespace(
@@ -163,6 +162,9 @@ def _commit_disagg_handoff(
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology(disable_overlap_schedule=True))
+
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()
@@ -187,6 +189,9 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
 
 class TestReasoningTokenAccounting(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology(disable_overlap_schedule=True))
+
     def test_multi_token_end_can_span_decode_steps(self):
         req = _make_req(terminate_after=99)
         req.require_reasoning = True

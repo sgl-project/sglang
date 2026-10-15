@@ -190,7 +190,6 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
             swa_tokens_per_layer=None,
             widened_max_total_num_tokens=64,
         ),
-        page_size=1,
         kv=SimpleNamespace(
             tree_cache=SimpleNamespace(
                 supports_mamba=lambda: True,
@@ -237,7 +236,6 @@ def test_hybrid_pool_stats_exclude_reserved_slots():
             swa_tokens_per_layer=None,
             widened_max_total_num_tokens=42,
         ),
-        enable_hisparse=False,
     )
 
     stats = observer._get_mamba_token_info()
@@ -288,7 +286,6 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
             swa_tokens_per_layer=None,
             widened_max_total_num_tokens=64,
         ),
-        page_size=1,
         kv=SimpleNamespace(
             tree_cache=SimpleNamespace(
                 mamba_protected_size=lambda: 0,

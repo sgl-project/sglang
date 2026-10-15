@@ -21,6 +21,7 @@ from sglang.test.scheduler_request_lists import (
     make_request_registry,
     make_request_retirer,
 )
+from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -63,13 +64,9 @@ def _manager(**deps):
         ),
         policy=SimpleNamespace(calc_priority=Mock()),
         new_token_ratio_tracker=None,
-        page_size=1,
         limits=SimpleNamespace(
             max_prefill_tokens=0, chunked_prefill_size=None, truncation_align_size=None
         ),
-        priority_scheduling_preemption_threshold=0,
-        enable_priority_preemption=False,
-        enable_priority_scheduling=False,
         context_len=128,
         beam_coordinator=_RowBudget(lambda: 64),
         step_builder=SimpleNamespace(
@@ -149,6 +146,10 @@ def _fdfo_result(blocks, accept_lengths, algo_states):
 
 class TestDllmManagerLists(unittest.TestCase):
     def setUp(self):
+        enter_scope(
+            self,
+            published_topology(page_size=1, priority_scheduling_preemption_threshold=0),
+        )
         self.checkpoint = self._patch("sglang.srt.dllm.manager.checkpoint_kv_cache")
         self._patch(
             "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"

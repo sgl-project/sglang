@@ -41,6 +41,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.scheduler_request_lists import make_request_retirer
+from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -100,7 +101,6 @@ def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
     )
     return SchedulerBatchResultProcessor(
         is_generation=True,
-        enable_overlap=True,
         model_config=SimpleNamespace(think_end_ids=None),
         kv=kv,
         services=SimpleNamespace(
@@ -127,6 +127,9 @@ def _make_result():
 
 
 class TestMambaBoundaryCommit(unittest.TestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_overlapped_boundary_moves_req_state_at_its_own_commit(self):
         """Under overlap, the step after a boundary step is built before the
         boundary commits. The build reads the Req; the boundary's checkpoint
@@ -240,6 +243,9 @@ class TestMambaBoundaryCommit(unittest.TestCase):
 
 
 class TestMambaSpecBoundaryCommit(unittest.TestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_spec_step_carries_the_slot_its_verify_tracks(self):
         """A spec decode step that crosses a track boundary: the step's plan
         names the slot its verify tracks into, and the host commit makes that
@@ -362,6 +368,9 @@ class TestMambaLazyInPlaceTrack(unittest.TestCase):
     place into the slot of its checkpoint. The build only plans it; the host
     commit of a step that crossed names the new checkpoint."""
 
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_spec_step_plans_the_checkpoint_slot_and_its_commit_names_a_crossing(
         self,
     ):
@@ -427,6 +436,9 @@ class TestMambaLazyFinishDonation(unittest.TestCase):
     """A finishing lazy request donates its checkpoint slot only when no
     forward writes it in place: not this step's crossing, and not a pending
     step's plan."""
+
+    def setUp(self):
+        enter_scope(self, published_topology())
 
     def _checkpoint_at_finish(self, step, result, pending_step=None) -> bool:
         req = step.reqs[0]
@@ -513,6 +525,9 @@ class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
     launched. When that decode tracks in place into the slot of the prefill's
     checkpoint, the commit publishes no checkpoint of that slot."""
 
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def _commit_prefill(self, max_new_tokens: int, pending_tracks: bool):
         sampling_params = SamplingParams(max_new_tokens=max_new_tokens)
         sampling_params.normalize(None)
@@ -593,6 +608,9 @@ class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
 
 
 class TestMambaExtendAdmission(unittest.TestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_next_chunk_built_before_commit_tracks_into_the_other_slot(self):
         """Under overlap the next chunk is built, and the chunked request
         stashed, before a chunk commits; admission, not the commit, hands the
@@ -630,6 +648,9 @@ class TestMambaExtendAdmission(unittest.TestCase):
 
 
 class TestMambaPrevTrackSeqlen(unittest.TestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_flip_names_the_checkpoint_in_the_other_slot(self):
         req, batch = _make_batch()
         processor = _make_processor()
@@ -661,6 +682,9 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
 
 
 class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_freed_rows_are_inert_and_live_rows_preserve_mapping(self):
         for positions, expected in (
             (None, [-1, 11]),

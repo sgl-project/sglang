@@ -702,12 +702,16 @@ class TestPrefillResultPolling(CustomTestCase):
                     swa_reprefill_tail_tokens=lambda: 0,
                     match_prefix=match_prefix,
                 )
-                scheduler.request_intake = make_request_intake(
-                    core_lists=scheduler.lists,
-                    kv=SimpleNamespace(
-                        tree_cache=scheduler.tree_cache, token_to_kv_pool_allocator=None
-                    ),
-                )
+                # The intake reads its config when built; _run_loop publishes
+                # the loop's own.
+                with published_topology():
+                    scheduler.request_intake = make_request_intake(
+                        core_lists=scheduler.lists,
+                        kv=SimpleNamespace(
+                            tree_cache=scheduler.tree_cache,
+                            token_to_kv_pool_allocator=None,
+                        ),
+                    )
 
                 def reissue(req, storage_hit_end):
                     scheduler.reissues.append(scheduler.iteration)

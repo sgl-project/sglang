@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -38,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
+    get_schedule,
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_params import (
@@ -214,7 +215,6 @@ def maybe_update_reasoning_tokens(
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
-    enable_overlap: bool
     model_config: ModelConfig
     kv: KvResources
     services: SchedulerServices
@@ -226,6 +226,9 @@ class SchedulerBatchResultProcessor:
     beam_coordinator: BeamCoordinator
     pending: PendingSteps
     request_retirer: RequestRetirer
+    enable_overlap: bool = field(
+        init=False, default_factory=lambda: not get_schedule().disable_overlap_schedule
+    )
 
     def _maybe_collect_routed_experts(self, req: Req):
         """Collect routed experts for a finished request.

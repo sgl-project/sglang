@@ -408,7 +408,6 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
                 widened_max_total_num_tokens=self.pool_size,
             ),
-            enable_hisparse=False,
         )
         return queue, queue.kv_manager.kv_args
 

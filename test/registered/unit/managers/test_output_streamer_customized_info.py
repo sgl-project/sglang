@@ -423,6 +423,9 @@ _IPC_ROUND_TRIPS = {
 
 
 class TestOutputStreamerSamplingMasks(unittest.TestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_rows_stream_once_and_expand_to_response_lists(self):
         """Queued rows cross either IPC codec once, in batch order, as per-token lists;
         rows queued later never overwrite a chunk that is still referenced."""
@@ -489,7 +492,11 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
         """Across decode steps, stream emissions and either IPC codec, each request gets
         the sampler's rows exactly as the tensor-to-list conversion defines them."""
         processor = SchedulerBatchResultProcessor(
-            **{f.name: None for f in dataclasses.fields(SchedulerBatchResultProcessor)}
+            **{
+                f.name: None
+                for f in dataclasses.fields(SchedulerBatchResultProcessor)
+                if f.init
+            }
         )
         modes = ["selected", "support", None, "support", "selected"]
         mask_reqs = [i for i, mode in enumerate(modes) if mode is not None]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -14,7 +14,8 @@ from sglang.srt.managers.load_snapshot import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.runtime_context import get_disagg, get_lora, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_lora, get_parallel, get_spec
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_policy import SchedulePolicy
@@ -34,9 +35,6 @@ if TYPE_CHECKING:
         RequestRegistry,
     )
     from sglang.srt.managers.scheduler_components.step_counters import StepCounters
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -46,12 +44,17 @@ class SchedulerLoadInquirer:
     capacity: KvCapacity
     pool_stats_observer: SchedulerPoolStatsObserver
     workers: Workers
-    spec_algorithm: SpeculativeAlgorithm
     policy: SchedulePolicy
     metrics_sink: MetricsSink
     request_registry: RequestRegistry
     mode_owners: ModeOwners
     step_counters: StepCounters
+    spec_algorithm: SpeculativeAlgorithm = field(
+        init=False,
+        default_factory=lambda: SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ),
+    )
 
     def get_num_waiting_uncached_tokens(self) -> int:
         """Estimate input tokens waiting for prefill compute."""

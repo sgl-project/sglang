@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -18,7 +18,7 @@ from sglang.srt.disaggregation.kv_events import (
     select_kv_publisher_dp_rank,
 )
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.bundles import KvCapacity, KvResources
@@ -44,11 +44,13 @@ hook_custom_types(KvMetrics)
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerKvEventsPublisher:
-    kv_events_config: Optional[str]
     kv: KvResources
     capacity: KvCapacity
     send_metrics_from_scheduler: Optional[zmq.Socket]
     metrics_sink: MetricsSink
+    kv_events_config: Optional[str] = field(
+        init=False, default_factory=lambda: get_observability().kv_events_config
+    )
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
 

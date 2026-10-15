@@ -7,6 +7,7 @@ from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.forward_batch_view import worker_forward_batch
 from sglang.srt.speculative.pp_spec_relay import PPSpecRelay
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -31,9 +32,11 @@ class PPSpecForward:
         streams: Streams,
         future_map,
         workers: Workers,
-        pp_group,
-        spec_algorithm,
     ):
+        pp_group = get_parallel().pp_group
+        spec_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
         self.req_to_token_pool = kv.req_to_token_pool
         self.device = streams.device
         self.future_map = future_map
