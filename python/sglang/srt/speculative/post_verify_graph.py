@@ -75,12 +75,15 @@ class PostVerifyGraph:
         self.disabled = False
         self._states: Dict[tuple, _KeyState] = {}
         self._pool = None
-        # The host runs up to ~2 rounds ahead of the device; a pinned slot is not
-        # rewritten before its async copy has executed.
+        # The host runs up to ~2 rounds ahead of the device; a pinned slot is
+        # rewritten only after the event behind its last async copy has completed.
         self._sim_len_host = [
             torch.zeros((1,), dtype=torch.int64, pin_memory=True) for _ in range(4)
         ]
+        self._sim_len_done: list = [None] * len(self._sim_len_host)
         self._sim_len_turn = 0
+        self._sim_len_stalls = 0
+        self._sim_len_slot = 0
         self._check = os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_CHECK", "0") == "1"
         self._max_top_k: Optional[int] = None
         self._checked = 0
@@ -196,9 +199,18 @@ class PostVerifyGraph:
         if SIMULATE_ACC_LEN <= 0:
             return None
         # Same host draw, at the same point of the round, as the eager path.
-        host = self._sim_len_host[self._sim_len_turn]
-        self._sim_len_turn = (self._sim_len_turn + 1) % len(self._sim_len_host)
+        turn = self._sim_len_turn
+        self._sim_len_turn = (turn + 1) % len(self._sim_len_host)
+        done = self._sim_len_done[turn]
+        if done is not None and not done.query():
+            # Host is more slots ahead than the ring covers; never overwrite a pending source.
+            self._sim_len_stalls += 1
+            if self._sim_len_stalls == 1:
+                logger.warning("post-verify graph: injected-length ring wrapped before its copy ran")
+            done.synchronize()
+        host = self._sim_len_host[turn]
         host[0] = sample_simulated_acc_len(SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len)
+        self._sim_len_slot = turn
         return host
 
     def _run(self, key, batch, verify_input, logits_output, num_draft_tokens):
@@ -270,6 +282,10 @@ class PostVerifyGraph:
                 dst.copy_(src, non_blocking=True)
         if sim_len is not None:
             slot.inputs["sim_len"].copy_(sim_len, non_blocking=True)
+            done = self._sim_len_done[self._sim_len_slot]
+            if done is None:
+                done = self._sim_len_done[self._sim_len_slot] = torch.cuda.Event()
+            done.record()
 
     def _capture(self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens):
         from sglang.srt.distributed.parallel_state import graph_capture
