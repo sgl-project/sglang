@@ -409,7 +409,7 @@ class Scheduler:
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.parts.capacity.max_total_num_tokens,
-            "max_req_input_len": self.parts.max_req_input_len,
+            "max_req_input_len": self.parts.limits.max_req_input_len,
             "startup_time": self.hub.internal_state.startup_time,
         }
 

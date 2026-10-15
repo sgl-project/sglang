@@ -72,6 +72,26 @@ class KvCapacity:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
+class RequestLimits:
+    """The request and prefill-step limits, known once the workers report
+    theirs and the chunk size is resolved."""
+
+    # The longest request, and its longest input, in tokens.
+    max_req_len: int
+    max_req_input_len: int
+    # The waiting queue's cap; None without one.
+    max_queued_requests: Optional[int]
+    # The tokens one prefill step may take.
+    max_prefill_tokens: int
+    # The prefill chunk; None without chunked prefill.
+    chunked_prefill_size: Optional[int]
+    # A prefill chunk may share its step with decoding requests.
+    is_mixed_chunk: bool
+    # The chunk alignment a truncated prefill keeps; None without one.
+    truncation_align_size: Optional[int]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
 class Streams:
     """The device and the streams the scheduler loop runs on."""
 

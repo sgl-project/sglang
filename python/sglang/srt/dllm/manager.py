@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler_components.bundles import (
         KvResources,
+        RequestLimits,
         SchedulerServices,
     )
     from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -54,12 +55,10 @@ class DllmManager:
         policy: SchedulePolicy,
         new_token_ratio_tracker: NewTokenRatioTracker,
         page_size: int,
-        max_prefill_tokens: int,
-        chunked_prefill_size: Optional[int],
+        limits: RequestLimits,
         priority_scheduling_preemption_threshold: int,
         enable_priority_preemption: bool,
         enable_priority_scheduling: bool,
-        truncation_align_size: Optional[int],
         context_len: int,
         beam_coordinator: BeamCoordinator,
         step_builder: StepBuilder,
@@ -77,14 +76,14 @@ class DllmManager:
         self.policy = policy
         self.new_token_ratio_tracker = new_token_ratio_tracker
         self.page_size = page_size
-        self.max_prefill_tokens = max_prefill_tokens
-        self.chunked_prefill_size = chunked_prefill_size
+        self.max_prefill_tokens = limits.max_prefill_tokens
+        self.chunked_prefill_size = limits.chunked_prefill_size
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
         self.enable_priority_preemption = enable_priority_preemption
         self.enable_priority_scheduling = enable_priority_scheduling
-        self.truncation_align_size = truncation_align_size
+        self.truncation_align_size = limits.truncation_align_size
         self.context_len = context_len
         self.beam_coordinator = beam_coordinator
         self.step_builder = step_builder

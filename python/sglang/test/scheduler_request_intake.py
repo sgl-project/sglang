@@ -15,7 +15,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 def make_request_intake(**deps) -> RequestIntake:
     """An intake over empty core lists, with no mode owners and inert
-    collaborators; `deps` replaces any constructor argument."""
+    collaborators; `deps` replaces any constructor argument or request limit."""
     args = dict(
         core_lists=CoreLists(),
         counters=LaunchCounters(),
@@ -38,11 +38,17 @@ def make_request_intake(**deps) -> RequestIntake:
             tp_worker=SimpleNamespace(get_pad_input_ids_func=lambda: None)
         ),
         dp_tp_group=SimpleNamespace(cpu_group=None, rank_in_group=0, first_rank=0),
+        sampling_mask_max_tokens=64,
+    )
+    limits = dict(
         max_req_len=4096,
         max_req_input_len=4095,
         max_queued_requests=None,
         chunked_prefill_size=None,
-        sampling_mask_max_tokens=64,
     )
+    for name in limits:
+        if name in deps:
+            limits[name] = deps.pop(name)
+    args["limits"] = SimpleNamespace(**limits)
     args.update(deps)
     return RequestIntake(**args)

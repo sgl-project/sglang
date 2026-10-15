@@ -68,6 +68,7 @@ from sglang.srt.managers.scheduler_components.bundles import (
     ComponentClasses,
     KvCapacity,
     KvResources,
+    RequestLimits,
     SchedulerServices,
     Streams,
     Workers,
@@ -235,7 +236,7 @@ class SchedulerParts:
     # The workers and their KV.
     workers: Workers
     external_corpus_manager: Any
-    max_req_input_len: int
+    limits: RequestLimits
     kv_event_lora_names: LoRANameTable
     kv: KvResources
     capacity: KvCapacity
@@ -655,6 +656,15 @@ def assemble_scheduler(
         chunked_prefill_size=chunked_prefill_size,
         disaggregation_mode=disaggregation_mode,
     )
+    limits = RequestLimits(
+        max_req_len=max_req_len,
+        max_req_input_len=max_req_input_len,
+        max_queued_requests=max_queued_requests,
+        max_prefill_tokens=max_prefill_tokens,
+        chunked_prefill_size=chunked_prefill_size,
+        is_mixed_chunk=is_mixed_chunk,
+        truncation_align_size=truncation_align_size,
+    )
 
     # Components, each built after the ones it takes
     lora_admission = LoraAdmission(workers=workers)
@@ -820,14 +830,12 @@ def assemble_scheduler(
             policy=policy,
             new_token_ratio_tracker=new_token_ratio_tracker,
             page_size=get_schedule().page_size,
-            max_prefill_tokens=max_prefill_tokens,
-            chunked_prefill_size=chunked_prefill_size,
+            limits=limits,
             priority_scheduling_preemption_threshold=(
                 get_schedule().priority_scheduling_preemption_threshold
             ),
             enable_priority_preemption=priority_preemption_enabled(),
             enable_priority_scheduling=get_schedule().enable_priority_scheduling,
-            truncation_align_size=truncation_align_size,
             context_len=model_config.context_len,
             beam_coordinator=beam_coordinator,
             step_builder=step_builder,
@@ -850,7 +858,7 @@ def assemble_scheduler(
         rust_server=rust_server,
         workers=workers,
         external_corpus_manager=external_corpus_manager,
-        max_req_input_len=max_req_input_len,
+        limits=limits,
         kv_event_lora_names=kv_event_lora_names,
         kv=kv,
         capacity=capacity,
@@ -916,10 +924,7 @@ def assemble_scheduler(
         mm_processor=mm_processor,
         workers=workers,
         dp_tp_group=dp_tp_group,
-        max_req_len=max_req_len,
-        max_req_input_len=max_req_input_len,
-        max_queued_requests=max_queued_requests,
-        chunked_prefill_size=chunked_prefill_size,
+        limits=limits,
         sampling_mask_max_tokens=server_args.sampling_mask_max_tokens,
     )
     step_planner = StepPlanner(
@@ -959,12 +964,9 @@ def assemble_scheduler(
         dynamic_chunk_sizer=dynamic_chunk_sizer,
         spec_algorithm=spec_algorithm,
         require_mlp_sync=requires_mlp_sync,
-        chunked_prefill_size=chunked_prefill_size,
-        is_mixed_chunk=is_mixed_chunk,
+        limits=limits,
         prefill_decode_interval=get_schedule().prefill_decode_interval or 0,
-        max_prefill_tokens=max_prefill_tokens,
         enable_priority_preemption=priority_preemption_enabled(),
-        truncation_align_size=truncation_align_size,
     )
     # Built after the request registry and the mode owners, which they read.
     weight_updater = SchedulerWeightUpdaterManager(

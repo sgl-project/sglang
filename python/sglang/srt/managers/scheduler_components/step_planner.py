@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.bundles import (
         KvCapacity,
         KvResources,
+        RequestLimits,
         Workers,
     )
     from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
@@ -204,12 +205,9 @@ class StepPlanner:
         dynamic_chunk_sizer: Optional[DynamicChunkSizer],
         spec_algorithm: SpeculativeAlgorithm,
         require_mlp_sync: bool,
-        chunked_prefill_size: Optional[int],
-        is_mixed_chunk: bool,
+        limits: RequestLimits,
         prefill_decode_interval: int,
-        max_prefill_tokens: int,
         enable_priority_preemption: bool,
-        truncation_align_size: Optional[int],
     ):
         self.core_lists = core_lists
         self.pending = pending
@@ -244,12 +242,12 @@ class StepPlanner:
         self.spec_algorithm = spec_algorithm
         self.is_hybrid_swa = capacity.is_hybrid_swa
         self.require_mlp_sync = require_mlp_sync
-        self.chunked_prefill_size = chunked_prefill_size
-        self.is_mixed_chunk = is_mixed_chunk
+        self.chunked_prefill_size = limits.chunked_prefill_size
+        self.is_mixed_chunk = limits.is_mixed_chunk
         self.prefill_decode_interval = prefill_decode_interval
-        self.max_prefill_tokens = max_prefill_tokens
+        self.max_prefill_tokens = limits.max_prefill_tokens
         self.enable_priority_preemption = enable_priority_preemption
-        self.truncation_align_size = truncation_align_size
+        self.truncation_align_size = limits.truncation_align_size
         # The largest recent prefill batch, which the prefill delayer reads.
         self.max_prefill_bs: int = 0
         # Steps left to decode before the next prefill may run.

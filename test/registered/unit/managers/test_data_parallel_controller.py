@@ -96,7 +96,7 @@ class TestLocalKvEventSources(CustomTestCase):
         component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
         scheduler = partial_scheduler()
         scheduler.parts.capacity.max_total_num_tokens = 64
-        scheduler.parts.max_req_input_len = 32
+        scheduler.parts.limits = SimpleNamespace(max_req_input_len=32)
         scheduler.hub.internal_state = SimpleNamespace(startup_time={})
         scheduler.parts.kv_events_publisher = component
         publisher = MagicMock()

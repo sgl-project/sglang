@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.bundles import (
         KvCapacity,
         KvResources,
+        RequestLimits,
         Workers,
     )
     from sglang.srt.managers.scheduler_components.engine_state import (
@@ -118,10 +119,7 @@ class RequestIntake:
         mm_processor: Any,
         workers: Workers,
         dp_tp_group: Any,
-        max_req_len: int,
-        max_req_input_len: int,
-        max_queued_requests: Optional[int],
-        chunked_prefill_size: Optional[int],
+        limits: RequestLimits,
         sampling_mask_max_tokens: int,
     ):
         self.lists = core_lists
@@ -148,10 +146,10 @@ class RequestIntake:
         self.pad_input_ids_func = workers.tp_worker.get_pad_input_ids_func()
         self.dp_tp_group = dp_tp_group
         self.dp_tp_cpu_group = dp_tp_group.cpu_group
-        self.max_req_len = max_req_len
-        self.max_req_input_len = max_req_input_len
-        self.max_queued_requests = max_queued_requests
-        self.chunked_prefill_size = chunked_prefill_size
+        self.max_req_len = limits.max_req_len
+        self.max_req_input_len = limits.max_req_input_len
+        self.max_queued_requests = limits.max_queued_requests
+        self.chunked_prefill_size = limits.chunked_prefill_size
         self.sampling_mask_max_tokens = sampling_mask_max_tokens
         self._last_logged_elastic_radix_namespace: Optional[str] = None
 

@@ -38,7 +38,14 @@ assert (_SRT_DIR / _SCHEDULER).is_file(), f"scheduler not found under {_SRT_DIR}
 # frozen bundles take nothing.
 # ---------------------------------------------------------------------------
 _SHARED = ["CoreLists", "LaunchCounters", "EngineFlags", "PendingSteps"]
-_FROZEN = ["KvResources", "KvCapacity", "Streams", "IpcChannels", "Workers"]
+_FROZEN = [
+    "KvResources",
+    "KvCapacity",
+    "RequestLimits",
+    "Streams",
+    "IpcChannels",
+    "Workers",
+]
 _DECLARED = {
     **{node: [] for node in _SHARED + _FROZEN},
     "StageMetrics": [],
@@ -128,6 +135,7 @@ _DECLARED = {
         "BeamCoordinator",
         "StepBuilder",
         "RequestRetirer",
+        "RequestLimits",
     ],
     "ModeOwners": ["DisaggPrefill", "DisaggDecode", "DllmManager", "HiSparse"],
     "RequestIntake": [
@@ -144,6 +152,7 @@ _DECLARED = {
         "RequestRetirer",
         "ModeOwners",
         "Workers",
+        "RequestLimits",
     ],
     "RequestRegistry": [
         "CoreLists",
@@ -181,6 +190,7 @@ _DECLARED = {
         "DecodeOffloadManager",
         "ModeOwners",
         "Workers",
+        "RequestLimits",
     ],
     "StepLauncher": [
         "Workers",
@@ -259,6 +269,7 @@ _PARAM = {
     "PendingSteps": ("pending",),
     "KvResources": ("kv",),
     "KvCapacity": ("capacity",),
+    "RequestLimits": ("limits",),
     "Workers": ("workers",),
     "Streams": ("streams",),
     "SchedulerServices": ("services",),

@@ -110,12 +110,12 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         policy=None,
         new_token_ratio_tracker=None,
         page_size=1,
-        max_prefill_tokens=0,
-        chunked_prefill_size=None,
+        limits=SimpleNamespace(
+            max_prefill_tokens=0, chunked_prefill_size=None, truncation_align_size=None
+        ),
         priority_scheduling_preemption_threshold=0,
         enable_priority_preemption=False,
         enable_priority_scheduling=False,
-        truncation_align_size=None,
         context_len=context_len,
         beam_coordinator=None,
         step_builder=None,
