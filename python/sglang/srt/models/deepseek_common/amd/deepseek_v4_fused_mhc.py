@@ -7,7 +7,6 @@ import triton
 if TYPE_CHECKING:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import HcCoefficients
 
-from sglang.experimental import monokernels as mono
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -583,17 +582,12 @@ def forward_hc_pre_from_prev_fused_boundary(
     prev_pre: Optional[torch.Tensor],
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     defer_post: bool,
-    plan=None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
-    comb); with defer_post this layer's is returned the same way and hidden_states is None.
-    Under a monokernel plan, a covered layer runs as its span."""
+    comb); with defer_post this layer's is returned the same way and hidden_states is None."""
     if pending_post is None:
         pending_post = (None, hidden_states, None, None)
-    span = mono.kernel(plan, layer.layer_id, "layer_in")
-    if span is not None:
-        return span(positions, forward_batch, pending_post, prev_pre, defer_post)
     residual, x, attn_coefficients = hc_boundary(
         layer,
         *pending_post,

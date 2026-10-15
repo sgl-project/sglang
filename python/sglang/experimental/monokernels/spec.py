@@ -16,49 +16,10 @@ import importlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
-# The plugin API a spec is written against: MonoSpec, BuildContext, ShapeKey, the
-# built model's ``kernel(layer_id, point, key)``, and a span's ``fn(plan, *inputs)``
+# The plugin API a spec is written against: MonoSpec, BuildContext, ShapeKey, and
+# the built model's ``serves(key)`` and ``forward(plan, *inputs)``
 API_VERSION = 1
 ENTRY_POINTS = "sglang.monokernels"
-
-
-class SpanPoint(enum.IntEnum):
-    """Where a span starts and ends, in layer order. ``LAYER_IN`` and ``LAYER_OUT``
-    carry whatever the model's layer loop passes between layers."""
-
-    LAYER_IN = 0
-    ATTN_IN = 1  # after the input norm
-    CORE_IN = 2  # before the attention backend call
-    CORE_OUT = 3
-    ATTN_PARTIAL = 4  # before the all-reduce
-    MLP_IN = 5  # after the post-attention norm
-    MLP_PARTIAL = 6  # before the all-reduce
-    LAYER_OUT = 7
-
-
-SPAN_REASONS = frozenset(
-    {"backend_state", "hardware_limit", "measured_slowdown", "rank_local"}
-)
-
-
-@dataclass(frozen=True)
-class Span:
-    """A covered part of a layer, in one or more launches; less than the whole
-    layer needs a reason. A span that starts at a partial point does the
-    all-reduce in the kernel."""
-
-    name: str
-    start: SpanPoint
-    end: SpanPoint
-    reason: Optional[str] = None
-
-    def __post_init__(self):
-        whole = (self.start, self.end) == (SpanPoint.LAYER_IN, SpanPoint.LAYER_OUT)
-        if self.start >= self.end or not (whole or self.reason in SPAN_REASONS):
-            raise ValueError(
-                f"span {self.name}: {self.start.name} -> {self.end.name}, "
-                f"reason {self.reason!r} (one of {sorted(SPAN_REASONS)})"
-            )
 
 
 class Feature(enum.Enum):
@@ -156,16 +117,14 @@ class BuildContext:
 @dataclass(frozen=True)
 class MonoSpec:
     """One model's monokernels for one vendor. ``build(model, hf_config, ctx)``
-    returns the built model, whose ``kernel(layer_id, point, key)`` gives the span
-    of ``layer_id`` that starts at ``point`` as ``fn(plan, *inputs)`` (the inputs
-    and outputs of the code it replaces), or None where ``key`` keeps the normal
-    path; it reads only the graph key."""
+    returns the built model: ``serves(key)`` says which graph keys its forward
+    runs (it reads only the key), and ``forward(plan, *inputs)`` runs a routed
+    step, taking and returning what the model's own forward does."""
 
     name: str
     devices: Mapping[str, DeviceLimits]  # per ISA
     features: frozenset[Feature]  # the refused-by-default features it accepts
     requires: Requirements
-    spans: Callable[..., Mapping[int, tuple[Span, ...]]]  # (hf_config) -> per layer
     numerics: Numerics
     config_disable_reasons: Callable[..., list[str]]  # (cfg, hf_config), before load
     # (model, hf_config, copies): after load, with the load hook's copies

@@ -25,7 +25,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.experimental import monokernels as mono
 from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
@@ -4184,8 +4183,6 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
-        # under a monokernel plan the covered layers take DSpark's captures
-        plan = mono.route(self, forward_batch, dspark_aux=dspark_aux_hidden_states)
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
@@ -4237,7 +4234,7 @@ class DeepseekV4Model(nn.Module):
                         hidden_states,
                     )
                 state = state.with_residual(hidden_states)
-            if capture_dspark and i in self.dspark_layers_to_capture and plan is None:
+            if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
@@ -4258,8 +4255,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids=input_ids,
                         forward_batch=forward_batch,
                         input_ids_global=input_ids_global,
-                        capture_dspark=capture_dspark and plan is None,
-                        plan=plan,
+                        capture_dspark=capture_dspark,
                     )
                     continue
                 state = self.layers[i].forward_hc_pre_from_prev(
@@ -5010,10 +5006,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             should_fuse_mega_moe_shared_experts,
         )
 
-        # draft models (NextN subclasses, DSpark borrows this hook) keep the normal path
-        if type(self) is DeepseekV4ForCausalLM:
-            mono.attach(self.model, self.config)
-
         # The only deployments whose fused-collective gates can fire; registration
         # must happen eagerly here, before graph capture.
         if get_platform().is_blackwell and get_parallel().tp_size == 4:
@@ -5290,8 +5282,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
                     ):
                         continue
-                    if not is_nextn:
-                        mono.load_tensor(self.model, name, loaded_weight)
                     if (
                         self.num_fused_shared_experts > 0
                         and "mlp.shared_experts" in name

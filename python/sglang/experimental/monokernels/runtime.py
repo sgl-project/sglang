@@ -1,20 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """The monokernel plugin in each process (RFC #43949), after the config checks in
-``guards``. Each call is a no-op while ``--enable-monokernel`` is off.
+``guards``. SGLang's runtime calls it for every model; each call is a no-op while
+``--enable-monokernel`` is off, and for a model no spec covers.
 
-- ``load_tensor(model, name, tensor)``: each checkpoint tensor, for the copies of
-  weights that loading rewrites.
+- ``watch_weights(model, weights)``: the model loader's checkpoint tensors, on
+  their way to ``model.load_weights``: the spec may keep a copy of a weight that
+  loading rewrites.
 - ``attach(model, hf_config)``: after weight load, before KV sizing. Every rank's
-  reasons are gathered and refused together; then build every planned width and
-  compare every rank's routing plans.
-- ``route(model, forward_batch, **state)``: one plan a forward, from the graph key.
-- ``kernel(plan, layer_id, point)``: the span that starts at ``point``, or None.
+  reasons are gathered and refused together; then build every planned width,
+  compare every rank's routing plans, and switch the model's forward.
 
-Routing runs none of the spec's code: ``attach`` fixes the spans of every graph
-key a step can have, up to the largest width, and every rank compares them. A
-forward looks its key up: any other key (prefill, extend, mixed and idle steps,
-uneven rows, a width not built) takes the normal path, for every layer. A graph
-replay repeats its capture's decision; each decision is logged once, on rank 0.
+The switch is SGLang's own pattern for execution backends (the torch.compile
+trampoline): ``model.forward`` on this instance routes each call. A routed step
+runs the spec's forward, which takes and returns what the model's forward does;
+any other step runs the model's forward as it is. Routing reads only the graph key
+and runs none of the spec's code: attach fixes which keys the spec serves, up to
+the largest width. Any other key (prefill, extend, mixed and idle steps, uneven
+rows, a width not built) takes the normal path. A graph replay repeats its
+capture's decision; each decision is logged once, on rank 0.
 """
 
 from __future__ import annotations
@@ -22,9 +25,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import types
 from collections import Counter
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any, Optional
 
 from sglang.experimental.monokernels.guards import deadline_s, device_isa
@@ -32,7 +35,6 @@ from sglang.experimental.monokernels.spec import (
     BuildContext,
     Feature,
     ShapeKey,
-    SpanPoint,
     find_spec,
 )
 
@@ -90,18 +92,23 @@ def _gather(obj) -> list:
     return out
 
 
-def load_tensor(model, name: str, tensor) -> None:
-    """Each checkpoint tensor, before renames and quantization: the spec may keep a
-    copy of a weight that loading rewrites."""
-    spec = model.__dict__.get("_mono_load_spec", False)
-    if spec is False:
-        archs = getattr(model.config, "architectures", None) or ()
-        spec = find_spec(archs, device_isa())[0] if enabled() else None
-        model.__dict__["_mono_load_spec"] = spec
-    if spec is not None and spec.load_tensor is not None:
-        spec.load_tensor(
-            model.__dict__.setdefault("_mono_copies", {}), model, name, tensor
-        )
+def watch_weights(model, weights):
+    """``weights`` as they are, after the spec saw each (name, tensor): the
+    checkpoint's names and tensors, before the model renames or converts them."""
+    if not enabled():
+        return weights
+    archs = getattr(getattr(model, "config", None), "architectures", None) or ()
+    spec = find_spec(archs, device_isa())[0]
+    if spec is None or spec.load_tensor is None:
+        return weights
+    copies = model.__dict__.setdefault("_mono_copies", {})
+
+    def watched():
+        for name, tensor in weights:
+            spec.load_tensor(copies, model, name, tensor)
+            yield name, tensor
+
+    return watched()
 
 
 def shape_key(forward_batch) -> Optional[ShapeKey]:
@@ -131,7 +138,7 @@ def _why_normal(forward_batch, key: Optional[ShapeKey], widths) -> str:
             return f"{key.forward_mode} over {top} rows"
         if key.rows not in widths:
             return f"{key.forward_mode} of {key.rows} rows, a width not built"
-        return f"{key.forward_mode} of {key.rows} rows, which the spec leaves normal"
+        return f"{key.forward_mode} of {key.rows} rows, which the spec does not serve"
     mode = forward_batch.forward_mode
     if mode.is_decode() or mode.is_target_verify():
         return f"{mode.name.lower()} with uneven rows a request"
@@ -145,7 +152,6 @@ class Plan:
 
     key: ShapeKey
     built: Any  # the spec's built model
-    spans: dict = field(compare=False)  # (layer_id, point name) -> span
     state: dict = field(default_factory=dict, compare=False)
 
 
@@ -158,28 +164,20 @@ def _keys(widths, tokens: int):
 
 
 class MonoRuntime:
-    """A model's built monokernels, and the spans of every graph key a step can
-    have, fixed here: routing a forward runs none of the spec's code."""
+    """A model's built monokernels, and the graph keys its forward serves, fixed
+    here: routing a forward runs none of the spec's code."""
 
-    def __init__(self, built, layer_ids, widths, tokens: int, rank: int = 0):
+    def __init__(self, built, widths, tokens: int, rank: int = 0):
         self.built, self.widths, self.rank = built, tuple(widths), rank
-        self.table: dict = {}  # ShapeKey -> {(layer_id, point name): span}
-        for key in _keys(self.widths, tokens):
-            spans = {}
-            for i in layer_ids:
-                for p in SpanPoint:
-                    fn = built.kernel(i, p, key)
-                    if fn is not None:
-                        spans[(i, p.name.lower())] = fn
-            if spans:
-                self.table[key] = spans
+        self.served = frozenset(
+            k for k in _keys(self.widths, tokens) if built.serves(k)
+        )
         self.counts: Counter = Counter()  # eager forwards: "mono", or the reason
         self._logged: set = set()
 
     def decision(self, key: ShapeKey) -> str:
         """The routing decision for ``key`` as text: what every rank must agree on."""
-        spans = " ".join(f"{i}.{p}" for i, p in sorted(self.table.get(key, ())))
-        return f"{key}: {spans or 'normal'}"
+        return f"{key}: {'mono' if key in self.served else 'normal'}"
 
     def note(self, key: Optional[ShapeKey], why: str) -> None:
         """Count an eager forward's path, and log each decision once on rank 0: a
@@ -201,10 +199,7 @@ class MonoRuntime:
             if why:
                 logger.info("monokernel: %s take the normal path: %s", where, why)
             else:
-                layers = len({i for i, _ in self.table[key]})
-                logger.info(
-                    "monokernel: %s run %d layers on monokernels", where, layers
-                )
+                logger.info("monokernel: %s run the monokernel forward", where)
 
 
 def attach(model, hf_config) -> None:
@@ -219,20 +214,19 @@ def attach(model, hf_config) -> None:
 
     isa = device_isa()
     spec, why = find_spec(getattr(hf_config, "architectures", None) or (), isa)
-    model.__dict__.pop("_mono_load_spec", None)
     copies = model.__dict__.pop("_mono_copies", {})
-    reasons = (
-        [why]
-        if spec is None
-        else list(spec.model_disable_reasons(model, hf_config, copies))
-    )
-    if spec is not None:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        if props.multi_processor_count < spec.devices[isa].resident_blocks:
-            reasons.append(
-                f"{Feature.PARTITIONED_GPU.value}: {props.multi_processor_count} compute "
-                f"units, the launch grid needs {spec.devices[isa].resident_blocks}"
-            )
+    if spec is None:
+        # the config hook refused a served model without a spec; this one (e.g. a
+        # draft model) keeps its forward
+        logger.info("monokernel: %s: the normal forward", why)
+        return
+    reasons = list(spec.model_disable_reasons(model, hf_config, copies))
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if props.multi_processor_count < spec.devices[isa].resident_blocks:
+        reasons.append(
+            f"{Feature.PARTITIONED_GPU.value}: {props.multi_processor_count} compute "
+            f"units, the launch grid needs {spec.devices[isa].resident_blocks}"
+        )
     # all ranks refuse together, before any handshake
     reasons = [f"rank {r}: {x}" for r, rs in enumerate(_gather(reasons)) for x in rs]
     if reasons:
@@ -246,18 +240,13 @@ def attach(model, hf_config) -> None:
     )
     ctx = BuildContext(isa, widths, deadline_s(get_device().watchdog_timeout), copies)
     t0, mem0 = time.perf_counter(), torch.cuda.memory_allocated()
-    rt = MonoRuntime(
-        spec.build(model, hf_config, ctx),
-        sorted(spec.spans(hf_config)),
-        widths,
-        tokens,
-        _rank(),
-    )
-    table = "\n".join(rt.decision(k) for k in sorted(rt.table, key=str))
+    rt = MonoRuntime(spec.build(model, hf_config, ctx), widths, tokens, _rank())
+    table = "\n".join(rt.decision(k) for k in sorted(rt.served, key=str))
     if len(set(_gather(hashlib.sha256(table.encode()).hexdigest()))) > 1:
         raise RuntimeError("monokernel routing plans differ across ranks")
     lines = [rt.decision(k) for k in keys]
     model.mono = rt
+    _switch(model)
     # SGLang's weight updater refuses each update: the kernels read copies and views
     model._derived_weight_cache_error = (
         "Online weight updates are not supported with --enable-monokernel "
@@ -277,6 +266,23 @@ def attach(model, hf_config) -> None:
         ctx.deadline_s,
         _sizes(copies),
     )
+
+
+def _switch(model) -> None:
+    """Route each call of ``model.forward`` on this instance, as SGLang's
+    torch.compile trampoline does: the spec's forward under a plan, else the
+    model's own. The runners call ``forward(input_ids, positions, forward_batch,
+    ...)``, and a CUDA graph capture records the routed call."""
+    original = model.forward
+
+    def forward(self, *args, **kwargs):
+        batch = kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
+        plan = route(self, batch)
+        if plan is None:
+            return original(*args, **kwargs)
+        return plan.built.forward(plan, *args, **kwargs)
+
+    model.forward = types.MethodType(forward, model)
 
 
 def _sizes(copies: dict) -> str:
@@ -319,22 +325,12 @@ def _capture_keys() -> list[ShapeKey]:
 
 
 def route(model, forward_batch, **state) -> Optional[Plan]:
-    """One plan a forward from the graph key alone; None: the normal path, for
-    every layer. ``state``: the forward's values the spec's kernels read."""
+    """One plan a forward from the graph key alone; None: the model's normal
+    forward. ``state``: the forward's values the spec's forward reads."""
     rt = vars(model).get("mono")  # no nn.Module attribute miss on the normal path
     if rt is None:
         return None
     key = shape_key(forward_batch)
-    spans = rt.table.get(key) if key is not None else None
-    rt.note(key, "" if spans else _why_normal(forward_batch, key, rt.widths))
-    return Plan(key, rt.built, spans, state) if spans else None
-
-
-def kernel(plan: Optional[Plan], layer_id: int, point):
-    """The span of ``layer_id`` that starts at ``point`` (a ``SpanPoint`` or its
-    lower-case name) under ``plan``, bound to the plan; None: the normal path."""
-    if plan is None:
-        return None
-    name = point if isinstance(point, str) else point.name.lower()
-    fn = plan.spans.get((layer_id, name))
-    return None if fn is None else partial(fn, plan)
+    served = key is not None and key in rt.served
+    rt.note(key, "" if served else _why_normal(forward_batch, key, rt.widths))
+    return Plan(key, rt.built, state) if served else None
