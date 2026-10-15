@@ -693,6 +693,51 @@ The legacy `--cache-threshold`, `--balance-abs-threshold`, and
 one-to-one replacements; remove them and review the current `sgl-router
 --help` output when tuning Cache-Aware routing.
 
+## Decode cache affinity (bucket-first routing)
+
+With `--chat-routing reorg --policy cache_aware --bucket-config buckets.json`,
+a decode group can opt into confirmed local-memory prefix reuse:
+
+```json
+{
+  "buckets": [{
+    "id": "pd",
+    "prefill": {"policy": "cache_aware"},
+    "decode": {
+      "policy": "cache_aware",
+      "affinity": {"mode": "balanced", "balanced_by": "running_requests"},
+      "admission": {"max_kv_usage": 0.9}
+    }
+  }]
+}
+```
+
+Prefill keeps its existing prefix policy. Decode selects the admitted worker
+with the longest confirmed GPU-or-host prefix, breaking equal-prefix ties by
+GPU-resident depth, decode load, then worker ID. The existing minimum matched
+token/ratio settings apply. Bucket membership, health, retry exclusions and
+prefill/decode version-group boundaries still constrain the candidates.
+
+Decode requires the local `radix_tree` provider and KV events from decode
+workers with decode prefix caching enabled. Disk/external-only copies and
+pending placements do not count as local-memory hits. Cache affinity currently
+applies only to workers reporting one DP rank; multi-rank workers remain eligible
+for the load-based fallback until dispatch can target the cached rank.
+
+Set the decode group's affinity mode to `prefer` or `balanced`. A missing or
+insufficient cache signal falls back to power-of-two. `prefer`
+keeps an admitted cache owner; `balanced` may choose another worker when both
+running-request load thresholds are exceeded. Decode defaults to balancing
+running requests, using that metric's default gap unless explicitly set on the
+group or inherited from a global running-request configuration. It does not
+compare prefill-token pressure. Selection reasons are `decode_cache_candidate`,
+`decode_affinity_load`, and `no_decode_cache_candidate`.
+
+The default decode policy remains power-of-two. Cache events are routing hints;
+engines still determine actual reuse. CPU policy and HTTP tests cover selection
+and fallback, but this mode needs serving benchmarks before claiming lower
+KV-transfer volume or latency.
+
 ## License
 
 Apache-2.0.

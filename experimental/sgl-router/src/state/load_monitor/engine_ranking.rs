@@ -214,6 +214,14 @@ impl<'a> CandidateLoads<'a> {
         self.compare_prefill_load_keys(&self.load_key(left), &self.load_key(right))
     }
 
+    pub(crate) fn compare_decode_engines(
+        &self,
+        left: &Arc<Worker>,
+        right: &Arc<Worker>,
+    ) -> Ordering {
+        self.compare_decode_load_keys(&self.load_key(left), &self.load_key(right))
+    }
+
     pub(crate) fn prefill_pressure_source(&self) -> &'static str {
         if self.compare_engine
             && self

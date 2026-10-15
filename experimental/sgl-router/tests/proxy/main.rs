@@ -37,3 +37,5 @@ mod shared_prefill_admission;
 mod sticky_input_ids;
 mod sticky_routing;
 mod timeout;
+
+mod decode_cache_aware;
