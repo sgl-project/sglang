@@ -1410,6 +1410,8 @@ class MultiModalMixin:
         if torch.is_tensor(value):
             if value.is_floating_point() and dtype is not None:
                 return value.to(dtype=dtype, device=device)
+            if device is not None:
+                return value.to(device=device)
             return value
         if isinstance(value, dict):
             return {k: self._cast_mm_value(v, dtype, device) for k, v in value.items()}
@@ -1525,15 +1527,31 @@ class MultiModalMixin:
             # re-derives each image's real patch count from image_sizes and
             # slices the padding back out.
             pending_5d_features: dict = {}
+            # HF feature extractors (e.g. AudioFlamingo3's feature extractor)
+            # return float32 features regardless of the model's runtime dtype;
+            # a device-only .to() leaves them mismatched against fp16/bf16
+            # encoder weights once passed into self.model(**kwargs).
+            # _encode_modality_items already casts dtype this way for the
+            # separate-encoder-call path -- this matches it for the
+            # run-the-whole-HF-model-in-one-shot path.
+            modality_dtype_cache: dict[str, Optional[torch.dtype]] = {}
 
             for batch_idx in range(len(mm_inputs or [])):
                 mm_input = mm_inputs[batch_idx]
                 if mm_input is None:
                     continue
                 for item in mm_input.mm_items or []:
+                    modality_name = item.modality.name.lower()
+                    if modality_name not in modality_dtype_cache:
+                        target_dtype, _ = self._get_modality_dtype_device(
+                            modality_name
+                        )
+                        modality_dtype_cache[modality_name] = target_dtype
+                    target_dtype = modality_dtype_cache[modality_name]
+
                     for key, value in (item.model_specific_data or {}).items():
                         if isinstance(value, torch.Tensor):
-                            value = value.to(device=target_device)
+                            value = self._cast_mm_value(value, target_dtype, target_device)
                         if key not in kwargs:
                             kwargs[key] = value
                         elif isinstance(value, torch.Tensor) and isinstance(
@@ -1542,11 +1560,13 @@ class MultiModalMixin:
                             kwargs[key] = torch.cat([kwargs[key], value], dim=0)
                     if item.feature is not None:
                         feature_key = self._mm_feature_kwarg.get(
-                            item.modality.name.lower(), "pixel_values"
+                            modality_name, "pixel_values"
                         )
                         feature = item.feature
                         if isinstance(feature, torch.Tensor):
-                            feature = feature.to(device=target_device)
+                            feature = self._cast_mm_value(
+                                feature, target_dtype, target_device
+                            )
                             if feature.dim() == 5:
                                 pending_5d_features.setdefault(feature_key, []).append(
                                     feature
