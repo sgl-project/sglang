@@ -263,6 +263,8 @@ def _drop_diverged_autotune_cache(
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
+    from flashinfer import autotune_v2
+
     # The gate below decides on the same inputs load_configs does.
     from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
 
@@ -331,6 +333,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
+            autotune_v2(mode="tune", persistent_cache=False),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
