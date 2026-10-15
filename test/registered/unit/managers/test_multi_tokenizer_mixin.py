@@ -16,10 +16,12 @@ maybe_stub_sgl_kernel()
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     BeamSearchOutput,
+    ConfigureLoggingReq,
     unwrap_from_pickle,
     wrap_as_pickle,
 )
@@ -407,6 +409,55 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(
             [(target, obj.rids) for target, obj in sent],
             [("detok-a", ["embedding-rid-0"]), ("detok-a", ["embedding-rid-1"])],
+        )
+
+    def test_router_keys_on_rid_without_tokenizer_worker_ipcs(self):
+        output = _make_batch_str_output()
+        output.http_worker_ipcs = [None, None]
+        router = _make_router()
+        router._pick = lambda key: f"detok-for-{key}"
+        sent = []
+        router._send = lambda target, obj: sent.append(
+            (target, obj.rids, obj.http_worker_ipcs)
+        )
+
+        router._send_batch(output)
+
+        self.assertEqual(
+            sent,
+            [
+                ("detok-for-rid-0", ["rid-0"], [None]),
+                ("detok-for-rid-1", ["rid-1"], [None]),
+            ],
+        )
+
+    def test_router_broadcasts_logging_config_and_routes_single_req_by_rid(self):
+        router = _make_router()
+        router.recv_from_scheduler = object()
+        router._pick = lambda key: f"detok-for-{key}"
+        sent = []
+        router._send = lambda target, obj: sent.append((target, type(obj).__name__))
+
+        with (
+            patch(
+                "sglang.srt.managers.multi_tokenizer_mixin.sock_recv",
+                side_effect=[
+                    ConfigureLoggingReq(log_level="debug"),
+                    AbortReq(rid="rid-0"),
+                    EOFError("end of input"),
+                ],
+            ),
+            self.assertRaisesRegex(EOFError, "end of input"),
+        ):
+            router.event_loop()
+
+        self.assertEqual(
+            sent,
+            [
+                ("detok-a", "ConfigureLoggingReq"),
+                ("detok-b", "ConfigureLoggingReq"),
+                ("detok-for-rid-0", "AbortReq"),
+            ],
         )
 
     def test_return_path_groups_noncontiguous_owners(self):
