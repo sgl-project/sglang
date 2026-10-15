@@ -1080,6 +1080,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
+        if get_serving().tokenizer_backend == "toktier":
+            # Plain text is awaited from toktier's worker pool when one is
+            # running (TOKTIER_SGLANG_SCHED_WORKERS > 0), so a long encode
+            # does not hold the event loop. Any other input, or no pool,
+            # gets None and takes the path below unchanged.
+            from toktier.integrations.sglang import tokenize_texts_with_pool
+
+            pooled = await tokenize_texts_with_pool(self, texts, is_cross_encoder)
+            if pooled is not None:
+                return pooled
+
         # Step 1: Detect input format and prepare for tokenization
         input_format = self._detect_input_format(texts, is_cross_encoder)
         tokenizer_input = self._prepare_tokenizer_input(texts, input_format)
