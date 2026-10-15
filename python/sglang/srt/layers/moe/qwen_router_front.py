@@ -178,8 +178,9 @@ def forward_routed_rt(
     from sglang.srt.runtime_context import get_parallel
 
     experts = block.experts
+    # The runner keeps the input scale as a 0-d tensor; the kernel takes shape [1].
     logits, x_fp4, x_sf = router_gemm_quant(
-        hidden_states, block.gate.weight, experts.w13_input_scale_quant
+        hidden_states, block.gate.weight, experts.w13_input_scale_quant.reshape(1)
     )
     topk_output = block.topk(hidden_states, logits)
     if not TopKOutputChecker.format_is_bypassed(topk_output):
