@@ -2132,6 +2132,10 @@ class Scheduler(
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
+        if recv_reqs:
+            # The last snapshot may predate these requests (it is published after
+            # each forward, before the requests sent during it are read).
+            self.publish_load_snapshot(force=True)
         return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
@@ -2503,6 +2507,7 @@ class Scheduler(
             ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
+            get_grammar_queue=lambda: self.grammar_manager.grammar_queue,
             get_disagg_prefill_bootstrap_queue=lambda: (
                 self.disagg_prefill_bootstrap_queue
             ),

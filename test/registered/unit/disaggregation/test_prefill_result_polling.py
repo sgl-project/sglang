@@ -462,6 +462,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         request_receiver=SimpleNamespace(recv_requests=receiver),
                         metrics_reporter=Mock(),
                         process_input_requests=Mock(),
+                        publish_load_snapshot=Mock(),
                     )
                     with published_topology():
                         received = [
