@@ -74,7 +74,8 @@ Legacy rank-less `.mamba` files are intentionally cold misses because they may
 contain another rank's state. Ordinary KV filenames are unchanged. Very long
 model namespaces are compacted to fit filesystem filename limits and also start
 with a cold cache. With file eviction enabled, each rank manages its own state
-files; the MLA KV writer also manages the shared KV files.
+files; the MLA KV writer also manages the shared KV files. The `max_size` limit
+applies to each rank's owned files, not to the total shared-directory size.
 
 ### Prefetch Policies
 

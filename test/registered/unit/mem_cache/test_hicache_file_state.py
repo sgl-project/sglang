@@ -5,12 +5,12 @@ import unittest
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 from test_hicache_file_lru_unit import _make_config
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     PoolHitPolicy,
@@ -51,24 +51,18 @@ def _mamba_pool(
     conv_dtype=torch.bfloat16,
     conv_shapes=((3, 4), (3, 4)),
 ):
-    device = SimpleNamespace(
-        size=capacity,
-        device="cpu",
-        num_mamba_layers=layers,
-        mamba_cache=SimpleNamespace(
-            temporal=torch.empty(
-                (layers, capacity, *temporal_shape), dtype=temporal_dtype
-            ),
-            conv=[
-                torch.empty((layers, capacity, *shape), dtype=conv_dtype)
-                for shape in conv_shapes
-            ],
+    buffer_info = MambaStateBufferInfo(
+        temporal=torch.empty((layers, capacity, *temporal_shape), dtype=temporal_dtype),
+        conv=tuple(
+            torch.empty((layers, capacity, *shape), dtype=conv_dtype)
+            for shape in conv_shapes
         ),
     )
     return MambaPoolHost(
-        device,
+        buffer_info,
         host_to_device_ratio=2,
         host_size=0,
+        device_capacity=capacity,
         pin_memory=False,
         device="cpu",
         layout=layout,
@@ -188,6 +182,22 @@ class TestFileRecurrentState(CustomTestCase):
                     target.get_data_page(3), expected if hit else before, rtol=0, atol=0
                 )
 
+    def test_pool_registration_preserves_pending_write_reservations(self):
+        """Registering recurrent state must not refund an unfinished KV write."""
+        backend = self.backend(
+            make_config(
+                extra_config={"max_size": 80, "min_free_space": 0, "eviction_ratio": 1}
+            )
+        )
+        pending = backend._get_suffixed_key("pending")
+        self.assertTrue(backend._evictor.reserve(pending, 80))
+        backend.register_mem_host_pool_v2(_mamba_pool(), PoolName.MAMBA)
+        self.assertFalse(backend.set("overflow", torch.ones(1, dtype=torch.uint8)))
+
+        backend._evictor.abort(pending)
+        self.assertTrue(backend.set("available", torch.ones(80, dtype=torch.uint8)))
+        self.assertEqual(backend._evictor._total_bytes, 80)
+
     def test_bounded_mla_replica_can_write_and_evict_only_its_state(self):
         """An MLA replica still owns its TP-sharded recurrent checkpoint."""
         for model in ("bounded/model", "模型" * 70):
@@ -208,6 +218,7 @@ class TestFileRecurrentState(CustomTestCase):
                 replica_config = replace(config, tp_rank=2)
                 replica = self.backend(replica_config)
                 replica.register_mem_host_pool_v2(state, PoolName.MAMBA)
+                self.assertTrue(replica._evictor.is_storage_owner)
                 self.assertFalse(replica.set("unowned-kv", torch.ones(1)))
                 for key in ("old", "new"):
                     transfer = PoolTransfer(
