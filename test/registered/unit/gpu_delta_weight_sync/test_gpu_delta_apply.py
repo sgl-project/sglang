@@ -202,6 +202,7 @@ def test_source_extent_pointer_overflow_and_empty_contracts(planner):
     m = planner
     group = m.ByteApplyGroup([16], [4096], ((linear(17), 1),))
     group.prepare_metadata(0)
+    assert group.prepare_metadata(0)
     with pytest.raises(ValueError, match="exceeds decoded"):
         group.bind(scratch(32))
     group.bind(scratch(33))
@@ -212,7 +213,8 @@ def test_source_extent_pointer_overflow_and_empty_contracts(planner):
         with pytest.raises(ValueError):
             m.ByteApplyGroup(sources, targets, ((linear(17), 1),)).prepare_metadata(0)
     empty = m.ByteApplyGroup([], [], ((linear((1 << 63) - 1), 0),))
-    empty.prepare_metadata(0)
+    assert not empty.prepare_metadata(0)
+    assert empty.prepare_metadata(0)
     assert empty.bind(scratch(0, 0))
     assert empty.bind_launch(None, None, None) is None
 
@@ -222,10 +224,11 @@ def test_aligned_bind_uses_immutable_template_without_replanning(planner, monkey
     contract = [4100, [4100], [1], [4100], [1]]
     sources, targets = [0], [4096]
     group = m.ByteApplyGroup(sources, targets, [(contract, 1)])
-    group.prepare_metadata(0)
+    assert not group.prepare_metadata(0)
     initial = list(group.metadata_rows)
     contract[1][0], sources[0], targets[0] = 1, 99, 101
     assert not group.bind(scratch(address=4097))
+    assert group.prepare_metadata(0)
     assert group.bind(scratch(address=8192))
     assert group.metadata_rows == initial
     assert list(group.pointer_rows(8192)) == [8192, 4096]
@@ -236,10 +239,61 @@ def test_aligned_bind_uses_immutable_template_without_replanning(planner, monkey
 
     monkeypatch.setattr(group, "_plan_binding", forbidden)
     monkeypatch.setattr(group, "pointer_rows", forbidden)
+    monkeypatch.setattr(m, "_validate_contract", forbidden)
     monkeypatch.setattr(m, "_compiled", forbidden)
+    monkeypatch.setattr(m, "_resident_ctas", forbidden)
     for address in (16384, 32768):
+        assert group.prepare_metadata(0)
         assert group.bind(scratch(address=address))
         assert all(a is b for a, b in zip(state, (group.metadata_rows, group.programs)))
+
+
+def test_metadata_cache_rebuilds_for_changed_device(planner, monkeypatch):
+    monkeypatch.setattr(
+        planner, "_resident_ctas", lambda kernel, device: 2 * (device + 1)
+    )
+    group = planner.ByteApplyGroup([0], [4096], ((linear(81920), 1),))
+    group.prepare_metadata(0)
+    original_kernels = group.kernels
+    assert not group.bind(scratch(address=4097))
+    assert not group.prepare_metadata(1)
+    assert group.kernels != original_kernels
+    assert group.programs[0].grid == (16, 1, 1)
+    assert group.prepare_metadata(1)
+    assert not group.prepare_metadata(0)
+    assert group.kernels == original_kernels
+    assert group.programs[0].grid == (8, 1, 1)
+    assert group.bind(scratch())
+    assert len(planner.warmed) == 6
+
+
+@pytest.mark.parametrize("device", [-1, False, 0.0, None])
+def test_metadata_cache_does_not_accept_invalid_device(planner, device):
+    group = planner.ByteApplyGroup([0], [4096], ((linear(4100), 1),))
+    group.prepare_metadata(0)
+    with pytest.raises(ValueError, match="invalid GPU delta apply device"):
+        group.prepare_metadata(device)
+    with pytest.raises(RuntimeError, match="must be prepared"):
+        group.bind(scratch())
+    assert not group.prepare_metadata(0)
+
+
+def test_failed_metadata_preparation_cannot_bind_and_is_retryable(planner, monkeypatch):
+    group = planner.ByteApplyGroup([0], [4096], ((linear(4100), 1),))
+    group.prepare_metadata(0)
+
+    def failed_plan(*args):
+        raise RuntimeError("injected planning failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(group, "_plan_binding", failed_plan)
+        with pytest.raises(RuntimeError, match="injected planning failure"):
+            group.prepare_metadata(1)
+        with pytest.raises(RuntimeError, match="must be prepared"):
+            group.bind(scratch())
+    assert not group.prepare_metadata(0)
+    assert group.prepare_metadata(0)
+    assert group.bind(scratch())
 
 
 def owner(groups):
@@ -256,6 +310,39 @@ def owner(groups):
     value.batches, value.status_checks, value.raw_copies = [], [], {}
     value._prepare_apply_bindings()
     return value
+
+
+def test_cached_preparation_restores_fallback_before_fresh_owner(planner):
+    contract = (420, (420,), (1,), (3, 5, 7, 4), (140, 4, 20, 1))
+    group = planner.ByteApplyGroup([0], [4096], ((contract, 1),))
+    group.prepare_metadata(0)
+    aligned = tuple(group.metadata_rows)
+    first = owner([group])
+    first.decoded = [scratch(address=4097), scratch()]
+    first._bind_apply_metadata()
+    assert group.programs[0].family == "general"
+
+    assert group.prepare_metadata(0)
+    assert tuple(group.metadata_rows) == aligned
+    assert group.programs[0].family == "word_affine"
+    second = owner([group])
+    assert second.apply_metadata is not first.apply_metadata
+    assert second.error is not first.error
+    first_refs = weakref.ref(first.apply_metadata), weakref.ref(first.error)
+    first._release_gpu()
+    gc.collect()
+    assert all(ref() is None for ref in first_refs)
+
+    second.decoded = [scratch(address=8192), scratch()]
+    _, calls = second._bind_apply_metadata()
+    assert calls[0] is second.apply_bindings[0][-1]
+    start, stop, *_ = second.apply_bindings[0]
+    assert second.apply_host_view[start:stop].tolist() == list(aligned)
+    del calls, _
+    second_refs = weakref.ref(second.apply_metadata), weakref.ref(second.error)
+    second._release_gpu()
+    gc.collect()
+    assert all(ref() is None for ref in second_refs)
 
 
 def test_slab_patch_restores_fallback_and_releases_prebound_views(planner):

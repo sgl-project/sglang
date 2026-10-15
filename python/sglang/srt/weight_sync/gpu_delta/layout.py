@@ -541,15 +541,18 @@ class PreparedDelta:
 
             compile_started = time.perf_counter()
             cache_before = _compiled.cache_info()
+            metadata_reused = False
             for _, _, group in self.static_plans:
                 if group is not None:
-                    group.prepare_metadata(self.device.index)
+                    metadata_reused = (
+                        group.prepare_metadata(self.device.index) or metadata_reused
+                    )
             cache_after = _compiled.cache_info()
             self.timings.update(
                 host_apply_kernel_prepare_s=time.perf_counter() - compile_started,
                 apply_kernel_cache_misses=cache_after.misses - cache_before.misses,
                 apply_kernel_cache_reused=int(
-                    cache_after.hits > cache_before.hits
+                    (metadata_reused or cache_after.hits > cache_before.hits)
                     and cache_after.misses == cache_before.misses
                 ),
             )

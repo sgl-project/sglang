@@ -8,7 +8,7 @@
 """Prepared groups of byte-affine XOR destinations; imported only at admission."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache, partial
 
 import torch
@@ -592,8 +592,14 @@ class ByteApplyGroup:
     targets: list[int]
     contracts: tuple
     kernels: tuple = ()
+    _prepared_device: int | None = field(default=None, init=False, repr=False)
 
     def prepare_metadata(self, device_index):
+        """Prepare immutable device metadata once; return whether it was cached."""
+        if type(device_index) is int and device_index == self._prepared_device:
+            self._restore_aligned_binding()
+            return True
+        self._prepared_device = None
         for contract, count in self.contracts:
             _validate_contract(contract, count)
         if sum(count for _, count in self.contracts) != len(self.sources) or len(
@@ -659,6 +665,17 @@ class ByteApplyGroup:
             self.grid_ctas,
         )
         self._binding_aligned = True
+        self._prepared_device = device_index
+        return False
+
+    def _restore_aligned_binding(self):
+        if not self._binding_aligned:
+            rows, programs, tiles, words, grid = self._aligned_binding
+            # A fallback may replace the current descriptors; retain the
+            # immutable aligned template across preparation and binding.
+            self.metadata_rows, self.programs = list(rows), list(programs)
+            self.tiles, self.word32_contracts, self.grid_ctas = tiles, words, grid
+            self._binding_aligned = True
 
     def pointer_rows(self, origin):
         position = 0
@@ -674,7 +691,7 @@ class ByteApplyGroup:
         Allocation alignment is checked, never assumed. The uncommon misaligned
         caller still uses the same conservative runtime descriptor construction.
         """
-        if not self.kernels:
+        if self._prepared_device is None:
             raise RuntimeError("GPU delta apply kernel must be prepared before pause")
         origin = scratch.data_ptr()
         if scratch.numel() < self.source_limit:
@@ -689,13 +706,7 @@ class ByteApplyGroup:
         ):
             raise ValueError("invalid GPU delta apply source pointer")
         if origin % 16 == 0:
-            if not self._binding_aligned:
-                rows, programs, tiles, words, grid = self._aligned_binding
-                # Only fallback recovery copies: normal aligned binds reuse the
-                # prepared state without walking descriptors or pointer lists.
-                self.metadata_rows, self.programs = list(rows), list(programs)
-                self.tiles, self.word32_contracts, self.grid_ctas = tiles, words, grid
-                self._binding_aligned = True
+            self._restore_aligned_binding()
             return True
         alignments, position = [], 0
         for _, count in self.contracts:
