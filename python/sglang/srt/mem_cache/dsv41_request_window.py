@@ -126,6 +126,21 @@ def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout
     """Move tokens between paged buffers of ``layout``: a data row and a scale row."""
     if not src_loc.numel():
         return
+    if (
+        src.is_cuda
+        and src.device == dst.device == src_loc.device == dst_loc.device
+        and src.dtype == dst.dtype == torch.uint8
+        and src.ndim == dst.ndim == 2
+        and src.stride(1) == dst.stride(1) == 1
+        and src_loc.ndim == dst_loc.ndim == 1
+        and src.untyped_storage().data_ptr() != dst.untyped_storage().data_ptr()
+    ):
+        from sglang.kernels.ops.attention.dsv4.request_window_copy import (
+            copy_packed_rows,
+        )
+
+        copy_packed_rows(src, dst, src_loc, dst_loc, page_size=page_size, layout=layout)
+        return
     src_loc, dst_loc = src_loc.long(), dst_loc.long()
     for width, base in (
         (layout.data_bytes, 0),
