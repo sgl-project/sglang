@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
+    _LoadedPages,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -475,34 +476,25 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertTrue(consumer.tree_core.is_external_cache_stored(node))
         consumer.sanity_check()
 
-    def test_lookup_shortfall_forgets_loaded_pages(self):
-        stored_keys = defaultdict(set)
+    def test_insert_forgets_loaded_pages(self):
         tokens = list(range(1, 9))
         consumer, consumer_allocator, consumer_req_pool, consumer_linker = (
-            self._load_from_producer(stored_keys, tokens, loaded_len=8)
+            self._load_from_producer(defaultdict(set), tokens, loaded_len=8)
         )
         self.assertEqual(consumer_linker.offload_calls, [])
+        self.assertEqual(consumer.linker.loaded_pages, {})
         page_hashes = consumer.tree_core.get_hash_values(
             consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens)))
             ).last_device_node
         )
 
-        # The store drops the last two pages after the load.
-        stored_keys[PoolName.KV].difference_update(page_hashes[2:])
+        # A recompute after eviction no longer knows the pages were loaded.
         consumer.evict(EvictParams(num_tokens=len(tokens)))
-        req = self._make_req(consumer_req_pool)
-        match = consumer.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
-        )
-        self.assertEqual(match.host_hit_length, 4)
-
-        # Recomputing writes the dropped pages again and skips the held ones.
         self._insert(consumer, consumer_allocator, consumer_req_pool, tokens)
         self.assertEqual(len(consumer_linker.offload_calls), 1)
         (kv_offload,) = consumer_linker.offload_calls[0]
-        self.assertEqual(kv_offload.keys, page_hashes[2:])
-        consumer.linker.release_request(req.rid)
+        self.assertEqual(kv_offload.keys, page_hashes)
         consumer.sanity_check()
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
@@ -990,9 +982,11 @@ def test_finish_loads_adopts_a_peer_rank_failure():
         _cache_for_wrapper(_all_reduce_attn_groups=reduce), _FakeLinker()
     )
     wrapper.inflight_load_rids = ["a", "b"]
+    wrapper.private_load_pages["a"] = _LoadedPages(4, frozenset({"h0", "h1"}))
     wrapper.start_layer_wise_loading()
 
     assert wrapper.finish_loads() == ["a", "b"]  # this rank landed, a peer did not
+    assert wrapper.loaded_pages == {}  # agrees with the peer, not its own load
     assert wrapper.finish_loads() == []  # nothing loaded: no collective
     reduce.assert_called_once()
 
@@ -1029,10 +1023,14 @@ def test_finish_loads_releases_private_index_references(landed, caplog):
     )
     wrapper.inflight_load_rids = ["rid"]
     wrapper.private_load_indices["rid"] = torch.arange(4)
+    pages = _LoadedPages(4, frozenset({"h0", "h1"}))
+    wrapper.private_load_pages["rid"] = pages
     wrapper.start_layer_wise_loading()
 
     assert wrapper.finish_loads() == ([] if landed else ["rid"])
     assert wrapper.private_load_indices == {}
+    assert wrapper.private_load_pages == {}
+    assert wrapper.loaded_pages == ({"rid": pages} if landed else {})
     assert ("External linker load failed" in caplog.text) is (not landed)
 
 
@@ -1040,10 +1038,30 @@ def test_finish_loads_releases_private_index_references(landed, caplog):
 def test_linker_lifecycle_releases_private_index_references(operation):
     wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), _FakeLinker())
     wrapper.private_load_indices["rid"] = torch.arange(4)
+    wrapper.private_load_pages["rid"] = _LoadedPages(4, frozenset({"h0"}))
+    wrapper.loaded_pages["landed"] = _LoadedPages(4, frozenset({"h1"}))
 
     getattr(wrapper, operation)()
 
     assert wrapper.private_load_indices == {}
+    assert wrapper.private_load_pages == {}
+    assert wrapper.loaded_pages == {}
+
+
+def test_loaded_pages_live_until_the_insert_covers_them():
+    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), _FakeLinker())
+    pages = _LoadedPages(8, frozenset({"h0", "h1"}))
+    wrapper.loaded_pages["rid"] = pages
+
+    wrapper.on_request_inserted("rid", 6)  # e.g. floored to a component boundary
+    assert wrapper.loaded_pages == {"rid": pages}
+    wrapper.on_request_inserted("rid", 8)
+    assert wrapper.loaded_pages == {}
+
+    for release in (wrapper.on_request_released, wrapper.release_request):
+        wrapper.loaded_pages["rid"] = pages
+        release("rid")
+        assert wrapper.loaded_pages == {}
 
 
 def test_release_request_cancels_queued_load():

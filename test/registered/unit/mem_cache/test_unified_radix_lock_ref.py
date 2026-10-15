@@ -19,6 +19,7 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
     def test_no_insert_without_lock_skips_lock_release(self):
         cache = object.__new__(UnifiedRadixCache)
         cache.cache_controller = None
+        cache.linker = None
         cache.session = MagicMock()
         cache.session.try_cache_finished_req.return_value = False
         cache.disable = False

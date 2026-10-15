@@ -1045,6 +1045,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.linker is not None:
+            self.linker.on_request_released(req.rid)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1173,6 +1175,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     priority=insert_params.priority + 1,
                 )
             )
+
+        if self.linker is not None:
+            self.linker.on_request_inserted(req.rid, req.kv.cache_inserted_len)
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
