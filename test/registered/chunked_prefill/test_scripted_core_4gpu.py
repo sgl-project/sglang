@@ -70,10 +70,10 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
         # ring, then post flush_cache into that window.
         flushed = False
         for _ in range(DEFAULT_MAX_STEPS):
-            in_flight = len(scheduler.parts.pending) > 0
+            in_flight = len(scheduler.pending) > 0
             queues_clear = (
-                scheduler.parts.lists.chunked_req is None
-                and len(scheduler.parts.lists.waiting_queue) == 0
+                scheduler.lists.chunked_req is None
+                and len(scheduler.lists.waiting_queue) == 0
             )
             if in_flight and queues_clear:
                 t.flush_cache()

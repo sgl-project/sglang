@@ -66,7 +66,7 @@ def _drain(t: ScriptedContext):
 
 
 def _pool_baseline(t: ScriptedContext):
-    tree = t.scheduler.parts.kv.tree_cache
+    tree = t.scheduler.tree_cache
     assert tree.evictable_size() == 0 and tree.protected_size() == 0, (
         "radix tree not empty at script start"
     )
@@ -76,7 +76,7 @@ def _pool_baseline(t: ScriptedContext):
 
 def _assert_no_leak(t: ScriptedContext, baseline):
     kv_free0, rows_free0 = baseline
-    tree = t.scheduler.parts.kv.tree_cache
+    tree = t.scheduler.tree_cache
     stats = t.engine_stats()
     assert tree.protected_size() == 0, f"locked tree tokens {tree.protected_size()}"
     assert stats["kv_pool_free"] + tree.evictable_size() == kv_free0, (
@@ -108,13 +108,13 @@ def _reference(t: ScriptedContext):
     decode_steps = _steps_holding(t, r.rid, "decode")
     assert decode_steps == n - 1, f"{decode_steps=} for {n} output tokens"
     _assert_no_leak(t, baseline)
-    tree_tokens = t.scheduler.parts.kv.tree_cache.evictable_size()
+    tree_tokens = t.scheduler.tree_cache.evictable_size()
     assert tree_tokens == _PROMPT_LEN + n - 1, f"{tree_tokens=} for {n} outputs"
 
     t.flush_cache()
     yield
     _assert_no_leak(t, baseline)
-    assert t.scheduler.parts.kv.tree_cache.evictable_size() == 0, "flush left tokens"
+    assert t.scheduler.tree_cache.evictable_size() == 0, "flush left tokens"
     return list(req.output_ids), req.tokenizer, set(req.eos_token_ids or ())
 
 
@@ -155,7 +155,7 @@ def _finish_and_check(t: ScriptedContext, r, req, baseline, *, case, check_tree)
     _assert_no_leak(t, baseline)
     n = len(req.output_ids)
     decode_steps = _steps_holding(t, r.rid, "decode")
-    tree_tokens = t.scheduler.parts.kv.tree_cache.evictable_size()
+    tree_tokens = t.scheduler.tree_cache.evictable_size()
     if check_tree:
         assert tree_tokens == _PROMPT_LEN + n - 1, (
             f"{case}: radix tree holds {tree_tokens} tokens, expected "

@@ -74,7 +74,7 @@ SMALL_KV_POOL_BALLAST_PROMPT_LEN: int = 1536
 
 
 def exhaust_row_pool(t, *, leave_rows: int, max_steps: int = DEFAULT_MAX_STEPS):
-    target: int = t.scheduler.parts.kv.req_to_token_pool.available_size() - leave_rows
+    target: int = t.scheduler.req_to_token_pool.available_size() - leave_rows
     if target <= 0:
         return
 
@@ -84,13 +84,13 @@ def exhaust_row_pool(t, *, leave_rows: int, max_steps: int = DEFAULT_MAX_STEPS):
         )
 
     for _ in range(max_steps):
-        if t.scheduler.parts.kv.req_to_token_pool.available_size() <= leave_rows:
+        if t.scheduler.req_to_token_pool.available_size() <= leave_rows:
             return
         yield
     raise AssertionError(
         f"exhaust_row_pool: ballast reqs never filled the row pool down to "
         f"leave_rows={leave_rows} after {max_steps} steps "
-        f"(available_size={t.scheduler.parts.kv.req_to_token_pool.available_size()})"
+        f"(available_size={t.scheduler.req_to_token_pool.available_size()})"
     )
 
 

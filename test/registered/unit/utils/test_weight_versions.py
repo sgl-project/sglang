@@ -27,7 +27,6 @@ from sglang.srt.utils.weight_versions import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell
 from sglang.test.scheduler_request_intake import make_request_intake
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.scheduler_request_lists import request_registry_of
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -311,28 +310,26 @@ class _ContextStub:
 def _scheduler_stub(
     version, decoding, waiting, chunked=None, hisparse=None, mode=None
 ) -> Scheduler:
-    scheduler = partial_scheduler()
-    scheduler.parts.mode_owners = ModeOwners()
-    scheduler.parts.lists = CoreLists()
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.mode_owners = ModeOwners()
+    scheduler.lists = CoreLists()
     scheduler.serving = _ServingStub(version)
-    scheduler.parts.lists.decoding = decoding
-    scheduler.parts.lists.waiting_queue = waiting
-    scheduler.parts.lists.chunked_req = chunked
-    scheduler.parts.grammar_manager = SimpleNamespace(
-        grammar_queue=[], abort_requests=None
-    )
-    scheduler.parts.mode_owners.dllm = None
-    scheduler.parts.mode_owners.hisparse_coordinator = hisparse
-    scheduler.mode.disaggregation_mode = mode or DisaggregationMode.NULL
-    scheduler.parts.mode_owners.disagg_prefill = None
-    scheduler.parts.mode_owners.disagg_decode = None
-    scheduler.hub.request_registry = request_registry_of(scheduler)
+    scheduler.lists.decoding = decoding
+    scheduler.lists.waiting_queue = waiting
+    scheduler.lists.chunked_req = chunked
+    scheduler.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=None)
+    scheduler.mode_owners.dllm = None
+    scheduler.mode_owners.hisparse_coordinator = hisparse
+    scheduler.disaggregation_mode = mode or DisaggregationMode.NULL
+    scheduler.mode_owners.disagg_prefill = None
+    scheduler.mode_owners.disagg_decode = None
+    scheduler.request_registry = request_registry_of(scheduler)
     return scheduler
 
 
 def _record_weight_version_change(scheduler, new_version):
     """Record through the weight updater, over the stub's request registry."""
-    updater = SimpleNamespace(request_registry=scheduler.hub.request_registry)
+    updater = SimpleNamespace(request_registry=scheduler.request_registry)
     SchedulerWeightUpdaterManager.record_weight_version_change(
         updater, new_version=new_version
     )
@@ -394,7 +391,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         retracted_req = _ReqStub(4)
         held_req = _ReqStub(6)
         scheduler = self._scheduler("v1", [], [], mode=DisaggregationMode.DECODE)
-        scheduler.parts.mode_owners.disagg_decode = decode_owner_shell(
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             prealloc_queue=SimpleNamespace(
                 queue=[],
                 retracted_queue=[retracted_req],
@@ -402,7 +399,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             ),
             flags=EngineFlags(_engine_paused=True),
         )
-        scheduler.hub.request_registry = request_registry_of(scheduler)
+        scheduler.request_registry = request_registry_of(scheduler)
 
         _record_weight_version_change(scheduler, new_version="v2")
 

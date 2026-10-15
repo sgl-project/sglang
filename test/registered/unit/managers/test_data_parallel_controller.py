@@ -32,7 +32,6 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -89,16 +88,17 @@ class TestLocalKvEventSources(CustomTestCase):
         }
 
     def test_scheduler_reports_logical_block_size_or_no_source(self):
+        from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.managers.scheduler_components.kv_events_publisher import (
             SchedulerKvEventsPublisher,
         )
 
         component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
-        scheduler = partial_scheduler()
-        scheduler.parts.capacity.max_total_num_tokens = 64
-        scheduler.parts.max_req_input_len = 32
-        scheduler.hub.internal_state.startup_time = {}
-        scheduler.parts.kv_events_publisher = component
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_total_num_tokens = 64
+        scheduler.max_req_input_len = 32
+        scheduler.startup_time = {}
+        scheduler.kv_events_publisher = component
         publisher = MagicMock()
         publisher.describe_local_source.return_value = self._source(4, 256)
         for owned_publisher, expected in (

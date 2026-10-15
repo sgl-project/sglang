@@ -64,7 +64,7 @@ class TestScriptedPPSpec(ScriptedTestCase):
         ]
         slots = set()
         for _ in range(800):
-            slots |= {req.ring_slot for req in t.scheduler.parts.lists.decoding}
+            slots |= {req.ring_slot for req in t.scheduler.lists.decoding}
             if all(r.finished for r in reqs):
                 break
             yield

@@ -14,6 +14,7 @@ from sglang.srt.managers.schedule_batch import (
     commit_step_counters,
     set_mamba_track_indices_from_reqs,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -38,7 +39,6 @@ from sglang.srt.speculative.spec_utils import (
     spec_prepare_for_decode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -138,30 +138,30 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         processor = _make_processor()
         result = _make_result()
 
-        scheduler = partial_scheduler()
-        scheduler.parts.mode_owners = ModeOwners()
-        scheduler.parts.counters = LaunchCounters()
-        scheduler.parts.flags = EngineFlags()
-        scheduler.mode.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.parts.mode_owners.disagg_prefill = None
-        scheduler.parts.mode_owners.disagg_decode = None
-        scheduler.parts.mode_owners.dllm = None
-        scheduler.parts.mode_owners.hisparse_coordinator = None
-        scheduler.parts.flags.gracefully_exit = False
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = None
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = None
+        scheduler.flags.gracefully_exit = False
         scheduler.flat_slot = ScheduleSlot()
         scheduler.ingest_requests = MagicMock(side_effect=[[], [], [], StopIteration])
-        scheduler.parts.flags._engine_paused = False
+        scheduler.flags._engine_paused = False
         scheduler._sched_idled = False
-        scheduler.parts.pending = PendingSteps()
-        scheduler.parts.recv_skipper = None
+        scheduler.pending = PendingSteps()
+        scheduler.recv_skipper = None
         scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
-        scheduler.parts.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.mode.step_launcher = SimpleNamespace(
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.step_launcher = SimpleNamespace(
             run_batch=MagicMock(return_value=result)
         )
         scheduler._apply_war_barrier = MagicMock()
-        scheduler.parts.step_counters = MagicMock()
-        scheduler.parts.is_generation = False
+        scheduler.step_counters = MagicMock()
+        scheduler.is_generation = False
 
         pool = SimpleNamespace(
             req_index_to_mamba_ping_pong_track_buffer_mapping=torch.tensor([[10, 11]]),

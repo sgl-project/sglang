@@ -47,7 +47,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 from sglang.test.scheduler_request_intake import make_request_intake
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.scheduler_request_lists import make_request_registry
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
@@ -931,16 +930,16 @@ class TestDecodeAdmission(unittest.TestCase):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
-        scheduler = partial_scheduler()
-        scheduler.parts.mode_owners = ModeOwners()
-        scheduler.parts.counters = LaunchCounters()
-        scheduler.parts.flags = EngineFlags()
-        scheduler.parts.lists = CoreLists()
-        scheduler.parts.grammar_manager = MagicMock()
-        scheduler.parts.grammar_manager.has_waiting_grammars.return_value = False
-        scheduler.parts.lists.waiting_queue = []
-        scheduler.parts.lists.decoding = []
-        scheduler.parts.mode_owners.disagg_decode = decode_owner_shell(
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
+        scheduler.lists = CoreLists()
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.has_waiting_grammars.return_value = False
+        scheduler.lists.waiting_queue = []
+        scheduler.lists.decoding = []
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             kv_checksum_computer=None,
             enable_priority_scheduling=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -957,7 +956,7 @@ class TestDecodeAdmission(unittest.TestCase):
             ngram_embedding_manager=MagicMock(),
             output_streamer=MagicMock(),
             device="cpu",
-            core_lists=scheduler.parts.lists,
+            core_lists=scheduler.lists,
         )
         return scheduler
 
@@ -981,7 +980,7 @@ class TestDecodeAdmission(unittest.TestCase):
             admitted = owner.pop_reqs_to_admit(ScheduleSlot())
 
         owner.policy.calc_priority.assert_called_once_with(
-            original_ready, scheduler.parts.lists.decoding
+            original_ready, scheduler.lists.decoding
         )
         self.assertEqual([req.rid for req in admitted], ["high"])
         self.assertEqual([req.rid for req in owner.ready], ["low"])
@@ -992,23 +991,23 @@ class TestDecodeAdmission(unittest.TestCase):
         owner.req_to_token_pool = MagicMock(size=4)
         owner.max_running_requests = 4
         running = MagicMock(rid="running")
-        scheduler.parts.lists.decoding = [running]
+        scheduler.lists.decoding = [running]
         kept, finished = MagicMock(rid="kept"), MagicMock(rid="finished")
         owner.ready = [kept, finished]
         # The handoff token finished one of them at admission.
         owner.commit_prefill_handoff = MagicMock()
         kept.finished.return_value = False
         finished.finished.return_value = True
-        scheduler.hub.step_planner = MagicMock(spec=StepPlanner)
-        scheduler.hub.step_planner.get_decode_step.return_value = None
-        scheduler.parts.dp_attn_adapter = MagicMock()
-        scheduler.parts.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
+        scheduler.step_planner = MagicMock(spec=StepPlanner)
+        scheduler.step_planner.get_decode_step.return_value = None
+        scheduler.dp_attn_adapter = MagicMock()
+        scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
             lambda step, need_sync=None: step
         )
-        scheduler.parts.metrics_sink.enable_fpm = False
-        scheduler.parts.scripted_scheduler_hook = None
-        scheduler.parts.ngram_embedding_manager = MagicMock()
-        scheduler.parts.ngram_embedding_manager.prepare_for_forward.side_effect = (
+        scheduler.enable_fpm = False
+        scheduler.scripted_scheduler_hook = None
+        scheduler.ngram_embedding_manager = MagicMock()
+        scheduler.ngram_embedding_manager.prepare_for_forward.side_effect = (
             lambda step, chunked_req: step
         )
         scheduler.scheduler_stage_metrics = None
@@ -1020,7 +1019,7 @@ class TestDecodeAdmission(unittest.TestCase):
 
         self.assertIsNone(step)
         owner.commit_prefill_handoff.assert_called_once_with([kept, finished])
-        self.assertEqual(scheduler.parts.lists.decoding, [running, kept])
+        self.assertEqual(scheduler.lists.decoding, [running, kept])
         self.assertEqual(owner.ready, [])
 
     def test_overlap_waits_for_forward_before_seeding_admitted_reqs(self):

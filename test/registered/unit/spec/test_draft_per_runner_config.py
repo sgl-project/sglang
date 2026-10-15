@@ -11,6 +11,7 @@ one constructor each — so they travel as arguments to the runner that owns the
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.model_runner import (
     ModelRunner,
     resolve_draft_attention_backend,
@@ -23,7 +24,6 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 )
 from sglang.srt.runtime_context import get_context, get_model
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -154,13 +154,13 @@ class TestDraftPerRunnerConfig(CustomTestCase):
     # -- the scheduler hands over the process's own config ---------------------
 
     def _scheduler(self, server_args, create_worker):
-        scheduler = partial_scheduler()
-        scheduler.parts.server_args = server_args
-        scheduler.parts.workers.tp_worker = SimpleNamespace(
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = server_args
+        scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(model_config=SimpleNamespace(context_len=4096))
         )
         scheduler.nccl_port = 0
-        scheduler.parts.spec_algorithm = SimpleNamespace(
+        scheduler.spec_algorithm = SimpleNamespace(
             is_none=lambda: False,
             is_ngram=lambda: False,
             create_worker=create_worker,

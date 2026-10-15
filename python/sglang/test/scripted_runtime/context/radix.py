@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 def get_all_node_hit_counts(ctx: ScriptedContext) -> dict[int, int]:
-    tree_cache = ctx.scheduler.parts.kv.tree_cache
+    tree_cache = ctx.scheduler.tree_cache
     core = getattr(tree_cache, "tree_core", None)
     return {
         node if core is not None else node.id: (
@@ -21,7 +21,7 @@ def get_all_node_hit_counts(ctx: ScriptedContext) -> dict[int, int]:
 
 
 def get_all_node_lock_refs(ctx: ScriptedContext) -> dict[int, int]:
-    tree_cache = ctx.scheduler.parts.kv.tree_cache
+    tree_cache = ctx.scheduler.tree_cache
     core = getattr(tree_cache, "tree_core", None)
     return {
         node if core is not None else node.id: get_node_lock_ref(tree_cache, node)

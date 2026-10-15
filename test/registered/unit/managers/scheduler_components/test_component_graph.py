@@ -30,7 +30,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _REPO_ROOT = Path(__file__).resolve().parents[5]
 _SRT_DIR = _REPO_ROOT / "python" / "sglang" / "srt"
 _SCHEDULER = "managers/scheduler.py"
-_ASSEMBLY = "managers/scheduler_assembly.py"
 assert (_SRT_DIR / _SCHEDULER).is_file(), f"scheduler not found under {_SRT_DIR}"
 
 # ---------------------------------------------------------------------------
@@ -396,13 +395,11 @@ _SCHEDULER_REFS = {
 _LAMBDA, _BOUND, _SELF = "lambda", "bound method", "self"
 _CALLBACK_SITES = {
     # Stage tables: the loop's own stages.
-    ("loop_schedules", "LoopSchedules", "schedule", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "admit_dllm", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "schedule_disagg_prefill", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "ring_intake_disagg_prefill", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "ring_schedule_disagg_prefill", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "ring_release_disagg_prefill", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "schedule_disagg_decode", _BOUND): 1,
+    ("init_mode_stages", "dict", "schedule", _BOUND): 4,
+    ("init_mode_stages", "dict", "admit", _BOUND): 1,
+    ("init_mode_stages", "functools.partial", "intake", _BOUND): 1,
+    ("init_mode_stages", "functools.partial", "schedule", _BOUND): 2,
+    ("init_mode_stages", "functools.partial", "release", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "ingest_requests", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "launch_step", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "commit_step", _BOUND): 1,
@@ -413,7 +410,19 @@ _CALLBACK_SITES = {
     ("handle_pd_role_switch", "role_switch.handle_pd_role_switch", "", _SELF): 1,
     ("run_event_loop", "dispatch_event_loop", "", _SELF): 1,
     # The scripted runtime's test hook.
-    ("__init__", "hook.attach", "", _SELF): 1,
+    (
+        "maybe_init_scripted_scheduler_hook",
+        "ScriptedSchedulerHook",
+        "scheduler",
+        _SELF,
+    ): 1,
+    # To be removed.
+    (
+        "init_dp_attn_adapter",
+        "SchedulerDPAttnAdapter",
+        "get_require_mlp_sync",
+        _LAMBDA,
+    ): 1,
 }
 
 # R3: (module under srt/, scope, attribute chain) reaching a node through the
@@ -428,9 +437,9 @@ _WORKER_ROOTS = (
 _THROUGH_WORKERS = {
     # The model runner builds the coordinator before graph capture.
     (
-        "managers/scheduler_assembly.py",
-        "init_hisparse_coordinator",
-        "tp_worker.model_runner.hisparse_coordinator",
+        "managers/scheduler.py",
+        "Scheduler.init_hisparse_coordinator",
+        "self.tp_worker.model_runner.hisparse_coordinator",
     ): 1,
 }
 
@@ -574,16 +583,10 @@ def _constructor_params(rel: str, class_name: str) -> list:
 
 
 def _scanned_modules() -> list:
-    """The scheduler, its assembly, the components and the classes below
-    ModeOwners."""
+    """The scheduler, the components and the classes below ModeOwners."""
     components = _SRT_DIR / "managers" / "scheduler_components"
     return sorted(
-        {
-            _SCHEDULER,
-            _ASSEMBLY,
-            *(rel for rel, _ in _BUILT.values()),
-            *_BELOW_MODE_OWNERS,
-        }
+        {_SCHEDULER, *(rel for rel, _ in _BUILT.values()), *_BELOW_MODE_OWNERS}
         | {path.relative_to(_SRT_DIR).as_posix() for path in components.glob("*.py")}
     )
 

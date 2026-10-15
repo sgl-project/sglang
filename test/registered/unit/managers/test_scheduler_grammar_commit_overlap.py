@@ -14,6 +14,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.batch_result_processor import (  # noqa: E402
     SchedulerBatchResultProcessor,
     advance_grammar_fsm,
@@ -35,7 +36,6 @@ from sglang.srt.managers.scheduler_components.pending_steps import (  # noqa: E4
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -87,35 +87,35 @@ class TestGrammarCommitOverlap(CustomTestCase):
         results = {1: _spec_result([5, 6]), 2: _spec_result([7, 8])}
         processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
 
-        s = partial_scheduler()
-        s.parts.mode_owners = ModeOwners()
-        s.parts.counters = LaunchCounters()
-        s.parts.flags = EngineFlags()
-        s.parts.flags.gracefully_exit = False
+        s = Scheduler.__new__(Scheduler)
+        s.mode_owners = ModeOwners()
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
+        s.flags.gracefully_exit = False
         s.flat_slot = ScheduleSlot()
-        s.mode.disaggregation_mode = DisaggregationMode.NULL
-        s.parts.mode_owners.disagg_prefill = None
-        s.parts.mode_owners.disagg_decode = None
-        s.parts.mode_owners.dllm = None
-        s.parts.mode_owners.hisparse_coordinator = None
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.mode_owners.disagg_prefill = None
+        s.mode_owners.disagg_decode = None
+        s.mode_owners.dllm = None
+        s.mode_owners.hisparse_coordinator = None
         s.ingest_requests = MagicMock(side_effect=[[], [], StopIteration])
-        s.parts.flags._engine_paused = False
+        s.flags._engine_paused = False
         s._sched_idled = False
-        s.parts.pending = PendingSteps()
-        s.parts.require_mlp_sync = False
-        s.parts.spec_algorithm = SpeculativeAlgorithm.EAGLE
-        s.parts.recv_skipper = None
-        s.parts.is_generation = False
-        s.parts.batch_result_processor = processor
+        s.pending = PendingSteps()
+        s.require_mlp_sync = False
+        s.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        s.recv_skipper = None
+        s.is_generation = False
+        s.batch_result_processor = processor
         s.get_next_batch_to_run = MagicMock(side_effect=steps)
         s._apply_war_barrier = MagicMock()
-        s.parts.step_counters = MagicMock()
+        s.step_counters = MagicMock()
 
         def run_batch(step):
             events.append(("launch", step.forward_iter))
             # The worker's verify runs the pending grammar commit before it
             # builds this step's vocab mask.
-            commit_pending_grammar(s.parts.pending)
+            commit_pending_grammar(s.pending)
             return results[step.forward_iter]
 
         def process_batch_result(step, result, slot):
@@ -123,7 +123,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
             # The host commit runs the step's grammar commit if not done yet.
             advance_grammar_fsm(result, step)
 
-        s.mode.step_launcher = SimpleNamespace(run_batch=run_batch)
+        s.step_launcher = SimpleNamespace(run_batch=run_batch)
         s.process_batch_result = process_batch_result
         s.init_mode_stages()
 

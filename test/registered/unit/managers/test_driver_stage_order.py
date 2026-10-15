@@ -24,7 +24,10 @@ from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
-from sglang.srt.managers.scheduler import _dispatch_event_loop_once  # noqa: E402
+from sglang.srt.managers.scheduler import (  # noqa: E402
+    Scheduler,
+    _dispatch_event_loop_once,
+)
 from sglang.srt.managers.scheduler_components.bundles import Streams  # noqa: E402
 from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
     EngineFlags,
@@ -44,7 +47,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E4
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -190,72 +192,70 @@ class _Shell:
         self.decode = dict(decode)
         self.ready_at = ready_at or {}
         self.results = {}
-        s = self.s = partial_scheduler()
-        s.parts.mode_owners = ModeOwners()
-        s.parts.counters = LaunchCounters()
-        s.parts.flags = EngineFlags()
-        s.parts.lists = CoreLists()
-        s.parts.flags.gracefully_exit = False
-        s.parts.flags._engine_paused = False
+        s = self.s = Scheduler.__new__(Scheduler)
+        s.mode_owners = ModeOwners()
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
+        s.lists = CoreLists()
+        s.flags.gracefully_exit = False
+        s.flags._engine_paused = False
         s._deferred_input_requests = []
         s.scheduler_stage_metrics = None
-        s.parts.lists.waiting_queue = []
-        s.parts.lists.decoding = []
-        s.parts.lists.chunked_req = None
-        s.parts.pending = PendingSteps()
+        s.lists.waiting_queue = []
+        s.lists.decoding = []
+        s.lists.chunked_req = None
+        s.pending = PendingSteps()
         s.flat_slot = ScheduleSlot()
-        s.parts.flags.enable_skip_finishing_decode = False
+        s.flags.enable_skip_finishing_decode = False
         s._sched_idled = False
-        s.parts.counters.cur_batch_for_debug = None
-        s.parts.recv_skipper = None
+        s.counters.cur_batch_for_debug = None
+        s.recv_skipper = None
         s.enable_overlap = False
         s.enable_unified_memory = False
-        s.parts.metrics_sink.enable_fpm = False
+        s.enable_fpm = False
         s.enable_hisparse = False
-        s.parts.mode_owners.hisparse_coordinator = None
-        s.parts.require_mlp_sync = False
-        s.parts.is_generation = True
+        s.mode_owners.hisparse_coordinator = None
+        s.require_mlp_sync = False
+        s.is_generation = True
         s.tp_size = 2
-        s.parts.spec_algorithm = SpeculativeAlgorithm.NONE
-        s.parts.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
-        s.parts.scripted_scheduler_hook = _Hook(self)
-        s.parts.mode_owners.dllm = None
-        s.parts.mode_owners.disagg_prefill = None
-        s.parts.mode_owners.disagg_decode = None
-        s.mode.disaggregation_mode = DisaggregationMode.NULL
+        s.spec_algorithm = SpeculativeAlgorithm.NONE
+        s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        s.scripted_scheduler_hook = _Hook(self)
+        s.mode_owners.dllm = None
+        s.mode_owners.disagg_prefill = None
+        s.mode_owners.disagg_decode = None
+        s.disaggregation_mode = DisaggregationMode.NULL
         if mode == "prefill":
-            s.parts.mode_owners.disagg_prefill = _PrefillOwner(self)
-            s.mode.disaggregation_mode = DisaggregationMode.PREFILL
+            s.mode_owners.disagg_prefill = _PrefillOwner(self)
+            s.disaggregation_mode = DisaggregationMode.PREFILL
         elif mode == "decode":
-            s.parts.mode_owners.disagg_decode = _DecodeOwner(self)
-            s.mode.disaggregation_mode = DisaggregationMode.DECODE
-            s.parts.decode_offload_manager = None
+            s.mode_owners.disagg_decode = _DecodeOwner(self)
+            s.disaggregation_mode = DisaggregationMode.DECODE
+            s.decode_offload_manager = None
         elif mode == "dllm":
-            s.parts.mode_owners.dllm = _DllmOwner(self)
+            s.mode_owners.dllm = _DllmOwner(self)
 
         s.ingest_requests = self.ingest_requests
         s._record_scheduler_state_for_paused_engine = lambda: self.log("paused")
         s.process_pending_chunked_abort = lambda: self.log("chunked_abort")
         s._process_hicache_events = self.hicache_events
-        s.hub.step_planner = SimpleNamespace(
+        s.step_planner = SimpleNamespace(
             should_defer_prefill=lambda: False,
             get_new_batch_prefill=lambda *slot: self.schedule_leaf("prefill"),
             get_decode_step=lambda *slot: self.schedule_leaf("decode"),
             arm_prefill_decode_interval=lambda step: self.log("arm_interval"),
         )
-        s.parts.dp_attn_adapter = SimpleNamespace(
+        s.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=self.mlp_sync,
             maybe_set_extend_view=lambda step: self.log("extend_view"),
         )
-        s.parts.ngram_embedding_manager = SimpleNamespace(
-            prepare_for_forward=self.ngram
-        )
-        s.mode.step_launcher = SimpleNamespace(
+        s.ngram_embedding_manager = SimpleNamespace(prepare_for_forward=self.ngram)
+        s.step_launcher = SimpleNamespace(
             run_batch=self.run_batch, launch_batch_sample_if_needed=self.sample
         )
         s._apply_war_barrier = lambda: self.log("war_barrier")
         s.process_batch_result = self.process_batch_result
-        s.parts.step_counters = SimpleNamespace(record=lambda record: None)
+        s.step_counters = SimpleNamespace(record=lambda record: None)
         s.on_idle = lambda: self.log("idle")
 
     def log(self, *event):
@@ -271,7 +271,7 @@ class _Shell:
             raise _Stop
         self.log("ingest", stop_at_pause) if stop_at_pause else self.log("ingest")
         if self.iteration == self.shutdown_at:
-            self.s.parts.flags.gracefully_exit = True
+            self.s.flags.gracefully_exit = True
         return []
 
     def hicache_events(self, should_retry_storage_prefetch=True):
@@ -373,7 +373,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
             + _at(2, "ingest", ("commit", "d1"))
             + _at(3, "ingest", "idle"),
         )
-        self.assertTrue(shell.s.parts.flags.enable_skip_finishing_decode)
+        self.assertTrue(shell.s.flags.enable_skip_finishing_decode)
 
     def test_shutdown_stops_new_launches(self):
         """The pass that receives the shutdown commits what is pending and
@@ -488,7 +488,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
                     + _at(1, *schedule, ("decode", None), *_FINALIZE_NONE)
                     + _at(1, ("commit", "d0") if overlap else "idle", "dd.prefetch"),
                 )
-                self.assertFalse(shell.s.parts.flags.enable_skip_finishing_decode)
+                self.assertFalse(shell.s.flags.enable_skip_finishing_decode)
 
 
 class _RingShell(_Shell):
@@ -500,12 +500,12 @@ class _RingShell(_Shell):
         s = self.s
         s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
         s.world_group = s.attn_tp_group = None
-        s.parts.streams = Streams(
+        s.streams = Streams(
             device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
         )
-        s.parts.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
-        s.parts.future_map = s.parts.workers.tp_worker = None
-        s.parts.pp_spec_forward = None
+        s.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
+        s.future_map = s.tp_worker = None
+        s.pp_spec_forward = None
         self.channel = SimpleNamespace(
             is_first_rank=True,
             is_last_rank=False,
@@ -519,7 +519,7 @@ class _RingShell(_Shell):
             wait_forward_dependencies=lambda: None,
             launch_event=None,
         )
-        s.parts.device_module = SimpleNamespace(
+        s.device_module = SimpleNamespace(
             Event=lambda: SimpleNamespace(record=lambda stream: None),
             current_stream=lambda: None,
             stream=lambda stream: nullcontext(),

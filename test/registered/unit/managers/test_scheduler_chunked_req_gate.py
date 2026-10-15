@@ -23,7 +23,6 @@ from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -65,41 +64,41 @@ def _make_tree_cache() -> BasePrefixCache:
 
 
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
-    s = partial_scheduler()
-    s.parts.mode_owners = ModeOwners()
-    s.parts.lists = CoreLists()
+    s = Scheduler.__new__(Scheduler)
+    s.mode_owners = ModeOwners()
+    s.lists = CoreLists()
     s.scheduler_stage_metrics = None
-    s.parts.scripted_scheduler_hook = None
-    s.mode.disaggregation_mode = DisaggregationMode.NULL
-    s.parts.mode_owners.disagg_prefill = None
-    s.parts.mode_owners.dllm = None
+    s.scripted_scheduler_hook = None
+    s.disaggregation_mode = DisaggregationMode.NULL
+    s.mode_owners.disagg_prefill = None
+    s.mode_owners.dllm = None
     s.enable_hisparse = False
-    s.parts.metrics_sink.enable_fpm = False
+    s.enable_fpm = False
     # Exercise the unconditional scheduler-loop HiCache event-drain point.
     s.enable_hierarchical_cache = True
     s.enable_unified_cache_external_linker = False
-    s.parts.require_mlp_sync = False
-    s.parts.spec_algorithm = MagicMock()
-    s.parts.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
-    s.parts.lists.decoding = []
-    s.hub.step_planner = MagicMock(spec=StepPlanner)
-    s.hub.step_planner.should_defer_prefill.return_value = False
-    s.hub.step_planner.get_new_batch_prefill.return_value = None
-    s.hub.step_planner.get_decode_step.return_value = None
-    s.parts.dp_attn_adapter = MagicMock()
-    s.parts.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
+    s.require_mlp_sync = False
+    s.spec_algorithm = MagicMock()
+    s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
+    s.lists.decoding = []
+    s.step_planner = MagicMock(spec=StepPlanner)
+    s.step_planner.should_defer_prefill.return_value = False
+    s.step_planner.get_new_batch_prefill.return_value = None
+    s.step_planner.get_decode_step.return_value = None
+    s.dp_attn_adapter = MagicMock()
+    s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
         side_effect=lambda batch, **_: batch
     )
-    s.parts.ngram_embedding_manager = MagicMock()
-    s.parts.ngram_embedding_manager.prepare_for_forward = MagicMock(
+    s.ngram_embedding_manager = MagicMock()
+    s.ngram_embedding_manager.prepare_for_forward = MagicMock(
         side_effect=lambda batch, **_: batch
     )
     tree_cache.check_hicache_events = MagicMock()
-    s.parts.kv.tree_cache = tree_cache
-    s.parts.lists.chunked_req = chunked_req
-    s.parts.lists._pending_chunked_abort_req = None
-    s.parts.mode_owners.disagg_decode = None
-    s.parts.mode_owners.hisparse_coordinator = None
+    s.tree_cache = tree_cache
+    s.lists.chunked_req = chunked_req
+    s.lists._pending_chunked_abort_req = None
+    s.mode_owners.disagg_decode = None
+    s.mode_owners.hisparse_coordinator = None
     s.init_mode_stages()
     return s
 
@@ -134,7 +133,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         Scheduler.get_next_batch_to_run(s, ScheduleSlot())
 
         self.assertEqual(req.prefix_len, self.INITIAL_PREFIX_LEN)
-        s.parts.kv.tree_cache.checkpoint.assert_not_called()
+        s.tree_cache.checkpoint.assert_not_called()
 
     def test_scheduled_chunked_req_advances_prefix_via_real_stash(self):
         # Symmetric guard against over-gating: when fill_len has advanced past
@@ -144,7 +143,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         Scheduler.get_next_batch_to_run(s, ScheduleSlot())
 
         self.assertEqual(req.prefix_len, self.POST_RESET_FILL_LEN)
-        s.parts.kv.tree_cache.checkpoint.assert_called_once_with(
+        s.tree_cache.checkpoint.assert_called_once_with(
             req, up_to=self.POST_RESET_FILL_LEN
         )
 
@@ -155,7 +154,7 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
 
         Scheduler.get_next_batch_to_run(s, ScheduleSlot())
-        self.assertIsNone(s.parts.lists.chunked_req)
+        self.assertIsNone(s.lists.chunked_req)
         cache.checkpoint.assert_not_called()
 
 

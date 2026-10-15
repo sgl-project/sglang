@@ -63,7 +63,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
     """Run the engine until the server warmup request has been received and
     fully processed, so scripts never observe foreign warmup traffic."""
     scheduler = ctx.scheduler
-    cfg = resolving_view(scheduler.parts.server_args)
+    cfg = resolving_view(scheduler.server_args)
     if cfg.skip_server_warmup:
         logger.info("scripted_runtime: skip_server_warmup set, not driving warmup")
         return
@@ -88,7 +88,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
                 f"idle_streak={idle_streak})"
             )
         yield
-        if proxy.work_reqs_seen > 0 and scheduler.hub.request_registry.is_fully_idle():
+        if proxy.work_reqs_seen > 0 and scheduler.request_registry.is_fully_idle():
             idle_streak += 1
         else:
             idle_streak = 0
@@ -103,14 +103,14 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
-    if scheduler.parts.flags._engine_paused:
+    if scheduler.flags._engine_paused:
         ctx.continue_generation()
 
     ctx._release_exhausted_pools()
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
         yield
-        if scheduler.hub.request_registry.is_fully_idle():
+        if scheduler.request_registry.is_fully_idle():
             break
     else:
         raise RuntimeError(
@@ -126,11 +126,10 @@ class ScriptedSchedulerHook:
     def __init__(
         self,
         *,
+        scheduler: Scheduler,
         tokenizer_recv_proxy: Optional[ScriptedTokenizerRecvProxy],
     ) -> None:
-        # Set by attach: the scheduler is built after its components.
-        self.scheduler: Optional[Scheduler] = None
-        self._tokenizer_recv_proxy = tokenizer_recv_proxy
+        self.scheduler = scheduler
         self._is_driver = (
             get_parallel().pp_rank == 0
             and get_parallel().tp_rank == 0
@@ -138,27 +137,22 @@ class ScriptedSchedulerHook:
         )
         self._batch_log: List[ScriptedBatchRecord] = []
         self._trace: Optional[SchedulingTraceWriter] = None
-        self._context: Optional[ScriptedContext] = None
-        self._script_fn_generator: Optional[Generator] = None
 
         if self._is_driver:
             ensure_script_importable(
                 envs.SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY.get()
             )
             self._http_poster: Optional[BackgroundHttpPoster] = BackgroundHttpPoster()
-        else:
-            self._http_poster = None
-
-    def attach(self, scheduler: Scheduler) -> None:
-        """Bind the scheduler the scripts drive, once it holds its parts."""
-        self.scheduler = scheduler
-        if self._is_driver:
-            self._context = ScriptedContext(
+            self._context: Optional[ScriptedContext] = ScriptedContext(
                 scheduler_hook=self,
-                tokenizer_recv_proxy=self._tokenizer_recv_proxy,
+                tokenizer_recv_proxy=tokenizer_recv_proxy,
                 http_poster=self._http_poster,
             )
-            self._script_fn_generator = self._run_dispatch_loop()
+            self._script_fn_generator: Optional[Generator] = self._run_dispatch_loop()
+        else:
+            self._http_poster = None
+            self._context = None
+            self._script_fn_generator = None
 
     def _run_dispatch_loop(self) -> Generator:
         endpoint = envs.SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR.get()
@@ -209,7 +203,7 @@ class ScriptedSchedulerHook:
         chunked = (
             batch.chunked_req
             if batch.prefill_reqs()
-            else self.scheduler.parts.lists.chunked_req
+            else self.scheduler.lists.chunked_req
         )
         self._batch_log.append(
             ScriptedBatchRecord(

@@ -22,7 +22,6 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers import scheduler as scheduler_mod  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -49,13 +48,13 @@ class _DeviceModule:
 
 
 def _scheduler(device_module, schedule_stream, forward_stream):
-    scheduler = partial_scheduler()
-    scheduler.parts.streams.device = "cuda"
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.device = "cuda"
     get_context().override("test", disable_overlap_schedule=False)
-    scheduler.parts.device_module = device_module
-    scheduler.parts.streams.schedule_stream = schedule_stream
-    scheduler.parts.streams.forward_stream = forward_stream
-    scheduler.parts.metrics_sink = SimpleNamespace(
+    scheduler.device_module = device_module
+    scheduler.schedule_stream = schedule_stream
+    scheduler.forward_stream = forward_stream
+    scheduler.metrics_sink = SimpleNamespace(
         start_scheduler_time_accounting=lambda: None
     )
     return scheduler
@@ -72,7 +71,7 @@ class TestScheduleStreamSettledAtInit(CustomTestCase):
 
         with patch.object(scheduler_mod, "is_cuda", return_value=True):
             scheduler.finalize_schedule_stream()
-        settled = scheduler.parts.streams.schedule_stream
+        settled = scheduler.schedule_stream
         self.assertNotEqual(settled.cuda_stream, forward_stream.cuda_stream)
 
         # A component built after the settle holds this stream; the loop must
@@ -83,7 +82,7 @@ class TestScheduleStreamSettledAtInit(CustomTestCase):
             patch.object(scheduler_mod, "triton_load_watch"),
         ):
             scheduler.run_event_loop()
-        self.assertIs(scheduler.parts.streams.schedule_stream, settled)
+        self.assertIs(scheduler.schedule_stream, settled)
         self.assertEqual(device_module.entered, [settled])
 
     def test_settled_before_the_components_that_wait_on_it(self):

@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
-from sglang.srt.managers.scheduler_assembly import rebuild_mode
 from sglang.srt.runtime_context import get_context, get_device, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -37,7 +36,7 @@ def run_event_loop_supervisor(
         except PdRoleSwitchRestart:
             logger.info(
                 "Re-dispatching event loop after PD role switch -> %s",
-                scheduler.mode.disaggregation_mode.value,
+                scheduler.disaggregation_mode.value,
             )
 
 
@@ -46,7 +45,7 @@ def handle_pd_role_switch(
 ) -> PdRoleSwitchReqOutput:
     """Flip the scheduler's disaggregation role at runtime. The instance must be
     idle; rebuild failure is fatal to the instance (no in-place rollback)."""
-    old_role = scheduler.mode.disaggregation_mode.value
+    old_role = scheduler.disaggregation_mode.value
     new_role = (recv_req.new_role or "").lower()
 
     def _fail(msg: str, safe_to_restore: bool = False) -> PdRoleSwitchReqOutput:
@@ -71,7 +70,7 @@ def handle_pd_role_switch(
             old_role=old_role,
             new_role=new_role,
         )
-    if not scheduler.hub.request_registry.is_fully_idle():
+    if not scheduler.request_registry.is_fully_idle():
         return _fail(
             "instance is not idle; drain all requests before switching",
             safe_to_restore=True,
@@ -81,8 +80,7 @@ def handle_pd_role_switch(
     # Same condition ensure_decode_cuda_graphs skips on, so the check cannot be
     # bypassed while the capture still runs.
     will_capture_graphs = (
-        new_role == "decode"
-        and not scheduler.parts.workers.tp_worker.get_decode_cuda_graph_bs()
+        new_role == "decode" and not scheduler.tp_worker.get_decode_cuda_graph_bs()
     )
     if will_capture_graphs and required_graph_gb is None:
         return _fail(
@@ -97,7 +95,7 @@ def handle_pd_role_switch(
             )
         try:
             available_graph_gb = get_available_gpu_memory(
-                scheduler.parts.streams.device, get_device().gpu_id
+                scheduler.device, get_device().gpu_id
             )
         except Exception as e:
             return _fail(
@@ -121,7 +119,12 @@ def handle_pd_role_switch(
         try:
             teardown_disaggregation(scheduler)
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
-            scheduler.mode = rebuild_mode(scheduler.parts, scheduler.loop_schedules())
+            scheduler.init_disaggregation()
+            scheduler.maybe_init_disagg_prefill()
+            scheduler.maybe_init_disagg_decode()
+            scheduler.maybe_init_disagg_move_gate()
+            scheduler.init_mode_stages()
+            scheduler.init_step_launcher()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
             logger.critical(
@@ -138,7 +141,7 @@ def handle_pd_role_switch(
         if new_role == "decode":
             # Best-effort deferred capture; a failure only degrades to eager.
             try:
-                scheduler.parts.workers.tp_worker.ensure_decode_cuda_graphs(
+                scheduler.tp_worker.ensure_decode_cuda_graphs(
                     recv_req.decode_cuda_graph_bs
                 )
             except Exception:
@@ -162,7 +165,7 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
 
     Table-driven: the first failing precondition's message is returned.
     """
-    sa = scheduler.parts.server_args
+    sa = scheduler.server_args
     km = _current_kv_manager(scheduler)
     # (failed?, safe to restore routing?, lazy message)
     checks = (
@@ -189,7 +192,7 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
             lambda: f"invalid new_role={new_role!r}",
         ),
         (
-            scheduler.mode.disaggregation_mode == DisaggregationMode.NULL,
+            scheduler.disaggregation_mode == DisaggregationMode.NULL,
             True,
             lambda: "instance is not running in PD disaggregation mode",
         ),
@@ -218,21 +221,19 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
 
 def _current_kv_manager(scheduler: Scheduler):
     """The KV manager of the current role's owner, or None."""
-    owners = scheduler.parts.mode_owners
-    owner = owners.disagg_prefill or owners.disagg_decode
+    owner = scheduler.mode_owners.disagg_prefill or scheduler.mode_owners.disagg_decode
     return owner.kv_manager if owner is not None else None
 
 
 def teardown_disaggregation(scheduler: Scheduler) -> None:
     """Release the current role's owner (its queues, metadata buffers and KV
     transfer manager) so the other role can be rebuilt."""
-    owners = scheduler.parts.mode_owners
-    if owners.disagg_prefill is not None:
-        owners.disagg_prefill.kv_manager.teardown()
-        owners.disagg_prefill = None
-    elif owners.disagg_decode is not None:
-        owners.disagg_decode.kv_manager.teardown()
-        owners.disagg_decode = None
+    if scheduler.mode_owners.disagg_prefill is not None:
+        scheduler.mode_owners.disagg_prefill.kv_manager.teardown()
+        scheduler.mode_owners.disagg_prefill = None
+    elif scheduler.mode_owners.disagg_decode is not None:
+        scheduler.mode_owners.disagg_decode.kv_manager.teardown()
+        scheduler.mode_owners.disagg_decode = None
         # clear socket ctx in CommonKVReceiver
         CommonKVReceiver.close_all_sockets()
     _release_prefix_cache_for_role_switch(scheduler)
@@ -254,9 +255,9 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     (the instance is already fully idle, checked before teardown) and, for
     hicache, best-effort clears the storage backend so it is released completely.
     """
-    if scheduler.parts.disable_radix_cache:
+    if scheduler.disable_radix_cache:
         return
-    tree_cache = scheduler.parts.kv.tree_cache
+    tree_cache = scheduler.tree_cache
     if tree_cache is not None:
         clear_storage = getattr(tree_cache, "clear_storage_backend", None)
         if callable(clear_storage):
@@ -265,5 +266,5 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
             except Exception:
                 logger.exception("hicache storage release on role switch failed")
         tree_cache.reset()
-    scheduler.parts.kv.req_to_token_pool.clear()
-    scheduler.parts.kv.token_to_kv_pool_allocator.clear()
+    scheduler.req_to_token_pool.clear()
+    scheduler.token_to_kv_pool_allocator.clear()

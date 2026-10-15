@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
@@ -41,7 +42,6 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
-from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.scheduler_request_lists import (
     assert_one_list_per_request,
     request_registry_of,
@@ -586,24 +586,24 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
 
     def _decode_scheduler(self, *, retracted=(), held=(), releasing=()):
-        scheduler = partial_scheduler()
-        scheduler.parts.mode_owners = ModeOwners()
-        scheduler.parts.counters = LaunchCounters()
-        scheduler.parts.flags = EngineFlags()
-        scheduler.parts.lists = CoreLists()
-        scheduler.parts.lists.decoding = []
-        scheduler.parts.pending = PendingSteps()
-        scheduler.parts.lists.chunked_req = None
-        scheduler.parts.lists.waiting_queue = []
-        scheduler.parts.grammar_manager = SimpleNamespace(
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
+        scheduler.lists = CoreLists()
+        scheduler.lists.decoding = []
+        scheduler.pending = PendingSteps()
+        scheduler.lists.chunked_req = None
+        scheduler.lists.waiting_queue = []
+        scheduler.grammar_manager = SimpleNamespace(
             grammar_queue=[], abort_requests=MagicMock()
         )
-        scheduler.parts.mode_owners.dllm = None
-        scheduler.parts.mode_owners.hisparse_coordinator = None
-        scheduler.mode.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler.parts.flags._engine_paused = False
-        scheduler.parts.mode_owners.disagg_prefill = None
-        scheduler.parts.mode_owners.disagg_decode = decode_owner_shell(
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = None
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.flags._engine_paused = False
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             prealloc_queue=SimpleNamespace(
                 queue=[],
                 retracted_queue=list(retracted),
@@ -612,7 +612,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             transfer_queue=SimpleNamespace(queue=[]),
             releasing=list(releasing),
         )
-        scheduler.parts.decode_offload_manager = None
+        scheduler.decode_offload_manager = None
         return scheduler
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
@@ -651,8 +651,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             out.append(req)
         owner = scheduler.disagg_decode
         owner.decode_offload_manager = manager
-        scheduler.parts.decode_offload_manager = manager
-        scheduler.mode.stages = ModeStages(
+        scheduler.decode_offload_manager = manager
+        scheduler.stages = ModeStages(
             schedule=MagicMock(), hold_finished=owner.hold_finished
         )
         return manager, out
@@ -673,13 +673,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
         manager, (done, live, plain) = self._offloading(
             scheduler, ("done", True, [1, 2]), ("live", False, [3]), ("plain", True, [])
         )
-        scheduler.parts.lists.decoding = [done, live, plain]
-        registry = scheduler.hub.request_registry = request_registry_of(scheduler)
+        scheduler.lists.decoding = [done, live, plain]
+        registry = scheduler.request_registry = request_registry_of(scheduler)
 
         # The commit: finished requests leave decoding; the one whose release
         # waits on a copy moves into releasing, the live one keeps decoding.
         scheduler.leave_finished_reqs(ScheduleSlot())
-        self.assertEqual(scheduler.parts.lists.decoding, [live])
+        self.assertEqual(scheduler.lists.decoding, [live])
         self.assertEqual(owner.releasing, [done])
         assert_one_list_per_request(scheduler)
         self.assertFalse(registry.is_fully_idle())
@@ -702,7 +702,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         manager, (done,) = self._offloading(scheduler, ("done", True, [1]))
         owner.releasing = [done]
         scheduler.mm_receiver = None
-        scheduler.parts.grammar_manager = MagicMock()
+        scheduler.grammar_manager = MagicMock()
         registry = request_registry_of(scheduler)
 
         registry.abort_request(AbortReq(abort_all=True))
@@ -730,15 +730,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
         held, kept = MagicMock(rid="held-1"), MagicMock(rid="other")
         scheduler = self._decode_scheduler(held=[held, kept])
         scheduler.mm_receiver = None
-        scheduler.parts.grammar_manager = MagicMock()
-        scheduler.parts.mode_owners.dllm = None
-        scheduler.parts.ipc_channels = MagicMock()
+        scheduler.grammar_manager = MagicMock()
+        scheduler.mode_owners.dllm = None
+        scheduler.ipc_channels = MagicMock()
         release_aborted_request = MagicMock()
         retirer = RequestRetirer(
             kv=MagicMock(),
             beam_coordinator=MagicMock(),
             output_streamer=MagicMock(),
-            ipc_channels=scheduler.parts.ipc_channels,
+            ipc_channels=scheduler.ipc_channels,
         )
         retirer.release_aborted_request = release_aborted_request
         scheduler.disagg_decode.request_retirer = retirer
@@ -750,7 +750,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             scheduler.disagg_decode.prealloc_queue.held_rebootstrap_reqs, [kept]
         )
         release_aborted_request.assert_called_once_with(held)
-        scheduler.parts.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
 
 
 class _GateReceiver:
