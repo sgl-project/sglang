@@ -4,6 +4,12 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "MOSS-Image",
+      modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
+      cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
+      note: "Base is the reference checkpoint; SFT checkpoint validation is pending.",
+    },
+    {
       name: "HunyuanImage-3.0",
       modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
       cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",

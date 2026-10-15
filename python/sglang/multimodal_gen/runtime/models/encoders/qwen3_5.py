@@ -12,8 +12,9 @@ from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3_5 import Qwen3_5EncoderConfig
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.loader.weight_utils import load_llm_encoder_weights
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextMLP
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
 )
@@ -219,25 +220,6 @@ class Qwen3_5Attention(nn.Module):
         return self.o_proj(output)
 
 
-class Qwen3_5MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.gate_proj = Qwen3_5Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.up_proj = Qwen3_5Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.down_proj = Qwen3_5Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
-
-    def forward(self, hidden_states):
-        return self.down_proj(
-            F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
-        )
-
-
 class Qwen3_5DecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -248,7 +230,7 @@ class Qwen3_5DecoderLayer(nn.Module):
             self.self_attn = Qwen3_5Attention(config)
         else:
             raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type}")
-        self.mlp = Qwen3_5MLP(config)
+        self.mlp = Qwen3VLTextMLP(config)
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -319,17 +301,15 @@ class Qwen3_5Model(TextEncoder):
         return not name.startswith("visual.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = dict(self.named_parameters())
-        loaded = set()
-        for name, weight in weights:
-            if not self.should_materialize_checkpoint_weight(name):
-                continue
-            param = params[name]
-            getattr(param, "weight_loader", default_weight_loader)(
-                param, weight.to(param.dtype)
-            )
-            loaded.add(name)
-        return loaded
+        return load_llm_encoder_weights(
+            (
+                (name, weight)
+                for name, weight in weights
+                if self.should_materialize_checkpoint_weight(name)
+            ),
+            dict(self.named_parameters()),
+            (),
+        )
 
     @torch.no_grad()
     def forward(

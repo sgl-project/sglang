@@ -51,6 +51,17 @@ from sglang.kernels.ops.diffusion import (
     rmsnorm_cast_before_weight_rope_bitexact,
 )
 from sglang.multimodal_gen.configs.models.dits.moss_image import MOSSImageDiTConfig
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    gather_seq,
+    shard_like,
+    shard_seq,
+    tail_attn_meta,
+)
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention.layer import LocalAttention
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -65,6 +76,27 @@ _ROPE_FUSION = BitExactFusionGate("MOSSImage RoPE")
 _RMSNORM_FUSION = BitExactFusionGate("MOSSImage RMSNorm", per_signature=True)
 _NORM_MOD_FUSION = BitExactFusionGate("MOSSImage RMSNorm + modulation")
 _NORM_ROPE_FUSION = BitExactFusionGate("MOSSImage RMSNorm + RoPE")
+
+
+def _fused_or_native(gate, eligible, fused, native, sig=None):
+    if eligible and not gate.disabled:
+        verified = gate.is_verified(sig)
+        if verified or not (
+            torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                out = fused()
+            except ValueError:
+                raise
+            except Exception as exc:
+                gate.on_exception(exc, logger=logger)
+            else:
+                return (
+                    out
+                    if verified
+                    else gate.accept_or_fallback(out, native(), sig=sig, logger=logger)
+                )
+    return native()
 
 
 def validate_skip_layers(skip_layers, num_layers):
@@ -99,29 +131,15 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        if not _RMSNORM_FUSION.disabled and can_use_rmsnorm_cast_before_weight(
-            device=x.device, dtype=x.dtype, contiguous=x.is_contiguous()
-        ):
-            sig = (x.device.index, x.dtype, x.shape[-1], x.numel() // x.shape[-1] >= 16)
-            verified = _RMSNORM_FUSION.is_verified(sig)
-            if not verified and (
-                torch.compiler.is_compiling()
-                or torch.cuda.is_current_stream_capturing()
-            ):
-                return self.forward_native(x)
-            try:
-                out = rmsnorm_cast_before_weight_bitexact(x, self.weight)
-            except ValueError:
-                raise
-            except Exception as exc:
-                _RMSNORM_FUSION.on_exception(exc, logger=logger)
-            else:
-                if verified:
-                    return out
-                return _RMSNORM_FUSION.accept_or_fallback(
-                    out, self.forward_native(x), sig=sig, logger=logger
-                )
-        return self.forward_native(x)
+        return _fused_or_native(
+            _RMSNORM_FUSION,
+            can_use_rmsnorm_cast_before_weight(
+                device=x.device, dtype=x.dtype, contiguous=x.is_contiguous()
+            ),
+            lambda: rmsnorm_cast_before_weight_bitexact(x, self.weight),
+            lambda: self.forward_native(x),
+            sig=(x.device.index, x.dtype, x.shape[-1], x.numel() // x.shape[-1] >= 16),
+        )
 
     def forward_native(self, x):
         y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
@@ -135,25 +153,12 @@ def _situ_native(hidden, gate):
 
 
 def _situ(hidden, gate):
-    verified = _SITU_FUSION.verified
-    if (
-        not _SITU_FUSION.disabled
-        and can_use_fused_situ_softcap_mul(device=hidden.device, dtype=hidden.dtype)
-        and (verified or _SITU_FUSION.can_attempt_once())
-    ):
-        try:
-            out = fused_situ_softcap_mul_bitexact(hidden, gate)
-        except ValueError:
-            raise
-        except Exception as exc:
-            _SITU_FUSION.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _SITU_FUSION.accept_or_fallback(
-                out, _situ_native(hidden, gate), logger=logger
-            )
-    return _situ_native(hidden, gate)
+    return _fused_or_native(
+        _SITU_FUSION,
+        can_use_fused_situ_softcap_mul(device=hidden.device, dtype=hidden.dtype),
+        lambda: fused_situ_softcap_mul_bitexact(hidden, gate),
+        lambda: _situ_native(hidden, gate),
+    )
 
 
 def _prepare_rope(rope):
@@ -170,94 +175,55 @@ def _rotate_native(x, rope):
 
 def _rotate(x, rope):
     sin, cos = (part.flatten(0, 1) for part in rope)
-    verified = _ROPE_FUSION.verified
-    if (
-        not _ROPE_FUSION.disabled
-        and x.is_cuda
-        and x.dtype is torch.bfloat16
-        and (verified or _ROPE_FUSION.can_attempt_once())
-    ):
-        try:
-            out = fused_rope_rotate_half_bitexact(x, cos, sin)
-        except ValueError:
-            raise
-        except Exception as exc:
-            _ROPE_FUSION.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _ROPE_FUSION.accept_or_fallback(
-                out, _rotate_native(x, rope), logger=logger
-            )
-    return _rotate_native(x, rope)
+    return _fused_or_native(
+        _ROPE_FUSION,
+        x.is_cuda and x.dtype is torch.bfloat16,
+        lambda: fused_rope_rotate_half_bitexact(x, cos, sin),
+        lambda: _rotate_native(x, rope),
+    )
 
 
-def _attention(q, k, v, rope, heads, attention):
+def _attention(q, k, v, rope, heads, attention, attn_mask_meta=None):
     shape = (*q.shape[:2], heads, q.shape[-1] // heads)
     q, k = q.reshape(shape), k.reshape(shape)
     if rope is not None:
         q = _rotate(q, rope)
         k = _rotate(k, rope)
     v = v.reshape(shape)
-    return attention(q.to(v.dtype), k.to(v.dtype), v).flatten(2)
+    kwargs = {"attn_mask_meta": attn_mask_meta} if attn_mask_meta is not None else {}
+    return attention(q.to(v.dtype), k.to(v.dtype), v, **kwargs).flatten(2)
 
 
 def _norm_modulate(norm, x, scale, shift):
-    gate = _NORM_MOD_FUSION
-    if (
-        not gate.disabled
-        and can_use_rmsnorm_cast_before_weight_modulate(
+    return _fused_or_native(
+        _NORM_MOD_FUSION,
+        can_use_rmsnorm_cast_before_weight_modulate(
             device=x.device,
             dtype=x.dtype,
             dim=x.shape[-1],
             rows=x.numel() // x.shape[-1],
-        )
-        and (gate.verified or gate.can_attempt_once())
-    ):
-        try:
-            out = rmsnorm_cast_before_weight_modulate_bitexact(
-                x, norm.weight, scale, shift
-            )
-        except ValueError:
-            raise
-        except Exception as exc:
-            gate.on_exception(exc, logger=logger)
-        else:
-            if gate.verified:
-                return out
-            return gate.accept_or_fallback(
-                out, modulate_scale_shift(norm(x), scale, shift), logger=logger
-            )
-    return modulate_scale_shift(norm(x), scale, shift)
+        ),
+        lambda: rmsnorm_cast_before_weight_modulate_bitexact(
+            x, norm.weight, scale, shift
+        ),
+        lambda: modulate_scale_shift(norm(x), scale, shift),
+    )
 
 
 def _norm_rope(norm, x, rope, heads):
     x = x.unflatten(-1, (heads, -1))
     sin, cos = (part.flatten(0, 1) for part in rope)
-    gate = _NORM_ROPE_FUSION
-    if (
-        not gate.disabled
-        and can_use_rmsnorm_cast_before_weight_rope(
+    return _fused_or_native(
+        _NORM_ROPE_FUSION,
+        can_use_rmsnorm_cast_before_weight_rope(
             device=x.device,
             dtype=x.dtype,
             dim=x.shape[-1],
             rows=x.numel() // x.shape[-1],
-        )
-        and (gate.verified or gate.can_attempt_once())
-    ):
-        try:
-            out = rmsnorm_cast_before_weight_rope_bitexact(x, norm.weight, cos, sin)
-        except ValueError:
-            raise
-        except Exception as exc:
-            gate.on_exception(exc, logger=logger)
-        else:
-            if gate.verified:
-                return out.flatten(2)
-            return gate.accept_or_fallback(
-                out, _rotate(norm(x), rope), logger=logger
-            ).flatten(2)
-    return _rotate(norm(x), rope).flatten(2)
+        ),
+        lambda: rmsnorm_cast_before_weight_rope_bitexact(x, norm.weight, cos, sin),
+        lambda: _rotate(norm(x), rope),
+    ).flatten(2)
 
 
 class _TextBlock(nn.Module):
@@ -307,7 +273,12 @@ class _Block(nn.Module):
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
         self.heads = heads
-        self.attention = LocalAttention(
+        attention_cls = (
+            USPAttention
+            if model_parallel_is_initialized() and get_sp_world_size() > 1
+            else LocalAttention
+        )
+        self.attention = attention_cls(
             num_heads=heads,
             head_size=dim // heads,
             supported_attention_backends={
@@ -325,7 +296,7 @@ class _Block(nn.Module):
         self.proj["ffn_up_gate"] = nn.Linear(dim, 2 * ffn_dim, bias=False)
         self.proj["ffn_down"] = nn.Linear(ffn_dim, dim, bias=False)
 
-    def forward(self, x, rope, modulation):
+    def forward(self, x, rope, modulation, attn_mask_meta=None):
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         y = _norm_modulate(self.norm1, x, scale_a, shift_a)
         dtype = self.proj["q"].weight.dtype
@@ -335,7 +306,15 @@ class _Block(nn.Module):
         x = residual_gate_add(
             x,
             self.proj["o"](
-                _attention(q, k, self.proj["v"](y), None, self.heads, self.attention)
+                _attention(
+                    q,
+                    k,
+                    self.proj["v"](y),
+                    None,
+                    self.heads,
+                    self.attention,
+                    attn_mask_meta,
+                )
             ),
             gate_a[:, None],
         )
@@ -431,6 +410,9 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         self.layer_names = ["layers"]
         self.hidden_size = dim
+        self._sequence_parallel = (
+            model_parallel_is_initialized() and get_sp_world_size() > 1
+        )
         self.num_attention_heads = num_heads
         self.num_channels_latents = latent_channels
         if dim % num_heads or (dim // num_heads) % 8 or freq_dim % 2:
@@ -556,9 +538,16 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             else:
                 text, rope = prepared_conditioning.samples[index]
             x = torch.cat((video, text), 1)
+            layer_kwargs = {}
+            if self._sequence_parallel:
+                x, shard = shard_seq(x)
+                rope = tuple(shard_like(part, shard) for part in rope)
+                layer_kwargs["attn_mask_meta"] = tail_attn_meta(shard, 1, x.device)
             for layer_index, layer in enumerate(self.layers):
                 if layer_index not in skip_layers:
-                    x = layer(x, rope, mod[index : index + 1])
+                    x = layer(x, rope, mod[index : index + 1], **layer_kwargs)
+            if self._sequence_parallel:
+                x = gather_seq(x, shard.orig_len)
             x = self.final_norm_video(
                 x[:, : height * width].to(self.final_norm_video.weight.dtype)
             )

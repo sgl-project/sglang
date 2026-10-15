@@ -45,6 +45,9 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     prefer_conditioning_cache,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+    run_cfg_parallel,
+)
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -138,7 +141,7 @@ class MOSSImageDenoisingStage(DenoisingStage):
 
         config = server_args.pipeline_config
 
-        def predict(branch, **overrides):
+        def predict(branch):
             branch.configure_batch(batch)
             with set_forward_context(
                 current_timestep=timestep_index,
@@ -151,18 +154,33 @@ class MOSSImageDenoisingStage(DenoisingStage):
                     timestep=timestep,
                     target_dtype=target_dtype,
                     guidance=guidance,
-                    **{**branch.kwargs, **overrides},
+                    **branch.kwargs,
                 )
             return config.slice_noise_pred(prediction, latents).float()
 
-        predictions = [predict(branch) for branch in cfg_policy.branches]
+        slg_branch = replace(
+            cfg_policy.branches[0],
+            kwargs={
+                **cfg_policy.branches[0].kwargs,
+                "skip_layers": tuple(params.slg_layers),
+            },
+        )
+        expanded_policy = replace(
+            cfg_policy, branches=[*cfg_policy.branches, slg_branch]
+        )
+        predictions = (
+            run_cfg_parallel(expanded_policy, predict)
+            if server_args.enable_cfg_parallel
+            else [predict(branch) for branch in expanded_policy.branches]
+        )
         noise_pred = cfg_policy.combine(
-            predictions,
+            predictions[:-1],
             batch,
             config.get_classifier_free_guidance_scale(batch, current_guidance_scale),
             config,
+            cfg_parallel=server_args.enable_cfg_parallel,
         )
-        skipped = predict(cfg_policy.branches[0], skip_layers=tuple(params.slg_layers))
+        skipped = predictions[-1]
         if not batch.do_classifier_free_guidance:
             # Reference CFG=1 SLG uses the skipped prediction as its base.
             noise_pred = skipped

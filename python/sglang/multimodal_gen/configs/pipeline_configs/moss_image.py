@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 from sglang.multimodal_gen.configs.sample.moss_image import resolve_uncond_skip_layers
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 
 
 @dataclass
@@ -36,18 +37,21 @@ class MOSSImagePipelineConfig(SpatialImagePipelineConfig):
     flow_shift: float = 5.0
     should_use_guidance: bool = False
     supports_auto_residency: bool = False
+    cfg_policy: CFGPolicy = field(
+        default_factory=lambda: CFGPolicy(parallel_uses_serial_arithmetic=True)
+    )
 
     def get_model_deployment_config(self):
         return ModelDeploymentConfig(
             keep_resident_min_available_gb=40,
             keep_resident_components=("dit", "text_encoder", "vae"),
             auto_enable_cfg_parallel=False,
-            supports_cfg_parallel=False,
+            supports_cfg_parallel=True,
         )
 
     def validate_server_args(self, server_args):
-        if server_args.num_gpus != 1:
-            raise ValueError("MOSSImage currently supports single-GPU inference only.")
+        if server_args.tp_size != 1:
+            raise ValueError("MOSSImage supports sequence and CFG parallelism, not TP.")
         if server_args.enable_torch_compile:
             raise ValueError("MOSSImage torch.compile support has not been validated.")
         if not server_args.disable_autocast:
