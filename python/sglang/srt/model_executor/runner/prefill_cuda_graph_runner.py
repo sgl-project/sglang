@@ -2118,10 +2118,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             prepared_ids = layer_kwargs.get("input_ids")
             if prepared_ids is None and args:
                 prepared_ids = args[0]
-            if (
-                prepared_ids is not None
-                and prepared_ids.data_ptr() != static_forward_batch.input_ids.data_ptr()
-            ):
+            if prepared_ids is not None:
                 static_forward_batch.input_ids[: prepared_ids.shape[0]].copy_(
                     prepared_ids
                 )
