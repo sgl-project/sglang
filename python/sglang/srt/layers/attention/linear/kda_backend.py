@@ -721,7 +721,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if (
             self.kernel_dispatcher.extend_kernel.uses_int64_query_start_loc
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and self.forward_metadata.query_start_loc is not None
         ):
             self.forward_metadata.query_start_loc_int64 = (
                 self.forward_metadata.query_start_loc.to(torch.int64)
