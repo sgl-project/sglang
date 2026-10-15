@@ -178,7 +178,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
         unmarked = torch.tensor([1], dtype=torch.int32)
 
         self.assertIs(
-            deepseek_weight_loader._clone_if_runai_streamed_tensor(unmarked),
+            weight_utils._clone_if_runai_streamed_tensor(unmarked),
             unmarked,
         )
 

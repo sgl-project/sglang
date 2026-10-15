@@ -137,7 +137,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
-    RUNAI_STREAMER_TENSOR_ATTR,
+    _clone_if_runai_streamed_tensor,
     default_weight_loader,
 )
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
@@ -3397,9 +3397,9 @@ class DeepseekV4Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
-            stage_facts=functools.partial(hc_boundary.stages, config)
-            if _is_cuda
-            else None,
+            stage_facts=(
+                functools.partial(hc_boundary.stages, config) if _is_cuda else None
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -5102,12 +5102,6 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     )
 
     return result.to(torch.bfloat16)
-
-
-def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
-        return tensor.clone().detach()
-    return tensor
 
 
 def _dequant_fp8_wo_a_streaming(
