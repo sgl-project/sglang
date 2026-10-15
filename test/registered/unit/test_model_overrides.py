@@ -1729,7 +1729,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         view = ResolvedView(
             SimpleNamespace(
-                enable_deterministic_inference=True, attention_backend="flashmla"
+                enable_deterministic_inference=True,
+                attention_backend="flashmla",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
             )
         )
         with self.assertRaises(ValueError):
@@ -1751,11 +1754,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     return_value=False,
                 ),
             ):
+                phases = {
+                    "prefill_attention_backend": None,
+                    "decode_attention_backend": None,
+                    field: "aiter",
+                }
                 view = ResolvedView(
                     SimpleNamespace(
                         enable_deterministic_inference=True,
                         attention_backend="triton",
-                        **{field: "aiter"},
+                        **phases,
                     )
                 )
                 with self.assertRaisesRegex(ValueError, field.replace("_", "-")):

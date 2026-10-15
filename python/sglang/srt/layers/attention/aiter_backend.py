@@ -541,15 +541,16 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
-        if get_exec().deterministic.enable_deterministic_inference and not self.use_mla:
-            # Deterministic mode allows aiter decode only for the paged_attention_ragged
-            # path; the unified-attention and 5D-pool kernels are not verified batch-invariant.
-            if self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d:
-                raise ValueError(
-                    "Deterministic inference supports aiter decode attention only with the "
-                    "default paged KV cache: not with sliding-window models, "
-                    "SGLANG_USE_AITER_UNIFIED_ATTN or a vectorized 5D KV cache layout."
-                )
+        # Deterministic mode allows aiter decode only for the paged_attention_ragged
+        # path; the unified-attention and 5D-pool kernels are not verified batch-invariant.
+        if get_exec().deterministic.enable_deterministic_inference and (
+            self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
+        ):
+            raise ValueError(
+                "Deterministic inference supports aiter decode attention only with the "
+                "default paged KV cache: not with sliding-window models, "
+                "SGLANG_USE_AITER_UNIFIED_ATTN or a vectorized 5D KV cache layout."
+            )
 
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
