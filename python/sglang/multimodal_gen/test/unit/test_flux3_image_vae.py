@@ -35,14 +35,16 @@ class TestFlux3ImageVAE(unittest.TestCase):
         block = AttnBlock(512, strided=True).cuda().eval()
         block.fast_path_gate = VaeFastPathGate()
         x = torch.randn(1, 512, 129, 129, device="cuda")
-        with (
-            torch.inference_mode(),
-            mock.patch.object(torch.backends.cuda.matmul, "allow_tf32", False),
-        ):
-            expected = block(x)
-            block.fast_path_gate.enabled = True
-            actual = block(x)
-        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
+        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            with torch.inference_mode():
+                expected = block(x)
+                block.fast_path_gate.enabled = True
+                actual = block(x)
+            torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
 
     def test_encoder_releases_dead_activations(self):
         encoder = Encoder(32, 3, 32, [1, 1], 1, 4).eval()
