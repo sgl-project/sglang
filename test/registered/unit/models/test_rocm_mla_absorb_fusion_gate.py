@@ -9,11 +9,14 @@ The caller carries one further term, ``not q_replicate_active``, which needs a
 ForwardBatch to evaluate and so is not part of this predicate.
 """
 
+import functools
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.models.bailing_moe_v3 import DsV3MLA
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
@@ -123,6 +126,60 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_large_row_count_falls_back(self):
         self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
+
+
+class TestRocmAbsorbCoreAttentionOutputGate(CustomTestCase):
+    def test_bailing_gate_after_rocm_prepare_state_reaches_o_proj(self):
+        """BailingMoeV3 appends its output gate after the ROCm prepare state;
+        the ROCm absorb core must accept it and gate the input of o_proj."""
+        num_tokens, num_heads, kv_lora_rank, v_head_dim = 3, 2, 4, 5
+        attn_output = torch.randn(num_tokens, num_heads * kv_lora_rank)
+        bmm_output = torch.randn(num_tokens, num_heads * v_head_dim)
+        gate = torch.rand(num_tokens, num_heads)
+        o_proj_inputs = []
+        attn = SimpleNamespace(
+            current_attention_backend="aiter",
+            _skip_rope_for_aiter_fused_mla=lambda: False,
+            attn_mqa=lambda *args, **kwargs: attn_output,
+            num_local_heads=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            v_head_dim=v_head_dim,
+            use_deep_gemm_bmm=False,
+            o_proj=lambda x: (o_proj_inputs.append(x) or x, None),
+            next_skip_topk=None,
+            gated_attention_proj_granularity_type="head_wise",
+        )
+        attn._apply_gated = functools.partial(DsV3MLA._apply_gated, attn)
+        rocm_prepare_state = (
+            torch.zeros(num_tokens, num_heads, 1),
+            torch.zeros(num_tokens, 1, 1),
+            torch.zeros(num_tokens, num_heads, kv_lora_rank),
+            torch.zeros(num_tokens, 1, kv_lora_rank),
+            SimpleNamespace(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+        with (
+            mock.patch.object(
+                forward_mla_rocm, "is_dcp_mla_decode_phase", return_value=False
+            ),
+            mock.patch.object(
+                forward_mla_rocm, "rocm_absorb_v_bmm", return_value=bmm_output
+            ),
+        ):
+            forward_mla_rocm.DeepseekMLARocmForwardMixin.forward_absorb_rocm_core(
+                attn, *rocm_prepare_state, gate
+            )
+
+        expected = (
+            bmm_output.view(num_tokens, num_heads, v_head_dim) * gate[:, :, None]
+        ).view(num_tokens, num_heads * v_head_dim)
+        self.assertEqual(len(o_proj_inputs), 1)
+        torch.testing.assert_close(o_proj_inputs[0], expected)
 
 
 if __name__ == "__main__":

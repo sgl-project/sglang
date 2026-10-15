@@ -50,6 +50,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    _apply_attention_output_gate,
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
     is_mla_dcp_lse_base_on_e,
@@ -826,6 +827,7 @@ class DeepseekMLARocmForwardMixin:
         topk_indices,
         llama_4_scaling,
         q_nope_unabsorbed=None,
+        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
@@ -1086,6 +1088,10 @@ class DeepseekMLARocmForwardMixin:
         elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
+            )
+        if attention_output_gate is not None:
+            attn_bmm_output = _apply_attention_output_gate(
+                self, attn_bmm_output, attention_output_gate
             )
         output, _ = self.o_proj(attn_bmm_output)
 
