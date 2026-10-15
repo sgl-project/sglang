@@ -832,7 +832,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 pipeline_config_name,
                 self.model_path,
             )
-        if not self.warmup_resolutions:
+        # ComfyUI requests carry the sampler's tensors, which a synthetic warmup
+        # cannot build; the ComfyUI step stage captures on its first real step.
+        if not self.warmup_resolutions and not self.comfyui_mode:
             self._default_bcg_warmup_resolution()
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
@@ -1512,7 +1514,11 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # BCG captures every graph during a synthetic warmup forward at startup
         # so serving never records a fresh graph.
-        if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
+        if (
+            self.enable_breakable_cuda_graph
+            and self.disagg_role == RoleType.MONOLITHIC
+            and not self.comfyui_mode
+        ):
             self.warmup_mode = "server"
 
         # Disaggregated roles do not host the HTTP startup request. Preserve
