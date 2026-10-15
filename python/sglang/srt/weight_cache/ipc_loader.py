@@ -2,8 +2,9 @@
 """IPC Model Loader — loads model weights from a Weight Cache Daemon.
 
 Zero-copy mode: param.data points directly to transport-mapped GPU memory.
-Backends are negotiated per daemon response (torch IPC by default, VMM FD when
-available). Engine depends on daemon staying alive.
+The daemon picks the backend (--weight-cache-transport) and names it in its
+response. With torch_ipc the engine depends on the daemon staying alive; with
+vmm_fd the engine's own mappings keep the weights valid.
 """
 
 import logging
@@ -12,7 +13,7 @@ import signal
 import stat
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -35,12 +36,25 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
-from .transport import TORCH_IPC_BACKEND, get_client_transport_backend
+from .transport import (
+    AUTO_BACKEND,
+    TORCH_IPC_BACKEND,
+    WeightCacheTransportBackend,
+    check_served_transport,
+    get_client_transport_backend,
+)
 
 logger = logging.getLogger(__name__)
 
 # How often the client polls the serving daemon's PID for liveness.
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
+
+# Transport backends that hold the mappings of a loaded model. The imported
+# tensors do not own those mappings (vmm_fd builds them on non-owning storages),
+# and a parameter or view can outlive the model object, so nothing unmaps them
+# while this process runs: they stay here until it exits, when the driver
+# releases them.
+_LOADED_MODEL_TRANSPORTS: List[WeightCacheTransportBackend] = []
 
 
 class IpcModelLoader(BaseModelLoader):
@@ -73,10 +87,12 @@ class IpcModelLoader(BaseModelLoader):
         fallback_loader_cls=None,
         weight_cache_mode: str = "client",
         fallback_load_format: str = "auto",
+        weight_cache_transport: str = AUTO_BACKEND,
     ):
         super().__init__(load_config)
         self.socket_path = socket_path
         self.weight_cache_mode = weight_cache_mode
+        self.weight_cache_transport = weight_cache_transport
         self._fallback_loader_cls = fallback_loader_cls
         self._fallback_load_format = fallback_load_format
         self.preloaded_weights_bytes = 0
@@ -123,38 +139,44 @@ class IpcModelLoader(BaseModelLoader):
             )
             return self._fallback_load(model_config, device_config)
 
-        entries = cache_data["entries"]
-        # Older daemons omit this field; missing metadata means no correction.
-        preloaded_weights_bytes = cache_data.get("preloaded_weights_bytes", 0)
-        if preloaded_weights_bytes is None:
-            preloaded_weights_bytes = 0
-        if (
-            isinstance(preloaded_weights_bytes, bool)
-            or not isinstance(preloaded_weights_bytes, int)
-            or preloaded_weights_bytes < 0
-        ):
-            raise RuntimeError(
-                "[IpcModelLoader] Daemon returned invalid weight-memory metadata: "
-                f"{preloaded_weights_bytes=}"
+        try:
+            entries = cache_data["entries"]
+            # Older daemons omit this field; missing metadata means no correction.
+            preloaded_weights_bytes = cache_data.get("preloaded_weights_bytes", 0)
+            if preloaded_weights_bytes is None:
+                preloaded_weights_bytes = 0
+            if (
+                isinstance(preloaded_weights_bytes, bool)
+                or not isinstance(preloaded_weights_bytes, int)
+                or preloaded_weights_bytes < 0
+            ):
+                raise RuntimeError(
+                    "[IpcModelLoader] Daemon returned invalid weight-memory "
+                    f"metadata: {preloaded_weights_bytes=}"
+                )
+            logger.info(
+                f"[IpcModelLoader] Fetched {len(entries)} tensors from daemon "
+                f"(transport={self._transport_backend.name}) "
+                f"in {time.perf_counter() - tic:.2f}s"
             )
-        logger.info(
-            f"[IpcModelLoader] Fetched {len(entries)} tensors from daemon "
-            f"(transport={self._transport_backend.name}) "
-            f"in {time.perf_counter() - tic:.2f}s"
-        )
 
-        from sglang.srt.model_loader.loader import (
-            _get_quantization_config,
-        )
+            from sglang.srt.model_loader.loader import (
+                _get_quantization_config,
+            )
 
-        quant_config = _get_quantization_config(model_config, self.load_config)
+            quant_config = _get_quantization_config(model_config, self.load_config)
 
-        model = self._load_zero_copy_mode(
-            model_config,
-            device_config,
-            entries,
-            quant_config,
-        )
+            model = self._load_zero_copy_mode(
+                model_config,
+                device_config,
+                entries,
+                quant_config,
+            )
+        except BaseException:
+            # Drop whatever the transport mapped for the failed load. A model
+            # that did load keeps its mappings until the process exits.
+            self._transport_backend.close()
+            raise
         self.preloaded_weights_bytes = preloaded_weights_bytes
 
         # Skip _post_load_weights: the daemon already ran
@@ -169,9 +191,14 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
-        # The model now points into the daemon's GPU memory via CUDA IPC. If the
-        # daemon dies, those pointers dangle, so watch it and fail loud.
-        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
+        # With torch_ipc the model points into the daemon's GPU memory via CUDA
+        # IPC. If the daemon dies, those pointers dangle, so watch it and fail
+        # loud. vmm_fd mappings keep the memory alive, so a dead daemon is
+        # only logged there.
+        self._start_daemon_liveness_watchdog(
+            cache_data.get("pid"),
+            fatal=self._transport_backend.name == TORCH_IPC_BACKEND,
+        )
 
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
@@ -180,7 +207,9 @@ class IpcModelLoader(BaseModelLoader):
 
         return model.eval()
 
-    def _start_daemon_liveness_watchdog(self, daemon_pid: Optional[int]) -> None:
+    def _start_daemon_liveness_watchdog(
+        self, daemon_pid: Optional[int], *, fatal: bool = True
+    ) -> None:
         """Fail loud if the serving daemon dies while we hold its weights.
 
         In both client and (engine-spawned) daemon mode, the model's param.data
@@ -190,6 +219,9 @@ class IpcModelLoader(BaseModelLoader):
         silent garbage. There is no safe in-place recovery, so a background
         thread polls the daemon PID and, on death, SIGKILLs this process with a
         clear message instead of letting it serve corrupt results.
+
+        With ``fatal=False`` (vmm_fd, whose mappings keep the weights valid)
+        the thread only logs that the daemon exited and stops.
         """
         if not daemon_pid or daemon_pid <= 0:
             logger.warning(
@@ -211,6 +243,13 @@ class IpcModelLoader(BaseModelLoader):
             while True:
                 time.sleep(_DAEMON_LIVENESS_POLL_INTERVAL)
                 if not _daemon_alive(daemon_pid):
+                    if not fatal:
+                        logger.warning(
+                            f"[IpcModelLoader] Weight cache daemon "
+                            f"(pid={daemon_pid}) exited. This engine's own VMM "
+                            f"mappings keep its weights valid; serving continues."
+                        )
+                        return
                     logger.critical(
                         f"[IpcModelLoader] Weight cache daemon (pid={daemon_pid}) "
                         f"died while this engine holds its weights via CUDA IPC. "
@@ -436,8 +475,11 @@ class IpcModelLoader(BaseModelLoader):
         if imported_refs:
             model._ipc_imported_tensors = imported_refs
         # Keep transport backend alive for the model lifetime (VMM backend owns
-        # VA mappings that must stay mapped while tensors are in use).
+        # VA mappings that must stay mapped while tensors are in use). A tensor
+        # can outlive the model object, so the mappings are not released with
+        # the model: they stay until the process exits.
         model._weight_cache_transport_backend = self._transport_backend
+        _LOADED_MODEL_TRANSPORTS.append(self._transport_backend)
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
@@ -565,6 +607,7 @@ class IpcModelLoader(BaseModelLoader):
                 )
 
             backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
+            check_served_transport(self.weight_cache_transport, backend_name)
             self._transport_backend = get_client_transport_backend(backend_name)
             result = self._transport_backend.recv_fetch_state_response(sock, result)
             return result

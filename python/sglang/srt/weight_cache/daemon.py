@@ -4,7 +4,9 @@ TP-sharded model weights in GPU memory and serves them via pluggable transport b
 
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
-2. Exports every parameter/buffer as a CUDA IPC handle
+2. Exports every parameter/buffer through the selected transport
+   (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
+   allocations shared as file descriptors (vmm_fd)
 3. Serves transport entries over a Unix socket to requesting engine processes
 4. Validates CacheConfig compatibility before serving
 
@@ -73,7 +75,12 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
-from .transport import choose_daemon_transport_backend
+from .transport import (
+    TORCH_IPC_BACKEND,
+    VMM_FD_BACKEND,
+    create_daemon_transport_backend,
+    resolve_daemon_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +184,7 @@ class WeightCacheDaemon:
         self.trust_remote_code = cfg.trust_remote_code
         self.revision = cfg.revision
         self.dist_init_method = dist_init_method
+        self.transport_name = resolve_daemon_transport(cfg.weight_cache_transport)
 
         device_uuid = current_platform.get_device_uuid(gpu_id)
         self.socket_path = get_socket_path(device_uuid)
@@ -264,9 +272,15 @@ class WeightCacheDaemon:
         # expandable_segments makes torch's caching allocator hand out memory
         # that cannot be exported via _share_cuda_, so the IPC export below would
         # die mid-way with an opaque CUDA error. Fail fast with an actionable
-        # message before touching the device.
-        self._assert_ipc_compatible_allocator()
+        # message before touching the device. vmm_fd copies the weights into
+        # allocations of its own, so it works with either allocator setting.
+        if self.transport_name == TORCH_IPC_BACKEND:
+            self._assert_ipc_compatible_allocator()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
+        # Pick the transport before loading, so an unusable one fails fast.
+        self.transport_backend = create_daemon_transport_backend(
+            self.transport_name, self.gpu_id
+        )
 
         # Reduce thread contention during multi-process loading
         torch.set_num_threads(1)
@@ -392,12 +406,23 @@ class WeightCacheDaemon:
             0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
         )
 
-        # Export all parameters and buffers as IPC handles
+        # Export all parameters and buffers through the transport backend
         self._export_state()
+        if self.transport_name == VMM_FD_BACKEND:
+            # The packed weights live in cuMemCreate allocations, which the
+            # caching allocator does not count. Add them to what it still
+            # holds (originals that something else kept alive, if any).
+            current_platform.empty_cache()
+            self.preloaded_weights_bytes = (
+                max(0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load)
+                + self.transport_backend.exported_bytes
+            )
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors as IPC handles."
+            f"Exported {len(self.state_entries)} tensors "
+            f"(transport={self.transport_name}, "
+            f"preloaded_weights_bytes={self.preloaded_weights_bytes})."
         )
 
     @staticmethod
@@ -423,7 +448,7 @@ class WeightCacheDaemon:
                         f"be exported via _share_cuda_, so the IPC handle export "
                         f"would fail mid-way. Unset expandable_segments for the "
                         f"weight cache daemon process (it can stay enabled for the "
-                        f"engine itself)."
+                        f"engine itself), or use --weight-cache-transport vmm_fd."
                     )
 
     def _export_state(self):
@@ -438,21 +463,27 @@ class WeightCacheDaemon:
             name for name, _ in self.model.named_parameters(remove_duplicate=False)
         )
         state_dict_names = set(self.model.state_dict().keys())
-        state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {}
+
+        # Comprehensions below leave no loop variable behind: with vmm_fd, a
+        # leftover reference would keep its original alive while packing.
 
         # Export all items from state_dict (parameters + persistent buffers)
-        for name, tensor in self.model.state_dict().items():
-            state_tensors[name] = (tensor.data, name in param_names)
+        state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {
+            name: (tensor.data, name in param_names)
+            for name, tensor in self.model.state_dict().items()
+        }
 
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
-        non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
-            if name not in state_dict_names:
-                state_tensors[name] = (buf.data, False)
-                non_persistent_count += 1
+        state_tensors.update(
+            (name, (buf.data, False))
+            for name, buf in self.model.named_buffers()
+            if name not in state_dict_names
+        )
+        non_persistent_count = len(state_tensors) - len(state_dict_names)
 
-        self.transport_backend = choose_daemon_transport_backend(state_tensors)
+        if self.transport_name == VMM_FD_BACKEND:
+            state_tensors = self._with_live_tensors(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
         # Log approximate serialized metadata size (not payload-backed bytes).
@@ -470,6 +501,38 @@ class WeightCacheDaemon:
             f"transport={self.transport_backend.name}, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
+
+    def _with_live_tensors(
+        self, state_tensors: Dict[str, Tuple[torch.Tensor, bool]]
+    ) -> Dict[str, Tuple[torch.Tensor, bool]]:
+        """Swap the detached aliases for the model's own parameter and buffer
+        objects. vmm_fd repoints these objects at the packed copy, which is
+        what frees each original while packing; repointing an alias alone
+        would leave the original alive. An entry that does not alias a live
+        object (e.g. one produced by a state_dict hook) is kept as is.
+        """
+        # A buffer that is a view keeps its base, and so the original storage,
+        # alive even after it is repointed. The daemon never runs the model,
+        # so re-register such buffers as plain aliases of the same memory.
+        for module in self.model.modules():
+            for leaf, buf in module._buffers.items():
+                if buf is not None and buf._base is not None:
+                    module._buffers[leaf] = buf.detach()
+        live = dict(self.model.named_buffers(remove_duplicate=False))
+        live.update(self.model.named_parameters(remove_duplicate=False))
+        result = {}
+        for name, (tensor, is_param) in state_tensors.items():
+            obj = live.get(name)
+            if (
+                obj is not None
+                and obj.data_ptr() == tensor.data_ptr()
+                and obj.dtype == tensor.dtype
+                and obj.shape == tensor.shape
+                and obj.stride() == tensor.stride()
+            ):
+                tensor = obj
+            result[name] = (tensor, is_param)
+        return result
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
         """Build the same initial physical expert layout as the engine."""
@@ -618,6 +681,10 @@ class WeightCacheDaemon:
             del self.model
             self.model = None
         self.state_entries.clear()
+        if self.transport_backend is not None:
+            # After the model: with vmm_fd its tensors point into these mappings.
+            self.transport_backend.close()
+            self.transport_backend = None
         current_platform.empty_cache()
         self._running = False
 

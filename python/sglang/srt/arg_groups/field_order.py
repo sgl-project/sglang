@@ -554,5 +554,6 @@ POSITIONAL_FIELD_ORDER = (
     "return_aux_hidden_state_layer_ids",
     "engram_config",
     "moe_ascend_ops_config",
+    "weight_cache_transport",
 )
 # fmt: on
