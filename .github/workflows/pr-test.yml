@@ -100,8 +100,6 @@ jobs:
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
-    # job+step timeouts must exceed max-wait-minutes, else the 360-min default kills the wait first
-    timeout-minutes: 250
     outputs:
       base_a_result: ${{ steps.wait.outputs.result }}
     steps:
@@ -111,7 +109,6 @@ jobs:
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
-        timeout-minutes: 245
         with:
           stage-name: base-a
           jobs: |
@@ -133,8 +130,6 @@ jobs:
       (needs.wait-for-base-a.result == 'success' || needs.wait-for-base-a.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
-    # job+step timeouts must exceed max-wait-minutes, else the 360-min default kills the wait first
-    timeout-minutes: 490
     outputs:
       base_b_result: ${{ steps.wait.outputs.result }}
     steps:
@@ -144,7 +139,6 @@ jobs:
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
-        timeout-minutes: 485
         with:
           stage-name: base-b
           jobs: |
@@ -154,7 +148,9 @@ jobs:
               {"prefix": "base-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-large'].size }}},
               {"prefix": "base-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-4-gpu-b200'].size }}}
             ]
-          max-wait-minutes: '480'
+          # 10 min under the 6h GitHub-hosted job cap: setup needs under 2 min, the rest is margin;
+          # timeout-minutes cannot raise the cap, and a wait killed by it ends `cancelled`.
+          max-wait-minutes: '350'
 
   # =============================================== PR Gate ====================================================
   call-gate:
