@@ -269,147 +269,105 @@ Required or commonly used bridge variables:
 
 ## The Tair KVCache backend
 
-`KV_INDEXER_BACKEND=tair_kvcache` selects `TairKvcacheIndexerBackend`, which stores placements
-in a [Tair KVCache Manager](https://github.com/alibaba/tair-kvcache) (Tair KVCache)
-MetaService instead of the server process. The wire contract is the vendored
+`KV_INDEXER_BACKEND=tair_kvcache` selects `TairKvcacheIndexerBackend`, which keeps
+placements in a [Tair KVCache Manager](https://github.com/alibaba/tair-kvcache)
+(KVCM) `MetaService` instead of the server process, over the vendored
 `proto/tair_kvcache_meta_service.proto` (`kv_cache_manager.proto.meta.MetaService`).
 
 ```bash
 KV_INDEXER_BACKEND=tair_kvcache \
 KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
-KV_INDEXER_TAIR_KVCACHE_ENDPOINT=http://tair_kvcache:50052 \
+KV_INDEXER_TAIR_KVCACHE_ENDPOINT=http://tair-kvcache:50052 \
 KV_INDEXER_TAIR_KVCACHE_INSTANCE_ID=my-model-deployment \
   cargo run --release --bin kv-indexer-server
 ```
 
-Translation, both directions:
+Both directions of the translation:
 
-- `ApplyExternalKvBatch` → `ReportEvent`: the worker id becomes the Tair KVCache
-  reporter id, REPORT becomes `BLOCK_ADD` (one spec per resident component,
-  legacy whole blocks report `full` alone), REVOKE becomes `BLOCK_DELETE`
-  (every component name, a superset removal), and the first batch per worker
-  prepends `NODE_REGISTER`. Heartbeats keep reporters alive so Tair KVCache liveness
-  does not reclaim idle-but-cached workers.
-- `MatchExternalKvPrefix` → `GetHostCacheState` (`QT_PREFIX_MATCH`): per host,
-  the longest contiguous prefix from block 0 — the same quantity the in-memory
-  backend computes. Reporters map back to workers through the address restated
-  on every apply batch; workers with no address cannot be routed and are
-  excluded.
+- `ApplyExternalKvBatch` -> `ReportEvent`: the worker id becomes the reporter
+  id, REPORT becomes `BLOCK_ADD` (one spec per resident component; legacy whole
+  blocks report `full` alone), REVOKE becomes `BLOCK_DELETE` (a superset
+  removal), `CLEAR_ALL_AT_TIER` becomes an empty `BLOCK_SNAPSHOT` (see below),
+  and the first batch per worker prepends `NODE_REGISTER`. Heartbeats keep
+  reporters alive so liveness does not reclaim idle-but-cached workers.
+- `MatchExternalKvPrefix` -> `GetHostCacheState` (`QT_PREFIX_MATCH`): per host,
+  the longest contiguous prefix from block 0, the same quantity the in-memory
+  backend computes. Reporters map back through the address restated on every
+  apply batch; a worker with no address is excluded.
 
-Configuration variables (all under `KV_INDEXER_TAIR_KVCACHE_`):
+Configuration (all under `KV_INDEXER_TAIR_KVCACHE_`):
 
-- `ENDPOINT` (required): MetaService gRPC address, e.g. `http://10.0.0.1:50052`
-- `INSTANCE_ID` (required): one Tair KVCache instance per routed model deployment
-- `STORAGE_TYPE`: event-report channel, `l1p5` (default) or `l2`, matching what
-  the deployment's Tair KVCache admin provisioned
-- `REPORT_TIERS`: tiers whose events are forwarded, default `HBM` (see below)
+- `ENDPOINT` and `INSTANCE_ID` (both required): the `MetaService` address and
+  the instance (one per routed model deployment).
+- `STORAGE_TYPE`: event-report channel the deployment provisioned, `l1p5`
+  (default) or `l2`. `REPORT_TIERS` (default `HBM`) lists the forwarded tiers.
 - `AUTO_REGISTER` (default `0`) with `INSTANCE_GROUP`, `BLOCK_SIZE`,
-  `MODEL_NAME`, `MODEL_DTYPE`: opt-in `RegisterInstance` carried out before the
-  first thing this backend sends -- an apply batch *or* a prefix query, since the
-  Router's first request can arrive before any worker has published a KV event.
-  It declares the `full,swa,mamba` spec names, and restates the block size and
-  model deployment Tair KVCache requires of every registration (a registration without
-  a model name/dtype, or with a non-positive block size, is rejected
-  `INVALID_ARGUMENT`). Against an instance someone else registered with
-  different fields, `DUPLICATE_ENTITY` now fails the query path too, not just
-  applies: the instance stays unroutable (every request `503`) until the
-  mismatch is resolved, which is the intended loud failure for a deployment
-  that should have left this off.
-- `QUERY_TIMEOUT_MS` (default 50, half the Router-side prefix deadline),
-  `APPLY_TIMEOUT_MS` (default 5000, one budget shared by every chunk of a batch).
-  Registration runs on the apply budget, not a caller's: it is a setup call that
-  makes the caller's own request possible. Two first calls racing on a cold
-  deployment may each send one registration; Tair KVCache accepts identical fields, and
-  after the first success no further call does.
-- `HEARTBEAT_INTERVAL_MS` (default 30000; `0` disables heartbeats). It must be
-  comfortably below Tair KVCache's EventReport liveness `heartbeat_timeout_ms`; at most a
-  third of it leaves room for a missed or delayed beat. A reporter that beats
-  too slowly is invisible to Tair KVCache between beats, and its placements are swept
-  once the cleanup grace passes.
+  `MODEL_NAME`, `MODEL_DTYPE`: opt-in `RegisterInstance` before the first thing
+  this backend sends. It declares the `full,swa,mamba` spec names and restates
+  the fields the manager requires; a registration must match an existing
+  instance field for field, or it fails `DUPLICATE_ENTITY`.
+- `QUERY_TIMEOUT_MS` (default 50, half the Router-side deadline) and
+  `APPLY_TIMEOUT_MS` (default 5000, one budget per batch, registration included).
+- `HEARTBEAT_INTERVAL_MS` (default 30000; `0` disables heartbeats). Keep it well
+  below the manager's EventReport liveness `heartbeat_timeout_ms`.
 
-Deployment prerequisites on the Tair KVCache side: an event-report storage and an
-instance group listing it as an `event_report_storage_candidates` entry, and a
-registered instance — either by the workers' own Tair KVCache connector (the common
-case; leave `AUTO_REGISTER` off) or by `AUTO_REGISTER=1` in routing-only
-deployments.
+The deployment needs an event-report storage listed in the instance group's
+`event_report_storage_candidates`, plus a registered instance — by the workers'
+own connector (the common case) or by `AUTO_REGISTER=1` for routing-only ones.
 
 Semantics and limitations:
 
-- Host-dram events are dropped by default: deployments running the Tair KVCache
-  connector already manage those placements through the data-plane write path,
-  and double reporting would race eviction. `REPORT_TIERS=HBM,DRAM` widens the
-  set for routing-only deployments. A report tier outside HBM/DRAM (`SSD`) is
-  not servable by the prefix rules: legacy workers still report it, but every
-  worker declaring a cache spec is excluded from answers (warned at startup).
+- Host-dram events are dropped by default (the connector manages those
+  placements through the data plane; double reporting would race eviction);
+  `REPORT_TIERS=HBM,DRAM` widens the set for routing-only deployments. A tier
+  outside HBM/DRAM (`SSD`) is not servable by the prefix rules: legacy workers
+  still report it, but every worker declaring a cache spec is excluded from
+  answers (warned at startup).
 - `CLEAR_ALL_AT_TIER` is applied as an **empty `BLOCK_SNAPSHOT`**, the one
-  Tair KVCache primitive with clear semantics: it commits synchronously and fences the
+  primitive with clear semantics: it commits synchronously and fences the
   reporter's older locations behind strict visibility, so the prefix answer
-  stops claiming them immediately. Three caveats are inherent to that
-  primitive. The scope is the whole reporter × storage channel across **every
-  medium**, so a clear on one tier also drops the other reported tiers. The
-  request is sent alone (Tair KVCache rejects a snapshot mixed with deltas) and, when
-  the actions around it are interleaved, in its action order: reports before
-  the clear end up fenced, reports after it land on the fresh generation.
-  Finally, Tair KVCache rate-limits snapshots per (instance, channel, reporter) — 30s
-  by default: a flush inside that window is dropped with a `WARN`
-  (`flush dropped, placements stay`) rather than failing the batch, because a
-  failed batch costs the bridge a reconnect without a replay. The first flush
-  of a delta-only reporter also switches it to strict visibility, which is what
-  hides the pre-clear blocks: the indexer must be the only writer of that
-  reporter's placements on that channel (another component writing under its
-  own reporter identity, or through the data plane, is unaffected). A
-  per-medium `CLEAR` remains a Tair KVCache-side ask.
-- `MatchExternalKv` (per-block placement) has no Tair KVCache equivalent and answers
-  `UNIMPLEMENTED`; `GetExternalKvHitCounts` stays empty. The prefix query is
-  the only routing signal.
-- The prefix answer is the legacy whole-block quantity: the longest contiguous
-  run of held blocks. Workers whose `cache_spec` requires rules beyond that —
-  an SWA window or a MAMBA boundary — or that report any block whose component
-  detail does not confirm the `full` component (including a zero mask inside a
-  component batch, which the bridge produces for mask-less blocks), are
-  **excluded from the answer entirely** (fail closed, logged once per worker),
-  so the answer stays a lower bound like the in-memory backend's instead of
-  over-reporting. Legacy and FULL-only workers are unaffected.
-- A worker id must not contain `#` (the Tair KVCache location-id separator); the
-  bridge dies on the resulting `INVALID_ARGUMENT`, which is the desired
-  fail-fast for a misconfigured fleet.
-- The instance the backend reports into must declare the `full`, `swa` and
-  `mamba` spec names in its `location_spec_infos` — auto-registration does;
-  a connector-registered instance does too if it registered those spec names.
-  If it does not, every `BLOCK_ADD` fails `INVALID_ARGUMENT` and the bridge
-  exits.
-- The reporter→address map is process-local: after an indexer restart, prefix
-  answers stay empty until each worker's next apply batch restates its
-  address. Tair KVCache's own placements survive; only the join is lost.
-- `snapshot_required` is advisory: Tair KVCache sets it while a reporter has no
-  committed snapshot version, which is the normal state of a delta-only
-  reporter — the request that writes its first delta creates that version — so
-  the backend logs it once per reporter lifecycle and never sends a snapshot.
-  It holds no placement state, so it could not rebuild one after Tair KVCache-side
-  cleanup anyway; until live blocks are re-reported the index under-reports
-  (the safe direction).
-- Reporter liveness is real and destructive: Tair KVCache marks a reporter unavailable
-  after its configured heartbeat timeout and then *deletes* that reporter's
-  placements once the cleanup grace has passed, so a deployment whose Tair KVCache
-  liveness is tighter than `HEARTBEAT_INTERVAL_MS` loses cache affinity for
-  idle workers. When the mismatch is large the reporter never counts as alive at
-  all: every beat lands on a tombstoned node, Tair KVCache sweeps its blocks, and prefix
-  queries keep answering "nothing here" for a worker that has plenty cached --
-  the failure mode is a silently empty index, not an error. Check the two
-  intervals together first when cache affinity looks broken on a fresh
-  deployment. After such a cleanup the next plain report fails
-  `NODE_NOT_REGISTERED`; the retry re-registers the reporter, but the reclaimed
-  blocks stay gone until the worker re-reports them.
-- A `NODE_REGISTER` is resent whenever a report fails with
-  `NODE_NOT_REGISTERED` (a reporter Tair KVCache forgot) or never succeeded, and each
-  heartbeat re-registers in passing. `NODE_NOT_REGISTERED` itself is
-  transient: the bridge retries, and the next report self-heals it.
-- Permanent configuration faults (`INSTANCE_NOT_EXIST`, `UNSUPPORTED`,
-  `REACH_MAX_ENTITY_CAPACITY`, duplicate registration with different fields)
-  surface as `FAILED_PRECONDITION`, which the bridge treats as fatal;
-  transient Tair KVCache failures surface as `UNAVAILABLE` and the Router degrades to
-  load-based routing. Tair KVCache `SERVER_NOT_LEADER` (HA deployments) is
-  `UNAVAILABLE` — this backend does not follow leader redirects.
+  stops claiming them immediately. Its scope is the whole reporter × storage
+  channel across **every medium** (no tier granularity); it travels alone (the
+  manager rejects a snapshot mixed with deltas) and in its action order. It is
+  also rate-limited per (instance, channel, reporter), 30s by default: a flush
+  inside that window is dropped with a `WARN` (`flush dropped, placements stay`)
+  rather than failing the batch, which would cost the deltas riding with it. The
+  first flush switches a delta-only reporter to strict visibility (that is what
+  hides the pre-clear blocks), so the indexer must be the only writer of that
+  reporter's placements on that channel; a per-medium `CLEAR` remains a
+  manager-side ask.
+- The prefix answer is the legacy whole-block quantity, so a worker whose
+  `cache_spec` needs rules beyond it (an SWA window, a MAMBA boundary) or that
+  reports component detail not confirming `full` (including a zero mask inside a
+  component batch, which the bridge produces for mask-less blocks) is
+  **excluded entirely** (fail closed, logged once per worker): the answer stays
+  a lower bound instead of over-reporting. `MatchExternalKv` has no equivalent
+  and answers `UNIMPLEMENTED`; `GetExternalKvHitCounts` stays empty.
+- A worker id must not contain `#` (the location-id separator) and the instance
+  must declare the `full,swa,mamba` spec names: either mistake fails
+  `INVALID_ARGUMENT` and the bridge exits, the desired fail-fast.
+- The reporter->address map is process-local: after an indexer restart, prefix
+  answers stay empty until the next batch restates an address. Placements
+  survive; only the join is lost.
+- `snapshot_required` is advisory (a reporter with no committed snapshot
+  version, the normal state here), so the backend logs it once per lifecycle and
+  never sends a snapshot; until live blocks are re-reported the index
+  under-reports, which is the safe direction.
+- Reporter liveness is destructive: a silent reporter is marked unavailable
+  after the heartbeat timeout and its placements are *deleted* once the cleanup
+  grace passes. With liveness tighter than `HEARTBEAT_INTERVAL_MS` the beats
+  land on a tombstoned node, the blocks are swept, and prefix queries keep
+  answering "nothing here" — a silently empty index, not an error. Check those
+  two intervals together first when cache affinity looks broken. The next report
+  after such a cleanup fails `NODE_NOT_REGISTERED` and the retry re-registers,
+  but the reclaimed blocks stay gone until the worker re-reports them.
+- A `NODE_REGISTER` is resent whenever a report fails `NODE_NOT_REGISTERED` or
+  never succeeded (each heartbeat also re-registers in passing). Permanent
+  configuration faults (`INSTANCE_NOT_EXIST`, `UNSUPPORTED`,
+  `REACH_MAX_ENTITY_CAPACITY`, a mismatched registration) are
+  `FAILED_PRECONDITION`, which the bridge treats as fatal; transient failures
+  are `UNAVAILABLE` and the Router degrades to load-based routing.
+  `SERVER_NOT_LEADER` (HA) is `UNAVAILABLE`: no leader redirects are followed.
 
 ## Tests
 
@@ -426,60 +384,39 @@ MetaService, including one end-to-end pass behind the real `KVIndexer` service.
 
 ## Live Tair KVCache integration
 
-`tests/tair_kvcache_live.rs` runs the backend against a real Tair KVCache Manager. It is
-`#[ignore]`d and gated on `TAIR_KVCACHE_LIVE_ENDPOINT`, so a normal `cargo test` never
-touches it.
+`tests/tair_kvcache_live.rs` runs the backend against a real Tair KVCache
+Manager. It is `#[ignore]`d and gated on `TAIR_KVCACHE_LIVE_ENDPOINT`, so a
+normal `cargo test` never touches it.
 
-`tests/tair_kvcache_live/setup_tair_kvcache_manager.py` builds the manager's own process and
-configuration: it starts `kv_cache_manager_bin`, provisions two event-report
-storages (L1P5 and L2) and an instance group listing them, and registers an
-instance declaring the `full,swa,mamba` spec names. Everything is one command:
+`tests/tair_kvcache_live/setup_tair_kvcache_manager.py` starts
+`kv_cache_manager_bin`, provisions two event-report storages (L1P5 and L2) with
+an instance group listing them, and registers an instance declaring the
+`full,swa,mamba` spec names. It needs a Tair KVCache checkout: `--manager-repo`
+points at it (or set `TAIR_KVCACHE_MANAGER_REPO`; an absolute `--binary` needs
+neither):
 
 ```bash
 # once, in the tair-kvcache checkout
 bazelisk build //kv_cache_manager:kv_cache_manager_bin
 
 # in experimental/sgl-router
-python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py start --workdir /tmp/tair_kvcache-live
+python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py start \
+    --workdir /tmp/tair_kvcache-live --manager-repo <tair-kvcache checkout>
 source /tmp/tair_kvcache-live/tair_kvcache_live.env
 cargo test -p sgl-kv-indexer --test tair_kvcache_live -- --ignored
 python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py stop --workdir /tmp/tair_kvcache-live
 ```
 
-A run that asks for these tests has to have them: with `--ignored`, a missing
-`TAIR_KVCACHE_LIVE_ENDPOINT` fails every test with the commands above instead of
-skipping, so `ok. N passed` always means the manager was really driven. Without
-`--ignored` (a plain `cargo test`) they are skipped, which is what keeps an
-ordinary test run independent of any external service. A manager that is set
-but no longer reachable fails fast on a connection probe, naming the endpoint
-and the harness command to diagnose it.
-
-`start` is idempotent (`config` re-applies provisioning, `status` reports the
-process, `stop` kills it), and the workdir keeps the manager's registry, logs and
-a `tair_kvcache_live.env` with the endpoints and instance names the tests read. Pass
-`--manager-repo` / `--binary` if the checkout or the binary moved. Both `stop` and
-the reuse path of `start` check that the state file's pid is still the manager
-they started — by the `local://<workdir>/registry.json` URI in its cmdline, which
-no other manager and no wrapper script can carry — before signalling or trusting
-it; a stale workdir cannot make them take down an unrelated process.
-
-A single-test failure that the `status` command reports as `Alive` is not
-explained by the harness: keep the full output (test name and panic message)
-alongside the manager's log tail before rerunning, so the next occurrence can be
-diagnosed from evidence rather than repetition.
-
-The harness provisions deliberately tight liveness (2s heartbeat timeout, 2s
-cleanup grace) so the reclamation tests finish in seconds; production values are
-an order of magnitude larger. That is why every test states its own heartbeat
-interval, and why a deployment should keep `HEARTBEAT_INTERVAL_MS` well below
-whatever the Tair KVCache admin configured.
-
-The suite pins, among others: the `RegisterInstance` fields Tair KVCache requires, the
-environment-variable path that assembles an auto-registering backend
-(`KV_INDEXER_TAIR_KVCACHE_*` -> `TairKvcacheBackendConfig::from_env` -> `RegisterInstance`, so
-a renamed variable cannot silently disable the registration),
-`BLOCK_ADD`/`BLOCK_DELETE` spec-name and URI rules, `NODE_REGISTER` resend
-idempotency, reporter liveness and the `NODE_NOT_REGISTERED` self-heal, the
-reported-medium filter, `snapshot_required` semantics, and the raw
-`p2p_host_count = 0` answer (`local`-only, `p2p_1_total_match == local`,
-`p2p_1_fetch == 0`).
+With `--ignored`, a missing `TAIR_KVCACHE_LIVE_ENDPOINT` fails every test instead
+of skipping, so `ok. N passed` always means the manager was really driven; an
+endpoint that no longer answers fails fast on a connection probe naming it.
+`start` is idempotent (`config` re-provisions, `status` reports the process,
+`stop` kills it), the workdir holds the registry, the logs and the env file the
+tests read, and `--manager-repo` / `--binary` relocate a moved checkout. The
+harness provisions deliberately tight liveness (2s timeout, 2s grace) so the
+reclamation tests finish in seconds, which is why every test states its own
+heartbeat interval; production values are an order of magnitude larger. Besides
+the clear, registration and liveness behavior above, the suite pins the
+manager's acceptance rules for specs and URIs, `NODE_REGISTER` resend
+idempotency, the reported-medium filter, `snapshot_required` semantics and the
+raw `p2p_host_count = 0` answer.

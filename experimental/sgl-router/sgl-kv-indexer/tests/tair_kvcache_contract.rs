@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tair KVCache backend contract tests: drive [`TairKvcacheIndexerBackend`] (and, in one
-//! case, the full `KVIndexer` service in front of it) against an in-process
-//! mock Tair KVCache `MetaService` over real gRPC. The mock records every request, so
-//! these tests pin the translation layer — indexer actions to Tair KVCache events,
-//! Tair KVCache host answers to indexer prefix matches — not Tair KVCache's own matching.
+//! Contract tests for the Tair KVCache backend: drive
+//! [`TairKvcacheIndexerBackend`] (and, in one case, the whole `KVIndexer` service)
+//! against an in-process mock `MetaService` over real gRPC. The mock records every
+//! request, pinning the translation layer -- actions to events, host answers to
+//! prefix matches -- not the manager's own matching.
 
 #[path = "common/kv.rs"]
 mod test_kv;
@@ -58,9 +58,9 @@ struct MockState {
     /// Canned partial-failure `item_results` for `ReportEvent`.
     report_item_results: Vec<i32>,
     report_snapshot_required: bool,
-    /// Canned per-snapshot failures, one popped per snapshot request (empty
-    /// means "commit"). Tair KVCache answers a failed snapshot with the code in both
-    /// the header and `item_results`, plus `retry_after_ms` when rate-limited.
+    /// Canned per-snapshot failures, one popped per snapshot request (empty means
+    /// "commit"). A failed snapshot answers with the code in the header and
+    /// `item_results`, plus `retry_after_ms` when rate-limited.
     snapshot_failures: Vec<ErrorCode>,
     /// Spec names per registered instance, as `RegisterInstance` declared
     /// them: Tair KVCache checks every reported name against this set.
@@ -72,9 +72,7 @@ impl MockState {
         state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    /// The spec names Tair KVCache would accept for this instance: what its
-    /// registration declared, or the connector's deployment for an instance
-    /// the mock never saw registered (the backend reports into those).
+    /// The spec names the manager would accept for this instance.
     fn declared_specs(&self, instance_id: &str) -> Vec<String> {
         self.registered_specs
             .get(instance_id)
@@ -135,10 +133,8 @@ fn validate_report_events(
 ) -> Option<ReportViolation> {
     use sgl_kv_indexer::kvcm_pb::event_item::EventParams;
     use sgl_kv_indexer::kvcm_pb::ReportEventType as T;
-    // The snapshot rules `CacheManager::ReportEvent` enforces before it looks
-    // at a single event: a complete snapshot travels alone, and only one per
-    // request. An empty block set is legal and means "this reporter owns
-    // nothing".
+    // `CacheManager::ReportEvent`'s request-level snapshot rules: a snapshot
+    // travels alone, at most one per request; empty blocks are legal.
     let snapshots = request
         .events
         .iter()
@@ -572,10 +568,7 @@ async fn apply_translates_report_revoke_and_registers_node() {
     let EventParams::BlockAdd(add) = report.events[2].event_params.as_ref().unwrap() else {
         panic!("expected BLOCK_ADD");
     };
-    // An eligible worker is whole-block answerable: every reported block
-    // carries the `full` component. Multi-component naming is covered by the
-    // translation unit tests; on the wire it only appears for excluded
-    // workers, which are never forwarded.
+    // An eligible worker is whole-block answerable: every block carries `full`.
     assert_eq!(
         add.specs
             .iter()
@@ -597,8 +590,7 @@ async fn apply_clears_with_an_empty_snapshot_of_its_own() {
     use sgl_kv_indexer::kvcm_pb::ReportEventType;
     let (backend, state) = start_backend().await;
     // DRAM is outside the default report tiers, so its REPORT is dropped; the
-    // CLEAR is applied as an empty snapshot, in a request of its own, and the
-    // registration for the first-seen worker rides that snapshot.
+    // CLEAR still goes, and the registration rides the snapshot.
     backend
         .apply_external_kv_batch(apply_request(
             "worker-0",
@@ -853,9 +845,8 @@ async fn mock_snapshot_accepts_empty_and_rejects_mixed_requests() {
 
     let state = Arc::new(Mutex::new(MockState::default()));
     let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
-    // `start_mock_tair_kvcache_manager` hands back the address before its task binds, so the
-    // first connect can race the listener (the backend's own client connects
-    // lazily and never sees it).
+    // The mock's address is handed back before its task binds, so the first
+    // connect can race the listener.
     let mut client = None;
     for _ in 0..50 {
         match MetaServiceClient::connect(format!("http://{addr}")).await {
@@ -1058,10 +1049,9 @@ async fn environment_configuration_reaches_the_wire() {
 
 #[tokio::test]
 async fn a_prefix_query_registers_an_auto_registering_instance_first() {
-    // The Router's first request can be a prefix query on a deployment where no
-    // KV event has arrived yet, so no apply batch has registered the instance.
-    // Tair KVCache answers INSTANCE_NOT_EXIST for that, which is permanent: the query
-    // path has to register on its own, ahead of the query it is answering.
+    // No apply batch has registered the instance yet. The manager answers
+    // INSTANCE_NOT_EXIST, which is permanent, so the query path must register
+    // ahead of the query it is answering.
     let state = Arc::new(Mutex::new(MockState::default()));
     let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
     let mut config = backend_config(addr);
@@ -1101,8 +1091,7 @@ async fn a_prefix_query_registers_an_auto_registering_instance_first() {
         "registration is once per backend, not per query"
     );
 
-    // Without auto-registration the instance stays missing and the query keeps
-    // surfacing Tair KVCache's verdict: a typo'd instance id is a configuration error,
+    // Without auto-registration the instance stays missing: a configuration error,
     // not a transient condition to paper over.
     let observer_state = Arc::new(Mutex::new(MockState::default()));
     let observer_addr = start_mock_tair_kvcache_manager(Arc::clone(&observer_state)).await;

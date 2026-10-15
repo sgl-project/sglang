@@ -1,34 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Live integration tests for the Tair KVCache backend against a *real* Tair KVCache
-//! Manager (Tair KVCache) MetaService, driven through `tests/tair_kvcache_live/setup_tair_kvcache_manager.py`.
+//! Live integration tests for the Tair KVCache backend against a real Tair
+//! KVCache Manager (KVCM). `tests/tair_kvcache_live/setup_tair_kvcache_manager.py`
+//! builds and provisions one, the env file it writes points the backend at it,
+//! and `--ignored` runs this suite; the script's docstring carries the commands.
 //!
-//!     # in the tair-kvcache checkout
-//!     bazelisk build //kv_cache_manager:kv_cache_manager_bin
-//!     # in experimental/sgl-router
-//!     python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py start --workdir /tmp/tair_kvcache-live
-//!     source /tmp/tair_kvcache-live/tair_kvcache_live.env
-//!     cargo test -p sgl-kv-indexer --test tair_kvcache_live -- --ignored
-//!     python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py stop --workdir /tmp/tair_kvcache-live
-//!
-//! Two guards keep these tests out of every other run: they are `#[ignore]`d,
-//! so a plain `cargo test -p sgl-kv-indexer` never touches the network. A run
-//! that does ask for them (`--ignored`/`--include-ignored`) with no harness
-//! fails instead of skipping: `ok. N passed` then always means the manager was
-//! really driven.
-//!
-//! Unlike `tests/tair_kvcache_contract.rs` (which pins our translation against a mock),
-//! these tests pin *Tair KVCache's* behavior: which events it accepts, what its liveness
-//! does to a silent reporter, and what `GetHostCacheState` answers. Where a test
-//! needs Tair KVCache's raw answer rather than our mapping of it, it talks to the
-//! MetaService directly with the vendored client.
-//!
-//! The harness provisions deliberately tight liveness (2s heartbeat timeout,
-//! 2s cleanup grace), so every backend here sets an explicit heartbeat cadence
-//! and the reclamation tests finish in seconds. A production deployment
-//! provisioned the same way would need the same care: a silent reporter's
-//! placements are *deleted*, not just hidden.
+//! The tests are `#[ignore]`d, so a plain `cargo test` never touches the
+//! network, and a run that explicitly asks for them without the harness fails
+//! rather than skipping: `N passed` then always means the manager was driven.
+//! Unlike `tair_kvcache_contract.rs` (our translation against a mock), these
+//! pin the *manager's* behavior -- accepted events, liveness reclamation,
+//! `GetHostCacheState` answers -- and use the vendored client directly where
+//! our own mapping would hide that answer. The harness provisions deliberately
+//! tight liveness (2s timeout, 2s grace), so every backend here sets an
+//! explicit heartbeat cadence: a silent reporter's placements are *deleted*,
+//! not just hidden.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,13 +46,11 @@ const ENV_INSTANCE_ID: &str = "TAIR_KVCACHE_LIVE_INSTANCE_ID";
 const ENV_INSTANCE_GROUP: &str = "TAIR_KVCACHE_LIVE_INSTANCE_GROUP";
 const ENV_MODEL_NAME: &str = "TAIR_KVCACHE_LIVE_MODEL_NAME";
 const ENV_MODEL_DTYPE: &str = "TAIR_KVCACHE_LIVE_MODEL_DTYPE";
-/// Written by the harness so a failure can name the workdir it used instead of
-/// assuming the default.
+/// Written by the harness, so a failure names the workdir actually used.
 const ENV_WORKDIR: &str = "TAIR_KVCACHE_LIVE_WORKDIR";
 const DEFAULT_LIVE_WORKDIR: &str = "/tmp/tair_kvcache-live";
 
-/// The harness provisions a 2s heartbeat timeout; 300ms keeps every reporter
-/// alive with room for a slow test step.
+/// The harness provisions a 2s heartbeat timeout: 300ms stays well inside it.
 const HEARTBEAT: Duration = Duration::from_millis(300);
 /// Generous per-RPC budgets: these tests assert Tair KVCache's answers, not scheduling.
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,13 +74,9 @@ fn nonempty_env(key: &str) -> Option<String> {
 }
 
 /// Whether this run explicitly asked for ignored tests (`--ignored` or
-/// `--include-ignored`, both passed straight to the test binary by libtest).
-///
-/// A run that asks for the live suite and then skips it because one variable is
-/// missing reports the same `ok. 17 passed` as a run that verified something.
-/// The suite must not be able to lie about that: an explicit request with no
-/// harness means failure, and only an implicit run (a plain `cargo test`, where
-/// these tests never start) skips silently.
+/// `--include-ignored`). A requested-but-skipped suite would report the same
+/// `ok. N passed` as one that verified something, so an explicit request with
+/// no harness fails; only an implicit run skips silently.
 fn live_suite_requested() -> bool {
     std::env::args()
         .skip(1)
@@ -125,11 +106,9 @@ fn live_env() -> Option<LiveEnv> {
         model_name: required(ENV_MODEL_NAME),
         dtype: required(ENV_MODEL_DTYPE),
     };
-    // A manager that is gone (this host's other workflows kill by name) must
-    // read as an environment failure with a next step, not as 17 bare
-    // connection errors that look like assertion failures. The workdir is
-    // whatever the harness was started with, so the printed commands are the
-    // ones that work on this run.
+    // A manager that is gone must read as an environment failure with a next
+    // step, not as bare connection errors; the printed commands name the
+    // workdir this run actually used.
     if let Err(reason) = probe_endpoint(&env.endpoint) {
         let workdir =
             std::env::var(ENV_WORKDIR).unwrap_or_else(|_| DEFAULT_LIVE_WORKDIR.to_string());
@@ -143,8 +122,7 @@ fn live_env() -> Option<LiveEnv> {
     Some(env)
 }
 
-/// A TCP connect is enough to tell "the manager is running" from "it is gone";
-/// no RPC, no runtime, no protocol.
+/// A TCP connect tells "running" from "gone" without an RPC or a runtime.
 fn probe_endpoint(endpoint: &str) -> Result<(), String> {
     use std::net::ToSocketAddrs;
 
@@ -165,8 +143,7 @@ fn probe_endpoint(endpoint: &str) -> Result<(), String> {
         .map_err(|error| format!("{addr}: {error}"))
 }
 
-/// Skips the test when the harness is not running and this run did not ask for
-/// it; fails loudly when it did (see [`live_suite_requested`]).
+/// Skips when the harness is absent and this run did not ask for the suite.
 macro_rules! live_env {
     () => {
         match live_env() {
@@ -179,8 +156,7 @@ macro_rules! live_env {
     };
 }
 
-/// Tair KVCache instances are created, never deleted, so every test takes a fresh id:
-/// runs are independent and repeatable against one long-lived manager.
+/// Instances are never deleted, so every test takes a fresh id.
 fn unique(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -226,8 +202,6 @@ fn auto_registering_backend(
 }
 
 /// Sets process environment variables for one test and restores them on drop.
-/// Only the env tests below use it, and no other test in this binary reads
-/// `KV_INDEXER_TAIR_KVCACHE_*`, so the global mutation stays contained.
 struct EnvGuard(Vec<(String, Option<String>)>);
 
 impl EnvGuard {
@@ -348,8 +322,7 @@ fn prefixes_by_address(response: &MatchExternalKvPrefixResponse) -> HashMap<Stri
 
 // --- Raw MetaService helpers ------------------------------------------------
 
-/// Talks to Tair KVCache directly, for behavior our backend hides or maps away
-/// (snapshot flags, raw `p2p_1_*` fields, medium filtering).
+/// Talks to the manager directly, for what our backend hides or maps away.
 struct RawKvcm {
     client: MetaServiceClient<Channel>,
     instance_id: String,
@@ -550,8 +523,7 @@ impl RawKvcm {
     }
 }
 
-/// The reporter's URI convention (channel scheme + reporter authority +
-/// medium), which Tair KVCache requires to be structurally valid.
+/// The reporter's URI convention the manager requires to be structurally valid.
 fn spec_uri(host: &str, medium: &str) -> String {
     format!("event_report://{host}/{medium}")
 }
@@ -621,12 +593,10 @@ fn locals(response: &GetHostCacheStateResponse) -> HashMap<String, i64> {
 
 // --- Ingestion: what Tair KVCache accepts ------------------------------------------
 
-/// The operator-facing entry point, end to end: environment variables
-/// (`TairKvcacheBackendConfig::from_env`) assemble an auto-registering backend that a
-/// real manager accepts. Everything else in this file builds the config
-/// programmatically, so this is the one test that would catch a renamed or
-/// unenforced variable — the failure mode being a registration Tair KVCache rejects,
-/// which makes the bridge exit, not a quiet misconfiguration.
+/// The operator-facing entry point, end to end: `from_env` assembles an
+/// auto-registering backend a real manager accepts. The other tests build the
+/// config programmatically, so this is what catches a renamed or unenforced
+/// variable, whose failure mode is a rejected registration (the bridge exits).
 #[tokio::test]
 #[ignore]
 async fn environment_configuration_registers_and_reports() {
@@ -670,8 +640,7 @@ async fn environment_configuration_registers_and_reports() {
     );
 }
 
-/// The auto-registration path end to end: `RegisterInstance` with `full`/
-/// `swa`/`mamba` `size: 0` specs, then reports landing as prefixes.
+/// Auto-registration end to end: `RegisterInstance`, then reports landing.
 #[tokio::test]
 #[ignore]
 async fn auto_registration_reports_and_answers_prefixes() {
@@ -729,12 +698,8 @@ async fn auto_registration_reports_and_answers_prefixes() {
     assert_eq!(answer.blocks_read, 2);
 }
 
-/// The Router's first request is a prefix query on an instance no worker has
-/// reported into yet. With auto-registration configured, that query must
-/// register the instance on its own -- Tair KVCache answers `INSTANCE_NOT_EXIST`
-/// otherwise, which the backend classifies as permanent and the Router turns
-/// into a 503 for every request until some other path warms a worker. Without
-/// auto-registration, a missing instance stays exactly that loud.
+/// The Router's first request is a prefix query on an instance no worker
+/// has reported to yet: a permanent fault for the query path, not transient.
 #[tokio::test]
 #[ignore]
 async fn a_query_before_any_report_registers_the_instance() {
@@ -810,8 +775,7 @@ async fn max_blocks_truncates_the_query() {
     );
 }
 
-/// The deployment-registered path: no `AUTO_REGISTER`, an instance the harness
-/// (standing in for the Tair KVCache connector) already registered with our spec names.
+/// The deployment-registered path: no `AUTO_REGISTER`, the instance exists.
 #[tokio::test]
 #[ignore]
 async fn reports_into_an_instance_registered_by_the_deployment() {
@@ -836,9 +800,7 @@ async fn reports_into_an_instance_registered_by_the_deployment() {
     );
 }
 
-/// Re-registering an existing instance with identical fields is a no-op; any
-/// field mismatch is a permanent fault. The harness registers this instance
-/// with exactly what `TairKvcacheAutoRegister` sends, so the first must hold.
+/// Identical re-registration is a no-op; a field mismatch is permanent.
 #[tokio::test]
 #[ignore]
 async fn re_registration_is_idempotent_and_mismatches_are_permanent() {
@@ -872,9 +834,7 @@ async fn re_registration_is_idempotent_and_mismatches_are_permanent() {
     );
 }
 
-/// `BLOCK_ADD` specs must name specs the instance declared: the harness
-/// instance declares `full`/`swa`/`mamba`, an instance declaring anything else
-/// rejects every report (the bridge exits instead of retrying forever).
+/// `BLOCK_ADD` must name declared specs; an undeclared one fails the report.
 #[tokio::test]
 #[ignore]
 async fn reports_into_an_instance_without_our_spec_names_fail() {
@@ -906,8 +866,7 @@ async fn reports_into_an_instance_without_our_spec_names_fail() {
     assert!(answer.hosts.is_empty(), "rejected blocks must not index");
 }
 
-/// A reporter Tair KVCache never saw, or forgot, is a permanent fault for the query
-/// path (the bridge's retry is what re-registers it).
+/// An unknown or forgotten reporter is a permanent query-path fault.
 #[tokio::test]
 #[ignore]
 async fn unknown_instance_is_a_permanent_fault() {
@@ -931,9 +890,7 @@ async fn unknown_instance_is_a_permanent_fault() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
 }
 
-/// `BLOCK_DELETE` must name registered specs. Our REVOKE sends every component
-/// name as a superset removal, which is only legal because the instance
-/// declares them all.
+/// `BLOCK_DELETE` must name registered specs; our REVOKE sends them all.
 #[tokio::test]
 #[ignore]
 async fn block_delete_requires_registered_spec_names() {
@@ -995,9 +952,7 @@ async fn block_delete_requires_registered_spec_names() {
     );
 }
 
-/// Re-sending `NODE_REGISTER` for an existing reporter is accepted, and the
-/// placements reported before it stay readable (Tair KVCache merges the node instead of
-/// replacing it).
+/// A repeated `NODE_REGISTER` is idempotent, and earlier placements stay.
 #[tokio::test]
 #[ignore]
 async fn node_register_resend_is_idempotent() {
@@ -1069,8 +1024,7 @@ async fn revokes_remove_single_blocks() {
 
 // --- Liveness ---------------------------------------------------------------
 
-/// The boundary the README documents: heartbeats keep an idle reporter's
-/// placements routable, silence lets Tair KVCache delete them.
+/// Heartbeats keep an idle reporter routable; silence lets it be reclaimed.
 #[tokio::test]
 #[ignore]
 async fn heartbeats_keep_an_idle_reporter_alive() {
@@ -1096,10 +1050,9 @@ async fn heartbeats_keep_an_idle_reporter_alive() {
     );
 }
 
-/// A silent reporter is reclaimed — placements deleted, not hidden — and its
-/// next report fails `NODE_NOT_REGISTERED` until a `NODE_REGISTER` clears the
-/// tombstone. That is exactly the sequence the backend's self-heal handles:
-/// one rejected batch, then a successful retry carrying the registration.
+/// A silent reporter is reclaimed -- placements deleted, not hidden -- and its
+/// next report re-registers it. The rejection is a transient
+/// `NodeNotRegistered`, which is what makes the self-healing work.
 #[tokio::test]
 #[ignore]
 async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
@@ -1138,8 +1091,7 @@ async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
     }
 
     // Becoming unroutable is immediate; the tombstone that rejects plain
-    // reports only appears once `cleanup_grace_ms` has passed and Tair KVCache has
-    // unregistered the reporter. Probe with a revoke so the wait writes
+    // reports appears once `cleanup_grace_ms` has passed. A revoke probe writes
     // nothing the sweep below could interleave with.
     let mut seq = 2;
     let error = loop {
@@ -1165,22 +1117,19 @@ async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
         error.message()
     );
 
-    // The reporter resumes: the bridge retries the batch, and the backend --
-    // which saw the `NODE_NOT_REGISTERED` failure -- prepends the registration
-    // that clears the tombstone. The request streaming again is the assertion;
-    // whether Tair KVCache keeps *those* blocks is a separate race, handled below.
+    // The reporter resumes: the backend saw `NODE_NOT_REGISTERED` and prepends
+    // the registration that clears the tombstone. Whether the manager keeps
+    // *those* blocks is a separate race, handled below.
     silent
         .apply_external_kv_batch(report_batch(&worker, address, seq, &[104, 105, 106]))
         .await
         .expect("the retry re-registers the reporter and succeeds");
 
-    // Tair KVCache dispatches the metadata sweep in the same breath as the unregister,
-    // and its generation guard only covers writes that landed before the sweep
-    // took its lease, so a re-report can still be swept. Converge on the answer
-    // instead of sleeping a magic duration: keep re-reporting until the
-    // reporter is routable again. This second backend is the reporter that
-    // stays up (it heartbeats), which keeps the liveness window out of the
-    // convergence.
+    // The metadata sweep shares the unregister's dispatch and its generation
+    // guard only covers writes that landed before the sweep took its lease, so
+    // a re-report can still be swept: converge on the answer instead of
+    // sleeping. This second backend heartbeats, keeping the liveness window out
+    // of the convergence.
     let resumed = backend(&env, &instance, Some(HEARTBEAT));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -1210,8 +1159,7 @@ async fn liveness_reclaims_a_silent_reporter_and_the_retry_self_heals() {
 
 // --- Query semantics --------------------------------------------------------
 
-/// Reporters with no router-facing address are excluded: Tair KVCache knows the host,
-/// the Router cannot route to it.
+/// A reporter without a router-facing address is excluded from the answer.
 #[tokio::test]
 #[ignore]
 async fn reporters_without_a_router_address_are_excluded() {
@@ -1243,7 +1191,7 @@ async fn reporters_without_a_router_address_are_excluded() {
     );
 }
 
-/// The raw `p2p_host_count = 0` answer, i.e. the fast path:
+/// The raw `p2p_host_count = 0` answer, i.e. the local fast path:
 /// `p2p_1_fetch == 0`, `p2p_1_total_match == local`, and only reporters that
 /// hold the first block appear at all.
 #[tokio::test]
@@ -1288,13 +1236,10 @@ async fn zero_p2p_host_count_answers_local_prefixes_only() {
     }
 }
 
-/// The per-worker answer only ever reflects what the workers reported over ZMQ
-/// (their L1 HBM), never Tair KVCache's own pool (L3). A data-plane write
-/// (`StartWriteCache`/`FinishWriteCache`) lands a serving location on the
-/// harness's NFS storage: Tair KVCache knows it, and names the *storage* as the holder
-/// when the query carries no medium filter -- while the query this backend makes
-/// (filtered by `REPORT_TIERS`) sees nothing, and the reporter→address join
-/// would drop a storage-named host anyway.
+/// The per-worker answer reflects only what workers reported over ZMQ, not what
+/// the data plane wrote: the manager attributes a data-plane block to the
+/// *storage* that holds it (`nfs_01`), so an L3 hit can only be served by
+/// fetching, never by routing to a worker.
 #[tokio::test]
 #[ignore]
 async fn l3_locations_do_not_answer_per_worker_prefixes() {
@@ -1374,8 +1319,7 @@ async fn l3_locations_do_not_answer_per_worker_prefixes() {
     );
 }
 
-/// The reported medium decides which placements a query sees: the backend
-/// reports HBM and queries HBM, so a DRAM-filtered query is empty.
+/// The reported medium decides which placements a query sees.
 #[tokio::test]
 #[ignore]
 async fn medium_filters_select_the_reported_medium() {
@@ -1411,13 +1355,9 @@ async fn medium_filters_select_the_reported_medium() {
     );
 }
 
-/// `snapshot_required` marks a reporter lifecycle, not an error: Tair KVCache asks for
-/// a reconciliation snapshot while the reporter has no committed snapshot
-/// version, and the first delta of a lifecycle is what creates that version —
-/// the request that creates it carries the flag too
-/// (`CacheManager::refresh_snapshot_response`: `committed.empty() ||
-/// created_generation`). A delta-only reporter therefore sees it exactly once
-/// per lifecycle.
+/// `snapshot_required` marks a reporter lifecycle, not an error: the manager asks
+/// for a first snapshot on the request that creates a reporter's generation,
+/// and the flag is advisory -- the delta still lands.
 #[tokio::test]
 #[ignore]
 async fn snapshot_required_marks_the_start_of_a_reporter_lifecycle() {
@@ -1472,9 +1412,7 @@ async fn snapshot_required_marks_the_start_of_a_reporter_lifecycle() {
     }
 }
 
-/// The other event-report channel: an L2 deployment reports `vineyard://` spec
-/// URIs and answers the same way (and only on the L2 channel). The router-side
-/// P2P dimension is out of scope here — this only pins the channel's plumbing.
+/// The L2 channel accepts `vineyard://` spec URIs and answers the same way.
 #[tokio::test]
 #[ignore]
 async fn l2_channel_accepts_vineyard_reports() {
@@ -1506,10 +1444,9 @@ async fn l2_channel_accepts_vineyard_reports() {
     );
 }
 
-/// `CLEAR_ALL_AT_TIER` reaches Tair KVCache as an empty `BLOCK_SNAPSHOT`: the reporter
-/// genuinely owns no blocks afterwards, so the prefix answer goes with it.
-/// This is the wave4 gap closing (`flush_cache` used to leave 100% of the
-/// placements behind).
+/// `CLEAR_ALL_AT_TIER` reaches the manager as an empty `BLOCK_SNAPSHOT`: the
+/// reporter owns no blocks afterwards, so the prefix answer goes with it. This
+/// is the harness's flush gap closing (it used to leave 100% of placements).
 #[tokio::test]
 #[ignore]
 async fn a_clear_removes_every_placement_of_the_reporter() {
@@ -1542,9 +1479,9 @@ async fn a_clear_removes_every_placement_of_the_reporter() {
     );
 }
 
-/// A report after the clear lands on the snapshot's fresh generation, so it is
-/// visible immediately while the pre-clear blocks stay gone. Tair KVCache stamps the
-/// new token server-side; the client never carries one.
+/// A report after the clear lands on the snapshot's fresh generation: visible
+/// immediately, while the pre-clear blocks stay gone. The manager stamps the new
+/// token server-side; the client never carries one.
 #[tokio::test]
 #[ignore]
 async fn a_report_after_a_clear_is_immediately_visible() {
@@ -1579,11 +1516,11 @@ async fn a_report_after_a_clear_is_immediately_visible() {
     );
 }
 
-/// A batch that reports and then clears, arriving after liveness reclaimed the
-/// reporter: the registration has to ride the batch's *first* request (the
-/// deltas). Left for the snapshot, Tair KVCache would reject the unregistered deltas
-/// with the tombstone, the whole batch would be lost (the bridge does not
-/// replay), and the registration would never be reached.
+/// A report-then-clear batch arriving after liveness reclaimed the reporter: the
+/// registration has to ride the batch's first request. Left for the snapshot,
+/// the manager would reject the unregistered deltas with the tombstone, the
+/// batch would be lost (the bridge does not replay), and the registration would
+/// never be reached.
 #[tokio::test]
 #[ignore]
 async fn a_report_then_clear_batch_gets_through_a_reclaimed_reporter() {
@@ -1646,10 +1583,9 @@ async fn a_report_then_clear_batch_gets_through_a_reclaimed_reporter() {
     );
 }
 
-/// Tair KVCache rate-limits snapshots per (instance, channel, reporter), 30s by
+/// The manager rate-limits snapshots per (instance, channel, reporter), 30s by
 /// default. A second flush inside that window is dropped with a warning rather
-/// than failing the batch: the bridge would reconnect and not replay, so the
-/// deltas riding with the flush would be lost too.
+/// than failing the batch, which would cost the deltas riding with it.
 #[tokio::test]
 #[ignore]
 async fn a_rate_limited_clear_degrades_to_a_warning() {
@@ -1668,10 +1604,9 @@ async fn a_rate_limited_clear_degrades_to_a_warning() {
         .await
         .expect("the first clear commits");
 
-    // Prove the cooldown is live for this reporter and channel, so the second
-    // clear below really takes the degradation path: a raw empty snapshot is
-    // answered SNAPSHOT_RATE_LIMITED with the remaining cooldown. A failed
-    // snapshot does not extend the window, so this probe is free.
+    // Prove the cooldown is live, so the second clear really takes the
+    // degradation path: a raw empty snapshot is answered SNAPSHOT_RATE_LIMITED
+    // with the remaining cooldown (a failed snapshot does not extend it).
     let mut raw = RawKvcm::connect(&env, &instance, &["full", "swa", "mamba"], 128).await;
     let probe = raw
         .report(

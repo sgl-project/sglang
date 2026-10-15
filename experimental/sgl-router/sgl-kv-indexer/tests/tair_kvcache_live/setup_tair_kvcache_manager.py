@@ -14,7 +14,10 @@ configuration.
     # once, in the Tair KVCache checkout
     bazelisk build //kv_cache_manager:kv_cache_manager_bin
 
-    python3 tests/tair_kvcache_live/setup_tair_kvcache_manager.py start --workdir /tmp/tair_kvcache-live
+    # --manager-repo is where the relative default --binary lives (or set
+    # TAIR_KVCACHE_MANAGER_REPO); an absolute --binary needs neither.
+    python3 tests/tair_kvcache_live/setup_tair_kvcache_manager.py start \\
+        --workdir /tmp/tair_kvcache-live --manager-repo <tair-kvcache checkout>
     source /tmp/tair_kvcache-live/tair_kvcache_live.env
     cargo test -p sgl-kv-indexer --test tair_kvcache_live -- --ignored
     python3 tests/tair_kvcache_live/setup_tair_kvcache_manager.py stop --workdir /tmp/tair_kvcache-live
@@ -24,7 +27,8 @@ provisioning is re-applied. `config` re-applies provisioning only. `start`
 verifies the state file's pid is still the manager it started before reusing or
 signalling it, so a stale workdir (they live in `/tmp`, which survives reboots)
 cannot make `stop` take down an unrelated process; `status` reports that check
-too. If the binary moved, point at it with `--binary`.
+too. If the binary moved, point at it with `--binary` (absolute, or relative
+to `--manager-repo`).
 
 The liveness knobs below are deliberately tight (2s timeout, 2s grace, 100ms
 check interval) so the reclamation tests finish in seconds; a production
@@ -74,7 +78,9 @@ LIVENESS = {
 }
 
 DEFAULT_BINARY = "bazel-bin/kv_cache_manager/kv_cache_manager_bin"
-DEFAULT_MANAGER_REPO = "/root/ws/kv/tair-kvcache"
+# No checkout is assumed: a relative DEFAULT_BINARY needs one, and the error in
+# `resolve_binary` says how to point at it (flag or environment).
+DEFAULT_MANAGER_REPO = os.environ.get("TAIR_KVCACHE_MANAGER_REPO", "")
 STATE_FILE = "tair_kvcache_live.json"
 ENV_FILE = "tair_kvcache_live.env"
 REGISTRY_FILE = "registry.json"
@@ -111,7 +117,9 @@ def process_identity(pid: int) -> Dict[str, str]:
         pass
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
-            identity["cmdline"] = handle.read().replace(b"\0", b" ").decode(errors="replace").strip()
+            identity["cmdline"] = (
+                handle.read().replace(b"\0", b" ").decode(errors="replace").strip()
+            )
     except OSError:
         pass
     return identity
@@ -133,7 +141,10 @@ def is_our_manager(state: Dict[str, Any], pid: int) -> bool:
     while a wrapper script or a renamed copy reads as a stranger we then refuse
     to stop.
     """
-    return bool(state.get("workdir")) and registry_uri(state) in process_identity(pid)["cmdline"]
+    return (
+        bool(state.get("workdir"))
+        and registry_uri(state) in process_identity(pid)["cmdline"]
+    )
 
 
 def terminate(pid: int, timeout: float) -> bool:
@@ -212,6 +223,12 @@ def pid_alive(pid: int) -> bool:
 def resolve_binary(args: argparse.Namespace) -> str:
     binary = args.binary
     if not os.path.isabs(binary):
+        if not args.manager_repo:
+            raise SetupError(
+                "a relative --binary needs the Tair KVCache checkout it lives in: pass "
+                "--manager-repo <tair-kvcache checkout> (or set TAIR_KVCACHE_MANAGER_REPO), "
+                "or pass an absolute --binary <path to kv_cache_manager_bin>"
+            )
         binary = os.path.join(args.manager_repo, binary)
     if not os.access(binary, os.X_OK):
         raise SetupError(
@@ -221,17 +238,23 @@ def resolve_binary(args: argparse.Namespace) -> str:
     return binary
 
 
-def http_post(url: str, payload: Dict[str, Any], timeout: float = 5.0) -> Dict[str, Any]:
+def http_post(
+    url: str, payload: Dict[str, Any], timeout: float = 5.0
+) -> Dict[str, Any]:
     try:
         response = requests.post(url, json=payload, timeout=timeout)
     except requests.RequestException as error:
         raise SetupError(f"POST {url} failed: {error}") from error
     if response.status_code != 200:
-        raise SetupError(f"POST {url} returned HTTP {response.status_code}: {response.text[:400]}")
+        raise SetupError(
+            f"POST {url} returned HTTP {response.status_code}: {response.text[:400]}"
+        )
     try:
         return response.json()
     except ValueError as error:
-        raise SetupError(f"POST {url} returned non-JSON: {response.text[:400]}") from error
+        raise SetupError(
+            f"POST {url} returned non-JSON: {response.text[:400]}"
+        ) from error
 
 
 def status_code(body: Dict[str, Any]) -> str:
@@ -259,7 +282,9 @@ def wait_ready(http_port: int, timeout: float) -> None:
     last_error = "no attempt made"
     while time.monotonic() < deadline:
         try:
-            body = http_post(url, {"trace_id": "sgl_kv_indexer_live_readiness"}, timeout=2.0)
+            body = http_post(
+                url, {"trace_id": "sgl_kv_indexer_live_readiness"}, timeout=2.0
+            )
             code = status_code(body)
             if code in ("OK", "SERVER_NOT_LEADER"):
                 return
@@ -267,7 +292,9 @@ def wait_ready(http_port: int, timeout: float) -> None:
         except SetupError as error:
             last_error = str(error)
         time.sleep(0.2)
-    raise SetupError(f"Tair KVCache did not become ready within {timeout:.0f}s: {last_error}")
+    raise SetupError(
+        f"Tair KVCache did not become ready within {timeout:.0f}s: {last_error}"
+    )
 
 
 def start_once(args: argparse.Namespace) -> Dict[str, Any]:
@@ -286,9 +313,10 @@ def start_once(args: argparse.Namespace) -> Dict[str, Any]:
         "--env=kvcm.logger.log_level=4",
     ]
     print(f"[setup] starting {shlex.join(command)}")
-    with open(os.path.join(args.workdir, "stdout.log"), "ab") as stdout, open(
-        os.path.join(args.workdir, "stderr.log"), "ab"
-    ) as stderr:
+    with (
+        open(os.path.join(args.workdir, "stdout.log"), "ab") as stdout,
+        open(os.path.join(args.workdir, "stderr.log"), "ab") as stderr,
+    ):
         process = subprocess.Popen(
             command,
             cwd=args.workdir,
@@ -330,7 +358,9 @@ def start_once(args: argparse.Namespace) -> Dict[str, Any]:
             f"{error} (pid {process.pid} survived shutdown and still holds "
             f"ports {rpc_port}/{http_port}; `stop` will retry it)"
         ) from error
-    print(f"[setup] Tair KVCache ready: grpc=127.0.0.1:{rpc_port} http=127.0.0.1:{http_port}")
+    print(
+        f"[setup] Tair KVCache ready: grpc=127.0.0.1:{rpc_port} http=127.0.0.1:{http_port}"
+    )
     return state
 
 
@@ -340,7 +370,9 @@ def start_manager(args: argparse.Namespace) -> Dict[str, Any]:
     if existing and pid_alive(int(existing["pid"])):
         pid = int(existing["pid"])
         if is_our_manager(existing, pid):
-            print(f"[setup] Tair KVCache already running (pid={pid}, grpc=127.0.0.1:{existing['rpc_port']})")
+            print(
+                f"[setup] Tair KVCache already running (pid={pid}, grpc=127.0.0.1:{existing['rpc_port']})"
+            )
             return existing
         # A reused pid would otherwise make `start` report "already running"
         # and provision against ports this state file no longer owns.
@@ -356,7 +388,9 @@ def start_manager(args: argparse.Namespace) -> Dict[str, Any]:
             return start_once(args)
         except SetupError as error:
             last_error = error
-            print(f"[setup] start attempt {attempt}/{args.start_attempts} failed: {error}")
+            print(
+                f"[setup] start attempt {attempt}/{args.start_attempts} failed: {error}"
+            )
     raise last_error
 
 
@@ -433,7 +467,10 @@ def instance_group() -> Dict[str, Any]:
                 "max_key_count": 1000000,
                 "mutex_shard_num": 16,
                 "batch_key_size": 16,
-                "meta_storage_backend_config": {"storage_type": "local", "storage_uri": ""},
+                "meta_storage_backend_config": {
+                    "storage_type": "local",
+                    "storage_uri": "",
+                },
                 "meta_cache_policy_config": {"type": "LRU", "capacity": 10000},
             },
         },
@@ -460,32 +497,48 @@ def provision(state: Dict[str, Any]) -> None:
 
     existing_storages = {
         storage["global_unique_name"]
-        for storage in api_post(f"{admin}/api/listStorage", {"trace_id": "sgl_kv_indexer_live_list_storage"}).get(
-            "storage", []
-        )
+        for storage in api_post(
+            f"{admin}/api/listStorage", {"trace_id": "sgl_kv_indexer_live_list_storage"}
+        ).get("storage", [])
     }
-    for name, storage_type in ((STORAGE_L1P5, "ST_EVENT_REPORT_L1P5"), (STORAGE_L2, "ST_EVENT_REPORT_L2")):
+    for name, storage_type in (
+        (STORAGE_L1P5, "ST_EVENT_REPORT_L1P5"),
+        (STORAGE_L2, "ST_EVENT_REPORT_L2"),
+    ):
         storage = event_report_storage(name, storage_type)
         if name not in existing_storages:
-            api_post(f"{admin}/api/addStorage", {"trace_id": f"sgl_kv_indexer_live_add_{name}", "storage": storage})
+            api_post(
+                f"{admin}/api/addStorage",
+                {"trace_id": f"sgl_kv_indexer_live_add_{name}", "storage": storage},
+            )
         # updateStorage is remove + add, so it makes the liveness knobs
         # authoritative on every run whether or not the storage already existed.
         api_post(
             f"{admin}/api/updateStorage",
-            {"trace_id": f"sgl_kv_indexer_live_update_{name}", "storage": storage, "force_update": True},
+            {
+                "trace_id": f"sgl_kv_indexer_live_update_{name}",
+                "storage": storage,
+                "force_update": True,
+            },
         )
-        print(f"[setup] event-report storage {name} ({storage_type}) configured, liveness={LIVENESS}")
+        print(
+            f"[setup] event-report storage {name} ({storage_type}) configured, liveness={LIVENESS}"
+        )
 
     existing_groups = {
         group["name"]
         for group in api_post(
-            f"{admin}/api/listInstanceGroup", {"trace_id": "sgl_kv_indexer_live_list_group"}
+            f"{admin}/api/listInstanceGroup",
+            {"trace_id": "sgl_kv_indexer_live_list_group"},
         ).get("instance_group", [])
     }
     if INSTANCE_GROUP not in existing_groups:
         api_post(
             f"{admin}/api/createInstanceGroup",
-            {"trace_id": "sgl_kv_indexer_live_create_group", "instance_group": instance_group()},
+            {
+                "trace_id": "sgl_kv_indexer_live_create_group",
+                "instance_group": instance_group(),
+            },
         )
     print(f"[setup] instance group {INSTANCE_GROUP} configured")
 
@@ -494,7 +547,9 @@ def provision(state: Dict[str, Any]) -> None:
         instance_registration(),
         accept=("OK", "DUPLICATE_ENTITY"),
     )
-    print(f"[setup] instance {INSTANCE_ID} registered (specs={','.join(SPEC_NAMES)}, block_size={BLOCK_SIZE})")
+    print(
+        f"[setup] instance {INSTANCE_ID} registered (specs={','.join(SPEC_NAMES)}, block_size={BLOCK_SIZE})"
+    )
 
 
 def write_env_file(workdir: str, state: Dict[str, Any]) -> str:
@@ -524,13 +579,35 @@ def print_instructions(state: Dict[str, Any]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("command", choices=("start", "config", "stop", "status"))
-    parser.add_argument("--workdir", default="/tmp/tair_kvcache-live", help="state, registry and logs live here")
-    parser.add_argument("--manager-repo", default=DEFAULT_MANAGER_REPO, help="Tair KVCache Manager checkout")
-    parser.add_argument("--binary", default=DEFAULT_BINARY, help="manager binary (relative to --manager-repo)")
-    parser.add_argument("--startup-timeout", type=float, default=60.0, help="seconds to wait for readiness")
-    parser.add_argument("--stop-timeout", type=float, default=15.0, help="seconds to wait for SIGTERM")
+    parser.add_argument(
+        "--workdir",
+        default="/tmp/tair_kvcache-live",
+        help="state, registry and logs live here",
+    )
+    parser.add_argument(
+        "--manager-repo",
+        default=DEFAULT_MANAGER_REPO,
+        help="Tair KVCache Manager checkout holding a relative --binary "
+        "(default: $TAIR_KVCACHE_MANAGER_REPO)",
+    )
+    parser.add_argument(
+        "--binary",
+        default=DEFAULT_BINARY,
+        help="manager binary (relative to --manager-repo)",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=60.0,
+        help="seconds to wait for readiness",
+    )
+    parser.add_argument(
+        "--stop-timeout", type=float, default=15.0, help="seconds to wait for SIGTERM"
+    )
     parser.add_argument(
         "--start-attempts",
         type=int,
@@ -548,7 +625,9 @@ def main() -> int:
         if args.command == "config":
             state = read_state(args.workdir)
             if not state or not pid_alive(int(state["pid"])):
-                raise SetupError(f"Tair KVCache is not running in {args.workdir}; run `start` first")
+                raise SetupError(
+                    f"Tair KVCache is not running in {args.workdir}; run `start` first"
+                )
             provision(state)
             print_instructions(state)
             return 0
@@ -566,7 +645,9 @@ def main() -> int:
             f"http=127.0.0.1:{state['http_port']} workdir={state['workdir']}"
         )
         if alive and not ours:
-            print(f"[setup] pid {pid} is {process_identity(pid)['exe'] or 'unknown'}, not this state file's manager")
+            print(
+                f"[setup] pid {pid} is {process_identity(pid)['exe'] or 'unknown'}, not this state file's manager"
+            )
         return 0 if ours else 1
     except SetupError as error:
         print(f"[setup] error: {error}", file=sys.stderr)

@@ -1,46 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tair KVCache backend: a [`KvIndexerBackend`] whose placement state lives in a Tair
-//! KVCache Manager (Tair KVCache) `MetaService` instead of this process.
+//! Tair KVCache backend: a [`KvIndexerBackend`] whose placement state lives in
+//! a Tair KVCache Manager (KVCM) `MetaService` instead of this process.
 //!
-//! # Shape
+//! Ingestion is unchanged -- the bridge turns each worker's ZMQ KV-event stream
+//! into [`ApplyExternalKvBatch`] RPCs -- and this backend translates those
+//! actions: REPORT becomes `BLOCK_ADD` (one component spec per resident
+//! component), REVOKE becomes `BLOCK_DELETE`, CLEAR_ALL_AT_TIER becomes an empty
+//! `BLOCK_SNAPSHOT` (the manager's only synchronous "this reporter owns nothing"
+//! primitive, sent in action order), and the reporter identity is the worker id,
+//! so `GetHostCacheState` answers map straight back onto workers.
 //!
-//! The ingestion side is unchanged: the same bridge turns each worker's ZMQ
-//! KV-event stream into [`ApplyExternalKvBatch`] RPCs. This backend translates
-//! those actions into Tair KVCache `ReportEvent` mutations — REPORT becomes
-//! `BLOCK_ADD` (one component spec per resident component), REVOKE becomes
-//! `BLOCK_DELETE`, and the reporter identity is the indexer `worker_id`, so
-//! `GetHostCacheState` answers map straight back onto workers, and
-//! `CLEAR_ALL_AT_TIER` becomes an empty `BLOCK_SNAPSHOT` — Tair KVCache's only
-//! synchronous "this reporter owns nothing" primitive, sent in action order.
-//!
-//! Query side: `MatchExternalKvPrefix` is answered by `GetHostCacheState`
-//! (`QT_PREFIX_MATCH`), whose per-host result is the longest contiguous run of
-//! held blocks from block 0 — the *legacy whole-block* quantity. That is not
-//! the rule engine's answer for a component-aware worker, so a worker whose
-//! cache spec requires SWA or MAMBA rules, or that reports components without
-//! a spec, is excluded from the query answer (see [`batch_is_tair_kvcache_eligible`]):
-//! the answer stays a lower bound, never an over-report — except that a
-//! dropped flush (see [`Inner::report_flush_snapshot`]) leaves placements
-//! behind on purpose, and a clear covers every medium of the channel rather
-//! than one tier. The per-block placement query (`MatchExternalKv`) has no Tair KVCache
-//! equivalent -- Tair KVCache answers hosts, not per-block location lists -- so it
-//! fails `UNIMPLEMENTED` and the prefix query is the only routing signal.
-//!
-//! # Deliberate limitations
-//!
-//! Flushes are best-effort in three ways that the protocol imposes, not this
-//! backend: they cover the whole reporter × channel across every medium (no
-//! tier granularity), Tair KVCache rate-limits them per reporter (a flush inside the
-//! cooldown is dropped with a warning instead of failing the batch), and the
-//! first one switches a delta-only reporter to strict visibility, so this
-//! indexer must be its only writer on that channel. Host-dram placements are
-//! not reported by default; the instance is registered only when
-//! auto-registration is configured; the reporter→address map is process-local,
-//! so a restart loses the join and not the placements; and `snapshot_required`
-//! marks a reporter lifecycle rather than a fault. The README carries the
-//! operational contract and the failure mode behind each.
+//! Prefix queries are answered by `GetHostCacheState` (`QT_PREFIX_MATCH`): the
+//! longest contiguous run of held blocks from block 0, which is not the rule
+//! engine's answer for a component-aware worker. Workers whose cache spec needs
+//! SWA or MAMBA rules are excluded rather than over-reported (see
+//! [`batch_is_tair_kvcache_eligible`]) and `MatchExternalKv` fails
+//! `UNIMPLEMENTED`: the prefix query is the only routing signal, always a lower
+//! bound. Deliberate limitations (clear scope and cooldown, the strict-visibility
+//! switch, host-dram reporting, process-local reporter addresses) carry their
+//! failure modes in the README.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -71,24 +51,20 @@ use crate::service::{
     COMPONENT_MAMBA, COMPONENT_SWA, SERVABLE_TIER_MASK, SUPPORTED_SPEC_VERSION,
 };
 
-/// Per-query deadline for `GetHostCacheState`. Half the router-side prefix
-/// deadline (`client::DEFAULT_QUERY_DEADLINE`), because this budget starts
-/// only after the service layer's admission checks: a full router-deadline
-/// budget here means the indexer keeps scanning after the router gave up.
+/// Per-query deadline for `GetHostCacheState`: half the router-side prefix
+/// deadline, since this budget starts after the service layer's admission
+/// checks, and a full router deadline here would outlive the router's ask.
 pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 50;
 /// Deadline for mutation and registration RPCs, shared by every chunk of one
-/// apply batch (see [`TairKvcacheIndexerBackend::apply_external_kv_batch`]). Applies
-/// are never shed by the service layer, so this bounds a hung Tair KVCache from
-/// stalling a bridge.
+/// apply batch. Applies are never shed by the service layer, so this is what
+/// keeps a hung manager from stalling a bridge.
 pub const DEFAULT_APPLY_TIMEOUT_MS: u64 = 5_000;
-/// Default heartbeat cadence. The backend heartbeats every worker it has seen
-/// for its own lifetime, so an idle worker's cache stays routable at the cost of
-/// Tair KVCache liveness never reclaiming a dead reporter -- the Router's health
-/// intersection is what keeps stale entries unroutable.
+/// Default heartbeat cadence. Beating for every worker the backend has seen
+/// keeps idle caches routable at the cost of liveness never reclaiming a dead
+/// reporter; the Router's health intersection is what hides those.
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
-/// Events per `ReportEvent` RPC. A maximal apply batch (16,384 hashes) would
-/// otherwise produce one multi-hundred-kilobyte message; chunking keeps each
-/// RPC comfortably under transport ceilings while preserving event order.
+/// Events per `ReportEvent` RPC: a maximal apply batch would otherwise be one
+/// multi-hundred-kilobyte message. Order is preserved across chunks.
 const MAX_EVENTS_PER_REPORT_EVENT: usize = 4_096;
 
 const ENV_ENDPOINT: &str = "KV_INDEXER_TAIR_KVCACHE_ENDPOINT";
@@ -104,10 +80,8 @@ const ENV_QUERY_TIMEOUT_MS: &str = "KV_INDEXER_TAIR_KVCACHE_QUERY_TIMEOUT_MS";
 const ENV_APPLY_TIMEOUT_MS: &str = "KV_INDEXER_TAIR_KVCACHE_APPLY_TIMEOUT_MS";
 const ENV_HEARTBEAT_INTERVAL_MS: &str = "KV_INDEXER_TAIR_KVCACHE_HEARTBEAT_INTERVAL_MS";
 
-/// Location-spec names reported per component. They double as the
-/// `LocationSpecInfo` names an auto-registered instance declares, and as the
-/// `spec_names` a REVOKE deletes (superset removal: a revoke drops the whole
-/// placement, whatever components it held).
+/// Location-spec names reported per component: also the `LocationSpecInfo` names
+/// an auto-registered instance declares, and the `spec_names` a REVOKE deletes.
 pub const SPEC_FULL: &str = "full";
 pub const SPEC_SWA: &str = "swa";
 pub const SPEC_MAMBA: &str = "mamba";
@@ -140,22 +114,18 @@ impl fmt::Display for TairKvcacheConfigError {
 
 impl std::error::Error for TairKvcacheConfigError {}
 
-/// Instance registration for routing-only deployments (the Tair KVCache connector
-/// registers the instance otherwise, and a second registration with different
-/// fields fails `DUPLICATE_ENTITY`).
-///
-/// Tair KVCache refuses a registration that omits the model deployment or a positive
-/// block size (`MetaServiceImpl::RegisterInstance`), so both are required here.
+/// Instance registration for routing-only deployments (the connector registers
+/// otherwise); a second registration with different fields fails
+/// `DUPLICATE_ENTITY`. A model deployment and a positive block size are both
+/// required by the manager.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TairKvcacheAutoRegister {
     pub instance_group: String,
     pub block_size: u32,
-    /// The routed deployment's identity, as a Tair KVCache `ModelDeployment`: the
-    /// indexer knows the fleet's workers, not their model, so the operator
-    /// states the name and dtype Tair KVCache demands (a pre-registered instance
-    /// accepts this registration only when its fields match; otherwise it
-    /// fails `DUPLICATE_ENTITY`). Other `ModelDeployment` fields keep their
-    /// Tair KVCache default.
+    /// The routed deployment's identity: the indexer knows the fleet's workers,
+    /// not their model, so the operator states the name and dtype the manager
+    /// demands. Every field must match a pre-registered instance, so the rest of
+    /// `ModelDeployment` keeps its defaults.
     pub model_name: String,
     pub dtype: String,
 }
@@ -345,12 +315,10 @@ fn env_nonempty(key: &str) -> Option<String> {
     }
 }
 
-/// Resident component-spec names for a reported bitmask. Legacy (mask 0) is an
-/// implicit whole-block store: the full component alone. A non-zero mask without
-/// FULL yields no specs at all -- such a block cannot serve full attention, and
-/// Tair KVCache counts a held block by *any* spec present, so reporting it would
-/// over-report. The caller drops it, matching the rule engine's fail-closed
-/// rule that FULL is required on every matched block.
+/// Resident component-spec names for a reported bitmask. Legacy (mask 0) means
+/// the full component alone; a mask without FULL yields no specs and the caller
+/// drops the block, because the manager counts a held block by *any* spec
+/// present.
 fn component_spec_names(mask: u32) -> Vec<&'static str> {
     if mask == 0 {
         return vec![SPEC_FULL];
@@ -368,16 +336,13 @@ fn component_spec_names(mask: u32) -> Vec<&'static str> {
     names
 }
 
-/// Whether one apply batch keeps its worker answerable by Tair KVCache's whole-block
-/// prefix match *without over-reporting* relative to the rule engine in
-/// `service::compute_worker_prefix`.
-///
-/// The rule engine gates a component-aware worker on more than block presence
-/// (SWA must cover a trailing window, MAMBA must sit on the boundary,
-/// fail-closed detail without a spec) and `GetHostCacheState` answers none of
-/// it, so a worker stays answerable only while every batch keeps it legacy
-/// whole-block, or FULL-only within servable reported tiers with component
-/// detail on every block.
+/// Whether one apply batch keeps its worker answerable by the manager's
+/// whole-block prefix match *without over-reporting* relative to the rule engine
+/// in `service::compute_worker_prefix`. That engine gates a component-aware
+/// worker on more than block presence (SWA windows, MAMBA boundaries) and
+/// `GetHostCacheState` answers none of it, so a worker stays answerable only
+/// while every batch keeps it legacy whole-block, or FULL-only within servable
+/// tiers with component detail on every block.
 fn batch_is_tair_kvcache_eligible(
     request: &ApplyExternalKvBatchRequest,
     report_tiers: &[TierType],
@@ -406,8 +371,7 @@ fn batch_is_tair_kvcache_eligible(
             continue;
         }
         match request.cache_spec.as_ref() {
-            // A legacy worker that reports component detail would fail the
-            // rule engine closed; it is not answerable here either.
+            // A legacy worker reporting component detail fails the rule engine closed.
             None => {
                 if !action.component_masks.is_empty() {
                     return Ok(false);
@@ -467,10 +431,9 @@ fn storage_uri_scheme(storage_type: StorageType) -> &'static str {
     }
 }
 
-/// The URI authority identifying the reporter: the worker address's
-/// `host:port` when one is restated, else the worker id. Tair KVCache validates spec
-/// URIs structurally (scheme + non-empty rest); the data plane later resolves
-/// the authority when fetching.
+/// The URI authority identifying the reporter: the worker address's `host:port`
+/// when one is restated, else the worker id. The manager only validates the
+/// structure; the data plane resolves the authority when fetching.
 fn reporter_uri_authority<'a>(worker_address: &'a str, worker_id: &'a str) -> &'a str {
     let Some((scheme, rest)) = worker_address.split_once("://") else {
         return worker_id;
@@ -583,9 +546,8 @@ enum TranslatedSegment {
 }
 
 /// Pure translation of one validated apply batch into the requests it takes to
-/// apply it, in action order. Actions on tiers outside `report_tiers` are
-/// dropped before translation; `prepend_node_register` re-registers a reporter
-/// Tair KVCache has forgotten (or never accepted), riding the batch's first request.
+/// apply it, in action order. Actions outside `report_tiers` are dropped first;
+/// `prepend_node_register` rides the batch's first request.
 fn translate_batch(
     request: &ApplyExternalKvBatchRequest,
     prepend_node_register: bool,
@@ -705,14 +667,11 @@ fn header_outcome(header: Option<&CommonResponseHeader>) -> HeaderOutcome {
     }
 }
 
-/// Maps a Tair KVCache response header into a `Result`. `INVALID_ARGUMENT` and
-/// `DUPLICATE_ENTITY` stay loud contract errors; permanent configuration
-/// faults (`INSTANCE_NOT_EXIST`, `UNSUPPORTED`, `REACH_MAX_ENTITY_CAPACITY`)
-/// become `FAILED_PRECONDITION`, which the bridge classifies as permanent
-/// instead of reconnecting forever on a typo'd instance id. Every other code
-/// — including `NODE_NOT_REGISTERED`, an expected event for a reporter Tair KVCache
-/// forgot and the next report re-registers — is a transient availability
-/// problem the caller retries or degrades on.
+/// Maps a manager response header into a `Result`. `INVALID_ARGUMENT` and
+/// `DUPLICATE_ENTITY` stay loud contract errors, and permanent configuration
+/// faults become `FAILED_PRECONDITION` so the bridge exits instead of
+/// reconnecting forever on a typo'd instance id; every other code, including
+/// `NODE_NOT_REGISTERED`, is transient.
 fn check_header(header: Option<&CommonResponseHeader>, what: &str) -> Result<(), Status> {
     match header_outcome(header) {
         HeaderOutcome::Ok => Ok(()),
@@ -733,10 +692,9 @@ fn check_header(header: Option<&CommonResponseHeader>, what: &str) -> Result<(),
     }
 }
 
-/// `(worker_id, address, matched blocks)` for one Tair KVCache host match: the worker
-/// must be answerable (see [`batch_is_tair_kvcache_eligible`]) with a non-empty
-/// router-facing address, and the reported prefix is clamped to the query
-/// length so a Tair KVCache over-report cannot exceed the ask.
+/// `(worker_id, address, matched blocks)` for one host match: the worker must be
+/// answerable (see [`batch_is_tair_kvcache_eligible`]) with a non-empty
+/// router-facing address, and the prefix is clamped to the query length.
 fn prefix_entry(
     host: HostCacheMatch,
     blocks_read: u32,
@@ -753,10 +711,10 @@ fn prefix_entry(
 #[derive(Debug, Default, Clone)]
 struct WorkerRecord {
     address: String,
-    /// Whether a `NODE_REGISTER` for this reporter has been accepted: a first
-    /// batch that fails must not burn the registration, and Tair KVCache may forget the
-    /// node after a liveness cleanup, so the flag flips only on a successful
-    /// report carrying one.
+    /// Whether a `NODE_REGISTER` for this reporter has been accepted. The flag
+    /// flips only on a successful report carrying one: a failed first batch must
+    /// not burn the registration, and a liveness cleanup makes the manager
+    /// forget it.
     node_registered: bool,
     /// Sticky: once a batch makes the worker unanswerable by whole-block
     /// matching (see [`batch_is_tair_kvcache_eligible`]), it stays excluded — the
@@ -824,9 +782,8 @@ impl Inner {
     }
 
     /// Forwards one `ReportEvent` and maintains the reporter's registration
-    /// flag: a successful report carrying `NODE_REGISTER` marks it registered,
-    /// and a `NODE_NOT_REGISTERED` failure resets it so the next report
-    /// re-registers.
+    /// flag: success carrying `NODE_REGISTER` marks it registered, and a
+    /// `NODE_NOT_REGISTERED` failure resets it so the next report re-registers.
     async fn report_event_checked(
         &self,
         host: &str,
@@ -903,27 +860,24 @@ impl Inner {
         Ok(())
     }
 
-    /// Applies one `CLEAR_ALL_AT_TIER` as an empty all-medium snapshot, in a
-    /// request of its own, and returns once Tair KVCache has committed the fence.
+    /// Applies one `CLEAR_ALL_AT_TIER` as an empty all-medium snapshot, in a request
+    /// of its own, and returns once the manager has committed the fence.
     ///
-    /// The retry policy is deliberately asymmetric:
+    /// The retry policy is asymmetric on purpose:
     ///
-    /// * `SNAPSHOT_IN_PROGRESS` is a transient race (another snapshot of this
-    ///   reporter, or a delta drain that timed out): the complete snapshot is
-    ///   re-sent after a short backoff, bounded so the batch keeps its budget.
+    /// * `SNAPSHOT_IN_PROGRESS` is a transient race (a concurrent snapshot, or a
+    ///   delta drain that timed out): re-send the complete snapshot after a short
+    ///   backoff, bounded by the apply budget.
     /// * `SNAPSHOT_RATE_LIMITED` **drops the flush with a warning instead of
-    ///   failing the batch**. Tair KVCache's cooldown (30s by default) cannot be waited
-    ///   out inside an apply budget, and a failed batch costs more than a missed
-    ///   flush: the bridge sees the error, reconnects, and does not replay, so
-    ///   every delta that rode in the same batch would be lost as well. The
-    ///   placements simply stay until a later clear gets through.
-    /// * `NODE_NOT_REGISTERED` means Tair KVCache forgot this reporter (a liveness
-    ///   cleanup): the retry carries a fresh `NODE_REGISTER`, so a flush is
-    ///   never lost just because the registration lapsed first.
+    ///   failing the batch**: the cooldown (30s by default) cannot be waited out
+    ///   inside an apply budget, and a failed batch costs more than a missed flush
+    ///   -- the bridge reconnects and does not replay, losing every delta that rode
+    ///   with it.
+    /// * `NODE_NOT_REGISTERED` means the manager forgot this reporter (liveness
+    ///   cleanup): the retry carries a fresh `NODE_REGISTER`.
     ///
-    /// Anything else keeps the delta path's classification. A committed
-    /// snapshot leaves no local state to drop -- this backend keeps none, the
-    /// answer comes from Tair KVCache, whose visibility now fences the reporter.
+    /// Anything else keeps the delta path's classification. A committed snapshot
+    /// leaves no local state to drop: this backend keeps none.
     async fn report_flush_snapshot(
         &self,
         host: &str,
@@ -1029,12 +983,9 @@ impl Inner {
         Ok(response)
     }
 
-    /// One-shot `RegisterInstance` when auto-registration is configured.
-    ///
-    /// It runs on the apply budget, not a caller's: this is a setup call rather
-    /// than a data-plane answer. Concurrent first calls (a cold start) may each
-    /// send one; Tair KVCache is idempotent for identical fields, and after the first
-    /// success the flag short-circuits the rest.
+    /// One-shot `RegisterInstance` when auto-registration is configured. It runs
+    /// on the apply budget (a setup call, not an answer), concurrent cold-start
+    /// calls may each send one, and the flag short-circuits the rest.
     async fn register_instance(&self) -> Result<(), Status> {
         let Some(auto) = &self.config.auto_register else {
             return Ok(());
@@ -1123,9 +1074,8 @@ impl TairKvcacheIndexerBackend {
     }
 
     /// Keeps one reporter alive per worker. The task holds a weak handle, so
-    /// dropping the backend stops the heartbeats; workers that stopped being
-    /// answerable (component rules) are skipped, since nothing is reported
-    /// for them and no answer should come back either.
+    /// dropping the backend stops it; workers that stopped being answerable are
+    /// skipped, since nothing is reported for them.
     fn spawn_heartbeat(&self, worker_id: String) {
         let Some(interval) = self.inner.config.heartbeat_interval else {
             return;
@@ -1288,13 +1238,11 @@ impl KvIndexerBackend for TairKvcacheIndexerBackend {
         ))
     }
 
-    /// Answers via `GetHostCacheState`: per reporter host, the longest
-    /// contiguous run of held blocks from block 0 — the legacy whole-block
-    /// quantity. Component-aware workers the rule engine would gate on SWA
-    /// windows or MAMBA boundaries are excluded rather than over-reported, so
-    /// the answer stays a lower bound like the default implementation's. (The
-    /// default path itself is unusable here: it derives placements from
-    /// `match_external_kv`, which has no Tair KVCache equivalent.)
+    /// Answers via `GetHostCacheState`: per reporter host, the longest contiguous
+    /// run of held blocks from block 0. Component-aware workers are excluded
+    /// rather than over-reported, so the answer stays a lower bound. (The default
+    /// path derives placements from `match_external_kv`, which has no equivalent
+    /// here.)
     async fn match_external_kv_prefix(
         &self,
         request: MatchExternalKvPrefixRequest,
@@ -1581,10 +1529,9 @@ mod tests {
         assert!(delta_events(&translated).is_empty());
     }
 
-    /// The pending registration rides the batch's first request whatever it
-    /// is. A reporter Tair KVCache has forgotten fails its very first delta when the
-    /// registration was left behind on the clear's snapshot (one request too
-    /// late), and the batch is lost.
+    /// The pending registration rides the batch's first request whatever it is:
+    /// left behind on a clear's snapshot it would arrive one request too late,
+    /// and a forgotten reporter would fail that first delta and lose the batch.
     #[test]
     fn translate_batch_registers_on_the_first_request_of_a_batch() {
         let clear = || ExternalKvAction {
