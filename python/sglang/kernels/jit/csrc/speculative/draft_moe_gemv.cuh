@@ -659,7 +659,8 @@ __global__ void __launch_bounds__(256) draft_router_kernel(const DraftRouterPara
     const float l = __ldcg(p.logits + i * kWarpThreads + lane);
     v[i] = l == l ? l : -1e30f;
     row_max = fmaxf(row_max, v[i]);
-    const uint32_t b = __float_as_uint(cast<fp32_t>(cast<bf16_t>(v[i]))) >> 16;
+    uint32_t b = __float_as_uint(cast<fp32_t>(cast<bf16_t>(v[i]))) >> 16;
+    b = b == 0x8000u ? 0u : b;  // -0.0 ties with +0.0, as in a float compare
     const uint32_t ord = (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u);
     key[i] = (ord << 16) | (0xffffu - static_cast<uint32_t>(i * kWarpThreads + lane));
   }
