@@ -20,7 +20,7 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
-Choose your **Hardware Platform** and **Quantization** below. The default is **B300 / NVFP4**. Each combination uses its default deployment recipe; use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
+Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps the existing deployment settings; **High Throughput** removes all speculative decoding parameters. Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";

@@ -1,5 +1,5 @@
 // Muse Spark Open Deployment recipes preserve the original default commands.
-// Hardware and quantization are the only Deployment selectors; tuning lives
+// Deployment selects hardware, quantization, and strategy; further tuning lives
 // in Playground. NVIDIA uses FA4, MI355X uses Triton for DFlash draft attention.
 // Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node with
 // Marlin W4A16 experts and BF16 at TP16 across two nodes; it has no
@@ -13,6 +13,14 @@ export const config = {
   showPlaygroundLink: false,
 
   matchDims: [
+    {
+      id: "strategy",
+      title: "Strategy",
+      options: [
+        { id: "low-latency", label: "Low Latency", subtitle: "Current defaults" },
+        { id: "high-throughput", label: "High Throughput", subtitle: "Spec decode off" },
+      ],
+    },
     {
       id: "quant",
       title: "Quantization",
@@ -215,7 +223,7 @@ export const config = {
       },
       {
         id: "speculative", title: "Speculative Decoding",
-        default: (s) => s.hw === "xeon" ? "off" : "dflash-v2",
+        default: (s) => s.hw === "xeon" || s.strategy === "high-throughput" ? "off" : "dflash-v2",
         stripPrefixes: [
           "--speculative-algorithm", "--speculative-draft-model-path",
           "--speculative-draft-attention-backend", "--speculative-num-draft-tokens",
@@ -596,5 +604,16 @@ export const config = {
         "--tool-call-parser muse",
       ],
     },
-  ],
+  ].flatMap((cell) => [
+    {
+      ...cell,
+      match: { ...cell.match, strategy: "low-latency" },
+    },
+    {
+      ...cell,
+      match: { ...cell.match, strategy: "high-throughput" },
+      verified: false,
+      flags: cell.flags.filter((flag) => !flag.startsWith("--speculative-")),
+    },
+  ]),
 };
