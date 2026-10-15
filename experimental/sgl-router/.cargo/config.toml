@@ -1,0 +1,8 @@
+# jemalloc (the binary's global allocator) fixes its page size at build time.
+# Left to detect it, a native build takes the build host's page size and a cross
+# build assumes 4 KiB, and either binary aborts at its first allocation on a
+# 64 KiB-page arm64 kernel. Pin 64 KiB for every arm64 Linux build, Docker or
+# not; it also runs on 4 KiB and 16 KiB kernels. The target-prefixed name is the
+# one tikv-jemalloc-sys reads first, so other targets are untouched.
+[env]
+AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE = "16"

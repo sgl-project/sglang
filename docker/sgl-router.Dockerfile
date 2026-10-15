@@ -66,6 +66,8 @@ ENV PCRE2_SYS_STATIC=1
 COPY --from=chef /work/recipe.json ./recipe.json
 COPY --from=chef /work/Cargo.lock ./Cargo.lock
 COPY experimental/sgl-router/rust-toolchain.toml ./
+# Build-time env the dep cook needs too: jemalloc's page size on arm64.
+COPY experimental/sgl-router/.cargo ./.cargo
 
 # Cook (compile + cache) the dep graph from the recipe. This layer's
 # inputs are recipe.json + the toolchain — code changes in src/ do NOT

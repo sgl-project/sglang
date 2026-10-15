@@ -1999,12 +1999,11 @@ fn build_outgoing_body(
             serde_json::Value::Number(b.room.into()),
         );
     }
-    let mut bytes = serde_json::to_vec(&obj).map_err(|e| {
+    // A u32 id is at most 10 digits plus its comma; 256 covers rid + bootstrap.
+    let size_hint = body.len() + input_ids.map_or(0, |ids| ids.len() * 11) + 256;
+    let bytes = crate::protocol::exact_json(&obj, size_hint).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
     })?;
-    // Held until the dispatch returns (the whole generation for a
-    // non-streaming request), so drop the Vec's doubling slack first.
-    bytes.shrink_to_fit();
     Ok(Bytes::from(bytes))
 }
 
@@ -3519,6 +3518,21 @@ mod tests {
             parsed.get("messages").is_some(),
             "messages must be retained alongside input_ids"
         );
+    }
+
+    /// A re-serialized engine body is held for the whole dispatch, so it must
+    /// not carry spare capacity (`to_vec` leaves some at any size). The ~3 MiB
+    /// pad stands in for an image-carrying body.
+    #[test]
+    fn build_outgoing_body_carries_no_doubling_slack() {
+        let body = Bytes::from(
+            serde_json::json!({"messages": [], "pad": "x".repeat(3 * 1024 * 1024 + 12_345)})
+                .to_string(),
+        );
+        let ids = [1u32, 2, 3];
+        let out = build_outgoing_body(&body, None, Some(&ids), None, None).unwrap();
+        let out = out.try_into_mut().expect("the test holds the only handle");
+        assert_eq!(out.capacity(), out.len());
     }
 
     /// With nothing to inject, the original bytes are forwarded unchanged

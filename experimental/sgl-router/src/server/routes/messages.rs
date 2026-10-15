@@ -17,6 +17,7 @@ use crate::discovery::ModelId;
 use crate::protocol::anthropic::{
     self, response::chat_to_message, stream::MessagesStream, EchoContext,
 };
+use crate::protocol::exact_json;
 use crate::protocol::transduce_body;
 use crate::server::app::RequestPhaseCell;
 use crate::server::app_context::AppContext;
@@ -39,7 +40,12 @@ pub(crate) async fn messages(
     converted.echo.hide_thinking = ctx.config.model.profile.messages.thinking_blocks
         == crate::profile::ThinkingBlocks::OnRequest
         && !converted.echo.thinking_requested;
-    let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
+    let anthropic::Converted { chat, echo, stream } = converted;
+    let chat_body = Bytes::from(exact_json(&chat, body.len()).expect("serialize chat"));
+    // The chat body is all the dispatch needs. Holding the Anthropic body and
+    // its conversion across the generation would keep two more copies of a
+    // possibly multi-MiB (image-carrying) request alive.
+    drop((chat, body));
     let chat_body = match ctx
         .config
         .model
@@ -61,7 +67,7 @@ pub(crate) async fn messages(
         Ok(r) => r,
         Err(e) => e.into_response(),
     };
-    adapt(resp, Some((converted.echo, converted.stream))).await
+    adapt(resp, Some((echo, stream))).await
 }
 
 /// Exact with the model's chat encoder, approximate without.

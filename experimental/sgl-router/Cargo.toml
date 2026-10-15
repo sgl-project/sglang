@@ -146,10 +146,6 @@ sha2 = "0.10"
 url = "2"
 
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
-
-# Global allocator for the binary (see `src/main.rs`).
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
 hmac = "0.12"
 hex = "0.4"
 
@@ -158,6 +154,17 @@ hex = "0.4"
 # in the binary when built with --features profiling, so the normal image
 # carries no profiling code or attack surface.
 pprof = { version = "0.13", features = ["flamegraph"], optional = true }
+
+# Global allocator for the binary (see `src/main.rs`). Background purging
+# threads are Linux-only in jemalloc, so the feature is enabled there alone.
+# These tables end `[dependencies]`: every key after a table header belongs to
+# that table, so a plain dependency listed below one is silently target-gated.
+# arm64 Linux builds pin jemalloc's page size in `.cargo/config.toml`.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "linux")))'.dependencies]
+tikv-jemallocator = "0.6"
 
 [features]
 profiling = ["pprof"]

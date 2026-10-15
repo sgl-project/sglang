@@ -12,6 +12,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Response};
 use axum::Extension;
 use bytes::Bytes;
 
+use crate::protocol::exact_json;
 use crate::protocol::responses::{
     self, response::chat_to_response, stream::ResponsesStream, EchoContext,
 };
@@ -33,11 +34,14 @@ pub(crate) async fn responses(
 ) -> Result<Response<Body>, ApiError> {
     let req: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
-    let converted = responses::to_chat(req).map_err(ApiError::BadRequest)?;
+    let responses::Converted { chat, echo, stream } =
+        responses::to_chat(req).map_err(ApiError::BadRequest)?;
     let chat_body = Bytes::from(
-        serde_json::to_vec(&converted.chat)
+        exact_json(&chat, body.len())
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("serialize chat request: {e}")))?,
     );
+    // As in `messages`: only the chat body rides along with the generation.
+    drop((chat, body));
     let chat_body = ctx
         .config
         .model
@@ -52,7 +56,7 @@ pub(crate) async fn responses(
         Surface::Chat,
     )
     .await?;
-    Ok(adapt(resp, converted.echo, converted.stream).await)
+    Ok(adapt(resp, echo, stream).await)
 }
 
 /// Keeps status, headers and extensions (access log); replaces the body.

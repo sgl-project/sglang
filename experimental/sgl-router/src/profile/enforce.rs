@@ -13,7 +13,12 @@ use serde_json::{Map, Value};
 
 use super::{lax_number, number, ApiProfile, OnExceed};
 use crate::config::SamplingField;
+use crate::protocol::exact_json;
 use crate::server::error::ApiError;
+
+/// Room past the incoming body's length for the fields a rewrite adds or
+/// replaces, so the re-serialization fits its first allocation.
+const REWRITE_HEADROOM: usize = 256;
 
 /// The (possibly rewritten) body and what the reply conversion must do.
 #[derive(Debug)]
@@ -131,11 +136,8 @@ impl ApiProfile {
         for (k, v) in &set {
             out.insert(k, Field::New(v.clone()));
         }
-        let mut bytes = serde_json::to_vec(&out)
+        let bytes = exact_json(&out, body.len() + REWRITE_HEADROOM)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("re-serialize request body: {e}")))?;
-        // The body lives as long as the request; don't let it carry the Vec's
-        // doubling slack (up to 2x a multi-MiB multimodal body) the whole time.
-        bytes.shrink_to_fit();
         Ok(Applied {
             body: Bytes::from(bytes),
             reasoning_general,
@@ -178,7 +180,7 @@ impl ApiProfile {
             None => Map::new(),
             Some(Value::Object(o)) => o,
             Some(_) if model.is_none() => return Ok(body),
-            Some(_) => return rewrite(&top, model, None),
+            Some(_) => return rewrite(&top, model, None, body.len()),
         };
         let mut changed = false;
 
@@ -241,15 +243,22 @@ impl ApiProfile {
         if !changed && model.is_none() {
             return Ok(body);
         }
-        rewrite(&top, model, changed.then_some(Value::Object(sp)))
+        rewrite(
+            &top,
+            model,
+            changed.then_some(Value::Object(sp)),
+            body.len(),
+        )
     }
 }
 
-/// Re-serialize `top` with `model` and/or `sampling_params` replaced.
+/// Re-serialize `top` (parsed from a body of `body_len` bytes) with `model`
+/// and/or `sampling_params` replaced.
 fn rewrite(
     top: &BTreeMap<String, &RawValue>,
     model: Option<Value>,
     sampling_params: Option<Value>,
+    body_len: usize,
 ) -> Result<Bytes, ApiError> {
     #[derive(Serialize)]
     #[serde(untagged)]
@@ -267,7 +276,7 @@ fn rewrite(
     if let Some(sp) = sampling_params {
         out.insert("sampling_params", Field::New(sp));
     }
-    serde_json::to_vec(&out)
+    exact_json(&out, body_len + REWRITE_HEADROOM)
         .map(Bytes::from)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("re-serialize request body: {e}")))
 }
@@ -324,6 +333,25 @@ mod tests {
             body,
             "nothing changed, nothing re-serialized"
         );
+    }
+
+    /// Rewritten bodies are held for the whole request, so they must not carry
+    /// spare capacity (`to_vec` leaves some at any size). The ~3 MiB pad stands
+    /// in for an image-carrying body.
+    #[test]
+    fn rewritten_bodies_carry_no_doubling_slack() {
+        let is_exact = |b: Bytes| {
+            let b = b.try_into_mut().expect("the test holds the only handle");
+            b.capacity() == b.len()
+        };
+        let pad = "x".repeat(3 * 1024 * 1024 + 12_345);
+        let p = profile("params:\n  temperature: {default: 0.7}\n");
+        let chat = json!({"model": "m", "messages": [], "pad": pad}).to_string();
+        assert!(is_exact(p.apply(Bytes::from(chat), "m").unwrap().body));
+        let generate = json!({"text": "hi", "pad": pad}).to_string();
+        assert!(is_exact(
+            p.apply_generate(Bytes::from(generate), "m").unwrap()
+        ));
     }
 
     #[test]

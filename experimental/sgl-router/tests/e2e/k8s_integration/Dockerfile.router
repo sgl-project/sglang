@@ -14,7 +14,8 @@ ENV RUSTUP_TOOLCHAIN=1.90.0
 
 WORKDIR /build
 
-# Copy just the sgl-router crate (context is the repo root)
+# Copy just the sgl-router crate (context is the repo root). Its
+# `.cargo/config.toml` pins jemalloc's page size for arm64 builds.
 COPY experimental/sgl-router /build/experimental/sgl-router
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

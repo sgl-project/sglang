@@ -118,6 +118,21 @@ pub(crate) fn data_payload(line: &[u8]) -> Option<serde_json::Value> {
     }
 }
 
+/// Serialize a request body into an exactly-sized buffer. Request bodies live
+/// until the dispatch returns (a whole generation, for a non-streaming request)
+/// and a multimodal one runs to MiBs, so the `Vec`'s growth slack (up to the
+/// body's size again) must not ride along with it. `size_hint` is the expected
+/// length (the body being rewritten), so a MiB-sized body is written into one
+/// allocation rather than grown by repeated doubling.
+pub(crate) fn exact_json<T: serde::Serialize + ?Sized>(
+    value: &T,
+    size_hint: usize,
+) -> serde_json::Result<Box<[u8]>> {
+    let mut buf = Vec::with_capacity(size_hint);
+    serde_json::to_writer(&mut buf, value)?;
+    Ok(buf.into_boxed_slice())
+}
+
 pub(crate) fn write_event(out: &mut Vec<u8>, event: &str, data: &serde_json::Value) {
     out.extend_from_slice(b"event: ");
     out.extend_from_slice(event.as_bytes());
