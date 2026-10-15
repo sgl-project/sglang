@@ -358,7 +358,9 @@ drun --env "HF_TOKEN=<secret>" \
 ```bash Command
 # Create a shortcut 'drun' to launch a privileged Docker container
 # The 950PR/DT Series exposes 8 devices: /dev/davinci0 through /dev/davinci7
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --env ASCEND_USE_FIA=1 \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci_manager --device=/dev/hisi_hdc \
@@ -412,6 +414,10 @@ cat /proc/sys/vm/swappiness # shows 10
 ```
 
 ## Running SGLang Service
+
+<Note>
+On the 950PR/DT Series, make sure `ASCEND_USE_FIA=1` is set before launching the server.
+</Note>
 
 ### Running Service For Large Language Models
 
