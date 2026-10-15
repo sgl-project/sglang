@@ -161,7 +161,7 @@ def install_monokernel_forward(
             spec is not None,
             spec_registered(backend=backend, architectures=archs),
             why,
-            None if spec is None else (spec.name, spec.api),
+            None if spec is None else (spec.name, spec.api_version),
         )
     )
     if not any(is_registered for _, is_registered, _, _ in lookups):
@@ -179,8 +179,8 @@ def install_monokernel_forward(
         raise ValueError(
             f"--monokernel-backend {backend}: the ranks load different specs: "
             + "; ".join(
-                f"rank {rank}: {name} (API {api})"
-                for rank, (*_, (name, api)) in enumerate(lookups)
+                f"rank {rank}: {name} (API version {api_version})"
+                for rank, (*_, (name, api_version)) in enumerate(lookups)
             )
         )
 

@@ -12,8 +12,8 @@ import msgspec
 if TYPE_CHECKING:
     import torch
 
-# Version the spec, build context, shape key, and built-forward contracts together.
-API_VERSION = 1
+# bumped on any breaking change to the contracts in this module
+MONOKERNEL_API_VERSION = 1
 
 
 class Feature(enum.Enum):
@@ -138,7 +138,7 @@ class MonoSpec(msgspec.Struct, frozen=True):
     # (model, hf_config, copies): after load, with the load hook's copies
     model_disable_reasons: Callable[[torch.nn.Module, Any, dict], list[str]]
     build: Callable[[torch.nn.Module, Any, BuildContext], BuiltMonokernels]
-    api: int  # the API_VERSION this spec is written against
+    api_version: int  # the MONOKERNEL_API_VERSION this spec is written against
     # (cfg, hf_config), before load: the checks requires cannot state
     config_disable_reasons: Optional[Callable[[Any, Any], list[str]]] = None
     # (copies, model, name, tensor): retain weights before model-specific conversion
@@ -196,10 +196,10 @@ def find_spec(
             continue
         if not isinstance(spec, MonoSpec):
             why.append(f"{path} is not a MonoSpec")
-        elif spec.api != API_VERSION:
+        elif spec.api_version != MONOKERNEL_API_VERSION:
             why.append(
-                f"{path} is written for monokernel API {spec.api}, this SGLang "
-                f"has {API_VERSION}"
+                f"{path} uses monokernel API version {spec.api_version}; this "
+                f"SGLang requires version {MONOKERNEL_API_VERSION}"
             )
         elif isa in spec.devices:
             return spec, ""

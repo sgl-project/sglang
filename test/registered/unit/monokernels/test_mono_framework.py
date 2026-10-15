@@ -80,10 +80,10 @@ SPEC = MonoSpec(
     ),
     model_disable_reasons=lambda model, hf, copies: [],
     build=lambda model, hf, ctx: FakeBuilt(),
-    api=registry.API_VERSION,
+    api_version=registry.MONOKERNEL_API_VERSION,
     load_tensor=_load_tensor,
 )
-OLD_SPEC = replace(SPEC, api=registry.API_VERSION - 1)
+OLD_SPEC = replace(SPEC, api_version=registry.MONOKERNEL_API_VERSION - 1)
 
 
 def server_args(**kw):
@@ -164,7 +164,8 @@ class TestMonokernelFramework(CustomTestCase):
         register(architecture="Old", path=f"{__name__}:OLD_SPEC")
         find = partial(registry.find_spec, backend=BACKEND)
         self.assertIs(find(architectures=[ARCH], isa="gfx950")[0], SPEC)
-        api = f"API {registry.API_VERSION - 1}, this SGLang has {registry.API_VERSION}"
+        version = registry.MONOKERNEL_API_VERSION
+        api = f"API version {version - 1}; this SGLang requires version {version}"
         for archs, isa, why in (
             ([ARCH], "gfx942", "has no spec"),
             (["Other"], "gfx950", "has no spec"),
@@ -322,11 +323,11 @@ class TestMonokernelFramework(CustomTestCase):
 
     def test_every_rank_takes_the_same_lookup_branch(self):
         # every rank refuses together: one returning alone would hang its peers
-        ours = (True, True, "", (SPEC.name, SPEC.api))
+        ours = (True, True, "", (SPEC.name, SPEC.api_version))
         with self.assertRaisesRegex(ValueError, "rank 1: broken"):
             install(archs=[ARCH], lookups=[ours, (False, True, "broken", None)])
         # ranks that load different specs (another plugin version) must not pair up
-        other = (True, True, "", ("fake_v2", SPEC.api))
+        other = (True, True, "", ("fake_v2", SPEC.api_version))
         with self.assertRaisesRegex(ValueError, "the ranks load different specs"):
             install(archs=[ARCH], lookups=[ours, other])
         # a model the backend registers no spec for keeps its forward on every rank
