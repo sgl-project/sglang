@@ -287,8 +287,8 @@ class LogitsProcessorOutput:
             return
         self.input_logprobs_copy_done.synchronize()
         self.input_logprobs_copy_done = None
-        # Only borrowed results contain spans within each sequence. Other
-        # producers (including multi-item scoring) keep their existing layout.
+        # An input-copy event identifies staged spans within each sequence.
+        # Other producers (including multi-item scoring) keep their layout.
         for sequences in (
             self.input_top_logprobs_val,
             self.input_top_logprobs_idx,
