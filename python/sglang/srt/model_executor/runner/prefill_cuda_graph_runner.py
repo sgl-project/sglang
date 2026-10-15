@@ -2104,6 +2104,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         full_path = self._is_full_backend
 
         def replay_layer_forward(*args, **layer_kwargs):
+            # The eager wrapper may remap multimodal hash placeholders to model
+            # token IDs. The captured body must see those IDs as well as the
+            # composed embeddings (e.g. for visual MoE routing and Engram masks).
+            # Update only the private static buffer, leaving scheduler IDs intact.
+            prepared_ids = layer_kwargs.get("input_ids")
+            if prepared_ids is None and args:
+                prepared_ids = args[0]
+            if (
+                prepared_ids is not None
+                and prepared_ids.data_ptr() != static_forward_batch.input_ids.data_ptr()
+            ):
+                static_forward_batch.input_ids[: prepared_ids.shape[0]].copy_(
+                    prepared_ids
+                )
             # The captured body graph reads activations from the static
             # input_embeds slot. The outer model.forward (run eagerly)
             # passes the live embeddings into layer_model.forward as the
