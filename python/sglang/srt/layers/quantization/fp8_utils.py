@@ -54,6 +54,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.utils import LazyImport
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -252,7 +253,9 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module.
+    _raw_bmm_fp8_batched = LazyImport("flashinfer", "bmm_fp8")
 
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
     def _bmm_fp8_batched_op(
