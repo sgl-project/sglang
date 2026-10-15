@@ -1,7 +1,7 @@
 import pickle
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import DEFAULT, MagicMock, patch
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.beam_search.types import BeamSearchSequence
+from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
@@ -197,6 +198,28 @@ def _make_router() -> MultiDetokenizerRouter:
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
+    def test_router_cpu_metric_started_only_when_enabled(self):
+        for enabled in (False, True):
+            with self.subTest(enable_metrics=enabled):
+                with (
+                    patch.multiple(
+                        multi_tokenizer_mixin,
+                        kill_itself_when_parent_died=DEFAULT,
+                        configure_logger=DEFAULT,
+                        MultiDetokenizerRouter=DEFAULT,
+                        start_cpu_monitor_thread=DEFAULT,
+                    ) as mocks,
+                    patch("setproctitle.setproctitle"),
+                    patch("psutil.Process"),
+                ):
+                    multi_tokenizer_mixin.run_multi_detokenizer_router_process(
+                        [], None, None, enable_metrics=enabled
+                    )
+
+                self.assertEqual(
+                    mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
+                )
+
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
 
