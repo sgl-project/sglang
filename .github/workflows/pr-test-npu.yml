@@ -382,7 +382,7 @@ jobs:
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         # bash only: the k8s runner pool defaults to `sh -e`, which lacks
         # `[[` and mapfile — under sh the coverage branch silently falls
-        # through to the PR-mode path below.
+        # through to the PR-mode path below
         shell: bash
         run: |
           # Coverage mode: enumerate case-level pytest node ids and run each
