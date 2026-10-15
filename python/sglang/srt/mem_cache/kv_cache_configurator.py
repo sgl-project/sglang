@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
+    Step5HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
@@ -2636,6 +2637,13 @@ class KVCacheConfigurator:
             if get_memory().enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
+                    token_to_kv_pool_allocator
+                )
+            elif (
+                get_memory().enable_hisparse
+                and get_step5_text_config(self.model_config.hf_config) is not None
+            ):
+                token_to_kv_pool_allocator = Step5HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator
                 )
 

@@ -53,6 +53,7 @@ class TestHiSparseDecodeRemap(CustomTestCase):
         )
         coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
         coordinator.is_dsv4_hisparse = False
+        coordinator.is_compressed_hisparse = False
         coordinator.mem_pool_device = pool.main_pool
         coordinator.token_to_kv_pool_allocator = allocator
         coordinator.device_buffer_size = 2

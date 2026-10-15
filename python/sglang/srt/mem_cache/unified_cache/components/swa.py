@@ -71,16 +71,16 @@ class SWAComponent(TreeComponent):
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         from sglang.srt.mem_cache.allocator.hisparse import (
-            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+            CompressedHiSparseTokenToKVPoolAllocator,
         )
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
-        # DeepSeek V4 HiSparse forces --disable-radix-cache, where this component
-        # only frees through free_swa_segment / free / free_group_*, which the
+        # HiSparse forces --disable-radix-cache, where this component only frees
+        # through free_swa_segment / free / free_group_*, which the compressed
         # HiSparse allocator defines.
         assert isinstance(
             params.token_to_kv_pool_allocator,
-            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+            (SWATokenToKVPoolAllocator, CompressedHiSparseTokenToKVPoolAllocator),
         ), (
             f"SWAComponent requires an SWA allocator, got {type(params.token_to_kv_pool_allocator)}"
         )

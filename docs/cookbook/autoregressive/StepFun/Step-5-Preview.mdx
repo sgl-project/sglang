@@ -74,6 +74,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **First start.** The first launch compiles FlashInfer modules (about 15 minutes on B300); later launches take about 6 minutes. Persist `FLASHINFER_WORKSPACE_BASE` and `~/.cache/sglang` across restarts.
 - **H200.** The FP8 weights (about 650 GB) do not fit TP4 on H200, so the H200 recipe uses TP8/EP8 with FA3 attention and Triton MoE.
 - **HiCache.** Size `--hicache-ratio` to the host memory available per rank. On B300 with TP8, a ratio of 1.5 fits.
+- **HiSparse.** On a PD decode instance without MTP, `--enable-hisparse --disable-radix-cache --hisparse-config='{"top_k": 513, "device_buffer_size": 1024, "host_to_device_ratio": 4}'` keeps full-attention KV in host memory and only a per-request working set of 8-token regions on GPU. `device_buffer_size` counts regions (at least 513, a multiple of 8), and the ratio must be an integer. BF16 KV cache only; see the [HiSparse guide](../../../docs/advanced_features/hisparse_guide).
 
 ## 3. Advanced Usage
 

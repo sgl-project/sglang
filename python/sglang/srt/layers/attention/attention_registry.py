@@ -407,6 +407,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 if spec.speculative_algorithm is not None
                 else 1
             ),
+            hisparse_coordinator=runner.hisparse_coordinator,
         )
 
     if isinstance(runner.model_config.hf_text_config, Dots3Config):

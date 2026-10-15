@@ -11,7 +11,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_pool_entry,
     register_stack_strategy,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, unwrap_write_loc
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    _set_kv_buffer_impl,
+    unwrap_write_loc,
+)
 from sglang.srt.mem_cache.swa_memory_pool import GB, SWAKVPool
 
 logger = logging.getLogger(__name__)
@@ -158,6 +162,103 @@ class Step5Fp8FullKVPool(MHATokenToKVPool):
         )
 
 
+class Step5HiSparseFullKVPool(MHATokenToKVPool):
+    """HiSparse FULL KV whose device rows are whole regions, the unit moved to host.
+
+    Sizes, pages and indices of this pool count regions; logical FULL locations
+    reach a device region through the HiSparse mapping. Attention reads the
+    same storage as [slots, heads, head_dim] token rows.
+    """
+
+    # Step5 indexer region size, fixed by its kernels.
+    region_size = 8
+
+    def __init__(self, *, size, page_size, head_num, head_dim, **kwargs):
+        self.token_head_num = head_num
+        self.token_head_dim = head_dim
+        super().__init__(
+            size=size // self.region_size,
+            page_size=page_size // self.region_size,
+            head_num=1,
+            head_dim=self.region_size * head_num * head_dim,
+            **kwargs,
+        )
+        self.full_to_hisparse_device_index_mapping = None
+
+    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
+        self.full_to_hisparse_device_index_mapping = (
+            full_to_hisparse_device_index_mapping
+        )
+
+    def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
+        # Logical pages are region-aligned, so a region's first token names it.
+        return full_indices[full_indices % self.region_size == 0] // self.region_size
+
+    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+        return self.full_to_hisparse_device_index_mapping[compressed_indices]
+
+    _translate_loc_to_hisparse_device = translate_loc_to_hisparse_device
+
+    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
+        return self.translate_loc_to_hisparse_device(
+            self.translate_loc_from_full_to_compressed(full_indices)
+        )
+
+    def _token_rows(self, region_rows: torch.Tensor) -> torch.Tensor:
+        return region_rows.view(-1, self.token_head_num, self.token_head_dim)
+
+    def _get_key_buffer(self, layer_id: int):
+        return self._token_rows(super()._get_key_buffer(layer_id))
+
+    def _get_value_buffer(self, layer_id: int):
+        return self._token_rows(super()._get_value_buffer(layer_id))
+
+    def set_kv_buffer(
+        self,
+        layer,
+        loc_info,
+        cache_k,
+        cache_v,
+        k_scale=None,
+        v_scale=None,
+        layer_id_override=None,
+        dcp_kv_mask=None,
+    ):
+        if dcp_kv_mask is not None:
+            raise NotImplementedError("Step5 HiSparse FULL KV does not support DCP")
+        loc, _, _ = unwrap_write_loc(loc_info)
+        device_regions = self.translate_loc_to_hisparse_device(loc // self.region_size)
+        device_loc = device_regions * self.region_size + loc % self.region_size
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        k_rows = self._get_key_buffer(layer_id)
+        _set_kv_buffer_impl(
+            cache_k,
+            cache_v,
+            k_rows,
+            self._get_value_buffer(layer_id),
+            device_loc,
+            row_dim=self.token_head_num * self.token_head_dim,
+            store_dtype=self.store_dtype,
+            device_module=self.device_module,
+            size_limit=k_rows.shape[0],
+            alt_stream=self.alt_stream,
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        raise NotImplementedError(
+            "Step5 HiSparse FULL KV does not support get_cpu_copy"
+        )
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        raise NotImplementedError(
+            "Step5 HiSparse FULL KV does not support load_cpu_copy"
+        )
+
+
 def _require_outside_capture(device: torch.device) -> None:
     if device.type == "cuda":
         with torch.cuda.device(device):
@@ -247,6 +348,7 @@ class Step5TokenToKVPool(SWAKVPool):
         token_to_kv_pool_class: type[MHATokenToKVPool] = MHATokenToKVPool,
         post_capture_active: bool = False,
         full_kv_fp8: bool = False,
+        full_logical_size: int | None = None,
     ):
         # Kernel layout constraints; engine configuration owns device, layer
         # selection and int32 address-capacity validation.
@@ -254,6 +356,19 @@ class Step5TokenToKVPool(SWAKVPool):
             raise ValueError("Step5 indexer kernels require P64/R8/D256")
         if size <= 0 or size % page_size:
             raise ValueError("Step5 requires a positive, page-aligned capacity")
+        # HiSparse keeps `size` FULL tokens on device; logical locations and
+        # the index keys over them span the larger `full_logical_size`.
+        hisparse = full_logical_size is not None
+        full_logical_size = full_logical_size if hisparse else size
+        if full_logical_size < size or full_logical_size % page_size:
+            raise ValueError("Step5 logical FULL capacity must cover the device pages")
+        if hisparse and full_kv_fp8:
+            raise ValueError("Step5 HiSparse requires BF16 FULL KV")
+        full_kv_pool_class = None
+        if full_kv_fp8:
+            full_kv_pool_class = Step5Fp8FullKVPool
+        elif hisparse:
+            full_kv_pool_class = Step5HiSparseFullKVPool
         if num_req_slots < 2:
             raise ValueError("num_req_slots must include padding and a usable slot")
         if index_ring_size < compression_ratio or index_ring_size % compression_ratio:
@@ -284,12 +399,13 @@ class Step5TokenToKVPool(SWAKVPool):
             enable_alt_stream=enable_alt_stream,
             kv_cache_layout=kv_cache_layout,
             token_to_kv_pool_class=token_to_kv_pool_class,
-            full_kv_pool_class=Step5Fp8FullKVPool if full_kv_fp8 else None,
+            full_kv_pool_class=full_kv_pool_class,
             post_capture_active=post_capture_active,
         )
         self.full_kv_fp8 = full_kv_fp8
+        self.full_logical_size = full_logical_size
         self.dsa_layer_ids = tuple(full_attention_layer_ids)
-        self.full_num_pages = size // page_size + 1
+        self.full_num_pages = full_logical_size // page_size + 1
         self.num_req_slots = num_req_slots
         self.index_head_dim = index_head_dim
         self.compression_ratio = compression_ratio
