@@ -395,6 +395,7 @@ pub enum PoolName {
     Kv,
     Mamba,
     Swa,
+    AuxiliarySwa,
     Indexer,
     DeepseekV4C4,
     DeepseekV4C4Indexer,
