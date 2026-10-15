@@ -9,6 +9,12 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Ovis/Ovis-Image",
     },
     {
+      name: "MOSS-Image",
+      modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
+      cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
+      note: "Base is the reference checkpoint; SFT checkpoint validation is pending.",
+    },
+    {
       name: "HunyuanImage-3.0",
       modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
       cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
@@ -35,6 +41,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "black-forest-labs/FLUX.2-klein-base-9B",
       ],
       cookbook: "/cookbook/diffusion/FLUX/FLUX",
+    },
+    {
+      name: "FLUX.3 Image",
+      modelIds: ["black-forest-labs/flux-3-image-klein", "black-forest-labs/flux-3-image-klein-base"],
+      cookbook: "/cookbook/diffusion/FLUX/FLUX.3",
     },
     {
       name: "Qwen-Image",

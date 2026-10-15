@@ -251,6 +251,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "AnimaPipelineConfig",
+        "Flux3ImagePipelineConfig",
         "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
@@ -269,6 +270,13 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "ZImagePipelineConfig",
         "Flux2KleinPipelineConfig",
     }
+)
+
+# Pipeline configs identified purely by ``--pipeline-class-name`` (their weights
+# are local paths, not HuggingFace ids), so the model-id whitelist does not
+# apply: selecting the pipeline is already an explicit opt-in.
+BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS = frozenset(
+    {"Flux3ImagePipelineConfig"}
 )
 
 
@@ -818,7 +826,11 @@ class ServerArgs(DisaggServerArgsMixin):
         # branches on Python-side state replays its capture-time branch.
         if not (
             pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
-            and self._is_breakable_cuda_graph_supported_model()
+            and (
+                pipeline_config_name
+                in BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS
+                or self._is_breakable_cuda_graph_supported_model()
+            )
         ):
             if pipeline_config is not None:
                 pipeline_config.validate_breakable_cuda_graph(self)
@@ -826,7 +838,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "[Diffusion BCG] not validated for %s (%s); enabling it as "
                 "requested. Warmup warns if nothing gets captured; compare outputs "
                 "against eager before relying on it. Validated: Anima Base v1.0, "
-                "FLUX.1-dev, FLUX.2-Klein, "
+                "FLUX.1-dev, FLUX.2-Klein, FLUX.3 Image Klein, "
                 "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
                 "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
                 "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, "
@@ -834,7 +846,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 pipeline_config_name,
                 self.model_path,
             )
-        if not self.warmup_resolutions:
+        # ComfyUI requests carry the sampler's tensors, which a synthetic warmup
+        # cannot build; the ComfyUI step stage captures on its first real step.
+        if not self.warmup_resolutions and not self.comfyui_mode:
             self._default_bcg_warmup_resolution()
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
@@ -1514,7 +1528,11 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # BCG captures every graph during a synthetic warmup forward at startup
         # so serving never records a fresh graph.
-        if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
+        if (
+            self.enable_breakable_cuda_graph
+            and self.disagg_role == RoleType.MONOLITHIC
+            and not self.comfyui_mode
+        ):
             self.warmup_mode = "server"
 
         # Disaggregated roles do not host the HTTP startup request. Preserve
