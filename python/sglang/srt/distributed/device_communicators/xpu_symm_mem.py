@@ -7,6 +7,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.device_communicators.all_reduce_utils import (
+    XPU_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
+)
 from sglang.srt.distributed.device_communicators.symm_mem_workspace import (
     SymmMemWorkspace,
     all_ranks_agree,
@@ -31,6 +34,8 @@ class XpuSymmMemCommunicator:
         self.workspace: Optional[SymmMemWorkspace] = None
         self.max_bytes = 0
         self._staging = {}
+        self._counter: Optional[torch.Tensor] = None
+        self._snapshot: Optional[torch.Tensor] = None
         if isinstance(device, int):
             device = torch.device(f"xpu:{device}")
         elif isinstance(device, str):
@@ -48,23 +53,29 @@ class XpuSymmMemCommunicator:
         )
 
         max_bytes = envs.SGLANG_XPU_SYMM_MEM_MAX_BYTES.get()
+        if max_bytes is None:
+            max_bytes = XPU_SYMM_MEM_ALL_REDUCE_MAX_SIZES.get(self.world_size, 0)
         # The buffer is reinterpreted as every supported dtype, so keep it
         # aligned to the widest element (fp32).
         self.max_bytes = max_bytes - max_bytes % 4
         if self.max_bytes <= 0:
-            logger.warning(
-                "XpuSymmMemCommunicator: SGLANG_XPU_SYMM_MEM_MAX_BYTES=%d leaves "
-                "no usable buffer, communicator is not available.",
-                max_bytes,
+            logger.info(
+                "XpuSymmMemCommunicator: no payload ceiling for world size %d "
+                "(SGLANG_XPU_SYMM_MEM_MAX_BYTES=%s); communicator is not available.",
+                self.world_size,
+                envs.SGLANG_XPU_SYMM_MEM_MAX_BYTES.get(),
             )
             return
 
+        # Two staging halves of max_bytes each; consecutive calls alternate.
         workspace = SymmMemWorkspace.create(
             group=group,
             device=device,
-            nbytes=self.max_bytes,
+            nbytes=2 * self.max_bytes,
             owner="XpuSymmMemCommunicator",
         )
+        self._counter = torch.zeros(1, dtype=torch.int32, device=device)
+        self._snapshot = torch.zeros(1, dtype=torch.int32, device=device)
         # Agreed on every rank, including one whose rendezvous failed alone:
         # ranks that disagree would diverge on every later all-reduce.
         ready = workspace is not None and self._compile_kernel(workspace)
@@ -84,16 +95,22 @@ class XpuSymmMemCommunicator:
         )
 
     def _compile_kernel(self, workspace: SymmMemWorkspace) -> bool:
-        """Build the Triton specialization up front, so a build failure becomes
-        a fallback here instead of an error on a forward pass. Reads only
-        buffers rendezvous already mapped, so no barrier is involved."""
+        """Build both kernels for every supported dtype up front, so a build
+        failure becomes a fallback here instead of an error on a forward pass.
+        Every rank runs the same calls, so the call counters stay in step."""
         from sglang.srt.hardware_backend.xpu.kernels.comm.one_shot_all_reduce import (
-            one_shot_all_reduce,
+            SUPPORTED_DTYPES,
         )
 
         try:
-            probe = torch.empty(64, dtype=torch.bfloat16, device=self.device)
-            one_shot_all_reduce(workspace.peer_ptrs, probe, self.world_size)
+            for dtype in SUPPORTED_DTYPES:
+                probe = torch.zeros(64, dtype=dtype, device=self.device)
+                self._stage_and_reduce(
+                    workspace=workspace,
+                    inp=probe,
+                    out=probe,
+                    staging=workspace.buffer.view(dtype),
+                )
             torch.xpu.synchronize()
         except Exception as e:
             logger.warning(
@@ -128,21 +145,41 @@ class XpuSymmMemCommunicator:
         default collective. ``out=inp`` reduces in place: peers read the staging
         copy, not ``out``.
         """
-        from sglang.srt.hardware_backend.xpu.kernels.comm.one_shot_all_reduce import (
-            one_shot_all_reduce,
-        )
-
         if not self.should_torch_symm_mem_allreduce(inp):
             return None
         if out is None:
             out = torch.empty_like(inp)
 
-        numel = inp.numel()
-        self._staging[inp.dtype][:numel].copy_(inp.view(-1))
-        # The first barrier publishes every rank's input before anyone reads its
-        # peers; the second stops the next call's staging write from racing a
-        # peer that is still reading this one.
-        self.workspace.barrier()
-        one_shot_all_reduce(self.workspace.peer_ptrs, out.view(-1), self.world_size)
-        self.workspace.barrier()
+        self._stage_and_reduce(
+            workspace=self.workspace,
+            inp=inp.view(-1),
+            out=out.view(-1),
+            staging=self._staging[inp.dtype],
+        )
         return out
+
+    def _stage_and_reduce(
+        self,
+        *,
+        workspace: SymmMemWorkspace,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        staging: torch.Tensor,
+    ) -> None:
+        from sglang.srt.hardware_backend.xpu.kernels.comm.one_shot_all_reduce import (
+            one_shot_all_reduce,
+            stage,
+        )
+
+        stage(inp=inp, staging=staging, counter=self._counter, snapshot=self._snapshot)
+        # Publishes every rank's input before anyone reads its peers. The next
+        # call stages into the other half, so no second barrier is needed.
+        workspace.barrier()
+        one_shot_all_reduce(
+            peer_ptrs=workspace.peer_ptrs,
+            out=out,
+            world_size=self.world_size,
+            half_numel=staging.numel() // 2,
+            counter=self._counter,
+            snapshot=self._snapshot,
+        )

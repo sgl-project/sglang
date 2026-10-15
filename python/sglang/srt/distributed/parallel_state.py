@@ -740,7 +740,8 @@ class GroupCoordinator:
             # (which invoke sycl_event.wait() and break XPU graph capture).
             # Keeps the operation in-place; the all-reduce is performed by
             # _all_reduce_in_place, which for XPU takes the symmetric-memory
-            # one-shot path for eligible payloads and otherwise falls through to
+            # one-shot path for eligible payloads in a captured graph and
+            # otherwise falls through to
             # torch.distributed.all_reduce on self.device_group (the same group
             # used by xpu_communicator).
             inplace_all_reduce(input_, group_name=self.unique_name)
@@ -1098,6 +1099,9 @@ class GroupCoordinator:
         elif (
             xpu_symm_mem_comm is not None
             and not xpu_symm_mem_comm.disabled
+            # Eager, its two Triton launches cost more than oneCCL at every
+            # size on Arc Pro B60; under graph replay it wins up to its ceiling.
+            and torch.xpu.is_current_stream_capturing()
             and xpu_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             xpu_symm_mem_comm.all_reduce(input_, out=input_)

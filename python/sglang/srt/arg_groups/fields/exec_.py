@@ -680,7 +680,7 @@ class ExecComm(msgspec.Struct):
     ] = False
     enable_torch_symm_mem: A[
         bool,
-        "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. On CUDA, only supports device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8. On Intel XPU, runs a one-shot all-reduce over IPC-mapped peer buffers for payloads up to SGLANG_XPU_SYMM_MEM_MAX_BYTES (world size up to 8, single node) and falls back to oneCCL otherwise.",
+        "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. On CUDA, only supports device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8. On Intel XPU, runs a one-shot all-reduce over IPC-mapped peer buffers inside captured XPU graphs, for payloads up to a per-world-size ceiling measured on Arc Pro B60 (64 KiB at 2 ranks, 32 KiB at 4 and 6; other world sizes stay on oneCCL unless SGLANG_XPU_SYMM_MEM_MAX_BYTES is set), and uses oneCCL otherwise.",
     ] = False
     enable_scattered_sconv: A[
         bool,
