@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -10,6 +12,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_admit_overlap import DEFER_PREALLOC, AdmitOverlap
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
@@ -18,6 +21,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     poll_and_all_reduce_with_staging,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -718,6 +722,84 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.queue, [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
+
+
+def _queue_scheduler():
+    scheduler = SimpleNamespace(
+        scheduler_stage_metrics=None,
+        enable_decode_hicache=False,
+        enable_hisparse=False,
+        waiting_queue=[],
+        polling_count=0,
+        polling_interval=1,
+        disagg_decode_transfer_queue=SimpleNamespace(
+            resolve_deferred_releases=MagicMock(),
+            pop_transferred=MagicMock(return_value=[]),
+            extend=MagicMock(),
+        ),
+        disagg_decode_prealloc_queue=SimpleNamespace(
+            resume_retracted_reqs=MagicMock(return_value=[]),
+            retracted_queue=[],
+            pop_preallocated=MagicMock(return_value=([], [])),
+        ),
+    )
+    scheduler._preallocate_new_requests = lambda: Scheduler._preallocate_new_requests(
+        scheduler
+    )
+    return scheduler
+
+
+class TestDeferredPrealloc(CustomTestCase):
+    def test_deferred_prealloc_is_left_to_the_loop(self):
+        """A deferring queue step must not preallocate itself (the loop does it once,
+        after the forward launch); otherwise it preallocates as before."""
+        disagg = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_polling_interval=1,
+        )
+        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            scheduler = _queue_scheduler()
+            self.assertTrue(
+                Scheduler.process_decode_queue(scheduler, defer_prealloc=True)
+            )
+            scheduler.disagg_decode_prealloc_queue.pop_preallocated.assert_not_called()
+
+            scheduler = _queue_scheduler()
+            self.assertFalse(Scheduler.process_decode_queue(scheduler))
+            scheduler.disagg_decode_prealloc_queue.pop_preallocated.assert_called_once()
+
+    def test_ctl_switches_between_iterations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = os.path.join(tmp, "admit")
+            overlap = AdmitOverlap(
+                static_flags=frozenset(), ctl_path=ctl, start_poller=False
+            )
+            # Missing control file: every switch off.
+            overlap._poll_ctl_once()
+            self.assertEqual(overlap.begin_iteration(), frozenset())
+            with open(ctl, "w") as f:
+                f.write("defer_prealloc bogus\n")
+            # An iteration keeps what the poller last read.
+            self.assertEqual(overlap.begin_iteration(), frozenset())
+            overlap._poll_ctl_once()
+            self.assertEqual(overlap.begin_iteration(), {DEFER_PREALLOC})
+            self.assertEqual(overlap.round_ct[DEFER_PREALLOC], 1)
+
+    def test_ctl_ignored_when_ranks_share_the_prealloc_poll(self):
+        # Ranks flipping at different iterations could reorder that collective.
+        queue = SimpleNamespace(gloo_group=SimpleNamespace(size=lambda: 2))
+        with (
+            envs.SGLANG_Q35MF_PDDEC_DEFER_PREALLOC.override(False),
+            envs.SGLANG_Q35MF_PDDEC_ADMIT_AB_CTL.override("/nonexistent/admit"),
+        ):
+            self.assertIsNone(AdmitOverlap.from_env(prealloc_queue=queue))
+        with (
+            envs.SGLANG_Q35MF_PDDEC_DEFER_PREALLOC.override(True),
+            envs.SGLANG_Q35MF_PDDEC_ADMIT_AB_CTL.override(""),
+        ):
+            overlap = AdmitOverlap.from_env(prealloc_queue=queue)
+            self.assertEqual(overlap.begin_iteration(), {DEFER_PREALLOC})
 
 
 if __name__ == "__main__":

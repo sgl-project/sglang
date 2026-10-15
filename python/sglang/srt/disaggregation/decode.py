@@ -43,6 +43,10 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.decode_admit_overlap import (
+    DEFER_PREALLOC,
+    AdmitOverlap,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -3066,6 +3070,9 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
+        admit_overlap = AdmitOverlap.from_env(
+            prealloc_queue=self.disagg_decode_prealloc_queue
+        )
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3084,7 +3091,16 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.process_decode_queue()
+            admit_flags = (
+                admit_overlap.begin_iteration()
+                if admit_overlap is not None
+                else frozenset()
+            )
+            if DEFER_PREALLOC in admit_flags:
+                prealloc_deferred = self.process_decode_queue(defer_prealloc=True)
+            else:
+                self.process_decode_queue()
+                prealloc_deferred = False
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
@@ -3107,9 +3123,14 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                # Before the barrier: the read-back does not wait for this forward.
+                if prealloc_deferred:
+                    self._preallocate_new_requests()
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
+                if prealloc_deferred:
+                    self._preallocate_new_requests()
                 batch_result = None
                 self._sched_idled = True
 
@@ -3317,8 +3338,14 @@ class SchedulerDisaggregationDecodeMixin:
                     )
         return new_batch
 
+    def _preallocate_new_requests(self: Scheduler) -> None:
+        req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+        self.disagg_decode_transfer_queue.extend(req_conns)
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def process_decode_queue(self: Scheduler):
+    def process_decode_queue(self: Scheduler, defer_prealloc: bool = False) -> bool:
+        """Returns True when ``defer_prealloc`` left this iteration's prealloc to the
+        caller, to run right after the forward launch."""
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
@@ -3334,7 +3361,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
-            return
+            return False
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -3342,10 +3369,13 @@ class SchedulerDisaggregationDecodeMixin:
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
+        prealloc_deferred = False
         if self.polling_count % self.polling_interval == 0:
             if get_disagg().disaggregation_decode_host_receive_threshold == 1:
-                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-                self.disagg_decode_transfer_queue.extend(req_conns)
+                if defer_prealloc:
+                    prealloc_deferred = True
+                else:
+                    self._preallocate_new_requests()
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
@@ -3358,3 +3388,4 @@ class SchedulerDisaggregationDecodeMixin:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
+        return prealloc_deferred

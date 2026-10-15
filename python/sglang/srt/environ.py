@@ -664,6 +664,12 @@ class Envs:
     # Control file selecting the draft-extend fence policy between rounds of one
     # server: "stock", "in_graph" or "pre_replay". Implies the in-graph marker.
     SGLANG_Q35MF_PDDEC_FENCE_AB_CTL = EnvStr("")
+    # PD decode admission overlap (srt/disaggregation/decode_admit_overlap.py):
+    # preallocate new requests right after the forward launch.
+    SGLANG_Q35MF_PDDEC_DEFER_PREALLOC = EnvBool(False)
+    # Control file switching the admission overlap between iterations of one
+    # server: whitespace-separated switch names, e.g. "defer_prealloc".
+    SGLANG_Q35MF_PDDEC_ADMIT_AB_CTL = EnvStr("")
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
