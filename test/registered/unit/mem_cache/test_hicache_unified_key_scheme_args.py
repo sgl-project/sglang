@@ -9,9 +9,12 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.overrides import resolution_result
-from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache.hicache_key_scheme import derive_namespace, namespace_digest
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.server_args import ServerArgs
@@ -54,6 +57,19 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
             hicache_storage_key_scheme="rank-suffix", hicache_mem_layout="page_first"
         )
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
+
+    def test_page_unified_storage_requires_distinct_keys(self):
+        with self.assertRaisesRegex(ValueError, "requires.*unified"):
+            _resolve(
+                hicache_storage_key_scheme="rank-suffix",
+                hicache_mem_layout="page_unified",
+            )
+        args = _resolve(
+            hicache_storage_key_scheme="rank-suffix",
+            hicache_mem_layout="page_unified",
+            hicache_storage_backend=None,
+        )
+        self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_unified")
 
     def test_partition_configs_require_the_unified_scheme(self):
         with self.assertRaisesRegex(ValueError, "require --hicache-storage-key-scheme"):
@@ -171,6 +187,29 @@ class TestControllerUnifiedKeys(CustomTestCase):
             self._suffixes(self._controller(mla=True)),
             [f"{namespace_digest(namespace)}_L4-8"],
         )
+
+    def test_hybrid_write_back_preserves_cpu_host_indices(self):
+        controller = object.__new__(HybridCacheController)
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = SimpleNamespace(
+            layout="page_unified",
+            supports_per_pool_backup_indices=True,
+            anchor_entry=SimpleNamespace(
+                host_pool=SimpleNamespace(can_use_write_back_jit=True)
+            ),
+        )
+        operation = CacheOperation(torch.arange(16), torch.arange(16, 32), node_id=1)
+        with patch.object(
+            controller,
+            "move_indices",
+            side_effect=AssertionError("Staged write-back needs CPU host indices"),
+        ):
+            host_indices, device_indices, transfers = controller._move_write_operation(
+                operation
+            )
+        self.assertIs(host_indices, operation.host_indices)
+        self.assertIs(device_indices, operation.device_indices)
+        self.assertIsNone(transfers)
 
     def test_incompatible_host_grids_are_rejected(self):
         for unsupported in ("sidecar", "missing_geometry", "packed_draft"):
