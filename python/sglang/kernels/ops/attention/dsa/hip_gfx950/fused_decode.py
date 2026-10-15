@@ -167,25 +167,31 @@ class Gfx950FusedIndexer:
     # The first decode is after both weight load and the pre-capture warmup, so
     # the torch.cat below is never recorded into a CUDA graph.
     #
-    # Known limitation: w_kw / norm_w / norm_b are copies taken once. An
-    # in-place weight update afterwards (RL weight sync writes through
-    # param.data.copy_, keeping the same storage) is not observed here, while
-    # w_q_b is a view and does track it -- so a reload would leave the two
-    # halves of the same GEMV on different weights. There is no per-module
-    # update hook to subscribe to, so a deployment that hot-swaps weights must
-    # run with --no-enable-dsa-fused-indexer.
+    # Known limitation: norm_w / norm_b, and on the bf16 path w_kw, are copies
+    # taken once. An in-place weight update afterwards (RL weight sync writes
+    # through param.data.copy_, keeping the same storage) is not observed here.
+    # On the bf16 path w_q_b is a view and does track it, so a reload would
+    # leave the two halves of the same GEMV on different weights; on the
+    # block-FP8 path node 1 calls the live layers and only the norm is stale.
+    # Indexer declares this through _derived_weight_cache_error, so online
+    # weight updates are rejected rather than served stale.
     def _constants(self):
         if self._const is None:
             ix = self.indexer
-            # L1: [wk ; weights_proj] -> one [160, 6144] bf16 weight. A pure
-            # weight-loader style merge: both are ReplicatedLinear over the same
-            # x, so one 6144->160 GEMM is arithmetically the two GEMMs.
-            w_kw = torch.cat(
-                [ix.wk.weight.detach(), ix.weights_proj.weight.detach()], dim=0
-            ).contiguous()
-            assert w_kw.dtype == torch.bfloat16, w_kw.dtype
-            w_q_b = ix.wq_b.weight.detach()
-            assert w_q_b.dtype == torch.bfloat16 and w_q_b.is_contiguous()
+            if ix.wq_b.weight.dtype == ix.wk.weight.dtype == torch.bfloat16:
+                # L1: [wk ; weights_proj] -> one [160, 6144] bf16 weight. A pure
+                # weight-loader style merge: both are ReplicatedLinear over the
+                # same x, so one 6144->160 GEMM is arithmetically the two GEMMs.
+                w_kw = torch.cat(
+                    [ix.wk.weight.detach(), ix.weights_proj.weight.detach()], dim=0
+                ).contiguous()
+                assert w_kw.dtype == torch.bfloat16, w_kw.dtype
+                w_q_b = ix.wq_b.weight.detach()
+                assert w_q_b.is_contiguous()
+            else:
+                # Block-FP8 wq_b / wk (GLM-5.3): node 1 runs the layers' own
+                # GEMMs, the same ones the standard path runs.
+                w_q_b = w_kw = None
 
             norm_w = ix.k_norm.weight.detach().float().contiguous()
             norm_b = ix.k_norm.bias.detach().float().contiguous()
@@ -231,7 +237,7 @@ class Gfx950FusedIndexer:
     def run(
         self,
         *,
-        x: torch.Tensor,
+        x: torch.Tensor | Tuple[torch.Tensor, ...],
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
@@ -248,14 +254,26 @@ class Gfx950FusedIndexer:
         assert ws is not None
 
         cols = page_table_64.shape[1] * PAGE_SIZE
-        q_proj = ws.q_proj[:rows]
-        kw = ws.kw[:rows]
         q_fp8 = ws.q_fp8[:rows]
         head_gate = ws.head_gate[:rows]
         logits = ws.logits[:rows, :cols]
 
-        # node 1: oq = q_lora @ wq_b.T and ok = x @ [wk ; weights_proj].T, one launch.
-        gemv.dual_gemv_bf16(q_lora[:rows], w_q_b, q_proj, x[:rows], w_kw, kw)
+        # node 1: oq = q_lora @ wq_b.T and ok = x @ [wk ; weights_proj].T.
+        if w_q_b is not None:
+            # One launch. x may be the (fp8, scale, bf16) tuple; the GEMV takes bf16.
+            x_bf16 = x[2] if isinstance(x, tuple) else x
+            q_proj = ws.q_proj[:rows]
+            kw = ws.kw[:rows]
+            gemv.dual_gemv_bf16(q_lora[:rows], w_q_b, q_proj, x_bf16[:rows], w_kw, kw)
+            k, weights = kw[:, :HEAD_DIM], kw[:, HEAD_DIM:]
+        else:
+            # Node 2 reads k and weights through their row stride, so the GEMM
+            # outputs go in as they are.
+            ix = self.indexer
+            q_proj, _ = ix.wq_b(q_lora[:rows])
+            k, _ = ix.wk(x)
+            weights = ix._weights_proj_bf16_in_fp32_out(x)
+            k, weights = k[:rows], weights[:rows]
 
         # node 2: k_norm | rope | Hadamard(q,k) | act_quant(q) |
         # indexer_k_quant_and_cache(k) | head gate.  The Hadamard is inline, so
@@ -263,9 +281,9 @@ class Gfx950FusedIndexer:
         qk.indexer_qk_rope_hadamard_quant_and_cache(
             q_proj.view(rows, N_HEADS, HEAD_DIM),
             q_fp8,
-            kw[:, HEAD_DIM:],
+            weights,
             head_gate,
-            kw[:, :HEAD_DIM],
+            k,
             kv_cache,
             out_cache_loc,
             norm_w,
