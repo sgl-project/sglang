@@ -54,7 +54,10 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
 
                 runner.model_runner = SimpleNamespace(
                     pp_group=SimpleNamespace(is_first_rank=True),
-                    model=SimpleNamespace(forward=outer_forward),
+                    model=SimpleNamespace(
+                        forward=outer_forward,
+                        config=SimpleNamespace(model_type="deepseek_v41"),
+                    ),
                 )
                 live = SimpleNamespace(input_ids=scheduler_ids, mm_input_embeds=None)
                 static = SimpleNamespace(

@@ -2113,12 +2113,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG / Full: replay the captured body, run the LM head +
         # logits_processor eagerly.
         full_path = self._is_full_backend
+        model_config = getattr(self.model_runner.model, "config", None)
+        sync_prepared_ids = getattr(model_config, "model_type", None) == "deepseek_v41"
 
         def replay_layer_forward(*args, **layer_kwargs):
             prepared_ids = layer_kwargs.get("input_ids")
             if prepared_ids is None and args:
                 prepared_ids = args[0]
-            if prepared_ids is not None:
+            # TODO: Add general multimodal replay tests before enabling for other models.
+            if sync_prepared_ids and prepared_ids is not None:
                 static_forward_batch.input_ids[: prepared_ids.shape[0]].copy_(
                     prepared_ids
                 )
