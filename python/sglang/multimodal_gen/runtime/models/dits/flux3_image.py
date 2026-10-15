@@ -892,7 +892,12 @@ class Flux3ImageDiT(Flux3Transformer):
     def can_reuse_mode_blocks(self) -> bool:
         return get_sp_world_size() == 1 and all(
             block.attention._usp.backend
-            in (AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA)
+            in (
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.TORCH_CUDNN_SDPA,
+                AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+            )
             for blocks in [self.txt_mode_blocks, *self.content_mode_blocks.values()]
             for block in blocks
         )

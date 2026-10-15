@@ -169,14 +169,19 @@ def _reference_weights(native) -> dict[str, torch.Tensor]:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA kernels")
 @pytest.mark.parametrize("compact_timesteps", [False, True])
+@pytest.mark.parametrize("backend", [None, "torch_cudnn_sdpa"])
 def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
-    request, compact_timesteps
+    request, compact_timesteps, backend, monkeypatch
 ):
     """Packing both CFG samples into one varlen sequence must not let them see
     each other: each sample's prediction equals the shared FLUX 3 transformer
     run on that sample alone (bf16 fused-kernel tolerance)."""
     request.getfixturevalue("single_process_model_parallel")
+    monkeypatch.setattr(
+        flux3_image.get_global_server_args(), "attention_backend", backend
+    )
     native = _tiny_native_dit()
+    assert native.can_reuse_mode_blocks()
     reference = Flux3Transformer(flux3_image_dit_config(**_TINY)).cuda().bfloat16()
     reference.load_state_dict(_reference_weights(native), strict=True)
 
