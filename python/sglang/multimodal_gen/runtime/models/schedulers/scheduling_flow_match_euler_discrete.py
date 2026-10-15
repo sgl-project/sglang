@@ -542,17 +542,16 @@ class FlowMatchEulerDiscreteScheduler(
                 batch, model_output, sample, current_sigma, next_sigma, generator
             )
         else:
-            if self.config.stochastic_sampling:
-                x0 = sample - current_sigma * model_output
-                noise = randn_tensor(
-                    sample.shape,
-                    generator=generator,
-                    device=sample.device,
-                    dtype=sample.dtype,
-                )
-                prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
-            else:
-                prev_sample = sample + dt * model_output
+            prev_sample = self._transition(
+                model_output=model_output,
+                sample=sample,
+                current_sigma=current_sigma,
+                next_sigma=next_sigma,
+                dt=dt,
+                generator=generator,
+                step_index=self.step_index,
+                timestep=timestep,
+            )
 
         # upon completion increase step index by one
         assert self._step_index is not None, "_step_index should not be None"
@@ -565,6 +564,31 @@ class FlowMatchEulerDiscreteScheduler(
             return (prev_sample,)
 
         return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
+
+    def _transition(
+        self,
+        *,
+        model_output: torch.FloatTensor,
+        sample: torch.FloatTensor,
+        current_sigma: torch.FloatTensor,
+        next_sigma: torch.FloatTensor,
+        dt: torch.FloatTensor,
+        generator: torch.Generator | list[torch.Generator] | None,
+        step_index: int,
+        timestep: int | torch.Tensor,
+    ) -> torch.FloatTensor:
+        if self.config.stochastic_sampling:
+            x0 = sample - current_sigma * model_output
+            noise = randn_tensor(
+                sample.shape,
+                generator=generator,
+                device=sample.device,
+                dtype=sample.dtype,
+            )
+            prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
+        else:
+            prev_sample = sample + dt * model_output
+        return prev_sample
 
     def _time_shift_exponential(
         self, mu: float, sigma: float, t: torch.Tensor | np.ndarray
