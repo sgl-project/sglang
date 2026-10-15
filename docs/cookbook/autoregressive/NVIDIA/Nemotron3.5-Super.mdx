@@ -28,6 +28,8 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **NVIDIA Nemotron 3.5 Super VL 120B-A12B** is a vision-language checkpoint in the Nemotron-H hybrid MoE family. The early-access NGC checkpoint configuration identifies `NemotronH_Omni_Reasoning_V3` and includes a vision encoder. The command panel uses the [NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4) and [BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16) Hugging Face IDs; the source runs used the [NGC model](https://registry.ngc.nvidia.com/orgs/0767305323357365/teams/super3-5-vl-ea-0911/models/nemotron-3.5-super-vl-120b-a12b-ea20261008). Check the checkpoint pages for access terms and model details.
 
+The SGLang model entry point is [`nano_nemotron_vl.py` on the `nemotron3-super-dev-20261015` branch](https://github.com/sgl-project/sglang/blob/nemotron3-super-dev-20261015/python/sglang/srt/models/nano_nemotron_vl.py), with its supporting kernels and runtime code on the same branch.
+
 The validation used text-only GSM8K prompts. It does **not** establish image or video request correctness, long-context behavior, or tool-call accuracy.
 
 ## 2. Configuration tips and validation
