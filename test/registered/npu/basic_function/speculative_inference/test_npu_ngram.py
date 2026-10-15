@@ -19,6 +19,8 @@ PROMPTS = [
 
 
 class TestNpuNgram(unittest.TestCase):
+    prompts = PROMPTS
+
     def generate(self, **options):
         import sglang as sgl
 
@@ -27,6 +29,7 @@ class TestNpuNgram(unittest.TestCase):
                 "SGLANG_TEST_NGRAM_MODEL", QWEN3_0_6B_WEIGHTS_PATH
             ),
             device="npu",
+            trust_remote_code=True,
             attention_backend="ascend",
             dtype="bfloat16",
             mem_fraction_static=0.75,
@@ -44,7 +47,7 @@ class TestNpuNgram(unittest.TestCase):
             # The second batch reuses the CPU trie learned from the first one.
             outputs = [
                 engine.generate(
-                    PROMPTS,
+                    self.prompts,
                     sampling_params={"temperature": 0, "max_new_tokens": 48},
                     return_logprob=True,
                 )
@@ -52,12 +55,13 @@ class TestNpuNgram(unittest.TestCase):
             ]
             if options:
                 sampled = engine.generate(
-                    PROMPTS[1],
+                    self.prompts[1],
                     sampling_params={
                         "temperature": 0.7,
                         "top_k": 10,
                         "top_p": 0.9,
                         "max_new_tokens": 24,
+                        "ignore_eos": True,
                     },
                     return_logprob=True,
                 )
@@ -74,7 +78,7 @@ class TestNpuNgram(unittest.TestCase):
         model = os.environ.get("SGLANG_TEST_NGRAM_MODEL", QWEN3_0_6B_WEIGHTS_PATH)
         tokenizer = AutoTokenizer.from_pretrained(model)
         documents = [
-            prompt + output["text"] for prompt, output in zip(PROMPTS, baseline[0])
+            prompt + output["text"] for prompt, output in zip(self.prompts, baseline[0])
         ]
         token_count = (
             sum(
@@ -142,6 +146,7 @@ class TestNpuNgram(unittest.TestCase):
                             accepts.append(output["meta_info"]["spec_accept_length"])
                     self.assertGreater(max(accepts), 1)
                     evidence[name] = {
+                        "prompts": self.prompts,
                         "options": options,
                         "greedy_output_ids_equal": True,
                         "checked_tokens": 288,

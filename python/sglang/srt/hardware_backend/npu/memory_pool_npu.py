@@ -590,6 +590,34 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Relocate accepted latent/RoPE rows, preserving overlapping sources."""
+        if tgt_loc.numel() == 0:
+            return
+        self._raise_if_native_kv_cache_disabled()
+        tgt_loc = tgt_loc.flatten().long()
+        src_loc = src_loc.flatten().long()
+        for cache in (self.k_buffer, self.v_buffer):
+            if cache.numel() == 0:
+                continue
+            if self.use_fia_nz and not self.dsa_kv_cache_store_fp8:
+                head_dim = cache.shape[-1]
+                src_rows = _mla_fia_nz_scatter_indices(
+                    src_loc, head_dim, self.page_size
+                ).flatten()
+                tgt_rows = _mla_fia_nz_scatter_indices(
+                    tgt_loc, head_dim, self.page_size
+                ).flatten()
+                rows = cache.view(self.layer_num, -1, 16)
+            else:
+                src_rows, tgt_rows = src_loc, tgt_loc
+                rows = cache.flatten(1, 2)
+            rows.index_copy_(1, tgt_rows, rows.index_select(1, src_rows))
+        for cache in (self.index_k_buffer, self.index_k_scale_buffer):
+            if cache is not None:
+                rows = cache.flatten(1, 2)
+                rows.index_copy_(1, tgt_loc, rows.index_select(1, src_loc))
+
     def __init__(
         self,
         size: int,

@@ -5,8 +5,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-import triton
-import triton.language as tl
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
     attention_sinks_triton,
@@ -62,31 +60,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
-
-
-@triton.jit
-def _build_ngram_attention_mask_kernel(
-    tree_mask,
-    prefix_lens,
-    out,
-    D: tl.constexpr,
-    KV_LEN: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    batch = tl.program_id(0)
-    query = tl.program_id(1)
-    keys = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
-    prefix = tl.load(prefix_lens + batch)
-    draft_key = keys - prefix
-    ancestor = tl.load(
-        tree_mask + batch * D * D + query * D + draft_key,
-        mask=(draft_key >= 0) & (draft_key < D) & (keys < KV_LEN),
-        other=0,
-    )
-    # NGRAM uses True=allowed; FIA uses True=blocked. Allow the prefix and
-    # ancestors, while blocking sibling branches and the unused page tail.
-    blocked = (keys >= prefix) & (ancestor == 0)
-    tl.store(out + (batch * D + query) * KV_LEN + keys, blocked, keys < KV_LEN)
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -358,26 +331,6 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
-    @staticmethod
-    def _build_ngram_attention_mask(
-        tree_mask: torch.Tensor,
-        prefix_lens: torch.Tensor,
-        draft_token_num: int,
-        padded_kv_len: int,
-    ) -> torch.Tensor:
-        """Build [B, 1, D, page-rounded KV slots] blocked masks for BSH FIA."""
-        bs = prefix_lens.numel()
-        out = torch.empty(
-            (bs, 1, draft_token_num, padded_kv_len),
-            dtype=torch.bool,
-            device=tree_mask.device,
-        )
-        if bs:
-            _build_ngram_attention_mask_kernel[
-                (bs, draft_token_num, triton.cdiv(padded_kv_len, 256))
-            ](tree_mask, prefix_lens, out, draft_token_num, padded_kv_len, 256)
-        return out
-
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -472,19 +425,22 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
-        if model_runner.spec_algorithm.is_ngram() and (
-            self.use_mla
-            or self.is_hybrid_swa
-            or model_runner.model_config.linear_attn_registry_result is not None
-        ):
-            raise ValueError(
-                "NGRAM on Ascend currently requires full-attention MHA/GQA."
-            )
-        if model_runner.spec_algorithm.is_ngram() and self.kv_cache_dtype not in (
-            torch.float16,
-            torch.bfloat16,
-        ):
-            raise ValueError("NGRAM on Ascend requires FP16 or BF16 KV caches.")
+        if model_runner.spec_algorithm.is_ngram():
+            unsupported = []
+            if self.is_hybrid_swa or (
+                model_runner.model_config.linear_attn_registry_result is not None
+            ):
+                unsupported.append("sliding-window or linear attention")
+            if getattr(self.token_to_kv_pool, "index_head_dim", None) is not None:
+                unsupported.append("sparse indexed attention")
+            if getattr(self, "use_alibi", False):
+                unsupported.append("ALiBi")
+            if self.kv_cache_dtype not in (torch.float16, torch.bfloat16):
+                unsupported.append(f"{self.kv_cache_dtype} KV cache")
+            if unsupported:
+                raise ValueError(
+                    "NGRAM on Ascend does not support " + ", ".join(unsupported) + "."
+                )
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
@@ -638,7 +594,11 @@ class AscendAttnBackend(AttentionBackend):
             _is_ngram_verify(forward_batch.spec_info)
             and forward_batch.forward_mode.is_target_verify()
         ):
-            self.forward_metadata.ngram_attn_mask = self._build_ngram_attention_mask(
+            from sgl_kernel_npu.attention.ngram_attention import (
+                build_ngram_attention_mask,
+            )
+
+            self.forward_metadata.ngram_attn_mask = build_ngram_attention_mask(
                 forward_batch.spec_info.custom_mask,
                 forward_batch.seq_lens,
                 int(forward_batch.spec_info.draft_token_num),
@@ -1637,11 +1597,18 @@ class AscendAttnBackend(AttentionBackend):
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             if _is_ngram_verify(forward_batch.spec_info):
-                if sinks is not None or slopes is not None:
-                    raise ValueError(
-                        "NGRAM on Ascend does not support attention sinks or ALiBi."
-                    )
-                return self.forward_ngram(q, k, v, layer, forward_batch, save_kv_cache)
+                return self.forward_ngram(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q_rope=q_rope,
+                    k_rope=k_rope,
+                    sinks=sinks,
+                    slopes=slopes,
+                )
             return self.forward_mtp(
                 q,
                 k,
@@ -2417,26 +2384,98 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_output
 
-    def forward_ngram(self, q, k, v, layer, forward_batch, save_kv_cache):
-        """Verify irregular trees using FIA's paged BSH full-mask path.
+    def forward_ngram(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        save_kv_cache,
+        q_rope=None,
+        k_rope=None,
+        sinks=None,
+        slopes=None,
+    ):
+        """Verify irregular trees with paged FIA and explicit ancestor masks.
 
-        TND split-fuse only accepts compressed causal/band masks on Ascend.
-        BSH with sparse_mode=0 preserves arbitrary ancestor masks without
-        gathering or duplicating the prefix KV cache for each branch.
+        Dense MHA uses BSH, avoiding TND split-fuse's causal-mask restriction.
+        MLA's latent+RoPE TND kernel supports the full mask for ND and NZ caches.
         """
         if (
             layer.sliding_window_size != -1
             or layer.attn_type != AttentionType.DECODER
             or layer.logit_cap != 0
-            or getattr(self, "use_alibi", False)
+            or sinks is not None
+            or slopes is not None
         ):
-            raise ValueError("NGRAM on Ascend requires full decoder attention.")
+            raise ValueError(
+                "NGRAM on Ascend requires full decoder attention without "
+                "attention sinks, ALiBi, or logit capping."
+            )
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
-                layer, KVWriteLoc(forward_batch.out_cache_loc), k, v
+                layer,
+                KVWriteLoc(forward_batch.out_cache_loc),
+                k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+                if self.use_mla
+                else k,
+                k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+                if self.use_mla
+                else v,
             )
         bs = forward_batch.batch_size
         d = int(forward_batch.spec_info.draft_token_num)
+        if self.use_mla:
+            c_kv, rope_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            if is_fia_nz():
+                k_cache = _reshape_kv_for_fia_nz(
+                    c_kv, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
+                )
+                rope_cache = _reshape_kv_for_fia_nz(
+                    rope_cache,
+                    layer.tp_k_head_num,
+                    self.qk_rope_head_dim,
+                    self.page_size,
+                )
+            else:
+                k_cache = c_kv.view(
+                    -1, layer.tp_k_head_num, self.page_size, self.kv_lora_rank
+                )
+                rope_cache = rope_cache.view(
+                    -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
+                )
+            query = q[: bs * d].reshape(-1, layer.tp_q_head_num, self.kv_lora_rank)
+            query_rope = q_rope[: bs * d].reshape(
+                -1, layer.tp_q_head_num, self.qk_rope_head_dim
+            )
+            padded_heads = self.q_head_num_padding or layer.tp_q_head_num
+            padding = padded_heads - layer.tp_q_head_num
+            if padding:
+                query = torch.nn.functional.pad(query, (0, 0, 0, padding))
+                query_rope = torch.nn.functional.pad(query_rope, (0, 0, 0, padding))
+            output, _ = torch_npu.npu_fused_infer_attention_score(
+                query.contiguous(),
+                k_cache,
+                k_cache,
+                query_rope=query_rope.contiguous(),
+                key_rope=rope_cache,
+                block_table=self.forward_metadata.block_tables,
+                block_size=self.page_size,
+                num_heads=padded_heads,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="TND",
+                atten_mask=self.forward_metadata.ngram_attn_mask,
+                scale=layer.scaling,
+                actual_seq_lengths=[(b + 1) * d for b in range(bs)],
+                actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int.tolist(),
+                sparse_mode=0,
+                pre_tokens=FULL_ATTENTION_WINDOW,
+                next_tokens=FULL_ATTENTION_WINDOW,
+            )
+            return output[:, : layer.tp_q_head_num].reshape(
+                bs * d, layer.tp_q_head_num * self.kv_lora_rank
+            )
         query = q[: bs * d].reshape(bs, d, layer.tp_q_head_num * layer.qk_head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim

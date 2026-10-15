@@ -855,7 +855,9 @@ Notes:
 - BFS breadth bounds must satisfy `1 <= min <= max`. `PROB` uses the maximum as per-node top-k and ignores the minimum. A breadth of one can still produce branches when several suffix matches are merged.
 - Optional: set `SGLANG_NGRAM_FORCE_GREEDY_VERIFY=True` to force greedy verification.
 
-Ascend NPU verifies irregular trees with paged BSH full-mask attention, follows child/sibling pointers during greedy verification, and compacts the accepted KV rows before the next iteration. It requires an updated `sgl-kernel-npu` with NGRAM mask reconstruction and tree-aware greedy verification. NPU execution is eager and synchronous. Full-attention MHA/GQA models with FP16/BF16 KV caches are supported; MLA, sliding-window/linear attention, attention sinks, ALiBi, logit capping, pipeline/context parallelism, and chain rejection sampling are unsupported.
+Ascend NPU verifies irregular trees with paged full-mask attention, follows child/sibling pointers during greedy verification, and compacts the accepted KV rows before the next iteration. It requires an updated `sgl-kernel-npu` with the NGRAM attention-mask builder, mask reconstruction, and tree-aware greedy verification. NPU execution is eager and synchronous. Full-attention MHA/GQA and dense MLA models with FP16/BF16 KV caches are supported. MHA/GQA uses BSH attention; MLA uses latent+RoPE TND attention and supports both ND and NZ KV layouts. Sliding-window/linear attention, sparse indexed MLA, attention sinks, ALiBi, logit capping, pipeline/context parallelism, and chain rejection sampling are unsupported.
+
+For MLA accuracy comparisons, set `ASCEND_USE_FIA=true` for both ordinary decoding and NGRAM so they use the same attention family. The legacy paged MLA decoder can produce different BF16 rounding. Weight quantization and KV quantization are separate: W8A8 target weights can use a BF16 KV cache. MLA validation uses DeepSeek-V2-Lite-W8A8 on Linux with Ascend910_9362 and CANN 9.1.
 
 ```bash Command
 python3 -m sglang.launch_server \

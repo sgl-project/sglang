@@ -1,13 +1,21 @@
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch_npu  # noqa: F401
+from sgl_kernel_npu.attention.ngram_attention import build_ngram_attention_mask
 
 from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_fia_nz
+from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+    NPUMHATokenToKVPool,
+    NPUMLATokenToKVPool,
+)
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
@@ -17,6 +25,183 @@ register_npu_ci(est_time=15, suite="nightly-1-npu-a3", nightly=True)
 
 
 class TestNgramAttention(unittest.TestCase):
+    @staticmethod
+    def make_mla_pool(dtype, use_nz):
+        with (
+            patch.dict(os.environ, {"SGLANG_USE_FIA_NZ": str(use_nz)}),
+            patch(
+                "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+            ),
+        ):
+            return NPUMLATokenToKVPool(
+                size=512,
+                page_size=128,
+                dtype=dtype,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                layer_num=2,
+                device="npu",
+                enable_memory_saver=False,
+            )
+
+    def test_mla_forward_matches_cpu_ancestor_attention(self):
+        torch.manual_seed(42)
+        bs, d, page, latent, rope = 2, 4, 128, 512, 64
+        prefixes = [3, 127]
+        lengths = [prefix + d for prefix in prefixes]
+        table = torch.tensor([[3, 0], [1, 2]], dtype=torch.int32)
+        tree = torch.tensor(
+            [[1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 1, 0], [1, 0, 1, 1]],
+            dtype=torch.bool,
+        ).repeat(bs, 1, 1)
+        blocked = torch.ones(bs, 1, d, 2 * page, dtype=torch.bool)
+        for b, prefix in enumerate(prefixes):
+            blocked[b, 0, :, :prefix] = False
+            blocked[b, 0, :, prefix : prefix + d] = ~tree[b]
+        positions = torch.tensor(prefixes)[:, None] + torch.arange(d)
+        draft_slots = (
+            table.gather(1, positions // page).long() * page + positions % page
+        ).flatten()
+        layer = SimpleNamespace(
+            layer_id=1,
+            tp_k_head_num=1,
+            v_head_dim=latent,
+            sliding_window_size=-1,
+            attn_type=AttentionType.DECODER,
+            logit_cap=0,
+            scaling=(latent + rope) ** -0.5,
+        )
+        for dtype, tolerance in ((torch.float16, 0.005), (torch.bfloat16, 0.03)):
+            for use_nz in (False, True):
+                for heads in (12, 16):
+                    with self.subTest(dtype=dtype, use_nz=use_nz, heads=heads):
+                        is_fia_nz.cache_clear()
+                        with patch.dict(os.environ, {"SGLANG_USE_FIA_NZ": str(use_nz)}):
+                            pool = self.make_mla_pool(dtype, use_nz)
+                            c = torch.randn(5, page, 1, latent, dtype=dtype)
+                            kr = torch.randn(5, page, 1, rope, dtype=dtype)
+                            pool.set_kv_buffer(
+                                layer, torch.arange(5 * page).npu(), c.npu(), kr.npu()
+                            )
+                            draft_c = torch.randn(bs * d, 1, latent, dtype=dtype)
+                            draft_kr = torch.randn(bs * d, 1, rope, dtype=dtype)
+                            c.view(-1, 1, latent)[draft_slots] = draft_c
+                            kr.view(-1, 1, rope)[draft_slots] = draft_kr
+                            q = torch.randn(bs, d, heads, latent, dtype=dtype)
+                            qr = torch.randn(bs, d, heads, rope, dtype=dtype)
+                            layer.tp_q_head_num = heads
+                            backend = object.__new__(AscendAttnBackend)
+                            backend.use_mla = True
+                            backend.kv_lora_rank, backend.qk_rope_head_dim = (
+                                latent,
+                                rope,
+                            )
+                            backend.q_head_num_padding = 16
+                            backend.page_size, backend.token_to_kv_pool = page, pool
+                            backend.forward_metadata = SimpleNamespace(
+                                block_tables=table.npu(),
+                                ngram_attn_mask=build_ngram_attention_mask(
+                                    tree.npu(),
+                                    torch.tensor(prefixes).npu(),
+                                    d,
+                                    2 * page,
+                                ),
+                                seq_lens_cpu_int=torch.tensor(lengths),
+                            )
+                            batch = SimpleNamespace(
+                                batch_size=bs,
+                                spec_info=SimpleNamespace(draft_token_num=d),
+                                out_cache_loc=draft_slots.npu(),
+                            )
+                            actual = (
+                                backend.forward_ngram(
+                                    q.flatten(0, 1).npu(),
+                                    draft_c.npu(),
+                                    None,
+                                    layer,
+                                    batch,
+                                    True,
+                                    q_rope=qr.flatten(0, 1).npu(),
+                                    k_rope=draft_kr.npu(),
+                                )
+                                .cpu()
+                                .float()
+                                .reshape(bs, d, heads, latent)
+                            )
+                            expected = []
+                            for b in range(bs):
+                                keys = (
+                                    c[table[b].long()]
+                                    .flatten(0, 1)[: lengths[b]]
+                                    .float()
+                                )
+                                ropes = (
+                                    kr[table[b].long()]
+                                    .flatten(0, 1)[: lengths[b]]
+                                    .float()
+                                )
+                                scores = (
+                                    torch.einsum(
+                                        "qhd,kd->hqk", q[b].float(), keys[:, 0]
+                                    )
+                                    + torch.einsum(
+                                        "qhd,kd->hqk", qr[b].float(), ropes[:, 0]
+                                    )
+                                ) * layer.scaling
+                                scores.masked_fill_(
+                                    blocked[b, 0, :, : lengths[b]], float("-inf")
+                                )
+                                expected.append(
+                                    torch.einsum(
+                                        "hqk,kd->qhd", scores.softmax(-1), keys[:, 0]
+                                    )
+                                )
+                            torch.testing.assert_close(
+                                actual,
+                                torch.stack(expected),
+                                atol=tolerance,
+                                rtol=tolerance,
+                            )
+                            for cache, reference in zip(pool.get_kv_buffer(1), (c, kr)):
+                                logical = gather_mla_cache_pages(
+                                    cache, torch.arange(5).npu(), is_nz=use_nz
+                                )
+                                torch.testing.assert_close(logical.cpu(), reference)
+        is_fia_nz.cache_clear()
+
+    def test_mla_compaction_preserves_latent_and_rope(self):
+        src = torch.tensor([127, 128, 130], device="npu")
+        dst = torch.tensor([128, 130, 127], device="npu")
+        for use_nz in (False, True):
+            with self.subTest(use_nz=use_nz):
+                pool = self.make_mla_pool(torch.float16, use_nz)
+                reference = []
+                for layer_id in range(2):
+                    c = (torch.arange(640 * 512).reshape(640, 1, 512) % 997).half()
+                    kr = (torch.arange(640 * 64).reshape(640, 1, 64) % 991).half()
+                    pool.set_kv_buffer(
+                        SimpleNamespace(layer_id=layer_id),
+                        torch.arange(640).npu(),
+                        c.npu(),
+                        kr.npu(),
+                    )
+                    for values in (c, kr):
+                        values[dst.cpu()] = values[src.cpu()].clone()
+                    reference.append((c, kr))
+                pool.move_kv_cache(dst, src)
+                pool.move_kv_cache(dst[:0], src[:0])
+                for layer_id in range(2):
+                    for cache, expected in zip(
+                        pool.get_kv_buffer(layer_id), reference[layer_id]
+                    ):
+                        logical = gather_mla_cache_pages(
+                            cache, torch.arange(5).npu(), is_nz=use_nz
+                        )
+                        torch.testing.assert_close(
+                            logical.cpu().flatten(0, 1), expected
+                        )
+
     def test_resolved_npu_configuration(self):
         options = dict(
             model_path=os.environ.get(
@@ -48,6 +233,7 @@ class TestNgramAttention(unittest.TestCase):
                 speculative_ngram_external_corpus_max_tokens=0,
             ),
             dict(speculative_use_rejection_sampling=True),
+            dict(tp_size=2, dcp_size=2),
         ):
             with self.subTest(options=invalid), self.assertRaises(ValueError):
                 ServerArgs(**dict(options, **invalid)).resolve_once()
@@ -61,7 +247,7 @@ class TestNgramAttention(unittest.TestCase):
             [[1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 1, 0], [1, 0, 1, 1]],
             dtype=torch.bool,
         ).repeat(bs, 1, 1)
-        mask = AscendAttnBackend._build_ngram_attention_mask(
+        mask = build_ngram_attention_mask(
             tree.flatten().npu(), torch.tensor(prefixes).npu(), d, 2 * page
         )
         expected_mask = torch.ones((bs, 1, d, 2 * page), dtype=torch.bool)
@@ -115,7 +301,7 @@ class TestNgramAttention(unittest.TestCase):
                 )
 
     def test_empty_and_single_root(self):
-        mask = AscendAttnBackend._build_ngram_attention_mask(
+        mask = build_ngram_attention_mask(
             torch.empty(0, dtype=torch.bool, device="npu"),
             torch.empty(0, dtype=torch.int64, device="npu"),
             4,
@@ -123,7 +309,7 @@ class TestNgramAttention(unittest.TestCase):
         )
         self.assertEqual(mask.shape, (0, 1, 4, 128))
         mask = (
-            AscendAttnBackend._build_ngram_attention_mask(
+            build_ngram_attention_mask(
                 torch.ones(1, dtype=torch.bool, device="npu"),
                 torch.tensor([3], device="npu"),
                 1,

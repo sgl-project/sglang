@@ -1302,7 +1302,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
     if cfg.device == "npu":
         if attention_backends_of(view) != ("ascend", "ascend"):
             raise ValueError("NGRAM on NPU requires the ascend attention backend.")
-        if cfg.pp_size != 1 or cfg.attn_cp_size != 1:
+        if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
             raise ValueError(
                 "NGRAM on NPU does not support pipeline or context parallelism."
             )
