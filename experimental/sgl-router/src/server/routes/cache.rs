@@ -85,6 +85,8 @@ pub struct SnapshotParams {
     /// match [`crate::state::kv_events::bootstrap::CURSORS_ONLY_PARAM`].
     #[serde(default)]
     cursors_only: bool,
+    #[serde(default)]
+    include_lora: bool,
 }
 
 /// `GET /internal/kv_snapshot` — serve this replica's KV tree so a newly
@@ -98,7 +100,8 @@ pub struct SnapshotParams {
 ///
 /// `?max_age_ms=N` bounds how stale a cached export may be; omitted,
 /// [`PRODUCER_CACHE_TTL`] applies. `?cursors_only=true` is answered from the
-/// live cursor map and bypasses the export cache.
+/// live cursor map and bypasses the export cache. `?include_lora=true` opts into
+/// version-2 LoRA mappings; legacy callers receive the base-model version-1 view.
 ///
 /// # Exposure
 ///
@@ -136,7 +139,9 @@ pub async fn kv_snapshot(
         .map_or(PRODUCER_CACHE_TTL, Duration::from_millis);
     // Pre-encoded (both encodings) and cached by the producer; handing `Bytes`
     // to the body is a refcount bump, not a copy.
-    let body = index.peer_snapshot_body(max_age).await;
+    let body = index
+        .peer_snapshot_body_for_client(max_age, params.include_lora)
+        .await;
     if body.is_empty() {
         // The encode failed. A 200 would carry a body the caller cannot
         // decode; a non-success status reads as "no snapshot here".
@@ -598,6 +603,55 @@ mod tests {
         assert_eq!(snap.workers.len(), 1);
         assert_eq!(snap.workers[0].url, "http://carrier:30000");
         assert_eq!(snap.cursors, vec![(0, 41)]);
+    }
+
+    #[tokio::test]
+    async fn mixed_snapshot_preserves_legacy_base_bootstrap_and_negotiates_lora() {
+        use crate::state::kv_events::bootstrap::{
+            fetch_snapshot, FetchAnswer, LORA_SNAPSHOT_FORMAT,
+        };
+        use crate::state::kv_events::BlockStored;
+        let ctx = ctx_with_seeded_index();
+        let index = ctx.kv_index.as_ref().unwrap().clone();
+        let worker = KvWorkerId::new("http://carrier:30000".into(), 0);
+        index.tree().store_event(
+            &worker,
+            &BlockStored {
+                block_hashes: vec![100],
+                parent_block_hash: None,
+                token_ids: vec![1, 2],
+                block_size: 64,
+                lora_id: None,
+                lora_name: Some("adapter-a".into()),
+                cache_salt: None,
+                is_bigram: false,
+                medium: Some("GPU".into()),
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::server::app::build_router(ctx.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let FetchAnswer::Body(full) = fetch_snapshot(&Client::new(), &url, Some(Duration::ZERO))
+            .await
+            .unwrap()
+        else {
+            panic!("new consumer must receive a snapshot")
+        };
+        assert_eq!(full.format, LORA_SNAPSHOT_FORMAT);
+        assert_eq!(full.nodes.len(), 2);
+        assert_eq!(full.lora_blocks.len(), 1);
+        // The cached legacy view keeps the same watermark and base holdings.
+        let legacy = parse_snapshot(get_snapshot(ctx, SNAPSHOT_PATH).await).await;
+        assert_eq!(legacy.format, 1);
+        assert!(legacy.lora_blocks.is_empty());
+        assert_eq!(legacy.nodes.len(), 1);
+        assert_eq!(legacy.nodes[0].block_hash, 7);
+        assert_eq!(legacy.workers, full.workers);
+        assert_eq!(legacy.cursors, full.cursors);
+        assert!(legacy.producer_ready);
+        server.abort();
+        index.shutdown().await;
     }
 
     /// No local index means 404, not an empty snapshot.
