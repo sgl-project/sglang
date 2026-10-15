@@ -55,6 +55,25 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
     assert extension.ServerArgs.call_args.kwargs["grpc_port"] == expected
 
 
+@pytest.mark.parametrize("enable_metrics", [False, True])
+def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
+    extension = MagicMock()
+    with (
+        get_context().override_server_args(enable_metrics=enable_metrics),
+        patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+    ):
+        rust_config._build_server_args(_scheduler_for_typed_config())
+
+    metrics = extension.ServerArgs.call_args.kwargs["metrics"]
+    if enable_metrics:
+        extension.MetricsConfig.assert_called_once_with(multiproc_dir="/tmp/prom")
+        assert metrics is extension.MetricsConfig.return_value
+    else:
+        assert metrics is None
+
+
 @pytest.mark.parametrize(
     "nnodes,tp_size,attn_dp_size,ep_join_mode,ranks,expected",
     [
