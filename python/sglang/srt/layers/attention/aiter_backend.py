@@ -409,6 +409,17 @@ class AiterAttnBackend(AttentionBackend):
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
 
+        # unified_attention's tile width equals the page size, so a smaller page
+        # produces wrong output rather than failing. On gfx1250 every non-MLA
+        # layer takes this path, so reject the unsupported sizes instead.
+        if is_gfx1250_supported() and not self.use_mla and self.page_size < 32:
+            raise ValueError(
+                f"page_size={self.page_size} is not supported on gfx1250 for "
+                "non-MLA models: aiter unified_attention's tile width equals the "
+                "page size, so smaller pages produce wrong output. Use "
+                "page_size >= 32 (the gfx1250 default for the aiter backend)."
+            )
+
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
         # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
