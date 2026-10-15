@@ -119,6 +119,15 @@ class _NoTokenAdder(_Adder):
         return AddReqResult.NO_TOKEN
 
 
+class _DecodeOnlyAdder(_Adder):
+    """Finds no KV for a prefill block; a decode block fits."""
+
+    def _admit(self, req):
+        if req.dllm.is_prefill():
+            return AddReqResult.NO_TOKEN
+        return super()._admit(req)
+
+
 class _Step:
     def __init__(self, reqs, kv_reuse_lens):
         self.reqs = list(reqs)
@@ -322,6 +331,24 @@ class TestDllmManagerLists(unittest.TestCase):
         step, rest = manager.schedule(rest)
 
         self.assertEqual([r.rid for r in step.reqs], ["b"])
+
+    def test_a_prefill_that_does_not_fit_lets_a_started_request_run(self):
+        # The started request holds the KV between its blocks; the new
+        # request's prefill finds no room until the started one finishes.
+        manager = _manager()
+        started, new = _req("started"), _req("new")
+        self._run_one_block(manager, [started])
+        self._patch(
+            "sglang.srt.dllm.manager.DllmManager._create_dllm_prefill_adder",
+            side_effect=_DecodeOnlyAdder,
+        )
+
+        step, rest = manager.schedule([new])
+
+        self.assertEqual(rest, [])
+        self.assertEqual([r.rid for r in step.reqs], ["started"])
+        self.assertTrue(step.forward_mode.is_dllm_extend())
+        self._assert_lists(manager, waiting=[new], staging=[], between_blocks=[started])
 
     def test_abort_pops_and_releases_the_waiting_requests_it_names(self):
         manager = _manager()
