@@ -255,7 +255,8 @@ def sample_generated_shared_prefix_requests(
     # string that the server then re-encodes.
     generate_prompt = gen_prompt_ids if input_ids else gen_prompt
     system_prompts = [
-        generate_prompt(tokenizer, int(system_prompt_lens[i])) for i in range(num_groups)
+        generate_prompt(tokenizer, int(system_prompt_lens[i]))
+        for i in range(num_groups)
     ]
 
     # shape: (num_groups, prompts_per_group, num_turns)
