@@ -26,7 +26,7 @@ Choose your **Hardware Platform** and **Quantization** below. The default is **B
 
 **Xeon CPU service configuration:**
 
-- Xeon serves the **INT4** checkpoint (quantized by Intel AutoRound, HF id: `intel-ai/Muse-Spark-open-816B-A42B-INT4`) on the SGLang CPU engine. A typical Xeon 6 P-core platform (e.g., Xeon 6980P) is recommended.
+- Xeon serves the **INT4** checkpoint (quantized by Intel AutoRound, HF id: `intel-ai/Muse-Spark-Open-816B-A42B-INT4`) on the SGLang CPU engine. A typical Xeon 6 P-core platform (e.g., Xeon 6980P) is recommended.
 - Set `--page-size 1` for the `intel_amx` attention backend (the CPU default attention backend).
 - We recommend setting the TP size equal to the NUMA count. See the **Notes** under [Launch of the Serving Engine](/docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) in the SGLang CPU server document for how to configure the arguments, especially TP and NUMA binding.
 
@@ -50,7 +50,7 @@ This cookbook provides deployment recipes for the Muse Spark Open 816B-A42B chec
 - **NVFP4:** `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` (NVIDIA default).
 - **MXFP4:** `amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4` (MI355X default; Quark-quantized).
 - **NVFP4 on MI355X (direct load):** the same `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` checkpoint runs on MI355X with `--quantization quark_mxfp4`; the weights are requantized to MXFP4 while loading, so no separate export is needed. Select **MI355X / NVFP4** in the panel for this command.
-- **INT4** `intel-ai/Muse-Spark-open-816B-A42B-INT4` (Xeon default; AutoRound-quantized).
+- **INT4** `intel-ai/Muse-Spark-Open-816B-A42B-INT4` (Xeon default; AutoRound-quantized).
 - **BF16:** `meta-models/Muse-Spark-Open-816B-A42B`.
 
 ## 2. Configuration tips
