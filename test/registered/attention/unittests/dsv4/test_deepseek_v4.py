@@ -726,6 +726,99 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
+    class _FakePagedIndexerMetadata:
+        """The two tensors a captured full-top-k indexer binds by address."""
+
+        def __init__(self, base: int):
+            self.compressed_seq_lens = torch.tensor(
+                [base + 1, base + 2], dtype=torch.int32
+            )
+            self.page_table = torch.tensor(
+                [[base + 3, base + 4], [base + 5, base + 6]], dtype=torch.int32
+            )
+
+        def copy_(self, other):
+            self.compressed_seq_lens.copy_(other.compressed_seq_lens)
+            self.page_table.copy_(other.page_table)
+
+    def _make_low_ratio_metadata(self, base: int):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
+
+        return DSV4Metadata(
+            self._make_core_metadata(base),
+            indexer_metadata=None,
+            c1_indexer_metadata=self._FakePagedIndexerMetadata(base),
+            c2_indexer_metadata=self._FakePagedIndexerMetadata(base + 100),
+        )
+
+    def test_refresh_replay_low_ratio_index_metadata_follows_capture_mode(self):
+        # Captured full-top-k fallback: the kernel reads the lengths and page
+        # tables of the capture-time objects, so a replay with new request
+        # lengths and KV page mappings must land in those tensors.
+        capture = self._make_low_ratio_metadata(0)
+        replay = self._make_low_ratio_metadata(1000)
+        held_c1, held_c2 = capture.c1_indexer_metadata, capture.c2_indexer_metadata
+        bound_lens = held_c1.compressed_seq_lens
+        bound_pages = held_c2.page_table
+
+        capture.refresh_for_breakable_cuda_graph_replay_(
+            replay, low_ratio_index_captured=True
+        )
+
+        self.assertIs(capture.c1_indexer_metadata, held_c1)
+        self.assertIs(capture.c2_indexer_metadata, held_c2)
+        self.assertIs(held_c1.compressed_seq_lens, bound_lens)
+        self.assertIs(held_c2.page_table, bound_pages)
+        self.assertTrue(
+            torch.equal(bound_lens, replay.c1_indexer_metadata.compressed_seq_lens)
+        )
+        self.assertTrue(torch.equal(bound_pages, replay.c2_indexer_metadata.page_table))
+
+        # Two-level candidates: the flat sources score eagerly on the live
+        # objects, whose width may exceed the captured one.
+        capture = self._make_low_ratio_metadata(0)
+        replay = self._make_low_ratio_metadata(1000)
+        capture.refresh_for_breakable_cuda_graph_replay_(
+            replay, low_ratio_index_captured=False
+        )
+        self.assertIs(capture.c1_indexer_metadata, replay.c1_indexer_metadata)
+        self.assertIs(capture.c2_indexer_metadata, replay.c2_indexer_metadata)
+
+    def test_backend_replay_refreshes_low_ratio_index_in_place_unless_two_level(
+        self,
+    ):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        for candidates, in_place in (
+            (SimpleNamespace(), True),  # DenseBlocksBackend: captured full top-k
+            (SimpleNamespace(consume_prefill_captured=lambda *_: None), False),
+        ):
+            capture = self._make_low_ratio_metadata(0)
+            replay = self._make_low_ratio_metadata(1000)
+            held = capture.c1_indexer_metadata
+            backend = object.__new__(DeepseekV4AttnBackend)
+            backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+            backend.prefill_candidates = candidates
+            backend._build_forward_metadata = lambda *_, **__: replay
+
+            backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                capture, SimpleNamespace(max_seq_len_override=None)
+            )
+
+            self.assertIs(backend.forward_metadata, capture)
+            if in_place:
+                self.assertIs(capture.c1_indexer_metadata, held)
+                self.assertTrue(
+                    torch.equal(
+                        held.compressed_seq_lens,
+                        replay.c1_indexer_metadata.compressed_seq_lens,
+                    )
+                )
+            else:
+                self.assertIs(capture.c1_indexer_metadata, replay.c1_indexer_metadata)
+
     def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
 
@@ -827,6 +920,75 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     combine.call_args.kwargs["topk_indices"].shape,
                     (2, expected_extent),
                 )
+
+
+class TestDSV4FullTopKCapturedFallback(CustomTestCase):
+    """CPU-only: the captured full-top-k fallback keeps every configured k."""
+
+    def _topk_calls(self, index_topk: int, width: int, use_topk_v2: bool = False):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk
+        from sglang.srt.layers.attention.dsv4.v41_indexer.types import (
+            CapturedPrefillInputs,
+        )
+
+        rows = 2
+        metadata = SimpleNamespace(
+            compressed_page_size=64,
+            max_compressed_seq_len=width,
+            compressed_seq_lens=torch.tensor([width, width // 2], dtype=torch.int32),
+            page_table=torch.zeros(rows, width // 64, dtype=torch.int32),
+            use_topk_v2=use_topk_v2,
+            row_chunks=lambda: [(slice(0, rows), None)],
+        )
+        inputs = CapturedPrefillInputs(
+            indexer=SimpleNamespace(index_topk=index_topk, n_local_heads=1, n_heads=1),
+            layer_id=0,
+            q=torch.zeros(rows, 1, 128, dtype=torch.bfloat16),
+            weights=torch.ones(rows, 1, dtype=torch.bfloat16),
+            paged_metadata=metadata,
+            out_page_indices=torch.full((rows, index_topk), -1, dtype=torch.int32),
+            out_raw_indices=torch.full((rows, index_topk), -1, dtype=torch.int32),
+        )
+        calls = []
+        with (
+            mock.patch.object(
+                full_topk,
+                "quantize_index_q",
+                return_value=(torch.zeros(rows, 1, 64), torch.zeros(rows, 1)),
+            ),
+            mock.patch.object(full_topk, "get_index_k_cache", return_value=object()),
+            mock.patch.object(
+                full_topk,
+                "deep_gemm_fp4_paged_mqa_logits",
+                return_value=torch.zeros(rows, width),
+            ),
+            mock.patch.object(
+                full_topk,
+                "topk_transform_paged_torch",
+                side_effect=lambda *a, **_: calls.append(("torch", a[3].shape[1])),
+            ),
+            mock.patch.object(
+                full_topk,
+                "topk_transform_paged_from_metadata",
+                side_effect=lambda *a, **_: calls.append(("kernel", None)),
+            ),
+        ):
+            full_topk.FullTopKIndexer._deep_gemm_prefill_captured(
+                SimpleNamespace(token_to_kv_pool=None), inputs
+            )
+        return calls
+
+    def test_k_within_the_v1_kernel_limit_uses_the_paged_kernel(self):
+        self.assertEqual(self._topk_calls(512, 4096), [("kernel", None)])
+        # k is bounded by the captured width before the limit applies.
+        self.assertEqual(self._topk_calls(2048, 512), [("kernel", None)])
+
+    def test_k_above_the_v1_kernel_limit_keeps_the_torch_topk(self):
+        self.assertEqual(self._topk_calls(2048, 4096), [("torch", 2048)])
+        # Top-k v2 has no such cap.
+        self.assertEqual(
+            self._topk_calls(2048, 4096, use_topk_v2=True), [("kernel", None)]
+        )
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):

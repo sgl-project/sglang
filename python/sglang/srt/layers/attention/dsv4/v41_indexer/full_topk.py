@@ -14,6 +14,10 @@ from sglang.kernels.ops.attention.deep_select import (
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
+from sglang.kernels.ops.attention.dsv4.topk import (
+    TOPK_V1_MAX_K,
+    topk_transform_paged_torch,
+)
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -174,6 +178,11 @@ class FullTopKIndexer:
         width = metadata.max_compressed_seq_len
         lens = metadata.compressed_seq_lens
         page_table = metadata.page_table
+        # The paged metadata dispatches to the v1 kernel here (top-k v2 is off
+        # for the low-ratio prefill metadata), which caps k; wider selections
+        # keep the torch top-k over the captured width.
+        topk = min(indexer.index_topk, width)
+        torch_topk = not metadata.use_topk_v2 and topk > TOPK_V1_MAX_K
         for rows, plan in metadata.row_chunks():
             logits = deep_gemm_fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),
@@ -184,6 +193,16 @@ class FullTopKIndexer:
                 plan,
                 width,
             )
+            if torch_topk:
+                topk_transform_paged_torch(
+                    logits,
+                    lens[rows],
+                    page_table[rows],
+                    inputs.out_page_indices[rows, :topk],
+                    page_size,
+                    inputs.out_raw_indices[rows, :topk],
+                )
+                continue
             # Per row up to its own length: a wide graph then costs only the
             # logits buffer, not a full-static-width top-k.
             topk_transform_paged_from_metadata(

@@ -1043,15 +1043,31 @@ class DSV4Metadata:
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
 
-    def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
+    def refresh_for_breakable_cuda_graph_replay_(
+        self,
+        static_metadata: DSV4Metadata,
+        *,
+        low_ratio_index_captured: bool = True,
+    ):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
-        # The ratio-1/2 indexer metadata is read by eager breaks (flat scoring)
-        # or only through scalars by captured kernels: take the live objects.
-        self.c1_indexer_metadata = static_metadata.c1_indexer_metadata
-        self.c2_indexer_metadata = static_metadata.c2_indexer_metadata
+        if low_ratio_index_captured:
+            # The captured full-top-k fallback reads the ratio-1/2 lengths and
+            # page tables by address: refresh them in place.
+            maybe_copy_inplace(
+                self.c1_indexer_metadata, src=static_metadata.c1_indexer_metadata
+            )
+            maybe_copy_inplace(
+                self.c2_indexer_metadata, src=static_metadata.c2_indexer_metadata
+            )
+        else:
+            # Two-level candidates: the flat sources score as eager breaks on the
+            # live objects (any context width) and the captured consumers read
+            # the candidate window through the bridge tensors only.
+            self.c1_indexer_metadata = static_metadata.c1_indexer_metadata
+            self.c2_indexer_metadata = static_metadata.c2_indexer_metadata
         maybe_copy_inplace(
             self.low_ratio_req_indices, src=static_metadata.low_ratio_req_indices
         )
@@ -2923,7 +2939,10 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
-        capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
+        capture_metadata.refresh_for_breakable_cuda_graph_replay_(
+            static_metadata,
+            low_ratio_index_captured=self._prefill_graph_low_ratio_index_captured(),
+        )
         self.forward_metadata = capture_metadata
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(metadata_batch, max_seq_len)
@@ -2946,7 +2965,10 @@ class DeepseekV4AttnBackend(
         if held is None:
             self._bcg_tail_metadata[rows] = fresh
             return fresh
-        held.refresh_for_breakable_cuda_graph_replay_(fresh)
+        held.refresh_for_breakable_cuda_graph_replay_(
+            fresh,
+            low_ratio_index_captured=self._prefill_graph_low_ratio_index_captured(),
+        )
         held.core_attn_metadata.swa_out_cache_loc = (
             fresh.core_attn_metadata.swa_out_cache_loc
         )
@@ -3662,6 +3684,15 @@ class DeepseekV4AttnBackend(
             tail.local_lens_cpu
             if tail.cp_metadata is not None
             else tail.extend_seq_lens_cpu
+        )
+
+    def _prefill_graph_low_ratio_index_captured(self) -> bool:
+        """Whether a prefill graph replay reads the ratio-1/2 indexer metadata by
+        address: without two-level candidates the full-top-k fallback is captured
+        with its lengths and page tables (see forward_low_ratio_sources), so the
+        replay has to refresh them in place."""
+        return not hasattr(
+            getattr(self, "prefill_candidates", None), "consume_prefill_captured"
         )
 
     def _prefill_graph_context_unbounded(self) -> bool:
