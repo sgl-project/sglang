@@ -100,7 +100,13 @@ class SWAComponent(TreeComponent):
         self.swa_max_states_per_path = params.swa_max_states_per_path
 
     component_type = ComponentType.SWA
+    pool_name = PoolName.SWA
     _independent = False
+
+    def restore_buffer_mapping(self, full_indices, window_indices):
+        self.cache._apply_cache_action(
+            RebuildFullToSWAMapping([full_indices], [window_indices])
+        )
 
     def _collect_unbacked_swa_nodes(
         self, node: UnifiedTreeNode
@@ -1099,7 +1105,7 @@ class SWAComponent(TreeComponent):
         assert self._swa_kv_pool_host is not None
         host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         if host_indices is None:
-            self.cache.evict_host(num_tokens, ComponentType.SWA)
+            self.cache.evict_host(num_tokens, self.component_type)
             host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         return host_indices
 
@@ -1112,7 +1118,7 @@ class SWAComponent(TreeComponent):
             return {}
         cd = node.component_data[self.component_type]
         if not self.tree_core.has_swa_host_pool or cd.value is None:
-            return {PoolName.SWA: []}
+            return {self.pool_name: []}
         rows = (
             node.component_data[BASE_COMPONENT_TYPE].value
             if self._unified_allocator() is not None
@@ -1120,8 +1126,8 @@ class SWAComponent(TreeComponent):
         )
         num_pages = len(rows) // self._swa_kv_pool_host.page_size
         if num_pages == 0 or num_pages > len(hash_values):
-            return {PoolName.SWA: []}
-        return {PoolName.SWA: list(hash_values[-num_pages:])}
+            return {self.pool_name: []}
+        return {self.pool_name: list(hash_values[-num_pages:])}
 
     def build_hicache_transfers(
         self,
@@ -1148,7 +1154,7 @@ class SWAComponent(TreeComponent):
             unbacked_swa_nodes.reverse()
             return [
                 PoolTransfer(
-                    name=PoolName.SWA,
+                    name=self.pool_name,
                     device_indices=(
                         self._translate_full_to_swa(
                             torch.cat(
@@ -1197,7 +1203,7 @@ class SWAComponent(TreeComponent):
 
             return [
                 PoolTransfer(
-                    name=PoolName.SWA,
+                    name=self.pool_name,
                     host_indices=torch.cat(backed_up),
                     device_indices=None,
                     nodes_to_load=[n.id for n in nodes],
@@ -1213,7 +1219,7 @@ class SWAComponent(TreeComponent):
                 return None
             return [
                 PoolTransfer(
-                    name=PoolName.SWA,
+                    name=self.pool_name,
                     host_indices=cd.host_value[-num_pages * self.tree_core.page_size :],
                     keys=node.hash_value[-num_pages:],
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
@@ -1228,7 +1234,7 @@ class SWAComponent(TreeComponent):
                 return None
             return [
                 PoolTransfer(
-                    name=PoolName.SWA,
+                    name=self.pool_name,
                     keys=["__placeholder__"] * num_pages,
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
@@ -1254,7 +1260,7 @@ class SWAComponent(TreeComponent):
 
             num_pages = len(value) // page
             return PoolTransfer(
-                name=PoolName.SWA,
+                name=self.pool_name,
                 device_indices=value[-num_pages * page :].to(torch.int64),
                 keys=node.hash_value[-num_pages:],
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
@@ -1270,7 +1276,7 @@ class SWAComponent(TreeComponent):
             return None
 
         transfer = PoolTransfer(
-            name=PoolName.SWA,
+            name=self.pool_name,
             keys=tail_keys,
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
@@ -1433,7 +1439,7 @@ class SWAComponent(TreeComponent):
             host_indices.numel() // page_size if host_indices is not None else 0
         )
         loaded_pages = (
-            pool_storage_result.extra_pool_hit_pages.get(PoolName.SWA, 0)
+            pool_storage_result.extra_pool_hit_pages.get(self.pool_name, 0)
             if pool_storage_result
             else 0
         )
@@ -1547,7 +1553,7 @@ class SWAComponent(TreeComponent):
         if self._swa_kv_pool_host is None:
             return
         for host_value in host_values:
-            self.cache.host_pool_group.free(host_value, pool=PoolName.SWA)
+            self.cache.host_pool_group.free(host_value, pool=self.pool_name)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
@@ -1572,7 +1578,7 @@ class SWAComponent(TreeComponent):
                 if host_indices is not None and host_indices.numel() > 0:
                     self.cache.cache_controller.append_host_mem_release(
                         extra_pools=[
-                            PoolTransfer(name=PoolName.SWA, host_indices=host_indices)
+                            PoolTransfer(name=self.pool_name, host_indices=host_indices)
                         ]
                     )
             return

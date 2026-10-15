@@ -168,7 +168,9 @@ class Schedule(msgspec.Struct):
                 "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
                 "family), how many radix-cached prefix tails it keeps room for. "
                 "Each tail is one sliding window plus one page. Default: 4 x "
-                "max_running_requests per attention-DP rank, 0 when the radix "
+                "max_running_requests per attention-DP rank, multiplied by "
+                "num_layers // draft_layers under encoder SWA bounded replay with "
+                "DSpark (only draft layers are paged there); 0 when the radix "
                 "cache is disabled."
             ),
         ),
