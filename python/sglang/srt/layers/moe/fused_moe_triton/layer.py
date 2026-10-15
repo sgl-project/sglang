@@ -581,8 +581,8 @@ class FusedMoE(torch.nn.Module):
         self.runner = self.quant_method.runner
 
     def configure_ascend_tp_finalize_fusion(self) -> Tuple[bool, bool]:
-        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-            NPUW4A8MXFP4MoEMethod,
+        from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
+            NPUFinalizeRouting,
         )
 
         eligible = (
@@ -591,18 +591,11 @@ class FusedMoE(torch.nn.Module):
             and self.num_fused_shared_experts in (0, 1)
             and not self.reduce_results
             and not isinstance(self.quant_method, KTEPWrapperMethod)
-            and isinstance(getattr(self, "w2_kernel", None), NPUW4A8MXFP4MoEMethod)
+            and isinstance(self.dispatcher.finalize, NPUFinalizeRouting)
+            and not self.moe_runner_config.apply_router_weight_on_input
         )
-        fuse_shared = (
-            eligible
-            and self.num_fused_shared_experts == 0
-            and envs.SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT.get()
-        )
-        fuse_scale = eligible and (
-            envs.SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE.get() or fuse_shared
-        )
-        self.should_fuse_routed_scaling_factor_in_topk |= fuse_scale
-        return fuse_scale, fuse_shared
+        self.should_fuse_routed_scaling_factor_in_topk |= eligible
+        return eligible, eligible and self.num_fused_shared_experts == 0
 
     @property
     def num_global_routed_experts(self) -> int:

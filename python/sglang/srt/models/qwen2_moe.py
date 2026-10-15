@@ -242,8 +242,19 @@ class Qwen2MoeMLP(nn.Module):
     def forward(
         self,
         x,
+        gateup_pre_quant=None,
     ):
-        gate_up, _ = self.gate_up_proj(x)
+        if getattr(self, "_npu_tp_shared", False) and x.shape[0]:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                shared_gmm1,
+                shared_gmm1_mode,
+            )
+
+            if shared_gmm1_mode(self) != "baseline":
+                return shared_gmm1(self, x, gateup_pre_quant)
+        gate_up, _ = self.gate_up_proj(
+            x if gateup_pre_quant is None else gateup_pre_quant
+        )
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
@@ -281,8 +292,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.num_fused_shared_experts = 0
 
         self.enable_shared_expert_fusion = False  # default to False
-        if support_shared_expert_fusion and (
-            _use_aiter or (_is_cuda and enable_cuda_shared_expert_fusion)
+        npu_shared_fusion = False
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                tp_fused_shared_expert_reason,
+            )
+
+            npu_shared_fusion = (
+                tp_fused_shared_expert_reason(config, quant_config) is None
+            )
+        if npu_shared_fusion or (
+            support_shared_expert_fusion
+            and (_use_aiter or (_is_cuda and enable_cuda_shared_expert_fusion))
         ):
             self.enable_shared_expert_fusion = (
                 self.num_shared_experts > 0
@@ -341,6 +362,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 config.model_type == "qwen3_5_moe_text" and uses_cutedsl_ar_fusion()
             ),
         )
+
+        self._fuse_npu_tp_routed_scale, self._fuse_npu_tp_shared = (
+            self.experts.configure_ascend_tp_finalize_fusion()
+            if _is_npu
+            else (False, False)
+        )
+        self._fuse_npu_tp_shared &= self.num_shared_experts > 0
+        if _is_npu and self._fuse_npu_tp_shared and self.alt_stream is None:
+            self.alt_stream = get_stream("npu_moe")
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -465,6 +495,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
             return topk_output
 
+        if _is_npu:
+            shared = self._get_shared_expert_weights(hidden_states)
+            if shared is None:
+                return topk_output
+            weights = shared[0].to(torch.float32)
+            ids = torch.full_like(topk_output.topk_ids[:, :1], self.num_experts)
+            return StandardTopKOutput(
+                torch.cat((topk_output.topk_weights, weights.reshape(-1, 1)), dim=-1),
+                torch.cat((topk_output.topk_ids, ids), dim=-1),
+                topk_output.router_logits,
+            )
+
         from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
         )
@@ -510,11 +552,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def _forward_shared_experts(
-        self, hidden_states: torch.Tensor, apply_gate: bool = True
+        self, hidden_states: torch.Tensor, apply_gate: bool = True, pre_quant_input=None
     ):
         shared_output = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    supports_mxfp8_linear,
+                )
+
+                self.shared_expert._npu_tp_shared = self._fuse_npu_tp_shared
+                if pre_quant_input is not None and supports_mxfp8_linear(
+                    self.shared_expert.gate_up_proj
+                ):
+                    shared_output = self.shared_expert(
+                        hidden_states, gateup_pre_quant=pre_quant_input
+                    )
+                else:
+                    shared_output = self.shared_expert(hidden_states)
+            else:
+                shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
@@ -708,6 +765,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         *,
         defer_finalize: bool = False,
+        pre_quant_input=None,
+        shared_output=None,
+        shared_output_ready=None,
     ):
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
             from sglang.kernels.ops.moe.smallm_router_gfx950 import qwen_moe_topk_output
@@ -732,6 +792,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+        if _is_npu:
+            return self.experts(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output,
+                shared_output_ready=shared_output_ready,
+            )
         return self.experts(hidden_states, topk_output)
 
     def _gate_shared_output_out_of_place(
@@ -753,7 +821,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
     ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
+        device_module = torch.get_device_module(hidden_states.device)
+        current_stream = device_module.current_stream()
+        pre_quant_input = None
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                prequantize_tp_input,
+            )
+
+            pre_quant_input = prequantize_tp_input(
+                self.experts, hidden_states, self.shared_expert
+            )
 
         if defer_finalize:
             # Keep routed FC2 on the current stream as finalize's PDL dependency;
@@ -762,7 +840,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_output = self._forward_router_experts(
                 hidden_states, defer_finalize=True
             )
-            with torch.cuda.stream(self.alt_stream):
+            with device_module.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
                     hidden_states, apply_gate=False
                 )
@@ -776,7 +854,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         shared_output = (
             self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+                hidden_states.clone(),
+                apply_gate=not use_fused_gate,
+                pre_quant_input=pre_quant_input,
             )
             if self.shared_expert is not None
             else None
@@ -798,8 +878,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 staged = True
         # ===== END TO BE REFACTORED ====
 
-        with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+        with device_module.stream(self.alt_stream):
+            if _is_npu:
+                hidden_states.record_stream(self.alt_stream)
+            router_output = self._forward_router_experts(
+                hidden_states,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output if self._fuse_npu_tp_shared else None,
+                shared_output_ready=(
+                    lambda: self.alt_stream.wait_stream(current_stream)
+                )
+                if self._fuse_npu_tp_shared
+                else None,
+            )
+            if self._fuse_npu_tp_shared:
+                shared_output = None
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -845,7 +938,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
         elif (
             self.alt_stream is not None
-            and get_is_capture_mode()
+            and (get_is_capture_mode() or (_is_npu and self._fuse_npu_tp_shared))
             and not torch.compiler.is_compiling()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
@@ -854,16 +947,32 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 defer_finalize=defer_finalize,
             )
         else:
+            pre_quant_input = None
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    prequantize_tp_input,
+                )
+
+                pre_quant_input = prequantize_tp_input(
+                    self.experts, hidden_states, self.shared_expert
+                )
             shared_output = self._forward_shared_experts(
-                hidden_states, apply_gate=not use_fused_gate and not defer_finalize
+                hidden_states,
+                apply_gate=not use_fused_gate and not defer_finalize,
+                pre_quant_input=pre_quant_input,
             )
             if defer_finalize and shared_output is not None:
                 shared_output = self._gate_shared_output_out_of_place(
                     hidden_states, shared_output
                 )
             final_hidden_states = self._forward_router_experts(
-                hidden_states, defer_finalize=defer_finalize
+                hidden_states,
+                defer_finalize=defer_finalize,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output if self._fuse_npu_tp_shared else None,
             )
+            if self._fuse_npu_tp_shared:
+                shared_output = None
 
         if defer_finalize:
             if shared_output is None:

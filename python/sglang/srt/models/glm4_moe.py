@@ -202,14 +202,14 @@ class Glm4MoeMLP(nn.Module):
     ):
         if self.is_replicated and x.shape[0] == 0:
             return x
-        if (
-            getattr(self, "_npu_tp_shared", False)
-            and envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.get()
-            and x.shape[0]
-        ):
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import shared_gmm1
+        if getattr(self, "_npu_tp_shared", False) and x.shape[0]:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                shared_gmm1,
+                shared_gmm1_mode,
+            )
 
-            return shared_gmm1(self, x, gateup_pre_quant)
+            if shared_gmm1_mode(self) != "baseline":
+                return shared_gmm1(self, x, gateup_pre_quant)
 
         gate_up, _ = self.gate_up_proj(
             x if gateup_pre_quant is None else gateup_pre_quant
@@ -570,6 +570,11 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self._fuse_npu_tp_shared &= (
+            hasattr(self, "shared_experts") and not self._fuse_shared_experts_inside_sbo
+        )
+        if _is_npu and self._fuse_npu_tp_shared and self.alt_stream is None:
+            self.alt_stream = get_stream("npu_moe")
         if _is_npu and hasattr(self, "shared_experts"):
             self.shared_experts._npu_tp_shared = (
                 not self._enable_a2a_moe and self.experts.moe_ep_size == 1
@@ -595,7 +600,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
-                and get_is_capture_mode()
+                and (get_is_capture_mode() or (_is_npu and self._fuse_npu_tp_shared))
             ):
                 return self.forward_normal_dual_stream(hidden_states)
             else:
@@ -607,12 +612,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.get_device_module(hidden_states.device).current_stream()
         pre_quant_input = self._prequantize_npu_tp_input(hidden_states)
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states, pre_quant_input)
 
-        with torch.cuda.stream(self.alt_stream):
+        with torch.get_device_module(hidden_states.device).stream(self.alt_stream):
+            if _is_npu:
+                hidden_states.record_stream(self.alt_stream)
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
@@ -736,7 +743,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             return None
         from sglang.srt.hardware_backend.npu.moe.tp_fusion import prequantize_tp_input
 
-        return prequantize_tp_input(self.experts, hidden_states)
+        return prequantize_tp_input(
+            self.experts, hidden_states, getattr(self, "shared_experts", None)
+        )
 
     def _forward_shared_experts(
         self, hidden_states: torch.Tensor, pre_quant_input=None
@@ -747,9 +756,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     supports_mxfp8_linear,
                 )
 
-                if envs.SGLANG_NPU_TP_MOE_REUSE_MXFP8.get() and supports_mxfp8_linear(
-                    self.shared_experts.gate_up_proj
-                ):
+                if supports_mxfp8_linear(self.shared_experts.gate_up_proj):
                     return self.shared_experts(
                         hidden_states, gateup_pre_quant=pre_quant_input
                     )
@@ -1087,6 +1094,12 @@ class Glm4MoeForCausalLM(nn.Module):
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         """Why this checkpoint cannot fuse its shared expert, or None. Asked by
         the loader before any layer is built."""
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                tp_fused_shared_expert_reason,
+            )
+
+            return tp_fused_shared_expert_reason(hf_config, quant_config)
         if (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):

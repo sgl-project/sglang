@@ -1,34 +1,34 @@
-"""Opt-in A5 TP fusion contracts for MXFP8 activations and MXFP4 weights."""
+"""Native TP MoE operand reuse and shared-expert eligibility."""
+
+from types import SimpleNamespace
+from typing import NamedTuple
 
 import torch
 
 
-def require_npu_op(name: str, arguments=()):
+class NpuMxfp8Input(NamedTuple):
+    data: torch.Tensor
+    scale: torch.Tensor
+
+
+def supports_npu_op(name, arguments=()):
     op = getattr(torch.ops.npu, name, None)
-    if op is None:
-        raise RuntimeError(f"A5 TP fusion requires torch_npu operator {name}")
-    schema = op.default._schema
-    available = {arg.name for arg in schema.arguments}
-    missing = set(arguments) - available
-    if missing:
-        raise RuntimeError(f"{name} ABI lacks {sorted(missing)}; found {schema}")
-    return op
+    if op is None or not hasattr(op, "default"):
+        return False
+    available = {arg.name for arg in op.default._schema.arguments}
+    return set(arguments).issubset(available)
 
 
-def mxfp8_input(hidden_states: torch.Tensor):
-    scale = getattr(hidden_states, "_npu_mxfp8_scale", None)
-    if scale is not None:
-        return hidden_states, scale
-    if hidden_states.dtype == torch.float8_e4m3fn:
-        raise RuntimeError("MXFP8 input is missing its E8M0 scales")
-    return torch.ops.npu.npu_dynamic_mx_quant(
-        hidden_states, dst_type=torch.float8_e4m3fn
+def mxfp8_input(hidden_states: torch.Tensor) -> NpuMxfp8Input:
+    if hidden_states.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("MXFP8 quantization requires FP16/BF16 input")
+    return NpuMxfp8Input(
+        *torch.ops.npu.npu_dynamic_mx_quant(hidden_states, dst_type=torch.float8_e4m3fn)
     )
 
 
 def record_mxfp8_operand(operand):
-    # Quantization can run on a different stream from either consumer.
-    stream = torch.get_device_module().current_stream()
+    stream = torch.get_device_module(operand[0].device).current_stream()
     for tensor in operand:
         tensor.record_stream(stream)
 
@@ -39,27 +39,29 @@ def supports_mxfp8_linear(layer) -> bool:
         NPUMXFP8LinearMethod,
     )
 
-    return isinstance(
-        getattr(getattr(layer, "scheme", None), "kernel", layer.quant_method),
-        (NPUMXFP4W4A8OfflineLinearMethod, NPUMXFP8LinearMethod),
-    )
+    kernel = getattr(getattr(layer, "scheme", None), "kernel", None)
+    if kernel is None:
+        kernel = getattr(layer, "quant_method", None)
+    return isinstance(kernel, (NPUMXFP4W4A8OfflineLinearMethod, NPUMXFP8LinearMethod))
 
 
-def prequantize_tp_input(experts, hidden_states):
-    from sglang.srt.environ import envs
+def prequantize_tp_input(experts, hidden_states, shared_experts=None):
     from sglang.srt.layers.moe.token_dispatcher.ascend_tp import AscendTPDispatcher
     from sglang.srt.layers.moe.utils import DispatcherOutputDtype
 
     dispatcher = experts.dispatcher
-    if getattr(hidden_states, "_npu_mxfp8_scale", None) is not None:
-        return mxfp8_input(hidden_states)
     if (
-        not envs.SGLANG_NPU_TP_MOE_PREQUANT_INPUT.get()
-        or hidden_states.shape[0] == 0
+        hidden_states.shape[0] == 0
+        or shared_experts is None
+        or not supports_mxfp8_linear(shared_experts.gate_up_proj)
         or hidden_states.dtype != torch.bfloat16
+        or hidden_states.shape[-1] % 64
         or not isinstance(dispatcher, AscendTPDispatcher)
         or experts.moe_ep_size != 1
         or dispatcher.ascend_dispatcher_output_dtype != DispatcherOutputDtype.MXFP8
+        or getattr(getattr(experts, "w13_kernel", None), "dynamic_quant_kwargs", ())
+        is None
+        or not supports_npu_op("npu_moe_init_routing_v2", ("scale",))
     ):
         return None
     return mxfp8_input(hidden_states)
@@ -73,73 +75,132 @@ def shared_gmm1_weight_views(weight, weight_scale):
     )
 
 
-def shared_gmm1_mode():
-    from sglang.srt.environ import envs
+def shared_gmm1_mode(mlp=None):
+    if mlp is None:
+        return "baseline"
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-    mode = envs.SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE.get()
-    if not mode:
-        return (
-            "grouped_fused" if envs.SGLANG_NPU_TP_MOE_SHARED_GMM1.get() else "baseline"
-        )
-    if mode not in ("baseline", "grouped_fused"):
-        raise ValueError(f"Unknown SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE: {mode!r}")
-    return mode
+    if (
+        not supports_mxfp8_linear(mlp.gate_up_proj)
+        or not supports_mxfp8_linear(mlp.down_proj)
+        or getattr(mlp, "swiglu_limit", None) is not None
+        or getattr(mlp.gate_up_proj, "bias", None) is not None
+        or not is_npu_arch35()
+        or not supports_npu_op("npu_grouped_matmul_swiglu_quant_v2")
+    ):
+        return "baseline"
+    return "grouped_fused"
 
 
-def shared_gateup_quant(mlp, x, pre_quant_input=None, *, mode="grouped_fused"):
+def shared_gmm1(mlp, x, pre_quant_input=None):
     from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
         NPUMXFP8LinearMethod,
     )
     from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-        _get_float4_e2m1fn_x2_dtype,
-        _require_e8m0_dtype,
+        NPUMXFP8MoEMethod,
+        NPUW4A8MXFP4MoEMethod,
     )
 
     gate = mlp.gate_up_proj
-    if not supports_mxfp8_linear(gate) or not supports_mxfp8_linear(mlp.down_proj):
-        raise ValueError("Shared GMM1 fusion requires MXFP8-compatible shared linears")
-    if getattr(mlp, "swiglu_limit", None) is not None:
-        raise ValueError("Shared GMM1 fusion does not support a clamped activation")
-    if getattr(gate, "bias", None) is not None:
-        raise ValueError("Shared GMM1 fusion requires a bias-free gate/up projection")
-    qx, scale = mxfp8_input(x) if pre_quant_input is None else pre_quant_input
-    record_mxfp8_operand((qx, scale))
-    if mode != "grouped_fused":
-        raise ValueError(f"Unsupported shared gate/up mode: {mode!r}")
-    kernel = getattr(getattr(gate, "scheme", None), "kernel", gate.quant_method)
-    weight_dtype = (
-        None
-        if isinstance(kernel, NPUMXFP8LinearMethod)
-        else _get_float4_e2m1fn_x2_dtype()
-    )
-    weight_scale = gate.weight_scale_inv if weight_dtype is None else gate.weight_scale
-    grouped_weight, grouped_scale = shared_gmm1_weight_views(gate.weight, weight_scale)
-    group_key = (qx.shape[0], qx.device)
+    linear_kernel = getattr(getattr(gate, "scheme", None), "kernel", None)
+    if linear_kernel is None:
+        linear_kernel = gate.quant_method
+    is_mxfp8 = isinstance(linear_kernel, NPUMXFP8LinearMethod)
+    kernel = getattr(mlp, "_npu_shared_gmm1_kernel", None)
+    if kernel is None:
+        kernel = NPUMXFP8MoEMethod("w13") if is_mxfp8 else NPUW4A8MXFP4MoEMethod()
+        mlp._npu_shared_gmm1_kernel = kernel
+    scale = gate.weight_scale_inv if is_mxfp8 else gate.weight_scale
+    weight, scale = shared_gmm1_weight_views(gate.weight, scale)
+    quant_info = SimpleNamespace(w13_weight=weight, w13_weight_scale=scale)
+    operand = mxfp8_input(x) if pre_quant_input is None else pre_quant_input
+    record_mxfp8_operand(operand)
+    # A singleton expert uses the same compute component as routed GMM1.
+    group_key = (x.shape[0], x.device)
     cached = getattr(mlp, "_npu_shared_group_list", None)
     if cached is None or cached[0] != group_key:
-        group_list = torch.full((1,), qx.shape[0], dtype=torch.int64, device=qx.device)
+        group_list = torch.full((1,), x.shape[0], dtype=torch.int64, device=x.device)
         mlp._npu_shared_group_list = (group_key, group_list)
     else:
         group_list = cached[1]
-    group_list.record_stream(torch.get_device_module().current_stream())
-    op = require_npu_op("npu_grouped_matmul_swiglu_quant_v2")
-    quantized, output_scale = op(
-        x=qx,
-        weight=[grouped_weight],
-        weight_scale=[grouped_scale],
-        x_scale=scale,
-        group_list=group_list,
-        dequant_mode=2,
-        quant_mode=2,
-        dequant_dtype=torch.float32,
-        quant_dtype=torch.float8_e4m3fn,
-        weight_dtype=weight_dtype,
-        weight_scale_dtype=_require_e8m0_dtype(),
-        x_scale_dtype=_require_e8m0_dtype(),
+    group_list.record_stream(torch.get_device_module(x.device).current_stream())
+    out = kernel.apply_fused_gmm1_swiglu(
+        quant_info, operand[0], group_list, operand[1], group_list_type=1
     )
-    return quantized, output_scale
+    return mlp.down_proj(NpuMxfp8Input(*out))[0]
 
 
-def shared_gmm1(mlp, x, pre_quant_input=None, *, mode="grouped_fused"):
-    operand = shared_gateup_quant(mlp, x, pre_quant_input, mode=mode)
-    return mlp.down_proj(operand)[0]
+def tp_fused_shared_expert_reason(config, quant_config):
+    """Validate matching routed/shared projection contracts before loading."""
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import is_sbo_enabled, is_tbo_enabled
+    from sglang.srt.runtime_context import get_exec, get_parallel
+
+    parallel = get_parallel()
+    shared_count = getattr(config, "n_shared_experts", None)
+    if shared_count is None:
+        shared_count = int(getattr(config, "shared_expert_intermediate_size", 0) > 0)
+    if (
+        not get_moe_a2a_backend().is_none()
+        or parallel.moe_ep_size != 1
+        or parallel.moe_dp_size != 1
+        or parallel.attn_dp_size != 1
+        or parallel.attn_cp_size != 1
+        or parallel.enable_prefill_cp
+        or shared_count != 1
+        or is_sbo_enabled()
+        or is_tbo_enabled()
+        or getattr(config, "swiglu_limit", None) is not None
+        or get_exec().moe.enable_eplb
+        or get_exec().moe.enable_waterfill
+    ):
+        return "NPU shared-expert fusion requires native TP/EP1 without overlap or expert remapping."
+    if (
+        getattr(config, "shared_expert_intermediate_size", config.moe_intermediate_size)
+        != config.moe_intermediate_size
+    ):
+        return "Shared and routed expert intermediate sizes differ."
+    if quant_config is None:
+        return None
+    if quant_config.get_name() != "modelslim":
+        return "NPU shared-expert fusion requires matching ModelSlim or unquantized experts."
+    description = quant_config.quant_description
+    shared = [
+        key
+        for key in description
+        if isinstance(key, str)
+        and (".shared_experts." in key or ".shared_expert." in key)
+        and key.endswith(".weight")
+    ]
+    if not shared:
+        return "Missing shared-expert quantization descriptors."
+    supported = {
+        "FLOAT",
+        "W8A8",
+        "W8A8_DYNAMIC",
+        "W8A8_MXFP8",
+        "W4A8",
+        "W4A4",
+        "W4A8_MXFP",
+        "W4A4_MXFP4",
+    }
+    expert_count = getattr(
+        config, "n_routed_experts", getattr(config, "num_experts", 0)
+    )
+    if expert_count <= 0:
+        return "Missing routed-expert count."
+    for key in shared:
+        marker = ".shared_experts." if ".shared_experts." in key else ".shared_expert."
+        layer, projection = key.split(marker)
+        scheme = description[key]
+        if scheme not in supported or any(
+            description.get(f"{layer}.experts.{i}.{projection}") != scheme
+            for i in range(expert_count)
+        ):
+            return "Shared and routed expert quantization descriptors differ."
+        if any(
+            f"{layer}{marker}{proj}.weight" not in description
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        ):
+            return "Missing shared-expert projection descriptors."
+    return None

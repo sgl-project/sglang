@@ -38,41 +38,6 @@ This document provides a list of commonly used environment variables and aims to
       <td><code>false</code></td>
     </tr>
     <tr>
-      <td><code>SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE</code></td>
-      <td>Fold the routed scaling factor into the TP MoE finalization kernel instead of a separate multiply. Requires a W4A8 MXFP TP setup; validated when the model is built.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_TP_MOE_FUSE_SHARED_EXPERT</code></td>
-      <td>Pass the shared-expert output into the TP MoE finalization (<code>skip1</code>) instead of a separate add. Implies <code>SGLANG_NPU_TP_MOE_FUSE_ROUTED_SCALE</code>.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_TP_MOE_PREQUANT_INPUT</code></td>
-      <td>Quantize the shared MoE input to MXFP8 once and feed it to routing and the shared expert gate/up projection.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_TP_MOE_REUSE_MXFP8</code></td>
-      <td>Let MXFP8 linear layers accept prequantized <code>(q, scale)</code> tuple inputs instead of re-quantizing.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_TP_MOE_SHARED_GMM1</code>, <code>SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE</code></td>
-      <td>Run the shared expert gate/up + activation + quant as one grouped GMM kernel (<code>grouped_fused</code>). The mode value overrides the boolean switch (<code>baseline</code> disables).</td>
-      <td><code>false</code>, <code>""</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8</code></td>
-      <td>Emit the post-attention norm output directly as MXFP8 via the fused native norm kernel. Requires <code>SGLANG_NPU_TP_MOE_PREQUANT_INPUT</code> and <code>SGLANG_NPU_TP_MOE_REUSE_MXFP8</code>.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_TP_MOE_MXFP8_GATE</code></td>
-      <td>Run the MoE router gate as an MXFP8 matmul producing FP32 logits. Requires <code>SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8</code>.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
       <td><code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
       <td>The maximum number of dispatched tokens on each rank.</td>
       <td><code>128</code></td>
