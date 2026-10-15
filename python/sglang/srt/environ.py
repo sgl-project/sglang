@@ -1124,6 +1124,9 @@ class Envs:
     # "tile,g1_n,g1_cm,g1_cn,g2_n,g2_cm,g2_cn" (e.g. "128,128,1,1,256,1,2"); empty = autotune.
     SGLANG_Q35MF_EXPERT_TACTIC = EnvStr("")
     SGLANG_Q35MF_EXPERT_TACTIC_MAX_TOKENS = EnvInt(16)
+    # Qwen MoE blocks on the CuTe DSL NVFP4 runner: router GEMV, top-k, input
+    # quantization and routing tables as one kernel at decode token counts.
+    SGLANG_Q35MF_ROUTE_FUSED = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

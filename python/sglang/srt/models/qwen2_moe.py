@@ -64,6 +64,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
+from sglang.srt.layers.moe import qwen_router_front
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
@@ -403,6 +404,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
+        # Single-kernel router front end (layers/moe/qwen_router_front.py); the
+        # arrival counter must persist across CUDA graph replays.
+        self._route_front_static_ok = (
+            None if envs.SGLANG_Q35MF_ROUTE_FUSED.get() and not is_nextn else False
+        )
+        if self._route_front_static_ok is None:
+            self.register_buffer(
+                "_route_arrival", torch.zeros(1, dtype=torch.int32), persistent=False
+            )
 
     def get_moe_weights(self):
         return [
@@ -809,6 +819,29 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return router_output, shared_output
 
+    def _forward_route_front(
+        self, hidden_states: torch.Tensor, use_fused_gate: bool
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        apply_gate = not use_fused_gate
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
+        ):
+            # Routed path on the current stream, so its first kernel can launch
+            # early behind the preceding all-reduce; shared expert on the side stream.
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            router_output = qwen_router_front.forward_routed(self, hidden_states)
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(
+                    hidden_states.clone(), apply_gate=apply_gate
+                )
+            current_stream.wait_stream(self.alt_stream)
+            return router_output, shared_output
+        shared_output = self._forward_shared_experts(hidden_states, apply_gate=apply_gate)
+        return qwen_router_front.forward_routed(self, hidden_states), shared_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -843,6 +876,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
+        elif (
+            self._route_front_static_ok is not False
+            and not defer_finalize
+            and qwen_router_front.supported(self, hidden_states)
+        ):
+            final_hidden_states, shared_output = self._forward_route_front(
+                hidden_states, use_fused_gate=use_fused_gate
+            )
         elif (
             self.alt_stream is not None
             and get_is_capture_mode()
