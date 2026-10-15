@@ -267,8 +267,11 @@ class TestMiniMaxAiterIndexer(unittest.TestCase):
         backend._init_rocm_linear_verify_metadata.assert_called_once_with(batch)
 
     def test_prefill_topk_reuse_is_scoped_to_batch(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
         cache = torch.empty(256, 1, 128, dtype=torch.float8_e4m3fn, device="cuda")
         backend = self.make_backend(cache)
+        backend.is_hip = True
         backend.kv_pool.get_kv_buffer = lambda _: (cache, cache)
         backend._is_sparse_kv_cached_by_fusion = Mock(return_value=True)
         backend.is_npu = backend.fp8_attn_gemm = backend.use_msa = False
@@ -319,6 +322,7 @@ class TestMiniMaxAiterIndexer(unittest.TestCase):
             )
 
         batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
             extend_seq_lens_cpu=[3],
             seq_lens_cpu=torch.tensor([3]),
             req_pool_indices=torch.zeros(1, device="cuda", dtype=torch.int64),
