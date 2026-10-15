@@ -342,6 +342,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+        self._split_kv_enabled = envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get()
+        self._split_kv_scratch = {}
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -1381,6 +1383,82 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if out_dtype is not None
             else (out.dtype if out is not None else self.q_data_type)
         )
+
+        if self._split_kv_enabled:
+            supported = (
+                not self.is_xqa_impl
+                and get_parallel().attn_dcp_size == 1
+                and self.page_size == 64
+                and q_len_per_req == 7
+                and seq_lens.numel() == 1
+                and query.shape == (7, query.shape[-2], 256)
+                and query.shape[-2] in (4, 8)
+                and query.dtype == torch.float8_e4m3fn
+                and query.is_contiguous()
+                and isinstance(kv_cache, tuple)
+                and len(kv_cache) == 2
+                and all(
+                    value.dtype == query.dtype
+                    and value.ndim == 4
+                    and value.shape[1:] == (1, 64, 256)
+                    and value.stride(-1) == 1
+                    for value in kv_cache
+                )
+                and kv_cache[0].stride() == kv_cache[1].stride()
+                and resolved_out_dtype == torch.bfloat16
+                and (
+                    out is None
+                    or (
+                        out.is_contiguous()
+                        and out.shape == query.shape
+                        and out.dtype == resolved_out_dtype
+                    )
+                )
+                and isinstance(bmm1_scale, (int, float))
+                and isinstance(bmm2_scale, (int, float))
+                and window_left < 0
+                and sinks is None
+                and mask is None
+                and kv_cache_sf is None
+                and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                in (None, 0.0)
+            )
+            if supported:
+                from sglang.kernels.ops.attention.split_kv_verify import (
+                    allocate_scratch,
+                    split_kv_verify,
+                )
+
+                key = (query.shape[-2], q_len_per_req)
+                scratch = self._split_kv_scratch.get(key)
+                if scratch is None:
+                    scratch = allocate_scratch(query, 1, 148, q_len_per_req)
+                    self._split_kv_scratch[key] = scratch
+                if out is None:
+                    out = torch.empty_like(query, dtype=resolved_out_dtype)
+                return split_kv_verify(
+                    query,
+                    kv_cache,
+                    block_tables,
+                    seq_lens,
+                    out,
+                    scratch,
+                    splits=148,
+                    qlen=q_len_per_req,
+                    block_m=64,
+                    block_n=128,
+                    qk_scale=float(bmm1_scale),
+                    v_scale=float(bmm2_scale),
+                    num_stages=2,
+                    skip_empty=True,
+                    short_merge=True,
+                    short_tiles=True,
+                    merge_tile=64,
+                )
+            logger.warning_once(
+                "Paged split attention is unsupported for this configuration; "
+                "using the stock attention implementation."
+            )
 
         def run_group(group_query, group_block_tables, group_seq_lens, group_out=None):
             kwargs = {}
