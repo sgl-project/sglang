@@ -243,7 +243,7 @@ For the full setup (streaming, tool-use, count_tokens, persisting env in `~/.cla
 ### 3.5 Context Parallelism
 
 <Warning>
-Zigzag prefill CP (`--cp-strategy zigzag`) is temporarily unavailable for GLM-5.3. For prefill CP on CUDA, use `interleave` with `--dp 1` as shown below.
+Zigzag prefill CP (`--cp-strategy zigzag`) is temporarily unavailable for GLM-5.3. For prefill CP on CUDA, use `interleave` as shown below.
 </Warning>
 
 Prefill context parallelism can help with reduction of TTFT under long context. To enable prefill context parallelism for GLM 5.3, please append the following arguments:
@@ -253,6 +253,12 @@ Prefill context parallelism can help with reduction of TTFT under long context. 
 --cp-strategy interleave \
 ```
 which splits the sequence equally across `--attn-cp-size` ranks during attention forward. The trade off for prefill CP is that it will introduce extra all-gather operation before indexer-topk and attention kernels, so it will increase latency for decode (in unified deployment) or short prefill.
+
+You can combine interleave CP with attention DP. Each attention-DP group owns
+`tp_size / attn_dp_size` CP ranks; for example, `--tp 8 --attn-dp-size 2`
+uses CP4 within each DP group. Dense FFNs retain their configured TP width:
+the default runs them over the full TP group, while `--moe-dense-tp-size 1`
+runs them independently on local token shards.
 
 When deploying with PD Disaggregation, a **prefill worker using the Mooncake transfer backend** can enable the [LayerSplit](https://z.ai/blog/scaling-pain) technique with
 ```bash

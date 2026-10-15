@@ -56,14 +56,13 @@ class TestNPUGLM52ReturnIndexerTopk(CustomTestCase):
                 "0.56",
                 "--tp-size",
                 "2",
-                "--dp-size",
+                "--attn-dp-size",
                 "2",
-                "--enable-dp-attention",
                 "--enable-dp-lm-head",
                 "--disable-cuda-graph",
                 "--enable-return-indexer-topk",
                 "--json-model-override-args",
-                '{"num_hidden_layers": 6}',
+                '{"num_hidden_layers": 6, "quantization_config": null}',
             ],
         )
         try:

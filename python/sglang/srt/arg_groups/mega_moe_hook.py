@@ -13,7 +13,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -143,11 +143,11 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         local_chunked_prefill_size = (
             cfg.chunked_prefill_size + token_partition_size - 1
         ) // token_partition_size
-    elif cfg.enable_dp_attention:
-        token_partition_size = cfg.dp_size
-        token_partition_name = "dp_size"
+    elif attn_dp_enabled_of(cfg):
+        token_partition_size = cfg.attn_dp_size
+        token_partition_name = "attn_dp_size"
         token_alignment = max(
-            cfg.tp_size // cfg.dp_size // cfg.attn_cp_size,
+            cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size,
             1,
         )
         local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size

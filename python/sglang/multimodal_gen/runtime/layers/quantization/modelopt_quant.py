@@ -18,8 +18,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
+    ModelOptFp8LinearMethod as StaticModelOptFp8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
@@ -28,7 +31,6 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
@@ -194,9 +196,6 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_config_filenames(cls) -> List[str]:
         return ["hf_quant_config.json"]
 
-    def get_scaled_act_names(self) -> List[str]:
-        return []
-
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant) -> Optional[str]:
         if hf_quant_config is None:
@@ -328,7 +327,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.swap_weight_nibbles = swap_weight_nibbles
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
         self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
-        self._comfy_int8_config: KitchenInt8Config | None = None
+        self._comfy_int8_config: ConvRotInt8Config | None = None
         self._comfy_fp8_config: ComfyFp8Config | None = None
 
     def set_comfy_layer_markers(self, layer_markers: dict[str, dict[str, Any]]) -> None:
@@ -346,7 +345,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if marker.get("format") == "int8_tensorwise"
         }
         self._comfy_int8_config = (
-            KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
+            ConvRotInt8Config(layer_markers=int8_markers) if int8_markers else None
         )
         fp8_markers = {
             prefix: marker
@@ -581,20 +580,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         copy_or_rebind_param(layer, "weight_scale", processed_weight_scale)
         copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
-        )
+    apply = StaticModelOptFp8LinearMethod.apply
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
@@ -823,33 +809,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 )
 
             x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
-        weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
-        x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
-
-        w = layer.weight
-        w_scale_interleaved = layer.weight_scale_interleaved
-
-        if x_scale_interleaved.dtype == torch.uint8:
-            x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
-        if w_scale_interleaved.dtype == torch.uint8:
-            w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
-        fp4_gemm, flashinfer_backend = _get_fp4_gemm_op()
-        if fp4_gemm is None:
-            raise RuntimeError("No FP4 GEMM kernel available. Install flashinfer.")
-        out = fp4_gemm(
-            x_fp4,
-            w.T,
-            x_scale_interleaved,
-            w_scale_interleaved.T,
-            layer.alpha,
-            output_dtype,
-            backend=flashinfer_backend,
+        out = apply_nvfp4_gemm_prequantized(
+            layer, x_fp4, x_scale_interleaved, output_dtype, bias
         )
-
-        out = slice_nvfp4_output(out, output_size)
-
-        if bias is not None:
-            out = out + bias
         return out.view(*output_shape)
 
 
