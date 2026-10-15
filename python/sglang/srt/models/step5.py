@@ -322,6 +322,22 @@ _STEP5_NVFP4_PARAM_SOURCES = {
 }
 
 
+def _step5_routed_expert_row(name: str, num_experts: int) -> tuple[str, int] | None:
+    # Trainers send `model.layers.L.moe.experts.E.<proj>`, one row of the packed `moe.<proj>`.
+    head, marker, tail = name.rpartition(".moe.experts.")
+    expert, _, projection = tail.partition(".")
+    if (
+        not marker
+        or not projection
+        or not expert.isdecimal()
+        or str(int(expert)) != expert
+    ):
+        return None
+    if not 0 <= int(expert) < num_experts:
+        return None
+    return f"{head}.moe.{projection}", int(expert)
+
+
 def _step5_indexed_nvfp4_layers(checkpoint_path) -> dict[int, str] | None:
     if not checkpoint_path:
         return None
@@ -1523,6 +1539,9 @@ class Step5ForCausalLM(nn.Module):
         self.nvfp4_expert_layouts = self.model.nvfp4_expert_layouts
         self.tie_word_embeddings = False
         self.num_fused_shared_experts = 0
+        # Only the first load_weights call (the checkpoint) must cover every target weight;
+        # later calls are weight updates and, as for other models, may stream any subset.
+        self._checkpoint_loaded = False
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -1690,9 +1709,11 @@ class Step5ForCausalLM(nn.Module):
             expected.update(sources or [name])
         seen, original_names = set(), set()
         checkpoint_depth = config.num_hidden_layers + config.num_nextn_predict_layers
-        weights = self._indexed_duplicate_weights(
-            weights, expected, getattr(self, "checkpoint_path", None)
-        )
+        checkpoint_load = not self._checkpoint_loaded
+        if checkpoint_load:
+            weights = self._indexed_duplicate_weights(
+                weights, expected, getattr(self, "checkpoint_path", None)
+            )
         for original_name, loaded_weight in weights:
             name = original_name
             if name.startswith("vision_model.") or name == "vit_large_projector.weight":
@@ -1709,11 +1730,18 @@ class Step5ForCausalLM(nn.Module):
                     continue
                 if local.startswith("share_expert."):
                     name = f"model.layers.{index}.moe.{local}"
+            expert_ids, seen_key = range(config.moe_num_experts), name
+            if name not in expected and not checkpoint_load:
+                row = _step5_routed_expert_row(name, config.moe_num_experts)
+                if row is not None and row[0] in expected:
+                    # one expert's row of the packed tensor; duplicates are per expert
+                    name, expert_ids, seen_key = row[0], (row[1],), original_name
+                    loaded_weight = loaded_weight.unsqueeze(0)
             if name not in expected:
                 raise ValueError(f"Unknown Step5 target weight: {name}")
-            if name in seen:
+            if seen_key in seen:
                 raise ValueError(f"Duplicate Step5 target weight: {original_name}")
-            seen.add(name)
+            seen.add(seen_key)
             original_names.add(original_name)
             nvfp4_source = step5_nvfp4_expert_source(name)
             if nvfp4_source is not None:
@@ -1769,8 +1797,8 @@ class Step5ForCausalLM(nn.Module):
                             f"BF16 expert weight has checkpoint scales: {original_name}"
                         )
                     seen.add(generated_scale)
-                for expert_id in range(config.moe_num_experts):
-                    weight = loaded_weight[expert_id]
+                for row, expert_id in enumerate(expert_ids):
+                    weight = loaded_weight[row]
                     if quantize_bf16:
                         local_id = experts._map_global_expert_id_to_local_expert_id(
                             expert_id
@@ -1827,10 +1855,11 @@ class Step5ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
         missing = expected - seen
-        if missing:
+        if checkpoint_load and missing:
             raise ValueError(
                 f"Step5 target is missing {len(missing)} weights: {sorted(missing)[:16]}"
             )
+        self._checkpoint_loaded = True
         for layer in self.model.layers:
             if layer.use_moe and layer.moe.use_nvfp4_experts:
                 step5_check_nvfp4_expert_scales(layer.moe.experts, layer.moe.prefix)
