@@ -567,10 +567,6 @@ class Glm47MoeDetector(BaseFormatDetector):
             logger.warning("Empty function name detected, skipping tool call")
             return None
 
-        # The function name is complete, but buffered calls are emitted
-        # atomically only after </tool_call>. Emitting the name here would
-        # leave clients with an irretractable partial call if generation ends
-        # before the closing tag.
         self.current_tool_name_sent = True
         self._streamed_raw_length = 0
         self._reset_streaming_state()

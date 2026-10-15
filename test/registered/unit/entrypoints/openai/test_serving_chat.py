@@ -1789,8 +1789,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(result, "Should return None when no completion is needed")
 
     def test_unstreamed_tool_args_ignores_incomplete_buffered_call(self):
-        """A truncated buffered call must not be completed with synthetic args."""
-
         mock_parser = Mock()
         mock_detector = Mock()
         mock_detector.prev_tool_call_arr = [
@@ -1816,8 +1814,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_glm47_truncated_buffered_call_emits_no_tool_chunk(self):
-        """A GLM call cut off before </tool_call> stays invisible to clients."""
-
         self.chat.tool_call_parser = "glm47"
         request = ChatCompletionRequest(
             model="test",

@@ -2970,8 +2970,6 @@ class OpenAIServingChat(OpenAIServingBase):
             return None
 
         tracked_call = detector.prev_tool_call_arr[tool_index]
-        # Some detectors buffer a call until its closing marker. Never turn a
-        # truncated buffered call into an apparently valid empty-argument call.
         if tracked_call.get("complete") is False:
             return None
 
