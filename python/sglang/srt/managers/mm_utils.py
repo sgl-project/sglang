@@ -516,8 +516,7 @@ def embed_mm_inputs(
     # Clamp input ids. This is because the input_ids for the multimodal tokens are
     # filled with the hash values of the multimodal for the prefix matching in the radix attention.
     # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-    input_ids.clamp_(min=0, max=vocab_size - 1)
-    input_embeds = input_embedding(input_ids)
+    input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1))
 
     # deepstack embedding
     if use_deepstack:
