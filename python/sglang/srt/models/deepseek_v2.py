@@ -1232,6 +1232,46 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _gate_and_topk(
+        self,
+        hidden_states: torch.Tensor,
+        gemm_output_zero_allocator: BumpAllocator,
+        input_ids_global: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor],
+        use_vision_topk: bool,
+        dispatch_info: Optional[ExpertLocationDispatchInfo],
+    ):
+        # router_logits: (num_tokens, n_experts)
+        if _is_hip:
+            router_logits, router_logits_partials = _hip_moe.forward_gate(
+                self,
+                hidden_states,
+                gemm_output_zero_allocator,
+                fused_gate=not use_vision_topk,
+            )
+        else:
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            router_logits_partials = None
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(self, "is_hash", False) else {}
+        )
+        if router_logits_partials is not None:
+            topk_kwargs["router_logits_partials"] = router_logits_partials
+        if use_vision_topk:
+            return vision_topk(
+                self,
+                router_logits,
+                input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+            )
+        return self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=dispatch_info,
+            **topk_kwargs,
+        )
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1275,38 +1315,19 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
                 )
-            # router_logits: (num_tokens, n_experts)
-            if _is_hip:
-                router_logits, router_logits_partials = _hip_moe.forward_gate(
-                    self,
+            topk_output = (
+                _hip_moe.smallm_router_topk_output(self, hidden_states)
+                if _use_aiter_gfx95 and not use_vision_topk and dispatch_info is None
+                else None
+            )
+            if topk_output is None:
+                topk_output = self._gate_and_topk(
                     hidden_states,
                     gemm_output_zero_allocator,
-                    fused_gate=not use_vision_topk,
-                )
-            else:
-                router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-                router_logits_partials = None
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            if router_logits_partials is not None:
-                topk_kwargs["router_logits_partials"] = router_logits_partials
-            if use_vision_topk:
-                topk_output = vision_topk(
-                    self,
-                    router_logits,
                     input_ids_global,
-                    num_token_non_padded=num_token_non_padded,
-                )
-            else:
-                topk_output = self.topk(
-                    hidden_states,
-                    router_logits,
-                    num_token_non_padded=num_token_non_padded,
-                    expert_location_dispatch_info=dispatch_info,
-                    **topk_kwargs,
+                    num_token_non_padded,
+                    use_vision_topk,
+                    dispatch_info,
                 )
         else:
             pre_quant_input = None
