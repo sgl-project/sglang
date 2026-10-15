@@ -795,6 +795,7 @@ class PrefillAdder:
             input_tokens=len(req.full_untruncated_fill_ids),
             swa_host_hit_length=swa_host_hit_length,
             chunk_limit=self.rem_chunk_tokens,
+            auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
         )
 
     def _mamba_gap_budget_for_req(
@@ -1333,6 +1334,16 @@ class PrefillAdder:
 
         return self.budget_state()
 
+    def _defer_staged_for_capacity_if_idle(self, req: Req, *, pool: str) -> None:
+        # Running work and admitted prefills (including continuing chunks) can
+        # release capacity. Only idle budget failures should force recomputation.
+        if self.can_run_list or (
+            self.running_batch is not None and self.running_batch.reqs
+        ):
+            return
+        if self.tree_cache.buffer_pipeline is not None:
+            self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -1379,6 +1390,8 @@ class PrefillAdder:
                 has_chunked_req=has_chunked_req,
             )
             if isinstance(admission, AddReqResult):
+                if admission is AddReqResult.NO_TOKEN:
+                    self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
                 return admission
 
             # A rejected candidate must not report prefillable or queue H2D.
@@ -1435,6 +1448,9 @@ class PrefillAdder:
                         swa_host_hit_length=req.swa_host_hit_length,
                         chunk_limit=self.rem_chunk_tokens,
                     ):
+                        self._defer_staged_for_capacity_if_idle(
+                            req, pool="load_back_budget"
+                        )
                         return AddReqResult.NO_TOKEN
                     promised_host_hit = req.host_hit_length
                     loaded = self.tree_cache.init_load_back(
