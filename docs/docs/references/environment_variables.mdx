@@ -249,7 +249,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_XPU_SYMM_MEM_MAX_BYTES`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Payload ceiling (bytes) for the Intel XPU symmetric-memory one-shot all-reduce enabled by `--enable-torch-symm-mem`; larger payloads use oneCCL. Unset uses the per-world-size default measured on Arc Pro B60 (64 KiB at 2 ranks, 32 KiB at 4 and 6, off otherwise); set it where peer bandwidth differs, e.g. Xe Link.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Payload ceiling (bytes) for the Intel XPU symmetric-memory one-shot all-reduce enabled by `--enable-torch-symm-mem`; larger payloads use oneCCL. Unset uses the per-world-size default measured on Arc Pro B60 (32 KiB at 2 ranks, 16 KiB at 4 and 6, 8 KiB at 8, off otherwise); set it where peer bandwidth differs, e.g. Xe Link.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unset</td>
     </tr>
 <tr>
