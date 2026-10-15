@@ -299,6 +299,9 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.unified_cache.linker_attachment import (
+    runtime_change_rejection,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -5271,23 +5274,29 @@ class Scheduler(
             mb is None or mb.is_empty() for mb in self.mbs
         )
 
+    def _admin_busy_message(self, action: str) -> Optional[str]:
+        if self.is_fully_idle():
+            return None
+        return (
+            f"Reject {action}: scheduler is not idle. "
+            f"#queue-req={len(self.waiting_queue)} "
+            f"#running-req={len(self.running_batch.reqs)}"
+        )
+
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
+        if self.enable_unified_cache_external_linker:
+            return self._attach_cache_linker(recv_req)
+
         if not self.enable_hierarchical_cache:
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.is_fully_idle():
-            return AttachHiCacheStorageReqOutput(
-                success=False,
-                message=(
-                    "Reject attach: scheduler is not idle. "
-                    f"#queue-req={len(self.waiting_queue)} "
-                    f"#running-req={len(self.running_batch.reqs)}"
-                ),
-            )
+        busy = self._admin_busy_message("attach")
+        if busy is not None:
+            return AttachHiCacheStorageReqOutput(success=False, message=busy)
 
         if not hasattr(self.tree_cache, "attach_storage_backend"):
             return AttachHiCacheStorageReqOutput(
@@ -5330,20 +5339,17 @@ class Scheduler(
     def detach_hicache_storage_wrapped(
         self, recv_req: DetachHiCacheStorageReqInput
     ) -> DetachHiCacheStorageReqOutput:
+        if self.enable_unified_cache_external_linker:
+            return self._detach_cache_linker()
+
         if not self.enable_hierarchical_cache:
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.is_fully_idle():
-            return DetachHiCacheStorageReqOutput(
-                success=False,
-                message=(
-                    "Reject detach: scheduler is not idle. "
-                    f"#queue-req={len(self.waiting_queue)} "
-                    f"#running-req={len(self.running_batch.reqs)}"
-                ),
-            )
+        busy = self._admin_busy_message("detach")
+        if busy is not None:
+            return DetachHiCacheStorageReqOutput(success=False, message=busy)
 
         if not hasattr(self.tree_cache, "detach_storage_backend"):
             return DetachHiCacheStorageReqOutput(
@@ -5373,6 +5379,54 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def _attach_cache_linker(
+        self, recv_req: AttachHiCacheStorageReqInput
+    ) -> AttachHiCacheStorageReqOutput:
+        rejection = runtime_change_rejection()
+        if rejection is None and (
+            recv_req.hicache_storage_prefetch_policy is not None
+            or recv_req.hicache_write_policy is not None
+        ):
+            rejection = "The external linker takes no prefetch or write policy."
+        if rejection is None:
+            rejection = self._admin_busy_message("attach")
+        if rejection is not None:
+            return AttachHiCacheStorageReqOutput(success=False, message=rejection)
+
+        try:
+            message = self.tree_cache.attach_cache_linker(
+                recv_req.hicache_storage_backend,
+                recv_req.hicache_storage_backend_extra_config_json,
+            )
+        except Exception as e:
+            logger.exception("Attach external linker failed with exception.")
+            return AttachHiCacheStorageReqOutput(success=False, message=str(e))
+        get_context().override(
+            "scheduler.attach_cache_linker",
+            unified_cache_external_linker_backend=recv_req.hicache_storage_backend,
+            hicache_storage_backend_extra_config=(
+                recv_req.hicache_storage_backend_extra_config_json
+            ),
+        )
+        return AttachHiCacheStorageReqOutput(success=True, message=message)
+
+    def _detach_cache_linker(self) -> DetachHiCacheStorageReqOutput:
+        rejection = runtime_change_rejection() or self._admin_busy_message("detach")
+        if rejection is not None:
+            return DetachHiCacheStorageReqOutput(success=False, message=rejection)
+
+        try:
+            message = self.tree_cache.detach_cache_linker()
+        except Exception as e:
+            logger.exception("Detach external linker failed with exception.")
+            return DetachHiCacheStorageReqOutput(success=False, message=str(e))
+        get_context().override(
+            "scheduler.detach_cache_linker",
+            unified_cache_external_linker_backend=None,
+            hicache_storage_backend_extra_config=None,
+        )
+        return DetachHiCacheStorageReqOutput(success=True, message=message)
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

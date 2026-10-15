@@ -8,6 +8,7 @@ and the published instance stays as the launcher left it.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
@@ -33,6 +34,7 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.server_args = self.server_args
         scheduler.enable_hierarchical_cache = True
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_hicache_storage = False
         scheduler.is_fully_idle = lambda: True
         scheduler.tree_cache = SimpleNamespace(
@@ -76,6 +78,71 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         self.assertEqual(
             resolution_result(self.server_args, "hicache_storage_backend"), "file"
         )
+
+
+class TestSchedulerCacheLinkerAttach(CustomTestCase):
+    def _scheduler(self, **fields):
+        override = get_context().override_server_args(
+            enable_unified_cache_external_linker=True, **fields
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_unified_cache_external_linker = True
+        scheduler.is_fully_idle = lambda: True
+        scheduler.tree_cache = SimpleNamespace(
+            attach_cache_linker=MagicMock(return_value="attached"),
+            detach_cache_linker=MagicMock(return_value="detached"),
+        )
+        return scheduler
+
+    def test_attach_and_detach_reach_the_namespace_readers(self):
+        scheduler = self._scheduler()
+        out = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(
+                hicache_storage_backend="mori",
+                hicache_storage_backend_extra_config_json='{"a": 1}',
+            )
+        )
+
+        self.assertTrue(out.success)
+        scheduler.tree_cache.attach_cache_linker.assert_called_once_with(
+            "mori", '{"a": 1}'
+        )
+        self.assertEqual(get_memory().unified_cache_external_linker_backend, "mori")
+        self.assertEqual(get_memory().hicache_storage_backend_extra_config, '{"a": 1}')
+
+        out = scheduler.detach_hicache_storage_wrapped(DetachHiCacheStorageReqInput())
+
+        self.assertTrue(out.success)
+        scheduler.tree_cache.detach_cache_linker.assert_called_once_with()
+        self.assertIsNone(get_memory().unified_cache_external_linker_backend)
+        self.assertIsNone(get_memory().hicache_storage_backend_extra_config)
+
+    def test_rejects_changes_the_linker_cannot_take(self):
+        scheduler = self._scheduler()
+        out = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(
+                hicache_storage_backend="mooncake",
+                hicache_write_policy="write_through",
+            )
+        )
+        self.assertFalse(out.success)
+        self.assertIn("no prefetch or write policy", out.message)
+
+        scheduler = self._scheduler(enable_linker_mla_dedup=True)
+        attach = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(hicache_storage_backend="mooncake")
+        )
+        detach = scheduler.detach_hicache_storage_wrapped(
+            DetachHiCacheStorageReqInput()
+        )
+        for out in (attach, detach):
+            self.assertFalse(out.success)
+            self.assertIn("--enable-linker-mla-dedup", out.message)
+        scheduler.tree_cache.attach_cache_linker.assert_not_called()
+        scheduler.tree_cache.detach_cache_linker.assert_not_called()
 
 
 if __name__ == "__main__":
