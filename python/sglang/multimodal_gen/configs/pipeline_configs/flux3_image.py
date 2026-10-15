@@ -197,11 +197,7 @@ class Flux3ImagePipelineConfig(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            # 15.6 GB of DiT weights on top of an 8.3 GB text encoder: 28.3 GB of
-            # components before any activation. A 32 GB card cannot run this with
-            # the DiT resident, and the default empty tuple makes the gate in
-            # _should_auto_enable_dit_layerwise_offload always false, so auto mode
-            # leaves it resident until the request OOMs.
+            # Allow automatic layerwise offload on memory-constrained GPUs.
             dit_layerwise_offload_modes=("auto", "memory"),
         )
 

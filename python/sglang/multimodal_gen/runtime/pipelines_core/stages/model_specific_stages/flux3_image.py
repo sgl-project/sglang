@@ -39,6 +39,9 @@ from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, Packed, 
 from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
     Flux3ImagePackageConfig,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
@@ -399,7 +402,7 @@ def crop_output(image: Tensor, crop: tuple[int, int, int, int] | None) -> Tensor
     if crop is None:
         return image
     left, top, right, bottom = crop
-    return image[:, top:bottom, left:right]
+    return image[..., top:bottom, left:right]
 
 
 def validate_generation(
@@ -465,13 +468,6 @@ def _image_paths(batch: Req) -> list[str] | None:
     if not all(isinstance(path, str) and path for path in paths):
         raise ValueError("FLUX.3 input image paths must be non-empty strings")
     return paths
-
-
-def _seed(batch: Req) -> int:
-    seed = batch.seed
-    if isinstance(seed, (list, tuple)):
-        seed = seed[0] if seed else 0
-    return int(seed or 0)
 
 
 def _steps(batch: Req, package_config) -> int:
@@ -730,13 +726,18 @@ class Flux3ImageDenoiseStage(DenoisingStage):
         alpha = float(pipeline_config.flux3_alpha or self.package_config.sampler.alpha)
         guidance = _cfg_scale(batch, self.package_config)
         images = [
-            noise_tokens(
-                int(req.height or height),
-                int(req.width or width),
-                _seed(req),
-                self.package_config,
-                get_local_torch_device(),
-            )
+            [
+                noise_tokens(
+                    int(req.height or height),
+                    int(req.width or width),
+                    seed,
+                    self.package_config,
+                    get_local_torch_device(),
+                )
+                for seed in normalize_output_seeds(
+                    req.seed or 0, num_outputs_per_prompt=req.num_outputs_per_prompt
+                )
+            ]
             for req in batches
         ]
         flow_map = self.package_config.dit.flow_map
@@ -748,7 +749,8 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                     "image": image,
                 }
                 for branch in range(1 if flow_map else 2)
-                for req, (image, _) in zip(batches, images)
+                for req, request_images in zip(batches, images)
+                for image, _ in request_images
             ],
             dict(self.package_config.dit.in_channels),
         )
@@ -801,9 +803,9 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                             step_callback=progress.update,
                             sequential_cfg=sequential_cfg,
                         )
-        counts = [image[0].shape[0] for image, _ in images]
-        for req, latent, (_, decode_ids) in zip(batches, latents.split(counts), images):
-            req.latents, req.latent_ids = latent, decode_ids
+        counts = [sum(image[0].shape[0] for image, _ in group) for group in images]
+        for req, latent, group in zip(batches, latents.split(counts), images):
+            req.latents, req.latent_ids = latent, group[0][1]
         return batches
 
 
@@ -843,7 +845,7 @@ class Flux3ImageDecodeStage(PipelineStage):
         ):
             with torch.inference_mode():
                 image = crop_output(
-                    vae_decode(self.vae, batch.latents, batch.latent_ids),
+                    vae_decode(self.vae, batch.latents, batch.latent_ids, batched=True),
                     batch.flux3_crop,
                 )
         return OutputBatch(output=self._to_display(image), metrics=batch.metrics)
@@ -864,15 +866,18 @@ class Flux3ImageDecodeStage(PipelineStage):
                     group[0][1].latent_ids,
                     batched=True,
                 )
-                for (index, req), image in zip(group, decoded):
+                decoded_groups = decoded.split(
+                    [req.num_outputs_per_prompt for _, req in group]
+                )
+                for (index, req), images in zip(group, decoded_groups):
                     outputs[index] = OutputBatch(
-                        output=[
-                            self._to_display(crop_output(image, req.flux3_crop))[0]
-                        ],
+                        output=list(
+                            self._to_display(crop_output(images, req.flux3_crop))
+                        ),
                         metrics=req.metrics,
                     )
         return outputs
 
     @staticmethod
     def _to_display(image: Tensor) -> Tensor:
-        return ((image.clamp(-1, 1) + 1) * 0.5).unsqueeze(0)
+        return ((image.clamp(-1, 1) + 1) * 0.5).reshape(-1, *image.shape[-3:])
