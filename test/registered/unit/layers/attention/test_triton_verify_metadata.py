@@ -158,6 +158,35 @@ def test_graph_capture_and_padded_replay_use_bonus_token_width(
     _assert_verify_width(backend, batch_size)
 
 
+class _DraftExtendInput(SpecInput):
+    def __init__(self, num_tokens_per_req):
+        super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
+        self.num_tokens_per_req = num_tokens_per_req
+        self.extend_seq_lens_tensor = None
+
+
+@pytest.mark.parametrize(
+    ("stamped_width", "width"), ((9, 9), (None, 4), (-1, 4), (0, 4))
+)
+def test_graph_draft_extend_uses_the_runner_width(stamped_width, width):
+    """BUG REGRESSION. A captured Triton draft extend strides by the width the
+    runner stamps on spec_info (draft tokens plus boundary-KV front rows), not by
+    num_draft_tokens; an unset width keeps num_draft_tokens."""
+    batch_size = 2
+    backend = _make_backend(batch_size)
+    backend.num_draft_tokens = 4
+    backend.speculative_num_steps = 3
+    spec_info = None if stamped_width is None else _DraftExtendInput(stamped_width)
+    expected = torch.arange(0, (batch_size + 1) * width, width, dtype=torch.int32)
+    for in_capture in (True, False):
+        forward_batch = _make_forward_batch(batch_size, spec_info)
+        forward_batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        assert torch.equal(backend.qo_indptr[: batch_size + 1], expected)
+        if in_capture:
+            assert backend.forward_metadata.max_extend_len == width
+
+
 @pytest.mark.parametrize("with_spec_info", (False, True))
 def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
     batch_size = 2
