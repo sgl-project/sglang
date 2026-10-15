@@ -70,7 +70,16 @@ def _worker(mode):
             if mode == "sp":
                 for skip in ((), (0,), (1,)):
                     expected = reference(x, timestep, text, skip_layers=skip)
-                    actual = candidate(x, timestep, text, skip_layers=skip)
+                    prepared = candidate.prepare_conditioning(
+                        text, None, 2, 3, torch.float32, batch_samples=True
+                    )
+                    actual = candidate(
+                        x,
+                        timestep,
+                        text,
+                        prepared_conditioning=prepared,
+                        skip_layers=skip,
+                    )
                     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
             else:
                 pipeline = MOSSImagePipelineConfig(dit_config=config)

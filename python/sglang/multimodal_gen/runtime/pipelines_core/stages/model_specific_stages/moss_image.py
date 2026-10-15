@@ -40,6 +40,7 @@ from sglang.multimodal_gen.configs.sample.moss_image import (
     MOSSImageSamplingParams,
     resolve_uncond_skip_layers,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     cached_encoder_call,
     prefer_conditioning_cache,
@@ -199,6 +200,9 @@ class MOSSImageDenoisingStage(DenoisingStage):
                     height,
                     width,
                     ctx.target_dtype,
+                    batch_samples=quality_allows(
+                        batch.sampling_params.quality, "lossless"
+                    ),
                 )
 
 

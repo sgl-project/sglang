@@ -484,13 +484,21 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         return text, rope
 
     def prepare_conditioning(
-        self, encoder_hidden_states, encoder_attention_mask, height, width, dtype
+        self,
+        encoder_hidden_states,
+        encoder_attention_mask,
+        height,
+        width,
+        dtype,
+        *,
+        batch_samples=False,
     ):
         # Neither the text refinement blocks nor RoPE depend on the timestep.
         contexts = self._unpad_text(encoder_hidden_states, encoder_attention_mask)
         by_length = {}
         for index, context in enumerate(contexts):
-            by_length.setdefault(context.shape[1], []).append(index)
+            key = context.shape[1] if batch_samples else index
+            by_length.setdefault(key, []).append(index)
         groups = []
         for indices in by_length.values():
             context = torch.cat([contexts[index] for index in indices])
@@ -558,19 +566,19 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         head = self.video_head_modulation(
             time.to(self.video_head_modulation.weight.dtype)
         ).view(batch, 2, -1)
-        video = self.video_embedder(
-            hidden_states.flatten(2)
-            .transpose(1, 2)
-            .to(self.video_embedder.weight.dtype)
-            .contiguous()
-        )
         if prepared_conditioning is None:
+            device_type = hidden_states.device.type
+            dtype = (
+                torch.get_autocast_dtype(device_type)
+                if torch.is_autocast_enabled(device_type)
+                else self.video_embedder.weight.dtype
+            )
             prepared_conditioning = self.prepare_conditioning(
                 encoder_hidden_states,
                 encoder_attention_mask,
                 height,
                 width,
-                video.dtype,
+                dtype,
             )
         outputs = (
             torch.empty_like(hidden_states, dtype=torch.float32)
@@ -580,11 +588,18 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         for group in prepared_conditioning.groups:
             indices = group.indices
             if indices is None:
-                group_video, group_mod, group_head = video, mod, head
+                group_video, group_mod, group_head = hidden_states, mod, head
             else:
                 group_video, group_mod, group_head = (
-                    tensor.index_select(0, indices) for tensor in (video, mod, head)
+                    tensor.index_select(0, indices)
+                    for tensor in (hidden_states, mod, head)
                 )
+            group_video = self.video_embedder(
+                group_video.flatten(2)
+                .transpose(1, 2)
+                .to(self.video_embedder.weight.dtype)
+                .contiguous()
+            )
             x = torch.cat((group_video, group.text), 1)
             rope = group.rope
             layer_kwargs = {}

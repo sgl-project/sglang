@@ -488,7 +488,10 @@ def test_prepared_conditioning_matches_steps_and_requests(
 
 
 @pytest.mark.parametrize("skip", [(), (1,)])
-def test_batch_groups_true_lengths_and_restores_sample_order(small_model, skip):
+@pytest.mark.parametrize("batch_samples", [False, True])
+def test_batch_groups_true_lengths_and_restores_sample_order(
+    small_model, skip, batch_samples
+):
     torch.manual_seed(42)
     x, text = torch.randn(4, 8, 2, 3), torch.randn(4, 5, 32)
     mask = torch.tensor(
@@ -513,10 +516,15 @@ def test_batch_groups_true_lengths_and_restores_sample_order(small_model, skip):
             lambda _, args: calls.append(args[0].shape[0])
         )
         try:
-            actual = small_model(x, times, text, mask, skip_layers=skip)
+            prepared = small_model.prepare_conditioning(
+                text, mask, 2, 3, torch.float32, batch_samples=batch_samples
+            )
+            actual = small_model(
+                x, times, text, mask, prepared_conditioning=prepared, skip_layers=skip
+            )
         finally:
             hook.remove()
-    assert calls == [2, 1, 1]
+    assert calls == ([2, 1, 1] if batch_samples else [1, 1, 1, 1])
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
@@ -555,7 +563,7 @@ def test_denoising_stage_prepares_actual_cfg_branches(
 
     batch = SimpleNamespace(
         do_classifier_free_guidance=use_cfg,
-        sampling_params=SimpleNamespace(cfg_gate_step=1.0),
+        sampling_params=SimpleNamespace(cfg_gate_step=1.0, quality="exact"),
     )
     latents = torch.randn(1, 8, 2, 3)
     pos = {"encoder_hidden_states": torch.randn(1, 3, 32)}
