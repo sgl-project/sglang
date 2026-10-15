@@ -63,7 +63,7 @@ class TestHiSparseStagingList(unittest.TestCase):
         self.assertEqual(scheduler.hisparse_coordinator.staging, [live, done])
 
         done.finished_reason = object()
-        Scheduler.leave_finished_reqs(scheduler, ScheduleSlot())
+        Scheduler.leave_finished_reqs(scheduler)
         self.assertEqual(scheduler.hisparse_coordinator.staging, [live])
         registry = request_registry_of(scheduler)
         self.assertEqual(registry.collect_inflight_reqs(), [live])

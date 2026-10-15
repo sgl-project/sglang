@@ -95,8 +95,6 @@ class DllmManager:
         self.waiting: List[Req] = []
         self.staging: List[Req] = []
         self.between_blocks: List[Req] = []
-        # Set when admission finds no room; the next commit clears it.
-        self.batch_is_full = False
         self._next_intake_seq = 0
 
     def lists(self) -> List[RequestList]:
@@ -179,12 +177,6 @@ class DllmManager:
         self.waiting = [req for req in self.waiting if not req.finished()]
         self.between_blocks = [req for req in self.between_blocks if not req.finished()]
 
-        if self.enable_priority_preemption or self.is_empty():
-            # Only a commit clears the latch otherwise, and with nothing in
-            # flight none will come: a failure found with an empty manager
-            # must not close admission for good.
-            self.batch_is_full = False
-
         # Early exit if batch is full or no requests available
         if self._should_skip_prefill(waiting_queue):
             return None, waiting_queue
@@ -236,8 +228,6 @@ class DllmManager:
             self.finish_dllm_forward(req)
             req.dllm.init_next_round_input(req)
         self._move_between_blocks(live_reqs)
-        # Admission reopens once the step's requests leave staging.
-        self.batch_is_full = False
 
     def _write_blocks(
         self,
@@ -411,7 +401,7 @@ class DllmManager:
 
     def _should_skip_prefill(self, waiting_queue: List[Req]) -> bool:
         """Check if DLLM prefill should be skipped."""
-        if (self.batch_is_full or not waiting_queue) and self.is_empty():
+        if not waiting_queue and self.is_empty():
             return True
 
         # No request decodes in dLLM mode.
@@ -421,7 +411,6 @@ class DllmManager:
             and self.is_empty()
             and not self.enable_priority_preemption
         ):
-            self.batch_is_full = True
             return True
 
         return False
@@ -530,16 +519,18 @@ class DllmManager:
     ) -> AddReqResult:
         """Process incoming DLLM requests with resource allocation and preemption."""
         res = AddReqResult.CONTINUE
+        # Once set, every later request must preempt to be admitted.
+        is_full = False
         for req in reqs:
             # Check if batch is full
             running_bs = 0
             if len(
                 adder.can_run_list
             ) >= self.beam_coordinator.get_num_allocatable_reqs(running_bs):
-                self.batch_is_full = True
+                is_full = True
 
             # Try preemption if batch is full
-            if self.batch_is_full:
+            if is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
@@ -554,8 +545,6 @@ class DllmManager:
             )
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    self.batch_is_full = True
                 break
 
         return res

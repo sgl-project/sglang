@@ -32,10 +32,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     LaunchCounters,
 )
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
-from sglang.srt.managers.scheduler_components.mode_stages import (
-    ModeStages,
-    ScheduleSlot,
-)
+from sglang.srt.managers.scheduler_components.mode_stages import ModeStages
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -673,7 +670,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         # The commit: finished requests leave decoding; the one whose release
         # waits on a copy moves into releasing, the live one keeps decoding.
-        scheduler.leave_finished_reqs(ScheduleSlot())
+        scheduler.leave_finished_reqs()
         self.assertEqual(scheduler.lists.decoding, [live])
         self.assertEqual(owner.releasing, [done])
         assert_one_list_per_request(scheduler)

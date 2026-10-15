@@ -954,8 +954,8 @@ class Scheduler:
         # either the new or the old role; the instance can no longer serve.
         self._pd_role_switch_unhealthy = False
         self.lists = CoreLists()
-        # The flat driver's schedule slot: every decoding request, and the
-        # admission flag (the PP ring keeps one per microbatch slot).
+        # The flat driver's schedule slot: every decoding request (the PP ring
+        # keeps one per microbatch slot).
         self.flat_slot = ScheduleSlot()
         # The launched steps whose results are not committed yet.
         self.pending = PendingSteps()
@@ -1846,16 +1846,13 @@ class Scheduler:
         self.process_batch_result(record.step, record.result, record.slot)
         self.step_counters.record(record)
 
-    def leave_finished_reqs(self, slot: ScheduleSlot) -> None:
+    def leave_finished_reqs(self) -> None:
         """Drop the requests a commit finished from decoding (PD decode holds
         those still releasing KV), and from the mode's own lists (HiSparse
-        staging); the committed slot's admission reopens if decoding shrank."""
-        num_decoding = len(self.lists.decoding)
+        staging)."""
         if (hold_finished := self.stages.hold_finished) is not None:
             hold_finished([r for r in self.lists.decoding if r.finished()])
         self.lists.decoding = [r for r in self.lists.decoding if not r.finished()]
-        if len(self.lists.decoding) < num_decoding:
-            slot.batch_is_full = False
         if (leave_finished := self.stages.leave_finished) is not None:
             leave_finished()
 
@@ -2486,8 +2483,6 @@ class Scheduler:
             ready_reqs = stages.collect_ready()
             if len(ready_reqs) > 0:
                 self._admit_hisparse_ready_reqs(ready_reqs, slot)
-            # Reset batch_is_full so the scheduler can schedule more prefills.
-            slot.batch_is_full = False
 
         if stages.admit is not None:
             new_batch = stages.admit(slot)
@@ -2670,7 +2665,7 @@ class Scheduler:
                 )
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
-        self.leave_finished_reqs(slot)
+        self.leave_finished_reqs()
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -2993,7 +2988,7 @@ class Scheduler:
         if self.pending and get_parallel().pp_size == 1:
             self.commit_pending_steps()
 
-        self.step_planner.retract_for_pause(self.flat_slot)
+        self.step_planner.retract_for_pause()
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

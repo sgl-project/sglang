@@ -19,15 +19,12 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class ScheduleSlot:
-    """What one step is scheduled for: the decoding requests it may run and
-    its admission flag. The flat driver has one slot, over every decoding
-    request; the PP ring has one per microbatch slot, over the requests that
-    slot launched."""
+    """What one step is scheduled for: the decoding requests it may run. The
+    flat driver has one slot, over every decoding request; the PP ring has
+    one per microbatch slot, over the requests that slot launched."""
 
     # The ring slot; None for the flat driver.
     index: Optional[int] = None
-    # Admission is shut until a request leaves decoding.
-    batch_is_full: bool = False
 
     def filter_decoding(self, decoding: List[Req]) -> List[Req]:
         """The decoding requests a step of this slot may run."""
