@@ -109,3 +109,7 @@ class TestMegaMoESumDeferral(unittest.TestCase):
         result = complete_owed(UnreducedOutput(value, group))
         torch.testing.assert_close(result, value * 4, rtol=0, atol=0)
         reduce.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()
