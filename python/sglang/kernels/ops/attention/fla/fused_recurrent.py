@@ -43,9 +43,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int64)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
         all = T
         T = eos - bos
     else:
@@ -358,7 +359,18 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
+    # Single-token TP4 decode otherwise launches only 48 CTAs and uses over
+    # 200 registers per thread. Smaller value tiles expose 192 independent
+    # CTAs without changing the recurrence or its one-warp K reductions.
+    use_small_value_tile = (
+        B == 1
+        and qkv_dim == 2560
+        and mixed_qkv.dtype == torch.bfloat16
+        and initial_state.dtype == torch.float32
+        and (HV, V, K) == (12, 128, 128)
+        and torch.cuda.get_device_capability(mixed_qkv.device)[0] == 10
+    )
+    BV = min(triton.next_power_of_2(V), 8 if use_small_value_tile else 32)
     num_stages = 3
     num_warps = 1
 
@@ -708,7 +720,6 @@ def fused_recurrent_kda_packed_decode(
 
 
 class FusedRecurrentFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(
@@ -907,9 +918,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int64)
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
         all = T
         T = eos - bos
     else:
@@ -1144,7 +1156,6 @@ def fused_recurrent_gated_delta_rule_update_fwd(
 
 
 class FusedRecurrentUpdateFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(
@@ -1227,7 +1238,11 @@ def fused_recurrent_gated_delta_rule_update(
                     f"The number of initial states is expected to be equal to the number of input sequences, "
                     f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
                 )
-            if initial_state_indices.shape[0] != intermediate_state_indices.shape[0]:
+            if (
+                intermediate_state_indices is not None
+                and initial_state_indices.shape[0]
+                != intermediate_state_indices.shape[0]
+            ):
                 raise ValueError(
                     f"The number of intermediate state indices is expected to be equal to the number of input sequences, "
                     f"i.e., {initial_state_indices.shape[0]} != {intermediate_state_indices.shape[0]}."

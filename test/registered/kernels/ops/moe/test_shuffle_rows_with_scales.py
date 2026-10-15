@@ -67,9 +67,9 @@ def _inputs(k, num_src_rows, num_dst_rows, seed):
 
 
 def _assert_same_bytes(got, ref, what):
-    assert torch.equal(
-        got.view(torch.int8), ref.view(torch.int8)
-    ), f"{what} bytes differ"
+    assert torch.equal(got.view(torch.int8), ref.view(torch.int8)), (
+        f"{what} bytes differ"
+    )
 
 
 @pytest.mark.parametrize("k,num_src_rows,num_dst_rows", CASES)

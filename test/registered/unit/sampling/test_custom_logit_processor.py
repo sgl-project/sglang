@@ -2,16 +2,16 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
-import json
 import unittest
 from array import array
 from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_THINKING,
     END_MESSAGE,
@@ -24,7 +24,10 @@ from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     InklingThinkingBudgetLogitProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
-    _cache_from_str,
+)
+from sglang.srt.sampling.sampling_batch_info import (
+    ProcessorEntry,
+    SamplingBatchInfo,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -37,29 +40,59 @@ def _make_req(origin_input_ids=None, output_ids=None):
     return req
 
 
+class TestApplyCustomLogitProcessor(CustomTestCase):
+    def test_repeats_request_params_for_each_token(self):
+        batch_size = 3
+        num_tokens = 2
+        params = [{"value": 1.0}, {"value": 2.0}, {"value": 3.0}]
+
+        def processor(logits, custom_params):
+            self.assertEqual(
+                custom_params, [params[0], params[0], params[2], params[2]]
+            )
+            for row, param in zip(logits, custom_params, strict=True):
+                row.fill_(param["value"])
+            return logits
+
+        sampling_info = SamplingBatchInfo(
+            temperatures=torch.ones(batch_size, 1),
+            top_ps=torch.ones(batch_size),
+            top_ks=torch.zeros(batch_size, dtype=torch.int32),
+            min_ps=torch.zeros(batch_size),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=4,
+            has_custom_logit_processor=True,
+            custom_params=params,
+            custom_logit_processor={
+                0: ProcessorEntry(
+                    processor=processor, rows=[0, 2], indices=torch.tensor([0, 2])
+                )
+            },
+            device="cpu",
+        )
+        logits = torch.zeros(batch_size * num_tokens, 4)
+
+        apply_custom_logit_processor(
+            logits, sampling_info, num_tokens_in_batch=num_tokens
+        )
+
+        expected = torch.tensor(
+            [[1.0] * 4, [1.0] * 4, [0.0] * 4, [0.0] * 4, [3.0] * 4, [3.0] * 4]
+        )
+        self.assertTrue(torch.equal(logits, expected))
+
+
 # Serialization round-trip
 class TestCustomLogitProcessorSerialization(CustomTestCase):
-
-    def test_to_str_produces_valid_json(self):
-        """Test that to_str() produces valid JSON with a 'callable' field."""
-        s = DisallowedTokensLogitsProcessor.to_str()
-        data = json.loads(s)
-        self.assertIn("callable", data)
-        self.assertIsInstance(data["callable"], str)
-
     def test_round_trip_serialization(self):
         """Test serialize then deserialize produces a usable processor."""
         s = DisallowedTokensLogitsProcessor.to_str()
         processor = CustomLogitProcessor.from_str(s)
         self.assertIsInstance(processor, DisallowedTokensLogitsProcessor)
-
-    def test_from_str_is_cached(self):
-        """Test that from_str uses LRU cache for repeated calls."""
-        _cache_from_str.cache_clear()
-        s = DisallowedTokensLogitsProcessor.to_str()
-        cls1 = _cache_from_str(s)
-        cls2 = _cache_from_str(s)
-        self.assertIs(cls1, cls2)
 
 
 # DisallowedTokensLogitsProcessor

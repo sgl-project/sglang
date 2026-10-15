@@ -335,7 +335,6 @@ def _configure_runner_for_eagle_draft(
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
     runner.model = _TinyDraftModel()
-    runner.tp_group = _DummyTpGroup()
     runner.device_timer = None
     runner.model_config.spec_hidden_size = settings.hidden_size
     runner.model_config.dtype = runner.dtype
@@ -445,7 +444,7 @@ def _capture_eagle_draft_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1, tp_rank=0),
+        get_parallel().override(attn_cp_size=1, tp_rank=0, tp_group=_DummyTpGroup()),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftCudaGraphRunner(
@@ -467,7 +466,7 @@ def _capture_frozen_kv_mtp_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1, tp_rank=0),
+        get_parallel().override(attn_cp_size=1, tp_rank=0, tp_group=_DummyTpGroup()),
     ):
         _reset_cuda_graph_test_buffers()
         return FrozenKVMTPCudaGraphRunner(worker)
@@ -511,6 +510,7 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(eager_fixture, case, draft_inputs, settings)
         eager_batch = adapter.make_forward_batch(case, draft_inputs, settings)
+        eager_fixture.runner.kv_index_translator.bind_own_plan(eager_batch)
         expected = _run_eagle_draft_eager(
             eager_worker,
             eager_batch,
@@ -527,6 +527,7 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
         graph_batch = adapter.make_forward_batch(case, draft_inputs, settings)
+        graph_fixture.runner.kv_index_translator.bind_own_plan(graph_batch)
         graph_runner = _capture_eagle_draft_graph_runner(
             graph_worker,
             graph_backend,
@@ -566,6 +567,7 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(eager_fixture, case, draft_inputs, settings)
         eager_batch = adapter.make_forward_batch(case, draft_inputs, settings)
+        eager_fixture.runner.kv_index_translator.bind_own_plan(eager_batch)
         expected = _run_frozen_kv_mtp_eager(eager_worker, eager_batch)
 
         graph_fixture, graph_worker, _ = _build_frozen_kv_mtp_fixture(
@@ -577,6 +579,7 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
         graph_batch = adapter.make_forward_batch(case, draft_inputs, settings)
+        graph_fixture.runner.kv_index_translator.bind_own_plan(graph_batch)
         graph_runner = _capture_frozen_kv_mtp_graph_runner(graph_worker)
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
@@ -606,9 +609,9 @@ class _DenseEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -645,9 +648,9 @@ class _FrozenKVMTPDenseDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1034,9 +1037,9 @@ class _MLAEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1292,9 +1295,9 @@ class _DSV4EagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:
@@ -1603,9 +1606,9 @@ class _DSAEagleDraftForward:
         )
 
     def __call__(self, forward_batch: ForwardBatch):
-        assert (
-            forward_batch.forward_metadata_ready
-        ), "draft-loop forward reached the runner without a pre-planned batch"
+        assert forward_batch.forward_metadata_ready, (
+            "draft-loop forward reached the runner without a pre-planned batch"
+        )
         spec_info = forward_batch.spec_info
         hidden_states = spec_info.hidden_states
         if hidden_states is None:

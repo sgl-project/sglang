@@ -1,4 +1,4 @@
-"""Run the shared UnifiedRadixCache unit suite with the Rust TreeCore."""
+"""Run the shared suite requesting Rust, including centralized Python fallbacks."""
 
 import unittest
 
@@ -6,7 +6,7 @@ import test_unified_radix_cache_unittest as shared_suite
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=57, stage="base-b", runner_config="1-gpu-small")
 
 
 class RustBackendSuite(unittest.TestSuite):
@@ -22,7 +22,7 @@ class RustBackendSuite(unittest.TestSuite):
 
 
 def load_tests(loader, standard_tests, pattern):
-    """Reuse the exact cache-level suite while swapping only its test factory."""
+    """Reuse the cache suite and its production backend compatibility resolver."""
     return RustBackendSuite(loader.loadTestsFromModule(shared_suite))
 
 

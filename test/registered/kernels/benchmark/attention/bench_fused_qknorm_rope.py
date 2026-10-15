@@ -5,7 +5,7 @@ Measures throughput (µs) for fused_qk_norm_rope across typical
 LLM configurations (head_dim × num_heads × num_tokens).
 
 Run:
-    python test/registered/jit/benchmark/bench_fused_qknorm_rope.py
+    python test/registered/kernels/benchmark/attention/bench_fused_qknorm_rope.py
 """
 
 import itertools

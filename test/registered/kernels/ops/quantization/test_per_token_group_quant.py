@@ -160,7 +160,9 @@ def test_ue8m0_bitexact(dtype, num_tokens, hidden):
     assert torch.equal(exp, exp_ref), "exponent bytes differ"
 
 
-@pytest.mark.parametrize("group_size", get_ci_test_range([16, 32, 64, 128], [16, 64]))
+@pytest.mark.parametrize(
+    "group_size", get_ci_test_range([16, 32, 64, 128], [16, 32, 64])
+)
 def test_ue8m0_group_sizes(group_size):
     """Group size is a template axis (v2 dispatched a runtime switch). Each size
     maps a group onto a different subwarp lane count; codes/exponents must stay
@@ -311,6 +313,104 @@ def _ref_silu_mul(x, hidden):
     return torch.nn.functional.silu(gate.float()).to(x.dtype) * up
 
 
+@pytest.mark.parametrize("group_size,hidden", [(32, 1792), (32, 6144), (128, 1024)])
+@pytest.mark.parametrize("swiglu_limit", [None, 10.0])
+def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):
+    """The post-quant kernels keep SiLU and the multiply in FP32 until FP8.
+
+    Unlike the generic fused quantizer below, there is no intermediate BF16
+    round. Reuse the independent UE8M0 oracle, and compare both layouts only
+    on active rows; an empty expert and a partial slab exercise masked counts.
+    """
+    from sglang.kernels.ops.moe.dsv4 import (
+        silu_and_mul_contig_post_quant,
+        silu_and_mul_masked_post_quant,
+    )
+
+    torch.manual_seed(123 + hidden)
+    experts, capacity = 3, 32
+    x = (
+        torch.randn(experts, capacity, hidden * 2, device="cuda", dtype=torch.bfloat16)
+        * 5
+    )
+    x[2, 0].zero_()
+    counts = torch.tensor([0, 17, 9], device="cuda", dtype=torch.int32)
+    gate, up = x.float().chunk(2, dim=-1)
+    if swiglu_limit is not None:
+        gate = gate.clamp_max(swiglu_limit)
+        up = up.clamp(-swiglu_limit, swiglu_limit)
+    activation = gate * torch.sigmoid(gate) * up
+    q_ref, exp_ref = ref_fp8_ue8m0(activation, group_size)
+
+    flat = x.flatten(0, 1)
+    q = torch.empty(experts * capacity, hidden, device="cuda", dtype=fp8_dtype)
+    scale = create_per_token_group_quant_fp8_output_scale(
+        x_shape=q.shape,
+        device="cuda",
+        group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    silu_and_mul_contig_post_quant(
+        flat,
+        q,
+        scale,
+        group_size,
+        scale_ue8m0=True,
+        transposed=True,
+        swiglu_limit=swiglu_limit,
+    )
+    masked_q = torch.empty_like(q).view(experts, capacity, hidden)
+    masked_scale = torch.empty(
+        experts,
+        hidden // group_size // 4,
+        capacity,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    silu_and_mul_masked_post_quant(
+        x,
+        masked_q,
+        masked_scale,
+        group_size,
+        counts,
+        scale_ue8m0=True,
+        transposed=True,
+        swiglu_limit=swiglu_limit,
+    )
+    exp = _decode_packed_exp(scale, hidden // group_size).view_as(exp_ref)
+    masked_exp = _decode_packed_exp(masked_scale.transpose(1, 2), hidden // group_size)
+    q = q.view_as(q_ref)
+    for expert, count in enumerate(counts.tolist()):
+        assert torch.equal(exp[expert, :count], exp_ref[expert, :count])
+        assert torch.equal(masked_exp[expert, :count], exp[expert, :count])
+        assert torch.equal(
+            masked_q[expert, :count].view(torch.uint8),
+            q[expert, :count].view(torch.uint8),
+        )
+        # Fast sigmoid may differ from torch by an FP32 ULP at an FP8
+        # rounding boundary; bound the resulting error, not arbitrary bytes.
+        torch.testing.assert_close(
+            q[expert, :count].float(),
+            q_ref[expert, :count].float(),
+            rtol=0.125,
+            atol=2**-9,
+        )
+        if count:
+            mismatch = (
+                (
+                    q[expert, :count].view(torch.uint8)
+                    != q_ref[expert, :count].view(torch.uint8)
+                )
+                .float()
+                .mean()
+            )
+            # A rare fast-math boundary flip is allowed, but systematic BF16
+            # intermediate rounding (the other fused path) must fail this gate.
+            assert mismatch.item() < 1e-4
+
+
 @pytest.mark.parametrize("column_major", [True, False])
 @pytest.mark.parametrize("scale_ue8m0", [True, False])
 def test_fused_silu(scale_ue8m0, column_major):
@@ -449,6 +549,45 @@ def test_masked_fused():
         if m > 0:
             assert _dequant_rel_err(x_q[e, :m], deq_scale[e, :m], act[e, :m], G) < 0.05
         assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
+
+
+@pytest.mark.parametrize("column_major", [False, True])
+def test_sorted_rows(column_major):
+    """Sorted MoE layout (TMA down input): rows the MoE GEMM never reads are
+    skipped, every other row is bit-identical to the flat kernel. hidden=512 is
+    one warp per row (4 groups), so each padding row is skipped as a whole."""
+    torch.manual_seed(11)
+    num_valid, block_m, num_blocks, hidden = 300, 16, 40, 512
+    rows = num_blocks * block_m + 7
+    num_post = (num_blocks - 3) * block_m
+    sorted_ids = torch.randint(0, num_valid, (rows,), dtype=torch.int32, device="cuda")
+    sorted_ids[torch.rand(rows, device="cuda") < 0.3] = num_valid
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+
+    ref_q = torch.zeros(rows, hidden, device="cuda", dtype=fp8_dtype)
+    ref_s = _alloc_scale((rows, hidden), column_major=column_major, scale_ue8m0=False)
+    per_token_group_quant(x, ref_q, ref_s, G)
+    x_q = torch.full_like(ref_q.view(torch.uint8), 0x7F).view(fp8_dtype)
+    x_s = _alloc_scale((rows, hidden), column_major=column_major, scale_ue8m0=False)
+    x_s.fill_(float("nan"))
+    per_token_group_quant(
+        x,
+        x_q,
+        x_s,
+        G,
+        sorted_token_ids=sorted_ids,
+        num_tokens_post_padded=torch.tensor(
+            [num_post], dtype=torch.int32, device="cuda"
+        ),
+        num_valid_tokens=num_valid,
+    )
+
+    row = torch.arange(rows, device="cuda")
+    kept = (row < num_post) & (sorted_ids < num_valid)
+    assert torch.equal(x_q.view(torch.uint8)[kept], ref_q.view(torch.uint8)[kept])
+    assert torch.equal(x_s[kept], ref_s[kept])
+    assert (x_q.view(torch.uint8)[~kept] == 0x7F).all(), "padding row written"
+    assert torch.isnan(x_s[~kept]).all(), "padding scale written"
 
 
 NON_FINITE_CASES = get_ci_test_range(

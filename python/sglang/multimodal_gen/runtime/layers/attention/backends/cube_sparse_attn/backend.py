@@ -36,7 +36,6 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class CubeSparseAttentionBackend(AttentionBackend):
-
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.CUBE_SPARSE_ATTN
@@ -63,13 +62,6 @@ class CubeSparseAttentionMetadata(AttentionMetadata):
 
 
 class CubeSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-
-    def __init__(self):
-        pass
-
-    def prepare(self):
-        pass
-
     def build(  # type: ignore[override]
         self,
         *,
@@ -279,7 +271,6 @@ def cube_sparse_attention(
 
 
 class CubeSparseAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

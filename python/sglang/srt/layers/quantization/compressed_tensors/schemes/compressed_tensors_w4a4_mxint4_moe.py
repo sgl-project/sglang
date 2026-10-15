@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -66,13 +65,12 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
             and config.num_bits == 4
         ), "MxInt4 only supports group strategy with group size 32"
         assert config.symmetric, "Only symmetric quantization is supported for MoE"
-        assert (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-        ), "MxInt4 only supports flashinfer_trtllm backend"
-        assert (
-            not config.actorder
-        ), "Actorder is not supported by flashinfer_trtllm backend"
-        self.moe_ep_rank = get_parallel().moe_ep_rank
+        assert get_moe_runner_backend().is_flashinfer_trtllm(), (
+            "MxInt4 only supports flashinfer_trtllm backend"
+        )
+        assert not config.actorder, (
+            "Actorder is not supported by flashinfer_trtllm backend"
+        )
 
         if self.quant_config.quant_format != CompressionFormat.pack_quantized.value:
             raise ValueError(
@@ -95,9 +93,9 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        assert (
-            params_dtype == torch.bfloat16
-        ), f"Params dtype should be torch.bfloat16, but got: {params_dtype}"
+        assert params_dtype == torch.bfloat16, (
+            f"Params dtype should be torch.bfloat16, but got: {params_dtype}"
+        )
 
         extra_weight_attrs.update({"quant_method": self.strategy})
         w13_weight = torch.nn.Parameter(
@@ -301,20 +299,16 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.is_gated
-        ), "Only gated MoEs are supported for flashinfer mxint4"
+        assert self.moe_runner_config.is_gated, (
+            "Only gated MoEs are supported for flashinfer mxint4"
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(x.dtype)
-        )
+        correction_bias = topk_config.correction_bias
 
         local_num_experts = self.moe_runner_config.num_local_experts
         routing_method_type = layer.routing_method_type
@@ -329,7 +323,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         )
 
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             num_tokens = x.shape[0]
             hidden_size = x.shape[-1]
@@ -353,7 +347,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
             n_group=topk_config.num_expert_group,
             topk_group=topk_config.topk_group,
             intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
-            local_expert_offset=self.moe_ep_rank * local_num_experts,
+            local_expert_offset=self.moe_runner_config.moe_ep_rank * local_num_experts,
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,

@@ -10,7 +10,7 @@ from sglang.srt.configs.model_config import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_text_config(**overrides):
@@ -34,6 +34,24 @@ class TestModelConfigShapes(CustomTestCase):
         model_config.hf_text_config = text_config
         model_config._derive_model_shapes()
         return model_config
+
+    def test_bailing_nextn_draft_keeps_the_target_attention(self):
+        """A Bailing draft is renamed BailingMoeForCausalLMNextN: the V2.5 one is
+        MLA, the V2 one keeps the GQA shapes of its target."""
+        gqa = _make_text_config(
+            architectures=["BailingMoeForCausalLMNextN"], head_dim=128
+        )
+        self.assertEqual(self._derive_shapes(gqa).attention_arch, AttentionArch.MHA)
+        mla = _make_text_config(
+            architectures=["BailingMoeForCausalLMNextN"],
+            head_dim=192,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            rope_scaling=None,
+        )
+        self.assertEqual(self._derive_shapes(mla).attention_arch, AttentionArch.MLA)
 
     def test_optional_head_dims_default_when_none(self):
         text_config = _make_text_config(
