@@ -73,6 +73,10 @@ def _tiny_native_dit(device="cuda", **overrides):
         mock.patch.object(linear, "get_group_size", return_value=1),
         mock.patch.object(linear, "get_group_rank", return_value=0),
         mock.patch.object(flux3_image, "get_tp_world_size", return_value=1),
+        mock.patch(
+            "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+            return_value=1,
+        ),
     ):
         model = Flux3ImageDiT(flux3_image_dit_config(**_TINY, **overrides))
     model = model.to(device=device, dtype=torch.bfloat16)

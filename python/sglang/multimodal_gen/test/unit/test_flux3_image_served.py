@@ -21,7 +21,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
 
 _MODEL = "flux-3-image-klein-base"
 _SNAPSHOT_DOWNLOAD = (
-    "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.snapshot_download"
+    "sglang.multimodal_gen.runtime.pipelines.flux3_image_package.snapshot_download"
 )
 _FP8R_MANIFEST = {
     "dtype": "float8_e4m3fn",
@@ -609,25 +609,24 @@ class TestFlux3Lora(unittest.TestCase):
 
 class TestFlux3TextEncoder(unittest.TestCase):
     def test_batch_encodes_each_prompt_with_reference_positions(self):
-        """Pad rows reach the DiT, so they must match the reference encoder: each
-        prompt alone in its own bucket, with real tokens at 0..n-1 and pads at 1.
-        Batched padding and the transformers default positions both moved them."""
+        """Batch only equal pad buckets; preserve each prompt's positions and order."""
         from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (
             Flux3TextEncoder,
         )
 
         class FakeTokenizer:
-            lengths = {"short": 3, "long": 6}
+            lengths = {"short": 3, "long": 6, "tiny": 2}
 
             def __call__(self, text, **kwargs):
                 if "return_tensors" not in kwargs:
                     length = min(self.lengths[text], kwargs["max_length"])
                     return {"input_ids": list(range(length))}
                 length = kwargs["max_length"]
-                attention_mask = torch.zeros((1, length), dtype=torch.long)
-                attention_mask[0, : self.lengths[text]] = 1
+                attention_mask = torch.zeros((len(text), length), dtype=torch.long)
+                for row, prompt in enumerate(text):
+                    attention_mask[row, : self.lengths[prompt]] = 1
                 return {
-                    "input_ids": torch.arange(length)[None],
+                    "input_ids": torch.arange(length)[None].expand(len(text), -1),
                     "attention_mask": attention_mask,
                 }
 
@@ -659,23 +658,28 @@ class TestFlux3TextEncoder(unittest.TestCase):
         encoder.processor = FakeProcessor()
         encoder.model = base_model
 
-        result = encoder.encode_batch(["short", "long"])
+        result = encoder.encode_batch(["short", "long", "tiny", "short"])
 
         self.assertEqual(
             [tuple(call["input_ids"].shape) for call in base_model.call_kwargs],
-            [(1, 4), (1, 8)],
+            [(2, 4), (1, 8)],
         )
         positions = base_model.call_kwargs[0]["position_ids"]
-        self.assertEqual(tuple(positions.shape), (4, 1, 4))
+        self.assertEqual(tuple(positions.shape), (4, 2, 4))
         self.assertEqual(positions[:, 0].tolist(), [[0, 1, 2, 1]] * 4)
+        self.assertEqual(positions[:, 1].tolist(), [[0, 1, 1, 1]] * 4)
         self.assertEqual(
             base_model.call_kwargs[1]["position_ids"][0, 0].tolist(),
             [0, 1, 2, 3, 4, 5, 1, 1],
         )
         self.assertEqual(
-            [tuple(tokens.shape) for tokens, _ in result], [(4, 2), (8, 2)]
+            [tuple(tokens.shape) for tokens, _ in result],
+            [(4, 2), (8, 2), (4, 2), (4, 2)],
         )
-        self.assertEqual([tuple(ids.shape) for _, ids in result], [(4, 4), (8, 4)])
+        self.assertEqual(
+            [tuple(ids.shape) for _, ids in result], [(4, 4), (8, 4), (4, 4), (4, 4)]
+        )
+        self.assertIs(result[0], result[3])
         self.assertEqual(result[0][1][-1, -1].item(), 3)
         self.assertEqual(result[1][1][-1, -1].item(), 7)
 
