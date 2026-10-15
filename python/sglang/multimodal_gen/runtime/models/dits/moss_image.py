@@ -604,7 +604,11 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
             x = x * (1 + group_head[:, 1, None]) + group_head[:, 0, None]
             x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))
-            sample = x.transpose(1, 2).reshape(x.shape[0], -1, height, width).float()
+            sample = (
+                x.transpose(1, 2)
+                .reshape(x.shape[0], -1, height, width)
+                .to(dtype=torch.float32, memory_format=torch.contiguous_format)
+            )
             if indices is None:
                 return sample
             outputs.index_copy_(0, indices, sample)

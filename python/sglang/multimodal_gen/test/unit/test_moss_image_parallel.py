@@ -65,7 +65,7 @@ def _worker(mode):
     with torch.inference_mode(), set_forward_context(0, None):
         for length in (4, 5, 7):
             torch.manual_seed(length)
-            x, text = torch.randn(1, 8, 2, 3), torch.randn(1, length, 32)
+            x, text = torch.randn(2, 8, 2, 3), torch.randn(2, length, 32)
             timestep = torch.tensor([630.0])
             if mode == "sp":
                 for skip in ((), (0,), (1,)):
