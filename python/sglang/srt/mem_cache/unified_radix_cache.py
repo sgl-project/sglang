@@ -15,13 +15,13 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
-from sglang.srt.mem_cache.allocator.page_interleave import (
-    page_interleave_shard_size,
-)
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     fold_u64,
     get_shm_exchange,
+)
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    page_interleave_shard_size,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -3353,7 +3353,9 @@ class UnifiedRadixCache(BasePrefixCache):
         ]
         if len(groups) > 1:
             return None
-        group = groups[0] if groups else (self.tp_group if self.tp_world_size > 1 else None)
+        group = (
+            groups[0] if groups else (self.tp_group if self.tp_world_size > 1 else None)
+        )
         return get_shm_exchange(group, "hicache")
 
     def writing_check(

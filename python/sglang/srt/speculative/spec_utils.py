@@ -550,7 +550,9 @@ def generate_simulated_accept_index_device(
         torch.where(
             steps < simulate_acc_len - 1,
             drafted,
-            torch.where(steps == simulate_acc_len - 1, target_predict.to(rows.dtype), rows),
+            torch.where(
+                steps == simulate_acc_len - 1, target_predict.to(rows.dtype), rows
+            ),
         )
     )
     return sim_accept_index

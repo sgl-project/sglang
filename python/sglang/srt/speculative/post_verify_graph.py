@@ -133,7 +133,9 @@ class PostVerifyGraph:
             return None
         if self._host_hooked():
             # A per-round host hook on the acceptance kernel cannot be replayed from a graph.
-            logger.warning("post-verify graph off: verify_tree_greedy_func is wrapped by a host hook")
+            logger.warning(
+                "post-verify graph off: verify_tree_greedy_func is wrapped by a host hook"
+            )
             self.disabled = True
             return None
         key = self._key(
@@ -151,7 +153,9 @@ class PostVerifyGraph:
         try:
             return self._run(key, batch, verify_input, logits_output, num_draft_tokens)
         except Exception:
-            logger.exception("post-verify graph disabled after an error; stock path from now on")
+            logger.exception(
+                "post-verify graph disabled after an error; stock path from now on"
+            )
             self.disabled = True
             raise
 
@@ -161,7 +165,16 @@ class PostVerifyGraph:
 
         return hasattr(eagle_utils.verify_tree_greedy_func, "__wrapped__")
 
-    def _key(self, *, batch, verify_input, logits_output, num_draft_tokens, topk, token_to_kv_pool_allocator):
+    def _key(
+        self,
+        *,
+        batch,
+        verify_input,
+        logits_output,
+        num_draft_tokens,
+        topk,
+        token_to_kv_pool_allocator,
+    ):
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
         info = batch.sampling_info
@@ -181,8 +194,15 @@ class PostVerifyGraph:
             or info.logit_bias is not None
             or info.sampling_seed is not None
             or info.need_min_p_sampling
-            or (model_runner.watermark_state is not None and info.has_watermark_candidates)
-            or getattr(token_to_kv_pool_allocator.get_kvcache(), "clear_unaccepted_c128_draft_states", None)
+            or (
+                model_runner.watermark_state is not None
+                and info.has_watermark_candidates
+            )
+            or getattr(
+                token_to_kv_pool_allocator.get_kvcache(),
+                "clear_unaccepted_c128_draft_states",
+                None,
+            )
             is not None
             or not logits_output.next_token_logits.is_cuda
         ):
@@ -233,10 +253,14 @@ class PostVerifyGraph:
             # Host is more slots ahead than the ring covers; never overwrite a pending source.
             self._sim_len_stalls += 1
             if self._sim_len_stalls == 1:
-                logger.warning("post-verify graph: injected-length ring wrapped before its copy ran")
+                logger.warning(
+                    "post-verify graph: injected-length ring wrapped before its copy ran"
+                )
             done.synchronize()
         host = self._sim_len_host[turn]
-        host[0] = sample_simulated_acc_len(SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len)
+        host[0] = sample_simulated_acc_len(
+            SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len
+        )
         self._sim_len_slot = turn
         return host
 
@@ -248,18 +272,24 @@ class PostVerifyGraph:
         st.turn ^= 1
         logits_ptr = logits_output.next_token_logits.data_ptr()
         if slot.graph is not None and slot.logits_ptr != logits_ptr:
-            raise RuntimeError("verify logits moved; the captured post-verify graph reads a stale buffer")
+            raise RuntimeError(
+                "verify logits moved; the captured post-verify graph reads a stale buffer"
+            )
         slot.logits_ptr = logits_ptr
         inputs = self._gather_inputs(batch, verify_input)
         sim_len = self._sim_len(verify_input.max_tree_depth)
         if slot.graph is None:
             if not slot.inputs:
                 slot.inputs = {k: v.clone() for k, v in inputs.items()}
-                slot.inputs["sim_len"] = torch.zeros((1,), dtype=torch.int64, device=self.device)
+                slot.inputs["sim_len"] = torch.zeros(
+                    (1,), dtype=torch.int64, device=self.device
+                )
             self._load(slot, inputs, sim_len)
             if st.warmups < _NUM_WARMUP * 2:
                 st.warmups += 1
-                return self._body(slot.inputs, batch, verify_input, logits_output, num_draft_tokens)
+                return self._body(
+                    slot.inputs, batch, verify_input, logits_output, num_draft_tokens
+                )
             self._capture(slot, batch, verify_input, logits_output, num_draft_tokens)
         else:
             self._load(slot, inputs, sim_len)
@@ -268,7 +298,9 @@ class PostVerifyGraph:
             self._compare(slot, batch, verify_input, logits_output, num_draft_tokens)
         return slot.outputs
 
-    def _compare(self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens):
+    def _compare(
+        self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens
+    ):
         # Debug only (host syncs): rerun the eager sampling and commit-output math on the same
         # inputs; the fields compared do not depend on the sampling coins.
         from sglang.srt.speculative.eagle_utils import eagle_sample
@@ -299,7 +331,9 @@ class PostVerifyGraph:
         self._mismatch += 0 if same else 1
         if not same or self._checked % 1000 == 0:
             logger.info(
-                "post-verify graph check: %d rounds, %d mismatches", self._checked, self._mismatch
+                "post-verify graph check: %d rounds, %d mismatches",
+                self._checked,
+                self._mismatch,
             )
 
     def _load(self, slot: _Slot, inputs: Dict[str, torch.Tensor], sim_len):
@@ -314,7 +348,9 @@ class PostVerifyGraph:
                 done = self._sim_len_done[self._sim_len_slot] = torch.cuda.Event()
             done.record()
 
-    def _capture(self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens):
+    def _capture(
+        self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens
+    ):
         from sglang.srt.distributed.parallel_state import graph_capture
 
         if self._pool is None:
@@ -324,12 +360,23 @@ class PostVerifyGraph:
         with _count_acceptance_calls() as acceptance_calls:
             with graph_capture(stream=stream) as ctx:
                 with torch.cuda.graph(
-                    graph, pool=self._pool, stream=ctx.stream, capture_error_mode="thread_local"
+                    graph,
+                    pool=self._pool,
+                    stream=ctx.stream,
+                    capture_error_mode="thread_local",
                 ):
-                    outputs = self._body(slot.inputs, batch, verify_input, logits_output, num_draft_tokens)
+                    outputs = self._body(
+                        slot.inputs,
+                        batch,
+                        verify_input,
+                        logits_output,
+                        num_draft_tokens,
+                    )
         # Injected acceptance only overrides the result; the real acceptance kernel must be in the graph.
         if acceptance_calls[0] == 0:
-            raise RuntimeError("post-verify graph captured without the acceptance kernel")
+            raise RuntimeError(
+                "post-verify graph captured without the acceptance kernel"
+            )
         slot.graph = graph
         slot.outputs = outputs
         logger.info("Captured post-verify graph for bs=%d", len(batch.seq_lens))
@@ -353,13 +400,15 @@ class PostVerifyGraph:
             if batch.mamba_track_indices is not None
             else 0
         )
-        new_seq_lens, bonus_tokens, commit_steps, draft_inputs = prepare_verify_commit_outputs(
-            predict,
-            accept_index,
-            accept_lens,
-            x["seq_lens"],
-            num_draft_tokens=num_draft_tokens,
-            mamba_track_interval=track_interval,
+        new_seq_lens, bonus_tokens, commit_steps, draft_inputs = (
+            prepare_verify_commit_outputs(
+                predict,
+                accept_index,
+                accept_lens,
+                x["seq_lens"],
+                num_draft_tokens=num_draft_tokens,
+                mamba_track_interval=track_interval,
+            )
         )
         commit_mamba_states_after_verify(
             self.target_worker,
@@ -369,7 +418,14 @@ class PostVerifyGraph:
             num_draft_tokens,
             prepared_step_indices=commit_steps,
         )
-        return predict, accept_lens, accept_index, new_seq_lens, bonus_tokens, draft_inputs
+        return (
+            predict,
+            accept_lens,
+            accept_index,
+            new_seq_lens,
+            bonus_tokens,
+            draft_inputs,
+        )
 
     @staticmethod
     def _views(x, batch, verify_input):

@@ -34,14 +34,14 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+    ShmTagExchange,
+    get_shm_exchange,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
-)
-from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
-    ShmTagExchange,
-    get_shm_exchange,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
@@ -360,7 +360,9 @@ def _broadcast_via_exchange(
         return recv_reqs if is_src else []
     if is_src:
         data = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
-        torch.distributed.broadcast(data, src=tp_group.ranks[0], group=tp_group.cpu_group)
+        torch.distributed.broadcast(
+            data, src=tp_group.ranks[0], group=tp_group.cpu_group
+        )
         return recv_reqs
     data = torch.empty(size, dtype=torch.uint8)
     torch.distributed.broadcast(data, src=tp_group.ranks[0], group=tp_group.cpu_group)

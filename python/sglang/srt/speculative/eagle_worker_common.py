@@ -25,13 +25,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.post_verify_graph import PostVerifyGraph
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
 )
+from sglang.srt.speculative.post_verify_graph import PostVerifyGraph
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -710,9 +710,18 @@ def run_eagle_verify(
         else None
     )
     if fused is not None:
-        predict, accept_lens, accept_index, new_seq_lens, bonus_tokens, prepared_draft_inputs = fused
+        (
+            predict,
+            accept_lens,
+            accept_index,
+            new_seq_lens,
+            bonus_tokens,
+            prepared_draft_inputs,
+        ) = fused
         if batch.return_logprob:
-            compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
+            compute_spec_logprobs(
+                batch, logits_output, predict, accept_index=accept_index
+            )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,

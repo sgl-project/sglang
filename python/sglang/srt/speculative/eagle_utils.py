@@ -703,7 +703,9 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
-_PACKED_VERIFY_BCAST = os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
+_PACKED_VERIFY_BCAST = (
+    os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
+)
 
 
 def _verify_uses_greedy(

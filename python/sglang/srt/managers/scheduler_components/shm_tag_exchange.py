@@ -50,7 +50,9 @@ class ShmTagExchange:
         self.rank = dist.get_rank(group)
         self.width = width
         self.seq = 0
-        self.timeout_s = float(os.environ.get("TORCH_DISTRIBUTED_DEFAULT_TIMEOUT", "1800"))
+        self.timeout_s = float(
+            os.environ.get("TORCH_DISTRIBUTED_DEFAULT_TIMEOUT", "1800")
+        )
         nbytes = 2 * self.world * width * 8
         ranks = dist.get_process_group_ranks(group)
         self._creator = self.rank == 0
@@ -68,7 +70,9 @@ class ShmTagExchange:
                 "multiprocessing.resource_tracker.register", lambda *a, **k: None
             ):
                 self.shm = shared_memory.SharedMemory(name=recv[0])
-        self.table = (ctypes.c_int64 * (2 * self.world * width)).from_buffer(self.shm.buf)
+        self.table = (ctypes.c_int64 * (2 * self.world * width)).from_buffer(
+            self.shm.buf
+        )
         dist.barrier(group=group)
 
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
@@ -119,7 +123,9 @@ class ShmTagExchange:
 _EXCHANGES: Dict[tuple, Optional[ShmTagExchange]] = {}
 
 
-def get_shm_exchange(group: Optional[dist.ProcessGroup], kind: str) -> Optional[ShmTagExchange]:
+def get_shm_exchange(
+    group: Optional[dist.ProcessGroup], kind: str
+) -> Optional[ShmTagExchange]:
     """Collective on first call per (group, kind): every rank of the group must call it
     at the same point. Returns None (stock path) when disabled or the group spans hosts."""
     if group is None or not edge_shm_sync_enabled():
