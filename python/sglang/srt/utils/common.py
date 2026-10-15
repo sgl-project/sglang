@@ -583,6 +583,10 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
+    # Under NVIDIA Confidential Computing host<->device copies go through a
+    # bounce buffer, so host staging is pageable there.
+    if is_confidential_compute():
+        return False
     return current_platform.is_pin_memory_available(device)
 
 
