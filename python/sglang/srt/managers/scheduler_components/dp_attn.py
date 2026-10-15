@@ -14,6 +14,10 @@ from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    _decode_total_seq_lens,
+    _prefill_attention_pairs,
+)
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
@@ -85,24 +89,29 @@ def _resolve_elastic_world_num_dp_ranks(
     live_num_dp_ranks = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
     # Query live membership because elastic joins can expand WORLD.
+    from sglang.srt.elastic_ep.topology import attn_replica_size
+
+    replica_size = attn_replica_size()
     world_size = torch.distributed.get_world_size(group)
 
-    if live_num_dp_ranks != effective_ep_size:
+    if live_num_dp_ranks * replica_size != effective_ep_size:
         raise RuntimeError(
             "[Elastic EP] WORLD MLP sync num_dp_ranks is out of sync: "
             f"rank={torch.distributed.get_rank(group)} "
             f"live_num_dp_ranks={live_num_dp_ranks} "
             f"effective_ep_size={effective_ep_size} "
+            f"attn_replica_size={replica_size} "
             f"world_size={world_size} configured_num_dp_ranks={num_dp_ranks} "
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"
         )
-    if live_num_dp_ranks > world_size:
+    if effective_ep_size > world_size:
         raise RuntimeError(
-            "[Elastic EP] WORLD MLP sync num_dp_ranks exceeds WORLD size: "
+            "[Elastic EP] WORLD MLP sync EP size exceeds WORLD size: "
             f"rank={torch.distributed.get_rank(group)} "
             f"live_num_dp_ranks={live_num_dp_ranks} world_size={world_size} "
-            f"effective_ep_size={effective_ep_size}"
+            f"effective_ep_size={effective_ep_size} "
+            f"attn_replica_size={replica_size}"
         )
 
     return live_num_dp_ranks
@@ -125,6 +134,8 @@ class MLPSyncBatchInfo:
     prefill_cuda_graph_max_prefix_len: int = 0
     # Every request in the local batch is a health-check probe.
     is_health_check: bool = False
+    # Causal (query, key) pairs this rank attends this step.
+    attention_pairs: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -132,6 +143,7 @@ class MLPSyncBatchInfo:
     sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_attention_pairs: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -149,6 +161,7 @@ class MLPSyncBatchInfo:
                 self.prefill_cuda_graph_max_prefix_len,
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
+                self.attention_pairs,
             ],
             device=device,
             dtype=dtype,
@@ -167,6 +180,7 @@ class MLPSyncBatchInfo:
                 0,  # prefill_cuda_graph_max_prefix_len
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
+                0,  # attention_pairs
             ],
             device=device,
             dtype=dtype,
@@ -177,6 +191,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -253,6 +268,7 @@ class MLPSyncBatchInfo:
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
+        self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -420,12 +436,31 @@ def _local_prefill_cuda_graph_vote(
         is_mixed=mode == ForwardMode.MIXED,
         batch_max_context_len=(
             int(local_batch.seq_lens_cpu.max().item())
-            if prefill_graph_runner.max_context_size is not None
+            if (
+                prefill_graph_runner.max_context_size is not None
+                or prefill_graph_runner.max_seq_len is not None
+            )
             and local_batch.seq_lens_cpu is not None
             and local_batch.seq_lens_cpu.numel() > 0
             else None
         ),
     )
+
+
+def _local_attention_pairs(local_batch: Optional[ScheduleBatch]) -> int:
+    """Causal (query, key) pairs the batch attends, pricing every layer as full
+    attention: one query per decode row over its committed length (spec
+    batches have no CPU seq_lens at schedule time), the chunk formula for
+    prefill."""
+    if (
+        local_batch is None
+        or local_batch.forward_mode.is_prebuilt()
+        or local_batch.forward_mode.is_idle()
+    ):
+        return 0
+    if local_batch.forward_mode.is_decode():
+        return _decode_total_seq_lens(local_batch)
+    return _prefill_attention_pairs(local_batch)
 
 
 class DPSyncWaitCarry:
@@ -563,6 +598,9 @@ def prepare_mlp_sync_batch_raw(
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
         is_health_check=is_health_check,
+        # Gathered unconditionally like the other columns, so a per-process
+        # metrics flag cannot make ranks disagree on what the tensor holds.
+        attention_pairs=_local_attention_pairs(local_batch),
     )
 
     if num_dp_ranks == 1:
@@ -628,6 +666,8 @@ def prepare_mlp_sync_batch_raw(
             local_batch.dp_balance_stats = DPBalanceStats.create(
                 local_tokens=num_tokens,
                 global_num_tokens=mlp_sync_info.global_num_tokens,
+                local_attention_pairs=mlp_sync_info.attention_pairs,
+                global_attention_pairs=mlp_sync_info.global_attention_pairs,
                 sync_wait_seconds=sync_wait_seconds,
             )
         elif local_batch is None and sync_wait_carry is not None:

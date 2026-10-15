@@ -579,6 +579,7 @@ async fn register_one(
     let profile = EngineProfile {
         protocol,
         dp_ranks: info.dp_ranks,
+        openai: info.openai.map(Arc::new),
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
@@ -636,6 +637,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 dp_aware: false,
+                dp_rank_policy: Default::default(),
                 bucket_config: None,
                 reorg_buckets: None,
                 reorg_admission: Default::default(),

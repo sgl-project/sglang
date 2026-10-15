@@ -129,6 +129,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [2048, 2304]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.max_num_tokens = 2304
         runner.enable_cp_bcg_capture = True
         return runner
@@ -903,7 +904,9 @@ class TestCPInterleaveStrategy(CustomTestCase):
         )
 
         with (
-            get_parallel().override(attn_cp_rank=2, attn_cp_size=4),
+            get_parallel().override(
+                attn_cp_rank=2, attn_cp_size=4, enable_cp_tp_group_sharing=False
+            ),
             patch(
                 "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
                 return_value=4,
