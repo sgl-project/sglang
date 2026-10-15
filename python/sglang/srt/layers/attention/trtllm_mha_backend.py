@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.graph_variants import use_split_kv_attention
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
@@ -1375,6 +1376,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         out: Optional[torch.Tensor] = None,
         out_dtype: Optional[torch.dtype] = None,
         mask: Optional[torch.Tensor] = None,
+        use_split_kv: bool = True,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1384,7 +1386,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else (out.dtype if out is not None else self.q_data_type)
         )
 
-        if self._split_kv_enabled:
+        if self._split_kv_enabled and use_split_kv:
             supported = (
                 not self.is_xqa_impl
                 and get_parallel().attn_dcp_size == 1
@@ -1834,6 +1836,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     kv_cache_sf=kv_cache_block_scales,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                     mask=mask,
+                    use_split_kv=(
+                        self._split_kv_enabled and use_split_kv_attention(forward_batch)
+                    ),
                 )
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard

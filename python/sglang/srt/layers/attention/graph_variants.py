@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 DSA_DENSE = "dense"
 DSA_SPARSE = "sparse"
 
+SPLIT_KV_STOCK = "split_kv_stock"
+SPLIT_KV_LONG = "split_kv_long"
+SPLIT_KV_MIN_LENGTH = 32768
+
 
 class AttentionGraphVariants(Protocol):
     # Capture order is significant when variants share a graph memory pool.
@@ -21,6 +25,62 @@ class AttentionGraphVariants(Protocol):
     def select(self, forward_batch: ForwardBatch) -> str:
         """Select one of capture_labels for the batch."""
         ...
+
+
+@dataclass(frozen=True)
+class SplitKVGraphVariants:
+    """Keep short sequences on stock attention without a device-to-host copy."""
+
+    capture_labels: ClassVar[tuple[str, ...]] = (SPLIT_KV_STOCK, SPLIT_KV_LONG)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        if forward_batch.batch_size != 1:
+            return SPLIT_KV_STOCK
+        length = getattr(forward_batch, "attention_kv_len_lower_bound", None)
+        if length is None:
+            lengths = forward_batch.seq_lens_cpu
+            if (
+                lengths is not None
+                and lengths.device.type == "cpu"
+                and lengths.numel() == 1
+            ):
+                length = int(lengths[0])
+        return (
+            SPLIT_KV_LONG
+            if length is not None and length >= SPLIT_KV_MIN_LENGTH
+            else SPLIT_KV_STOCK
+        )
+
+
+def create_split_kv_graph_variants(
+    capture_forward_mode, captured_req_width: int
+) -> Optional[SplitKVGraphVariants]:
+    from sglang.srt.environ import envs
+
+    if (
+        envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get()
+        and captured_req_width == 7
+        and (
+            capture_forward_mode.is_target_verify()
+            or capture_forward_mode.is_draft_extend_v2()
+        )
+    ):
+        return SplitKVGraphVariants()
+    return None
+
+
+def use_split_kv_attention(forward_batch: ForwardBatch) -> bool:
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+        get_is_capture_mode,
+    )
+
+    variant = get_capture_attention_variant()
+    if variant is not None:
+        return variant == SPLIT_KV_LONG
+    if get_is_capture_mode():
+        return False
+    return SplitKVGraphVariants().select(forward_batch) == SPLIT_KV_LONG
 
 
 @dataclass(frozen=True)
