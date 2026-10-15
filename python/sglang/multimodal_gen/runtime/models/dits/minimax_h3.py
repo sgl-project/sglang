@@ -434,7 +434,7 @@ def _modulate_scale_shift(
     """Apply indexed affine modulation, reusing disposable CUDA BF16 input."""
     # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
     if (
-        x.is_cuda
+        (x.is_cuda or x.is_xpu)
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and shift.dtype == _BF16_DTYPE
@@ -459,7 +459,7 @@ def _modulate_gate(
     """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
-        x.is_cuda
+        (x.is_cuda or x.is_xpu)
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and gate.dtype == _BF16_DTYPE
