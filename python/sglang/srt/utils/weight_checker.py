@@ -63,6 +63,7 @@ _NON_PERSISTENT_BUFFER_PATTERNS = (
     "inv_freq",
     "freqs_cis",
     "expert_mask_gpu",
+    "axis_map",
 )
 
 
