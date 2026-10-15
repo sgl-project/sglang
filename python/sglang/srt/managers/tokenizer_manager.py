@@ -2504,6 +2504,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
         else:
             customized_info = None
+        detokenize_duration = (
+            recv_obj.detokenize_duration
+            if isinstance(recv_obj, BatchStrOutput)
+            else None
+        )
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = get_serving().batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
@@ -2516,6 +2521,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
                 continue
+
+            if detokenize_duration is not None:
+                state.time_stats.add_detokenize_duration(detokenize_duration)
 
             # Build meta_info and return value
             meta_info = {

@@ -390,6 +390,8 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     api_server_dispatch_time: float = 0.0
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
+    detokenize_total_duration: float = 0.0
+    detokenize_batches: int = 0
 
     def __getstate__(self) -> object:
         state = {}
@@ -425,6 +427,9 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             # closed below, so they must be merged in here rather than by the caller.
             attrs = dict(span_attrs) if span_attrs else {}
             attrs.update(self.convert_to_gen_ai_span_attrs())
+            if self.detokenize_batches:
+                attrs["detokenize.total_ms"] = self.detokenize_total_duration * 1000
+                attrs["detokenize.batches"] = self.detokenize_batches
             self.trace_ctx.trace_req_finish(
                 convert_time_to_realtime_ns(ts), attrs=attrs
             )
@@ -472,6 +477,10 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 convert_time_to_realtime_ns(ts),
                 thread_finish_flag=True,
             )
+
+    def add_detokenize_duration(self, duration: float):
+        self.detokenize_total_duration += duration
+        self.detokenize_batches += 1
 
     def set_response_sent_to_client_time(self, ts=None):
         ts = ts or time.perf_counter()

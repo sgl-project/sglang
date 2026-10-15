@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -156,6 +157,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             get_serving().disable_tokenizer_batch_decode
         )
         self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
+        self.enable_trace = get_observability().enable_trace
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -442,6 +444,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        start_time = time.perf_counter()
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
         if is_beam_search_batch(recv_obj):
@@ -459,7 +462,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
-        return BatchStrOutput(
+        output = BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
@@ -509,6 +512,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
+        if self.enable_trace:
+            output.detokenize_duration = time.perf_counter() - start_time
+        return output
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")

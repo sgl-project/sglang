@@ -171,6 +171,24 @@ class TestSetFinishedTimeSpanAttrs(CustomTestCase):
             attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL], 0.4
         )
 
+    def test_sums_detokenize_time_over_the_batches_that_carried_the_request(self):
+        stats = self._tracing_stats()
+        stats.add_detokenize_duration(0.001)
+        stats.add_detokenize_duration(0.002)
+
+        stats.set_finished_time(ts=2.0)
+
+        attrs = stats.trace_ctx.trace_req_finish.call_args.kwargs["attrs"]
+        self.assertAlmostEqual(attrs["detokenize.total_ms"], 3.0)
+        self.assertEqual(attrs["detokenize.batches"], 2)
+
+        # A request no detokenizer batch carried (e.g. aborted while queued).
+        stats = self._tracing_stats()
+        stats.set_finished_time(ts=2.0)
+        attrs = stats.trace_ctx.trace_req_finish.call_args.kwargs["attrs"]
+        self.assertNotIn("detokenize.total_ms", attrs)
+        self.assertNotIn("detokenize.batches", attrs)
+
     def test_caller_attrs_not_mutated(self):
         stats = self._tracing_stats()
         stats.created_time = 1.0

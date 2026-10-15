@@ -300,6 +300,16 @@ class TestMultiTokenizerMixin(CustomTestCase):
             grouped.input_top_logprobs_val_flat[1], np.array([[1.0]], np.float32)
         )
 
+    def test_split_keeps_the_batch_detokenize_duration(self):
+        """Every request in a batch waited for the whole batch to detokenize."""
+        output = _make_batch_str_output()
+        output.detokenize_duration = 0.003
+
+        self.assertEqual(_handle_output_by_index(output, 1).detokenize_duration, 0.003)
+        self.assertEqual(
+            _handle_output_by_indices(output, [1, 0]).detokenize_duration, 0.003
+        )
+
     def test_grouped_split_caches_struct_fields_by_output_type(self):
         self.addCleanup(_cached_output_fields.cache_clear)
         _cached_output_fields.cache_clear()
