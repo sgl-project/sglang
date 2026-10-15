@@ -1939,10 +1939,8 @@ def _apply_fallback_scaled_mm(
     )
 
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
-    # A static per-tensor input_scale (e.g. activation_scheme=="static" with a
-    # channelwise weight_scale) has no row dimension to trim; only narrow when
-    # x_scale actually carries one (dynamic/per-token scales, possibly padded).
-    if x_scale.dim() > 0:
+    # A single scale has no row dimension to trim, regardless of its shape.
+    if x_scale.numel() > 1:
         x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
 
     output = output * x_scale * weight_scale.t()

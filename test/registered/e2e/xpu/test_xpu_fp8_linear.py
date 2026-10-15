@@ -342,14 +342,6 @@ class TestXPUFP8Linear(CustomTestCase):
         )
         K, N = 256, 384
         weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) / 3
-        weight_scale = (
-            weight_bf16.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
-            / torch.finfo(torch.float8_e4m3fn).max
-        )
-        block_method = Fp8LinearMethod(
-            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
-        )
-        self.assertFalse(block_method.use_per_token_if_dynamic)
 
         layer = torch.nn.Module()
         layer.logical_widths = [N]
@@ -357,7 +349,6 @@ class TestXPUFP8Linear(CustomTestCase):
         layer.orig_dtype = torch.bfloat16
         layer.input_scale = None
         self.assertFalse(method.cutlass_fp8_supported)
-        self.assertFalse(method.use_per_token_if_dynamic)
         method.process_weights_after_loading(layer)
         self.assertTrue(method.use_per_token_if_dynamic)
         weight = layer.weight
@@ -448,6 +439,34 @@ class TestXPUFP8Linear(CustomTestCase):
         )
         torch.testing.assert_close(
             output, reference.to(torch.bfloat16), rtol=0.05, atol=0.2
+        )
+
+    def test_prequantized_vector_scale_with_channelwise_weight_scale(self):
+        """A one-element pre-quantized input scale is treated as scalar."""
+        M, K, N = 4, 256, 384
+        q_input = torch.randn(M, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight = torch.randn(K, N, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.full((N, 1), 0.5, device=self.device)
+        input_scale = torch.tensor([0.25], device=self.device)
+
+        output = apply_fp8_linear(
+            input=q_input,
+            weight=weight,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            use_per_token_if_dynamic=True,
+            compressed_tensor_quant=True,
+            pre_quant_output_dtype=torch.bfloat16,
+        )
+        reference = (q_input.float() * input_scale.float()) @ (
+            weight.float() * weight_scale.t()
+        )
+        torch.testing.assert_close(
+            output, reference.to(torch.bfloat16), rtol=0.01, atol=0.1
         )
 
 

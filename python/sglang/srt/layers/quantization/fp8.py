@@ -1046,19 +1046,22 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
-            if _is_xpu and layer.weight_scale.ndim in (1, 2):
-                # Normalize channelwise scales to [N, 1] before the rowwise gate.
-                # Covers both the [1, N] layout this method's own quantize-at-load
-                # path produces and the plain [N] layout some FP8 checkpoints use.
-                if layer.weight_scale.ndim == 1 or layer.weight_scale.shape[0] == 1:
+            if _is_xpu:
+                # A scale is row-wise iff it carries exactly one value per
+                # output channel, regardless of shape ([N], [1, N], [N, 1], ...).
+                num_channels = sum(layer.logical_widths)
+                is_rowwise = layer.weight_scale.numel() == num_channels
+                if is_rowwise and (
+                    layer.weight_scale.shape != (num_channels, 1)
+                    or not layer.weight_scale.t().is_contiguous()
+                ):
                     with torch.no_grad():
                         layer.weight_scale.set_(
-                            layer.weight_scale.data.reshape(-1, 1).contiguous()
+                            layer.weight_scale.data.reshape(
+                                num_channels, 1
+                            ).contiguous()
                         )
-                self.use_per_token_if_dynamic = (
-                    layer.weight_scale.shape[1] == 1
-                    and layer.weight_scale.t().is_contiguous()
-                )
+                self.use_per_token_if_dynamic = is_rowwise
 
             if _is_cpu:
                 assert _is_cpu_amx_available, (
