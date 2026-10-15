@@ -61,13 +61,13 @@ Before following this tutorial, complete the environment setup in the documents 
 Before downloading model weights, check the model size to reserve enough disk space.
 For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
-- [Qwen3-Next-80B-A3B-Instruct](https://www.modelscope.cn/models/Qwen/Qwen3-Next-80B-A3B-Instruct) (BF16, 162.68GB) — used as the EAGLE3 draft model
+- [Qwen3-Next-80B-A3B-Instruct](https://www.modelscope.cn/models/Qwen/Qwen3-Next-80B-A3B-Instruct) (BF16, 162.68GB) — used as the draft model for NEXTN speculative decoding
 - [Qwen3-Next-80B-A3B-Instruct-W8A8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-Next-80B-A3B-Instruct-W8A8) (W8A8 quantized version, 84.90GB)
 
 <Info>
 We recommend deploying the W8A8 variant as the main model for reduced resource usage and higher throughput.
 It (84.90GB) can be deployed on 2 × 64GB (`--tp-size 2`), which corresponds to 1 card (2 dies) on A3 Series.
-The BF16 weights serve as the EAGLE3 draft model (set `--speculative-draft-model-path` to the BF16 weight path).
+The BF16 weights serve as the NEXTN draft model (set `--speculative-draft-model-path` to the BF16 weight path).
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
