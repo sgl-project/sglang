@@ -358,7 +358,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -1648,6 +1648,11 @@ class Scheduler(
                 self.draft_worker.get_confidence_budget_prepare()
             )
 
+        # If enable async D2H copy when overlap is enabled
+        # Currently used by NVIDIA Confidential Computing (CC) only
+        self.enable_async_d2h_copy = False
+        self.async_d2h_worker = None
+
         if use_mlx():
             # MLX uses its own overlap loop and does not create CUDA streams,
             # but the normal non-overlap scheduler path still relays decode
@@ -1667,6 +1672,19 @@ class Scheduler(
 
         if not self.enable_overlap:
             return
+
+        # Under NVIDIA Confidential Computing (CC) the per-step D2H result readback is
+        # forced synchronous and blocks the scheduler thread at issue, serializing the
+        # overlap pipeline. Offload it to a worker thread (AsyncD2HCopyWorker).
+        self.enable_async_d2h_copy = is_confidential_compute()
+        if self.enable_async_d2h_copy:
+            from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
+
+            self.async_d2h_worker = AsyncD2HCopyWorker(self.device_module)
+            logger.info(
+                "NVIDIA Confidential Computing (CC) detected: "
+                "using async D2H copy worker to preserve overlap scheduling."
+            )
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -3928,18 +3946,23 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        num_held_rows: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        available = self.req_to_token_pool.available_size()
-
+        # Rows the counted requests may occupy: the free rows, plus the rows that
+        # counted requests already hold (a continuing chunk, a session borrow),
+        # minus the rows promised to beam members.
         active_batch = running_batch or self.running_batch
-        available = max(
-            available - self.beam_coordinator.pending_member_rows(active_batch), 0
+        row_budget = max(
+            self.req_to_token_pool.available_size()
+            + num_held_rows
+            - self.beam_coordinator.pending_member_rows(active_batch),
+            0,
         )
-        res = min(pp_budget, available)
+        res = min(pp_budget, row_budget)
         if beam_width is not None:
             # A beam candidate owns beam_width rows once decoding.
-            res = min(res, available // beam_width)
+            res = min(res, row_budget // beam_width)
 
         return res
 
@@ -3985,8 +4008,8 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
         if running_batch.is_empty():
-            # An empty batch never reaches update_running_batch, the only
-            # other place that clears the flag, so admission would stay shut.
+            # An empty batch has no request left to leave, and only a leaving
+            # request clears the flag elsewhere, so admission would stay shut.
             running_batch.batch_is_full = False
 
         if (
@@ -4008,11 +4031,9 @@ class Scheduler(
         ):
             return None, running_batch
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        # A chunked request skips this check: it keeps its req_to_token row across
+        # chunks, and under PP it (or a dllm request) may finish in another
+        # microbatch, so holding it back here would leak its memory.
         if (
             self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
             and self.chunked_req is None
@@ -4098,6 +4119,10 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # A spent pass budget admits no one, even before the first
+            # candidate: the resumed chunk or mixed decode rows can spend it.
+            if adder.budget_state() == AddReqResult.OTHER:
+                break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4114,17 +4139,14 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                num_held_rows=num_held_rows,
             ):
                 running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
@@ -4628,10 +4650,17 @@ class Scheduler(
                                 # gated by copy_done, so nothing on forward_stream waits.
                                 self.copy_stream.wait_stream(self.forward_stream)
                                 with self.copy_stream_ctx:
-                                    batch_result.copy_to_cpu(
+                                    copy_fn = partial(
+                                        batch_result.copy_to_cpu,
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
+                                    if self.enable_async_d2h_copy:
+                                        batch_result.copy_done = (
+                                            self.async_d2h_worker.submit(copy_fn)
+                                        )
+                                    else:
+                                        copy_fn()
                         else:
                             batch_result.future_indices = future_indices
 
@@ -4927,10 +4956,15 @@ class Scheduler(
         # with subsequent forward computation.
         self.copy_stream.wait_stream(self.forward_stream)
         with self.copy_stream_ctx:
-            batch_result.copy_to_cpu(
+            copy_fn = partial(
+                batch_result.copy_to_cpu,
                 return_logprob=cur_batch.return_logprob,
                 return_hidden_states=cur_batch.return_hidden_states,
             )
+            if self.enable_async_d2h_copy:
+                batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
+            else:
+                copy_fn()
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -6187,6 +6221,10 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            # Stop the async D2H copy worker thread if any.
+            if scheduler.async_d2h_worker is not None:
+                scheduler.async_d2h_worker.shutdown()
+                scheduler.async_d2h_worker = None
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:

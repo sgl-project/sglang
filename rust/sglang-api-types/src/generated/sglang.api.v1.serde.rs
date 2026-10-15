@@ -1593,6 +1593,9 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.extra_key {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
         }
+        if let Some(v) = &self.priority {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1632,6 +1635,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_video_data = None;
                 let mut f_audio_data = None;
                 let mut f_extra_key = None;
+                let mut f_priority = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -1794,6 +1798,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_extra_key = Some(map.next_value::<Option<StringOrList>>()?);
                         }
+                        "priority" => {
+                            if f_priority.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("priority"));
+                            }
+                            f_priority = Some(map.next_value::<Option<i64>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -1823,6 +1833,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     video_data: f_video_data.flatten(),
                     audio_data: f_audio_data.flatten(),
                     extra_key: f_extra_key.flatten(),
+                    priority: f_priority.flatten(),
                 })
             }
         }
