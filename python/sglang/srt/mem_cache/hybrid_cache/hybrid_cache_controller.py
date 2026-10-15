@@ -1583,6 +1583,9 @@ class HybridCacheController(BaseHiCacheController):
             for transfer in operation.pool_transfers or []
             if self.should_backup(transfer)
         ]
+        kv_first = getattr(self.storage_backend, "sidecars_after_kv", False)
+        if kv_first and not self.backup_skip:
+            super()._page_backup(operation)
 
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
@@ -1598,7 +1601,8 @@ class HybridCacheController(BaseHiCacheController):
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
         if not self.backup_skip:
-            super()._page_backup(operation)
+            if not kv_first:
+                super()._page_backup(operation)
         else:
             sidecar_ok = bool(backup_transfers)
             if sidecar_ok:

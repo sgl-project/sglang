@@ -31,6 +31,8 @@ NUM_SLOTS = 64
 
 class _Kind(enum.Enum):
     FULL = 0
+    SWA = 1
+    MAMBA = 2
 
 
 class _InsertError(enum.Enum):
@@ -43,7 +45,7 @@ class _GeometryMismatch(RuntimeError):
 
 
 class _FakeGeometry:
-    def __init__(self, block_size, full_slot_bytes):
+    def __init__(self, block_size, full_slot_bytes, **components):
         self.key = (block_size, full_slot_bytes)
 
 
@@ -210,6 +212,8 @@ _FAKE_RADIXSHMEM = SimpleNamespace(
     GeometryMismatch=_GeometryMismatch,
     ComponentType=_Kind,
     COMPONENT_MASK_FULL=1,
+    COMPONENT_MASK_SWA=2,
+    COMPONENT_MASK_MAMBA=4,
     InsertError=_InsertError,
 )
 
