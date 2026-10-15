@@ -1000,7 +1000,6 @@ class Scheduler:
         self.metrics_reporter = SchedulerMetricsReporter(
             metrics_sink=self.metrics_sink,
             request_registry=self.request_registry,
-            core_lists=self.lists,
             counters=self.counters,
             pool_stats_observer=self.pool_stats_observer,
             grammar_manager=self.grammar_manager,

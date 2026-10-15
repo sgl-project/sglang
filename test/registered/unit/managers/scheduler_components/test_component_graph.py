@@ -197,7 +197,6 @@ _DECLARED = {
     "MetricsReporter": [
         "MetricsSink",
         "RequestRegistry",
-        "CoreLists",
         "LaunchCounters",
         "PoolStatsObserver",
         "GrammarManager",

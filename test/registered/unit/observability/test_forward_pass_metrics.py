@@ -150,7 +150,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     return SchedulerMetricsReporter(
         metrics_sink=metrics_sink,
         request_registry=scheduler.request_registry,
-        core_lists=getattr(scheduler, "lists", None),
         counters=None,
         pool_stats_observer=getattr(scheduler, "pool_stats_observer", None),
         grammar_manager=getattr(scheduler, "grammar_manager", None),

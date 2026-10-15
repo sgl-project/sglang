@@ -46,7 +46,6 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.constrained.grammar_manager import GrammarManager
     from sglang.srt.disaggregation.encoder.receiver import MMReceiverBase
-    from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.managers.scheduler_components.bundles import (
@@ -620,7 +619,6 @@ class SchedulerMetricsReporter:
 
     metrics_sink: MetricsSink
     request_registry: RequestRegistry
-    core_lists: CoreLists
     counters: LaunchCounters
     pool_stats_observer: SchedulerPoolStatsObserver
     grammar_manager: GrammarManager
@@ -1135,7 +1133,7 @@ class SchedulerMetricsReporter:
                 self._mfu_log_write_bytes += write_bytes
 
             if x := self.metrics_sink.scheduler_status_logger:
-                x.maybe_dump(batch, self.core_lists.waiting_queue)
+                x.maybe_dump(batch, self.request_registry.queued_reqs())
 
         # Periodic work: log + heavy metrics at decode_log_interval
         if (

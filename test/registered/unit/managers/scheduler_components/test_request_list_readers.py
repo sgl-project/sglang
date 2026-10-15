@@ -175,12 +175,6 @@ _DIRECT_READS = {
         "_DisaggPrefillRing.is_drained",
         "DisaggPrefill.transfer",
     ): 1,
-    # The status logger's queued requests.
-    (
-        "managers/scheduler_components/metrics_reporter.py",
-        "SchedulerMetricsReporter.report_decode_stats",
-        "CoreLists.waiting_queue",
-    ): 1,
     # Writers of the core waiting queue (the queue-limit door evicts from it;
     # the L3 retries follow its order); they go with the loop as the only
     # writer.

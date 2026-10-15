@@ -454,6 +454,35 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         )
 
 
+class TestStatusLoggerQueuedRequests(CustomTestCase):
+    def test_pd_decode_ready_requests_are_dumped_as_queued(self):
+        """The status logger's queued requests are the registry's: on PD
+        decode the transferred requests waiting for a row."""
+        ready = SimpleNamespace(rid="ready")
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
+        reporter.mode_owners = ModeOwners(
+            disagg_decode=decode_owner_shell(ready=[ready])
+        )
+        reporter.request_registry = make_request_registry(
+            mode_owners=reporter.mode_owners
+        )
+        reporter.enable_mfu_metrics = False
+        reporter.metrics_sink.current_scheduler_metrics_enabled = True
+        reporter.metrics_sink.metrics_collector = MagicMock()
+        reporter.metrics_sink.scheduler_status_logger = MagicMock()
+        # Off the log interval: the report stops after the status dump.
+        reporter.metrics_sink.forward_ct_decode = 1
+        reporter.metrics_sink.decode_log_interval = 2
+        batch = SimpleNamespace(reqs=[], dp_cooperation_info=None)
+
+        reporter.report_decode_stats(False, batch=batch)
+
+        reporter.metrics_sink.scheduler_status_logger.maybe_dump.assert_called_once_with(
+            batch, [ready]
+        )
+
+
 class TestRequestTimePerOutputToken(CustomTestCase):
     def _collector(self, labels):
         with get_context().override_server_args(
