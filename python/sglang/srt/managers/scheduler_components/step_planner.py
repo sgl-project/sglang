@@ -4,7 +4,8 @@ selection and retraction, and the retract/reset half of pause and flush."""
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -86,6 +87,35 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+
+
+@dataclass(frozen=True, slots=True)
+class _NoKvRoom:
+    """A pass that stopped on a waiting request finding no KV room, and the
+    state it saw. Later passes are skipped while no request has left the slot
+    (its running requests still lead its list; admitted ones join behind
+    them), no request slot has been freed, the request that found no room is
+    still the queue head, and, under priority scheduling, which sorts a
+    higher-priority arrival first, nothing has arrived."""
+
+    running: Tuple[Req, ...]
+    num_free_req_slots: int
+    head: Req
+    tail: Optional[Req]
+
+    def holds(
+        self,
+        running_reqs: List[Req],
+        num_free_req_slots: int,
+        waiting_queue: List[Req],
+        priority_scheduling: bool,
+    ) -> bool:
+        return (
+            tuple(running_reqs[: len(self.running)]) == self.running
+            and num_free_req_slots <= self.num_free_req_slots
+            and waiting_queue[0] is self.head
+            and (not priority_scheduling or waiting_queue[-1] is self.tail)
+        )
 
 
 class StepPlanner:
@@ -174,6 +204,8 @@ class StepPlanner:
         self.max_prefill_bs: int = 0
         # Steps left to decode before the next prefill may run.
         self._prefill_decode_interval_remaining = 0
+        # Per slot, the inputs of its last pass that found no KV room.
+        self._no_kv_room: Dict[Optional[int], _NoKvRoom] = {}
 
     def should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -197,22 +229,34 @@ class StepPlanner:
         if is_extend:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
 
-    def admission_skip_reason(self, running_reqs: List[Req]) -> Optional[str]:
-        """Why a prefill admission next to running_reqs would admit no request
-        now, or None to run it. Each reason is read from the current lists and
-        pools, so nothing carries over from an earlier step."""
+    def admission_skip_reason(
+        self, slot: ScheduleSlot, running_reqs: List[Req]
+    ) -> Optional[str]:
+        """Why a prefill admission for slot next to running_reqs would admit no
+        request now, or None to run it."""
         if self.core_lists.chunked_req is not None:
             # The chunked request continues regardless: under PP it can start in
             # one slot and end in another, so a slot's request cap is not strict.
             return None
         if len(self.core_lists.waiting_queue) == 0:
             return "no waiting request"
-        if self.enable_priority_preemption:
-            # Preempting a running request frees its request slot and KV.
-            return None
-        if self.beam_coordinator.get_num_allocatable_reqs(len(running_reqs)) <= 0:
-            # Every waiting request meets the request cap before it is added.
+        if (
+            not self.enable_priority_preemption
+            and self.beam_coordinator.get_num_allocatable_reqs(len(running_reqs)) <= 0
+        ):
+            # Every waiting request meets the request cap before it is added;
+            # with priority preemption it may free a running request's slot.
             return "no request slot"
+        no_kv_room = self._no_kv_room.get(slot.index)
+        if no_kv_room is not None:
+            if no_kv_room.holds(
+                running_reqs,
+                self.req_to_token_pool.available_size(),
+                self.core_lists.waiting_queue,
+                self.policy.enable_priority_scheduling,
+            ):
+                return "no KV room"
+            del self._no_kv_room[slot.index]
         return None
 
     def get_new_batch_prefill(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
@@ -256,7 +300,7 @@ class StepPlanner:
         # Under PP only the scheduled slot's requests: a slot's batch size
         # is capped, and preemption must not pick a request in flight.
         running_reqs = slot.filter_decoding(self.core_lists.decoding)
-        if self.admission_skip_reason(running_reqs) is not None:
+        if self.admission_skip_reason(slot, running_reqs) is not None:
             return None
 
         running_bs = len(running_reqs)
@@ -364,6 +408,7 @@ class StepPlanner:
         )
         # Once set, every later request must preempt to be admitted.
         is_full = False
+        no_kv_room = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.core_lists.waiting_queue:
             if get_lora().enable_lora and not self.lora_admission.can_schedule_lora_req(
@@ -443,6 +488,7 @@ class StepPlanner:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                no_kv_room = res == AddReqResult.NO_TOKEN
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -462,6 +508,36 @@ class StepPlanner:
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        # Remember a pass that stopped on a request finding no KV room, after
+        # admitting others or none: until a request leaves, a request slot
+        # frees or the queue head changes (or, under priority scheduling, a
+        # request arrives), later passes would stop there too. Estimates that
+        # drift between those events (the new token ratio, prefix matches,
+        # the evictable tree size) do not reopen it. With nothing running no
+        # release is coming, so nothing is remembered. Hybrid SWA frees KV as
+        # windows slide and HiSparse admits as host copies land; both run
+        # every pass.
+        if (
+            no_kv_room
+            and running_reqs
+            and not adder.preempt_list
+            and not self.is_hybrid_swa
+            and self.hisparse_coordinator is None
+        ):
+            # As the launch leaves them: the admitted requests out of the
+            # queue, and those without a row holding a new one.
+            admitted = set(adder.can_run_list)
+            num_new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
+            waiting_queue = self.core_lists.waiting_queue
+            self._no_kv_room[slot.index] = _NoKvRoom(
+                running=tuple(running_reqs),
+                num_free_req_slots=(
+                    self.req_to_token_pool.available_size() - num_new_rows
+                ),
+                head=next(r for r in waiting_queue if r not in admitted),
+                tail=waiting_queue[-1],
+            )
 
         # Preemption already released these requests; requeue them even when
         # the request they made room for was not admitted.
