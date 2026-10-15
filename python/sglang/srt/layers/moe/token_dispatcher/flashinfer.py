@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.arg_groups.overrides import flashinfer_a2a_max_dispatch_tokens_per_rank
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     is_dp_attention_enabled,
@@ -56,6 +57,17 @@ logger = logging.getLogger(__name__)
 # FlashInfer keys MNNVL allocations by workspace size; aligned tail padding gives
 # concurrently live paths distinct persistent workspaces without extra token work.
 _WORKSPACE_NAMESPACE_ALIGNMENT = 128
+
+
+def combine_payload_in_workspace(runner_backend) -> bool:
+    """Whether the MoE runner writes its output into the a2a workspace, so that
+    combine reads it in place instead of staging a copy."""
+    if runner_backend.is_flashinfer_cutlass():
+        return True
+    return (
+        runner_backend.is_flashinfer_cutedsl()
+        and envs.SGLANG_Q35MF_EXPERT_ENABLE_A2A_DIRECT_OUTPUT.get()
+    )
 
 
 def _max_tokens_per_scattered_source(
@@ -138,7 +150,9 @@ class FlashinferDispatcher(BaseDispatcher):
             else self.num_experts
         )
         # TODO: Can other moe runners use payload_in_workspace too?
-        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.payload_in_workspace = combine_payload_in_workspace(
+            get_moe_runner_backend()
+        )
         self.dispatch_type = get_flashinfer_a2a_dispatch_type()
 
         # FlashInfer sizes the workspace from the maximum dispatched tokens per

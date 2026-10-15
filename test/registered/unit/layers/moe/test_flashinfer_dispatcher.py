@@ -3,13 +3,17 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+    FlashinferDispatcher,
+    combine_payload_in_workspace,
+)
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
     TopKConfig,
 )
-from sglang.srt.layers.moe.utils import FlashinferA2ADispatchType
+from sglang.srt.layers.moe.utils import FlashinferA2ADispatchType, MoeRunnerBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -139,6 +143,19 @@ class TestFlashinferDispatcher(CustomTestCase):
         )
         topk_weights = moe_a2a.payloads[moe_a2a.expert_id_payload_index + 1]
         self.assertEqual(topk_weights.shape, (3, 2))
+
+    def test_combine_payload_in_workspace_per_runner(self):
+        """CuTe DSL keeps combine's staging copy unless its switch is on; CUTLASS
+        always writes in place; runners that cannot write in place never do."""
+        cutedsl = MoeRunnerBackend.FLASHINFER_CUTEDSL
+        cutlass = MoeRunnerBackend.FLASHINFER_CUTLASS
+        trtllm = MoeRunnerBackend.FLASHINFER_TRTLLM
+        with envs.SGLANG_Q35MF_EXPERT_ENABLE_A2A_DIRECT_OUTPUT.override(False):
+            self.assertFalse(combine_payload_in_workspace(cutedsl))
+            self.assertTrue(combine_payload_in_workspace(cutlass))
+        with envs.SGLANG_Q35MF_EXPERT_ENABLE_A2A_DIRECT_OUTPUT.override(True):
+            self.assertTrue(combine_payload_in_workspace(cutedsl))
+            self.assertFalse(combine_payload_in_workspace(trtllm))
 
 
 if __name__ == "__main__":
