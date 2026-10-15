@@ -52,12 +52,7 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
         self.enterContext(envs.SGLANG_DSV4_KV_LAYOUT.override("auto"))
 
     def test_auto_selects_mega_only_where_it_runs(self):
-        args = mega_args(
-            tp_size=2,
-            attn_dp_size=2,
-            cuda_graph_backend_prefill=Backend.BREAKABLE,
-            enable_decoder_swa_bounded_replay=True,
-        )
+        args = mega_args(tp_size=2, attn_dp_size=2)
         self.assertEqual(resolved_backend(args), "flashmla_mega")
         self.assertEqual(args.dsv4_attn_backend, "auto")
         self.assertEqual(
@@ -65,25 +60,13 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
         )
         for fields in (
             dict(model_type="deepseek_v4"),
-            dict(cuda_graph_backend_prefill=Backend.FULL),
             dict(disaggregation_mode="prefill"),
         ):
             with self.subTest(fields=fields):
                 self.assertEqual(resolved_backend(mega_args(**fields)), "flashmla")
-
-    def test_explicit_mega_names_its_blocker(self):
-        for message, fields in (
-            ("DeepSeek-V4.1", dict(model_type="deepseek_v4")),
-            ("prefill CUDA graphs", dict(cuda_graph_backend_prefill=Backend.FULL)),
-            ("context parallelism", dict(enable_prefill_cp=True)),
-        ):
-            with self.subTest(fields=fields):
-                with self.assertRaisesRegex(ValueError, message):
-                    resolved_backend(
-                        mega_args(dsv4_attn_backend="flashmla_mega", **fields)
-                    )
         with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
-            with self.assertRaisesRegex(ValueError, "SM100/SM103"):
+            self.assertEqual(resolved_backend(mega_args()), "flashmla")
+            with self.assertRaisesRegex(AssertionError, "SM100/SM103"):
                 resolved_backend(mega_args(dsv4_attn_backend="flashmla_mega"))
 
 

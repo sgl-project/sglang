@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
@@ -26,32 +26,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _mega_attention_blocker(server_args: ServerArgs) -> Optional[str]:
+def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
     from sglang.srt.utils.common import is_sm100_supported
 
     cfg = resolving_view(server_args)
-    model = model_config_of(server_args)
-    if model.hf_config.model_type != "deepseek_v41":
-        return "requires DeepSeek-V4.1"
-    if cfg.device != "cuda" or not is_sm100_supported():
-        return "requires SM100/SM103"
-    if cfg.cuda_graph_config.prefill.backend not in (
-        Backend.DISABLED,
-        Backend.BREAKABLE,
-    ):
-        return "does not support prefill CUDA graphs yet"
-    if cfg.enable_encoder_swa_bounded_replay:
-        return "does not support encoder SWA bounded replay yet"
-    if cfg.enable_prefill_cp:
-        return "does not support context parallelism yet"
-    return None
-
-
-def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
-    cfg = resolving_view(server_args)
     layout = envs.SGLANG_DSV4_KV_LAYOUT
     if (
-        _mega_attention_blocker(server_args) is not None
+        model_config_of(server_args).hf_config.model_type != "deepseek_v41"
+        or cfg.device != "cuda"
+        or not is_sm100_supported()
         or cfg.kv_cache_dtype != "fp8_e4m3"
         or cfg.disaggregation_mode != "null"
         or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
@@ -90,10 +73,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if cfg.dsv4_attn_backend == "flashmla_mega":
-        blocker = _mega_attention_blocker(server_args)
-        if blocker is not None:
-            raise ValueError(f"--dsv4-attn-backend flashmla_mega {blocker}")
-        logger.info("DeepSeek-V4.1 attention: flashmla_mega backend enabled.")
+        from sglang.srt.utils.common import is_sm100_supported
+
+        assert (
+            model_config_of(server_args).hf_config.model_type == "deepseek_v41"
+            and cfg.device == "cuda"
+            and is_sm100_supported()
+        ), "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on SM100/SM103."
 
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
