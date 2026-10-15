@@ -125,6 +125,11 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 
     def process_weights_after_loading(self, layer) -> None:
         if _is_cpu:
+            if self.is_static_input_scheme or not self.input_symmetric:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A8 INT8 only supports dynamic symmetric activation quantization."
+                )
+
             if self.strategy == QuantizationStrategy.TENSOR:
                 weight, max_w_scale = _requantize_int8_with_max_scale(
                     weight=layer.weight,

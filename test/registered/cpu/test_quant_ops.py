@@ -132,6 +132,20 @@ class TestCPUQuantOps(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "AMX-packed weights"):
             scheme.apply_weights(layer, x, None)
 
+    def test_compressed_tensors_w8a8_int8_cpu_rejects_static_input(self):
+        """CPU rejects checkpoint input scales instead of silently changing quantization semantics."""
+        scheme = CompressedTensorsW8A8Int8(QuantizationStrategy.CHANNEL, True, True)
+
+        with self.assertRaisesRegex(NotImplementedError, "dynamic symmetric"):
+            scheme.process_weights_after_loading(SimpleNamespace())
+
+    def test_compressed_tensors_w8a8_int8_cpu_rejects_asymmetric_input(self):
+        """CPU rejects activation zero-points instead of silently changing quantization semantics."""
+        scheme = CompressedTensorsW8A8Int8(QuantizationStrategy.CHANNEL, False, False)
+
+        with self.assertRaisesRegex(NotImplementedError, "dynamic symmetric"):
+            scheme.process_weights_after_loading(SimpleNamespace())
+
 
 if __name__ == "__main__":
     unittest.main()
