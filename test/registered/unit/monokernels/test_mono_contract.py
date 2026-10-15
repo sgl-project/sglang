@@ -1,11 +1,4 @@
-"""The SGLang names the monokernel framework reads, pinned on CPU.
-
-The framework's runtime paths run only with a vendor plugin on its GPUs, so no
-CPU test executes them. Every framework module that imports from elsewhere in
-``sglang.srt`` lists what it reads in ``SGLANG_READS``. A refactor that renames
-one fails here, naming the module to repair, instead of failing at a GPU server's
-startup. The checks are static (AST).
-"""
+"""Detect renamed SGLang dependencies before a vendor plugin reaches GPU startup."""
 
 import ast
 import unittest
@@ -28,8 +21,7 @@ def _tree(path: Path) -> ast.Module:
 
 @lru_cache(maxsize=None)
 def _provided(path: Path) -> frozenset:
-    """What a source file provides: definitions, assignment targets (``x.name = ...``
-    too), imported names, parameters as ``f(p)`` and string literals as ``"x"``."""
+    """Collect definitions, attributes, imports, f(parameter) names, and string literals."""
     names = set()
     for node in ast.walk(_tree(path)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -83,7 +75,7 @@ READERS = [
 
 class TestSglangReads(CustomTestCase):
     def test_every_srt_import_is_declared(self):
-        self.assertTrue(READERS, f"no framework module under {ROOT}")  # a moved root
+        self.assertTrue(READERS, f"no framework module under {ROOT}")
         for path in READERS:
             with self.subTest(module=str(path.relative_to(ROOT))):
                 declared = {n for names in _declared(path).values() for n in names}

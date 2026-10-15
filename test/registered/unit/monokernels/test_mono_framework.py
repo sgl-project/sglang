@@ -1,6 +1,4 @@
-"""The monokernel framework on CPU, with a fake spec: the plugin registry, the
-startup refusals, the decode capture sizes, the forward switch, the load hook and
-the wait deadlines."""
+"""CPU contracts for monokernel registration, validation, routing, and weight copies."""
 
 import inspect
 import unittest
@@ -41,8 +39,7 @@ WIDTHS = (1, 2, 4, 6, 12)
 
 
 class FakeBuilt:
-    """A built spec: serves every key but decode steps of 4 rows, and records each
-    routed forward's rows and plan state."""
+    """Reject four-row decode and record routed steps to test fallback and state isolation."""
 
     def __init__(self):
         self.asked = 0
@@ -119,11 +116,10 @@ class Lm(torch.nn.Module):
 
 
 def switched():
-    """An ``Lm`` as attach leaves it, for a spec built at ``WIDTHS``, 6 tokens a
-    verify request."""
+    """Build a fake model with six-token verify requests and fixed routing keys."""
     lm, built = Lm(), FakeBuilt()
-    served = runtime._served(built=built, widths=WIDTHS, tokens=6)
-    runtime._switch(model=lm, built=built, served=served)
+    served = runtime._served_keys(built=built, widths=WIDTHS, tokens=6)
+    runtime._install_forward(model=lm, built=built, served=served)
     return lm, built
 
 
@@ -159,8 +155,7 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertIn(repr(BACKEND), reason)  # the registered ones are listed
 
     def test_a_backend_has_one_spec_an_architecture(self):
-        # plugins register in every process: the same spec again is a no-op, and
-        # another plugin's spec for the architecture is an error, not a silent swap
+        # Repeated registration must not silently replace another plugin's spec.
         registry.register(backend=BACKEND, architecture=ARCH, path=f"{__name__}:SPEC")
         with self.assertRaises(ValueError):
             registry.register(backend=BACKEND, architecture=ARCH, path="other:SPEC")
@@ -247,8 +242,7 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertEqual(built.asked, asked)
 
     def test_each_forward_has_its_own_plan_state(self):
-        # the spec's forward keeps what its layers share in plan.state; a plan kept
-        # across forwards would hand one step's values to the next
+        # Reusing a plan would leak layer state into the next forward.
         lm, built = switched()
         for _ in range(2):
             lm(torch.zeros(1), None, batch("decode", 2, 2))
@@ -268,7 +262,7 @@ class TestMonokernelFramework(CustomTestCase):
         ):
             watched = list(mono.watch_weights(model=model, weights=iter(weights)))
             self.assertIs(mono.watch_weights(model=other, weights=weights), weights)
-        # every checkpoint tensor reaches the model's loader, as it is and in order
+        # Observing a weight must preserve its identity and checkpoint order.
         self.assertEqual(
             [(n, id(t)) for n, t in watched], [(n, id(t)) for n, t in weights]
         )

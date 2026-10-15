@@ -184,7 +184,7 @@ class ExecKernel(msgspec.Struct):
     ] = None
     monokernel_backend: A[
         Optional[str],
-        "Run the monokernels of this registered backend (persistent kernels that run most of a decoder layer, including its TP all-reduce, in one or two launches), e.g. amd from sgl-amd-mono; installed plugins register backends. Decode and verify steps the backend's spec for the model serves run its kernels, and every other step runs the standard path. Startup fails, listing every reason, if the backend is not registered, has no spec for the model on this GPU, or the setup uses a feature the spec does not accept.",
+        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons.",
     ] = None
     prefill_attention_backend: A[
         Optional[str],

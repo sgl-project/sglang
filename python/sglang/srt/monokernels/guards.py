@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The monokernel framework's refusals, before any process starts.
-
-``handle_monokernel(server_args)``, the config hook, finds the spec, refuses an
-unsupported setup with every reason, and sets the decode capture sizes; it is a
-no-op without ``--monokernel-backend``. ``runtime`` refuses again after load,
-with the loaded weights. The deadline of every wait is set here too: half of
-``--watchdog-timeout``, and one under ``MIN_DEADLINE_S`` is refused.
-"""
+"""Startup validation, graph-size alignment, and wait deadlines for monokernels."""
 
 from __future__ import annotations
 
@@ -17,9 +10,7 @@ from sglang.srt.monokernels.spec import Feature, NumericsKind, find_spec
 
 logger = logging.getLogger(__name__)
 
-# The SGLang names this module reads, by file under python/sglang/ (``f(p)``: a
-# parameter, ``"x"``: a string literal). test_mono_contract pins them, so renaming
-# one in SGLang fails a CPU test that names this file, not a server's startup.
+# Source-contract inventory for test_mono_contract: f(p) is a parameter, "x" a literal.
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "monokernel_backend",
@@ -71,20 +62,19 @@ SGLANG_READS = {
     "srt/model_executor/cuda_graph_config.py": ("Phase", "DECODE", "with_phase"),
 }
 
-# A wait's deadline is below --watchdog-timeout, and long enough that a normal
-# delay on one rank is not a failure.
+# Leave time for peers to abort before the process watchdog fires.
 MAX_DEADLINE_S, MIN_DEADLINE_S = 60.0, 5.0
 
 
 def deadline_s(watchdog_timeout: Optional[float]) -> float:
-    """Half the watchdog, at most ``MAX_DEADLINE_S``."""
+    """Return half the watchdog timeout, capped at MAX_DEADLINE_S."""
     if not watchdog_timeout or watchdog_timeout <= 0:
         return MAX_DEADLINE_S
     return min(MAX_DEADLINE_S, 0.5 * float(watchdog_timeout))
 
 
 def device_isa() -> Optional[str]:
-    """The GPU's ISA name, e.g. ``gfx950`` (feature suffixes dropped); None without one."""
+    """Return the GPU ISA without feature suffixes, or None without a GPU."""
     import torch
 
     if not torch.cuda.is_available():
@@ -147,7 +137,7 @@ def features_in_use(cfg: Any) -> set[Feature]:
 
 
 def monokernel_disable_reasons(*, cfg, model_config, isa):
-    """(spec, every reason the setup is refused); spec is None when none fits."""
+    """Return the matching spec and all configuration rejection reasons."""
     if isa is None:
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
@@ -193,8 +183,7 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
 def covered_capture_sizes(
     *, widths, tokens_per_request: int, sizes: list[int]
 ) -> list[int]:
-    """Up to the largest covered size, the decode capture sizes are the widths (rows)
-    divided by the tokens a request; larger sizes stay as configured."""
+    """Replace sizes through the largest covered batch with supported widths / tokens."""
     covered = sorted(
         {w // tokens_per_request for w in widths if w % tokens_per_request == 0}
     )
@@ -204,7 +193,7 @@ def covered_capture_sizes(
 
 
 def handle_monokernel(server_args) -> None:
-    """The config hook (``arg_groups/pipeline.py``)."""
+    """Validate the selected backend and resolve its decode capture sizes."""
     from sglang.srt.arg_groups.overrides import (
         declare_resolution,
         model_config_of,

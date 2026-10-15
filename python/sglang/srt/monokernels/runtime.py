@@ -1,22 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The monokernel framework in each process, after the config checks in ``guards``.
-SGLang's runtime calls it for every model; each call is a no-op without
-``--monokernel-backend``, and for a model the backend has no spec for.
-
-- ``watch_weights``: the model loader's checkpoint tensors, on their way to
-  ``model.load_weights``; the spec may keep a copy of a weight that loading rewrites.
-- ``attach``: after weight load, before KV sizing. Every rank's refusal reasons are
-  listed together; then it builds every planned width, checks that every rank
-  serves the same graph keys, and switches the model's forward.
-
-The switch is SGLang's own pattern for execution backends (the torch.compile
-trampoline): ``model.forward`` on this instance routes each call by its graph key
-alone, against the keys fixed at attach. A step the spec serves runs the spec's
-forward, which takes and returns what the model's forward does; any other step
-(prefill, extend, mixed and idle steps, uneven rows, a width not built) runs the
-model's forward as it is. A CUDA graph replays its capture's decision, so the
-startup log line that lists the served steps says which steps run the monokernels.
-"""
+"""Weight observation and full-forward dispatch for the selected monokernel backend."""
 
 from __future__ import annotations
 
@@ -37,7 +20,7 @@ from sglang.srt.monokernels.spec import (
 
 logger = logging.getLogger(__name__)
 
-# The SGLang names this module reads (as in ``guards.SGLANG_READS``)
+# Source-contract inventory for test_mono_contract.
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "monokernel_backend",
@@ -72,7 +55,7 @@ SGLANG_READS = {
 
 
 def _backend() -> Optional[str]:
-    """The ``--monokernel-backend`` this process runs, or None."""
+    """Return the selected backend, or None without published server configuration."""
     from sglang.srt.runtime_context import get_context, get_exec
 
     # the model loader also runs without a server's config (tools, unit tests)
@@ -81,8 +64,8 @@ def _backend() -> Optional[str]:
     return get_exec().kernel.monokernel_backend
 
 
-def _gather(obj) -> list:
-    """Every TP rank's ``obj``, through the CPU group."""
+def _gather_tp(obj) -> list:
+    """Gather a value from every TP rank through the CPU group."""
     import torch.distributed as dist
 
     from sglang.srt.runtime_context import get_parallel
@@ -96,8 +79,7 @@ def _gather(obj) -> list:
 
 
 def watch_weights(*, model, weights):
-    """``weights`` as they are, after the spec saw each (name, tensor): the
-    checkpoint's names and tensors, before the model renames or converts them."""
+    """Let the spec observe checkpoint tensors before model-specific conversion."""
     backend = _backend()
     if backend is None:
         return weights
@@ -132,16 +114,14 @@ def shape_key(forward_batch) -> Optional[ShapeKey]:
 
 
 class Plan(msgspec.Struct, frozen=True):
-    """One routed forward: its graph key, and ``state``, where the spec's forward
-    keeps the values its layers share within the step."""
+    """A routed forward's graph key and state shared by its layers within that step."""
 
     key: ShapeKey
     state: dict = {}
 
 
 def attach(*, model, hf_config) -> None:
-    """After weight load, before KV sizing: refuse with every rank's reasons, or
-    build every planned width and switch the model's forward."""
+    """Build the selected spec and install its forward after loading, before KV sizing."""
     backend = _backend()
     if backend is None:
         return
@@ -155,8 +135,7 @@ def attach(*, model, hf_config) -> None:
     )
     copies = model.__dict__.pop("_mono_copies", {})
     if spec is None:
-        # the config hook refused a served model without a spec; this one (e.g. a
-        # draft model) keeps its forward
+        # A draft model may have no registered spec.
         logger.info("monokernel: %s: the normal forward", why)
         return
     reasons = list(spec.model_disable_reasons(model, hf_config, copies))
@@ -166,8 +145,12 @@ def attach(*, model, hf_config) -> None:
             f"{Feature.PARTITIONED_GPU.value}: {props.multi_processor_count} compute "
             f"units, the launch grid needs {spec.devices[isa].resident_blocks}"
         )
-    # all ranks refuse together, before any handshake
-    reasons = [f"rank {r}: {x}" for r, rs in enumerate(_gather(reasons)) for x in rs]
+    # Collect validation failures before the plugin starts collective setup.
+    reasons = [
+        f"rank {rank}: {reason}"
+        for rank, rank_reasons in enumerate(_gather_tp(reasons))
+        for reason in rank_reasons
+    ]
     if reasons:
         raise ValueError(f"--monokernel-backend {backend}: " + "; ".join(reasons))
 
@@ -177,21 +160,21 @@ def attach(*, model, hf_config) -> None:
         tokens = _tokens_per_request()
     keys = _capture_keys(tokens)
     rows = {k.rows for k in keys}
-    # the widths the capture plan routes (every width a step can have without graphs)
+    # Eager execution can use every supported width.
     widths = tuple(
         w for w in spec.widths(isa) if w % tokens == 0 and (not keys or w in rows)
     )
-    ctx = BuildContext(
+    build_context = BuildContext(
         isa=isa,
         widths=widths,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         copies=copies,
     )
-    t0, mem0 = time.perf_counter(), torch.cuda.memory_allocated()
-    built = spec.build(model, hf_config, ctx)
-    served = _served(built=built, widths=widths, tokens=tokens)
-    # a rank that routed a step differently would wait on its peers until the deadline
-    if any(other != served for other in _gather(served)):
+    build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
+    built = spec.build(model, hf_config, build_context)
+    served = _served_keys(built=built, widths=widths, tokens=tokens)
+    # Different routes would leave ranks waiting in incompatible collectives.
+    if any(other != served for other in _gather_tp(served)):
         raise RuntimeError("monokernel: the ranks' specs serve different graph keys")
     routed = [k for k in keys if k in served] if keys else served
     if not routed:
@@ -200,8 +183,8 @@ def attach(*, model, hf_config) -> None:
             "server's steps "
             f"(widths {list(widths)}, {tokens} tokens a request)"
         )
-    _switch(model=model, built=built, served=served)
-    # SGLang's weight updater refuses each update: the kernels read copies and views
+    _install_forward(model=model, built=built, served=served)
+    # Captured kernels retain weight copies that online updates cannot refresh.
     model._derived_weight_cache_error = (
         f"Online weight updates are not supported with --monokernel-backend {backend} "
         f"({spec.name})"
@@ -212,19 +195,18 @@ def attach(*, model, hf_config) -> None:
         "stops every rank with a GPU fault at address 0x0); weight copies: %s",
         spec.name,
         isa,
-        _steps(routed),
+        _format_steps(routed),
         f" ({len(routed)} of {len(keys)} decode graphs)" if keys else "",
         list(widths),
-        time.perf_counter() - t0,
-        (torch.cuda.memory_allocated() - mem0) / 2**20,
-        ctx.deadline_s,
-        _sizes(copies),
+        time.perf_counter() - build_start,
+        (torch.cuda.memory_allocated() - memory_before) / 2**20,
+        build_context.deadline_s,
+        _format_weight_copies(copies),
     )
 
 
-def _served(*, built, widths, tokens: int) -> frozenset[ShapeKey]:
-    """The graph keys of ``widths`` rows that ``built`` serves: decode, and verify at
-    ``tokens`` a request. Fixed here: routing runs none of the spec's code."""
+def _served_keys(*, built, widths, tokens: int) -> frozenset[ShapeKey]:
+    """Resolve supported decode and verify keys once, before any forwards."""
     keys = [
         ShapeKey(forward_mode="decode", batch_size=w, tokens_per_request=1)
         for w in widths
@@ -240,14 +222,11 @@ def _served(*, built, widths, tokens: int) -> frozenset[ShapeKey]:
     return frozenset(k for k in keys if built.serves(k))
 
 
-def _switch(*, model, built, served: frozenset[ShapeKey]) -> None:
-    """Route each call of ``model.forward`` on this instance by its graph key, as
-    SGLang's torch.compile trampoline routes by phase. The runners call
-    ``forward(input_ids, positions, forward_batch, ...)``, and a CUDA graph capture
-    records the routed call."""
+def _install_forward(*, model, built, served: frozenset[ShapeKey]) -> None:
+    """Install shape-based dispatch while preserving the original forward signature."""
     original = model.forward
 
-    # the graph runners read the forward's parameters: they see the model's own
+    # Graph runners inspect the original parameters to select forward arguments.
     @functools.wraps(original)
     def forward(*args, **kwargs):
         batch = kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
@@ -259,8 +238,8 @@ def _switch(*, model, built, served: frozenset[ShapeKey]) -> None:
     model.forward = forward
 
 
-def _steps(keys) -> str:
-    """The steps ``keys`` cover, e.g. "decode steps of batch size [1, 2, 4]"."""
+def _format_steps(keys) -> str:
+    """Format supported batch sizes grouped by step mode and tokens per request."""
     sizes: dict = {}
     for k in keys:
         sizes.setdefault((k.forward_mode, k.tokens_per_request), []).append(
@@ -272,7 +251,7 @@ def _steps(keys) -> str:
     )
 
 
-def _sizes(copies: dict) -> str:
+def _format_weight_copies(copies: dict) -> str:
     kinds: dict = {}
     for key, t in copies.items():
         n, b = kinds.get(key[0], (0, 0))
@@ -292,8 +271,7 @@ def _tokens_per_request() -> int:
 
 
 def _capture_keys(tokens: int) -> list[ShapeKey]:
-    """The decode graph keys at ``tokens`` a request: DECODE, or TARGET_VERIFY (a
-    speculative verify step, or a draft's block)."""
+    """Return configured decode or verify graph keys, or [] when graphs are disabled."""
     from sglang.srt.runtime_context import get_exec
 
     graph = get_exec().graph

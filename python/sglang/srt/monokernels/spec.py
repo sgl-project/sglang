@@ -1,14 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""What a model declares to the monokernel framework, and the registry that
-finds it. A spec module imports without its model, so the config hook can
-refuse a setup before any process starts.
-
-Specs live in vendor packages (e.g. sgl-amd-mono), which SGLang loads as general
-plugins (the ``sglang.srt.plugins`` entry points, in every process): the plugin
-registers its backend's spec for each architecture, as a "module:attribute" path,
-and ``--monokernel-backend`` names the backend a server runs. A spec module is
-imported only when a server asks for it. A spec states the
-``API_VERSION`` it was written against; any other version is refused at startup."""
+"""Lazy plugin registration and model-specific monokernel contracts."""
 
 from __future__ import annotations
 
@@ -18,8 +9,7 @@ from typing import Any, Callable, Mapping, Optional
 
 import msgspec
 
-# The plugin API a spec is written against: MonoSpec, BuildContext, ShapeKey, and
-# the built model's ``serves(key)`` and ``forward(plan, *inputs)``
+# Version the spec, build context, shape key, and built-forward contracts together.
 API_VERSION = 1
 
 
@@ -71,9 +61,11 @@ class NumericsKind(enum.Enum):
 
 
 class Numerics(msgspec.Struct, frozen=True):
-    """Against the normal path on the same GPU. TOLERANCE bounds are per launch
-    output: ``<launch>.<output>.<metric>``, with a metric in ``max_abs`` (0 is
-    bit-exact), ``rel`` or ``cosine``; the kernel tests read them from here."""
+    """Numerical bounds against the standard path on the same GPU.
+
+    Bounds use <launch>.<output>.<metric>; metrics are max_abs, rel, or cosine.
+    A max_abs bound of zero requires bitwise equality.
+    """
 
     kind: NumericsKind
     bounds: Mapping[str, float] = {}
@@ -114,10 +106,12 @@ class BuildContext(msgspec.Struct, frozen=True):
 
 
 class MonoSpec(msgspec.Struct, frozen=True):
-    """One model's monokernels for one vendor. ``build(model, hf_config, ctx)``
-    returns the built model: ``serves(key)`` says which graph keys its forward
-    runs (it reads only the key), and ``forward(plan, *inputs)`` runs a routed
-    step, taking and returning what the model's own forward does."""
+    """A model-specific plugin contract.
+
+    build(model, hf_config, ctx) returns an object with serves(key) and
+    forward(plan, *inputs). Its forward accepts and returns the model's own
+    forward arguments and outputs.
+    """
 
     name: str
     devices: Mapping[str, DeviceLimits]  # per ISA
@@ -129,11 +123,9 @@ class MonoSpec(msgspec.Struct, frozen=True):
     model_disable_reasons: Callable[..., list[str]]
     build: Callable[..., Any]
     api: int  # the API_VERSION this spec is written against
-    # (copies, model, name, tensor): each checkpoint tensor before renames and
-    # quantization, to keep a copy of a weight that loading rewrites
+    # (copies, model, name, tensor): retain weights before model-specific conversion
     load_tensor: Optional[Callable[..., None]] = None
-    # (model) -> the rows a request of the steps it serves, where they are not the
-    # server's (1, or the verify width): e.g. a speculative draft's block
+    # (model) -> tokens per request when different from the target, e.g. draft blocks
     tokens_per_request: Optional[Callable[..., int]] = None
 
     def widths(self, isa: str) -> tuple[int, ...]:
@@ -145,9 +137,7 @@ _REGISTRY: dict[str, dict[str, str]] = {}
 
 
 def register(*, backend: str, architecture: str, path: str) -> None:
-    """Register ``backend``'s spec for an HF architecture at ``path``
-    ("module:attribute"); a plugin calls it from its ``sglang.srt.plugins`` entry
-    point, which runs in every process."""
+    """Register a module:attribute spec path from a general plugin entry point."""
     specs = _REGISTRY.setdefault(backend, {})
     if specs.get(architecture, path) != path:
         raise ValueError(
@@ -158,9 +148,7 @@ def register(*, backend: str, architecture: str, path: str) -> None:
 
 
 def find_spec(*, backend: str, architectures, isa: Optional[str]):
-    """(``backend``'s spec for ``architectures`` on ``isa``, "") or (None, why there
-    is none). A spec that fails to import or states another API version is a
-    reason too."""
+    """Return the compatible spec and an empty reason, or None and a rejection reason."""
     if backend not in _REGISTRY:
         return None, (
             f"no monokernel backend {backend!r} is registered (registered: "
