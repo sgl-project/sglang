@@ -3587,7 +3587,6 @@ class DeepseekV4AttnBackend(
         compress_ratio: int,
         num_heads: int,
     ):
-        # Paged Mega prefill needs physical slots; gathered prefill reads raw indices.
         return (
             self.trtllm_attn
             or (

@@ -33,7 +33,6 @@ def _mega_attention_available() -> bool:
 
 
 def _mega_attention_blocker(server_args: ServerArgs) -> Optional[str]:
-    """Why flashmla_mega cannot serve this launch, or None."""
     from sglang.srt.utils.common import is_sm100_supported
 
     cfg = resolving_view(server_args)
@@ -53,7 +52,6 @@ def _mega_attention_blocker(server_args: ServerArgs) -> Optional[str]:
     ):
         return "requires eight 512-dim heads per WO-A group on every attention rank"
     quant = getattr(model.hf_config, "quantization_config", None) or {}
-    # Fp8 WO-A keeps its absorb GEMM; the fused path takes BF16 WO-A only.
     if (
         envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
         and quant.get("quant_method") == "fp8"
@@ -67,7 +65,6 @@ def _mega_attention_blocker(server_args: ServerArgs) -> Optional[str]:
         return "does not support prefill CUDA graphs yet"
     if cfg.enable_encoder_swa_bounded_replay:
         return "does not support encoder SWA bounded replay yet"
-    # Decode attention TP under CP reshapes the heads the derived WQ-B/WO-A were built for.
     if cfg.enable_prefill_cp:
         return "does not support context parallelism yet"
     return None

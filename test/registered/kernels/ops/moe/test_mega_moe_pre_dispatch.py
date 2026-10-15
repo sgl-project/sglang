@@ -71,7 +71,6 @@ def test_mxfp8_scale_output_uses_padded_row_stride() -> None:
     reason="Requires Blackwell GPU (sm_100+)",
 )
 def test_empty_mhc_view_clears_idle_dispatch() -> None:
-    """An idle mHC slice must clear routing slots despite its parent row stride."""
     hidden, padded_max, top_k = 2304, 8, 8
     x = torch.empty(1, 4, hidden, device="cuda", dtype=torch.bfloat16)[:0, 0]
     assert x.stride(0) == 4 * hidden

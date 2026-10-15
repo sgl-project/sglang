@@ -74,7 +74,6 @@ class TestMegaAttention(CustomTestCase):
                 projection = prepare_mega_wq_b(linear, 64)
                 self.assertIsNone(prepare_mega_wq_b(linear, 16))
                 x = torch.randn(1536, 1280, device="cuda", dtype=torch.bfloat16)
-                # The fused-RMSNorm decode path hands apply() a pre-quantized input.
                 quantized = Mxfp8SwizzledInput(
                     *fp8_utils.flashinfer_mxfp8_quantize(
                         x[:3], is_sf_swizzled_layout=True, alignment=32
@@ -114,7 +113,6 @@ class TestMegaAttention(CustomTestCase):
         )
         indices = torch.arange(128, device="cuda", dtype=torch.int32).repeat(3, 1)
         extra_indices = torch.arange(64, device="cuda", dtype=torch.int32).repeat(3, 1)
-        # 16 heads exercises the padded head groups the projection must drop.
         for heads in (16, 64):
             with self.subTest(heads=heads):
                 q = torch.randn(3, heads, 512, device="cuda", dtype=torch.bfloat16)

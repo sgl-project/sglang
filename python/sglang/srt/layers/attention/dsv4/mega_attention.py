@@ -9,7 +9,6 @@ from sglang.srt.runtime_context import get_buffer
 
 
 def pack_mega_query(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
-    # The fused kernel reads Q as 16-element chunks interleaved across its 64/128 heads.
     tokens, heads, _ = q.shape
     out = q.new_zeros(tokens, 32, padded_heads, 16)
     out[:, :, :heads] = q.view(tokens, heads, 32, 16).transpose(1, 2)
@@ -24,7 +23,6 @@ def use_mega_paged_prefill(
 ) -> bool:
     if num_heads != 64 or compress_ratio not in (1, 2) or num_query_tokens > 1024:
         return False
-    # GB300 sweeps: paged reads win once the dequantized history dominates a short extension.
     gather_tokens = int(seq_lens_cpu.sum()) // compress_ratio
     return gather_tokens >= max(32768, 192 * num_query_tokens)
 
@@ -33,7 +31,6 @@ def mega_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     tables = get_buffer("dsv4_mega_cos_sin", dict)
     key = freqs_cis.data_ptr()
     if key not in tables:
-        # The fused kernel reads [positions, cos(32) | sin(32)], not interleaved pairs.
         tables[key] = torch.cat((freqs_cis.real, freqs_cis.imag), dim=-1)
     return tables[key]
 
@@ -65,10 +62,8 @@ def prepare_mega_wq_b(
         return None
 
     def permute_rows(tensor: torch.Tensor) -> torch.Tensor:
-        # (head, chunk, 16) -> (chunk, head, 16): the kernel's Q row order.
         return tensor.view(num_heads, 32, 16, -1).transpose(0, 1).reshape(rows, -1)
 
-    # Only .weight / .weight_scale_inv_swizzled are read by quant_method.apply.
     projection = torch.nn.Module()
     projection.weight = permute_rows(weight)
     projection.weight_scale_inv_swizzled = block_scale_interleave(
@@ -79,7 +74,6 @@ def prepare_mega_wq_b(
 
 def prepare_mega_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     groups, rank, hidden = weight.shape
-    # The kernel emits each group's 512 dims as 32-element chunks interleaved across its 8 heads.
     permuted = (
         weight.view(groups, rank, 8, 16, 32).transpose(2, 3).reshape(weight.shape)
     )
@@ -89,7 +83,6 @@ def prepare_mega_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
         column_major_scales=True,
         scale_tma_aligned=True,
         scale_ue8m0=True,
-        # Fully-masked batched quant: the one layout with per-group column-major scales.
         masked_m=torch.full((groups,), rank, dtype=torch.int32, device=weight.device),
     )
 
@@ -106,7 +99,6 @@ def apply_mega_wo_a(
     out = torch.empty(
         (data.shape[0], groups, rank), dtype=torch.bfloat16, device=data.device
     )
-    # Groups past the real heads hold the kernel's zero-padded heads.
     deep_gemm.fp8_einsum(
         "bhr,hdr->bhd",
         (data[:, :groups], scale[:, :groups]),

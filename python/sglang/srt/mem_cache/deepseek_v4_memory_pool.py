@@ -169,7 +169,6 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
     if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
-        # The fused kernel reads only the packed V4.1 SWA layout.
         mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (

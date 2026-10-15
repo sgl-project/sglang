@@ -1316,7 +1316,6 @@ class MQALayer(MqaAttentionBase):
         return result
 
     def setup_mega_attention(self) -> None:
-        """Derive the fused kernel's weight layouts; rerun after every weight load."""
         if not self.use_mega_attention:
             return
         from sglang.srt.layers.attention.dsv4.mega_attention import (
