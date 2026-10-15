@@ -25,7 +25,10 @@ from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_trito
 from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_trtllm import (
     FusedPostExpertNormWeightedSumTRTLLM,
 )
-from sglang.kernels.ops.muse_spark_v12.norm_fp4_quant import fused_norm_fp4_quant
+from sglang.kernels.ops.muse_spark_v12.norm_fp4_quant import (
+    fused_norm_fp4_quant,
+    fused_norm_fp4_quant_static,
+)
 from sglang.srt.distributed import get_moe_tp_group
 from sglang.srt.layers import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
@@ -652,9 +655,15 @@ class MuseSpark1xFp4Experts(nn.Module):
             hs_scale_linear = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
                 seq_len, hidden_size // 16
             )
+        elif pre_expert_norm is not None:
+            per_token_scale = None
+            hs_fp4, hs_scale_linear = fused_norm_fp4_quant_static(
+                hidden_states,
+                self._pre_norm_weight(pre_expert_norm),
+                pre_expert_norm.eps,
+                self.w13_input_scale_quant,
+            )
         else:
-            if pre_expert_norm is not None:
-                hidden_states = pre_expert_norm(hidden_states)
             # Match the known-good public vLLM activation path. SGLang's
             # helper selects FlashInfer's experimental CuTeDSL quantizer on
             # SM100, while vLLM's scaled_fp4_quant uses the stable CUDA
