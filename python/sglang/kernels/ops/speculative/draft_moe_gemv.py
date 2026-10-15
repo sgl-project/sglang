@@ -20,6 +20,7 @@ _DOWN_WARPS_PER_CTA = 8
 _UP_STAGES = 8
 _DOWN_COLS = 27
 _UP_CONTIG = True
+_DOWN_SMEM_BYTES = 200 * 1024
 
 
 @cache_once
@@ -86,10 +87,14 @@ def draft_moe_gemv(
     shared_gate_w [H]; topk_ids int32 [1, K]; topk_weights fp32 [1, K];
     out [1, H]; scratch act [K + 1, I] bf16 and gate [1] fp32.
     """
+    inter, topk = w2.shape[-1], topk_ids.shape[-1]
+    # The down pass keeps (topk + 1) weight slices of down_cols rows in shared memory.
+    slice_bytes = (topk + 1) * inter * w2.element_size()
+    down_cols = min(down_cols, _DOWN_SMEM_BYTES // slice_bytes)
     module = _draft_moe_gemv_module(
         x.shape[-1],
-        w2.shape[-1],
-        topk_ids.shape[-1],
+        inter,
+        topk,
         pairs_per_cta,
         down_warps_per_cta,
         up_stages,
