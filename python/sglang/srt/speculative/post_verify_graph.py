@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 _NUM_WARMUP = 2
 _MAX_BS = 2
+# Arbitrary bound on captured graph sets (key x verify logits buffer).
+_MAX_STATES = 16
 
 
 def post_verify_graph_enabled() -> bool:
@@ -87,7 +89,6 @@ class _Slot:
         self.commit_graph: Optional[torch.cuda.CUDAGraph] = None
         self.inputs: Dict[str, torch.Tensor] = {}
         self.outputs: Optional[Tuple] = None
-        self.logits_ptr = 0
 
 
 class _KeyState:
@@ -167,10 +168,18 @@ class PostVerifyGraph:
             self._count_round(None)
             return None
         key = key + (uno_target_max_top_k,)
+        # The graph reads the verify logits in place, and the verify runner may hold
+        # several logits buffers per batch size, so graphs are kept per buffer.
+        state_key = (key, logits_output.next_token_logits.data_ptr())
+        if state_key not in self._states and len(self._states) >= _MAX_STATES:
+            self._count_round(None)
+            return None
         self._max_top_k = uno_target_max_top_k
         self._count_round(key)
         try:
-            return self._run(key, batch, verify_input, logits_output, num_draft_tokens)
+            return self._run(
+                state_key, batch, verify_input, logits_output, num_draft_tokens
+            )
         except Exception:
             logger.exception(
                 "post-verify graph disabled after an error; stock path from now on"
@@ -302,18 +311,12 @@ class PostVerifyGraph:
         self._sim_len_slot = turn
         return host
 
-    def _run(self, key, batch, verify_input, logits_output, num_draft_tokens):
-        st = self._states.get(key)
+    def _run(self, state_key, batch, verify_input, logits_output, num_draft_tokens):
+        st = self._states.get(state_key)
         if st is None:
-            st = self._states[key] = _KeyState()
+            st = self._states[state_key] = _KeyState()
         slot = st.slots[st.turn]
         st.turn ^= 1
-        logits_ptr = logits_output.next_token_logits.data_ptr()
-        if slot.graph is not None and slot.logits_ptr != logits_ptr:
-            raise RuntimeError(
-                "verify logits moved; the captured post-verify graph reads a stale buffer"
-            )
-        slot.logits_ptr = logits_ptr
         inputs = self._gather_inputs(batch, verify_input)
         sim_len = self._sim_len(verify_input.max_tree_depth)
         if slot.graph is None:
@@ -329,7 +332,12 @@ class PostVerifyGraph:
                     slot.inputs, batch, verify_input, logits_output, num_draft_tokens
                 )[:6]
             self._capture(
-                slot, batch, verify_input, logits_output, num_draft_tokens, key=key
+                slot,
+                batch,
+                verify_input,
+                logits_output,
+                num_draft_tokens,
+                key=state_key[0],
             )
         else:
             self._load(slot, inputs, sim_len)
