@@ -24,6 +24,17 @@ class WeightExporter:
     get_model: Callable[[], Any]
     _weights_send_group: dict = field(default_factory=dict)
 
+    def _check_weight_export_supported(self):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_SM120_NVFP4_PHASE_LAYOUT.get():
+            raise RuntimeError(
+                "Weight export is not supported while "
+                "SGLANG_SM120_NVFP4_PHASE_LAYOUT is enabled. The live parameter "
+                "buffers can hold the reversible decode layout. Restart with "
+                "the layout cycle disabled before exporting checkpoint weights."
+            )
+
     def init_weights_send_group_for_remote_instance(
         self,
         master_address,
@@ -33,6 +44,7 @@ class WeightExporter:
         group_name,
         backend="nccl",
     ):
+        self._check_weight_export_supported()
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
@@ -81,6 +93,7 @@ class WeightExporter:
         ports,
         group_name,
     ):
+        self._check_weight_export_supported()
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
@@ -124,6 +137,7 @@ class WeightExporter:
         return success, message
 
     def save_remote_model(self: WeightExporter, url: str):
+        self._check_weight_export_supported()
         from sglang.srt.model_loader.loader import RemoteModelLoader
 
         logger.info(f"Saving model to {url}")
@@ -135,6 +149,7 @@ class WeightExporter:
         pattern: Optional[str] = None,
         max_size: Optional[int] = None,
     ):
+        self._check_weight_export_supported()
         from sglang.srt.model_loader.loader import ShardedStateLoader
 
         logger.info(
@@ -150,6 +165,7 @@ class WeightExporter:
         Only used for unit test with an unoptimized performance.
         For optimized performance, please use torch.save and torch.load.
         """
+        self._check_weight_export_supported()
         # TODO: (chenyang) Add support for Qwen models.
         try:
             return self.get_model().get_weights_by_name(

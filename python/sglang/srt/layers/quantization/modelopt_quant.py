@@ -608,6 +608,14 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 layer.register_parameter(scale_name, scale)
 
     def _can_use_flashinfer_bmm(self, layer: torch.nn.Module) -> bool:
+        import os
+
+        if os.environ.get("SGLANG_DISABLE_FLASHINFER_BMM", "0") == "1":
+            # On SM120 the flashinfer bmm path serves prefill with SM89
+            # cuBLAS tiles (~480 TF/s); the cutlass scaled-mm route is
+            # measurably faster there. Decode M=1 shapes already take the
+            # sm120 GEMV fast path either way.
+            return False
         if not self.enable_flashinfer_bmm or layer.input_scale is None:
             return False
         k, n = layer.weight.shape
@@ -3249,11 +3257,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
             swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
+            from sglang.srt.model_executor.model_runner_components.nvfp4_layout import (
+                pair_weight_for_layer,
+            )
+
             quant_info = FlashInferCutlassMoeQuantInfo(
+                pair_w2_weight=pair_weight_for_layer(layer),
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 output_dtype=torch.bfloat16,
+                w13_blockscale_plain=getattr(layer, "w13_weight_scale", None),
+                w2_blockscale_plain=getattr(layer, "w2_weight_scale", None),
                 quant_scales=[
                     layer.w13_input_scale_quant,
                     layer.w13_blockscale_swizzled,

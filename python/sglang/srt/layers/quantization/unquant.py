@@ -256,8 +256,8 @@ def initialize_bf16_gemm_config() -> None:
     backend = Bf16GemmBackend(backend_str)
 
     if backend.is_gemv():
-        if torch.cuda.get_device_capability()[0] != 9:
-            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
+        if torch.cuda.get_device_capability()[0] not in (9, 12):
+            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper) or SM12x")
 
         global _hopper_bf16_gemv, _use_hopper_bf16_gemv
         from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
@@ -450,6 +450,14 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if envs.SGLANG_SM120_LOSSLESS_BF16_HEAD.get():
+            from sglang.kernels.ops.gemm.sm120_lossless_bf16_head import (
+                prepare_lossless_bf16_head,
+            )
+
+            prepare_lossless_bf16_head(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -490,6 +498,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if envs.SGLANG_SM120_LOSSLESS_BF16_HEAD.get():
+            from sglang.kernels.ops.gemm.sm120_lossless_bf16_head import (
+                prepare_lossless_bf16_head,
+            )
+
+            # ModelOpt also assigns this method to an excluded BF16 LM head.
+            prepare_lossless_bf16_head(layer)
 
     def apply(
         self,
@@ -517,7 +532,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
-            get_bf16_gemm_backend().is_cutedsl()
+            (get_bf16_gemm_backend().is_cutedsl() or get_bf16_gemm_backend().is_gemv())
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16

@@ -571,6 +571,7 @@ def _chunk_scan_fwd(
     chunk_offsets=None,
     initial_states=None,
     out=None,
+    sm120_tiles=False,
 ):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
@@ -620,7 +621,9 @@ def _chunk_scan_fwd(
         if z is not None
         else (0, 0, 0, 0)
     )
-    _chunk_scan_fwd_kernel[grid](
+    # Preserve upstream autotuning outside the explicit SM120 specialization.
+    kernel = _chunk_scan_fwd_kernel.fn if sm120_tiles else _chunk_scan_fwd_kernel
+    kernel[grid](
         cb,
         x,
         z,
@@ -696,5 +699,10 @@ def _chunk_scan_fwd(
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
+        **(
+            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 16}
+            if sm120_tiles
+            else {}
+        ),
     )
     return out_x
