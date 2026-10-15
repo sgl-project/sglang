@@ -655,6 +655,15 @@ class Envs:
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(False)
+    # Draft-extend read-done event recorded inside its CUDA graph right after the
+    # attention metadata kernel (srt/speculative/draft_extend_read_fence.py).
+    SGLANG_Q35MF_PDDEC_FENCE = EnvBool(False)
+    # Measurement only: publish the draft-extend read-done event before the
+    # replay; the in-graph metadata reads are not covered by it.
+    SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE = EnvBool(False)
+    # Control file selecting the draft-extend fence policy between rounds of one
+    # server: "stock", "in_graph" or "pre_replay". Implies the in-graph marker.
+    SGLANG_Q35MF_PDDEC_FENCE_AB_CTL = EnvStr("")
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)

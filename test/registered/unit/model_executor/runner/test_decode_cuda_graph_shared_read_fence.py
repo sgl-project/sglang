@@ -3,13 +3,22 @@ from unittest.mock import create_autospec
 
 import pytest
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+)
+from sglang.srt.speculative.draft_extend_read_fence import (
+    DraftExtendFencePolicy,
+    DraftExtendReadFence,
+)
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -69,6 +78,154 @@ def test_publish_read_done():
     runner._publish_read_done(in_graph=False)
     assert recorded == ["record"]
     assert runner.model_runner.shared_read_done_event is not marker
+
+
+DRAFT_EXTEND = ForwardMode.DRAFT_EXTEND_V2
+
+
+def _extend_runner(*, declared: SharedReadEnds, fence, has_marker: bool):
+    runner = EAGLEDraftExtendCudaGraphRunner.__new__(EAGLEDraftExtendCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(shared_read_done_event=None)
+    runner.in_graph_metadata_prep_done = object() if has_marker else None
+    runner.forward_mode = DRAFT_EXTEND
+    runner.draft_extend_attn_backend = _backend(declared)
+    runner.read_fence = fence
+    return runner
+
+
+def _fence(*, ctl_path=None, allow_pre_replay=False):
+    # Tests drive the control-file poll by hand instead of the background thread.
+    return DraftExtendReadFence(
+        capture_marker=True,
+        allow_pre_replay=allow_pre_replay,
+        ctl_path=ctl_path,
+        start_poller=False,
+    )
+
+
+@pytest.mark.parametrize("declared", list(SharedReadEnds))
+def test_draft_extend_read_ends_without_fence_is_stock(declared):
+    # Switches off: the backend's declaration passes through untouched.
+    runner = _extend_runner(declared=declared, fence=None, has_marker=False)
+    assert runner._draft_extend_shared_read_ends() is declared
+
+
+def test_draft_extend_fence_disabled_by_default():
+    with (
+        envs.SGLANG_Q35MF_PDDEC_FENCE.override(False),
+        envs.SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE.override(False),
+        envs.SGLANG_Q35MF_PDDEC_FENCE_AB_CTL.override(""),
+    ):
+        assert DraftExtendReadFence.from_env() is None
+        backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+        assert backend.shared_read_ends(DRAFT_EXTEND) is SharedReadEnds.UNKNOWN
+
+
+def test_trtllm_mha_declares_in_replay_draft_extend_only_when_enabled():
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    with envs.SGLANG_Q35MF_PDDEC_FENCE.override(True):
+        assert backend.shared_read_ends(DRAFT_EXTEND) is SharedReadEnds.IN_REPLAY
+        # Other modes keep their declarations.
+        assert backend.shared_read_ends(ForwardMode.EXTEND) is SharedReadEnds.PRE_REPLAY
+        assert backend.shared_read_ends(DECODE) is SharedReadEnds.IN_REPLAY
+        assert (
+            backend.shared_read_ends(ForwardMode.TARGET_VERIFY)
+            is SharedReadEnds.IN_REPLAY
+        )
+
+
+@pytest.mark.parametrize(
+    "has_marker, expected",
+    [
+        (True, SharedReadEnds.IN_REPLAY),
+        # No captured marker: only a post-replay event covers the graph's reads.
+        (False, SharedReadEnds.POST_REPLAY),
+    ],
+)
+def test_draft_extend_in_graph_policy(has_marker, expected):
+    fence = _fence()
+    runner = _extend_runner(
+        declared=SharedReadEnds.IN_REPLAY, fence=fence, has_marker=has_marker
+    )
+    assert runner._draft_extend_shared_read_ends() is expected
+    key = "in_graph" if has_marker else "in_graph_unavailable"
+    assert fence.policy_round_ct[key] == 1
+
+
+def test_draft_extend_in_graph_policy_keeps_unknown_backend_coarse():
+    # A backend that does not declare in-replay reads keeps the whole-forward fence.
+    fence = _fence()
+    runner = _extend_runner(
+        declared=SharedReadEnds.UNKNOWN, fence=fence, has_marker=True
+    )
+    assert runner._draft_extend_shared_read_ends() is SharedReadEnds.UNKNOWN
+    assert fence.policy_round_ct["in_graph_unavailable"] == 1
+
+
+def test_draft_extend_ab_ctl_switches_policy_between_rounds(tmp_path):
+    ctl = tmp_path / "fence_policy"
+    fence = _fence(ctl_path=str(ctl), allow_pre_replay=True)
+    runner = _extend_runner(
+        declared=SharedReadEnds.IN_REPLAY, fence=fence, has_marker=True
+    )
+
+    # Missing control file: stock, i.e. no event and the whole-forward fence.
+    fence._poll_ctl_once()
+    assert runner._draft_extend_shared_read_ends() is SharedReadEnds.UNKNOWN
+
+    ctl.write_text("in_graph\n")
+    # Rounds only see what the poller last read.
+    assert runner._draft_extend_shared_read_ends() is SharedReadEnds.UNKNOWN
+    fence._poll_ctl_once()
+    assert runner._draft_extend_shared_read_ends() is SharedReadEnds.IN_REPLAY
+
+    ctl.write_text("pre_replay")
+    fence._poll_ctl_once()
+    assert runner._draft_extend_shared_read_ends() is SharedReadEnds.PRE_REPLAY
+
+    ctl.write_text("bogus")
+    fence._poll_ctl_once()
+    assert runner._draft_extend_shared_read_ends() is SharedReadEnds.UNKNOWN
+
+    assert fence.snapshot() == {
+        "policy": DraftExtendFencePolicy.STOCK.value,
+        "round_ct": 5,
+        "stock": 3,
+        "in_graph": 1,
+        "pre_replay": 1,
+        "in_graph_unavailable": 0,
+    }
+
+
+def test_draft_extend_pre_replay_needs_unsafe_switch(tmp_path):
+    ctl = tmp_path / "fence_policy"
+    ctl.write_text("pre_replay")
+    fence = _fence(ctl_path=str(ctl), allow_pre_replay=False)
+    runner = _extend_runner(
+        declared=SharedReadEnds.IN_REPLAY, fence=fence, has_marker=True
+    )
+    fence._poll_ctl_once()
+    assert runner._draft_extend_shared_read_ends() is SharedReadEnds.UNKNOWN
+
+
+def test_draft_extend_static_policies_from_env():
+    with (
+        envs.SGLANG_Q35MF_PDDEC_FENCE.override(True),
+        envs.SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE.override(False),
+        envs.SGLANG_Q35MF_PDDEC_FENCE_AB_CTL.override(""),
+    ):
+        fence = DraftExtendReadFence.from_env()
+        assert fence.capture_marker
+        assert fence.policy_for_round() is DraftExtendFencePolicy.IN_GRAPH
+    with (
+        envs.SGLANG_Q35MF_PDDEC_FENCE.override(False),
+        envs.SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE.override(True),
+        envs.SGLANG_Q35MF_PDDEC_FENCE_AB_CTL.override(""),
+    ):
+        fence = DraftExtendReadFence.from_env()
+        # The measurement arm needs no marker.
+        assert not fence.capture_marker
+        assert fence.policy_for_round() is DraftExtendFencePolicy.PRE_REPLAY
 
 
 if __name__ == "__main__":

@@ -57,6 +57,9 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.speculative.draft_extend_read_fence import (
+    draft_extend_in_graph_fence_enabled,
+)
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
@@ -177,6 +180,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
         if fm == ForwardMode.EXTEND:
             return SharedReadEnds.PRE_REPLAY
+        # Draft-extend graphs read req_to_token only in the in-graph metadata
+        # kernel; later kernels read the backend-owned page table.
+        if fm.is_draft_extend_v2() and draft_extend_in_graph_fence_enabled():
+            return SharedReadEnds.IN_REPLAY
         return super().shared_read_ends(fm)
 
     def __init__(
