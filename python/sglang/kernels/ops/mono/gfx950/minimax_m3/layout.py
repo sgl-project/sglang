@@ -22,6 +22,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     N_ROUTED,
     PAGE16,
     SPARSE_BLOCK,
+    THREADS,
     TOP_K,
     TOPK_BLOCKS,
     TOTAL_INDEX_HEADS,
@@ -251,6 +252,36 @@ MID_ROW = INTER // 4 + 4
 MIDSC_ROW = INTER // 32 + 4
 # and the o stage's FP8 attention rows (512 words: the same 16-way conflict)
 O_ROW = O_K // 4 + 4
+
+# Thread maps whose extent is set by TP, each walked in whole THREADS-wide
+# rounds. Every one of these was originally written as a single round, which
+# was correct only because at TP4 the work happens to come to exactly THREADS
+# slots; at TP2 the dimension doubles and one round covers half of it, leaving
+# the rest of the region unwritten for the next stage to read as NaN bits.
+#
+# The merge: a thread holds 4 dims of one head, so the CTA needs
+# H * HEAD_DIM / 4 slots -- 512 at TP4, 1024 at TP2.
+MERGE_SLOTS = H * (HEAD_DIM // 4)
+MERGE_PASSES = -(-MERGE_SLOTS // THREADS)
+# Whether those rounds come out whole. At TP8 (H = 8) the merge needs only half
+# a CTA, so its tail round has to be masked out of both the amax reduction and
+# the store, or it writes past O_K / 4 words and corrupts the pool. The refusal
+# lives with the merge stage in post_attn, not here: this module only states
+# the map, and TP8's other constants are perfectly well defined.
+MERGE_ROUNDS_WHOLE = MERGE_SLOTS == MERGE_PASSES * THREADS
+# The narrow MoE path's two mid passes, over a MOE_SLOTS * INTER region: 3840
+# at TP4, 7680 at TP2, 1920 at TP8. (The wide path, from WIDE_FROM tokens up,
+# derives its own counts from the row count it is given.) The copy moves two
+# elements a thread; the MXFP8 pass takes eight.
+MID_COPY_ROUNDS = -(-(MOE_SLOTS * INTER) // (2 * THREADS))
+MID8_SLOTS = MOE_SLOTS * INTER // 8
+MID8_ROUNDS = -(-MID8_SLOTS // THREADS)
+# The MXFP8 pass's scale is an xor-reduction over 4-lane groups, so a round's
+# active slots must not end inside one. THREADS is a multiple of 64, so a round
+# offset never moves a lane out of its wave, and this keeps the tail aligned.
+assert MID8_SLOTS % 4 == 0, (
+    f"the MXFP8 mid pass leaves a partial 4-lane scale group: INTER = {INTER}"
+)
 
 
 def pool_words(tokens: int) -> int:

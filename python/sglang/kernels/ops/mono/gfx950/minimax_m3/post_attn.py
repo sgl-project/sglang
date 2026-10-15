@@ -118,6 +118,12 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     AG_RS_FROM,
     DN_ROWS,
     ISCORE_BLOCKS,
+    MERGE_PASSES,
+    MERGE_ROUNDS_WHOLE,
+    MERGE_SLOTS,
+    MID8_ROUNDS,
+    MID8_SLOTS,
+    MID_COPY_ROUNDS,
     MID_ROW,
     MIDSC_ROW,
     N_DN,
@@ -220,20 +226,12 @@ assert N_SPLIT == 2 * TOTAL_INDEX_HEADS
 assert N_SPLIT * TOPK_BLOCKS <= INDEX_CP_FROM_BLOCKS <= THREADS
 assert MAX_TOKENS <= SPARSE_BLOCK
 
-# The merge's thread map: a thread holds 4 dims of one head, so the CTA needs
-# H * HEAD_DIM / 4 slots. At TP4 that is exactly THREADS and one round covers
-# every head, which is why the map was written as `tid // (HEAD_DIM // 4)`. At
-# TP2 H is 32 and the map needs 1024 slots: one round merges only the first 16
-# heads and leaves half of attnq unwritten, so o_proj reads uninitialized memory
-# and the layer comes out NaN. The CTA walks the map in MERGE_PASSES rounds.
-MERGE_SLOTS = H * (HEAD_DIM // 4)
-MERGE_PASSES = -(-MERGE_SLOTS // THREADS)
-# TP8 (H = 8) needs only half a CTA, so its tail round would have to be masked
-# out of both the amax reduction and the store -- without that it would write
-# past O_K / 4 words and corrupt the pool. That belongs with the H = 8 thread-map
-# work the split and selection stages also need, so until then this refuses
-# loudly at import rather than corrupting silently.
-assert MERGE_SLOTS == MERGE_PASSES * THREADS, (
+# The merge walks its thread map in MERGE_PASSES whole rounds and has no masked
+# tail, so a TP whose map does not come out whole (TP8: H = 8 fills half a CTA)
+# would write past O_K / 4 words into the pool. Masking it belongs with the
+# H = 8 thread-map work the split and selection stages also need; until then
+# this refuses loudly at import rather than corrupting silently.
+assert MERGE_ROUNDS_WHOLE, (
     f"the merge needs {MERGE_SLOTS} thread slots, not a whole number of "
     f"{THREADS}-thread rounds: H = {H} needs a masked tail round"
 )
@@ -1448,13 +1446,7 @@ def build_post_attn_kernel(
         MID8_LDS = tokens * MID16_WORDS
         MIDSC_WORDS = MOE_SLOTS * INTER // 32
         MIDSC_LDS = MID8_LDS + tokens * MID8_WORDS
-        # Both narrow-path mid passes are INTER-sized, so neither fits a fixed
-        # number of THREADS-wide rounds: MOE_SLOTS * INTER is 3840 at TP4 but
-        # 7680 at TP2. The wide path (stage_moe_wide) already derives its own
-        # counts; these two are the narrow path's.
-        MID_COPY_ROUNDS = -(-(MOE_SLOTS * INTER) // (2 * THREADS))  # 4 TP4, 8 TP2
-        MID8_SLOTS = MID8_WORDS // 2  # 8 elements a lane, 4 lanes a 32-block
-        MID8_ROUNDS = -(-MID8_SLOTS // THREADS)  # 1 at TP4, 2 at TP2
+        assert MID8_SLOTS == MID8_WORDS // 2  # the module-level count, restated
 
         def mx8_scale(vals, offsets):
             """E8M0 byte (>= 1) of the 32-block the lanes xor-``offsets`` apart share,

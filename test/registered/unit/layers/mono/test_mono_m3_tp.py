@@ -49,6 +49,14 @@ print(json.dumps({
     "KV_PAGE_BYTES": l.KV_PAGE_BYTES,
     "ISCORE_BLOCKS": l.ISCORE_BLOCKS,
     "N_SPLIT": l.N_SPLIT,
+    "THREADS": c.THREADS,
+    "MOE_SLOTS": c.MOE_SLOTS,
+    "MERGE_SLOTS": l.MERGE_SLOTS,
+    "MERGE_PASSES": l.MERGE_PASSES,
+    "MERGE_ROUNDS_WHOLE": l.MERGE_ROUNDS_WHOLE,
+    "MID_COPY_ROUNDS": l.MID_COPY_ROUNDS,
+    "MID8_SLOTS": l.MID8_SLOTS,
+    "MID8_ROUNDS": l.MID8_ROUNDS,
 }))
 """
 
@@ -161,6 +169,58 @@ class TestMonoM3PerTP(CustomTestCase):
         for tp in (2, 4):
             v = self.v[tp]
             self.assertEqual(v["PADDED_SCALE_COLS"], v["SCALE_COLS"], f"TP{tp}")
+
+    def test_thread_maps_cover_the_work_they_walk(self):
+        """Every TP-sized map is walked in whole THREADS-wide rounds, and the
+        rounds must actually reach the end of it.
+
+        This is the shape of three TP2 bugs at once: each map was written as a
+        single round, which is correct only because at TP4 the work comes to
+        exactly THREADS slots. At TP2 the dimension doubles, one round covers
+        half, and the rest of the region is left for the next stage to read as
+        NaN bits. Asserting coverage rather than the literal counts is what
+        makes this a test and not a restatement of the arithmetic."""
+        for tp, v in self.v.items():
+            threads, msg = v["THREADS"], f"TP{tp}"
+            # the merge: 4 dims of one head a thread
+            self.assertEqual(v["MERGE_SLOTS"], v["H"] * 128 // 4, msg)
+            self.assertGreaterEqual(
+                v["MERGE_PASSES"] * threads, v["MERGE_SLOTS"], f"{msg} merge short"
+            )
+            # the narrow MoE mid passes: 2 elements a thread, then 8
+            work = v["MOE_SLOTS"] * v["INTER"]
+            self.assertGreaterEqual(
+                v["MID_COPY_ROUNDS"] * threads * 2, work, f"{msg} mid copy short"
+            )
+            self.assertEqual(v["MID8_SLOTS"], work // 8, msg)
+            self.assertGreaterEqual(
+                v["MID8_ROUNDS"] * threads, v["MID8_SLOTS"], f"{msg} mxfp8 short"
+            )
+            # a round's tail must not split the 4-lane group the MXFP8 scale is
+            # reduced over, and a round offset must not move a lane out of its
+            # wave
+            self.assertEqual(threads % 64, 0, msg)
+            self.assertEqual(v["MID8_SLOTS"] % 4, 0, f"{msg} partial scale group")
+
+        # and none of it may move at TP4, whose build is the regression gate
+        v4 = self.v[4]
+        self.assertEqual(v4["MERGE_PASSES"], 1)
+        self.assertEqual(v4["MID_COPY_ROUNDS"], 4)
+        self.assertEqual(v4["MID8_ROUNDS"], 1)
+        self.assertEqual(v4["MID8_SLOTS"], 480)
+        # TP2 is where every one of them needed a second round
+        v2 = self.v[2]
+        self.assertEqual(v2["MERGE_PASSES"], 2)
+        self.assertEqual(v2["MID_COPY_ROUNDS"], 8)
+        self.assertEqual(v2["MID8_ROUNDS"], 2)
+
+    def test_tp8_merge_still_needs_a_masked_tail(self):
+        """A known gap, asserted so it cannot be forgotten: at H = 8 the merge
+        fills half a CTA, so its rounds do not come out whole and post_attn
+        refuses to build. TP2 and TP4 do come out whole."""
+        self.assertFalse(self.v[8]["MERGE_ROUNDS_WHOLE"], "TP8 merge")
+        for tp in (2, 4):
+            self.assertTrue(self.v[tp]["MERGE_ROUNDS_WHOLE"], f"TP{tp} merge")
 
 
 if __name__ == "__main__":
