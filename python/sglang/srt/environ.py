@@ -415,6 +415,11 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
+    # --enable-monokernel: the spans to run (comma list, default all), one stalled wait (rank:site[:after]), and
+    # the spans against the normal path at attach (log, or enforce the spec's bounds)
+    SGLANG_TEST_MONO_SPANS = EnvStr("")
+    SGLANG_TEST_MONO_FAULT_INJECT = EnvStr("")
+    SGLANG_TEST_MONO_CHECK_NUMERICS = EnvStr("")
     # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)

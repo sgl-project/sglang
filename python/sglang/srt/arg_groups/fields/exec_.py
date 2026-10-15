@@ -137,6 +137,13 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
     ] = False
+    enable_monokernel: A[
+        bool,
+        "Run the decode and verify steps of supported models on monokernels: persistent kernels that run most "
+        "of a decoder layer, including its TP all-reduce, in one or two launches. Experimental; DeepSeek-V4.1 "
+        "on gfx950 at TP 2 / 4. Startup refuses every unsupported feature at once. See "
+        "python/sglang/experimental/monokernels/README.md.",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
