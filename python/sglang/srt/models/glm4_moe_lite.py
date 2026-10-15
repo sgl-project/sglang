@@ -242,6 +242,11 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
+            _shared_expert_use_tp1 = (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            )
             self.shared_experts = Glm4MoeLiteMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -249,14 +254,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
+            self._shared_expert_tp1 = _shared_expert_use_tp1
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
             )
@@ -712,6 +712,33 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         )
         self.capture_aux_hidden_states = False
 
+        # Weight loading mappings for ParameterMapper compatibility
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # Add A-proj fusion mapping when q_lora_rank is enabled (MLA)
+        self.fuse_qkv_a_proj = hasattr(config, "q_lora_rank") and (
+            config.q_lora_rank is not None
+        )
+        if self.fuse_qkv_a_proj:
+            self.stacked_params_mapping.extend(
+                [
+                    ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+                    ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+                ]
+            )
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=config.n_routed_experts + self.num_fused_shared_experts,
+        )
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
@@ -823,6 +850,22 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def mutate_weight_preload(self, name: str) -> str:
+        """GLM4-MoE-Lite: shared expert fusion."""
+        if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            return name.replace(
+                "mlp.shared_experts",
+                f"mlp.experts.{self.config.n_routed_experts}",
+            )
+        return name
+
+    def custom_scale_remap(self, name: str) -> str:
+        """GLM4-MoE-Lite: k_proj/v_proj -> attn_mqa for MLA kv scale."""
+        for s in ["k_scale", "v_scale"]:
+            if s in name:
+                return name.replace(f"{s[0]}_proj", "attn_mqa")
+        return name
 
     def load_weights(
         self,

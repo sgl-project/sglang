@@ -40,6 +40,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.true_on_policy import should_use_tp_invariant_row_linear
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -1582,6 +1583,15 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
+        if (
+            isinstance(param, BlockQuantScaleParameter)
+            and getattr(param, "format_ue8m0", False)
+            and loaded_weight.dtype == torch.int32
+            and not self.use_presharded_weights
+        ):
+            self._load_ue8m0_packed_scale(param, loaded_weight)
+            return
+
         if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
@@ -1603,6 +1613,29 @@ class RowParallelLinear(LinearBase):
             except TypeError:
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
+
+    def _load_ue8m0_packed_scale(
+        self, param: BlockQuantScaleParameter, loaded_weight: torch.Tensor
+    ):
+        # TODO: This is hacky, better to have a more stable solution
+        # The loaded scale is a full-size DeepGEMM UE8M0 packed tensor (int32,
+        # mn-major, 4 scale columns per word; see transform_scale_ue8m0). The
+        # input-dim shard boundary sits at sub-word granularity whenever
+        # (k_local / block_k) % 4 != 0, so the packed form cannot be narrowed
+        # directly: unpack to fp32, narrow in scale-column units, then repack.
+        from sglang.srt.layers.quantization.fp8_utils import (
+            inverse_transform_scale_ue8m0,
+            transform_scale_ue8m0,
+        )
+
+        block_k = self.quant_method.quant_config.weight_block_size[1]
+        mn = param.data.shape[0]
+        sf_fp32 = inverse_transform_scale_ue8m0(loaded_weight, mn=mn)
+        shard_size = (self.input_size_per_partition + block_k - 1) // block_k
+        sf_local = sf_fp32.narrow(1, self.tp_rank * shard_size, shard_size).contiguous()
+        packed = transform_scale_ue8m0(sf_local, mn=mn)
+        assert param.data.shape == packed.shape, f"{param.data.shape=} {packed.shape=}"
+        param.data.copy_(packed)
 
     def forward(
         self,
@@ -1646,7 +1679,27 @@ class RowParallelLinear(LinearBase):
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            if output_tensor is None:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+            is_tuple = isinstance(input_parallel, tuple)
+            is_fp8 = isinstance(self.quant_method, Fp8LinearMethod)
+            k_size = (
+                input_parallel[0].shape[-1] if is_tuple else input_parallel.shape[-1]
+            )
+            if should_use_tp_invariant_row_linear(k_size):
+                if output_tensor is not None:
+                    raise RuntimeError(
+                        "tp-invariant row linear cannot write into a caller-owned "
+                        "output tensor"
+                    )
+                if is_fp8:
+                    raise NotImplementedError(
+                        "FP8 tp-invariant row-linear not yet supported"
+                    )
+                output_parallel = torch.ops.tp_inv_ops.matmul_tp_inv(
+                    input_parallel, self.weight.t(), bias_
+                )
+            elif output_tensor is None:
                 output_parallel = self.quant_method.apply(
                     self, input_parallel, bias=bias_
                 )

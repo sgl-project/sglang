@@ -42,12 +42,14 @@ class ExecFeatures(msgspec.Struct):
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
     enable_tf32_matmul: A[
-        bool,
+        Optional[bool],
         Arg(
-            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only. Defaults to the model's preference, otherwise disabled.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
+            fallback=False,
         ),
-    ] = False
+    ] = None
 
     # -------------------------------------------------------------------------
     # Misc runtime features
@@ -556,6 +558,9 @@ class ExecGraph(msgspec.Struct):
         "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
     ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True)] = False
+    disable_draft_cuda_graph: A[
+        bool, "Disable cuda graph for draft model in speculative decoding."
+    ] = False
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
@@ -1023,6 +1028,15 @@ class ExecDeterministic(msgspec.Struct):
     enable_deterministic_inference: A[
         bool, "Enable deterministic inference mode with batch invariant ops."
     ] = False
+    enable_prefill_only_deterministic_inference: A[
+        bool,
+        "Enable prefill-only deterministic inference mode with batch invariant ops.",
+    ] = False
+    true_on_policy_contract: A[
+        Optional[str],
+        "Internal true-on-policy parity contract selected by the launcher. "
+        "Normal users should prefer the Miles true_on_policy switch.",
+    ] = None
     rl_on_policy_target: A[
         Optional[str],
         Arg(

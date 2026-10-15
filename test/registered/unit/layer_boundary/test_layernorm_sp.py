@@ -127,6 +127,137 @@ class TestLayerNormSPValidation(CustomTestCase):
             validate_layernorm_sp(**{**self.VALID, "speculative_algorithm": "EAGLE3"})
 
 
+class TestMuseLayerNormSPValidation(CustomTestCase):
+    VALID = dict(
+        architecture="MuseSpark1xForCausalLM",
+        tp_size=4,
+        ep_size=4,
+        attn_dp_enabled=False,
+        speculative_algorithm="DFLASH",
+        quantization="modelopt_fp4",
+        moe_a2a_backend="none",
+        moe_runner_backend="flashinfer_trtllm",
+        enable_megamoe_for_layernorm_sp=True,
+    )
+
+    def test_megamoe_nvfp4_and_bf16_with_dflash(self):
+        for size in (4, 8):
+            for quantization in ("modelopt_fp4", None):
+                with self.subTest(size=size, quantization=quantization):
+                    validate_layernorm_sp(
+                        **{
+                            **self.VALID,
+                            "tp_size": size,
+                            "ep_size": size,
+                            "quantization": quantization,
+                        }
+                    )
+
+    def test_rejects_attention_dp_and_unsupported_expert_geometry(self):
+        for overrides, message in (
+            ({"attn_dp_enabled": True}, "attention DP"),
+            ({"ep_size": 2}, "TP4/EP4 or TP8/EP8"),
+            ({"speculative_algorithm": "EAGLE3"}, "speculative"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_layernorm_sp(**{**self.VALID, **overrides})
+
+    def test_flashinfer_a2a_uses_attention_dp_geometry(self):
+        from sglang.srt.arg_groups.moe_hook import (
+            _flashinfer_a2a_topology_is_supported as supported,
+        )
+
+        ordinary = dict(
+            architecture="Qwen3MoeForCausalLM",
+            tp_size=4,
+            ep_size=4,
+            attn_dp_size=4,
+            attn_dp_enabled=True,
+            enable_layernorm_sp=False,
+        )
+        self.assertTrue(supported(**ordinary))
+        self.assertFalse(supported(**{**ordinary, "attn_dp_size": 2}))
+        muse = dict(
+            ordinary,
+            architecture="MuseSpark1xForCausalLM",
+            attn_dp_size=1,
+            attn_dp_enabled=False,
+            enable_layernorm_sp=True,
+        )
+        self.assertTrue(supported(**muse))
+        self.assertFalse(supported(**{**muse, "ep_size": 2}))
+        self.assertFalse(supported(**{**muse, "attn_dp_enabled": True}))
+        self.assertFalse(supported(**{**muse, "enable_layernorm_sp": False}))
+
+
+class TestLayerNormSPActiveFlag(CustomTestCase):
+    def tearDown(self):
+        reset_context()
+
+    def test_active_flag_is_registered_on_forward_flags(self):
+        """``sp_active`` must stay a registered ForwardFlags slot.
+
+        ``set()`` rejects names missing from ``ForwardFlags._DEFAULTS``, so this
+        fails if the slot is dropped, and it must also be in ``_GRAPH_VISIBLE``
+        because the participant linears read it under CUDA graph capture.
+        """
+        from sglang.srt.runtime_context import ForwardFlags
+
+        self.assertIn("sp_active", ForwardFlags._DEFAULTS)
+        self.assertIn("sp_active", ForwardFlags._GRAPH_VISIBLE)
+
+        self.assertFalse(get_forward().sp_active)  # default
+        get_forward().set("sp_active", True)
+        self.assertTrue(get_forward().sp_active)
+        get_forward().set("sp_active", False)
+        self.assertFalse(get_forward().sp_active)
+
+
+class TestMuseCutlassParallelContext(CustomTestCase):
+    def test_cutlass_collectives_use_runtime_tp_group(self):
+        from sglang.kernels.ops.gemm import sp_collective_gemm
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        group = object()
+        linear = SimpleNamespace(
+            _sp_use_cutlass=True,
+            bias=None,
+            quant_method=UnquantizedLinearMethod(),
+            weight=torch.ones(4, 4, dtype=torch.bfloat16),
+            tp_size=2,
+        )
+        x = torch.ones(3, 4, dtype=torch.bfloat16)
+        with (
+            patch.object(layernorm_sp, "sp_num_tokens", return_value=3),
+            patch.object(
+                layernorm_sp,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_group=SimpleNamespace(device_group=group)
+                ),
+            ),
+            patch.object(
+                sp_collective_gemm,
+                "all_gather_matmul",
+                return_value=torch.arange(16).reshape(4, 4),
+            ) as gather,
+            patch.object(
+                sp_collective_gemm,
+                "matmul_reduce_scatter",
+                return_value=torch.ones(2, 4),
+            ) as scatter,
+        ):
+            out = layernorm_sp.column_parallel_g_matmul(linear, x, None)
+            torch.testing.assert_close(out, torch.arange(12).reshape(3, 4))
+            self.assertIs(gather.call_args.args[2], group)
+            layernorm_sp.row_parallel_gbar_matmul(linear, x, None)
+            self.assertIs(scatter.call_args.args[2], group)
+            torch.testing.assert_close(
+                scatter.call_args.args[0], torch.cat((x, torch.zeros_like(x[:1])))
+            )
+
+
 class _Norm:
     def __call__(self, x, residual=None, post_residual_addition=None):
         if residual is None:

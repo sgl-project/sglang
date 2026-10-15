@@ -37,8 +37,13 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.true_on_policy import (
+    should_disable_fused_qk_norm_mrope,
+    should_force_bfloat16_dense_tensor_math,
+)
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen3Config = None
 
@@ -108,16 +113,16 @@ class Qwen3Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-            )
-            if get_exec().deterministic.rl_on_policy_target is not None
-            else {}
+        self.q_norm = RMSNorm(
+            self.head_dim,
+            eps=rms_norm_eps,
+            true_on_policy_weight_dtype=torch.float32,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        self.k_norm = RMSNorm(
+            self.head_dim,
+            eps=rms_norm_eps,
+            true_on_policy_weight_dtype=torch.float32,
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -273,14 +278,20 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_exec().deterministic.rl_on_policy_target is not None:
-            hidden_states = hidden_states.bfloat16()
+        if (
+            should_force_bfloat16_dense_tensor_math()
+            or hidden_states.dtype != self.qkv_proj.weight.dtype
+        ):
+            # True-on-policy RMSNorm can produce fp32 activations while dense
+            # projections remain bf16, including during cuda-graph capture when
+            # the global on-policy flag is temporarily cleared.
+            hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
 
         save_kv_cache = True
         use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
-            and get_exec().deterministic.rl_on_policy_target is None
+            and not should_disable_fused_qk_norm_mrope()
         )
 
         if use_aiter_fused:
@@ -300,9 +311,9 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if get_exec().deterministic.rl_on_policy_target is not None:
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
+        if should_force_bfloat16_dense_tensor_math() or q.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
@@ -321,16 +332,7 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        if (
-            hasattr(config, "rope_parameters")
-            and config.rope_parameters
-            and "rope_theta" in config.rope_parameters
-        ):
-            rope_theta = config.rope_parameters["rope_theta"]
-            rope_scaling = config.rope_parameters
-        else:
-            rope_theta = getattr(config, "rope_theta", 1000000)
-            rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = Qwen3Attention(
@@ -358,21 +360,19 @@ class Qwen3DecoderLayer(nn.Module):
             reduce_results=False,
         )
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-                override_orig_dtype=torch.float32,
-                fp32_residual=True,
-            )
-            if get_exec().deterministic.rl_on_policy_target is not None
-            else {}
-        )
         self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            true_on_policy_weight_dtype=torch.float32,
+            true_on_policy_override_orig_dtype=torch.float32,
+            true_on_policy_fp32_residual=True,
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            true_on_policy_weight_dtype=torch.float32,
+            true_on_policy_override_orig_dtype=torch.float32,
+            true_on_policy_fp32_residual=True,
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
@@ -515,6 +515,16 @@ class Qwen3ForCausalLM(nn.Module):
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
+        # Stacked params mapping for unified weight loading API
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
         # handle the lm head on different pp ranks
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
@@ -624,15 +634,7 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
+        stacked_params_mapping = self.stacked_params_mapping
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if not name.startswith("model.") and (

@@ -1,0 +1,174 @@
+Plan B: Aiter CK paged prefill + Aiter unified-attention 3D decode everywhere
+
+Target repos: sglang and aiter (one file, two applications)
+    git -C $SGLANG_ROOT apply --include='python/*' \
+        patches/03-plan-b-aiter-unified-attention-3d.patch
+    git -C $AITER_ROOT  apply --include='aiter/*'  \
+        patches/03-plan-b-aiter-unified-attention-3d.patch
+
+Apply on top of 01-aiter-fix-page-scatter-vm-fault.patch. Mutually exclusive
+with Plan A (02-*): reverse that patch before applying this one.
+
+Two changes:
+
+1. aiter_backend.py (sglang) - the same page_size > 1 prefill fix as Plan A: a
+   block-level page table, a 4D [num_pages, page_size, kv_heads, head_dim] KV
+   view, and a per-request seqlen_k, so CK and unified_attention agree on the
+   paging instead of CK falling back to one-token pages.
+
+2. unified_attention.py (aiter) - route sliding-window decode to the 3D
+   (split-K) kernel instead of the 2D kernel. Decode keeps running on aiter for
+   all 62 layers; the sliding-window layers stop paying for the 2D kernel's
+   unsplit KV loop. Both kernels apply the same window mask, so outputs match
+   the 2D path (max abs diff 4.9e-4 in bf16, torch.allclose at 1e-2/1e-2).
+diff --git a/python/sglang/srt/layers/attention/aiter_backend.py b/python/sglang/srt/layers/attention/aiter_backend.py
+index 1f9bc87d3a..8c7210ab22 100755
+--- a/python/sglang/srt/layers/attention/aiter_backend.py
++++ b/python/sglang/srt/layers/attention/aiter_backend.py
+@@ -149,6 +149,7 @@ class ForwardMetadata:
+     swa_page_table: Optional[torch.Tensor] = None
+     # full->SWA translated out_cache_loc (SWA KV-store write target)
+     swa_out_cache_loc: Optional[torch.Tensor] = None
++    prefill_seqlen_k: Optional[torch.Tensor] = None
+
+
+ _AITER_PARTITION_SIZE_ROCM = 256
+@@ -740,23 +741,19 @@ class AiterAttnBackend(AttentionBackend):
+         )
+         return page_table[:, strided_indices] // page_size
+
+-    def _build_unified_page_table_from_spec(
++    def _build_unified_page_table_from_ragged(
+         self,
+-        spec_info,
++        kv_flat: torch.Tensor,
++        kv_indptr: torch.Tensor,
+         bs: int,
+         dest_buf: Optional[torch.Tensor] = None,
+         swa_dest_buf: Optional[torch.Tensor] = None,
+-    ) -> torch.Tensor:
+-        """Convert ragged (token-level) kv_indices from spec_info into a 2D
+-        block-level page_table of shape (bs, max_num_blocks_per_seq).
+-        unified_attention expects max_seqlen_k = page_table.shape[1] *
+-        page_size to be a captured constant, so rows are sized to the
+-        backend-level max_num_blocks_per_seq regardless of seqused_k.
+-        """
+-        kv_indptr = spec_info.kv_indptr
+-        kv_flat = spec_info.kv_indices
++        max_blocks: Optional[int] = None,
++    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
++        """Convert ragged token-level KV indices to a dense block page table."""
+         page_size = self.page_size
+-        max_blocks = (self.max_context_len + page_size - 1) // page_size
++        if max_blocks is None:
++            max_blocks = (self.max_context_len + page_size - 1) // page_size
+
+         swa_slot_mapping = None
+         swa_page_table = None
+@@ -797,6 +794,22 @@ class AiterAttnBackend(AttentionBackend):
+
+         return page_table, swa_page_table
+
++    def _build_unified_page_table_from_spec(
++        self,
++        spec_info,
++        bs: int,
++        dest_buf: Optional[torch.Tensor] = None,
++        swa_dest_buf: Optional[torch.Tensor] = None,
++    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
++        """Build the graph-stable block page table used by unified_attention."""
++        return self._build_unified_page_table_from_ragged(
++            spec_info.kv_indices,
++            spec_info.kv_indptr,
++            bs,
++            dest_buf=dest_buf,
++            swa_dest_buf=swa_dest_buf,
++        )
++
+     def _build_verify_unified_metadata(
+         self,
+         bs: int,
+@@ -1674,7 +1687,22 @@ class AiterAttnBackend(AttentionBackend):
+                     spec_info=None,
+                 )
+
+-                if self.use_sliding_window_kv_pool:
++                kv_indices = self.indices_updater_prefill.kv_indices
++                if self.page_size > 1:
++                    # CK's 3D fallback treats every token as a one-token page.
++                    # Preserve the configured paging for its 4D KV path so
++                    # BUFFER_LOAD and unified_attention use the same blocks.
++                    max_kv_len = forward_batch.seq_lens_cpu.max().item()
++                    max_blocks = (max_kv_len + self.page_size - 1) // self.page_size
++                    kv_indices, swa_page_table = (
++                        self._build_unified_page_table_from_ragged(
++                            kv_indices,
++                            self.indices_updater_prefill.kv_indptr,
++                            bs,
++                            max_blocks=max_blocks,
++                        )
++                    )
++                elif self.use_sliding_window_kv_pool:
+                     # AITER attention kernels (e.g. mha_batch_prefill_func)
+                     # require int32 page indices; full_to_swa_index_mapping is
+                     # stored as int64.
+@@ -1686,13 +1714,18 @@ class AiterAttnBackend(AttentionBackend):
+
+                 self.forward_metadata = ForwardMetadata(
+                     self.indices_updater_prefill.kv_indptr,
+-                    self.indices_updater_prefill.kv_indices,
++                    kv_indices,
+                     None,
+                     None,
+                     max(forward_batch.extend_seq_lens_cpu),
+                     forward_batch.seq_lens_cpu.max().item(),
+                     swa_page_table=swa_page_table,
+                     swa_out_cache_loc=swa_out_cache_loc,
++                    prefill_seqlen_k=(
++                        forward_batch.seq_lens[:bs].to(torch.int32)
++                        if self.page_size > 1
++                        else None
++                    ),
+                 )
+
+     def init_cuda_graph_state(
+@@ -2923,6 +2956,21 @@ class AiterAttnBackend(AttentionBackend):
+                 page_table = self.forward_metadata.swa_page_table
+
+             extra_kwargs = {}
++            if self.page_size > 1:
++                if k_cache.shape[0] % self.page_size != 0:
++                    raise ValueError(
++                        f"KV cache size {k_cache.shape[0]} is not divisible by "
++                        f"page_size={self.page_size}"
++                    )
++                k_cache = k_cache.view(
++                    -1, self.page_size, k_cache.shape[1], k_cache.shape[2]
++                )
++                v_cache = v_cache.view(
++                    -1, self.page_size, v_cache.shape[1], v_cache.shape[2]
++                )
++                extra_kwargs["block_table"] = page_table
++                extra_kwargs["seqlen_k"] = self.forward_metadata.prefill_seqlen_k
++
+             attn_out = getattr(forward_batch, "_attn_output", None)
+             if attn_out is not None and q.dtype != fp8_dtype:
+                 extra_kwargs["out"] = attn_out.view(
+diff --git a/aiter/ops/triton/attention/unified_attention.py b/aiter/ops/triton/attention/unified_attention.py
+--- a/aiter/ops/triton/attention/unified_attention.py
++++ b/aiter/ops/triton/attention/unified_attention.py
+@@ -293,6 +293,14 @@ def use_2d_kernel(
+     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
+     if IS_DEVICE_ARCH_GFX12:
+         return (sliding_window > 0) or (not all_decode)
+
++    # Sliding-window decode takes the 3D (split-K) kernel as well. The 2D
++    # kernel keeps the whole KV loop inside one program per query tile, so a
++    # 2048-token window decode is several times slower than the split-K 3D
++    # kernel on gfx950 even though it reads less KV. Both kernels apply the
++    # same window mask, so the result is unchanged.
++    if all_decode and sliding_window > 0:
++        return False
++
+     if head_size >= 512 and not get_arch().is_rdna and not all_decode:
+         return True

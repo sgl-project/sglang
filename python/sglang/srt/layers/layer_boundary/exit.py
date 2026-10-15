@@ -66,6 +66,9 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_parallel,
 )
+from sglang.srt.true_on_policy import (
+    should_disable_mlp_allreduce_fusion_for_on_policy,
+)
 
 
 def _select_dp_reduce_scatter(
@@ -191,7 +194,8 @@ class ExitPolicy:
             owes_sum=steps.output.group is not None and not sum_in_reduce_scatter,
         )
         defer_moe_finalize = (
-            self.plan.fusions is not None
+            not should_disable_mlp_allreduce_fusion_for_on_policy()
+            and self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
         )
         if not steps.output.may_defer_to_next and not (

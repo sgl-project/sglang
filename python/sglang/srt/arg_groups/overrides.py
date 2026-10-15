@@ -306,6 +306,29 @@ def collect_model_override_declarations(
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
+@_register_for(
+    "MuseSpark1xForCausalLM",
+    "MuseSparkForConditionalGeneration",
+)
+def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    overrides: Dict[str, Any] = {}
+    if cfg.enable_tf32_matmul is None:
+        overrides["enable_tf32_matmul"] = True
+        logger.info("Enable TF32 matmul by default for Muse Spark")
+    if cfg.kv_cache_dtype == "auto":
+        logger.info("Use fp8_e4m3 KV cache by default for Muse Spark")
+        overrides["kv_cache_dtype"] = "fp8_e4m3"
+    if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
+        # NaViT shards over the full TP group only, so attention TP narrower
+        # than TP needs the replicated (data-parallel) encoder.
+        logger.info(
+            "Enable the data-parallel mm encoder for Muse Spark under attention DP"
+        )
+        overrides["mm_enable_dp_encoder"] = True
+    return overrides
+
+
 @register_model_override_predicate(
     lambda arch: (
         "Step3p5ForCausalLM" in arch or "Step3p7ForConditionalGeneration" in arch
@@ -889,7 +912,8 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
-        "DeepseekV4ForCausalLM",
+        # DeepseekV4 is absent on purpose: under EP + NextN its workspace
+        # creation barriers against the cuda-graph capture loop's own barrier.
         "GptOssForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",
@@ -1307,7 +1331,10 @@ def _page_size_default(view: Any) -> dict:
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
     if num_dp_ranks_of(view) == 1 and view.ep_join_mode != "scale":
-        return {"enable_dp_lm_head": False}
+        # Keep the dp LM head when attention context parallelism is enabled,
+        # even without data parallelism (context-parallel LM head).
+        if not (view.enable_dp_lm_head and view.attn_cp_size > 1):
+            return {"enable_dp_lm_head": False}
     return {}
 
 
@@ -1363,8 +1390,9 @@ def _tp_lm_head_all_to_all_default(view: Any) -> dict:
 def _dp_lm_head_validation(view: Any) -> dict:
     """Require DP attention for DP LM head and TP LM-head all-to-all."""
     if view.enable_dp_lm_head:
-        assert attn_dp_enabled_of(view), (
-            "--enable-dp-lm-head requires attention DP (--attn-dp-size)."
+        assert attn_dp_enabled_of(view) or view.attn_cp_size > 1, (
+            "--enable-dp-lm-head requires attention DP (--attn-dp-size) "
+            "unless attention context parallelism is enabled."
         )
     if view.enable_tp_lm_head_all_to_all:
         assert attn_dp_enabled_of(view), (

@@ -29,6 +29,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.utils import get_normalized_target_modules
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -60,10 +61,15 @@ class LoRAAdapter(nn.Module):
         load_config: LoadConfig,
         lora_backend: BaseLoRABackend,
         base_model: Optional[torch.nn.Module] = None,
+        keep_weights_on_device: bool = False,
     ):
         super().__init__()
         self.uid: str = uid
+        self.keep_weights_on_device: bool = keep_weights_on_device
         self.config: LoRAConfig = config
+        self.normalized_target_modules = get_normalized_target_modules(
+            config.target_modules, base_model=base_model
+        )
         assert self.config.hf_config["peft_type"].lower() == "lora"
         self.base_hf_config: AutoConfig = base_hf_config
         self.load_config: LoadConfig = load_config
@@ -161,13 +167,23 @@ class LoRAAdapter(nn.Module):
 
         self._normalize_weights()
 
+    def _stage_weight(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        # streamed weights are IPC views into the trainer's buckets; a full-adapter clone would not fit
+        if self.keep_weights_on_device and loaded_weight.is_cuda:
+            return loaded_weight
+        return loaded_weight.cpu()
+
+    def release_staged_weights(self):
+        """Drop the staged copies once installed in the memory pool; the adapter cannot be reinstalled."""
+        for layer in self.layers:
+            layer.weights.clear()
+            layer.pinned_weights.clear()
+        self.embedding_layers.clear()
+        self.pinned_embedding_layers.clear()
+        self.added_tokens_embeddings.clear()
+        self.pinned_added_tokens_embeddings.clear()
+
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
-        from sglang.srt.lora.utils import get_normalized_target_modules
-
-        normalized_target_modules = get_normalized_target_modules(
-            self.config.target_modules
-        )
-
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
@@ -175,7 +191,7 @@ class LoRAAdapter(nn.Module):
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
-            self.layers[layer_id].weights[name] = loaded_weight.cpu()
+            self.layers[layer_id].weights[name] = self._stage_weight(loaded_weight)
         elif "embed_tokens" in name or "lm_head" in name:
             # Check if this module is declared in target_modules before loading.
             # When normalized_target_modules is {"all"} (e.g. target_modules was
@@ -183,17 +199,17 @@ class LoRAAdapter(nn.Module):
             # --lora-target-modules will govern which modules are active.
             module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
             if (
-                "all" in normalized_target_modules
-                or module_name in normalized_target_modules
+                "all" in self.normalized_target_modules
+                or module_name in self.normalized_target_modules
             ):
-                self.embedding_layers[name] = loaded_weight.cpu()
+                self.embedding_layers[name] = self._stage_weight(loaded_weight)
             else:
                 logger.debug(
                     f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
                 )
         elif "input_embeddings" in name or "output_embeddings" in name:
             # added/extra token emb
-            self.added_tokens_embeddings[name] = loaded_weight.cpu()
+            self.added_tokens_embeddings[name] = self._stage_weight(loaded_weight)
             assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
                 f"LoRA adapter {self.uid} has lora_added_tokens_size {self.config.lora_added_tokens_size} specified in the config, "
                 f"but the loaded weight '{name}' has shape {loaded_weight.shape[0]} in first dimension"
@@ -210,6 +226,8 @@ class LoRAAdapter(nn.Module):
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
             self._normalize_in_proj_qkvz(layer.weights)
+            # Stack in_proj_b + in_proj_a → in_proj_ba for GDN layers
+            self._normalize_in_proj_ba(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -450,6 +468,25 @@ class LoRAAdapter(nn.Module):
                 weights.pop(k_name)
                 weights.pop(v_name)
                 weights.pop(z_name)
+            elif "in_proj_qkv." in weight_name:
+                # 2-way split (Megatron-Bridge adapter export): in_proj_qkv
+                # covers the q|k|v rows and in_proj_z the z rows, with one
+                # shared lora_A. The stacked buffer expects one A block per
+                # slice, so repeat the qkv A block 3x (q, k, v) before
+                # appending the z block; B rows concatenate directly.
+                z_name = weight_name.replace("in_proj_qkv.", "in_proj_z.")
+                if z_name not in weights:
+                    continue
+                qkvz_name = weight_name.replace("in_proj_qkv.", "in_proj_qkvz.")
+                cat_dim = weights[weight_name].dim() - 2
+                qkv_w = weights[weight_name]
+                if "lora_A" in weight_name:
+                    repeat_dims = [1] * qkv_w.dim()
+                    repeat_dims[cat_dim] = 3
+                    qkv_w = qkv_w.repeat(*repeat_dims)
+                weights[qkvz_name] = torch.cat((qkv_w, weights[z_name]), cat_dim)
+                weights.pop(weight_name)
+                weights.pop(z_name)
             elif "in_proj_qkvz" in weight_name and "lora_A" in weight_name:
                 # Already-merged adapter: replicate the shared A across the 4
                 # stacked slots the buffer expects (q, k, v, z).
@@ -458,6 +495,45 @@ class LoRAAdapter(nn.Module):
                 repeat_dims[ndim - 2] = 4
                 weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
+
+    def _normalize_in_proj_ba(self, weights: Dict[str, torch.Tensor]):
+        """Normalize in_proj_ba weights for GDN (GatedDeltaNet) layers like
+        Qwen3.5.
+
+        Two adapter formats are handled:
+
+        1. Split: ``in_proj_b + in_proj_a`` (HF checkpoint naming, also the
+           Megatron-Bridge adapter export) are present as separate weights →
+           concatenate them into ``in_proj_ba`` (B rows b|a; A blocks b, a).
+
+        2. Already-merged: the adapter has a single ``in_proj_ba`` weight
+           (PEFT trained against SGLang's fused Linear). The stacked buffer
+           expects two per-slice ``A`` blocks, so repeat ``lora_A`` 2x along
+           the rank dim. ``lora_B`` is already full-output-dim and matches
+           the buffer directly.
+        """
+        for weight_name in list(weights.keys()):
+            # NB: match with the trailing dot so the merged "in_proj_ba."
+            # names don't take the split branch.
+            if "in_proj_b." in weight_name:
+                a_name = weight_name.replace("in_proj_b.", "in_proj_a.")
+                if a_name not in weights:
+                    continue
+                ba_name = weight_name.replace("in_proj_b.", "in_proj_ba.")
+                cat_dim = weights[weight_name].dim() - 2
+                weights[ba_name] = torch.cat(
+                    (weights[weight_name], weights[a_name]), cat_dim
+                )
+                weights.pop(weight_name)
+                weights.pop(a_name)
+            elif "in_proj_ba" in weight_name and "lora_A" in weight_name:
+                # Already-merged adapter: replicate the shared A across the 2
+                # stacked slots the buffer expects (b, a).
+                ndim = weights[weight_name].dim()
+                repeat_dims = [1] * ndim
+                repeat_dims[ndim - 2] = 2
+                weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
+            # else (in_proj_ba lora_B, or unrelated): no-op.
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]

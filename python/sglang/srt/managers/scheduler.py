@@ -74,6 +74,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation import role_switch
@@ -154,8 +155,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
-    LoadLoRAAdapterFromTensorsReqInput,
-    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
@@ -163,6 +162,9 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    PullWeightsReqInput,
+    RegisterLoRAAdapterReqInput,
+    RegisterLoRAAdapterReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1778,6 +1780,10 @@ class Scheduler(
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
                 ),
+                (
+                    PullWeightsReqInput,
+                    self.weight_updater.pull_weights,
+                ),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
@@ -1791,10 +1797,7 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
-                (
-                    LoadLoRAAdapterFromTensorsReqInput,
-                    self.load_lora_adapter_from_tensors,
-                ),
+                (RegisterLoRAAdapterReqInput, self.register_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
@@ -2462,6 +2465,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             server_args=self.server_args,
             is_generation=self.is_generation,
+            is_multimodal_gen=getattr(self.model_config, "is_multimodal_gen", False),
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: (
@@ -5190,6 +5194,9 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        if GPU_MEMORY_TYPE_KV_CACHE in self.weight_updater.offload_tags:
+            logger.info("Cache flush skipped: KV cache memory is released.")
+            return True
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
@@ -5651,20 +5658,22 @@ class Scheduler(
         result = self.tp_worker.load_lora_adapter(recv_req)
         return result
 
-    def load_lora_adapter_from_tensors(
-        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
-    ) -> LoadLoRAAdapterFromTensorsReqOutput:
-        """In-place loading a new lora adapter from serialized tensors."""
-
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
-        return result
-
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        self.weight_updater.forget_lora_adapter(recv_req.lora_name)
+        return result
+
+    def register_lora_adapter(
+        self, recv_req: RegisterLoRAAdapterReqInput
+    ) -> RegisterLoRAAdapterReqOutput:
+        """Create-or-refresh a LoRA adapter's identity and config (weights zeroed)."""
+
+        result = self.tp_worker.register_lora_adapter(recv_req)
+        self.weight_updater.forget_lora_adapter(recv_req.lora_name)
         return result
 
     def init_weights_send_group_for_remote_instance(

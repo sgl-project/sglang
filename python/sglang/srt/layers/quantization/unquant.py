@@ -149,6 +149,7 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (2, 512, 8192): (64, 8, 4, 12),
     (4, 512, 8192): (64, 8, 4, 10),
     (8, 512, 8192): (64, 8, 4, 12),
+    (12, 512, 8192): (64, 8, 4, 12),
     (16, 512, 8192): (64, 8, 4, 12),
     (24, 512, 8192): (64, 8, 4, 12),
     (32, 512, 8192): (64, 16, 4, 9),
@@ -156,6 +157,7 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (2, 2304, 8192): (64, 8, 2, 12),
     (4, 2304, 8192): (128, 8, 4, 6),
     (8, 2304, 8192): (64, 8, 4, 10),
+    (12, 2304, 8192): (128, 16, 4, 5),
     (16, 2304, 8192): (64, 16, 4, 9),
     (24, 2304, 8192): (64, 32, 2, 9),
     (32, 2304, 8192): (64, 32, 2, 9),
@@ -166,6 +168,10 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
+    (1, 1024, 4096): (128, 8, 4, 6),
+    (2, 1024, 4096): (128, 8, 4, 6),
+    (4, 1024, 4096): (128, 8, 4, 6),
+    (8, 1024, 4096): (128, 8, 4, 6),
     # Qwen4-Exp TP4 decode shapes, measured on B300 (sm103) under CUDA graph replay;
     # unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
     (1, 320, 2560): (64, 8, 4, 11),
@@ -953,7 +959,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         block layout. During weight update, checkpoint tensors are in
         canonical layout and need a temporary shape restore for copy.
         """
-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+        if not self.use_flashinfer_trtllm_moe:
             return
 
         expected_shape = None

@@ -39,7 +39,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import get_device_core_count, is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -1302,8 +1302,6 @@ def _run_tgv(
     return out
 
 
-_TGV_NUM_SMS = 148
-
 # (tactic, cta_m, cta_n, num_mma_ctas), smallest cta_n first.
 _TGV_TACTIC_LADDER = (
     (18, 64, 16, 2),
@@ -1324,10 +1322,11 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
 
 def _pick_tactic(m: int, n: int, k: int) -> int:
     """Pick the first ladder tactic whose grid fits one wave of the SMs."""
+    num_sms = get_device_core_count(torch.cuda.current_device())
     best, best_ctas = None, None
     for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
         ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
-        if ctas <= _TGV_NUM_SMS:
+        if ctas <= num_sms:
             return tactic
         if best_ctas is None or ctas < best_ctas:
             best, best_ctas = tactic, ctas
@@ -1340,6 +1339,26 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
 # (L2-defeating weight rotation + CUDA-graph timing; serving A/B confirmed
 # e2e with GSM8K parity). kv_a (n=576) loses (0.84x) and stays out. Gated to
 # small decode batches; larger m stays on the measured heuristic below.
+# Muse Spark Open TP4 projections using TGV on B300 at M <= 8.
+_MUSE_SPARK_TGV_WIN_SHAPES = frozenset(
+    {
+        (4608, 8192),  # qkvg
+        (4096, 8192),  # pooler
+        (8192, 4096),  # unpooler
+        (8192, 2048),  # o_proj
+        (2048, 4096),  # unpooler TP4 slice
+        (1024, 8192),  # pooler TP4 slice
+    }
+)
+
+# Muse Spark Open TP8 projections using TGV on GB300.
+_MUSE_SPARK_TP8_TGV_M_RANGES = {
+    (2304, 8192): (40, 512),
+    (8192, 1024): (1, 64),
+    (512, 8192): (256, 512),
+    (1024, 4096): (1, 512),
+}
+
 _K3_TGV_WIN_SHAPES = frozenset(
     {
         (6144, 7168),  # KDA fused qkvg
@@ -1365,7 +1384,12 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
-    if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+    m_range = _MUSE_SPARK_TP8_TGV_M_RANGES.get((n, k))
+    if m_range is not None:
+        return m_range[0] <= m <= m_range[1]
+    if m <= 8 and (
+        (n, k) in _K3_TGV_WIN_SHAPES or (n, k) in _MUSE_SPARK_TGV_WIN_SHAPES
+    ):
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False

@@ -153,6 +153,13 @@ def get_hidden_dim(
         )
 
 
+def shared_experts_count(config: AutoConfig) -> Optional[int]:
+    # DeepSeek-style configs say n_shared_experts, Kimi K3 says num_shared_experts
+    return getattr(config, "n_shared_experts", None) or getattr(
+        config, "num_shared_experts", None
+    )
+
+
 def get_default_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -188,7 +195,7 @@ def get_default_hidden_dim(
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
-            n_shared = getattr(config, "n_shared_experts", None)
+            n_shared = shared_experts_count(config)
             if moe_inter is not None and n_shared is not None:
                 inter = moe_inter * n_shared
         return config.hidden_size, inter * 2
@@ -198,7 +205,7 @@ def get_default_hidden_dim(
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
-            n_shared = getattr(config, "n_shared_experts", None)
+            n_shared = shared_experts_count(config)
             if moe_inter is not None and n_shared is not None:
                 inter = moe_inter * n_shared
         return inter, config.hidden_size
@@ -240,12 +247,19 @@ def get_default_hidden_dim(
         moe_inter = (
             getattr(config, "moe_intermediate_size", None) or config.intermediate_size
         )
-        return config.hidden_size, moe_inter * 2
+        # Latent MoE (Kimi K3) routes a compressed activation into the experts.
+        moe_hidden = (
+            getattr(config, "routed_expert_hidden_size", None) or config.hidden_size
+        )
+        return moe_hidden, moe_inter * 2
     elif module_name == "down_proj_moe":
         moe_inter = (
             getattr(config, "moe_intermediate_size", None) or config.intermediate_size
         )
-        return moe_inter, config.hidden_size
+        moe_hidden = (
+            getattr(config, "routed_expert_hidden_size", None) or config.hidden_size
+        )
+        return moe_inter, moe_hidden
     elif module_name == "embed_tokens":
         # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
         # if contain extra tokens will be added; otherwise is 0.
@@ -260,6 +274,7 @@ def get_default_hidden_dim(
 
 def get_normalized_target_modules(
     target_modules: Union[str, Iterable[str]],
+    base_model: Optional[torch.nn.Module] = None,
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
@@ -285,6 +300,13 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_qkv": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
+        "in_proj_b": "in_proj_ba",
+        "in_proj_a": "in_proj_ba",
         "out_proj": "out_proj",
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
@@ -305,6 +327,11 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
+        # Models may fuse adapter projections differently from the common HF layout.
+        if base_model is not None and hasattr(
+            base_model, "get_lora_target_module_name"
+        ):
+            name = base_model.get_lora_target_module_name(name)
         base_name = name.split(".")[-1]
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
@@ -323,6 +350,7 @@ def get_stacked_multiply(
     stacked_rank = {
         "qkv_proj": 3,
         "in_proj_qkvz": 4,  # GDN packed input projection
+        "in_proj_ba": 2,  # GDN packed b/a input projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
         "gate_up_proj_shared_moe": 2,
@@ -402,6 +430,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "up_proj",
         "gate_up_proj",
         "down_proj",
@@ -458,7 +487,7 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             else:
                 raw_names.add(leaf_name)
 
-    normalized = get_normalized_target_modules(raw_names)
+    normalized = get_normalized_target_modules(raw_names, base_model=model)
     result = normalized & _KNOWN_LORA_TARGET_MODULES
 
     # Allow models to declare additional LoRA-compatible modules that

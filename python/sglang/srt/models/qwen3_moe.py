@@ -23,6 +23,7 @@ from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -48,7 +49,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK, TopKOutputChecker
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -69,6 +70,11 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.true_on_policy import (
+    get_on_policy_rms_norm_kwargs,
+    is_true_on_policy_enabled,
+    should_disable_fused_qk_norm_mrope,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -341,7 +347,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            if is_true_on_policy_enabled():
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights, self.top_k, dim=-1
+                )
+                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+                routing_weights = routing_weights.to(hidden_states.dtype)
+                topk_output = StandardTopKOutput(
+                    topk_weights=routing_weights,
+                    topk_ids=selected_experts,
+                    router_logits=router_logits,
+                )
+            else:
+                topk_output = self.topk(hidden_states, router_logits)
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(hidden_states, topk_output)
@@ -569,7 +588,7 @@ class Qwen3MoeAttention(nn.Module):
         )
         self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        )
+        ) and not is_true_on_policy_enabled()
         self.compatible_with_fused_qk_norm_rope = not isinstance(
             self.rotary_emb, MRotaryEmbedding
         ) and self.head_dim in (64, 128, 256)
@@ -589,6 +608,7 @@ class Qwen3MoeAttention(nn.Module):
                     )
                 )
             )
+            and not should_disable_fused_qk_norm_mrope()
         )
         self.use_fused_qk_norm_rope_cpu = (
             _is_cpu
@@ -607,8 +627,9 @@ class Qwen3MoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        norm_kwargs = get_on_policy_rms_norm_kwargs(fp32_residual=False)
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.alt_stream = alt_stream
 
     def op_prepare(self, state):
@@ -876,9 +897,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 reduce_results=False,
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        norm_kwargs = get_on_policy_rms_norm_kwargs(fp32_residual=False)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
@@ -1029,6 +1053,23 @@ class Qwen3MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+        # Stacked params mapping for unified weight loading API
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+
         self.capture_aux_hidden_states = False
         # IPC loading bypasses load_weights(), so initialize the EPLB descriptor here.
         self.routed_experts_weights_of_layer = LazyValue(
@@ -1164,21 +1205,8 @@ class Qwen3MoeForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
+        stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.expert_params_mapping
 
         # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
         params_dict = dict(self.named_parameters())

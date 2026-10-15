@@ -178,7 +178,7 @@ class TestSchedulerEndpoints(unittest.TestCase):
         ):
             for ports in (None, [23100, 23200]):
                 with self.subTest(host=host, ports=ports):
-                    args.host = host
+                    args.scheduler_host = host
                     args.scheduler_ports = ports
                     expected = [
                         f"tcp://{expected_host}:{port}"

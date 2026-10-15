@@ -168,13 +168,27 @@ class MiniMaxH3RolloutCollector:
     """Accumulates video-target trajectory and per-step log probs."""
 
     sigmas_video: list[float]
+    return_step_indices: set[int] | None = None
     latent_steps: list[torch.Tensor] = field(default_factory=list)
+    latent_step_indices: list[int] = field(default_factory=list)
     log_prob_sums: list[torch.Tensor] = field(default_factory=list)
     log_prob_counts: list[torch.Tensor] = field(default_factory=list)
     pos_cond_kwargs: dict[str, Any] = field(default_factory=dict)
+    _next_latent_index: int = 0
+
+    def _record_latent(self, video_target: torch.Tensor) -> None:
+        index = self._next_latent_index
+        self._next_latent_index += 1
+        if (
+            self.return_step_indices is not None
+            and index not in self.return_step_indices
+        ):
+            return
+        self.latent_steps.append(video_target.detach().cpu().clone())
+        self.latent_step_indices.append(index)
 
     def record_initial(self, video_target: torch.Tensor) -> None:
-        self.latent_steps.append(video_target.detach().cpu().clone())
+        self._record_latent(video_target)
 
     def record_step(
         self,
@@ -182,7 +196,7 @@ class MiniMaxH3RolloutCollector:
         log_prob_sum: torch.Tensor,
         log_prob_count: torch.Tensor,
     ) -> None:
-        self.latent_steps.append(video_target.detach().cpu().clone())
+        self._record_latent(video_target)
         self.log_prob_sums.append(log_prob_sum.detach().cpu())
         self.log_prob_counts.append(log_prob_count.detach().cpu())
 
@@ -191,7 +205,7 @@ class MiniMaxH3RolloutCollector:
         stacked = torch.stack(self.latent_steps, dim=0).unsqueeze(0)
         divisor = 1000.0
         step_sigmas = torch.tensor(
-            [float(s) for s in self.sigmas_video[:-1]],
+            [float(s) for s in self.sigmas_video],
             dtype=torch.float32,
         )
         timesteps = step_sigmas * divisor
@@ -214,6 +228,9 @@ class MiniMaxH3RolloutCollector:
                 latents=stacked,
                 timesteps=timesteps,
                 sigmas=sigmas,
+                latent_step_indices=torch.tensor(
+                    self.latent_step_indices, dtype=torch.long
+                ),
             ),
         )
 

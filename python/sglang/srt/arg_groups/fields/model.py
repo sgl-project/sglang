@@ -288,6 +288,10 @@ class Model(msgspec.Struct):
             nargs="*",
         ),
     ] = None
+    custom_pull_weights_pre_read_hook: A[
+        Optional[str],
+        "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
+    ] = None
     weight_loader_disable_mmap: A[
         bool,
         "Disable mmap while loading weight using safetensors.",
@@ -324,6 +328,14 @@ class Model(msgspec.Struct):
     remote_instance_weight_loader_start_seed_via_transfer_engine: A[
         bool,
         "Start seed server via transfer engine backend for remote instance weight loader.",
+    ] = False
+    enable_engine_info_bootstrap: A[
+        bool,
+        "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",
+    ] = False
+    enable_rdt_weight_sync: A[
+        bool,
+        "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
     ] = False
     engine_info_bootstrap_port: A[
         int,

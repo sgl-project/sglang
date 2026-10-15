@@ -849,6 +849,7 @@ class CPUGraphRunner:
                     num_tokens,
                     req_pool_indices,
                     seq_lens,
+                    out_cache_loc,
                     None,
                     forward_batch.forward_mode,
                     forward_batch.spec_info,

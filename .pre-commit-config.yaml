@@ -8,7 +8,11 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
+        # A blank unified-diff context line is a single required space, and a
+        # patch that ends on one needs its final newline kept as well.
+        exclude: ^(docker/muse[_-]spark/|3rdparty/amd/muse_spark/patches/).*\.patch$
       - id: end-of-file-fixer
+        exclude: ^(docker/muse[_-]spark/|3rdparty/amd/muse_spark/patches/).*\.patch$
       - id: check-yaml
         args: [--allow-multiple-documents]
         # Helm chart templates embed Go template syntax ({{- ... -}})

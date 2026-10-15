@@ -43,7 +43,13 @@ _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
 
 # Force redirect deep_gemm cache_dir. Defaults under SGLANG_CACHE_DIR so it
 # sits with the other compiled-kernel caches; SGLANG_DG_CACHE_DIR still wins.
-os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
+_dg_cache_dir = envs.SGLANG_DG_CACHE_DIR.get()
+if os.getenv("SGLANG_DG_CACHE_DIR_PER_PROCESS", "0").lower() in ("1", "true", "yes"):
+    # Colocated RL engines share a host; a per-process dir keeps their JIT caches
+    # from racing on the same files.
+    _dg_cache_dir = os.path.join(_dg_cache_dir, f"pid_{os.getpid()}")
+os.makedirs(_dg_cache_dir, exist_ok=True)
+os.environ["DG_JIT_CACHE_DIR"] = _dg_cache_dir
 
 # Refer to https://github.com/deepseek-ai/DeepGEMM/commit/d75b218b7b8f4a5dd5406ac87905039ead3ae42f
 # NVRTC may have performance loss with some cases.

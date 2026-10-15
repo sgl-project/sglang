@@ -209,6 +209,10 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             )
         scheduler_infos.append(data)
         reader.close()
+        if data["actual_scheduler_port"] is not None:
+            server_args.scheduler_ports[data["dp_replica"]] = data[
+                "actual_scheduler_port"
+            ]
 
     logger.debug("All workers are ready")
     logger.info("[server-load] workers_ready_monotonic_ns=%d", time.monotonic_ns())
@@ -241,7 +245,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             logger.info("Launch FastAPI server in another process because of webui.")
             http_server_process = worker_context.Process(
                 target=bootstrap_http_server_process,
-                args=(server_args_payload,),
+                args=(ServerArgsPayload.capture(server_args),),
                 name="sglang-diffusion-webui",
                 daemon=True,
             )
@@ -442,7 +446,7 @@ def launch_pool_disagg_server(
     logger.info("All pool role instances ready")
 
     # Start DiffusionServer
-    frontend_endpoint = f"tcp://{host}:{server_args.scheduler_port}"
+    frontend_endpoint = server_args.scheduler_endpoint
 
     diffusion_server = DiffusionServer(
         frontend_endpoint=frontend_endpoint,
@@ -548,7 +552,7 @@ def launch_disagg_server(server_args: ServerArgs):
     denoiser_result_ep = f"tcp://{host}:{base_port + 2}"
     decoder_result_ep = f"tcp://{host}:{base_port + 3}"
 
-    frontend_endpoint = f"tcp://{host}:{base_port}"
+    frontend_endpoint = server_args.scheduler_endpoint
 
     logger.info(
         "Starting DiffusionServer: %d encoder(s), %d denoiser(s), %d decoder(s)",

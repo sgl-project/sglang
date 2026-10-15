@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -86,6 +87,63 @@ def test_topology_capability(
         )
     else:
         intra_node_capability.assert_not_called()
+
+
+def _workspace_owner(monkeypatch):
+    monkeypatch.setattr(custom_all_reduce_v2, "_FORCE_PUSH_SIZE_KB", None)
+    monkeypatch.setattr(custom_all_reduce_v2.torch.cuda, "synchronize", Mock())
+    monkeypatch.setattr(
+        custom_all_reduce_v2.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+    monkeypatch.setattr(custom_all_reduce_v2.dist, "barrier", Mock())
+    return SimpleNamespace(
+        disabled=False,
+        max_push_size=3 * 1024**2,
+        max_pull_size=16 * 1024**2,
+        max_size=16 * 1024**2,
+        config=object(),
+        device=object(),
+        group=object(),
+        _capture_started=False,
+        _graph_mode_allowed=False,
+        _graph_counter=0,
+        _graph_inputs=[],
+        _init_workspace=Mock(),
+    )
+
+
+def test_reserve_push_preserves_policy_and_is_idempotent(monkeypatch):
+    comm = _workspace_owner(monkeypatch)
+    policy = comm.config
+    reserve = custom_all_reduce_v2.CustomAllReduceV2.reserve_push_capacity
+    reserve(comm, 4 * 1024**2 - 1)
+    assert comm.max_push_size == 4 * 1024**2
+    assert comm.max_size == comm.max_pull_size == 16 * 1024**2
+    assert comm.config is policy
+    comm._init_workspace.assert_called_once_with()
+    custom_all_reduce_v2.torch.cuda.synchronize.assert_called_once_with(comm.device)
+    custom_all_reduce_v2.dist.barrier.assert_called_once_with(group=comm.group)
+    reserve(comm, 2 * 1024**2)
+    reserve(comm, 4 * 1024**2)
+    comm._init_workspace.assert_called_once_with()
+
+
+def test_reserve_push_respects_forced_capacity(monkeypatch):
+    comm = _workspace_owner(monkeypatch)
+    monkeypatch.setattr(custom_all_reduce_v2, "_FORCE_PUSH_SIZE_KB", 3072)
+    custom_all_reduce_v2.CustomAllReduceV2.reserve_push_capacity(comm, 4 * 1024**2)
+    assert comm.max_push_size == 3 * 1024**2
+    comm._init_workspace.assert_not_called()
+
+
+def test_reserve_push_rejects_growth_after_push_only_capture(monkeypatch):
+    comm = _workspace_owner(monkeypatch)
+    # Push-only graphs do not register graph input rows.
+    comm._capture_started = True
+    with pytest.raises(RuntimeError, match="before CUDA graph capture"):
+        custom_all_reduce_v2.CustomAllReduceV2.reserve_push_capacity(comm, 4 * 1024**2)
+    assert comm.max_push_size == 3 * 1024**2
+    comm._init_workspace.assert_not_called()
 
 
 if __name__ == "__main__":

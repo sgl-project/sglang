@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
@@ -51,6 +52,42 @@ def _make_dflash_args(draft_backend: str | None) -> ServerArgs:
 
 
 class TestOOTDFlashHooks(CustomTestCase):
+    def test_noncausal_trtllm_fallback_preserves_platform_defaults(self):
+        cases = (
+            (False, True, False, False, "fa4"),
+            (False, False, False, False, "flashinfer"),
+            (False, False, True, False, "triton"),
+            (False, False, False, True, "triton"),
+            (True, True, False, False, "custom_backend"),
+        )
+        for oot, sm100, hip, xpu, expected in cases:
+            platform = _platform(supported_backends={"custom_backend", "trtllm_mha"})
+            platform.is_out_of_tree.return_value = oot
+            args = _make_dflash_args("trtllm_mha")
+            with (
+                self.subTest(oot=oot, sm100=sm100, hip=hip, xpu=xpu),
+                patch(f"{HOOK_MODULE}.current_platform", platform),
+                patch(
+                    f"{HOOK_MODULE}.get_platform",
+                    return_value=SimpleNamespace(
+                        is_sm100=sm100, is_hip=hip, is_xpu=xpu
+                    ),
+                ),
+                patch(
+                    "sglang.srt.utils.hf_transformers_utils.get_config",
+                    return_value=SimpleNamespace(num_hidden_layers=1, is_causal=False),
+                ),
+                patch(
+                    "sglang.srt.speculative.dflash_utils.get_dflash_layer_types",
+                    return_value=["full_attention"],
+                ),
+            ):
+                _resolve_dflash_draft_attention_backend(args)
+                self.assertEqual(
+                    resolution_result(args, "speculative_draft_attention_backend"),
+                    expected,
+                )
+
     def _resolve_backend(self, draft_backend: str | None, platform: Mock) -> str | None:
         args = _make_dflash_args(draft_backend)
         with (

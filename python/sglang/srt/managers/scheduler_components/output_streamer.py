@@ -62,6 +62,7 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    is_multimodal_gen: bool = False
     _test_stream_output_count: int = 0
 
     def __post_init__(self) -> None:
@@ -205,6 +206,8 @@ class SchedulerOutputStreamer:
                 acc.customized_info[key] = values
 
         # Send to detokenizer
+        if self.is_multimodal_gen:
+            return
         payload = acc.to_payload(
             dp_rank=get_parallel().dp_rank,
             is_idle_batch=is_idle_batch,
@@ -679,6 +682,15 @@ class _GenerationStreamAccumulator:
         if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
+        indexer_topk_num_layers = None
+        if self.return_indexer_topk:
+            from sglang.srt.state_capturer.indexer_topk import (
+                get_global_indexer_capturer,
+            )
+
+            _idx_cap = get_global_indexer_capturer()
+            if _idx_cap is not None:
+                indexer_topk_num_layers = _idx_cap.num_indexer_layers
         return BatchTokenIDOutput(
             rids=self.rids,
             http_worker_ipcs=self.http_worker_ipcs,
@@ -739,6 +751,7 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
+            indexer_topk_num_layers=indexer_topk_num_layers,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
             ),

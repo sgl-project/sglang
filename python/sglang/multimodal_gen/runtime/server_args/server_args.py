@@ -539,6 +539,7 @@ class ServerArgs(DisaggServerArgsMixin):
     webui: bool = False
     webui_port: int | None = 12312
 
+    scheduler_host: str = "127.0.0.1"
     scheduler_port: int = 5555
     # settled ingress ports, one per DP replica; None until ports are settled
     scheduler_ports: list[int] | None = None
@@ -1450,6 +1451,9 @@ class ServerArgs(DisaggServerArgsMixin):
                     )
                 seen_ports[port] = name
                 self._require_port(port, name)
+            self.scheduler_ports = [
+                self.scheduler_port + replica for replica in range(self.dp_size or 1)
+            ]
         else:
             settled_ports: set[int] = set()
             if needs_http:
@@ -2845,6 +2849,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Master port for distributed inference. If not set, a random free port will be used.",
         )
         parser.add_argument(
+            "--scheduler-host",
+            type=str,
+            default=ServerArgs.scheduler_host,
+            help="Host the scheduler binds for client requests.",
+        )
+        parser.add_argument(
             "--scheduler-port",
             type=int,
             default=ServerArgs.scheduler_port,
@@ -3150,7 +3160,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def scheduler_endpoint_for(self, replica: int) -> str:
         """Ingress endpoint of one DP replica's driver rank."""
-        scheduler_host = self.host
+        scheduler_host = self.scheduler_host
         if (
             scheduler_host is None
             or scheduler_host == "localhost"

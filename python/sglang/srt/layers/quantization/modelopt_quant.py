@@ -1621,7 +1621,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
 
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get(
+                "ignore",
+                config.get("modules_to_not_convert", config.get("exclude_modules", [])),
+            )
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
@@ -2412,6 +2415,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
+        """Align TRT-LLM weights, allowing model-specific storage layouts."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            align_fp4_moe_weights_for_flashinfer_trtllm,
+        )
+
+        align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2872,12 +2883,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
         ):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                align_fp4_moe_weights_for_flashinfer_trtllm,
-            )
-
             # FlashInfer TRTLLM processing - handles both w13 and w2
-            align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            self._align_fp4_moe_weights_for_flashinfer_trtllm(layer)
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
