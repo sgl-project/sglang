@@ -183,7 +183,9 @@ class TestLruSkipsNonReloadable(CustomTestCase):
 
 class TestUnloadRefCacheCleanup(CustomTestCase):
     def setUp(self):
-        self.enterContext(get_context().override_server_args(enable_lora=True, dp_size=1))
+        self.enterContext(
+            get_context().override_server_args(enable_lora=True, dp_size=1)
+        )
 
     def _make_unload_tm(self, success: bool) -> TokenizerManager:
         tm = TokenizerManager.__new__(TokenizerManager)
