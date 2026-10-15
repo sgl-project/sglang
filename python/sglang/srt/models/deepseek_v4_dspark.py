@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops import mono
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
@@ -923,6 +924,29 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 positions=positions,
             )
 
+    def _forward_stages_mono(self, plan, x, forward_batch):
+        """Every stage as the whole-layer launches, the FFN post pending between stages (stage 0: identity fold
+        from the embeddings and a one-hot pre, SGLang's copy-0 combine) -> (hidden, last FFN pre)."""
+        pending, pre, last = (None, x, None, None), None, len(self.stages) - 1
+        for i, stage in enumerate(self.stages):
+            span = mono.kernel(plan, stage.layer_id, "layer_in")
+            hidden, pre, out = span(
+                stage,
+                forward_batch.positions,
+                None,
+                None,
+                forward_batch,
+                None,
+                pre,
+                pending,
+                defer_post=i < last,
+            )
+            if out is not None:
+                pending = out
+            else:
+                x = hidden
+        return x, pre
+
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.embed_tokens is None:
             raise ValueError(
@@ -947,10 +971,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
         pre = None
+        plan = mono.route(self, forward_batch)
         # Draft MoE layers have no recorder layer index, so keep them out of the stats.
         with get_global_expert_distribution_recorder().disable_this_region():
-            for stage in self.stages:
-                x, pre = stage(positions, x, forward_batch, pre)
+            if plan is not None:
+                x, pre = self._forward_stages_mono(plan, x, forward_batch)
+            else:
+                for stage in self.stages:
+                    x, pre = stage(positions, x, forward_batch, pre)
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
@@ -1007,6 +1035,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_head=self.markov_head,
         )
 
+    def precompile_kernels_after_loading(self) -> None:
+        if self.hc_pre_from_prev_sublayer and not _is_npu:
+            mono.attach(self, type(self).__name__)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
@@ -1023,6 +1055,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             num_experts=(self.config.n_routed_experts + self.num_fused_shared_experts),
         )
 
+        weights = ((n, mono.load_tensor(self, n, w)) for n, w in weights)
         for name, loaded_weight in weights:
             mapped = (
                 self._remap_dspark_weight_name_npu(name)
@@ -1086,6 +1119,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        mono.loaded(self)
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set

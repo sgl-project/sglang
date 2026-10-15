@@ -232,6 +232,8 @@ _SPECS = {
     "DeepseekV41ForCausalLM": "sglang.kernels.ops.mono.deepseek_v41_gfx950.spec:MONO_SPEC",
     # V4 and V4.1 share the model class; the spec refuses anything but V4.1-Flash's config
     "DeepseekV4ForCausalLM": "sglang.kernels.ops.mono.deepseek_v41_gfx950.spec:MONO_SPEC",
+    # the DSpark draft model: its stages as whole layers, attached by the draft's own loader
+    "DeepseekV4ForCausalLMDSpark": "sglang.kernels.ops.mono.deepseek_v41_gfx950.spec:DRAFT_SPEC",
 }
 
 

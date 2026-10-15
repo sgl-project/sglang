@@ -299,6 +299,9 @@ class Packed:
     between: frozenset = (
         frozenset()
     )  # whole layers whose indexer / compressor run between K1 and K2
+    checked: bool = (
+        True  # check mode compares this model's layers against the module path
+    )
 
     def kernel(self, rows: int) -> MonoKernel:
         return MonoKernel(self, rows)
@@ -306,6 +309,8 @@ class Packed:
     def span(self, route):
         from sglang.kernels.ops.mono.deepseek_v41_gfx950 import glue
 
+        if not self.checked:
+            route = route._replace(checker=None)
         return functools.partial(glue.run_layer, route)
 
 
@@ -492,6 +497,57 @@ def whole_layer_meta(
     return m
 
 
+def draft_build(model, ctx: MonoContext) -> Packed:
+    """The DSpark draft (``DeepseekV4ForCausalLMDSpark``): every stage whole (window-only attention, ratio 0, no
+    indexer) on a runner of its own -- the draft's routing (128 / 3, one FP4 group an ug task, as ATOM's
+    DraftMonoRunner) and its block-window keys: a row reads its request's window up to the anchor and the whole block,
+    the indices SGLang's draft backend builds (window + block, padded to 64 slots)."""
+    from sglang.kernels.ops.mono.deepseek_v41_gfx950 import runner
+    from sglang.kernels.ops.mono.guards import MonoRefused
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import select_dsv4_kv_layout
+
+    t = _text_config(ctx.hf_config)
+    experts, topk = int(t.dspark_n_routed_experts), int(t.dspark_num_experts_per_tok)
+    block = int(model.gamma)  # the draft block's rows a request (DSpark gamma)
+    swa_width = -(-(128 + block) // 64) * 64
+    weights, layer_spans = {}, {}
+    for stage in model.stages:
+        lid = stage.layer_id
+        try:
+            assert getattr(stage.self_attn, "compress_ratio", 0) == 0, (
+                "draft stage with a compressor"
+            )
+            w = _layer_weights(stage, runner)
+            w.check(ctx.tp_size, experts=experts)
+            w.attn = _attn_weights(lid, stage, runner, ctx.tp_rank)
+            w.attn.check(runner.Dims(ctx.tp_size))
+        except (AssertionError, AttributeError, ValueError) as e:
+            raise MonoRefused(
+                f"--enable-monokernel refused (deepseek_v41 DSpark draft): stage {lid}: {e}"
+            ) from None
+        weights[lid], layer_spans[lid] = w, WHOLE
+    layout, _ = select_dsv4_kv_layout()
+    r = runner.DSV41MonoLayer(
+        ctx.tp_size,
+        ctx.tp_rank,
+        ctx.cpu_group,
+        ctx.device,
+        kv41=layout.value == "v41",
+        experts=experts,
+        topk=topk,
+        ug_groups=1,
+        swa_width=swa_width,
+        deadline_ticks=_deadline(ctx),
+    )
+    return Packed(
+        runner=r,
+        weights=weights,
+        spans=layer_spans,
+        rows_per_request=(block,),
+        checked=False,
+    )
+
+
 def eligible(ctx: MonoContext, step: MonoStep):
     return None
 
@@ -520,6 +576,19 @@ def skip_metadata(name, forward_batch, key, source) -> bool:
 
     return skips_schedule(forward_batch, key, source)
 
+
+DRAFT_SPEC = MonoSpec(
+    name="deepseek_v41_dspark_draft",
+    devices={"gfx950": GFX950},
+    features=frozenset({Feature.SPEC_VERIFY, Feature.EAGER, Feature.SPEC_DRAFT_LAYERS}),
+    requires=REQUIRES,
+    spans=lambda hf_config: {},
+    numerics=NUMERICS,
+    config_disable_reasons=lambda cfg, hf_config: [],
+    model_disable_reasons=lambda model: [],
+    build=draft_build,
+    eligible=eligible,
+)
 
 MONO_SPEC = MonoSpec(
     name="deepseek_v41",
