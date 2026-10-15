@@ -380,9 +380,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._chat_template_cache: OrderedDict[
             bytes, tuple[tuple[int, ...], Optional[str]]
         ] = OrderedDict()
-        self._defer_forwarded_prompt_decode = (
-            envs.SGLANG_Q35MF_ARRIVE_SKIP_DECODE.get()
-        )
+        self._defer_forwarded_prompt_decode = envs.SGLANG_Q35MF_ARRIVE_SKIP_DECODE.get()
         if (
             envs.SGLANG_Q35MF_ARRIVE_PREWARM.get()
             and self.tokenizer_manager.tokenizer is not None

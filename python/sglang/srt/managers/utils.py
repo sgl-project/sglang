@@ -253,7 +253,9 @@ class GenerationBatchResult:
         if (
             _RESULT_HOST_RING_ENABLED
             and not return_logprob
-            and not (return_hidden_states and self.logits_output.hidden_states is not None)
+            and not (
+                return_hidden_states and self.logits_output.hidden_states is not None
+            )
             and self._copy_ids_to_pinned_ring()
         ):
             return
