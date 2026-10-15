@@ -123,7 +123,9 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver.get_exec",
                 return_value=SimpleNamespace(
-                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                    moe=SimpleNamespace(
+                        is_ep_scale_joiner=False, is_ep_offset_joiner=False
+                    )
                 ),
             ),
             patch(

@@ -1151,7 +1151,7 @@ _GATHER_SETTLE_BUDGET_S = 20.0
 _GATHER_SETTLE_POLL_S = 0.05
 
 
-def mooncake_all_gather_settling(output, input_, *, group) -> None:
+def mooncake_all_gather_settling(output, input_, *, group, gather) -> None:
     """One mlp_sync gather, retried only while Mooncake refuses it as inactive.
 
     The opposite call from ``mooncake_all_reduce_strict``, for a reason that does not
@@ -1161,15 +1161,14 @@ def mooncake_all_gather_settling(output, input_, *, group) -> None:
     gather after it can land while the membership change is still being digested. The
     refusal is a precondition check raised before the collective is posted, so no peer
     can have completed a gather this rank never sent, and waiting only makes it arrive
-    late rather than not at all.
+    late rather than not at all. ``gather`` is the all-gather to post, with
+    ``all_gather_single``'s signature.
     """
-    from sglang.srt.distributed.utils import all_gather_single
-
     deadline = time.monotonic() + _GATHER_SETTLE_BUDGET_S
     waited_from = None
     while True:
         try:
-            all_gather_single(output, input_, group=group)
+            gather(output, input_, group=group)
             if waited_from is not None:
                 logger.warning(
                     "[Elastic EP] mlp_sync gather settled after %.2fs",

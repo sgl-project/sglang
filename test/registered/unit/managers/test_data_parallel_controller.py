@@ -5,7 +5,7 @@ test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via
 `__new__` and inject only the attrs the schedulers read (`workers`, `status`,
-`_active_workers`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
+`_active_workers`, `_draining_slots`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
 if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
 is exercised as the real method, no mock. The refresh-throttle tests inject
 `load_snapshot_reader` and `_last_refresh_time` on top of those.
@@ -54,6 +54,7 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(num_dp_ranks)]
     ctl.status = [True] * num_dp_ranks
     ctl._active_workers = list(range(num_dp_ranks))
+    ctl._draining_slots = set()
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
@@ -83,7 +84,9 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         controller = DataParallelController.__new__(DataParallelController)
         controller._receive_ports_as_client = MagicMock(return_value=handshake)
         controller.launch_tensor_parallel_group = launch
-        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=True))
+        execution = SimpleNamespace(
+            moe=SimpleNamespace(is_ep_scale_joiner=True, is_ep_offset_joiner=True)
+        )
 
         with (
             patch(
