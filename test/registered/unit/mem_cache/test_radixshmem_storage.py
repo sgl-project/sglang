@@ -203,7 +203,7 @@ class _FakeClient:
         pass
 
 
-_FAKE_SHMRADIX = SimpleNamespace(
+_FAKE_RADIXSHMEM = SimpleNamespace(
     RadixClient=_FakeClient,
     Geometry=_FakeGeometry,
     GeometryMismatch=_GeometryMismatch,
@@ -273,7 +273,7 @@ def _info(prefix):
 class TestRadixShmemStorage(CustomTestCase):
     def setUp(self):
         _FakeClient.servers.clear()
-        self._patch = mock.patch.dict(sys.modules, {"shmradix": _FAKE_SHMRADIX})
+        self._patch = mock.patch.dict(sys.modules, {"radixshmem": _FAKE_RADIXSHMEM})
         self._patch.start()
         from sglang.srt.mem_cache.storage.radixshmem import RadixShmemStorage
 

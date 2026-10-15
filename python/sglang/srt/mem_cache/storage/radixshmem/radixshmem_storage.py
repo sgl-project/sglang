@@ -65,22 +65,22 @@ class _Pool:
 
 class RadixShmemStorage(HiCacheStorage):
     def __init__(self, storage_config: HiCacheStorageConfig, mem_pool_host: Any = None):
-        import shmradix
+        import radixshmem
 
-        self.shmradix = shmradix
+        self.radixshmem = radixshmem
         cfg = storage_config.extra_config or {}
         self.leader = storage_config.tp_rank == 0 or not storage_config.is_mla_model
-        self.client = shmradix.RadixClient(
-            cfg.get("radixshmem_name", "/shmradix"),
+        self.client = radixshmem.RadixClient(
+            cfg.get("radixshmem_name", "/radixshmem"),
             endpoint=cfg.get("radixshmem_endpoint"),
             max_outstanding=int(cfg.get("radixshmem_max_outstanding", 256)),
             local_read_only=not self.leader,
         )
         self.ready_timeout_s = float(cfg.get("radixshmem_timeout_s", 300))
         self.pull_timeout_ms = int(cfg.get("radixshmem_pull_timeout_ms", 30000))
-        self.full = shmradix.ComponentType.FULL
-        self.full_mask = int(shmradix.COMPONENT_MASK_FULL)
-        self.insert_ok = shmradix.InsertError.OK
+        self.full = radixshmem.ComponentType.FULL
+        self.full_mask = int(radixshmem.COMPONENT_MASK_FULL)
+        self.insert_ok = radixshmem.InsertError.OK
         self._salt_parts = (
             storage_config.model_name,
             f"pp{storage_config.pp_rank}",
@@ -121,7 +121,7 @@ class RadixShmemStorage(HiCacheStorage):
             slot_bytes = max(p.page_bytes for p in self.pools.values())
             if slot_bytes == 0:
                 raise RuntimeError("radixshmem: no registered host pool carries data")
-            geometry = self.shmradix.Geometry(
+            geometry = self.radixshmem.Geometry(
                 block_size=self.block_size, full_slot_bytes=slot_bytes
             )
             self.client.configure(geometry)
