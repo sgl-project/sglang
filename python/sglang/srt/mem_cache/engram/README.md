@@ -1,4 +1,10 @@
-# Local Mooncake Engram tables
+# Unified Engram storage with Mooncake
+
+EngramStore provides one storage abstraction for N-gram/hash embeddings and
+direct token-indexed per-layer embeddings across the supported model families.
+Models provide row IDs and interpret returned bytes; storage ownership and
+lookup are shared. Its table contract supports local and remote backends; this
+SGLang integration currently selects local storage.
 
 `--engram-backend mooncake` stores lookup tables in host memory owned by
 Mooncake. `--engram-local-dir` selects the snapshot directory (default:
