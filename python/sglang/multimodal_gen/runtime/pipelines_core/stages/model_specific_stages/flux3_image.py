@@ -55,6 +55,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    FlowRolloutController,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    finalize_rollout_if_enabled,
+    init_rollout_env_if_enabled,
+    prepare_rollout_if_enabled,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
@@ -186,6 +194,7 @@ def denoise_packed(
     step_callback: Callable[[], None] | None = None,
     mode: str = "image",
     sequential_cfg: bool = False,
+    transition: Callable[..., Tensor] | None = None,
 ) -> Tensor:
     if packed.num_samples % 2:
         raise ValueError(
@@ -211,7 +220,11 @@ def denoise_packed(
                 else:
                     unconditional, conditional = dit(packed=packed)[mode].chunk(2)
             velocity = unconditional + guidance * (conditional - unconditional)
-            image = packed.data[mode].chunk(2)[0] + delta * velocity
+            sample = packed.data[mode].chunk(2)[0]
+            if transition is None:
+                image = sample + delta * velocity
+            else:
+                image = transition(step=step, sample=sample, velocity=velocity)
             packed.data[mode] = torch.cat((image, image))
     return packed.data[mode].chunk(2)[0]
 
@@ -769,6 +782,15 @@ class Flux3ImageDenoiseStage(DenoisingStage):
         num_steps = max(0, steps)
         schedule = build_timesteps(steps, alpha)
         batch.timesteps = schedule
+        transition = None
+        if batch.rollout:
+            transition = self._prepare_rollout(
+                batches,
+                server_args,
+                schedule=schedule,
+                image=images[0][0][0],
+                guidance=guidance,
+            )
         with self.use_declared_component(
             component_name="transformer",
             module=self.transformer,
@@ -826,11 +848,99 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                             guidance,
                             step_callback=progress.update,
                             sequential_cfg=sequential_cfg,
+                            transition=transition,
                         )
+        finalize_rollout_if_enabled(
+            batch=batch,
+            latents=latents[None],
+            num_inference_steps=num_steps,
+            final_timestep=schedule.new_zeros(()),
+            pipeline_config=pipeline_config,
+        )
         counts = [sum(image[0].shape[0] for image, _ in group) for group in images]
         for req, latent, group in zip(batches, latents.split(counts), images):
             req.latents, req.latent_ids = latent, group[0][1]
         return batches
+
+    def _prepare_rollout(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+        *,
+        schedule: Tensor,
+        image: tuple[Tensor, Tensor],
+        guidance: float | None,
+    ) -> Callable[..., Tensor]:
+        """Bind the rollout controller; return the stand-in for the Euler update."""
+        batch = batches[0]
+        if (
+            len(batches) != 1
+            or max(1, int(batch.num_outputs_per_prompt or 1)) != 1
+            or self.package_config.dit.flow_map
+            or batch.flux3_condition is not None
+        ):
+            raise ValueError(
+                "FLUX.3 image rollout supports one t2i output per request with CFG"
+            )
+        device = get_local_torch_device()
+        image_tokens, image_ids = image
+        seed = normalize_output_seeds(batch.seed or 0, num_outputs_per_prompt=1)[0]
+        # Python-float dt, as in denoise_packed, keeps ODE steps bit-exact with serving.
+        deltas = (schedule[1:] - schedule[:-1]).tolist()
+
+        def build_controller(*, batch: Req, pipeline_config) -> FlowRolloutController:
+            return FlowRolloutController(
+                sde_type=batch.rollout_sde_type,
+                noise_level=float(batch.rollout_noise_level),
+                log_prob_no_const=batch.rollout_log_prob_no_const,
+                debug_mode=batch.rollout_debug_mode,
+                sde_step_indices=batch.rollout_sde_step_indices,
+                generator=torch.Generator(device=device).manual_seed(seed),
+                return_dit_trajectory=batch.rollout_return_dit_trajectory,
+                return_step_indices=batch.rollout_return_step_indices,
+                # FLUX.3 shards inside the DiT; the latent tokens stay whole.
+                shard_for_sp=lambda latents: latents,
+                gather_for_sp=lambda stacked_latents: stacked_latents,
+                sigmas=schedule,
+                latents_shape=(1, *image_tokens.shape),
+                ode_transition=lambda *, model_output, sample, step_index: (
+                    sample + deltas[step_index] * model_output
+                ),
+            )
+
+        prepare_rollout_if_enabled(
+            batch=batch,
+            pipeline_config=server_args.pipeline_config,
+            build_controller=build_controller,
+        )
+        neg_cond, pos_cond = (
+            {
+                "encoder_hidden_states": tokens,
+                "flux3_txt_4d_rope_pos_ids": ids,
+                "flux3_img_4d_rope_pos_ids": image_ids,
+            }
+            for tokens, ids in batch.flux3_text  # [negative, positive]
+        )
+        init_rollout_env_if_enabled(
+            batch=batch,
+            image_kwargs={},
+            pos_cond_kwargs=pos_cond,
+            neg_cond_kwargs=neg_cond,
+            guidance=torch.tensor(guidance),
+        )
+        controller = batch.rollout_controllers["visual"]
+        sigmas = schedule.to(device)
+        return lambda *, step, sample, velocity: controller.transition(
+            model_output=velocity[None],
+            sample=sample[None],
+            current_sigma=sigmas[step],
+            next_sigma=sigmas[step + 1],
+            dt=sigmas[step + 1] - sigmas[step],
+            generator=controller.generator,
+            step_index=step,
+            # sigma * 1000, the trajectory timestep convention of the other families.
+            timestep=sigmas[step] * 1000,
+        )[0]
 
 
 class Flux3ImageDecodeStage(PipelineStage):
@@ -875,7 +985,11 @@ class Flux3ImageDecodeStage(PipelineStage):
                     vae_decode(self.vae, batch.latents, batch.latent_ids, batched=True),
                     batch.flux3_crop,
                 )
-        return OutputBatch(output=self._to_display(image), metrics=batch.metrics)
+        return OutputBatch(
+            output=self._to_display(image),
+            metrics=batch.metrics,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
+        )
 
     @torch.no_grad()
     def run_grouped_requests(self, batches, server_args):
@@ -905,6 +1019,7 @@ class Flux3ImageDecodeStage(PipelineStage):
                             self._to_display(crop_output(images, req.flux3_crop))
                         ),
                         metrics=req.metrics,
+                        rollout_trajectory_data=req.rollout_trajectory_data,
                     )
         return outputs
 
