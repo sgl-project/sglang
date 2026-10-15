@@ -27,10 +27,10 @@ pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@r
 The picker selects `black-forest-labs/flux-3-image-klein-base` or
 `black-forest-labs/flux-3-image-klein`, each a self-contained repository. Access
 to the selected checkpoint is required. Keep `--model-path` at its repository
-root; `--model-variant` selects only the quantized DiT. Release-checkpoint
-validation is pending; earlier measurements used a pre-release checkpoint.
-Unverified hardware or resource shapes remain selectable but are not measured
-recommendations.
+root; `--model-variant` selects only the quantized DiT. Both release BF16
+checkpoints have single-GB300 generation checks; see the validation boundaries
+below. Unverified hardware or resource shapes remain selectable but are not
+measured recommendations.
 </Note>
 
 <Warning>
@@ -261,6 +261,13 @@ and after batching matched exactly. Preserve additional memory headroom for
 batching rather than assuming a batch-1 recipe fits on a 32 GB card at batch 2.
 
 ## 8. Validation boundaries
+
+Both release BF16 checkpoints have been tested on one GB300 with FlashAttention,
+eager execution, all components resident and batch 1: 1024x1024 T2I and I2I,
+50 steps for Base and 16 for distilled, two prompts/seeds, and repeated requests.
+The repeated requests matched pixel-for-pixel within each quality setting.
+These generation checks do not establish official-reference parity or validate
+the other hardware, quantization and parallel configurations in the picker.
 
 The native DiT's packed CFG forward has focused comparison tests against the
 shared FLUX 3 transformer. Such component tests do not replace full-checkpoint

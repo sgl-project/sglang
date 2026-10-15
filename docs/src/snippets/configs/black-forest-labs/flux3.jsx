@@ -181,7 +181,13 @@ return {
         nodes: { min: 1, max: 1 },
         gpus_per_node: { min: 1, max: 8 },
       },
-      verifiedRecipes: [],
+      verifiedRecipes: [{
+        id: "gb300-base-bf16", hw: "gb300", nodes: 1,
+        gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1,
+        variant: "base", quant: "bf16", placement: "resident", attention: "fa",
+        execution: "eager", quality: "exact", batch_size: 1, outputs: 1,
+        default: true,
+      }],
       autoTopology: (s) => ({
         tp_size: Number(s.gpus_per_node) || 1,
         ulysses_degree: 1,
@@ -227,15 +233,20 @@ return {
       if (Number(s.batch_size) > 1) {
         parallel.push(`--batching-max-size ${Number(s.batch_size)}`, `--batching-delay-ms ${Number(s.batch_delay) || 0}`);
       }
-      const warnings = ["Release-checkpoint validation is pending. Earlier measurements used a pre-release checkpoint."];
+      const verified = s.hw === "gb300" && gpus === 1
+        && ["base", "distilled"].includes(s.variant) && s.quant === "bf16"
+        && s.placement === "resident" && s.attention === "fa"
+        && s.execution === "eager" && ["exact", "lossless"].includes(s.quality)
+        && Number(s.batch_size) === 1 && Number(s.outputs) === 1;
+      const warnings = verified ? [] : ["This exact hardware, checkpoint and topology combination is not yet end-to-end verified."];
       if (s.hw === "rtx5090" && s.placement === "resident" && Number(s.batch_size) > 1) {
         warnings.push("Full-resolution batching needs additional activation memory. Use offload or batch 1 if the resident batch does not fit.");
       }
       return {
         match: { hw: s.hw },
         nnodes: 1,
-        verified: false,
-        verificationStatus: errors.length ? "error" : "unverified",
+        verified: verified && !errors.length,
+        verificationStatus: errors.length ? "error" : verified ? "verified" : "unverified",
         env: [],
         flags: [
           `--model-path ${modelOf(s)}`,
@@ -249,8 +260,8 @@ return {
           errors,
           warnings,
           verification: {
-            serve: errors.length ? "error" : "unverified",
-            request: errors.length ? "error" : "unverified",
+            serve: errors.length ? "error" : verified ? "verified" : "unverified",
+            request: errors.length ? "error" : verified ? "verified" : "unverified",
           },
           resolvedSettings: {
             placement: s.placement === "resident" ? "GPU resident" : s.placement === "offload" ? "Layerwise offload" : "Auto",
