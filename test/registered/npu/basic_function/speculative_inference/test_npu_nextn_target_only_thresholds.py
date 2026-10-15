@@ -150,6 +150,7 @@ class TestNpuNextnTargetOnlyThresholds(CustomTestCase):
             )
         )
 
+        print(f"Generated text: {result['text']!r}")
         print(
             "Qwen3.5-9B NEXTN generated "
             f"{completion_tokens} tokens; accepted {correct}/{proposed} drafts "
