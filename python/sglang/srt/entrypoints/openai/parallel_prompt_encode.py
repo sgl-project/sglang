@@ -243,6 +243,13 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
     return chunks
 
 
+def prebuild_parallel_prompt_encode_plan(tokenizer):
+    # The plan parses the whole tokenizer config under the GIL; built lazily, that
+    # stalls every stream of the process on the first long prompt.
+    if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get():
+        _plan_for(tokenizer)
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
     global _parallel_ok, _parallel_pid

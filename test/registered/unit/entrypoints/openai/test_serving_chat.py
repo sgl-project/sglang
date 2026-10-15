@@ -258,6 +258,15 @@ class TestChatTemplateCache(CustomTestCase):
             2,
         )
 
+    def test_skipped_prompt_decode_caches_ids_without_text(self):
+        first = self._render(decode_prompt=False)
+        second = self._render()
+
+        self.assertEqual(first, ([11, 12], None))
+        self.assertEqual(second, ([11, 12], None))
+        self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
+        self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
     def test_non_serializable_input_bypasses_cache(self):
         messages = [{"role": "user", "content": object()}]
         self._render(messages=messages)
@@ -640,6 +649,43 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertEqual(adapted.input_ids, [11, 22, 33])
         self.assertIsNone(adapted.text)
+
+    def _setup_text_only_jinja_reuse(self, prompt_ids):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        self.tm.tokenizer.apply_chat_template.return_value = "rendered prompt"
+        self.tm.tokenizer.encode.return_value = prompt_ids
+        self.tm.tokenizer.decode.return_value = "decoded prompt"
+
+    def test_deferred_prompt_decode_forwards_same_ids_without_decode(self):
+        self._setup_text_only_jinja_reuse([11, 22, 33])
+        stock, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.tm.tokenizer.decode.reset_mock()
+        self.chat._chat_template_cache.clear()
+
+        self.chat._defer_forwarded_prompt_decode = True
+        deferred, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(stock.input_ids, [11, 22, 33])
+        self.assertEqual(deferred.input_ids, stock.input_ids)
+        self.assertIsNone(deferred.text)
+        self.tm.tokenizer.decode.assert_not_called()
+
+    def test_deferred_prompt_decode_still_sends_decoded_text(self):
+        # Empty ids are not forwarded, so the text prompt must match the stock decode.
+        self._setup_text_only_jinja_reuse([])
+        stock, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.chat._chat_template_cache.clear()
+
+        self.chat._defer_forwarded_prompt_decode = True
+        deferred, _ = self.chat._convert_to_internal_request(self.basic_req)
+
+        self.assertEqual(stock.text, "decoded prompt")
+        self.assertEqual(deferred.text, stock.text)
+        self.assertIsNone(deferred.input_ids)
 
     def test_prompt_reuse_keeps_media_path(self):
         self.tm.model_config.is_multimodal = True
