@@ -4127,9 +4127,15 @@ class DeepseekV4Model(nn.Module):
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_input_ids = forward_batch.input_ids[:total]
+                if is_in_breakable_cuda_graph():
+                    # The hasher reads per-request rows and commits the n-gram
+                    # history, so CP breakable graphs run it at an eager break.
+                    hash_ids = bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, global_input_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(global_input_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]

@@ -2095,9 +2095,12 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         use_prefill_cuda_graph: bool = False,
+        out_cache_loc: Optional[torch.Tensor] = None,
     ) -> DSV4Metadata:
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         extend_seq_lens = forward_batch.extend_seq_lens
+        if out_cache_loc is None:
+            out_cache_loc = forward_batch.out_cache_loc
         assert (
             seq_lens is not None
             and seq_lens_cpu is not None
@@ -2112,7 +2115,7 @@ class DeepseekV4HipRadixBackend(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu.tolist(),
-            out_cache_loc=forward_batch.out_cache_loc,
+            out_cache_loc=out_cache_loc,
             num_tokens=sum(extend_seq_lens_cpu),
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -2330,6 +2333,14 @@ class DeepseekV4HipRadixBackend(
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu,
+            # CP replays build from the static batch, whose out_cache_loc is padded to
+            # the bucket; the eager low-ratio sources write only the live rows.
+            # init_forward_metadata_in_graph pins the bucket-sized SWA store target.
+            out_cache_loc=(
+                forward_batch.out_cache_loc[: sum(forward_batch.extend_seq_lens_cpu)]
+                if is_cp_active(forward_batch)
+                else None
+            ),
         )
 
     @staticmethod
@@ -2368,10 +2379,6 @@ class DeepseekV4HipRadixBackend(
             raise NotImplementedError(
                 "breakable prefill CUDA graphs on HIP support only the DeepSeek-V4.1 layout "
                 "(ratios 1 / 2); the c4 / c128 metadata is not pinned for the captured segments"
-            )
-        if get_parallel().attn_cp_size != 1:
-            raise NotImplementedError(
-                "breakable prefill CUDA graphs on HIP do not support attention CP"
             )
         assert forward_batch.forward_mode.is_extend(), forward_batch.forward_mode
         max_seq_len = self._graph_metadata_max_seq_len(forward_batch)
@@ -3368,13 +3375,17 @@ class DeepseekV4HipRadixBackend(
         rows, which are request-major like the extend's (interleave keeps the order)."""
         cp_meta = forward_batch.attn_cp_metadata
         total = int(cp_meta.total_seq_lens)
+        extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
+        # CP breakable graphs set total_seq_lens to the capture bucket; the sources
+        # run at an eager break and read only the live logical rows.
+        total = min(total, sum(extend_lens_cpu))
         tail = self.forward_metadata.late_layer_tail
         if tail is not None:
             q_lens_cpu = tail.local_lens_cpu
             req_global, pos_global = tail.req_global, tail.pos_global
         else:
             q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                extend_lens_cpu,
                 get_parallel().attn_cp_rank,
                 get_parallel().attn_cp_size,
             )

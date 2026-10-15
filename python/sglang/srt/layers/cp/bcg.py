@@ -31,7 +31,10 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
 )
-from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.interleave import (
+    _HIP_MIN_TOKENS_PER_RANK,
+    InterleaveCPStrategy,
+)
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
@@ -100,8 +103,13 @@ def filter_prefill_cp_bcg_capture_num_tokens(
 ) -> list[int]:
     """Keep only token buckets where the selected CP strategy can run."""
     min_num_tokens = resolved_view(server_args).attn_cp_size
-    if resolving_view(server_args).cp_strategy == "zigzag":
+    cp_strategy = resolving_view(server_args).cp_strategy
+    if cp_strategy == "zigzag":
         min_num_tokens *= 2
+    elif cp_strategy == "interleave" and is_hip():
+        # InterleaveCPStrategy.can_apply leaves smaller HIP batches unsharded,
+        # so a smaller bucket could never be captured or replayed with CP.
+        min_num_tokens *= _HIP_MIN_TOKENS_PER_RANK
     filtered = [size for size in capture_num_tokens if size >= min_num_tokens]
     if not filtered:
         raise ValueError(

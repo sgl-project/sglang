@@ -1,4 +1,4 @@
-"""CPU checks for DSV4 interleave BCG padding and the eager logits tail."""
+"""CPU checks for DSV4 interleave BCG padding, the eager logits tail and the HIP V4.1 path."""
 
 import unittest
 from contextlib import nullcontext
@@ -7,6 +7,9 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+    DeepseekV4HipRadixBackend,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy, init_cp_strategy
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -26,6 +29,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4PrefillCPBCG(unittest.TestCase):
+    def setUp(self):
+        # The layouts below use fewer tokens than the HIP CP minimum per rank;
+        # the HIP rule has its own test (test_dsv41_prefill_cp_bcg_hip.py).
+        for target, kwargs in (
+            ("sglang.srt.layers.cp.interleave._is_hip", {"new": False}),
+            ("sglang.srt.layers.cp.bcg.is_hip", {"return_value": False}),
+        ):
+            patcher = patch(target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
 
@@ -442,6 +456,237 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             )
         else:
             self.assertNotIn("hidden_states_before_norm", kwargs)
+
+
+_HIP = "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix"
+
+
+class TestDSV41PrefillCPBCGHip(unittest.TestCase):
+    def tearDown(self):
+        init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
+
+    def test_capture_buckets_follow_hip_min_tokens_per_rank(self):
+        cfg = SimpleNamespace(attn_cp_size=4, cp_strategy="interleave")
+        buckets = [16, 32, 63, 64, 128]
+        with (
+            patch("sglang.srt.layers.cp.bcg.resolving_view", return_value=cfg),
+            patch("sglang.srt.layers.cp.bcg.resolved_view", return_value=cfg),
+        ):
+            with patch("sglang.srt.layers.cp.bcg.is_hip", return_value=True):
+                self.assertEqual(
+                    filter_prefill_cp_bcg_capture_num_tokens(buckets, cfg), [64, 128]
+                )
+                with self.assertRaisesRegex(ValueError, ">= 64"):
+                    filter_prefill_cp_bcg_capture_num_tokens([16, 32], cfg)
+                cfg.cp_strategy = "zigzag"
+                self.assertEqual(
+                    filter_prefill_cp_bcg_capture_num_tokens(buckets, cfg),
+                    [16, 32, 63, 64, 128],
+                )
+                cfg.cp_strategy = "interleave"
+            with patch("sglang.srt.layers.cp.bcg.is_hip", return_value=False):
+                self.assertEqual(
+                    filter_prefill_cp_bcg_capture_num_tokens(buckets, cfg), buckets
+                )
+
+    def test_smallest_hip_bucket_is_cp_active(self):
+        # Every captured bucket must shard; prepare_cp_forward asserts it does.
+        init_cp_strategy(enable_prefill_cp=True, cp_size=4, cp_strategy="interleave")
+        cfg = SimpleNamespace(attn_cp_size=4, cp_strategy="interleave")
+        with (
+            patch("sglang.srt.layers.cp.bcg.resolving_view", return_value=cfg),
+            patch("sglang.srt.layers.cp.bcg.resolved_view", return_value=cfg),
+            patch("sglang.srt.layers.cp.bcg.is_hip", return_value=True),
+            patch("sglang.srt.layers.cp.interleave._is_hip", True),
+        ):
+            smallest = filter_prefill_cp_bcg_capture_num_tokens([8, 63, 64, 96], cfg)[0]
+            for num_tokens, expected in ((smallest - 1, False), (smallest, True)):
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    extend_seq_lens_cpu=[num_tokens],
+                )
+                self.assertEqual(
+                    get_cp_strategy().can_apply(num_tokens, batch), expected
+                )
+
+    def test_low_ratio_capture_accepts_attention_cp(self):
+        metadata = object()
+        backend = SimpleNamespace(
+            low_ratios=(1, 2),
+            has_c4=False,
+            has_c128=False,
+            _graph_metadata_max_seq_len=Mock(return_value=None),
+            _prefill_metadata_for_batch=Mock(return_value=metadata),
+            init_forward_metadata_in_graph=Mock(),
+            _refresh_fp4_prefill_workspace=Mock(),
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        with (
+            get_parallel().override(attn_cp_size=4, attn_cp_rank=1),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+                "is_unified_kv_triton",
+                return_value=False,
+            ),
+        ):
+            result = DeepseekV4HipRadixBackend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                backend, batch
+            )
+        self.assertIs(result, metadata)
+        self.assertIs(backend.forward_metadata, metadata)
+        backend.init_forward_metadata_in_graph.assert_called_once_with(batch)
+        backend._refresh_fp4_prefill_workspace.assert_called_once_with(batch)
+
+    def test_low_ratio_cp_graph_metadata_writes_only_live_rows(self):
+        # A CP replay builds from the static batch, whose out_cache_loc is padded to
+        # the bucket (32). The eager low-ratio sources write the 11 live rows, so the
+        # write fields (raw/c1/c2 out_loc) must be built from the live prefix only.
+        bucket, lengths = 32, [5, 6]
+        for cp_active in (False, True):
+            backend = SimpleNamespace(
+                _init_forward_metadata_prefill_from_batch=Mock(return_value="meta")
+            )
+            out_cache_loc = torch.zeros(bucket, dtype=torch.int64)
+            out_cache_loc[: sum(lengths)] = torch.arange(1, sum(lengths) + 1)
+            batch = SimpleNamespace(
+                seq_lens_cpu=torch.tensor([30, 41]),
+                seq_lens=torch.tensor([30, 41]),
+                req_pool_indices=torch.tensor([1, 2]),
+                max_seq_len_override=None,
+                extend_seq_lens_cpu=lengths,
+                out_cache_loc=out_cache_loc,
+            )
+            with patch(f"{_HIP}.is_cp_active", return_value=cp_active):
+                self.assertEqual(
+                    DeepseekV4HipRadixBackend._prefill_metadata_for_batch(
+                        backend, batch
+                    ),
+                    "meta",
+                )
+            kwargs = backend._init_forward_metadata_prefill_from_batch.call_args.kwargs
+            self.assertEqual(kwargs["max_seq_len"], 41)
+            if cp_active:
+                torch.testing.assert_close(
+                    kwargs["out_cache_loc"], out_cache_loc[: sum(lengths)]
+                )
+            else:
+                self.assertIsNone(kwargs["out_cache_loc"])
+
+    def test_low_ratio_sources_read_live_rows_under_a_bucket_total(self):
+        # CP BCG sets total_seq_lens to the capture bucket (16); the compressor and
+        # the indexer must still see the 11 live tokens of the [5, 6] extend.
+        bucket, cp_size, lengths = 16, 2, [5, 6]
+        live = sum(lengths)
+        for rank in range(cp_size):
+            positions = torch.zeros(bucket, dtype=torch.int64)
+            positions[:live] = torch.cat([torch.arange(n) + 100 for n in lengths])
+            batch = SimpleNamespace(
+                attn_cp_metadata=SimpleNamespace(total_seq_lens=bucket),
+                extend_seq_lens_cpu=list(lengths),
+                positions=positions,
+            )
+            local_rows = bucket // cp_size
+            x = torch.arange(local_rows, dtype=torch.float32)[:, None]
+            gathered = torch.arange(bucket, dtype=torch.float32)[:, None]
+            backend = SimpleNamespace(
+                forward_metadata=SimpleNamespace(late_layer_tail=None),
+                _low_ratio_compress=Mock(),
+                _low_ratio_index_topk=Mock(),
+            )
+            layer = SimpleNamespace(compressor=object(), indexer=object())
+            local_positions = positions[:live][rank::cp_size]
+            with (
+                get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size),
+                patch(
+                    f"{_HIP}.cp_materialize_global_token_order",
+                    return_value=gathered,
+                ),
+                patch(
+                    f"{_HIP}.token_req_indices",
+                    side_effect=lambda fb, num_tokens: torch.zeros(num_tokens),
+                ) as req_indices,
+            ):
+                DeepseekV4HipRadixBackend._forward_low_ratio_sources_cp(
+                    backend,
+                    layer=layer,
+                    x=x,
+                    q_lora=torch.ones(local_rows, 4),
+                    positions=torch.nn.functional.pad(
+                        local_positions, (0, local_rows - local_positions.shape[0])
+                    ),
+                    forward_batch=batch,
+                    run_compressor=True,
+                    run_indexer=True,
+                )
+            self.assertEqual(req_indices.call_args.kwargs["num_tokens"], live)
+            _, x_global, req, pos, _ = backend._low_ratio_compress.call_args.args
+            torch.testing.assert_close(x_global, gathered[:live])
+            self.assertEqual(req.shape[0], live)
+            torch.testing.assert_close(pos, positions[:live])
+
+            args = backend._low_ratio_index_topk.call_args
+            rows = args.kwargs["rows_per_request"]
+            self.assertEqual(sum(rows), local_positions.shape[0])
+            self.assertEqual(args.args[1].shape[0], sum(rows))
+            torch.testing.assert_close(args.args[4], local_positions)
+
+    def test_cp_engram_hash_runs_at_an_eager_break_in_breakable_graphs(self):
+        from sglang.srt.models import deepseek_v4
+
+        bucket, cp_size, local_rows = 16, 2, 8
+        for in_graph in (False, True):
+            hash_ids = torch.arange(bucket)[:, None, None].expand(bucket, 2, 3)
+            hasher = Mock(return_value=hash_ids)
+            eager_break = Mock(return_value=hash_ids)
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                attn_cp_metadata=SimpleNamespace(total_seq_lens=bucket),
+                input_ids=torch.arange(bucket + 4),
+            )
+            model = SimpleNamespace(
+                pp_group=SimpleNamespace(world_size=1),
+                engram_hasher=hasher,
+                late_layer_start=None,
+                start_layer=1,
+                end_layer=1,
+                layers=[SimpleNamespace(hc_cfg=None)],
+            )
+            state = Mock()
+            state.materialized.return_value = SimpleNamespace(residual="r", pre="p")
+            with (
+                get_parallel().override(attn_cp_rank=1, attn_cp_size=cp_size),
+                patch.object(deepseek_v4, "is_cp_active", return_value=True),
+                patch.object(
+                    deepseek_v4, "is_in_breakable_cuda_graph", return_value=in_graph
+                ),
+                patch.object(
+                    deepseek_v4, "bcg_deepseek_v4_engram_hash_ids", eager_break
+                ),
+                patch.object(
+                    deepseek_v4,
+                    "get_forward",
+                    return_value=SimpleNamespace(sp_active=False),
+                ),
+                patch.object(deepseek_v4.mhc, "HcState", return_value=state),
+            ):
+                out = deepseek_v4.DeepseekV4Model._forward_layers_hc_pre_from_prev(
+                    model,
+                    positions=torch.zeros(local_rows, dtype=torch.int64),
+                    hidden_states=torch.zeros(local_rows, 4),
+                    forward_batch=batch,
+                    input_ids=torch.zeros(local_rows, dtype=torch.int64),
+                    input_ids_global=torch.zeros(local_rows, dtype=torch.int64),
+                    capture_dspark=False,
+                    dspark_aux_hidden_states=[],
+                )
+            self.assertEqual(out, ("r", "p", None))
+            called, idle = (eager_break, hasher) if in_graph else (hasher, eager_break)
+            idle.assert_not_called()
+            called.assert_called_once()
+            ids = called.call_args.args[1 if in_graph else 0]
+            torch.testing.assert_close(ids, batch.input_ids[:bucket])
+            if in_graph:
+                self.assertIs(called.call_args.args[0], hasher)
 
 
 if __name__ == "__main__":
