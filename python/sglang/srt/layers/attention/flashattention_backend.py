@@ -257,6 +257,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
+        # CUDA graph state for the SWA window align, set by init_cuda_graph_state.
+        self._swa_align_seqlens: Optional[torch.Tensor] = None
+        self._swa_align_leftpad: Optional[torch.Tensor] = None
 
         self.is_prefill_aware_swa = getattr(model_runner, "prefill_aware_swa", False)
         if self.is_prefill_aware_swa:
@@ -511,25 +514,31 @@ class FlashAttentionBackend(AttentionBackend):
         tile_mn = self._swa_fa4_tile_mn(is_swa_layer, packed_q_rows=packed, allow=allow)
         return {"tile_mn": tile_mn} if tile_mn is not None else {}
 
-    def _swa_align_out_buffers(self, seqlens: torch.Tensor):
+    def _swa_align_graph_buffers(self, seqlens: torch.Tensor):
+        # Captured kernels read these addresses, and replay prep writes them out
+        # of graph, so they are allocated once in init_cuda_graph_state and never
+        # replaced. Eager forwards must not use them.
         n = int(seqlens.numel())
-        buf_s = getattr(self, "_swa_align_seqlens", None)
-        if buf_s is None or buf_s.numel() < n or buf_s.device != seqlens.device:
-            cap = max(n, int(getattr(self, "_swa_align_capacity", n)))
-            self._swa_align_seqlens = torch.zeros(
-                cap, dtype=torch.int32, device=seqlens.device
-            )
-            self._swa_align_leftpad = torch.zeros_like(self._swa_align_seqlens)
+        assert_buffer_fits(n, self._swa_align_seqlens.numel(), "SWA window align")
         return self._swa_align_seqlens[:n], self._swa_align_leftpad[:n]
 
     def _compute_swa_window_align(
-        self, seqlens: torch.Tensor, window_left: int, query_len: int
+        self,
+        seqlens: torch.Tensor,
+        window_left: int,
+        query_len: int,
+        *,
+        use_graph_buffers: bool,
     ):
         from sglang.kernels.ops.attention.swa_window_align import (
             align_swa_cache_seqlens,
         )
 
-        out_seqlens, out_leftpad = self._swa_align_out_buffers(seqlens)
+        out_seqlens, out_leftpad = (
+            self._swa_align_graph_buffers(seqlens)
+            if use_graph_buffers
+            else (None, None)
+        )
         return align_swa_cache_seqlens(
             seqlens,
             window_left=window_left,
@@ -538,7 +547,9 @@ class FlashAttentionBackend(AttentionBackend):
             out_leftpad=out_leftpad,
         )
 
-    def _fill_swa_window_align(self, metadata: FlashAttentionMetadata) -> None:
+    def _fill_swa_window_align(
+        self, metadata: FlashAttentionMetadata, use_graph_buffers: bool = True
+    ) -> None:
         from sglang.kernels.ops.attention.swa_window_align import (
             swa_window_align_supported,
         )
@@ -557,7 +568,10 @@ class FlashAttentionBackend(AttentionBackend):
         if seqlens is None:
             return
         aligned, leftpad = self._compute_swa_window_align(
-            seqlens, int(self.sliding_window_size), q_len
+            seqlens,
+            int(self.sliding_window_size),
+            q_len,
+            use_graph_buffers=use_graph_buffers,
         )
         metadata.swa_aligned_seqlens = aligned
         metadata.swa_cache_leftpad = leftpad
@@ -596,7 +610,10 @@ class FlashAttentionBackend(AttentionBackend):
             and metadata.swa_aligned_seqlens.shape == cache_seqlens.shape
         ):
             return metadata.swa_aligned_seqlens, metadata.swa_cache_leftpad
-        return self._compute_swa_window_align(cache_seqlens, int(window_left), q_len)
+        # Used right here: eager allocates, a capture allocates from its pool.
+        return self._compute_swa_window_align(
+            cache_seqlens, int(window_left), q_len, use_graph_buffers=False
+        )
 
     def supports_swa_head_gate(self) -> bool:
         return self.fa_impl_ver == 4
@@ -1521,7 +1538,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
-        self._fill_swa_window_align(metadata)
+        # Eager: the batch may be wider than any captured graph.
+        self._fill_swa_window_align(metadata, use_graph_buffers=False)
         self.forward_metadata = metadata
 
     def get_paged_mha_kv_cache(
@@ -2607,9 +2625,8 @@ class FlashAttentionBackend(AttentionBackend):
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
 
         # This is being used by normal decode and draft decode when topk == 1
-        self._swa_align_capacity = max_bs * max(int(self.topk or 1), 1)
         self._swa_align_seqlens = torch.zeros(
-            self._swa_align_capacity, dtype=torch.int32, device=self.device
+            max_bs * max(int(self.topk or 1), 1), dtype=torch.int32, device=self.device
         )
         self._swa_align_leftpad = torch.zeros_like(self._swa_align_seqlens)
         self.decode_cuda_graph_metadata = {
