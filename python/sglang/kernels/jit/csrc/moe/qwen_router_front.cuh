@@ -5,8 +5,9 @@
 // cute-dsl grouped GEMMs consume.
 //
 // Every CTA computes the logits of kExpertsPerCta experts for all tokens on
-// tensor cores; CTA b < M also quantizes token row b. The last CTA to arrive
-// (acq_rel counter, no spinning) runs top-k and builds the routing tables.
+// tensor cores, bitwise equal to the cuBLAS router GEMM (see gemv_chain); CTA
+// b < M also quantizes token row b. The last CTA to arrive (acq_rel counter, no
+// spinning) runs top-k and builds the routing tables.
 // router_tail_kernel runs the same top-k, quantization and tables behind a
 // router GEMM computed elsewhere (bitwise to the stock chain given its logits).
 //
@@ -64,8 +65,12 @@ struct Params {
   uint64_t* trace;                   // optional %globaltimer stamps (instrumented build only)
   uint32_t num_tokens;
   uint32_t tile_log2;
-  uint32_t full;  // 0: logits and top-k only (no input quantization, no routing tables)
+  uint32_t mode;  // kMode* bits: input quantization, top-k, routing tables
 };
+
+inline constexpr uint32_t kModeQuant = 1u;
+inline constexpr uint32_t kModeTopk = 2u;
+inline constexpr uint32_t kModeTables = 4u;
 
 SGL_DEVICE float bf16_lo(uint32_t v) {
   return __uint_as_float(v << 16);
@@ -587,7 +592,7 @@ SGL_DEVICE void topk_and_tables(const Params& p, uint32_t* s_mask, int16_t* s_ti
   }
   __syncthreads();
   trace_stamp<kTrace>(p, kNumCtas * 8 + 2);
-  if (!p.full) return;
+  if (!(p.mode & kModeTables)) return;
 
   // Tiles in ascending expert order; with M <= 16 every active expert owns one tile.
   const uint32_t e0 = 2 * threadIdx.x;
@@ -634,47 +639,119 @@ SGL_DEVICE void topk_and_tables(const Params& p, uint32_t* s_mask, int16_t* s_ti
   trace_stamp<kTrace>(p, kNumCtas * 8 + 3);
 }
 
-// Router GEMV on tensor cores. Per CTA: kExpertsPerCta experts as the n8 tile
-// (columns 4..7 zero), tokens as the m16 tile, each warp a 512-wide K slice in
-// 8 groups of 64. Inside a group, lane (g, c) loads the 32 B chunk
-// [base + 16c, base + 16c + 16) of token row g and expert row g, and step t uses
-// its elements [4t, 4t + 4): a fixed K permutation shared by A and B.
+// Router GEMV in the order of the cuBLAS router GEMM it replaces (bitwise equal
+// for this shape): K split into two halves, each half a sequential chain of
+// 16-wide MMAs in increasing K, the two fp32 halves added, rounded to bf16.
+// Per CTA: kExpertsPerCta experts as the n8 tile (columns 4..7 repeat expert 0
+// and are discarded), tokens as the m16 tile (rows >= M repeat token 0); warp 0
+// runs the chain of the first half, warp 1 the second, operands from shared memory.
+inline constexpr uint32_t kSplitK = kHidden / 2;
+inline constexpr uint32_t kChainSteps = kSplitK / 16;
+// Shared-memory rows are padded by 16 B so the 8 rows of an ldmatrix hit distinct banks.
+inline constexpr uint32_t kRowBytes = kHidden * 2 + 16;
+
 template <uint32_t kMaxM>
-SGL_DEVICE void gemv_tiles(const Params& p, uint32_t expert0, const U32x8 (&w)[8], float (&acc)[4][4]) {
-  const uint32_t warp = threadIdx.x / 32;
+struct GemvSmem {
+  static constexpr uint32_t kW = 0;
+  static constexpr uint32_t kX = kW + kExpertsPerCta * kRowBytes;
+  static constexpr uint32_t kPart = kX + kMaxM * kRowBytes;  // fp32 [2][16][kExpertsPerCta]
+  static constexpr uint32_t kBarW = kPart + 2 * 16 * kExpertsPerCta * 4;
+  static constexpr uint32_t kBarX = kBarW + 8;
+  static constexpr uint32_t kBytes = kBarX + 8;
+};
+
+SGL_DEVICE uint32_t smem_addr(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+SGL_DEVICE void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(addr));
+}
+
+SGL_DEVICE void ldmatrix_x2(uint32_t (&r)[2], uint32_t addr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
+}
+
+// One K half of the GEMV for this CTA's experts; writes the fp32 partials to s_part.
+template <uint32_t kMaxM>
+SGL_DEVICE void gemv_chain(uint32_t half, uint32_t M, const uint8_t* smem, float* s_part) {
+  using L = GemvSmem<kMaxM>;
   const uint32_t lane = threadIdx.x % 32;
-  const uint32_t g = lane >> 2, c = lane & 3;
-  const uint32_t M = p.num_tokens;
-  const bool row_lo = g < M;
-  const bool row_hi = (kMaxM > 8) && (g + 8 < M);
-  const bf16_t* x_lo = p.x + static_cast<size_t>(g) * kHidden + warp * kKPerWarp + 16 * c;
-  const bf16_t* x_hi = x_lo + 8 * static_cast<size_t>(kHidden);
+  const uint32_t j = lane >> 3, r = lane & 7;
+  // ldmatrix.x4 for A: matrix j covers tokens (j & 1) * 8 + r and K offset (j >> 1) * 8.
+  const uint32_t tok = (j & 1) * 8 + r;
+  const uint32_t a_row = tok < M ? tok : 0;
+  const uint32_t a_addr = smem_addr(smem + L::kX + a_row * kRowBytes + (half * kSplitK + (j >> 1) * 8) * 2);
+  // ldmatrix.x2 for B: matrix (j & 1) covers experts r and K offset (j & 1) * 8.
+  const uint32_t b_row = r < kExpertsPerCta ? r : 0;
+  const uint32_t b_addr = smem_addr(smem + L::kW + b_row * kRowBytes + (half * kSplitK + (j & 1) * 8) * 2);
+  // Fragments are loaded kDepth steps ahead so shared-memory latency stays off the MMA chain.
+  constexpr uint32_t kDepth = 4;
+  uint32_t a[kDepth][4], b[kDepth][2];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+  for (uint32_t i = 0; i < kDepth; ++i) {
+    ldmatrix_x4(a[i], a_addr + i * 32);
+    ldmatrix_x2(b[i], b_addr + i * 32);
+  }
+  float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-  for (int q = 0; q < 8; ++q) {
-    U32x8 xl{make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
-    U32x8 xh{make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
-    if (row_lo) xl = ld_produced32(x_lo + 64 * q);
-    if (row_hi) xh = ld_produced32(x_hi + 64 * q);
-#pragma unroll
-    for (int t = 0; t < 4; ++t) {
-      mma_bf16_16816(
-          acc[t],
-          u32x8_at(xl, 2 * t),
-          u32x8_at(xh, 2 * t),
-          u32x8_at(xl, 2 * t + 1),
-          u32x8_at(xh, 2 * t + 1),
-          u32x8_at(w[q], 2 * t),
-          u32x8_at(w[q], 2 * t + 1));
+  for (uint32_t step = 0; step < kChainSteps; ++step) {
+    const uint32_t slot = step % kDepth;
+    mma_bf16_16816(d, a[slot][0], a[slot][1], a[slot][2], a[slot][3], b[slot][0], b[slot][1]);
+    if (step + kDepth < kChainSteps) {
+      ldmatrix_x4(a[slot], a_addr + (step + kDepth) * 32);
+      ldmatrix_x2(b[slot], b_addr + (step + kDepth) * 32);
     }
   }
-  (void)expert0;
+  // C fragment: d0/d1 = (token g, experts 2c, 2c+1), d2/d3 = token g + 8.
+  const uint32_t g = lane >> 2, c = lane & 3;
+  if (c < kExpertsPerCta / 2) {
+    float* part = s_part + half * 16 * kExpertsPerCta;
+    part[g * kExpertsPerCta + 2 * c] = d[0];
+    part[g * kExpertsPerCta + 2 * c + 1] = d[1];
+    if constexpr (kMaxM > 8) {
+      part[(g + 8) * kExpertsPerCta + 2 * c] = d[2];
+      part[(g + 8) * kExpertsPerCta + 2 * c + 1] = d[3];
+    }
+  }
+}
+
+SGL_DEVICE void mbar_init(uint32_t bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(count) : "memory");
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+SGL_DEVICE void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(bytes) : "memory");
+}
+
+SGL_DEVICE void mbar_wait(uint32_t bar, uint32_t parity) {
+  asm volatile(
+      "{\n"
+      ".reg .pred done;\n"
+      "WAIT_%=:\n"
+      "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1;\n"
+      "@!done bra WAIT_%=;\n"
+      "}" ::"r"(bar),
+      "r"(parity)
+      : "memory");
+}
+
+SGL_DEVICE void bulk_load(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst),
+      "l"(src),
+      "r"(bytes),
+      "r"(bar)
+      : "memory");
 }
 
 template <uint32_t kMaxM, bool kUsePDL, bool kTrace>
 __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_constant__ Params p) {
-  __shared__ float s_red[kWarps][kMaxTokens][kExpertsPerCta];
+  using L = GemvSmem<kMaxM>;
+  extern __shared__ __align__(128) uint8_t smem[];
   __shared__ uint32_t s_mask[kExperts];
   __shared__ int16_t s_tile[kExperts];
   __shared__ int16_t s_ids[kMaxTokens * kTopK];
@@ -682,72 +759,72 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
   __shared__ uint32_t s_last;
 
   const uint32_t warp = threadIdx.x / 32;
-  const uint32_t lane = threadIdx.x % 32;
-  const uint32_t g = lane >> 2, c = lane & 3;
   const uint32_t expert0 = blockIdx.x * kExpertsPerCta;
   const uint32_t M = p.num_tokens;
   const uint32_t tb = blockIdx.x * 8;
+  float* s_part = reinterpret_cast<float*>(smem + L::kPart);
+  const uint32_t bar_w = smem_addr(smem + L::kBarW);
+  const uint32_t bar_x = smem_addr(smem + L::kBarX);
   trace_stamp<kTrace>(p, tb + 0);
 
-  // Router weights are static: start pulling this CTA's 32 KB into L2 before
-  // waiting on the producer grid. ptxas moves plain loads below griddepcontrol.wait.
-  asm volatile("prefetch.global.L2 [%0];" ::"l"(p.weight + static_cast<size_t>(expert0) * kHidden + threadIdx.x * 64)
-               : "memory");
-  U32x8 w[8];
-  {
-    const bf16_t* src = p.weight + static_cast<size_t>(expert0 + (g & 3)) * kHidden + warp * kKPerWarp + 16 * c;
+  // Router weights are static: their bulk copies are issued before waiting on the producer grid.
+  if (threadIdx.x == 0) {
+    mbar_init(bar_w, 1);
+    mbar_init(bar_x, 1);
+    mbar_expect_tx(bar_w, kExpertsPerCta * kHidden * 2);
 #pragma unroll
-    for (int q = 0; q < 8; ++q) {
-      w[q] = U32x8{make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
-      if (g < kExpertsPerCta) w[q] = ld_weight(src + 64 * q);
-    }
-  }
-  if (u32x8_at(w[7], 7) != 0x12345678u) trace_stamp<kTrace>(p, tb + 1);
-
-  device::PDLWaitPrimary<kUsePDL>();
-  trace_stamp<kTrace>(p, tb + 2);
-
-  // Row blockIdx.x is quantized by this CTA, one 16-element block per thread,
-  // loaded now so the latency overlaps the GEMV.
-  const bool quant_row = p.full && blockIdx.x < M;
-  const uint32_t qk = warp * kKPerWarp + lane * kKPerLane;
-  U32x8 qv{make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
-  if (quant_row) qv = ld_produced32(p.x + static_cast<size_t>(blockIdx.x) * kHidden + qk);
-
-  float acc[4][4];
-  gemv_tiles<kMaxM>(p, expert0, w, acc);
-  if (acc[0][0] != 12345.0f) trace_stamp<kTrace>(p, tb + 3);
-
-  if (quant_row) {
-    uint32_t sf;
-    uint2 packed;
-    quantize_block(qv.lo, qv.hi, p.global_scale[0], sf, packed);
-    const uint32_t blk = qk / kSfVec;
-    *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(blockIdx.x) * (kHidden / 2) + blk * 8) = packed;
-    p.x_sf[static_cast<size_t>(blockIdx.x) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
-  }
-
-  // C fragment: d0/d1 = (token g, experts 2c, 2c+1), d2/d3 = token g + 8.
-  if (c < kExpertsPerCta / 2) {
-    float d[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) d[i] = __fadd_rn(__fadd_rn(acc[0][i], acc[1][i]), __fadd_rn(acc[2][i], acc[3][i]));
-    s_red[warp][g][2 * c] = d[0];
-    s_red[warp][g][2 * c + 1] = d[1];
-    if constexpr (kMaxM > 8) {
-      s_red[warp][g + 8][2 * c] = d[2];
-      s_red[warp][g + 8][2 * c + 1] = d[3];
+    for (uint32_t e = 0; e < kExpertsPerCta; ++e) {
+      bulk_load(smem_addr(smem + L::kW + e * kRowBytes), p.weight + static_cast<size_t>(expert0 + e) * kHidden,
+                kHidden * 2, bar_w);
     }
   }
   __syncthreads();
+
+  device::PDLWaitPrimary<kUsePDL>();
+  trace_stamp<kTrace>(p, tb + 1);
+  if (!(p.mode & kModeTopk)) {
+    // The dependent grid reads our outputs only after its own griddepcontrol.wait.
+    device::PDLTriggerSecondary<kUsePDL>();
+  }
+  if (threadIdx.x == 0) {
+    mbar_expect_tx(bar_x, M * kHidden * 2);
+#pragma unroll
+    for (uint32_t row = 0; row < kMaxM; ++row) {
+      if (row < M) {
+        bulk_load(smem_addr(smem + L::kX + row * kRowBytes), p.x + static_cast<size_t>(row) * kHidden, kHidden * 2,
+                  bar_x);
+      }
+    }
+  }
+
+  if (warp < 2) {
+    mbar_wait(bar_w, 0);
+    mbar_wait(bar_x, 0);
+    trace_stamp<kTrace>(p, tb + 2);
+    gemv_chain<kMaxM>(warp, M, smem, s_part);
+  } else if ((p.mode & kModeQuant) && blockIdx.x < M) {
+    // CTA b < M quantizes token row b while warps 0 and 1 run the GEMV chains.
+    mbar_wait(bar_x, 0);
+    const uint8_t* row = smem + L::kX + blockIdx.x * kRowBytes;
+    for (uint32_t blk = threadIdx.x - 64; blk < kBlocksPerRow; blk += kThreads - 64) {
+      const uint4* src = reinterpret_cast<const uint4*>(row + blk * kSfVec * 2);
+      uint32_t sf;
+      uint2 packed;
+      quantize_block(src[0], src[1], p.global_scale[0], sf, packed);
+      *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(blockIdx.x) * (kHidden / 2) + blk * 8) = packed;
+      p.x_sf[static_cast<size_t>(blockIdx.x) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
+    }
+  }
+  __syncthreads();
+  trace_stamp<kTrace>(p, tb + 3);
   if (threadIdx.x < M * kExpertsPerCta) {
     const uint32_t m = threadIdx.x / kExpertsPerCta;
     const uint32_t e = threadIdx.x % kExpertsPerCta;
-    float s = s_red[0][m][e];
-#pragma unroll
-    for (uint32_t ww = 1; ww < kWarps; ++ww) s = __fadd_rn(s, s_red[ww][m][e]);
-    p.logits[m * kExperts + expert0 + e] = __float2bfloat16_rn(s);
+    const float lo = s_part[m * kExpertsPerCta + e];
+    const float hi = s_part[(16 + m) * kExpertsPerCta + e];
+    p.logits[m * kExperts + expert0 + e] = __float2bfloat16_rn(__fadd_rn(lo, hi));
   }
+  if (!(p.mode & kModeTopk)) return;
 
   // Publish: bar.sync orders this CTA's stores before the arriving thread's
   // gpu-scope release; the last arrival acquires and runs top-k.
@@ -823,7 +900,7 @@ struct RouterFrontKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
     TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
-    TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(weight);
+    TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(weight);
     TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
     TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
     TensorMatcher({M_, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
@@ -866,10 +943,42 @@ struct RouterFrontKernel {
         kTrace ? static_cast<uint64_t*>(trace.data_ptr()) : nullptr,
         M,
         static_cast<uint32_t>(tile_log2),
-        1u,
+        kModeQuant | kModeTopk | kModeTables,
     };
-    LaunchKernel(kNumCtas, kThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, kTrace>, params);
+    launch_front<kTrace>(params, device.unwrap());
+  }
+
+  /// \brief Router logits (bitwise to the cuBLAS router GEMM) and NVFP4 input quantization only.
+  static void run_gemm(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView global_scale,
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView x_fp4,
+      const tvm::ffi::TensorView x_sf) {
+    using namespace host;
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
+    TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(weight);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
+    TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).verify(logits);
+    TensorMatcher({M_, kHidden / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(8).verify(x_fp4);
+    TensorMatcher({M_, kBlocksPerRow}).with_dtype<uint8_t>().with_device(device).verify(x_sf);
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    CHECK_HOST(M <= kMaxM && kMaxM <= kMaxTokens) << "router_gemm: num_tokens " << M << " exceeds " << kMaxM;
+    if (M == 0) return;
+    Params params{};
+    params.x = static_cast<const bf16_t*>(x.data_ptr());
+    params.weight = static_cast<const bf16_t*>(weight.data_ptr());
+    params.global_scale = static_cast<const float*>(global_scale.data_ptr());
+    params.logits = static_cast<bf16_t*>(logits.data_ptr());
+    params.x_fp4 = static_cast<uint8_t*>(x_fp4.data_ptr());
+    params.x_sf = static_cast<uint8_t*>(x_sf.data_ptr());
+    params.num_tokens = M;
+    params.mode = kModeQuant;
+    launch_front<false>(params, device.unwrap());
   }
 
   /// \brief Top-k, input quantization and routing tables from router logits computed elsewhere.
@@ -930,7 +1039,7 @@ struct RouterFrontKernel {
     params.num_non_exiting_tiles = static_cast<int32_t*>(num_non_exiting_tiles.data_ptr());
     params.num_tokens = M;
     params.tile_log2 = static_cast<uint32_t>(tile_log2);
-    params.full = 1u;
+    params.mode = kModeQuant | kModeTopk | kModeTables;
     LaunchKernel(1 + M, kThreads, device.unwrap()).enable_pdl(kUsePDL)(router_tail_kernel<kMaxM, kUsePDL>, params);
   }
 
@@ -963,9 +1072,22 @@ struct RouterFrontKernel {
     params.topk_ids = static_cast<int32_t*>(topk_ids.data_ptr());
     params.arrival = static_cast<uint32_t*>(arrival.data_ptr());
     params.num_tokens = M;
-    params.full = 0;
-    LaunchKernel(kNumCtas, kThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, false>, params);
+    params.mode = kModeTopk;
+    launch_front<false>(params, device.unwrap());
+  }
+
+ private:
+  template <bool kT>
+  static void launch_front(const Params& params, DLDevice device) {
+    using namespace host;
+    constexpr uint32_t kSmem = GemvSmem<kMaxM>::kBytes;
+    static const bool smem_attr_set = [] {
+      CHECK_CUDA(cudaFuncSetAttribute(
+          router_front_kernel<kMaxM, kUsePDL, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+      return true;
+    }();
+    (void)smem_attr_set;
+    LaunchKernel(kNumCtas, kThreads, device, kSmem).enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, kT>, params);
   }
 };
 

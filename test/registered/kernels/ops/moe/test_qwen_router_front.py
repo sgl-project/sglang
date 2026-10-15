@@ -3,7 +3,7 @@
 Given the same bf16 logits, the softmax / top-10 / renormalize output must equal the
 Triton router bit for bit, the NVFP4 input quantization must equal fp4_quantize
 (cute-dsl, linear scales), and the routing tables must equal moe_sort on every entry the
-grouped GEMMs read. The fused GEMV's logits are checked against an fp32 reference; the
+grouped GEMMs read. The fused GEMV reproduces the cuBLAS router GEMM bit for bit; the
 tail kernel takes the stock router GEMM's logits.
 """
 
@@ -51,9 +51,25 @@ def test_router_front_matches_stock_chain(m: int, tile: int, clustered: bool) ->
         router_front(x, weight, gs, out)
     torch.cuda.synchronize()
 
-    ref = x.float() @ weight.float().t()
-    torch.testing.assert_close(out.logits.float(), ref, rtol=1.6e-2, atol=1e-2)
+    # The GEMV follows the cuBLAS router GEMM's accumulation order: logits must be bitwise.
+    assert torch.equal(out.logits, torch.nn.functional.linear(x, weight))
     _assert_matches_stock_chain(out, out.logits, x, gs, m, tile)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("m", [1, 7, 9, 16])
+def test_router_gemm_quant_matches_stock(m: int) -> None:
+    """Logits and NVFP4 input quantization for runners that route internally: bitwise to stock."""
+    from sglang.kernels.ops.moe.qwen_router_front import router_gemm_quant
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    x, weight, gs = _inputs(m, seed=4000 + m, clustered=False)
+    logits, x_fp4, x_sf = router_gemm_quant(x, weight, gs)
+    torch.cuda.synchronize()
+    assert torch.equal(logits, torch.nn.functional.linear(x, weight))
+    xq, xsf = fp4_quantize(x, gs, 16, False, False)
+    assert torch.equal(x_fp4, xq.view(torch.uint8).reshape(m, -1))
+    assert torch.equal(x_sf, xsf.view(torch.uint8).reshape(m, -1))
 
 
 @requires_blackwell

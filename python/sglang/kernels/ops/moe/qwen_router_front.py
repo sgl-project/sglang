@@ -41,6 +41,7 @@ def _jit_module(max_m: int, trace: bool = False) -> Module:
         cuda_files=["moe/qwen_router_front.cuh"],
         cuda_wrappers=[
             ("run", f"RouterFrontKernel<{args}>::run"),
+            ("run_gemm", f"RouterFrontKernel<{args}>::run_gemm"),
             ("run_tail", f"RouterFrontKernel<{args}>::run_tail"),
             ("run_topk", f"RouterFrontKernel<{args}>::run_topk"),
         ],
@@ -127,6 +128,24 @@ def router_front(
         out.tile_log2,
     )
     return out
+
+
+def router_gemm_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Router logits and NVFP4 input quantization in one launch, for runners that route internally.
+
+    Returns (logits bf16 [M, 512], x_fp4 uint8 [M, 2048], x_sf uint8 [M, 256] linear layout); the
+    logits equal the cuBLAS router GEMM bit for bit and the quantization equals fp4_quantize.
+    """
+    m = x.shape[0]
+    logits = torch.empty((m, NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
+    x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
+    x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
+    _jit_module(_max_m_bucket(m)).run_gemm(x, weight, global_scale, logits, x_fp4, x_sf)
+    return logits, x_fp4, x_sf
 
 
 def router_tail(

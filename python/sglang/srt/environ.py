@@ -1130,7 +1130,7 @@ class Envs:
     # routing tables as one kernel after the router GEMM at decode token counts.
     SGLANG_Q35MF_ROUTE_FUSED = EnvBool(False)
     # With SGLANG_Q35MF_ROUTE_FUSED: compute the router GEMV in the same kernel
-    # too (different accumulation order from the cuBLAS router GEMM).
+    # too, in the cuBLAS router GEMM's accumulation order.
     SGLANG_Q35MF_ROUTE_GEMV = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
