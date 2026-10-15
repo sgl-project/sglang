@@ -111,7 +111,7 @@ export const config = {
     },
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verificationStatus: (sel) => sel.mambaDtype === "float32" ? "in-progress" : "verified",
+      verificationStatus: "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -134,7 +134,7 @@ export const config = {
     },
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: (sel) => sel.mambaDtype === "float32" ? "in-progress" : "verified",
+      verificationStatus: "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -153,7 +153,7 @@ export const config = {
     },
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verificationStatus: (sel) => sel.mambaDtype === "float32" ? "in-progress" : "verified",
+      verificationStatus: "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -176,7 +176,7 @@ export const config = {
     },
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: (sel) => sel.mambaDtype === "float32" ? "in-progress" : "verified",
+      verificationStatus: "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -197,7 +197,7 @@ export const config = {
     },
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verificationStatus: (sel) => sel.mambaDtype === "float32" ? "in-progress" : "verified",
+      verificationStatus: "verified",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -248,7 +248,7 @@ export const config = {
     },
     {
       match: { hw: "rtx-pro-6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verificationStatus: (sel) => sel.mambaDtype === "float32" ? "in-progress" : "verified",
+      verificationStatus: "verified",
       env: [],
       flags: [
         "--trust-remote-code",
