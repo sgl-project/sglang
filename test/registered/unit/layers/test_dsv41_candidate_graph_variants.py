@@ -87,5 +87,28 @@ class TestVerifyCandidateGraph(CustomTestCase):
             )
 
 
+class TestPrefillGraphCandidateWindow(CustomTestCase):
+    def test_wide_prefill_graph_keeps_low_ratio_sources_eager(self):
+        """The captured ratio-1/2 indexer is exact only inside the candidate window
+        (2048 blocks x 8 on V4.1-Flash); a wider prefill graph must not capture it."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _low_ratio_graph_fits_candidates,
+        )
+
+        def fits(low_ratios, max_seq_len, window=2048 * 8):
+            return _low_ratio_graph_fits_candidates(
+                low_ratios=low_ratios, candidate_window=window, max_seq_len=max_seq_len
+            )
+
+        self.assertTrue(fits((1, 2), 16384))
+        self.assertFalse(fits((1, 2), 16384 + 256))
+        # The smallest ratio sets the bound.
+        self.assertTrue(fits((2,), 32768))
+        self.assertFalse(fits((1, 2), None))
+        # Without candidate blocks the captured top-k is exact at any width.
+        self.assertTrue(fits((1, 2), 262144, window=0))
+        self.assertTrue(fits((), None))
+
+
 if __name__ == "__main__":
     unittest.main()
