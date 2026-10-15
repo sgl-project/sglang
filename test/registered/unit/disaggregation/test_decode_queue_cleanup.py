@@ -127,10 +127,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(physical_available, 3 * page_size)
         self.assertEqual(queue._pre_alloc.call_count, 3)
 
-    def test_overlap_resume_restores_after_inflight_forward(self):
-        # Under overlap, a request finished at the last commit can still have
-        # its redundant decode step in flight, writing a slot the resumed
-        # request may reuse: the restore waits for that forward first.
+    def test_overlap_resume_restores_without_waiting_on_the_forward(self):
+        # A released request's slot and written pages go back only at the
+        # commit of the last pending step that carries it, so the slot a
+        # resumed request takes is written by no forward in flight.
         override = get_context().override_server_args(
             disaggregation_decode_retraction_backup="cpu_tensor"
         )
@@ -150,10 +150,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
             )
             for i in range(2)
         ]
-        forward_stream = object()
-        schedule_stream = MagicMock()
-        schedule_stream.wait_stream.side_effect = lambda s: events.append(("wait", s))
-
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.request_retirer = MagicMock()
         queue.retracted_queue = reqs.copy()
@@ -161,9 +157,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.token_to_kv_pool_allocator = MagicMock(page_size=1)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.tree_cache = MagicMock()
-        queue.enable_overlap = True
-        queue.schedule_stream = schedule_stream
-        queue.forward_stream = forward_stream
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(4096, None)
         )
@@ -172,9 +165,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._pre_alloc = MagicMock()
 
         self.assertEqual(queue.resume_retracted_reqs([]), reqs)
-        self.assertEqual(
-            events, [("wait", forward_stream), ("restore", 0), ("restore", 1)]
-        )
+        self.assertEqual(events, [("restore", 0), ("restore", 1)])
 
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()

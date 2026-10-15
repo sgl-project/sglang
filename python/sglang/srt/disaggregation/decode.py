@@ -457,9 +457,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         core_lists: CoreLists,
         get_ready: Callable[[], List[Req]],
         get_pending_lora_ids: Callable[[], Set[Optional[str]]],
-        enable_overlap: bool,
-        schedule_stream: Any,
-        forward_stream: Any,
     ):
         parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
@@ -493,9 +490,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.core_lists = core_lists
         self.get_ready = get_ready
         self.get_pending_lora_ids = get_pending_lora_ids
-        self.enable_overlap = enable_overlap
-        self.schedule_stream = schedule_stream
-        self.forward_stream = forward_stream
         self.host_pool = None
         self.host_reserved_tokens = 0
         self.gloo_group = parallel.attn_tp_group.cpu_group
@@ -1134,12 +1128,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             )
 
-            if len(resumed_reqs) == 1 and self.enable_overlap:
-                # A request finished at the last commit can still have its
-                # redundant decode forward in flight, writing a slot `_pre_alloc`
-                # may have just reused. The restore copies on a stream that
-                # follows only the schedule stream, so order it after that forward.
-                self.schedule_stream.wait_stream(self.forward_stream)
+            # No forward still writes the slot and pages `_pre_alloc` took: a
+            # released request's go back only at the commit of the last
+            # pending step that carries it.
             restore_kv_cache(
                 req,
                 self.tree_cache,
@@ -3135,8 +3126,6 @@ class DisaggDecode:
         max_token_pool_size = capacity.max_token_pool_size
         max_running_requests = capacity.max_running_requests
         device = streams.device
-        schedule_stream = streams.schedule_stream
-        forward_stream = streams.forward_stream
         metrics_sink = services.metrics_sink
         output_streamer = services.output_streamer
         scheduler_stage_metrics = services.scheduler_stage_metrics
@@ -3176,8 +3165,6 @@ class DisaggDecode:
         self.max_running_requests = max_running_requests
         self.device = device
         self.enable_overlap = enable_overlap
-        self.schedule_stream = schedule_stream
-        self.forward_stream = forward_stream
         self.future_map = future_map
         self.ngram_embedding_manager = ngram_embedding_manager
         self.scheduler_stage_metrics = scheduler_stage_metrics
@@ -3264,9 +3251,6 @@ class DisaggDecode:
             core_lists=core_lists,
             get_ready=lambda: self.ready,
             get_pending_lora_ids=get_pending_lora_ids,
-            enable_overlap=enable_overlap,
-            schedule_stream=schedule_stream,
-            forward_stream=forward_stream,
         )
         self.transfer_queue.prealloc_queue = self.prealloc_queue
         self.kv_checksum_computer = self.prealloc_queue.kv_checksum_computer
@@ -3707,10 +3691,9 @@ class DisaggDecode:
             # node's output token.
             self.penalty_store.alloc(req)
 
-        if self.enable_overlap:
-            # A finished request can still have one redundant forward in flight.
-            # Drain it before an admitted request seeds a potentially reused row.
-            self.schedule_stream.wait_stream(self.forward_stream)
+        # The admitted requests' rows were preallocated from the pools, which
+        # get a released row back only at the commit of the last pending step
+        # that writes it; no forward in flight writes them.
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             for req in reqs:
                 if req.kv.retraction_backup is not None:
@@ -3774,9 +3757,8 @@ class DisaggDecode:
         takes as input and, with speculation, the draft state the prefill node
         sent and the committed lengths. Their first decode step's worker
         gathers both like any other."""
-        # Non-blocking H2D: with overlap this runs on the schedule stream after
-        # its wait on the in-flight forward, so a blocking copy would stall the
-        # host until that forward ends and leave the GPU idle.
+        # Non-blocking H2D on the schedule stream: the host does not wait for
+        # the copy while a forward runs.
         pin_memory = is_pin_memory_available(self.device)
         last_tokens = torch.tensor(
             [req.output_ids[-1] for req in reqs],

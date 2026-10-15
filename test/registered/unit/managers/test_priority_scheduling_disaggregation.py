@@ -965,8 +965,6 @@ class TestDecodeAdmission(unittest.TestCase):
             max_running_requests=1,
             future_map=MagicMock(),
             policy=MagicMock(),
-            schedule_stream=MagicMock(),
-            forward_stream=MagicMock(),
             ngram_embedding_manager=MagicMock(),
             output_streamer=MagicMock(),
             device="cpu",
@@ -1036,7 +1034,9 @@ class TestDecodeAdmission(unittest.TestCase):
         self.assertEqual(scheduler.lists.decoding, [running, kept])
         self.assertEqual(owner.ready, [])
 
-    def test_overlap_waits_for_forward_before_seeding_admitted_reqs(self):
+    def test_overlap_seeds_admitted_reqs_without_waiting_on_the_forward(self):
+        # Their rows came from the pools, which get a released row back only
+        # at the commit of the last pending step that writes it.
         scheduler = self._new_scheduler(enable_overlap=True)
         req = MagicMock(
             rid="request",
@@ -1055,9 +1055,6 @@ class TestDecodeAdmission(unittest.TestCase):
 
         owner = scheduler.disagg_decode
         call_order = []
-        owner.schedule_stream.wait_stream.side_effect = lambda _: call_order.append(
-            "wait"
-        )
         owner.future_map.stash.side_effect = lambda *_: call_order.append("seed")
 
         with (
@@ -1068,8 +1065,7 @@ class TestDecodeAdmission(unittest.TestCase):
         ):
             owner.commit_prefill_handoff([req])
 
-        owner.schedule_stream.wait_stream.assert_called_once_with(owner.forward_stream)
-        self.assertEqual(call_order, ["wait", "seed"])
+        self.assertEqual(call_order, ["seed"])
         self.assertEqual(req.already_computed, 3)
         owner.penalty_store.alloc.assert_called_once_with(req)
         owner.output_streamer.stream_output.assert_called_once_with([req], False)
