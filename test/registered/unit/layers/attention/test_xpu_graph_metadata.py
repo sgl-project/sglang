@@ -9,10 +9,10 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
 
 
 class TestXPUGraphMetadata(CustomTestCase):
@@ -223,9 +223,9 @@ class TestXPUGraphMetadata(CustomTestCase):
         class _FakeModelRunner:
             device = "cpu"
             is_draft_worker = False
-            attention_chunk_size = None
+            attention_chunk_size = 512
             attn_backend = SimpleNamespace(
-                attention_chunk_size=None,
+                attention_chunk_size=512,
                 dllm_attention=None,
             )
             req_to_token_pool = SimpleNamespace(
@@ -235,7 +235,7 @@ class TestXPUGraphMetadata(CustomTestCase):
             model_config = SimpleNamespace(
                 is_multimodal=False,
                 hidden_size=64,
-                attention_chunk_size=None,
+                attention_chunk_size=512,
                 hf_config=SimpleNamespace(),
             )
             model = _FakeModel()

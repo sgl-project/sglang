@@ -131,6 +131,15 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
             "XPUGraphRunner does not support two batch overlap (TBO) yet "
             "because TBO requires concurrent multi-stream graph capture."
         )
+        assert not self.require_mlp_tp_gather, (
+            "XPUGraphRunner does not support MLP TP gather yet."
+        )
+        assert not self.require_mlp_sync, (
+            "XPUGraphRunner does not support MLP sync yet."
+        )
+        assert not self.require_gathered_buffer, (
+            "XPUGraphRunner does not support gathered buffer yet."
+        )
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(
