@@ -106,12 +106,12 @@ async fn missing_and_empty_keys_use_admitted_power_of_two_without_binding() {
         admission.reject.store(true, Ordering::Relaxed);
         assert!(matches!(
             policy.pick(&engines, &request).await,
-            Err(PickError::AdmissionRejected(_))
+            Err(PickError::NoAdmissibleEngine(_))
         ));
         admission.reject.store(false, Ordering::Relaxed);
     }
     assert!(store.is_empty());
-    assert_eq!(admission.calls.lock().unwrap().len(), 4);
+    assert_eq!(admission.calls.lock().unwrap().len(), 8);
 }
 
 #[tokio::test]
@@ -125,7 +125,7 @@ async fn failed_fallback_preserves_existing_binding() {
     admission.reject.store(true, Ordering::Relaxed);
     assert!(matches!(
         policy.pick(&engines, &request).await,
-        Err(PickError::AdmissionRejected(_))
+        Err(PickError::NoAdmissibleEngine(_))
     ));
     assert!(store.is_empty());
     admission.reject.store(false, Ordering::Relaxed);
@@ -134,7 +134,7 @@ async fn failed_fallback_preserves_existing_binding() {
     admission.reject.store(true, Ordering::Relaxed);
     assert!(matches!(
         policy.pick(&engines, &request).await,
-        Err(PickError::AdmissionRejected(_))
+        Err(PickError::NoAdmissibleEngine(_))
     ));
     admission.reject.store(false, Ordering::Relaxed);
     assert_eq!(
@@ -142,7 +142,7 @@ async fn failed_fallback_preserves_existing_binding() {
         "a"
     );
     assert_eq!(store.len(), 1);
-    assert_eq!(admission.calls.lock().unwrap().len(), 5);
+    assert_eq!(admission.calls.lock().unwrap().len(), 7);
 }
 
 #[tokio::test]
@@ -263,7 +263,7 @@ async fn removed_binding_is_replaced_only_after_admission() {
     admission.reject.store(true, Ordering::Relaxed);
     assert!(matches!(
         policy.pick(&replacement, &request).await,
-        Err(PickError::AdmissionRejected(_))
+        Err(PickError::NoAdmissibleEngine(_))
     ));
     admission.reject.store(false, Ordering::Relaxed);
     assert_eq!(
@@ -492,7 +492,9 @@ async fn concurrent_assignment_winner_is_checked_and_preserved_on_rejection() {
             assert_eq!(pick.engine.id.0, "b");
             assert_eq!(pick.reason, "session_primary");
         }
-        assert_eq!(*admission.calls.lock().unwrap(), vec!["a", "b"]);
+        // Both candidates are checked before sampling, then the racing
+        // winner once more as the effective binding.
+        assert_eq!(*admission.calls.lock().unwrap(), vec!["a", "b", "b"]);
         assert_eq!(
             admission
                 .competitor
