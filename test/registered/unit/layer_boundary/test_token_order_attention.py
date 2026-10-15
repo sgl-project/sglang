@@ -97,7 +97,7 @@ class TestTokenOrderAttention(CustomTestCase):
         take_back = step.keywords["move"]
         self.assertIs(take_back.func, cp_take_back_in_token_order)
         self.assertIs(take_back.keywords["group"], SumGroup.ATTN_CP)
-        read = step.keywords["read"]
+        read = step.keywords["read_step"]
         self.assertIs(read.func, prepare._then_moe_cp_gather)
         self.assertIs(read.keywords["gather"].func, prepare._update_read)
         entry = ffn.plan.paths[CP].entry
