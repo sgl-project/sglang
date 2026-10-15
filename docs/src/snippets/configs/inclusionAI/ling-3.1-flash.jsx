@@ -101,6 +101,11 @@ export const config = {
         label: "EP",
         values: [
           null,
+          {
+            value: 1,
+            disable: { hw: ["gb300"] },
+            disableReason: "TP-only needs eight GPUs; the GB300 recipe uses four.",
+          },
           4,
           {
             value: 8,
