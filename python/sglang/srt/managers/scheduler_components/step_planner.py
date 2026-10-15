@@ -547,12 +547,14 @@ class StepPlanner:
             if hicache_storage_enabled() and (
                 self.request_intake.prefetch_after_device_hit_loss(req)
             ):
+                self._revert_match(req)
                 continue
             if (
                 hicache_storage_enabled()
                 and buffer_pipeline is not None
                 and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
+                self._revert_match(req)
                 continue
             res = adder.add_one_req(
                 req,
