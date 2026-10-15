@@ -478,9 +478,15 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         rope = tuple(
             part.expand(context.shape[0], -1, -1).contiguous() for part in rope
         )
-        text = self.text_embedder(
-            context, tuple(part[:, height * width :] for part in rope)
-        )
+        # Small text GEMMs are particularly sensitive to changing batch shape.
+        texts = [
+            self.text_embedder(
+                context[index : index + 1],
+                tuple(part[index : index + 1, height * width :] for part in rope),
+            )
+            for index in range(context.shape[0])
+        ]
+        text = texts[0] if len(texts) == 1 else torch.cat(texts)
         return text, rope
 
     def prepare_conditioning(
