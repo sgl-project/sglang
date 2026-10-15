@@ -142,8 +142,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search is not supported with hierarchical cache."
         if self.model_config.is_encoder_decoder:
             return "Beam search is not supported with encoder-decoder models."
-        if self.tree_cache.supports_swa() or self.tree_cache.supports_mamba():
-            return "Beam search is not supported with SWA/mamba hybrid caches."
+        if self.tree_cache.supports_mamba():
+            return "Beam search is not supported with mamba hybrid caches."
+        # SWA is allowed: the hybrid allocator shares one virtual id space
+        # across the full and sliding-window sub-pools, and every beam fork
+        # primitive (alias, remap, orphan collect, free) operates purely on
+        # req_to_token virtual ids, so both pools follow automatically.
 
         if req.session_id is not None or recv_req.session_params is not None:
             return "Beam search is not supported for session requests."
