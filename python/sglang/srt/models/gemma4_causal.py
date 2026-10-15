@@ -63,6 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.mem_cache.engram import make_embedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -897,7 +898,8 @@ class Gemma4TextModel(PreTrainedModel):
             and self.hidden_size_per_layer_input
             and self.hidden_size_per_layer_input > 0
         ):
-            self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+            self.embed_tokens_per_layer = make_embedding(
+                Gemma4TextScaledWordEmbedding,
                 self.vocab_size_per_layer_input,
                 config.num_hidden_layers * self.hidden_size_per_layer_input,
                 self.padding_idx,

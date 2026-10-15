@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.mem_cache.engram import make_embedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -672,7 +673,8 @@ class Gemma3nTextModel(PreTrainedModel):
         self.hidden_size = config.hidden_size
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
-        self.embed_tokens_per_layer = Gemma3nTextScaledWordEmbedding(
+        self.embed_tokens_per_layer = make_embedding(
+            Gemma3nTextScaledWordEmbedding,
             config.vocab_size_per_layer_input,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
             self.padding_idx,

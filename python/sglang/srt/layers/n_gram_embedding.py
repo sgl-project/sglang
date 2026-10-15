@@ -5,6 +5,7 @@ from torch.nn import Parameter
 from sglang.kernels.ops.speculative.ngram_embedding import compute_n_gram_ids
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.mem_cache.engram import make_embedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -47,7 +48,8 @@ class NgramEmbedding(torch.nn.Module):
                 self.exclusive_oe_embedder_size_sums[i]
                 + int(over_embedding_m + i * 2 + 1)
             )
-        self.oe_embeder = VocabParallelEmbedding(
+        self.oe_embeder = make_embedding(
+            VocabParallelEmbedding,
             num_embeddings=int(self.exclusive_oe_embedder_size_sums[-1]),
             embedding_dim=oe_hidden_dim,
             use_attn_tp_group=use_attn_tp_group,

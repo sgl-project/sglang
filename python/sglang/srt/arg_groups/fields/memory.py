@@ -22,6 +22,16 @@ class Memory(msgspec.Struct):
     """Namespace ``memory``."""
 
     _NS_PATH = "memory"
+    engram_backend: A[
+        str,
+        Arg(
+            help="Storage for Engram/N-gram and per-layer embedding tables.",
+            choices=["native", "mooncake"],
+        ),
+    ] = "native"
+    engram_local_dir: A[str, "Directory for local Mooncake Engram table snapshots."] = (
+        "/dev/shm/sglang-engram"
+    )
     radix_eviction_policy: A[
         str,
         Arg(

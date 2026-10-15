@@ -51,6 +51,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+from sglang.srt.mem_cache.engram import enabled as engram_enabled
+from sglang.srt.mem_cache.engram.storage import init_deepseek, lookup_deepseek
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
@@ -763,7 +765,10 @@ class EngramEmbedding(nn.Module):
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        self._mooncake = None
+        if engram_enabled():
+            init_deepseek(self, FP8_BLOCK_SIZE)
+        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
@@ -883,6 +888,8 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
+        if self._mooncake is not None:
+            return lookup_deepseek(self, indices, FP8_BLOCK_SIZE)
         if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
