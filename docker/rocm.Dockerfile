@@ -647,7 +647,7 @@ RUN git clone ${AITER_REPO} \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
- && pip install -r requirements.txt \
+ && pip install -r requirements.txt
 
 # ROCm/aiter#5195's .co with a mask assembled in between the q rows sharing a
 # tile, which the grouped dsv4 decode needs; bit-identical at max_seqlen_q=1.
