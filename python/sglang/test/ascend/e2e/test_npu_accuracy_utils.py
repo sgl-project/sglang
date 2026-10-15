@@ -517,7 +517,9 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     eval_type=self.eval_type,
                     judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
-                    api_url_path=getattr(self, "eval_api_url_path", "/v1/chat/completions"),
+                    api_url_path=getattr(
+                        self, "eval_api_url_path", "/v1/chat/completions"
+                    ),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -747,7 +749,9 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     eval_type=self.eval_type,
                     judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
-                    api_url_path=getattr(self, "eval_api_url_path", "/v1/chat/completions"),
+                    api_url_path=getattr(
+                        self, "eval_api_url_path", "/v1/chat/completions"
+                    ),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
