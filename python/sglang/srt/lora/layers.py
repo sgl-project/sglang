@@ -9,6 +9,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -26,7 +27,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -66,7 +67,7 @@ class BaseLayerWithLoRA(nn.Module):
         has LoRA batch metadata. batch_info is None on DP-attention idle
         forwards (see LoRAManager.prepare_lora_batch), so idle forwards take
         the base path."""
-        batch_info = self.lora_backend.batch_info
+        batch_info = self.lora_backend.get_batch_info()
         return (
             self.set_lora
             and batch_info is not None
@@ -79,9 +80,7 @@ class BaseLayerWithLoRA(nn.Module):
     def set_lora_info(self, *args):
         pass
 
-    # Weight slicing derives the shard rank from the wrapped base layer
-    # (base_layer.tp_rank): under DP attention, attention layers are built
-    # on the attn-TP group, so the outer/global TP rank would overshoot.
+    # LoRA slices follow the base layer's group; attention TP can differ from TP.
     def slice_lora_a_weights(self, A: torch.Tensor):
         pass
 
@@ -119,7 +118,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         # all-reduce, making the unsharded LoRA approach mathematically
         # incorrect — a sharded LoRA kernel would be needed.
         if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
-            from sglang.srt.layers.communicator import get_attn_tp_context
+            from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
             assert not get_attn_tp_context().allow_input_scattered, (
                 "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
@@ -225,7 +224,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Extra tokens (tokens >= vocab_size) are now handled efficiently
         in the backend's run_lora_a_embedding method.
         """
-        batch_info = self.lora_backend.batch_info
+        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.DP_LOCAL)
 
         # Get base embedding output
         # For tokens >= vocab_size, base_layer will clamp or handle them
@@ -243,10 +242,11 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         # Apply LoRA if configured; DP-attention idle forwards take the base
         # path (see lora_active).
-        if self.lora_active:
-            # The backend's run_lora_a_embedding now handles both regular
-            # and extra tokens efficiently with CUDA graph support
-            base_output = self.apply_lora(base_output, input_, batch_info)
+        with get_forward().scoped(lora_batch_layout=LoRABatchLayout.DP_LOCAL):
+            if self.lora_active:
+                # The backend's run_lora_a_embedding now handles both regular
+                # and extra tokens efficiently with CUDA graph support
+                base_output = self.apply_lora(base_output, input_, batch_info)
 
         return base_output
 
@@ -294,7 +294,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         # incompatible with input_scattered mode where the all-reduce is
         # skipped.
         if tp_size > 1:
-            from sglang.srt.layers.communicator import get_attn_tp_context
+            from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
             if get_attn_tp_context().allow_input_scattered:
                 raise ValueError(
@@ -340,7 +340,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         (chunked logprobs), _lm_head_pass_idx selects a precomputed
         per-pass batch_info.  Otherwise the full-pruned batch_info is used.
 
-        Returns None when no lm_head pruning applies (decode, no LoRA, etc.).
+        Returns None when no separate lm_head routing applies.
         """
         pass_idx = self.lora_backend._lm_head_pass_idx
         if (
@@ -362,9 +362,9 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                 raise RuntimeError(
                     f"lm_head LoRA input token count mismatch: got "
                     f"{num_tokens} tokens but lm_head_batch_info expects "
-                    f"{batch_info.expected_tokens}. This likely means "
-                    f"a pruning step in LogitsProcessor._get_pruned_states is "
-                    f"not reflected in get_lm_head_pruned_lens()."
+                    f"{batch_info.expected_tokens}. This likely means the "
+                    f"routing metadata does not match the rows gathered by "
+                    f"LogitsProcessor."
                 )
 
         return batch_info
@@ -519,7 +519,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor):
-        local_tp_rank = self.base_layer.tp_rank
+        local_tp_rank = get_group_rank_size(self.base_layer.tp_group)[0]
         shard_size = self.base_layer.output_partition_sizes[0]
         start_idx = local_tp_rank * shard_size
         end_idx = (local_tp_rank + 1) * shard_size
@@ -622,7 +622,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor):
-        local_tp_rank = self.base_layer.tp_rank
+        local_tp_rank = get_group_rank_size(self.base_layer.tp_group)[0]
         partition_sizes = self.base_layer.output_partition_sizes
         output_sizes = self.base_layer.output_sizes
         slices = []
@@ -647,13 +647,13 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
     def slice_lora_b_weights(self, B: torch.Tensor):
         bl = self.base_layer
-        tp_rank = bl.tp_rank
+        tp_rank = get_group_rank_size(bl.tp_group)[0]
         hd, nkv, nh, dr, tp = (
             bl.inkling_head_dim,
             bl.inkling_num_kv_heads,
             bl.inkling_num_heads,
             bl.inkling_d_rel,
-            bl.inkling_tp_size,
+            get_group_rank_size(bl.tp_group)[1],
         )
         q_size, kv_size, r_size = hd * nh, hd * nkv, dr * nh
         q_off, k_off, v_off, r_off = 0, q_size, q_size + kv_size, q_size + 2 * kv_size
@@ -737,17 +737,18 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         q_proj_shard_size = base_layer.q_proj_shard_size
         kv_proj_shard_size = base_layer.kv_proj_shard_size
         num_kv_head_replicas = base_layer.num_kv_head_replicas
-        local_tp_rank = base_layer.tp_rank
+        local_tp_rank = get_group_rank_size(base_layer.tp_group)[0]
 
         q_start_idx = q_proj_shard_size * local_tp_rank
         q_end_idx = q_start_idx + q_proj_shard_size
 
-        kv_shard_id = local_tp_rank // num_kv_head_replicas
+        kv_tp_rank, _ = get_group_rank_size(base_layer.kv_tp_group)
+        kv_shard_id = kv_tp_rank // num_kv_head_replicas
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
-        q_size = base_layer.output_sizes[0]
-        k_size = base_layer.output_sizes[1] // num_kv_head_replicas
+        q_size = base_layer.total_num_heads * base_layer.head_size
+        k_size = base_layer.total_num_kv_heads * base_layer.head_size
         B_q_shard = B[q_start_idx:q_end_idx, :]
         B_k_shard = B[q_size + kv_start_idx : q_size + kv_end_idx, :]
         B_v_shard = B[q_size + k_size + kv_start_idx : q_size + k_size + kv_end_idx, :]
@@ -804,13 +805,11 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.lora_backend.start_lora_a_overlap(x, self.A_buffer)
 
     def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=None):
+        tp_rank, tp_size = get_group_rank_size(self.base_layer.tp_group)
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
-            tp_rank = get_parallel().tp_rank
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.base_layer.tp_size
-            )
+            splitted_input = split_tensor_along_last_dim(input_, num_partitions=tp_size)
             input_parallel = splitted_input[tp_rank].contiguous()
 
         lora_active = self.lora_active
@@ -819,7 +818,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
         bias_ = (
             None
-            if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
+            if (tp_rank > 0 or self.base_layer.skip_bias_add)
             else self.base_layer.bias
         )
         output_parallel = self.base_layer.quant_method.apply(
@@ -828,7 +827,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
         should_reduce = (
             self.base_layer.reduce_results
-            and self.base_layer.tp_size > 1
+            and tp_size > 1
             and not skip_all_reduce
             and not should_skip_mlp_all_reduce()
         )
@@ -865,7 +864,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return output_, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor):
-        local_tp_rank = self.base_layer.tp_rank
+        local_tp_rank, _ = get_group_rank_size(self.base_layer.tp_group)
         shard_size = self.base_layer.input_size_per_partition
         start_idx = local_tp_rank * shard_size
         end_idx = (local_tp_rank + 1) * shard_size
@@ -1106,11 +1105,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """Build LoRAInfo for the current batch."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
 
-        batch_info = self.lora_backend.batch_info
+        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL)
+        assert batch_info is not None
 
         lora_ranks = batch_info.lora_ranks
         max_lora_rank = self.down_lora_a_weights.shape[2]
-        cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
+        cg_buffers = (
+            self.lora_backend.prefill_moe_cg_buffers
+            if batch_info is self.lora_backend.prefill_cuda_graph_batch_info
+            else getattr(self.lora_backend, "moe_cg_buffers", None)
+        )
         moe_lora_info = batch_info.moe_lora_info
         assert moe_lora_info is not None
 
@@ -1144,9 +1148,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             has_active_lora=has_active_lora,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
@@ -1159,7 +1160,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         2. After down projection, before final reduction
         """
         # DP-attention idle forward: no batch_info, run the base MoE path.
-        if self.lora_backend.batch_info is None:
+        if self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None:
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch

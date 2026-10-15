@@ -1,7 +1,4 @@
-"""Config-time override declarations for nemotron_h.
-
-Architectures: NemotronHForCausalLM, NemotronHPuzzleForCausalLM.
-"""
+"""Config-time override declarations for nemotron_h."""
 
 import logging
 from typing import Any, Dict
@@ -17,7 +14,11 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
-@_register_for("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
+@_register_for(
+    "NemotronHForCausalLM",
+    "NemotronHPuzzleForCausalLM",
+    "NemotronH_Omni_Reasoning_V3",
+)
 def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     """NemotronH quantization / MoE runner / attention backend defaults
     (absorbed from the retired arg_groups/nemotron_h_hook.py; the mamba radix
@@ -35,7 +36,12 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     ]
     quantization = cfg.quantization
     if is_modelopt:
-        assert model_config.hf_config.mlp_hidden_act == "relu2"
+        language_config = (
+            model_config.hf_text_config
+            if model_arch == "NemotronH_Omni_Reasoning_V3"
+            else hf_config
+        )
+        assert language_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
             quant_algo = model_config.hf_config.quantization_config["quant_algo"]
             if quant_algo == "MIXED_PRECISION":
@@ -47,6 +53,14 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
+
+    uses_expert_remap = (
+        cfg.enable_eplb
+        or cfg.ep_num_redundant_experts > 0
+        or cfg.init_expert_location != "trivial"
+    )
+    if uses_expert_remap:
+        _validate_expert_remap(cfg, hf_config, model_arch)
 
     has_w4a16_moe_layers = False
     if is_modelopt and quantization == "modelopt_mixed":
@@ -70,6 +84,18 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend for "
                 f"{model_arch} with W4A16_NVFP4 MoE layers"
             )
+    elif (
+        uses_expert_remap
+        and cfg.moe_runner_backend == "auto"
+        and get_platform().is_sm100
+        and cfg.moe_a2a_backend == "none"
+    ):
+        # flashinfer_trtllm routes inside the kernel and cannot take the remap.
+        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+        logger.info(
+            "Use flashinfer_trtllm_routed as MoE runner backend on sm100 for "
+            f"{model_arch} with EPLB or redundant experts"
+        )
     elif (is_modelopt or model_config.quantization is None) and (
         cfg.moe_runner_backend == "auto"
     ):
@@ -121,3 +147,34 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         elif get_platform().is_sm100:
             overrides["attention_backend"] = "trtllm_mha"
     return overrides
+
+
+def _validate_expert_remap(cfg: Any, hf_config: Any, model_arch: str) -> None:
+    if cfg.moe_runner_backend == "flashinfer_trtllm":
+        raise ValueError(
+            "flashinfer_trtllm routes inside the kernel and does not support EPLB or "
+            "redundant experts on Nemotron-H; use "
+            "--moe-runner-backend flashinfer_trtllm_routed."
+        )
+    if (
+        cfg.enable_eplb
+        and cfg.moe_runner_backend == "flashinfer_cutedsl"
+        and cfg.moe_a2a_backend == "none"
+    ):
+        raise ValueError(
+            "flashinfer_cutedsl without an a2a backend does not migrate its expert "
+            "scales on EPLB rebalance; use --moe-runner-backend "
+            "flashinfer_trtllm_routed or set --moe-a2a-backend."
+        )
+    if model_arch == "NemotronHPuzzleForCausalLM":
+        num_routed_experts = {
+            block["n_routed_experts"]
+            for block in hf_config.block_configs
+            if block["block_type"] == "moe"
+        }
+        if len(num_routed_experts) > 1:
+            raise ValueError(
+                "EPLB and redundant experts need the same routed expert count on "
+                "every MoE layer, got "
+                f"{sorted(num_routed_experts)}."
+            )

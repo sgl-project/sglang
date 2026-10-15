@@ -14,8 +14,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
-    accept_greedy_triton,
-    finalize_accept_lens_triton,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -25,6 +23,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     ScatterCompactToStrided,
     build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
+)
+from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+    simulated_bonus_sample,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -46,9 +47,10 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -78,6 +80,30 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
     can_run_cuda_graph: bool
 
 
+def candidate_request_length_bound(
+    reqs, pending_verify_tokens: int = 0
+) -> Optional[int]:
+    """Bound committed positions without reading asynchronous acceptance results.
+    The overlap loop can hold one unprocessed result, so reserve its full width;
+    the runner adds the current verify width. Aborted/embedding/multimodal requests
+    return None: their visible token IDs may not track cache positions."""
+    if not reqs:
+        return None
+    longest = 0
+    for req in reqs:
+        budget = req.sampling_params.max_new_tokens
+        if (
+            not isinstance(budget, int)
+            or budget < 0
+            or getattr(req, "to_finish", None) is not None
+            or getattr(req, "input_embeds", None) is not None
+            or getattr(req, "multimodal_inputs", None) is not None
+        ):
+            return None
+        longest = max(longest, len(req.origin_input_ids) + budget)
+    return longest + pending_verify_tokens
+
+
 class TargetVerifyExecutor:
     def __init__(
         self,
@@ -90,8 +116,19 @@ class TargetVerifyExecutor:
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
+        simulated_correct_len: Optional[torch.Tensor] = None,
+        block_verification: bool = False,
     ) -> None:
         self.target_worker = target_worker
+        # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
+        self._target_is_dsv41 = (
+            getattr(
+                target_worker.model_runner.model_config.hf_text_config,
+                "model_type",
+                None,
+            )
+            == "deepseek_v41"
+        )
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
@@ -100,7 +137,8 @@ class TargetVerifyExecutor:
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
-        self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
+        self._block_verification = block_verification
+        self._simulated_correct_len = simulated_correct_len
 
     def accept_and_finalize(
         self,
@@ -115,79 +153,63 @@ class TargetVerifyExecutor:
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
+        simulate_bonus_sampling_info=None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
         Folded path: the accept/finalize/out-token kernels already ran inside
         the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
-        Eager path: run them here, including the SGLANG_SIMULATE_ACC_LEN
-        override.
+        Eager path: run them here. Both apply the SGLANG_SIMULATE_ACC_LEN
+        override drawn by begin_simulated_step.
         """
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
+        simulate = self._simulated_correct_len is not None
+        # Simulated acceptance overwrites correct_len below, so a sampling accept
+        # (draft/target softmax + rejection) would be computed only to be discarded.
+        accept_sampling_info = None if simulate and _is_hip else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
-            sampling_info=sampling_info,
+            sampling_info=accept_sampling_info,
             draft_input=draft_input,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
+            fused_argmax=self._target_is_dsv41,
+            block_verification=self._block_verification,
         )
-        if self._simulate_acc_len > 0:
-            correct_len = self._simulated_correct_len(
-                bs=bs, dtype=correct_len.dtype, device=correct_len.device
-            )
-
-        site = (
+        sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
-            if sampling_info is None or sampling_info.is_all_greedy
+            if accept_sampling_info is None or accept_sampling_info.is_all_greedy
             else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
-        self._tp_sync.sync(site, correct_len)
-        self._tp_sync.sync(site, bonus)
-        self._tp_sync.sync(site, cap_trim_lens)
-
-        finalized = FinalizeAcceptLens.execute(
+        return build_accept_outs(
             correct_len=correct_len,
+            bonus=bonus,
             cap_trim_lens=cap_trim_lens,
             prefix_lens=prefix_lens,
-        )
-        out_tokens = BuildOutTokens.execute(
             draft_tokens=draft_tokens,
-            correct_len=correct_len,
-            bonus=bonus,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
             gamma=self.gamma,
-        )
-        return AcceptOuts(
-            correct_len=correct_len,
-            bonus=bonus,
-            cap_trim_lens=finalized.cap_trim_lens,
-            commit_lens=finalized.commit_lens,
-            new_seq_lens=finalized.new_seq_lens,
-            out_tokens=out_tokens,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            tp_sync=self._tp_sync,
+            sync_site=sync_site,
+            simulated_correct_len=self._simulated_correct_len,
+            target_logits=target_logits,
+            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
 
-    def _simulated_correct_len(
-        self, *, bs: int, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        buf = self._simulated_correct_drafts_buf
-        if (
-            buf is None
-            or buf.numel() < bs
-            or buf.dtype != dtype
-            or buf.device != device
-        ):
-            buf = torch.empty((max(bs, 512),), dtype=dtype, device=device)
-            self._simulated_correct_drafts_buf = buf
-
+    def begin_simulated_step(self) -> None:
+        """Draw this step's SGLANG_SIMULATE_ACC_LEN correct length, before the
+        target verify, so the folded accept in the graph applies it too."""
+        if self._simulated_correct_len is None:
+            return
         simulated_acc_len = sample_simulated_acc_len(
             self._simulate_acc_len, SIMULATE_ACC_METHOD, self.gamma + 1
         )
-        return buf[:bs].fill_(simulated_acc_len - 1)
+        self._simulated_correct_len.fill_(simulated_acc_len - 1)
 
     def run_idle_participation(
         self,
@@ -260,6 +282,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
+            kv_loc_plan=verify_window.kv_loc_plan,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -296,6 +319,10 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
+        if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
+            verify_input.candidate_max_seq_len_upper_bound = (
+                candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
+            )
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -332,6 +359,7 @@ class TargetVerifyExecutor:
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
+                kv_loc_plan=verify_window.kv_loc_plan,
             )
             return
         hidden = logits_output.hidden_states
@@ -348,10 +376,11 @@ class TargetVerifyExecutor:
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
+        cache_loc = self.kv_injector.ids_for(verify_window.kv_loc_plan)
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_window.verify_cache_loc,
-            cache_loc_2d=verify_window.verify_cache_loc_2d,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(verify_window.verify_cache_loc_2d.shape),
             positions=verify_window.positions_2d.reshape(-1),
             commit_lens=commit_lens,
             state_slot=state_slot,
@@ -364,6 +393,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
+        kv_loc_plan,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -373,6 +403,9 @@ class TargetVerifyExecutor:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=layout,
             live_seq_lens_cpu=batch.seq_lens_cpu,
+            # The packed rows are a selection of the planned verify window.
+            kv_loc_plan=kv_loc_plan,
+            kv_loc_cols=ragged_window.window_index,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -405,6 +438,7 @@ class TargetVerifyExecutor:
         bs: int,
         device: str,
         sampling_info,
+        verify_window: VerifyWindow,
         inject_gate: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         ragged_window = BuildRaggedVerifyWindow.execute(
@@ -424,6 +458,7 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
+            kv_loc_plan=verify_window.kv_loc_plan,
         )
         logits_output = target_verify.logits_output
 
@@ -479,6 +514,7 @@ class CommitInjectCtx(msgspec.Struct):
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
+    kv_injector: Optional[TargetHiddenKvInjector] = None
 
 
 class AcceptOuts(msgspec.Struct):
@@ -499,9 +535,12 @@ class DsparkVerifyEpilogue:
         device,
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        fused_argmax: bool = False,
+        simulated_correct_len: Optional[torch.Tensor] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
+        self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -528,17 +567,26 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
+        # SGLANG_SIMULATE_ACC_LEN: the step's correct length, filled per step.
+        self.simulated_correct_len = simulated_correct_len
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
+        self._static_step_state: Optional[tuple[int, bool]] = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
-        if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
+        if (
+            runner.model_runner.is_draft_worker
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
             return
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.next_token_logits is None
             or out.hidden_states is None
         ):
+            return
+        if not runner.ragged_verify_mode:
+            self._static_epilogue(out, forward_batch)
             return
         self(
             compact_logits=out.next_token_logits,
@@ -550,6 +598,7 @@ class DsparkVerifyEpilogue:
         )
 
     def begin_step(self, verify_lens, armed: bool) -> None:
+        self._static_step_state = None
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -558,6 +607,49 @@ class DsparkVerifyEpilogue:
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
+
+    def begin_static_step(self, bs: int, armed: bool) -> None:
+        state = (bs, armed)
+        if self._static_step_state == state:
+            return
+        self.verify_lens_buf[:bs].fill_(self.stride)
+        self.verify_lens_buf[bs:].zero_()
+        self.inject_gate_buf.fill_(int(armed))
+        self._static_step_state = state
+
+    def _static_epilogue(self, out, forward_batch) -> None:
+        bs = forward_batch.batch_size
+        verify_lens = self.verify_lens_buf[:bs]
+        candidates = forward_batch.input_ids.view(bs, self.stride)
+        commit_lens = self._accept(
+            candidates=candidates,
+            logits=out.next_token_logits,
+            draft_tokens=candidates[:, 1:].contiguous(),
+            seq_lens=forward_batch.seq_lens,
+        )
+        if not self.folds_commit:
+            return
+        # Same staged locations as target verify; padded and fallback rows skip KV.
+        gated_commit_lens = (
+            torch.minimum(commit_lens, verify_lens.to(torch.int32))
+            * self.inject_gate_buf
+        )
+        cache_loc = forward_batch.out_cache_loc
+        state_slot = None
+        if is_unified_kv_triton():
+            state_slot = (
+                forward_batch.req_pool_indices.view(-1, 1)
+                .expand(bs, self.stride)
+                .reshape(-1)
+            )
+        self.commit_ctx.kv_injector.inject_target_hidden(
+            target_hidden=out.hidden_states,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(bs, self.stride),
+            positions=forward_batch.positions,
+            commit_lens=gated_commit_lens,
+            state_slot=state_slot,
+        )
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
@@ -610,7 +702,23 @@ class DsparkVerifyEpilogue:
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
-        commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
+        candidates = torch.zeros(
+            (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
+        )
+        scatter_compact_to_strided_into(
+            compact=input_ids.view(-1, 1),
+            verify_lens=verify_lens,
+            out=candidates,
+            stride=self.stride,
+            fill_value=0,
+        )
+        commit_lens = self._accept(
+            candidates=candidates.view(bs, self.stride),
+            logits=self.strided_logits[: bs * self.stride],
+            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            seq_lens=seq_lens,
+            cutoff_verify_lens=verify_lens,
+        )
         if self.folds_commit:
             self._commit_inject(
                 commit_lens, verify_lens, seq_lens, req_pool_indices, bs
@@ -632,45 +740,31 @@ class DsparkVerifyEpilogue:
             fill_value=0.0,
         )
 
-    def _accept(self, input_ids, seq_lens, verify_lens, bs: int) -> torch.Tensor:
-        candidates = torch.zeros(
-            (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
-        )
-        scatter_compact_to_strided_into(
-            compact=input_ids.view(-1, 1),
-            verify_lens=verify_lens,
-            out=candidates,
-            stride=self.stride,
-            fill_value=0,
-        )
-        correct_len, bonus, cap_trim_lens = accept_greedy_triton(
-            candidates=candidates.view(bs, self.stride),
-            target_logits=self.strided_logits[: bs * self.stride],
+    def _accept(
+        self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
+    ) -> torch.Tensor:
+        bs = candidates.shape[0]
+        correct_len, bonus, cap_trim_lens = AcceptGreedy.execute(
+            candidates=candidates,
+            target_logits=logits,
             verify_num_draft_tokens=self.stride,
-            cutoff_verify_lens=verify_lens,
+            cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=self._fused_argmax,
         )
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
-        finalized = finalize_accept_lens_triton(
-            correct_len=correct_len,
-            cap_trim_lens=cap_trim_lens,
-            prefix_lens=seq_lens[:bs],
-        )
-        out_tokens = BuildOutTokens.execute(
-            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+        accept = build_accept_outs(
             correct_len=correct_len,
             bonus=bonus,
-            verify_num_draft_tokens=self.stride,
+            cap_trim_lens=cap_trim_lens,
+            prefix_lens=seq_lens[:bs],
+            draft_tokens=draft_tokens,
             gamma=self.gamma,
+            verify_num_draft_tokens=self.stride,
+            tp_sync=self._tp_sync,
+            sync_site=SpecTpSyncSite.DSPARK_ACCEPT_GRAPH,
+            simulated_correct_len=self.simulated_correct_len,
+            out=self.read_accept(bs),
         )
-        self.correct_len_buf[:bs].copy_(correct_len)
-        self.bonus_buf[:bs].copy_(bonus)
-        self.cap_trim_lens_buf[:bs].copy_(cap_trim_lens.to(torch.int32))
-        self.commit_lens_buf[:bs].copy_(finalized.commit_lens)
-        self.new_seq_lens_buf[:bs].copy_(finalized.new_seq_lens)
-        self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
-        return finalized.commit_lens
+        return accept.commit_lens
 
     def _commit_inject(
         self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int
@@ -709,6 +803,93 @@ class DsparkVerifyEpilogue:
             )
 
 
+def build_accept_outs(
+    *,
+    correct_len: torch.Tensor,
+    bonus: torch.Tensor,
+    cap_trim_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    tp_sync: SpecTpSync,
+    sync_site: SpecTpSyncSite,
+    simulated_correct_len: Optional[torch.Tensor] = None,
+    target_logits: Optional[torch.Tensor] = None,
+    simulate_bonus_sampling_info=None,
+    out: Optional[AcceptOuts] = None,
+) -> AcceptOuts:
+    """``out``: static buffers (the in-graph accept's) to copy the results into."""
+    bs = correct_len.shape[0]
+    if simulated_correct_len is not None:
+        # The accept runs as served; only its length is replaced.
+        correct_len = simulated_correct_len.repeat(bs).to(correct_len.dtype)
+        if simulate_bonus_sampling_info is not None:
+            assert target_logits is not None
+            bonus = sample_simulated_bonus(
+                target_logits=target_logits,
+                correct_len=correct_len,
+                greedy_bonus=bonus,
+                sampling_info=simulate_bonus_sampling_info,
+                bs=bs,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+            )
+    tp_sync.sync(sync_site, correct_len)
+    tp_sync.sync(sync_site, bonus)
+    tp_sync.sync(sync_site, cap_trim_lens)
+
+    finalized = FinalizeAcceptLens.execute(
+        correct_len=correct_len,
+        cap_trim_lens=cap_trim_lens,
+        prefix_lens=prefix_lens,
+    )
+    out_tokens = BuildOutTokens.execute(
+        draft_tokens=draft_tokens,
+        correct_len=correct_len,
+        bonus=bonus,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        gamma=gamma,
+    )
+    accept = AcceptOuts(
+        correct_len=correct_len,
+        bonus=bonus,
+        cap_trim_lens=finalized.cap_trim_lens,
+        commit_lens=finalized.commit_lens,
+        new_seq_lens=finalized.new_seq_lens,
+        out_tokens=out_tokens,
+    )
+    if out is not None:
+        out.correct_len.copy_(accept.correct_len)
+        out.bonus.copy_(accept.bonus)
+        out.cap_trim_lens.copy_(accept.cap_trim_lens)
+        out.commit_lens.copy_(accept.commit_lens)
+        out.new_seq_lens.copy_(accept.new_seq_lens)
+        out.out_tokens.copy_(accept.out_tokens)
+        return out
+    return accept
+
+
+def sample_simulated_bonus(
+    *,
+    target_logits: torch.Tensor,
+    correct_len: torch.Tensor,
+    greedy_bonus: torch.Tensor,
+    sampling_info,
+    bs: int,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    """Temperature-sample every verify row and return the row at the (simulated)
+    correct_len as the bonus token. Temperature only: callers exclude top-p/top-k/min-p."""
+    bonus = simulated_bonus_sample(
+        target_logits=target_logits,
+        correct_len=correct_len,
+        temperatures=sampling_info.temperatures,
+        bs=bs,
+        rows_per_request=verify_num_draft_tokens,
+    )
+    return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -719,6 +900,8 @@ def accept_draft_tokens(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
+    fused_argmax: bool = False,
+    block_verification: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -729,14 +912,25 @@ def accept_draft_tokens(
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=fused_argmax,
         )
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
-        rows_per_request=gamma_rows,
-    ).view(bs, gamma_rows, vocab)
-    expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    if draft_block.greedy_draft:
+        # An argmax draft is one-hot: rejection accepts at the target probability.
+        draft_tokens = draft_block.draft_tokens
+        draft_probs = torch.zeros(
+            (*draft_tokens.shape, target_logits.shape[-1]),
+            dtype=torch.float32,
+            device=target_logits.device,
+        )
+        draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
+    else:
+        bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+        draft_probs = SoftmaxTemp.execute(
+            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+            temperatures=draft_block.temperatures,
+            rows_per_request=gamma_rows,
+        ).view(bs, gamma_rows, vocab)
+        expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
             candidates=candidates,
@@ -747,12 +941,14 @@ def accept_draft_tokens(
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            block_verification=block_verification,
         )
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        fused_argmax=fused_argmax,
     )
     sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
         candidates=candidates,
@@ -763,6 +959,7 @@ def accept_draft_tokens(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        block_verification=block_verification,
     )
     selected = SelectMixedAccept.execute(
         greedy_mask=greedy_mask,

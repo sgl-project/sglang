@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from sglang.kernels.ops.attention.dsv4.rms_normalize_hip import rms_normalize_triton
+from sglang.kernels.ops.layernorm.rms_normalize_hip import rms_normalize_triton
 
 
 class DeepseekRefRMSNorm(nn.Module):

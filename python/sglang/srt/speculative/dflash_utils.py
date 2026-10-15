@@ -36,11 +36,21 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        "XPUAttentionBackend",
     }
 )
 
 
-if is_cuda() or is_musa():
+if is_cuda():
+    from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+    from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
+
+    from sglang.kernels.ops.speculative.sampling import (
+        tree_speculative_sampling_target_only,
+    )
+
+    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+elif is_musa():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -196,8 +206,20 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     backend = attn_backend
     for _ in range(4):
+        if isinstance(backend, HybridAttnBackend):
+            # Resolve wrappers down to the backend that runs TARGET_VERIFY
+            backend = backend._select_backend(ForwardMode.TARGET_VERIFY)
+            continue
+        if isinstance(backend, TboAttnBackend):
+            # primary and children come from the same creator.
+            backend = backend.primary
+            continue
         full_backend = getattr(backend, "full_attn_backend", None)
         if full_backend is None:
             break
@@ -538,6 +560,17 @@ class DFlashDraftConfig:
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    projector_type: Optional[str]
+    shift_label: Optional[bool]
+    pure_draft_prefix_len: Optional[int]
+    gru_hidden_dim: Optional[int]
+    emb_dim: Optional[int]
+    attention_sink_bias: bool = False
+    attention_value_scale: Optional[float] = None
+
+    @property
+    def is_domino(self) -> bool:
+        return self.projector_type == "domino"
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -698,6 +731,95 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    # MiMo DFlash draft extras: per-head attention sink bias and V value scale.
+    raw_attention_sink_bias = dflash_cfg.get("attention_sink_bias", False)
+    if not isinstance(raw_attention_sink_bias, bool):
+        raise ValueError(
+            "DFLASH dflash_config.attention_sink_bias must be a bool, "
+            f"got {raw_attention_sink_bias!r} (type={type(raw_attention_sink_bias).__name__})."
+        )
+    attention_sink_bias = bool(raw_attention_sink_bias)
+
+    raw_attention_value_scale = dflash_cfg.get("attention_value_scale", None)
+    if raw_attention_value_scale is None:
+        attention_value_scale: Optional[float] = None
+    else:
+        if isinstance(raw_attention_value_scale, bool) or not isinstance(
+            raw_attention_value_scale, (int, float)
+        ):
+            raise ValueError(
+                "DFLASH dflash_config.attention_value_scale must be int|float|None, "
+                f"got {raw_attention_value_scale!r} "
+                f"(type={type(raw_attention_value_scale).__name__})."
+            )
+        attention_value_scale = float(raw_attention_value_scale)
+
+    projector_type = dflash_cfg.get(
+        "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
+    )
+    shift_label = None
+    pure_draft_prefix_len = None
+    gru_hidden_dim = None
+    emb_dim = None
+    if projector_type == "domino":
+        shift_label = dflash_cfg.get(
+            "shift_label", _cfg_get(draft_hf_config, "shift_label", None)
+        )
+        pure_draft_prefix_len = _parse_optional_int(
+            dflash_cfg.get(
+                "pure_draft_prefix_len",
+                _cfg_get(draft_hf_config, "pure_draft_prefix_len", None),
+            ),
+            field_name="DFLASH Domino pure_draft_prefix_len",
+            min_value=0,
+        )
+        gru_hidden_dim = _parse_optional_int(
+            dflash_cfg.get(
+                "gru_hidden_dim", _cfg_get(draft_hf_config, "gru_hidden_dim", None)
+            ),
+            field_name="DFLASH Domino gru_hidden_dim",
+            min_value=1,
+        )
+        nested_emb_dim = _parse_optional_int(
+            dflash_cfg.get("emb_dim", None),
+            field_name="DFLASH Domino dflash_config.emb_dim",
+            min_value=1,
+        )
+        top_level_emb_dim = _parse_optional_int(
+            _cfg_get(draft_hf_config, "emb_dim", None),
+            field_name="DFLASH Domino top-level emb_dim",
+            min_value=1,
+        )
+        if (
+            nested_emb_dim is not None
+            and top_level_emb_dim is not None
+            and nested_emb_dim != top_level_emb_dim
+        ):
+            raise ValueError(
+                "DFLASH Domino emb_dim differs between dflash_config and the "
+                f"top-level config: {nested_emb_dim} != {top_level_emb_dim}."
+            )
+        emb_dim = nested_emb_dim if nested_emb_dim is not None else top_level_emb_dim
+
+        if not isinstance(shift_label, bool):
+            raise ValueError(
+                "DFLASH Domino requires dflash_config.shift_label to be a bool, "
+                f"got {shift_label!r}."
+            )
+        if pure_draft_prefix_len != 1:
+            raise ValueError(
+                "DFLASH Domino currently requires pure_draft_prefix_len=1, "
+                f"got {pure_draft_prefix_len!r}."
+            )
+        if gru_hidden_dim is None:
+            raise ValueError("DFLASH Domino requires dflash_config.gru_hidden_dim.")
+        if emb_dim is None:
+            raise ValueError("DFLASH Domino requires dflash_config.emb_dim.")
+        if block_size is not None and block_size <= 1:
+            raise ValueError(
+                f"DFLASH Domino requires block_size > 1, got {block_size}."
+            )
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -711,6 +833,13 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        projector_type=projector_type,
+        shift_label=shift_label,
+        pure_draft_prefix_len=pure_draft_prefix_len,
+        gru_hidden_dim=gru_hidden_dim,
+        emb_dim=emb_dim,
+        attention_sink_bias=attention_sink_bias,
+        attention_value_scale=attention_value_scale,
     )
 
 
@@ -839,10 +968,15 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_len: float,
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
+    next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
 ) -> None:
-    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
-    block_size = candidates.shape[1]
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
+    ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
+    bs, block_size = candidates.shape
+    if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
+        # The sampling-verify branch does not materialize the target argmax.
+        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
@@ -969,7 +1103,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 dtype=torch.float32,
             )
 
-        target_probs = build_dflash_verify_target_probs(
+        target_probs = build_speculative_verify_target_probs(
             next_token_logits=next_token_logits,
             sampling_info=sampling_info,
             draft_token_num=draft_token_num,
@@ -1010,7 +1144,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def build_dflash_verify_target_probs(
+def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,

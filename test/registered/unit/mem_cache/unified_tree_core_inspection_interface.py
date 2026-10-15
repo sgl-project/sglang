@@ -79,6 +79,13 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
         ...
 
     @abstractmethod
+    def get_component_host_lock_ref(
+        self, node_id: NodeId, component_type: ComponentType
+    ) -> int:
+        """The component's host lock count on the node."""
+        ...
+
+    @abstractmethod
     def get_node_hit_count(self, node_id: NodeId) -> int:
         """The node's accumulated match count."""
         ...
@@ -86,6 +93,11 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
     @abstractmethod
     def get_write_through_pending_id(self, node_id: NodeId) -> Optional[int]:
         """The node's pending write-through id, if any."""
+        ...
+
+    @abstractmethod
+    def is_external_cache_stored(self, node_id: NodeId) -> bool:
+        """Whether the node is known to be stored in the external cache."""
         ...
 
     @abstractmethod
