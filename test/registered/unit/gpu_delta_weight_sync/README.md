@@ -3,10 +3,10 @@
 The experimental receiver applies canonical XOR deltas directly to existing
 execution-layout buffers. Static bundled MTP layer weights remain unchanged;
 its shared embedding/head buffers continue to follow the target. The disk update
-API remains independent. Pure Torch byte transforms cover CuTe DSL NVFP4 expert
-layouts and BF16 dense storage. Backend-specific CuTe scale conversion and
-model-specific indexer conversion remain focused helpers; no MegaMoE runtime is
-admitted on this branch.
+API remains independent. Centralized FlashInfer bindings describe lossless
+physical weight and scale layouts, including padding and interleaving, through
+the generic apply metadata. Backend admission rejects weight requantization;
+compact UE8M0 scales may expand losslessly for consumers that require FP32 storage.
 
 Canonical names, shapes and dtypes come from the original immutable local
 safetensors checkpoint headers at first delta admission. The feature supports the
@@ -24,11 +24,11 @@ Model mapping is selected once during admission in `gpu_delta/models.py`. The
 implemented DeepSeek MLA/DSA family covers GLM's shared runtime implementation:
 canonical name mutation, unequal Q/KV-A fusion, indexer fusion and numeric norm
 replacement, static draft exclusions, and MLA derived views. `bindings.py` owns
-ordinary dense TP/vocabulary slicing, FlashInfer CuTe DSL NVFP4 W4A16 physical
-layouts, alpha/scale refresh views, and generic consumer identity snapshots.
+ordinary dense TP/vocabulary slicing and generic consumer identity snapshots;
+`flashinfer.py` owns admitted FlashInfer physical layouts and derived scale views.
 `layout.py` owns canonical plans and DE/apply scheduling. A new model
 family supplies startup bindings and derived views through the same small mapping
-interface; no GDN/KDA mapping or additional serving backend is implemented here.
+interface; no GDN/KDA mapping or non-FlashInfer MoE backend is implemented here.
 
 Descriptions list the backend's dense and MoE storage contracts in `layouts`.
 The rank layout digest binds these contracts and the canonical tensor views.
@@ -47,6 +47,14 @@ HTTP routes, tokenizer coordination and scheduler control handlers live under
 communicator and scheduler-handler registration. Preparation takes no model-update
 writer lock. Partial mutation poisons the delta session instead of attempting
 recovery or falling back to a different update path.
+
+The CPU suite is grouped by contract: `bindings` covers canonical slicing and
+FlashInfer mapping oracles; `layout`, `apply`, and `derived` cover planning,
+cache reuse and derived-buffer updates; `codec_admission` covers input geometry
+and outer payload decoding; `session` covers lifecycle, scheduler dispatch and
+published-rank identity. Checkpoint, host-cache, memory, tokenizer and HTTP tests
+retain their separate fixtures. Native layout, DE codec and allocator-lifetime
+tests remain separate from CPU tests and do not require a serving benchmark.
 
 ```bash
 python -m pytest -q test/registered/unit/gpu_delta_weight_sync \

@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -52,21 +53,6 @@ def _apply_binding(binding, mask):
         selected = view.selected_bytes(mask.reshape(-1)) if binding.segments else mask
         for destination in view.destinations:
             destination.bitwise_xor_(selected.reshape(destination.shape))
-
-
-def _reference_scale_swizzle(source):
-    """Independent coordinate oracle for the loader's padded scale bytes."""
-    rows, cols = source.shape
-    padded_rows, padded_cols = (rows + 127) // 128 * 128, (cols + 3) // 4 * 4
-    row = torch.arange(rows)[:, None]
-    col = torch.arange(cols)[None, :]
-    offsets = (
-        ((row // 128 * (padded_cols // 4) + col // 4) * 32 + row % 32) * 4
-        + row % 128 // 32
-    ) * 4 + col % 4
-    expected = torch.zeros(padded_rows * padded_cols, dtype=torch.uint8)
-    expected[offsets.flatten()] = source.flatten()
-    return expected.reshape(padded_rows, padded_cols)
 
 
 class TestCanonicalPlanCache(unittest.TestCase):
@@ -252,75 +238,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     torch.testing.assert_close(_bytes(target), expected)
                     self.assertEqual(target.data_ptr(), pointer)
                     self.assertEqual(target.stride(), stride)
-
-    def test_scale_binding_updates_unique_images_and_preserves_padding(self):
-        cases = [
-            (projection, rows, cols)
-            for projection in ("gate", "up", "down")
-            for rows in ((64, 128, 256) if projection != "down" else (128, 256))
-            for cols in (4, 64, 192)
-        ] + [("gate", 64, 19), ("up", 128, 3), ("down", 17, 3), ("down", 129, 8)]
-        for projection, rows, cols in cases:
-            for independent_mma in (False, True):
-                with self.subTest(
-                    projection=projection, rows=rows, cols=cols, mma=independent_mma
-                ):
-                    mask = torch.randint(256, (rows, cols), dtype=torch.uint8)
-                    expanded = mask
-                    if projection != "down":
-                        expanded = torch.zeros(2 * rows, cols, dtype=torch.uint8)
-                        start = 64 if projection == "gate" else 0
-                        for row in range(0, rows, 64):
-                            expanded[2 * row + start : 2 * row + start + 64] = mask[
-                                row : row + 64
-                            ]
-                    transformed = _reference_scale_swizzle(expanded)
-                    primary = torch.randint(256, transformed.shape, dtype=torch.uint8)
-                    padded_rows, padded_cols = primary.shape
-                    physical = primary.view(
-                        padded_rows // 128, padded_cols // 4, 32, 4, 4
-                    )
-                    mma = physical.permute(2, 3, 0, 4, 1).unsqueeze(-1)
-                    if independent_mma:
-                        mma = mma.clone(memory_format=torch.preserve_format)
-                    stem = "w2" if projection == "down" else "w13"
-                    layer = SimpleNamespace(
-                        moe_tp_size=1,
-                        use_presharded_weights=False,
-                        quant_method=_nvfp4_method(),
-                        moe_runner_config=SimpleNamespace(is_gated=True),
-                        _map_global_expert_id_to_local_expert_id=lambda _: 0,
-                        **{
-                            stem + "_blockscale_swizzled": primary.unsqueeze(0),
-                            stem + "_weight_scale": primary.unsqueeze(0),
-                            stem + "_blockscale_mma": mma,
-                        },
-                    )
-                    binding = byte_layout._moe_binding(
-                        "scale",
-                        {"dtype": "F8_E4M3", "shape": [rows, cols]},
-                        layer,
-                        0,
-                        projection,
-                        "weight_scale",
-                    )
-                    self.assertEqual(len(binding.storage), 2 if independent_mma else 1)
-                    images = [primary]
-                    if independent_mma:
-                        images.append(
-                            mma[..., 0].permute(2, 4, 0, 1, 3).view_as(primary)
-                        )
-                    before = [image.clone() for image in images]
-                    pointers = [image.data_ptr() for image in images]
-                    _apply_binding(binding, mask)
-                    for image, original in zip(images, before):
-                        torch.testing.assert_close(image, original ^ transformed)
-                    # Alias duplication would cancel the first XOR. A second
-                    # update also proves cached destinations stay live.
-                    _apply_binding(binding, mask)
-                    for image, original, pointer in zip(images, before, pointers):
-                        torch.testing.assert_close(image, original)
-                        self.assertEqual(image.data_ptr(), pointer)
 
     def test_unfused_bf16_shared_experts_use_ordinary_tp8_slices(self):
         tp_rank, intermediate, hidden = 3, 32, 16

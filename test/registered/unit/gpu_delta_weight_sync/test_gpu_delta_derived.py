@@ -11,6 +11,7 @@ from typing import Optional
 from unittest.mock import patch
 
 import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -76,9 +77,9 @@ def _layer(backend, w4a16=False):
         w2_input_scale_quant=torch.ones(2) if cute or mega else torch.tensor(1.0),
         gemm1_clamp_limit=torch.zeros(2) if not (cute or mega) else None,
         gemm1_beta=torch.zeros(2) if not (cute or mega) else None,
-        _cutedsl_wrapper=SimpleNamespace(quant_mode="w4a16" if w4a16 else "w4a4")
-        if cute
-        else None,
+        _cutedsl_wrapper=(
+            SimpleNamespace(quant_mode="w4a16" if w4a16 else "w4a4") if cute else None
+        ),
         _cutedsl_scales=(torch.zeros(2), torch.ones(1), torch.zeros(2)),
         _cutedsl_input_scale=torch.ones(1),
         _flashinfer_megamoe_input_norm_const=0.25,
@@ -149,7 +150,10 @@ class TestDerivedNvfp4(unittest.TestCase):
                     for tensor in (*update.sources, *update.destinations)
                 ]
                 incoming = torch.tensor([1.0, 2.0, 3.0, 8.0])
-                copies = update.prepare({id(layer.w13_input_scale): incoming})
+                copies = _prepare_updates(
+                    (update,),
+                    {torch.float32: ([layer.w13_input_scale[3:4]], [incoming[3:4]])},
+                )
                 torch.testing.assert_close(
                     _value(copies, layer.g1_alphas), torch.tensor([16.0, 32.0])
                 )
@@ -240,15 +244,20 @@ class TestDerivedNvfp4(unittest.TestCase):
             )
         torch.testing.assert_close(layer.g1_alphas, torch.zeros(2))
 
-    def test_bad_target_geometry_fails_before_any_copy(self):
-        layer = _layer("flashinfer_trtllm")
-        update = derived.nvfp4_derived_update(layer, "flashinfer_trtllm")
-        with self.assertRaisesRegex(ValueError, "source geometry changed"):
-            update.prepare({id(layer.w2_weight_scale_2): torch.ones(3)})
-        layer.g1_alphas.resize_(3)
-        with self.assertRaisesRegex(ValueError, "destination geometry changed"):
-            update.prepare({})
-        torch.testing.assert_close(layer.g2_alphas, torch.zeros(2))
+        layer = _layer("flashinfer_megamoe")
+        layer.w13_weight_scale_2[:, 1].copy_(layer.w13_weight_scale_2[:, 0])
+        update = derived.nvfp4_derived_update(layer, "megamoe")
+        near = layer.w13_weight_scale_2.clone()
+        near[:, 1] += 1e-6
+        update.prepare({id(layer.w13_weight_scale_2): near})
+        near[0, 1] = float("nan")
+        with self.assertRaisesRegex(ValueError, "matching gate/up"):
+            update.prepare({id(layer.w13_weight_scale_2): near})
+        layer._flashinfer_megamoe_input_norm_const = 0.1
+        layer._flashinfer_megamoe_layer._megakernel_config.input_norm_const = 0.1
+        update = derived.nvfp4_derived_update(layer, "megamoe")
+        with self.assertRaisesRegex(ValueError, "input normalization changed"):
+            update.prepare({id(layer.w13_input_scale): torch.full((4,), 10.0)})
 
     def test_megamoe_batch_validates_once_before_returning_any_copies(self):
         layers = [_layer("flashinfer_megamoe") for _ in range(2)]
@@ -295,22 +304,6 @@ class TestDerivedNvfp4(unittest.TestCase):
         self.assertEqual(transfers, [4])
         for layer in layers:
             torch.testing.assert_close(layer.g1_alphas, torch.zeros(2))
-
-    def test_megamoe_preserves_captured_float_and_allclose_semantics(self):
-        layer = _layer("flashinfer_megamoe")
-        layer.w13_weight_scale_2[:, 1].copy_(layer.w13_weight_scale_2[:, 0])
-        update = derived.nvfp4_derived_update(layer, "megamoe")
-        near = layer.w13_weight_scale_2.clone()
-        near[:, 1] += 1e-6
-        update.prepare({id(layer.w13_weight_scale_2): near})
-        near[0, 1] = float("nan")
-        with self.assertRaisesRegex(ValueError, "matching gate/up"):
-            update.prepare({id(layer.w13_weight_scale_2): near})
-        layer._flashinfer_megamoe_input_norm_const = 0.1
-        layer._flashinfer_megamoe_layer._megakernel_config.input_norm_const = 0.1
-        update = derived.nvfp4_derived_update(layer, "megamoe")
-        with self.assertRaisesRegex(ValueError, "input normalization changed"):
-            update.prepare({id(layer.w13_input_scale): torch.full((4,), 10.0)})
 
     def test_helpers_are_resolved_once_and_per_token_constants_are_reused(self):
         for backend in ("flashinfer_trtllm", "flashinfer_cutedsl"):
@@ -381,21 +374,16 @@ class TestDerivedNvfp4(unittest.TestCase):
         for source, before in zip(update.sources, sources_before):
             torch.testing.assert_close(source, before)
 
-    def test_prepare_updates_activation_scalar_only(self):
+    def test_derived_source_destination_and_patch_geometry_fail_before_writes(self):
         layer = _layer("flashinfer_trtllm")
-        update = derived.nvfp4_derived_update(layer, "trtllm")
-        copies = _prepare_updates(
-            (update,),
-            {torch.float32: ([layer.w13_input_scale[3:4]], [torch.tensor([8.0])])},
-        )
-        torch.testing.assert_close(
-            _value(copies, layer.g1_alphas), torch.tensor([16.0, 32.0])
-        )
-        torch.testing.assert_close(
-            layer.w13_input_scale, torch.tensor([1.0, 2.0, 3.0, 4.0])
-        )
+        update = derived.nvfp4_derived_update(layer, "flashinfer_trtllm")
+        with self.assertRaisesRegex(ValueError, "source geometry changed"):
+            update.prepare({id(layer.w2_weight_scale_2): torch.ones(3)})
+        layer.g1_alphas.resize_(3)
+        with self.assertRaisesRegex(ValueError, "destination geometry changed"):
+            update.prepare({})
+        torch.testing.assert_close(layer.g2_alphas, torch.zeros(2))
 
-    def test_prepare_updates_rejects_other_elements_and_overlaps(self):
         allocation = torch.arange(4, dtype=torch.float32)
         source = allocation[:2]
         update = derived.DerivedUpdate(

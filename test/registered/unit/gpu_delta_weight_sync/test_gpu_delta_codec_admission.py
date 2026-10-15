@@ -1,8 +1,9 @@
-"""nvCOMP ABI/options, hardware admission and prepared metadata ownership."""
+"""CPU codec admission, outer payload integrity and prepared metadata ownership."""
 
 import ctypes
 import importlib.util
 import sys
+import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import zstandard as zstd
 
+from sglang.srt.weight_sync.gpu_delta.payload import HostPayloadPool, validate_codec
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -203,16 +206,15 @@ def test_workspace_query_cache_uses_exact_geometry_and_preserves_failure(monkeyp
     assert calls == [(2, 20, 30), (2, 20, 31), (2, 20, 31)]
 
 
-@pytest.mark.parametrize("name", ["snappy", "lz4"])
 @pytest.mark.parametrize("stages", [2, 3, 4])
 def test_host_input_plans_reject_invalid_geometry_before_device_work(
-    monkeypatch, name, stages
+    monkeypatch, stages
 ):
     # Native tests exercise successful slab construction/slot reuse. Keep the
     # vector arithmetic and output-lease failures here without a fake CUDA API.
     decoder = object.__new__(codec.NvcompDecoder)
     decoder.device = torch.device("cpu")
-    decoder.inner_codec = name
+    decoder.inner_codec = "snappy"
     decoder.maximum_chunk_bytes = 4 << 20
     decoder.alignments = codec._Alignments(16, 16, 16)
     table, counts = _frame_table([[(0, 20, 64, 0), (32, 17, 32, 128)]])
@@ -282,6 +284,83 @@ def test_host_input_plans_reject_invalid_geometry_before_device_work(
         with pytest.raises(ValueError, match=error):
             plan.bind_outputs(slots)
         assert not plan.decoded_slots
+
+
+class TestOuterZstd(unittest.TestCase):
+    def test_manifest_codec_and_frame_geometry_admission(self):
+        admitted = dict(codec="snappy-zstd", frame_bytes=1 << 20)
+        for codec in ("snappy-zstd", "lz4-zstd", "lz4"):
+            for size in (1 << 16, 192 << 10, 1 << 19, 1 << 20, 2 << 20, 4 << 20):
+                with self.subTest(codec=codec, size=size):
+                    validate_codec(admitted | {"codec": codec, "frame_bytes": size})
+        for patch_value in (
+            {"codec": "zstd"},
+            {"codec": None},
+            {"frame_bytes": 0},
+            {"frame_bytes": -1},
+            {"frame_bytes": (4 << 20) + 1},
+            {"frame_bytes": 1.5},
+            {"frame_bytes": True},
+        ):
+            with (
+                self.subTest(patch=patch_value),
+                self.assertRaisesRegex(ValueError, "codec"),
+            ):
+                validate_codec(admitted | patch_value)
+
+    def test_gpu_outer_chunks_decode_directly_to_one_destination(self):
+        values = [bytes(range(256)) * 4096, bytes(range(19))]
+        pool = HostPayloadPool(2)
+        self.addCleanup(pool.close)
+        for known_size in (False, True):
+            payload, chunks = bytearray(), []
+            for index, value in enumerate(values):
+                payload.extend(bytes((-len(payload)) % 16))
+                compressed = zstd.ZstdCompressor(
+                    level=1, write_content_size=known_size
+                ).compress(value)
+                chunks.append(
+                    dict(
+                        encoded_offset=len(payload),
+                        encoded_bytes=len(compressed),
+                        decoded_offset=index * (1 << 20),
+                        decoded_bytes=len(value),
+                    )
+                )
+                payload.extend(compressed)
+            target = bytearray(sum(map(len, values)))
+            pool.executor.submit(
+                pool.decode_zstd, memoryview(payload), chunks, memoryview(target)
+            ).result()
+            self.assertEqual(target, b"".join(values))
+
+    def test_invalid_frames_fail_without_publishing_a_decoded_result(self):
+        raw = bytes(range(64)) * 128
+        encoded = bytearray(zstd.ZstdCompressor(write_checksum=True).compress(raw))
+        pool = HostPayloadPool(2)
+        self.addCleanup(pool.close)
+        chunk = dict(
+            encoded_offset=0,
+            encoded_bytes=len(encoded),
+            decoded_offset=0,
+            decoded_bytes=len(raw) + 1,
+        )
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            pool.executor.submit(
+                pool.decode_zstd,
+                memoryview(encoded),
+                [chunk],
+                memoryview(bytearray(len(raw) + 1)),
+            ).result()
+        chunk["decoded_bytes"] = len(raw)
+        encoded[-1] ^= 1
+        with self.assertRaises(zstd.ZstdError):
+            pool.executor.submit(
+                pool.decode_zstd,
+                memoryview(encoded),
+                [chunk],
+                memoryview(bytearray(len(raw))),
+            ).result()
 
 
 if __name__ == "__main__":

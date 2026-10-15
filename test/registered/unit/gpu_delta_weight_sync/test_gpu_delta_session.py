@@ -1,6 +1,7 @@
 """CPU tests for distributed delta transaction failure boundaries."""
 
 import asyncio
+import io
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ from sglang.srt.weight_sync.gpu_delta import io as delta_io
 from sglang.srt.weight_sync.gpu_delta import session as delta_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 from sglang.srt.weight_sync.gpu_delta.session import (
     DeltaSession,
@@ -447,3 +448,211 @@ def test_clear_surfaces_failed_async_release_before_backend_close(make_session):
         session.clear()
     assert session.version == 1 and not backend.closed
     assert session.backend is backend
+
+
+@pytest.mark.parametrize("flush_cache", [True, False])
+@pytest.mark.parametrize("keep_pause", [True, False])
+def test_update_owns_pause_fence_retract_and_resume_order(
+    monkeypatch, flush_cache, keep_pause
+):
+    from sglang.utils import TypeBasedDispatcher
+
+    events = []
+    scheduler = SimpleNamespace(_engine_paused=False)
+
+    def fence():
+        assert scheduler._engine_paused
+        events.append("fence")
+
+    def pause(obj):
+        assert scheduler._engine_paused and obj.mode == "retract"
+        events.append("retract")
+
+    def flush(empty_cache):
+        assert not empty_cache
+        events.append("flush")
+        return True
+
+    def apply():
+        events.append("apply")
+        return {"applied": True}
+
+    def resume(obj):
+        assert not obj.torch_empty_cache
+        events.append("resume")
+        scheduler._engine_paused = False
+
+    scheduler.device_module = SimpleNamespace(synchronize=fence)
+    scheduler.pause_generation = pause
+    scheduler.flush_cache = flush
+    scheduler.continue_generation = resume
+    scheduler.record_weight_version_change = lambda version: events.append(
+        ("version", version)
+    )
+    control = delta_runtime.GpuDeltaSchedulerControl(scheduler)
+    monkeypatch.setattr(delta_runtime, "GpuDeltaSchedulerControl", lambda _: control)
+    wrapped = delta_runtime.with_gpu_delta_controls(scheduler, TypeBasedDispatcher([]))
+    who = {"engine_id": "e0", "rank_id": "original"}
+    session = control.session = delta_runtime.DeltaSession(
+        who,
+        SimpleNamespace(
+            prepare=lambda *args: SimpleNamespace(
+                apply=apply,
+                close=lambda: None,
+                release_and_close=lambda: events.append("release"),
+            ),
+            host_arena=SimpleNamespace(directory=None),
+            close=lambda: events.append("close"),
+        ),
+    )
+    try:
+        session.prepare(
+            dict(
+                session_id="p",
+                manifest_path="/manifest",
+                manifest_sha256="a" * 64,
+                stream_id="run",
+                base_version=0,
+                target_version=1,
+                plan_digest="b" * 64,
+                participants=[who],
+            )
+        )
+        deadline = time.monotonic() + 2
+        while session.status()["state"] == "PREPARING" and time.monotonic() < deadline:
+            time.sleep(0.001)
+        result = wrapped(
+            delta_io.ApplyGpuDeltaReqInput(
+                session_id="p", rid="apply-rid", flush_cache=flush_cache
+            )
+        )
+        assert result.rid == "apply-rid" and scheduler._engine_paused
+        expected = ["fence", "retract"] + (["flush"] if flush_cache else []) + ["apply"]
+        assert result.success and events == expected
+        result = wrapped(
+            delta_io.ResumeGpuDeltaReqInput(session_id="p", keep_pause=keep_pause)
+        )
+        assert result.success and result.participant["state"] == "RESUMED"
+        expected += [("version", "1")] + ([] if keep_pause else ["resume"])
+        assert events[: len(expected)] == expected
+        assert scheduler._engine_paused is keep_pause
+        assert result.participant["generation_paused"] is keep_pause
+        timing = result.participant["scheduler_timing"]
+        assert (timing["resumed_ns"] is None) is keep_pause
+        assert (timing["blocked_s"] is None) is keep_pause
+        cleared = wrapped(delta_io.ClearGpuDeltaStateReqInput())
+        assert cleared.success and cleared.participant["version"] == 1
+        assert events[len(expected) :] == ["release", "close"]
+        released = wrapped(
+            delta_io.ReleaseGpuDeltaCacheReqInput(owner_rank_ids=["original"])
+        )
+        assert released.success and released.participant["state"] == "CLEARED"
+        assert scheduler._engine_paused is keep_pause
+        assert released.participant["generation_paused"] is keep_pause
+    finally:
+        session._executor.shutdown(wait=True)
+
+
+def test_describe_binds_published_scheduler_ranks(monkeypatch):
+    rank = 7
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    try:
+        # Derive the serving identity from the published launch-time ranks.
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tp_size=8,
+                dp_size=8,
+                ep_size=8,
+                enable_dp_attention=True,
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=rank, dp_rank=rank),
+        )
+        runner = SimpleNamespace(
+            model=object(),
+            weight_updater=SimpleNamespace(
+                _assert_weight_cache_inactive=lambda _: None
+            ),
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_lora = False
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.rust_server = None
+        scheduler.tp_worker = SimpleNamespace(model_runner=runner)
+
+        plan = {"tensors": []}
+        backends = []
+
+        def make_backend(model_runner, identity):
+            assert model_runner is runner
+            backends.append(identity.copy())
+            return SimpleNamespace(
+                describe=lambda: plan,
+                host_arena=SimpleNamespace(directory=None),
+                close=lambda: None,
+            )
+
+        monkeypatch.setitem(
+            sys.modules,
+            "sglang.srt.weight_sync.gpu_delta.layout",
+            SimpleNamespace(GpuDeltaBackend=make_backend),
+        )
+        monkeypatch.setattr(
+            "sglang.srt.model_executor.model_runner_components.weight_updater."
+            "_unsupported_derived_weight_cache_error",
+            lambda _: None,
+        )
+        # Linux starttime field; comm deliberately contains spaces and ')'.
+        stat = "123 (scheduler worker)) " + " ".join(["0"] * 19 + ["456"])
+        monkeypatch.setattr(
+            "sglang.srt.weight_sync.gpu_delta.session.open",
+            lambda path: io.StringIO(stat),
+            raising=False,
+        )
+        cache_engines = []
+
+        def cache_id(engine_id):
+            cache_engines.append(engine_id)
+            return "shared-host-test"
+
+        monkeypatch.setattr(
+            "sglang.srt.weight_sync.gpu_delta.host.host_cache_id",
+            cache_id,
+        )
+        control = GpuDeltaSchedulerControl(scheduler)
+        receipt = control._describe("engine-0")
+        assert receipt["identity"] | {
+            "rank_id": "ignored",
+            "hostname": "ignored",
+            "pid": 0,
+        } == {
+            "engine_id": "engine-0",
+            "rank_id": "ignored",
+            "hostname": "ignored",
+            "host_cache_id": "shared-host-test",
+            "pid": 0,
+            "start_ticks": 456,
+            "tp_rank": rank,
+            "dp_rank": rank,
+            "pp_rank": 0,
+        }
+        assert receipt["state"] == "IDLE" and receipt["version"] == 0
+        assert receipt["plan"] == plan
+        assert control._describe("engine-0") == receipt
+        assert len(backends) == 1
+        assert cache_engines == ["engine-0"]
+        control.session.version = 7
+        assert control.session.clear()["version"] == 7
+        control.session.release_cache(owner=True)
+        fresh = control._describe("unused-new-engine-name")
+        assert fresh["identity"] == receipt["identity"] and fresh["version"] == 7
+        assert len(backends) == 2 and cache_engines == ["engine-0"]
+        control.session._executor.shutdown(wait=True)
+    finally:
+        reset_context()

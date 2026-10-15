@@ -828,7 +828,7 @@ def decode_fixture(codec):
     return entries, layout, size, {"payload": memoryview(bytes(blob))}, expected
 
 
-@pytest.mark.parametrize("codec", ["snappy-zstd", "lz4"])
+@pytest.mark.parametrize("codec", ["snappy-zstd", "lz4-zstd", "lz4"])
 def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly(codec):
     entries, layout, size, files, expected = decode_fixture(codec)
     destination = bytearray(size)

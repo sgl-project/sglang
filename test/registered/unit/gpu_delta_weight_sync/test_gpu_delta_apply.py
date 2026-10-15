@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.srt.weight_sync.gpu_delta.layout import PreparedDelta
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -64,13 +65,6 @@ def planner(monkeypatch):
 
 def linear(size):
     return size, (size,), (1,), (size,), (1,)
-
-
-def test_apply_plan_rejects_missing_affine_destinations(planner):
-    assert planner.plan_apply([]) is None
-    with pytest.raises(ValueError, match="affine byte destinations"):
-        planner.plan_apply([(SimpleNamespace(destinations=()), 0, 16)])
-    assert not planner.warmed and not planner.launched
 
 
 def scratch(size=1 << 24, address=4096):
@@ -198,7 +192,12 @@ def test_invalid_byte_contract_rejected_before_kernel_warmup(planner, contract, 
     assert planner.warmed == []
 
 
-def test_source_extent_pointer_overflow_and_empty_contracts(planner):
+def test_source_bounds_empty_plans_and_missing_destinations(planner):
+    assert planner.plan_apply([]) is None
+    with pytest.raises(ValueError, match="affine byte destinations"):
+        planner.plan_apply([(SimpleNamespace(destinations=()), 0, 16)])
+    assert not planner.warmed and not planner.launched
+
     m = planner
     group = m.ByteApplyGroup([16], [4096], ((linear(17), 1),))
     group.prepare_metadata(0)
@@ -248,7 +247,9 @@ def test_aligned_bind_uses_immutable_template_without_replanning(planner, monkey
         assert all(a is b for a, b in zip(state, (group.metadata_rows, group.programs)))
 
 
-def test_metadata_cache_rebuilds_for_changed_device(planner, monkeypatch):
+def test_metadata_cache_rebuilds_for_changed_device_and_rejects_invalid_devices(
+    planner, monkeypatch
+):
     monkeypatch.setattr(
         planner, "_resident_ctas", lambda kernel, device: 2 * (device + 1)
     )
@@ -266,16 +267,14 @@ def test_metadata_cache_rebuilds_for_changed_device(planner, monkeypatch):
     assert group.bind(scratch())
     assert len(planner.warmed) == 6
 
-
-@pytest.mark.parametrize("device", [-1, False, 0.0, None])
-def test_metadata_cache_does_not_accept_invalid_device(planner, device):
-    group = planner.ByteApplyGroup([0], [4096], ((linear(4100), 1),))
-    group.prepare_metadata(0)
-    with pytest.raises(ValueError, match="invalid GPU delta apply device"):
-        group.prepare_metadata(device)
-    with pytest.raises(RuntimeError, match="must be prepared"):
-        group.bind(scratch())
-    assert not group.prepare_metadata(0)
+    for device in (-1, False, 0.0, None):
+        group = planner.ByteApplyGroup([0], [4096], ((linear(4100), 1),))
+        group.prepare_metadata(0)
+        with pytest.raises(ValueError, match="invalid GPU delta apply device"):
+            group.prepare_metadata(device)
+        with pytest.raises(RuntimeError, match="must be prepared"):
+            group.bind(scratch())
+        assert not group.prepare_metadata(0)
 
 
 def test_failed_metadata_preparation_cannot_bind_and_is_retryable(planner, monkeypatch):

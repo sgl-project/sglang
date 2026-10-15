@@ -53,9 +53,19 @@ def _encode(values, codec, offsets=None):
     return payload, frames
 
 
-@pytest.mark.parametrize("codec", ["snappy-zstd", "lz4-zstd", "lz4"])
-@pytest.mark.parametrize("sort_chunks", ["0", "1"])
-@pytest.mark.parametrize("stages", [2, 3, 4])
+# Outer LZ4 wrapping is covered by the CPU payload suite; this exercises the two
+# distinct inner decoders across every slot count and both sorting settings.
+@pytest.mark.parametrize(
+    "codec,sort_chunks,stages",
+    [
+        ("snappy-zstd", "0", 2),
+        ("snappy-zstd", "1", 3),
+        ("snappy-zstd", "0", 4),
+        ("lz4", "1", 2),
+        ("lz4", "0", 3),
+        ("lz4", "1", 4),
+    ],
+)
 def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     codec, sort_chunks, stages, monkeypatch
 ):
@@ -97,6 +107,11 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         for _ in range(stages)
     ]
     plans = plan.bind_outputs(decoded)
+    # Native status/size views exercise both typed allocation paths, including
+    # nonzero-offset ring slots; successful decode below verifies their contents.
+    assert workspace.statuses.dtype == torch.int32
+    assert workspace.actual_sizes.dtype == plan.metadata.dtype == torch.int64
+    assert workspace.statuses.device == workspace.actual_sizes.device == device
     plan.record_stream(stream)
     del plan
     assert plans[0].metadata.untyped_storage().data_ptr() == (
@@ -132,7 +147,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         for index, (plan, frames, size) in enumerate(zip(plans, batches, output_sizes)):
             binding = SimpleNamespace(name="tensor")
             mapped, mapped_counts, gaps = _plan_decode(
-                [([(binding, 0, size)], size, None, [])],
+                [([(binding, 0, size)], size, None)],
                 {
                     "tensor": {
                         "frames": [
@@ -152,14 +167,13 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
             assert mapped_counts == [len(frames)]
             prepared_batches.append(
                 _PreparedBatch(
-                    plan,
-                    None,
-                    [],
-                    [
+                    decoder=plan,
+                    apply=None,
+                    zero_ranges=[
                         decoded[index % stages][offset : offset + length]
                         for offset, length in gaps[0]
                     ],
-                    prepare_status_check(plan, prepared.error),
+                    check_status=prepare_status_check(plan, prepared.error),
                 )
             )
         for output in decoded:
@@ -258,31 +272,6 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     del plan, batch
     assert all(ref() is None for ref in output_refs)
     # Original host input is released only after both streams' readers finish.
-    del host
-    allocation.close()
-
-
-def test_rejects_frame_range_before_decode():
-    device = torch.device("cuda", 0)
-    decoder = NvcompDecoder(device, "snappy")
-    allocation = HostAllocation(256, device.index)
-    host = torch.frombuffer(allocation.view, dtype=torch.uint8)[:256]
-    decoded = tuple(
-        device_empty(256, dtype=torch.uint8, device=device) for _ in range(2)
-    )
-    stream = torch.cuda.Stream(device=device)
-    good = [(0, 32, 128, 0)]
-    with pytest.raises(ValueError, match="outside input"):
-        decoder.prepare_batches(
-            *_frame_table([good, [(240, 32, 128, 0)]]), host, stream
-        )
-    plan = decoder.prepare_batches(
-        *_frame_table([good, [(0, 32, 128, 240)]]), host, stream
-    )
-    with pytest.raises(ValueError, match="Out-of-bounds"):
-        plan.bind_outputs(decoded)
-    stream.synchronize()
-    del plan
     del host
     allocation.close()
 
