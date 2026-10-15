@@ -123,15 +123,13 @@ __device__ __forceinline__ float inv_scale_ue8m0(int32_t exp) {
 
 #ifdef USE_ROCM
 // Runtime GPU architecture detection for ROCm multi-arch FP8 support.
-// gfx950 (MI350) and gfx1250 (RDNA4) both use E4M3FN (max=448).
-// gfx942 (MI300) uses E4M3FNUZ (max=224).
+// gfx942 (MI300) uses E4M3FNUZ (max=224); every other supported target uses E4M3FN (max=448).
 inline static bool is_e4m3fn_gpu() {
   static int cached_result = -1;  // -1 = not detected, 0 = no, 1 = yes
   if (cached_result == -1) {
     hipDeviceProp_t prop;
     hipGetDeviceProperties(&prop, 0);
-    cached_result =
-        (strncmp(prop.gcnArchName, "gfx950", 6) == 0 || strncmp(prop.gcnArchName, "gfx1250", 7) == 0) ? 1 : 0;
+    cached_result = strncmp(prop.gcnArchName, "gfx942", 6) != 0 ? 1 : 0;
   }
   return cached_result == 1;
 }
