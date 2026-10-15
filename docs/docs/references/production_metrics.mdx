@@ -7,6 +7,24 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+## Process CPU usage
+
+With `--enable-metrics`, `sglang:process_cpu_seconds_total` accumulates user and system CPU seconds, sampled every five seconds. The `component` label identifies `tokenizer`, `detokenizer`, `detokenizer_router`, or `data_parallel_controller`. The `pid` label identifies the process, so workers of the same component remain distinguishable in multiprocess collection.
+
+To compare tokenizer workers within each scraped server instance:
+
+```promql
+rate(sglang:process_cpu_seconds_total{component="tokenizer"}[1m])
+```
+
+A value of `1` means one CPU core on average. To aggregate workers by component while keeping server instances separate:
+
+```promql
+sum without (pid) (rate(sglang:process_cpu_seconds_total[1m]))
+```
+
+Queries that previously expected one series per component must now aggregate across `pid`. A PID identifies a process rather than a stable worker slot; worker restarts can create new series. Multiprocess counter files retain exited workers' last values until the metrics directory is cleared on server restart, so use rates to compare CPU usage rather than cumulative totals.
+
 ## Language model metrics
 
 `sglang:time_to_first_token_seconds` measures the time from request creation in the API server to the first token. For streaming requests it ends when the first output arrives after detokenization, which may contain no printable text. Non-streaming clients only see the final response, so for them it ends when the scheduler produced the first token.
