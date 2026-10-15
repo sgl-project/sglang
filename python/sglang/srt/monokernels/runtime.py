@@ -8,6 +8,9 @@ import logging
 import time
 from typing import Any, Optional
 
+import torch
+import torch.distributed as dist
+
 from sglang.srt.monokernels.guards import deadline_s, device_isa
 from sglang.srt.monokernels.spec import (
     BuildContext,
@@ -18,6 +21,13 @@ from sglang.srt.monokernels.spec import (
     ShapeKey,
     find_spec,
     spec_registered,
+)
+from sglang.srt.runtime_context import (
+    get_context,
+    get_device,
+    get_exec,
+    get_parallel,
+    get_spec,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,8 +76,6 @@ SGLANG_READS = {
 
 def _backend() -> Optional[str]:
     """Return the selected backend, or None without published server configuration."""
-    from sglang.srt.runtime_context import get_context, get_exec
-
     # the model loader also runs without a server's config (tools, unit tests)
     if not get_context().is_config_namespace_published("exec"):
         return None
@@ -76,10 +84,6 @@ def _backend() -> Optional[str]:
 
 def _gather_tp(obj) -> list:
     """Gather a value from every TP rank through the CPU group."""
-    import torch.distributed as dist
-
-    from sglang.srt.runtime_context import get_parallel
-
     group = get_parallel().tp_group
     if group.world_size == 1:
         return [obj]
@@ -128,10 +132,6 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
     backend = _backend()
     if backend is None:
         return
-    import torch
-
-    from sglang.srt.runtime_context import get_device
-
     isa = device_isa()
     archs = hf_config.architectures
     spec, why = find_spec(backend=backend, architectures=archs, isa=isa)
@@ -261,8 +261,6 @@ class _CaptureCheck:
         self.done = False
 
     def __call__(self, runner, out, forward_batch, num_tokens) -> None:
-        import torch
-
         if self.done or not torch.cuda.is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
         self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
@@ -366,8 +364,6 @@ def _format_weight_copies(copies: dict) -> str:
 
 
 def _tokens_per_request() -> int:
-    from sglang.srt.runtime_context import get_spec
-
     spec_cfg = get_spec()
     if spec_cfg.speculative_algorithm is None:
         return 1
@@ -376,8 +372,6 @@ def _tokens_per_request() -> int:
 
 def _capture_keys(tokens: int) -> list[ShapeKey]:
     """Return configured decode or verify graph keys, or [] when graphs are disabled."""
-    from sglang.srt.runtime_context import get_exec
-
     graph = get_exec().graph
     if graph.disable_cuda_graph or graph.disable_decode_cuda_graph:
         return []

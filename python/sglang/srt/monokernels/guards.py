@@ -6,6 +6,16 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+import torch
+
+from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
+    declare_resolution,
+    model_config_of,
+    resolving_view,
+)
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.monokernels.spec import Feature, NumericsKind, find_spec
 
 logger = logging.getLogger(__name__)
@@ -73,8 +83,6 @@ def deadline_s(watchdog_timeout: Optional[float]) -> float:
 
 def device_isa() -> Optional[str]:
     """Return the GPU ISA without feature suffixes, or None without a GPU."""
-    import torch
-
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -84,8 +92,6 @@ def device_isa() -> Optional[str]:
 
 
 def _ragged_verify(cfg) -> bool:
-    from sglang.srt.environ import envs
-
     mode = envs.SGLANG_RAGGED_VERIFY_MODE.get().lower()
     return cfg.speculative_algorithm is not None and mode != "static"
 
@@ -136,9 +142,6 @@ def features_in_use(cfg: Any) -> set[Feature]:
 
 def monokernel_disable_reasons(*, cfg, model_config, isa):
     """Return the matching spec and all configuration rejection reasons."""
-    from sglang.srt.arg_groups.overrides import attention_backends_of
-    from sglang.srt.environ import envs
-
     if isa is None:
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
@@ -207,18 +210,10 @@ def covered_capture_sizes(
 
 def handle_monokernel(server_args) -> None:
     """Validate the selected backend and resolve its decode capture sizes."""
-    from sglang.srt.arg_groups.overrides import (
-        declare_resolution,
-        model_config_of,
-        resolving_view,
-    )
-
     cfg = resolving_view(server_args)
     backend = cfg.monokernel_backend
     if backend is None:
         return
-    from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
-
     isa = device_isa()
     spec, reasons = monokernel_disable_reasons(
         cfg=cfg, model_config=model_config_of(server_args), isa=isa
