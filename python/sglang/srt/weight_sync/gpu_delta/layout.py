@@ -21,6 +21,7 @@ from itertools import chain
 import numpy as np
 import orjson
 import torch
+
 from sglang.srt.weight_sync.gpu_delta.bindings import (
     _ITEMSIZES,
     BACKEND_LAYOUTS,
@@ -44,7 +45,6 @@ class GpuDeltaLayout:
     def __init__(self, model, inventory):
         from sglang.srt.weight_sync.gpu_delta.host import _natural_key
 
-        self.model = model
         if not inventory:
             raise ValueError("canonical checkpoint metadata is unavailable")
         # Normalize negotiated wire metadata without changing checkpoint inventory.
@@ -137,9 +137,7 @@ class GpuDeltaLayout:
             consumer.check_objects()
         for tensor, expected, kind in self._tensor_checks:
             if _tensor_identity(tensor) != expected:
-                raise RuntimeError(
-                    f"GPU delta {kind} changed; readmission required"
-                )
+                raise RuntimeError(f"GPU delta {kind} changed; readmission required")
 
     def _reject_overlaps(self, model_aliases):
         # Gate/up intentionally share one interleaved weight/scale allocation;
@@ -204,7 +202,6 @@ class GpuDeltaBackend:
         self.decode_stages = int(os.environ.get("GPU_DELTA_DECODE_STAGES", "2"))
         if self.decode_stages not in (2, 3, 4):
             raise ValueError("GPU_DELTA_DECODE_STAGES must be 2, 3 or 4")
-        self.identity = dict(identity)
         self._canonical_plan_digest = None
         self.batch_plan = None
         inventory = read_canonical_checkpoint_inventory(model_runner)

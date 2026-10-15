@@ -577,7 +577,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
     def test_prepare_releases_foreign_metadata_before_local_work(self):
         backend, manifest = TestCanonicalPlanCache().publication()
         backend.device, backend.decode_stages = torch.device("cpu"), 2
-        backend.identity = {"host_cache_id": "host"}
         backend.payload_pool = object()
         manifest.update(
             codec="lz4-zstd",
