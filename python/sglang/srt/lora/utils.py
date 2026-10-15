@@ -272,6 +272,21 @@ def get_default_hidden_dim(
         raise NotImplementedError("get_hidden_dim not implemented for " + module_name)
 
 
+# Fused LoRA modules loaded member by member: each adapter projection fills its own slot of
+# the fused buffer, sliced by the wrapper of the fused layer; untrained members stay zero.
+LORA_FUSED_MEMBERS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
+    "qkvr": ("wq_du", "wk_dv", "wv_dv", "wr_du"),
+}
+LORA_FUSED_MEMBER_SLOTS = {
+    member: (fused, slot)
+    for fused, members in LORA_FUSED_MEMBERS.items()
+    for slot, member in enumerate(members)
+}
+
+
 def get_normalized_target_modules(
     target_modules: Union[str, Iterable[str]],
     base_model: Optional[torch.nn.Module] = None,
@@ -295,11 +310,7 @@ def get_normalized_target_modules(
         return {"all"}
 
     params_mapping = {
-        "q_proj": "qkv_proj",
-        "k_proj": "qkv_proj",
-        "v_proj": "qkv_proj",
-        "gate_proj": "gate_up_proj",
-        "up_proj": "gate_up_proj",
+        **{member: fused for member, (fused, _) in LORA_FUSED_MEMBER_SLOTS.items()},
         "in_proj_q": "in_proj_qkvz",
         "in_proj_k": "in_proj_qkvz",
         "in_proj_v": "in_proj_qkvz",
@@ -315,8 +326,6 @@ def get_normalized_target_modules(
         "lm_head": "lm_head",
         "output": "lm_head",
         "unembed_tokens": "lm_head",
-        "q_a_proj": "fused_qkv_a_proj_with_mqa",
-        "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
         # DSA indexer projections are qualified with their parent module name
         # because the bare leaf names collide with unrelated modules in other
         # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
@@ -348,14 +357,12 @@ def get_stacked_multiply(
     if base_model is not None and hasattr(base_model, "get_stacked_multiply"):
         return base_model.get_stacked_multiply(module_name)
     stacked_rank = {
-        "qkv_proj": 3,
+        **{fused: len(members) for fused, members in LORA_FUSED_MEMBERS.items()},
         "in_proj_qkvz": 4,  # GDN packed input projection
         "in_proj_ba": 2,  # GDN packed b/a input projection
-        "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
         "gate_up_proj_shared_moe": 2,
         "in_proj": 2,
-        "fused_qkv_a_proj_with_mqa": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
