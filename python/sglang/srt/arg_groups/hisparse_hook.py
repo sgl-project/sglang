@@ -87,6 +87,19 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
 
 
+def validate_step5_hisparse(server_args: ServerArgs) -> None:
+
+    cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype == "fp8_e4m3":
+        raise ValueError("Step5 HiSparse requires BF16 KV cache.")
+    # The prefill side would send logical FULL pages instead of device regions.
+    if cfg.disaggregation_mode == "prefill":
+        raise ValueError(
+            "Step5 HiSparse is not supported on the PD prefill side; enable it "
+            "on the decode side only."
+        )
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
@@ -99,14 +112,21 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         is_deepseek_v4,
         is_minimax_sparse,
     )
+    from sglang.srt.configs.step5 import get_step5_text_config
 
     hf_config = model_config_of(server_args).hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_m3_hisparse = is_minimax_sparse(hf_config)
+    is_step5_hisparse = get_step5_text_config(hf_config) is not None
     is_hip = get_platform().is_hip
-    assert is_deepseek_dsa(hf_config) or is_v4_hisparse or is_m3_hisparse, (
+    assert (
+        is_deepseek_dsa(hf_config)
+        or is_v4_hisparse
+        or is_m3_hisparse
+        or is_step5_hisparse
+    ), (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
-        "models (e.g., DeepSeek V3.2, GLM-5), DeepSeek V4, and MiniMax M3 now. "
+        "models (e.g., DeepSeek V3.2, GLM-5), DeepSeek V4, MiniMax M3 and Step5 now. "
     )
 
     assert cfg.disable_radix_cache, (
@@ -137,6 +157,10 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
     # MiniMax M3 uses its own Triton sparse kernels.
     if is_m3_hisparse:
+        return
+
+    if is_step5_hisparse:
+        validate_step5_hisparse(server_args)
         return
 
     if resolved_view(server_args).kv_cache_dtype not in (

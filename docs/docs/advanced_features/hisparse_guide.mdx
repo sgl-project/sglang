@@ -6,7 +6,7 @@ metatags:
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1), **DeepSeek V4**, and **MiniMax M3**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
+> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1), **DeepSeek V4**, **MiniMax M3**, and **Step5**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
 
 ## Why HiSparse?
 
@@ -173,6 +173,14 @@ Dense-layer K/V and index K stay on GPU; sparse-layer K/V use host memory plus a
 - Use `--attention-backend triton`, `--mm-attention-backend triton_attn`, `--disable-prefill-cuda-graph`, and `--disable-radix-cache`.
 - Set `device_buffer_size` to at least 2048 in `--hisparse-config`; `top_k` does not override the model's selection width.
 - PD retraction backup is not supported. Use `--num-reserved-decode-tokens` to reserve capacity for the expected output length.
+
+### Step5
+
+SWA-layer K/V and the indexer state stay on GPU; full-attention K/V move to host memory in 8-token regions, the unit the Step5 indexer selects.
+
+- `device_buffer_size` counts regions; it must cover 513 (512 selected regions plus the one being decoded) and be a multiple of 8. Since it must not be smaller than `top_k`, set `top_k` to 513, e.g. `--hisparse-config='{"top_k": 513, "device_buffer_size": 1024, "host_to_device_ratio": 4}'`.
+- `host_to_device_ratio` must be an integer.
+- Use BF16 KV cache, `--disable-radix-cache`, and no MTP. Enable HiSparse on the decode instance only.
 
 ### Benchmark
 

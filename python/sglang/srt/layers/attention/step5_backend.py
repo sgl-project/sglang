@@ -45,6 +45,19 @@ from sglang.srt.utils.common import async_h2d
 
 STEP5_SWA_GRAPH_REQUEST_SLOTS = 8
 
+# Packed regions: physical region in the high word, logical token start in the low.
+_PACKED_LOGICAL_START_MASK = 0xFFFFFFFF
+
+
+def _selected_logical_regions(packed: torch.Tensor, region_size: int) -> torch.Tensor:
+    logical_starts = packed & _PACKED_LOGICAL_START_MASK
+    return torch.where(packed >= 0, logical_starts // region_size, -1).to(torch.int32)
+
+
+def _with_physical_regions(packed: torch.Tensor, regions: torch.Tensor) -> torch.Tensor:
+    remapped = (regions.to(torch.int64) << 32) | (packed & _PACKED_LOGICAL_START_MASK)
+    return torch.where(packed >= 0, remapped, packed)
+
 
 def _allocate_attention_buffers(
     *, rows, attention_shape, work, decode, groups, region_bins, device
@@ -245,6 +258,7 @@ class Step5AttentionBackend(AttentionBackend):
         speculative_eagle_topk: int = 1,
         speculative_num_steps: int = 0,
         speculative_num_draft_tokens: int = 1,
+        hisparse_coordinator=None,
     ):
         if not isinstance(kv_pool, Step5TokenToKVPool):
             raise ValueError("Step5 backend requires Step5TokenToKVPool")
@@ -271,6 +285,7 @@ class Step5AttentionBackend(AttentionBackend):
         self.swa_backend = swa_backend
         self.token_to_kv_pool = kv_pool
         self.req_to_token_pool = req_to_token_pool
+        self.hisparse_coordinator = hisparse_coordinator
         self.context_len = context_len
         self.position_capacity = context_len + position_padding
         self.attention_shape = (swa_backend.num_attention_heads, swa_backend.head_dim)
@@ -796,6 +811,24 @@ class Step5AttentionBackend(AttentionBackend):
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.forward_metadata.indexer_metadata
 
+    def _to_hisparse_device_regions(self, packed, layer, forward_batch, *, decode):
+        """Point selected regions at HiSparse device rows, swapping in decode misses."""
+        full_kv_pool = self.token_to_kv_pool.full_kv_pool
+        if not decode:
+            # A prefilling request keeps all of its regions on device.
+            return _with_physical_regions(
+                packed, full_kv_pool.translate_loc_to_hisparse_device(packed >> 32)
+            )
+        region_size = full_kv_pool.region_size
+        device_regions = self.hisparse_coordinator.swap_in_selected_blocks(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=(forward_batch.seq_lens + region_size - 1) // region_size,
+            top_k_blocks=_selected_logical_regions(packed, region_size),
+            layer_id=self.token_to_kv_pool.layers_mapping[layer.layer_id][0],
+            sparse_block_size=1,
+        )
+        return _with_physical_regions(packed, device_regions)
+
     def _forward_dsa(
         self,
         q,
@@ -835,6 +868,10 @@ class Step5AttentionBackend(AttentionBackend):
                 raise RuntimeError("Step5 side branch did not produce its head gate")
             head_gate.record_stream(torch.cuda.current_stream())
         packed, counts, lengths = index_selection
+        if self.hisparse_coordinator is not None:
+            packed = self._to_hisparse_device_regions(
+                packed, layer, forward_batch, decode=metadata.decode
+            )
         kv_scales = {}
         if self.fp8_full_kv:
             k_scale, v_scale = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)

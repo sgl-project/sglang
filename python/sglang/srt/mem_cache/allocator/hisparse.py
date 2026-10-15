@@ -271,25 +271,30 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
 
-class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class CompressedHiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    """HiSparse over a hybrid SWA allocator whose FULL KV moves in multi-token items.
+
+    Every ``compress_ratio`` logical FULL tokens share one HiSparse device item.
+    """
+
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
+        *,
+        hisparse_kvcache,
+        compress_ratio: int,
+        compressed_logical_size: int,
     ):
-        assert isinstance(logical_attn_allocator._kvcache, DeepSeekV4TokenToKVPool)
-        assert isinstance(
-            logical_attn_allocator._kvcache.c4_kv_pool, HiSparseC4DevicePool
-        )
-        self.compress_ratio = 4
+        self.compress_ratio = compress_ratio
 
-        self.hisparse_kvcache = logical_attn_allocator._kvcache.c4_kv_pool
+        self.hisparse_kvcache = hisparse_kvcache
         self._size_full = logical_attn_allocator.size_full
         self._size_hisparse = self.hisparse_kvcache.size
 
         self.dtype = self.hisparse_kvcache.dtype
         self.device = self.hisparse_kvcache.device
-        # Keep the public page_size as the logical DSV4 full/SWA page size.
-        # C4 HiSparse allocation/device-buffer code must use the compressed page size.
+        # Keep the public page_size as the logical full/SWA page size.
+        # HiSparse allocation/device-buffer code must use the compressed page size.
         self.page_size = logical_attn_allocator.page_size
         self.hisparse_page_size = self.hisparse_kvcache.page_size
 
@@ -310,7 +315,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
-                    self._kvcache.c4_logical_size + self.hisparse_page_size,
+                    compressed_logical_size + self.hisparse_page_size,
                     dtype=torch.int64,
                     device=self.device,
                 ),
@@ -516,9 +521,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
+    def compressed_len(self, num_tokens):
+        """Number of HiSparse items covering a prefix of ``num_tokens`` FULL tokens."""
+        raise NotImplementedError
+
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        # Last complete C4 block of a prefix of last_loc + 1 tokens; -1 stays -1.
-        return (last_locs - (self.compress_ratio - 1)) // self.compress_ratio
+        """Item of the last FULL location of a prefix; -1 stays -1."""
+        raise NotImplementedError
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self.hisparse_kvcache._translate_loc_to_hisparse_device(
@@ -540,9 +549,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
         num_new_pages_hisparse = get_num_new_pages(
-            seq_lens=seq_lens_cpu // self.compress_ratio,
+            seq_lens=self.compressed_len(seq_lens_cpu),
             page_size=self.hisparse_page_size,
-            prefix_lens=prefix_lens_cpu // self.compress_ratio,
+            prefix_lens=self.compressed_len(prefix_lens_cpu),
         )
         if (
             num_new_pages_logical
@@ -570,10 +579,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
         hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
-            prefix_lens // self.compress_ratio,
-            prefix_lens_cpu // self.compress_ratio,
-            seq_lens // self.compress_ratio,
-            seq_lens_cpu // self.compress_ratio,
+            self.compressed_len(prefix_lens),
+            self.compressed_len(prefix_lens_cpu),
+            self.compressed_len(seq_lens),
+            self.compressed_len(seq_lens_cpu),
             hisparse_last_loc,
             len(compressed_logical_indices),
         )
@@ -638,3 +647,54 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             full_free_group = self.full_free_group
             self.full_free_group = []
             self.free_full(torch.cat(full_free_group))
+
+
+class DeepSeekV4HiSparseTokenToKVPoolAllocator(
+    CompressedHiSparseTokenToKVPoolAllocator
+):
+    """Items are C4 entries, which exist only once all four tokens are written."""
+
+    def __init__(self, logical_attn_allocator: BaseTokenToKVPoolAllocator):
+        kvcache = logical_attn_allocator._kvcache
+        assert isinstance(kvcache, DeepSeekV4TokenToKVPool)
+        assert isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool)
+        super().__init__(
+            logical_attn_allocator,
+            hisparse_kvcache=kvcache.c4_kv_pool,
+            compress_ratio=4,
+            compressed_logical_size=kvcache.c4_logical_size,
+        )
+
+    def compressed_len(self, num_tokens):
+        return num_tokens // self.compress_ratio
+
+    def get_last_loc_compressed(self, last_locs: torch.Tensor):
+        # Last complete C4 block of a prefix of last_loc + 1 tokens; -1 stays -1.
+        return (last_locs - (self.compress_ratio - 1)) // self.compress_ratio
+
+
+class Step5HiSparseTokenToKVPoolAllocator(CompressedHiSparseTokenToKVPoolAllocator):
+    """Items are Step5 FULL KV regions; the region being decoded is attended while partial."""
+
+    def __init__(self, logical_attn_allocator: BaseTokenToKVPoolAllocator):
+        from sglang.srt.mem_cache.step5_kv_pool import (
+            Step5HiSparseFullKVPool,
+            Step5TokenToKVPool,
+        )
+
+        kvcache = logical_attn_allocator._kvcache
+        assert isinstance(kvcache, Step5TokenToKVPool)
+        assert isinstance(kvcache.full_kv_pool, Step5HiSparseFullKVPool)
+        region_size = kvcache.full_kv_pool.region_size
+        super().__init__(
+            logical_attn_allocator,
+            hisparse_kvcache=kvcache.full_kv_pool,
+            compress_ratio=region_size,
+            compressed_logical_size=kvcache.full_logical_size // region_size,
+        )
+
+    def compressed_len(self, num_tokens):
+        return (num_tokens + self.compress_ratio - 1) // self.compress_ratio
+
+    def get_last_loc_compressed(self, last_locs: torch.Tensor):
+        return last_locs // self.compress_ratio

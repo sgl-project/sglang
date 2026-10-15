@@ -133,6 +133,8 @@ class Step5KVGeometry(msgspec.Struct, frozen=True, kw_only=True):
     index_k_heads: int
     sliding_window: int
     full_kv_fp8: bool = False
+    # Logical FULL tokens per device-resident token; None when HiSparse is off.
+    hisparse_ratio: int | None = None
 
 
 class Step5RequestCapacity(msgspec.Struct, frozen=True, kw_only=True):
@@ -196,6 +198,20 @@ def _step5_full_kv_fp8() -> bool:
     return get_model().kv_cache_dtype == "fp8_e4m3"
 
 
+def _step5_hisparse_ratio() -> int | None:
+    if not get_memory().enable_hisparse:
+        return None
+    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+    return parse_hisparse_config().host_to_device_ratio
+
+
+def _step5_full_device_tokens(
+    full_tokens: int, ratio: int | None, page_size: int
+) -> int:
+    return -(-full_tokens // ((ratio or 1) * page_size)) * page_size
+
+
 def _create_capacity_policy(kvc):
     if SWARequestCapPoolConfigurator.is_applicable(kvc):
         policy = SWARequestCapPoolConfigurator(kvc)
@@ -208,6 +224,10 @@ def _create_capacity_policy(kvc):
             kvc.model_config.v_head_dim,
             fp8=True,
         )
+        policy._recompute_cell_size()
+    ratio = _step5_hisparse_ratio()
+    if ratio is not None:
+        policy._full_per_token //= ratio
         policy._recompute_cell_size()
     return policy
 
@@ -397,6 +417,8 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             ("max_prefill_tokens", schedule.max_prefill_tokens),
             ("disable_overlap_schedule", schedule.disable_overlap_schedule),
             ("disable_radix_cache", memory.disable_radix_cache),
+            ("enable_hisparse", memory.enable_hisparse),
+            ("hisparse_config", memory.hisparse_config),
             ("enable_unified_memory", memory.enable_unified_memory),
             ("enable_page_major_kv_layout", memory.enable_page_major_kv_layout),
             ("speculative_algorithm", spec.speculative_algorithm),
@@ -623,6 +645,9 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
         index = parse_step5_index_geometry(hf)
         if kvc.page_size != 64:
             raise ValueError("Step5 requires page64")
+        hisparse_ratio = _step5_hisparse_ratio()
+        if hisparse_ratio is not None:
+            _step5_integer("HiSparse host_to_device_ratio", hisparse_ratio, 1)
         return Step5KVGeometry(
             target_full_ids=full,
             target_swa_ids=swa,
@@ -646,6 +671,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             index_k_heads=index.index_k_heads,
             sliding_window=kvc.sliding_window_size,
             full_kv_fp8=_step5_full_kv_fp8(),
+            hisparse_ratio=hisparse_ratio,
         )
 
     @staticmethod
@@ -947,6 +973,13 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
         layer_count = len(
             geometry.target_full_ids + geometry.target_swa_ids + geometry.draft_swa_ids
         )
+        device_full = _step5_full_device_tokens(full, geometry.hisparse_ratio, page)
+        hisparse_bytes = 0
+        if geometry.hisparse_ratio is not None:
+            # Logical-to-device region map and the device region allocator.
+            hisparse_bytes = 8 * (
+                (full + page) // geometry.region_size + 1 + device_full // page
+            )
         # These two costs are consumed by allocation checks. The other costs are
         # local arithmetic, not a string-keyed ledger required by pool construction.
         index_state_bytes = _step5_bytes(compressed_index_key_bytes + ring_bytes)
@@ -955,7 +988,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             slots * (8 * geometry.hidden_size + 20) if geometry.draft_swa_ids else 0
         )
         persistent = _step5_bytes(
-            (full + page) * len(geometry.target_full_ids) * full_per_token
+            (device_full + page) * len(geometry.target_full_ids) * full_per_token
             + (swa + page)
             * (len(geometry.target_swa_ids) + len(geometry.draft_swa_ids))
             * per_token
@@ -969,6 +1002,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             # MHATokenToKVPool: K/V pointers, combined pointers and strides.
             # Each BF16 layer has (1 + 1 + 2 + 2) 64-bit entries.
             + 8 * (1 + 1 + 2 + 2) * layer_count
+            + hisparse_bytes
             + index_state_bytes
         )
         payload = Step5MemoryPoolConfig(
@@ -1144,7 +1178,6 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             kvc.post_capture_kv_active
             or get_memory().enable_unified_memory
             or get_memory().enable_page_major_kv_layout
-            or get_memory().enable_hisparse
             or get_schedule().prefill_only_disable_kv_cache
             or not kvc.is_hybrid_swa
             or kvc.is_hybrid_swa_compress
@@ -1369,9 +1402,13 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
         allocator: BaseTokenToKVPoolAllocator,
     ) -> None:
         """Check actual resources after the pre-allocation runtime admission check."""
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            Step5HiSparseTokenToKVPoolAllocator,
+        )
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.mem_cache.step5_kv_pool import (
             Step5Fp8FullKVPool,
+            Step5HiSparseFullKVPool,
             Step5TokenToKVPool,
         )
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1381,8 +1418,15 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             if kvc.device == "cuda"
             else torch.device("cpu")
         )
+        geometry = config.geometry
+        hisparse = geometry.hisparse_ratio is not None and not kvc.is_draft_worker
+        if hisparse != isinstance(allocator, Step5HiSparseTokenToKVPoolAllocator):
+            raise ValueError("Step5 HiSparse requires exactly its region allocator")
         Step5PoolConfigurator._validate_step5_shared_resources(
-            config=config, req_pool=req_pool, allocator=allocator, device=device
+            config=config,
+            req_pool=req_pool,
+            allocator=allocator.logical_attn_allocator if hisparse else allocator,
+            device=device,
         )
         selection = kvc.layer_info.step5_layer_selection
         expected_mapping = {
@@ -1399,6 +1443,11 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
         # subclass, but carries target-only state that is not charged to a draft.
         # MHA subclasses include NoOp, FP4, page-major and unified storage. The byte
         # model below prices the native BF16 NHD allocation, not those other layouts.
+        full_device_tokens = _step5_full_device_tokens(
+            config.full_max_total_num_tokens,
+            geometry.hisparse_ratio if hisparse else None,
+            geometry.page_size,
+        )
         if (
             (
                 type(kv_pool) is not SWAKVPool
@@ -1406,7 +1455,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
                 else not isinstance(kv_pool, Step5TokenToKVPool)
             )
             or (kv_pool.size, kv_pool.size_swa)
-            != (config.full_max_total_num_tokens, config.swa_max_total_num_tokens)
+            != (full_device_tokens, config.swa_max_total_num_tokens)
             or kv_pool.page_size != config.geometry.page_size
             or kv_pool.layers_mapping != expected_mapping
             or kv_pool.full_to_swa_index_mapping
@@ -1415,6 +1464,8 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             is not (
                 Step5Fp8FullKVPool
                 if config.geometry.full_kv_fp8 and not kvc.is_draft_worker
+                else Step5HiSparseFullKVPool
+                if hisparse
                 else MHATokenToKVPool
             )
             or type(kv_pool.swa_kv_pool) is not MHATokenToKVPool
@@ -1436,6 +1487,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
         if (
             kv_pool.num_req_slots != config.num_req_slots
             or kv_pool.index_ring_size != config.requests.index_ring_size
+            or kv_pool.full_logical_size != config.full_max_total_num_tokens
         ):
             raise ValueError("Step5 state capacity differs from its resolved budget")
         expected = config.index_state_bytes
@@ -1465,8 +1517,15 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             raise ValueError("Step5 native KV pool requires its model-owned selection")
         kwargs = {}
         pool_cls = SWAKVPool
+        full_device_tokens = full_max_total_num_tokens
         if not kvc.is_draft_worker:
             pool_cls = Step5TokenToKVPool
+            hisparse_ratio = _step5_hisparse_ratio()
+            if hisparse_ratio is not None:
+                kwargs["full_logical_size"] = full_max_total_num_tokens
+                full_device_tokens = _step5_full_device_tokens(
+                    full_max_total_num_tokens, hisparse_ratio, kvc.pool_page_size
+                )
             kwargs.update(
                 enable_memory_saver=get_exec().features.enable_memory_saver,
                 num_req_slots=req_to_token_pool.req_to_token.shape[0],
@@ -1478,7 +1537,7 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
                 full_kv_fp8=_step5_full_kv_fp8(),
             )
         return pool_cls(
-            size=full_max_total_num_tokens,
+            size=full_device_tokens,
             size_swa=(
                 full_max_total_num_tokens
                 if kvc.draft_swa_full_capacity

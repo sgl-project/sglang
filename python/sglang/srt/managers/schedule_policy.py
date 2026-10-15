@@ -48,7 +48,7 @@ from sglang.srt.managers.schedule_batch import (
     split_cached_prefix_by_tier,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    CompressedHiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import (
@@ -648,11 +648,11 @@ class PrefillAdder:
                 ]
             )
 
-        # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
+        # Compressed HiSparse wraps an SWATokenToKVPoolAllocator internally and
         # exposes the full SWA allocator interface.
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator,
-            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
+            (SWATokenToKVPoolAllocator, CompressedHiSparseTokenToKVPoolAllocator),
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
         # A new state slot eats shared-gap bytes that `rem_total_tokens` counts

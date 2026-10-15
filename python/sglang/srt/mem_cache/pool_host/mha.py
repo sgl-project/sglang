@@ -1201,8 +1201,8 @@ class HiSparseMHATokenToKVPoolHost(HiSparseHostPoolMixin, MHATokenToKVPoolHost):
             raise ValueError(
                 "MiniMax M3 HiSparse host transfers require the kernel backend."
             )
-        for layer_id in range(device_pool.start_layer, device_pool.end_layer):
-            host_layer = layer_id - device_pool.start_layer
+        for host_layer in range(device_pool.layer_num):
+            layer_id = device_pool.start_layer + host_layer
             transfer_kv_per_layer(
                 src_k=device_pool.get_key_buffer(layer_id),
                 dst_k=self.k_buffer[host_layer],
