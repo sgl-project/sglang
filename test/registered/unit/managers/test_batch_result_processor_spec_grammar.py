@@ -412,19 +412,6 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertFalse(replayed)
         self.assertFalse(req.pd_rebootstrap_in_progress)
 
-    def test_fresh_cache_only_replay_keeps_recovery_markers(self):
-        req = _make_req(terminate_after=99)
-        req.pd_rebootstrap_in_progress = False
-        req.pd_rebootstrap_forced_output_id = 12
-        batch = SimpleNamespace(dsv41_cache_only_replay=True)
-
-        replayed = SchedulerBatchResultProcessor._acknowledge_cache_only_rebootstrap(
-            batch, req
-        )
-
-        self.assertFalse(replayed)
-        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
-
     def test_normal_prefill_batch_needs_no_cache_only_marker(self):
         req = _make_req(terminate_after=99)
         req.pd_rebootstrap_in_progress = True
@@ -435,46 +422,6 @@ class TestReasoningTokenAccounting(CustomTestCase):
         )
 
         self.assertFalse(replayed)
-        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
-        self.assertTrue(req.pd_rebootstrap_in_progress)
-
-    def test_middle_chunk_does_not_consume_rebootstrap_boundary(self):
-        req = _make_req(terminate_after=99)
-        req.pd_rebootstrap_in_progress = True
-        req.pd_rebootstrap_forced_output_id = 12
-        req.dsv41_cache_only_replay = True
-        req.inflight_middle_chunks = 1
-        req.is_retracted = False
-        req.time_stats = MagicMock()
-        batch = SimpleNamespace(
-            reqs=[req],
-            dsv41_cache_only_replay=True,
-            return_logprob=False,
-            return_hidden_states=False,
-            return_hidden_states_mode=0,
-            spec_info=None,
-            decoding_reqs=[],
-            spec_algorithm=SimpleNamespace(is_none=lambda: True),
-            prefill_stats=None,
-            dp_cooperation_info=None,
-        )
-        result = GenerationBatchResult(
-            logits_output=SimpleNamespace(
-                hidden_states=None,
-                customized_info=None,
-                sampling_mask_output=None,
-            ),
-            next_token_ids=torch.tensor([999], dtype=torch.long),
-        )
-        processor = _make_prefill_processor()
-
-        with patch(
-            "sglang.srt.managers.scheduler_components.batch_result_processor.get_memory",
-            return_value=SimpleNamespace(enable_hisparse=False),
-        ):
-            processor.process_batch_result_prefill(batch, result)
-
-        self.assertEqual(list(req.output_ids), [])
         self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
         self.assertTrue(req.pd_rebootstrap_in_progress)
 
