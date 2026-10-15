@@ -1569,6 +1569,10 @@ class Envs:
     SGLANG_Q35MF_ARRIVE_D2H_RING = EnvBool(False)
     # A decode batch unchanged since its stash reuses the relayed draft inputs.
     SGLANG_Q35MF_ARRIVE_SKIP_REGATHER = EnvBool(False)
+    # Decode rounds that allocate no KV slots skip building the unused length tensors.
+    SGLANG_Q35MF_ARRIVE_DECODE_PREP = EnvBool(False)
+    # Draft cache locations and the draft-extend layout come from one JIT launch each.
+    SGLANG_Q35MF_ARRIVE_DRAFT_PREP = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

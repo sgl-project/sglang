@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -50,6 +51,7 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+_SKIP_IDLE_DECODE_LENS = envs.SGLANG_Q35MF_ARRIVE_DECODE_PREP.get()
 
 logger = logging.getLogger(__name__)
 
@@ -1172,6 +1174,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
+    if _SKIP_IDLE_DECODE_LENS and num_needed_tokens == 0:
+        # Every nxt equals cur: alloc_for_spec_decode would only read the lengths to allocate.
+        return
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")

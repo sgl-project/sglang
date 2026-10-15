@@ -303,6 +303,124 @@ def test_draft_cache_positions_graph(bs, steps, dtype, mrope):
             )
 
 
+@pytest.mark.parametrize("bs", [1, 3, 128])
+@pytest.mark.parametrize("cols", [1, 7])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_jit_draft_cache_locs_matches_triton_graph(bs, cols, dtype, mrope):
+    """The JIT launch writes exactly what the Triton kernel writes, also when replayed from a graph."""
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_draft_cache_locs_contiguous,
+    )
+    from sglang.kernels.ops.speculative.draft_prep import draft_cache_locs
+
+    table = torch.randint(
+        -(2**31), 2**31 - 1, ((bs + 3), 64), dtype=torch.int32, device="cuda"
+    )
+    requests = torch.randperm(bs + 3, device="cuda")[:bs]
+    seq = torch.randint(0, 64 - cols, (bs,), device="cuda", dtype=dtype)
+
+    def outputs():
+        return (
+            torch.full((bs * cols,), -7, device="cuda", dtype=torch.int64),
+            torch.full_like(seq, -7),
+            torch.full((3, bs), -7, device="cuda", dtype=torch.int64)
+            if mrope
+            else None,
+        )
+
+    jit_out, ref_out = outputs(), outputs()
+
+    def run():
+        assert draft_cache_locs(
+            req_pool_indices=requests,
+            req_to_token=table,
+            seq_lens=seq,
+            out_cache_loc=jit_out[0],
+            positions=jit_out[1],
+            mrope=jit_out[2],
+            cols=cols,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        requests.copy_(torch.randperm(bs + 3, device="cuda")[:bs])
+        seq.copy_(torch.randint(0, 64 - cols, (bs,), device="cuda", dtype=dtype))
+        graph.replay()
+        assign_draft_cache_locs_contiguous[(bs,)](
+            requests,
+            table,
+            seq,
+            ref_out[0],
+            64,
+            1,
+            cols,
+            positions=ref_out[1],
+            mrope=ref_out[2],
+            BS=bs,
+            WRITE_POSITIONS=True,
+            WRITE_MROPE=mrope,
+        )
+        for actual, expected in zip(jit_out, ref_out):
+            if expected is not None:
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bs", [0, 1, 3, 129])
+@pytest.mark.parametrize("width", [1, 7])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_jit_draft_extend_layout_matches_triton_graph(bs, width, dtype, mrope):
+    """Same outputs as prepare_draft_extend_layout for strided lengths, including negative ones."""
+    from sglang.kernels.ops.speculative.draft_prep import draft_extend_layout
+    from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_layout
+
+    seq = torch.zeros(bs * 2, device="cuda", dtype=dtype)[::2]
+    draft_extend_layout(seq, width, mrope)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        jit = draft_extend_layout(seq, width, mrope)
+    for value in [0, -5, 131000]:
+        seq.copy_(torch.randint(-3, 5, (bs,), device="cuda", dtype=dtype) + value)
+        graph.replay()
+        ref = prepare_draft_extend_layout(seq, width, mrope)
+        for actual, expected in zip([*jit[:3], *jit[3]], [*ref[:3], *ref[3]]):
+            if expected is None:
+                assert actual is None
+            else:
+                assert actual.dtype == expected.dtype
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_jit_draft_prep_rejects_unsupported_layout():
+    """An unsupported layout writes nothing and reports it, so the Triton path stays the fallback."""
+    from sglang.kernels.ops.speculative.draft_prep import (
+        draft_cache_locs,
+        draft_extend_layout,
+    )
+
+    locs = torch.full((4,), -7, device="cuda", dtype=torch.int64)
+    positions = torch.full((2,), -7, device="cuda", dtype=torch.int64)
+    for table in [
+        torch.zeros((4, 64), device="cuda", dtype=torch.int64),
+        torch.zeros((4, 128), device="cuda", dtype=torch.int32)[:, ::2],
+    ]:
+        assert not draft_cache_locs(
+            req_pool_indices=torch.zeros(2, device="cuda", dtype=torch.int64),
+            req_to_token=table,
+            seq_lens=torch.zeros(2, device="cuda", dtype=torch.int64),
+            out_cache_loc=locs,
+            positions=positions,
+            mrope=None,
+            cols=2,
+        )
+    assert (locs == -7).all() and (positions == -7).all()
+    assert draft_extend_layout(torch.zeros(2, device="cuda"), 4, False) is None
+
+
 @pytest.mark.parametrize("bs", [0, 1, 7, 128, 257])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("interval", [0, 16, 512])

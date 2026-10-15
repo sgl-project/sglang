@@ -15,6 +15,7 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -50,9 +51,15 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_DRAFT_PREP_JIT = envs.SGLANG_Q35MF_ARRIVE_DRAFT_PREP.get() and not _is_cpu
 
 if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
+if _DRAFT_PREP_JIT:
+    from sglang.kernels.ops.speculative.draft_prep import (
+        draft_cache_locs,
+        draft_extend_layout,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -172,13 +179,18 @@ def prepare_for_draft_extend(
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
-        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
-                batch.seq_lens,
-                num_draft_tokens,
-                draft_model_runner.model_config.model_is_mrope
-                and all(x is None for x in batch.multimodal_inputs),
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        layout = None
+        if _DRAFT_PREP_JIT:
+            layout = draft_extend_layout(batch.seq_lens, num_draft_tokens, with_mrope)
+        if layout is None:
+            layout = prepare_draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope
             )
+        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
+            layout
         )
     elif fused_lengths:
         batch.prefix_lens, batch.extend_lens, post_seq_lens = (
@@ -302,21 +314,35 @@ def prepare_for_draft(
                         prepared_mrope_positions = torch.empty(
                             (3, bs), dtype=torch.int64, device=batch.device
                         )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    window_cols,
-                    positions=prepared_positions,
-                    mrope=prepared_mrope_positions,
-                    BS=bs,
-                    WRITE_POSITIONS=prepared_positions is not None,
-                    WRITE_MROPE=prepared_mrope_positions is not None,
+                jit_done = (
+                    _DRAFT_PREP_JIT
+                    and prepared_positions is not None
+                    and draft_cache_locs(
+                        req_pool_indices=batch.req_pool_indices,
+                        req_to_token=req_to_token_pool.req_to_token,
+                        seq_lens=batch.seq_lens,
+                        out_cache_loc=batch.out_cache_loc,
+                        positions=prepared_positions,
+                        mrope=prepared_mrope_positions,
+                        cols=window_cols,
+                    )
                 )
+                if not jit_done:
+                    # FIXME(lsyin): align with the default code path
+                    assign_draft_cache_locs_contiguous[(bs,)](
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        window_cols,
+                        positions=prepared_positions,
+                        mrope=prepared_mrope_positions,
+                        BS=bs,
+                        WRITE_POSITIONS=prepared_positions is not None,
+                        WRITE_MROPE=prepared_mrope_positions is not None,
+                    )
             if plans_window:
                 kv_loc_plan = target_translator.plan(
                     req_pool_indices=batch.req_pool_indices,
