@@ -3823,7 +3823,7 @@ def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_an
             step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
             if backup_requested:
                 # The checkpoint has no host copy, so write-back requests a backup first.
-                assert step.mamba_backup_node_id == parent
+                _assert_internal_eviction_pending(step, ComponentType.MAMBA, parent)
                 step = core.finish_mamba_state_eviction(parent)
             assert step.node_id is None and step.mamba_backup_node_id is None
             _accumulate_step(step, tracker, frees, {})

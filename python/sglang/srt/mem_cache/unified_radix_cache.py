@@ -926,9 +926,17 @@ class UnifiedRadixCache(BasePrefixCache):
                         backup_kv = self._evict_device_leaf(node_id, tracker)
                     if node_id is not None and backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
+                        host_lock = None
+                        if self.tree_core.is_backuped(node_id):
+                            # Host eviction during this backup could evict the node's
+                            # Full KV from host before it is demoted. Lock it so other
+                            # nodes are evicted instead.
+                            host_lock = self.inc_host_lock_ref(node_id).to_dec_params()
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
+                        if host_lock is not None:
+                            self.dec_host_lock_ref(node_id, host_lock)
                         if written is not None:
                             self.writing_check(write_back=True)
                             self._demote(node_id, tracker)
@@ -1585,8 +1593,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self, action: BackupKV, write_back: bool = False
     ) -> Optional[int]:
         """Run a backup action top-down, stopping at the first failed backup.
-        Returns the Full KV tokens written (0 for a component-only backup), or
-        None when nothing reached host."""
+        Returns the Full KV tokens written for the last node (0 when only its
+        Mamba or SWA state was written), or None when a node gets no host
+        space (note this can be after prior nodes were committed)."""
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end

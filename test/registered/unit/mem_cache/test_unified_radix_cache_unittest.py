@@ -7012,6 +7012,26 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(_host_value(cache, node, ComponentType.MAMBA))
         cache.sanity_check()
 
+    def test_hicache_write_back_component_backup_keeps_full_host_copy(self):
+        if not self.cfg.has_mamba or self._skip_unsupported_hicache_test():
+            self.skipTest("requires Mamba component without SWA")
+        cache, _, _, seq_a, node = self._build_backed_up_mamba_fixture()
+        write = cache.cache_controller.write
+
+        def write_after_host_eviction(*args, **kwargs):
+            # A shared Full/SWA host pool evicts Full KV from host to make room.
+            cache.evict_host(len(seq_a))
+            return write(*args, **kwargs)
+
+        with mock.patch.object(
+            cache.cache_controller, "write", side_effect=write_after_host_eviction
+        ):
+            cache.evict(EvictParams(num_tokens=len(seq_a)))
+
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.FULL))
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.MAMBA))
+        cache.sanity_check()
+
     def _build_internal_swa_fixture(self, write_policy):
         """HiCache fixture where seq_a's node is INTERNAL and its child spans
         the sliding window, so the leaf backup walk cannot cover it."""
