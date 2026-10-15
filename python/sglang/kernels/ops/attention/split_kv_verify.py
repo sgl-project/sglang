@@ -433,6 +433,7 @@ def split_kv_verify(
         skip_empty,
         short_merge,
         num_warps=merge_warps,
+        enable_fp_fusion=False,
     )
     return out
 

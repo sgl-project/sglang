@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--heads", default="4,8")
     parser.add_argument("--lengths", default="2048,131072,168960")
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--sanitizer-only", action="store_true")
     args = parser.parse_args()
     spec = importlib.util.spec_from_file_location("split_attention_check", args.kernel)
     module = importlib.util.module_from_spec(spec)
@@ -42,7 +43,11 @@ def main():
         args=vars(args),
         kernel_md5=hashlib.md5(Path(args.kernel).read_bytes()).hexdigest(),
         script_md5=hashlib.md5(Path(__file__).read_bytes()).hexdigest(),
-        mode="numerical validation; no timing claim",
+        mode=(
+            "sanitizer controls; numerical gate not run"
+            if args.sanitizer_only
+            else "numerical validation; no timing claim"
+        ),
     )
     seeds = [42] if args.quick else list(map(int, args.seeds.split(",")))
     heads_values = [4, 8] if args.quick else list(map(int, args.heads.split(",")))
@@ -90,42 +95,44 @@ def main():
                 with torch.cuda.graph(graph):
                     candidate()
                 graph.replay()
-                flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                    q,
-                    kv,
-                    workspace,
-                    table,
-                    seq,
-                    262144,
-                    bmm1_scale=qk_scale,
-                    bmm2_scale=v_scale,
-                    out=stock,
-                    q_len_per_req=7,
-                    multi_ctas_kv_counter_buffer=counter,
-                )
-                selected = table[0].long()
-                ref = reference(
-                    q,
-                    kv[0].index_select(0, selected).reshape(-1, 256)[:length],
-                    kv[1].index_select(0, selected).reshape(-1, 256)[:length],
-                    length,
-                    qk_scale,
-                    v_scale,
-                )
                 row = dict(seed=seed, heads=heads, length=length, q_len=7, batch=1)
-                for label, value in (("stock", stock), ("candidate", out)):
-                    error = value.double() - ref
-                    row[label] = dict(
-                        mean_row_rel_l2=(error.norm(dim=-1) / ref.norm(dim=-1))
-                        .mean()
-                        .item(),
-                        max_abs=error.abs().max().item(),
+                row["numerical_pass"] = None
+                if not args.sanitizer_only:
+                    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                        q,
+                        kv,
+                        workspace,
+                        table,
+                        seq,
+                        262144,
+                        bmm1_scale=qk_scale,
+                        bmm2_scale=v_scale,
+                        out=stock,
+                        q_len_per_req=7,
+                        multi_ctas_kv_counter_buffer=counter,
                     )
-                row["numerical_pass"] = (
-                    row["candidate"]["mean_row_rel_l2"]
-                    <= 1.05 * row["stock"]["mean_row_rel_l2"]
-                    and row["candidate"]["max_abs"] <= 2 * row["stock"]["max_abs"]
-                )
+                    selected = table[0].long()
+                    ref = reference(
+                        q,
+                        kv[0].index_select(0, selected).reshape(-1, 256)[:length],
+                        kv[1].index_select(0, selected).reshape(-1, 256)[:length],
+                        length,
+                        qk_scale,
+                        v_scale,
+                    )
+                    for label, value in (("stock", stock), ("candidate", out)):
+                        error = value.double() - ref
+                        row[label] = dict(
+                            mean_row_rel_l2=(error.norm(dim=-1) / ref.norm(dim=-1))
+                            .mean()
+                            .item(),
+                            max_abs=error.abs().max().item(),
+                        )
+                    row["numerical_pass"] = (
+                        row["candidate"]["mean_row_rel_l2"]
+                        <= 1.05 * row["stock"]["mean_row_rel_l2"]
+                        and row["candidate"]["max_abs"] <= 2 * row["stock"]["max_abs"]
+                    )
                 expected = out.clone()
                 seq.zero_()
                 graph.replay()
@@ -135,11 +142,13 @@ def main():
                 graph.replay()
                 torch.cuda.synchronize()
                 row["restore_pass"] = torch.equal(out, expected)
+                row["finite_pass"] = torch.isfinite(out).all().item()
                 row["verdict"] = (
                     "PASS"
-                    if row["numerical_pass"]
+                    if row["numerical_pass"] is not False
                     and row["empty_pass"]
                     and row["restore_pass"]
+                    and row["finite_pass"]
                     else "FAIL"
                 )
                 records.append(row)
