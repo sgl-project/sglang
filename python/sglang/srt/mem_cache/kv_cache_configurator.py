@@ -194,6 +194,23 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
+def _max_running_requests_user_set() -> bool:
+    """Whether --max-running-requests was explicitly provided by the operator.
+
+    Speculative decoding auto-resolves it to 48 when omitted (see
+    arg_groups/speculative_hook), and model hooks may do the same through
+    declare_resolution; those defaults must not be mistaken for a user-chosen
+    request limit when sizing the mamba state pool with the radix cache
+    disabled (sgl-project/sglang#44355). Sizing the pool around the auto
+    default can reserve so much state memory that no GPU memory is left for
+    the attention KV cache, failing startup. The pre-resolution _raw_input
+    snapshot records what the operator actually passed; auto defaults are
+    declared through the resolution stash and never touch it.
+    """
+    raw = getattr(get_context().server_args, "_raw_input", None) or {}
+    return raw.get("max_running_requests") is not None
+
+
 def mm_runtime_reservation_gb(
     *, is_multimodal: bool, mm_feature_transport: Optional[str]
 ) -> float:
@@ -2997,8 +3014,14 @@ class KVCacheConfigurator:
         elif (
             get_memory().disable_radix_cache
             and get_schedule().max_running_requests is not None
+            and _max_running_requests_user_set()
         ):
-            # Use explicitly set max_running_requests when radix cache is disabled
+            # Size the state pool from an explicitly set --max-running-requests
+            # when the radix cache is disabled. An auto-resolved default (e.g.
+            # the speculative-decoding 48) is not a user choice, so it falls
+            # through to the ratio-based auto-fit below instead: the pool then
+            # fits the available memory and leaves room for the attention KV
+            # cache (sgl-project/sglang#44355).
             get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=get_schedule().max_running_requests
