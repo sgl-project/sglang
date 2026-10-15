@@ -402,7 +402,9 @@ class AiterAttnBackend(AttentionBackend):
 
         # paged_attention_ragged (cpp_itfs, GFX9-only) and the CK
         # mha_batch_prefill have no gfx1250 implementation.
-        if self.use_sliding_window_kv_pool or is_gfx1250_supported():
+        if self.use_sliding_window_kv_pool or (
+            is_gfx1250_supported() and not self.use_mla
+        ):
             self.use_triton_unified_attention = True
         else:
             self.use_triton_unified_attention = get_bool_env_var(
@@ -412,12 +414,12 @@ class AiterAttnBackend(AttentionBackend):
         # unified_attention's tile width equals the page size, so a smaller page
         # produces wrong output rather than failing. On gfx1250 every non-MLA
         # layer takes this path, so reject the unsupported sizes instead.
-        if is_gfx1250_supported() and not self.use_mla and self.page_size < 32:
+        if is_gfx1250_supported() and not self.use_mla and self.page_size < 16:
             raise ValueError(
                 f"page_size={self.page_size} is not supported on gfx1250 for "
                 "non-MLA models: aiter unified_attention's tile width equals the "
                 "page size, so smaller pages produce wrong output. Use "
-                "page_size >= 32 (the gfx1250 default for the aiter backend)."
+                "page_size >= 16 (the gfx1250 default for the aiter backend is 32)."
             )
 
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
