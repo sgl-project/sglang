@@ -64,6 +64,7 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.runtime_context import (
     get_disagg,
 )
@@ -155,6 +156,16 @@ def _extract_field_by_index(
 
     new_field = [field[index]]
     return wrap_as_pickle(new_field) if should_wrap_result else new_field
+
+
+def _extract_pooled_hidden_states_by_index(output: BatchEmbeddingOutput, i: int):
+    states = output.pooled_hidden_states
+    if states is None:
+        return None
+    # Stacked layout: one tensor holding a row per request.
+    if len(states) == 1 and len(output.rids) > 1:
+        return [states[0][i]]
+    return [states[i]]
 
 
 def _handle_output_by_index(output, i):
@@ -285,6 +296,12 @@ def _handle_output_by_index(output, i):
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            cached_tokens_details=_extract_field_by_index(
+                output, "cached_tokens_details", i
+            ),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
+            pooled_hidden_states=_extract_pooled_hidden_states_by_index(output, i),
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
@@ -786,6 +803,8 @@ def run_multi_detokenizer_router_process(
     ipc_name_list: List[str],
     server_args: ServerArgs,
     port_args: PortArgs,
+    *,
+    enable_metrics: bool,
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
@@ -794,6 +813,8 @@ def run_multi_detokenizer_router_process(
 
     router = None
     try:
+        if enable_metrics:
+            start_cpu_monitor_thread("detokenizer_router")
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:

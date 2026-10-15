@@ -406,7 +406,12 @@ class TestBufferModeSidecar(unittest.TestCase):
 
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = cache
-        pipeline._swa_window_pages = 1
+        pipeline._swa_component = SimpleNamespace(
+            pool_name=PoolName.SWA,
+            component_type=ComponentType.SWA,
+            full_window_pages=1,
+        )
+        pipeline._auxiliary_swa_component = None
         pipeline.write_backlog_cap = 8
         pipeline.reset()
         pipeline._build_backup_transfers = lambda node_id, *, kv_only=False: (
