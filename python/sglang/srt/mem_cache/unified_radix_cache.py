@@ -2708,6 +2708,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         beliefs = self.storage_existence_cache
         verdicts = operation.query_pool_hit_pages
+        # No rank-agreed KV query evidence; leave beliefs unchanged.
+        if PoolName.KV not in verdicts:
+            return
         folded_pages = operation.storage_hit_count // self.page_size
 
         def verdict(pool: PoolName) -> tuple[int, bool]:
@@ -2852,7 +2855,6 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
-        self._invalidate_absent_from_hit_query(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -3013,13 +3015,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
                 if info is None:
-                    # Request already aborted/cleaned up; still flush the
-                    # query's absent-hash feedback.
-                    self._invalidate_absent_from_hit_query(operation)
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue
@@ -3053,7 +3053,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
-                self._invalidate_absent_from_hit_query(operation)
                 self._account_prefetch_outcome(operation, revoked=False)
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
