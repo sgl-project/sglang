@@ -361,6 +361,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", quant: "nvfp4" },
+      verified: true,
       nnodes: 1,
       env: [],
       flags: [
