@@ -303,13 +303,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                 )
                 run_dsa_sparse_fp8_prefill_case(self, case, dsa_prefill_backend=impl)
 
-    # A mixed-chunk batch: one chunk of a long prefill plus decode requests
-    # appended as one-token extends (`--enable-mixed-chunk`). It runs the
-    # prefill impl like EXTEND but carries ForwardMode.MIXED, so the backend
-    # must route it exactly like EXTEND: the prefill graph runner builds the
-    # attention metadata from the MIXED batch and replays EXTEND graphs, and
-    # context-parallel / NPU runs hand MIXED straight to forward_extend. On
-    # PAGED the bf16-only sparse prefill kernels receive the packed FP8 pool.
+    # --enable-mixed-chunk batch: one prefill chunk plus 1-token decode rows.
     FP8_MIXED_CASE = DSAAttentionCase(
         name="dsa_sparse_fp8_mixed_chunk",
         backend="dsa",
