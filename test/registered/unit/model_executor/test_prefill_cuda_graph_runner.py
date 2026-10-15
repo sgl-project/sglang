@@ -215,6 +215,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.device = torch.device("cpu")
         runner.prefill_backend_name = prefill_backend_name
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner._capture_req_slots = capture_req_slots
         runner.max_bs = 4
         runner._prefill_static_buffers = None
@@ -384,6 +385,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner._capture_chunked_prefix = False
         runner.buffer_registry = _FakeBatchRegistry()
         translator = _static_pool_translator()
@@ -632,6 +634,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_num_tokens = 4
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner._capture_chunked_prefix = False
         runner.has_mha_companion_layers = False
 
@@ -698,6 +701,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_num_tokens = 32
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.backend = SimpleNamespace()
         runner.prefill_backend_name = Backend.FULL
         runner.has_mha_companion_layers = False
