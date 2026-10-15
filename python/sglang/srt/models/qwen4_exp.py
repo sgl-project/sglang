@@ -15,10 +15,6 @@ import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
-from sglang.kernels.ops.speculative.ragged_verify_kernels import (
-    build_ragged_dense_row_maps,
-    gather_rows_masked,
-)
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -28,6 +24,9 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.linear.utils import (
+    ragged_verify_dense_scatter_indices,
+    ragged_verify_gather_from_dense,
+    ragged_verify_scatter_to_dense,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -186,8 +185,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
-    ragged_dense_rows: Optional[torch.Tensor] = None
-    ragged_packed_rows: Optional[torch.Tensor] = None
+    ragged_dense_indices: Optional[torch.Tensor] = None
 
 
 class _BreakablePLEBatch:
@@ -278,19 +276,25 @@ def _prepare_ple_batch(
         if mode.is_target_verify()
         else None
     )
-    ragged_dense_rows = ragged_packed_rows = None
+    ragged_dense_indices = None
     if ragged_layout is not None:
-        ragged_dense_rows, ragged_packed_rows = build_ragged_dense_row_maps(
+        draft_token_num = int(forward_batch.spec_info.draft_token_num)
+        num_dense = ragged_layout.bs * draft_token_num
+        ragged_dense_indices = ragged_verify_dense_scatter_indices(
             query_start_loc=ragged_layout.qo_indptr_device,
-            num_packed_rows=processed_tokens,
-            draft_token_num=int(forward_batch.spec_info.draft_token_num),
+            seq_len=processed_tokens,
+            draft_token_num=draft_token_num,
         )
-        tokens = gather_rows_masked(tokens.unsqueeze(1), ragged_packed_rows)[:, 0]
+        tokens = ragged_verify_scatter_to_dense(
+            tokens, dense_indices=ragged_dense_indices, num_dense=num_dense
+        )
         if out_cache_loc is not None:
-            out_cache_loc = gather_rows_masked(
-                out_cache_loc[:processed_tokens].unsqueeze(1), ragged_packed_rows
-            )[:, 0]
-        physical_tokens = processed_tokens = ragged_packed_rows.shape[0]
+            out_cache_loc = ragged_verify_scatter_to_dense(
+                out_cache_loc[:processed_tokens],
+                dense_indices=ragged_dense_indices,
+                num_dense=num_dense,
+            )
+        physical_tokens = processed_tokens = num_dense
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
     if mode.is_target_verify():
@@ -420,8 +424,7 @@ def _prepare_ple_batch(
         state_indices=state_indices,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
-        ragged_dense_rows=ragged_dense_rows,
-        ragged_packed_rows=ragged_packed_rows,
+        ragged_dense_indices=ragged_dense_indices,
     )
 
 
@@ -1365,12 +1368,18 @@ class Qwen4ExpPLELayer(nn.Module):
         forward_batch: ForwardBatch,
         batch: _PLEBatch,
     ) -> torch.Tensor:
-        if batch.ragged_dense_rows is None:
+        if batch.ragged_dense_indices is None:
             return self._forward_rows(hidden_states, forward_batch, batch)
-        dense = gather_rows_masked(hidden_states, batch.ragged_packed_rows)
+        dense = ragged_verify_scatter_to_dense(
+            hidden_states[: batch.ragged_dense_indices.shape[0]],
+            dense_indices=batch.ragged_dense_indices,
+            num_dense=batch.processed_tokens,
+        )
         output = self._forward_rows(dense, forward_batch, batch)
         return _pad_token_rows(
-            gather_rows_masked(output, batch.ragged_dense_rows),
+            ragged_verify_gather_from_dense(
+                output, dense_indices=batch.ragged_dense_indices
+            ),
             hidden_states.shape[0],
         )
 

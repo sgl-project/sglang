@@ -562,7 +562,7 @@ def eagle_prepare_for_verify(
         batch.input_ids = (
             verify_input.draft_token
             if ragged_forward is None
-            else ragged_forward.input_ids
+            else ragged_forward.window.verify_ids
         )
         maybe_detect_oob(
             batch.input_ids,
@@ -575,7 +575,7 @@ def eagle_prepare_for_verify(
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
         if ragged_forward is not None:
-            batch.out_cache_loc = ragged_forward.out_cache_loc
+            batch.out_cache_loc = ragged_forward.window.verify_cache_loc
         elif verify_input.prepared_out_cache_loc is not None:
             batch.out_cache_loc = verify_input.prepared_out_cache_loc
         else:
@@ -623,13 +623,13 @@ def eagle_prepare_for_verify(
         ),
         kv_loc_plan=verify_input.kv_loc_plan,
         write_cols=(
-            ragged_forward.window_cols
+            ragged_forward.window.window_index
             if ragged_forward is not None and verify_input.kv_loc_plan is not None
             else None
         ),
     )
     if ragged_forward is not None:
-        verify_forward_batch.positions = ragged_forward.positions
+        verify_forward_batch.positions = ragged_forward.window.positions
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(

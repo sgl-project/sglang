@@ -188,6 +188,9 @@ class EagleDraftInput(SpecInput):
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
+    # Adaptive verification: draft tokens to verify beyond each request's first;
+    # None verifies every draft.
+    verify_token_budget: Optional[int] = None
 
     # False when this input is missing model-required state for graph replay.
     # DP attention synchronizes the bit across ranks before the worker runs.

@@ -1356,6 +1356,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 target_model_runner=self._target_worker.model_runner,
                 device=self.device,
+                overlap=not get_schedule().disable_overlap_schedule,
             )
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
@@ -1383,6 +1384,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
                 )
+
+    def get_confidence_budget_prepare(self):
+        return self._prepare_adaptive_verify_budget
+
+    def _prepare_adaptive_verify_budget(self, batch, future_map) -> None:
+        if self.adaptive_verifier is not None:
+            self.adaptive_verifier.prepare_verify_budget(batch, future_map)
 
     def forward_batch_generation(
         self,
@@ -1466,6 +1474,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                             draft_input=draft_input,
                             num_reqs=len(batch.seq_lens),
                         ),
+                        verify_token_budget=draft_input.verify_token_budget,
                     )
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
@@ -1476,7 +1485,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
+                on_publish(
+                    batch_output.new_seq_lens,
+                    confidence=(
+                        None
+                        if adaptive_verify_step is None
+                        else adaptive_verify_step.predictions
+                    ),
+                )
             if (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()

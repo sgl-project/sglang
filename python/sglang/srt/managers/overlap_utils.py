@@ -58,6 +58,8 @@ def decide_needs_confidence_relay() -> bool:
     )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+    if get_spec().speculative_adaptive_verification:
+        return True
     algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     if not algo.is_dspark():
         return False

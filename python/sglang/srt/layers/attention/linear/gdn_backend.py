@@ -9,7 +9,6 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.kernels.ops.speculative.ragged_verify_kernels import gather_rows_masked
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
@@ -19,6 +18,9 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
     pp_spec_stable_rows_enabled,
+    ragged_verify_dense_scatter_indices,
+    ragged_verify_gather_from_dense,
+    ragged_verify_scatter_to_dense,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -989,16 +991,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
-        ragged_dense_rows = forward_metadata.ragged_dense_rows
-        if is_target_verify and ragged_dense_rows is not None:
-            packed_rows = forward_metadata.ragged_packed_rows
-            mixed_qkv, a, b = (
-                gather_rows_masked(x, packed_rows) for x in (mixed_qkv, a, b)
+        dense_indices = None
+        if (
+            is_target_verify
+            and forward_batch.spec_info.ragged_verify_layout is not None
+        ):
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            num_reqs = query_start_loc.shape[0] - 1
+            num_dense = num_reqs * draft_token_num
+            dense_indices = ragged_verify_dense_scatter_indices(
+                query_start_loc=query_start_loc,
+                seq_len=seq_len,
+                draft_token_num=draft_token_num,
             )
-            seq_len = packed_rows.shape[0]
+            mixed_qkv, a, b = (
+                ragged_verify_scatter_to_dense(
+                    x, dense_indices=dense_indices, num_dense=num_dense
+                )
+                for x in (mixed_qkv, a, b)
+            )
+            seq_len = num_dense
             query_start_loc = self._dense_verify_query_start_loc(
-                num_reqs=query_start_loc.shape[0] - 1,
-                draft_token_num=forward_batch.spec_info.draft_token_num,
+                num_reqs=num_reqs,
+                draft_token_num=draft_token_num,
                 device=query_start_loc.device,
             )
 
@@ -1191,9 +1206,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
-            if ragged_dense_rows is not None:
-                core_attn_out = gather_rows_masked(
-                    core_attn_out.reshape(seq_len, -1), ragged_dense_rows
+            if dense_indices is not None:
+                core_attn_out = ragged_verify_gather_from_dense(
+                    core_attn_out.reshape(seq_len, -1), dense_indices=dense_indices
                 ).view(*core_attn_out.shape[:-3], -1, *core_attn_out.shape[-2:])
         else:
             g, beta = self._prefill_gates(layer, a, b)

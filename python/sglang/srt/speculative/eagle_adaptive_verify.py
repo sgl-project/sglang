@@ -6,52 +6,68 @@ from collections import deque
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
-import numpy as np
 import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
-    CompactRowIndex,
+    BuildRaggedVerifyWindow,
+    RaggedVerifyWindow,
+    ScatterCompactToStrided,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.overlap_utils import (
+    CONFIDENCE_RELAY_RING_LAG,
+    ResolvedConfidence,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.acceptance_estimator import OnlineAcceptanceEstimator
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    HostConfidenceBudgetPlanner,
+    graph_tier_fill_budget,
+    local_verify_tier_num_tokens,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.dspark_components.dspark_sps import (
+    SpsAdditiveCostTable,
+    build_uninitialized_sps_table,
+)
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, round_up_grid
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 logger = logging.getLogger(__name__)
 
 _PROFILE_REPLAYS = 5
-# Plan from confidences copied two steps ago so every TP rank reads the same data.
-_STALE_LAG = 2
 _RESIDUAL_SYNC_INTERVAL = 64
 _MIN_RESIDUAL_SAMPLES = 8
 _EMA_WEIGHT = 0.1
-_DEFAULT_ACCEPT_RATE = 0.7
 
 
 class RaggedVerifyForward(msgspec.Struct, frozen=True):
-    input_ids: torch.Tensor
-    positions: torch.Tensor
-    out_cache_loc: torch.Tensor
-    window_cols: torch.Tensor
+    window: RaggedVerifyWindow
     mrope_positions: Optional[torch.Tensor]
-    strided_rows: torch.Tensor
+    layout: RaggedVerifyLayout
+    num_draft_tokens: int
 
     def unpack_output(self, logits_output) -> None:
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            self.strided_rows
-        ]
+        logits_output.next_token_logits = self._to_strided(
+            logits_output.next_token_logits
+        )
         if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[self.strided_rows]
+            logits_output.hidden_states = self._to_strided(logits_output.hidden_states)
+
+    def _to_strided(self, compact: torch.Tensor) -> torch.Tensor:
+        return ScatterCompactToStrided.execute(
+            compact=compact,
+            layout=self.layout,
+            fill_value=0.0,
+            verify_num_draft_tokens=self.num_draft_tokens,
+        )
 
 
 class AdaptiveVerifyStep(msgspec.Struct, frozen=True):
@@ -60,64 +76,6 @@ class AdaptiveVerifyStep(msgspec.Struct, frozen=True):
     predictions: torch.Tensor
     num_reqs: int
     verify_cost_ms: float
-
-
-class _StaleSurvival:
-    def __init__(self, *, pool_size: int, num_steps: int, max_bs: int) -> None:
-        self._predictions = np.full(
-            (pool_size, num_steps), _DEFAULT_ACCEPT_RATE, dtype=np.float32
-        )
-        self._generation = np.full(pool_size, -1, dtype=np.int64)
-        self._default = np.full(num_steps, _DEFAULT_ACCEPT_RATE, dtype=np.float32)
-        self._slots = [
-            torch.empty((max_bs, num_steps), dtype=torch.float32, pin_memory=True)
-            for _ in range(_STALE_LAG + 1)
-        ]
-        self._next_slot = 0
-        self._pending: deque = deque()
-
-    def push(
-        self,
-        *,
-        predictions: torch.Tensor,
-        req_pool_indices_cpu: torch.Tensor,
-        generation_cpu: torch.Tensor,
-    ) -> None:
-        num_reqs = predictions.shape[0]
-        slot = self._slots[self._next_slot]
-        self._next_slot = (self._next_slot + 1) % len(self._slots)
-        slot[:num_reqs].copy_(predictions, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        self._pending.append(
-            (
-                slot,
-                num_reqs,
-                event,
-                req_pool_indices_cpu.numpy().astype(np.int64),
-                generation_cpu.numpy().astype(np.int64),
-            )
-        )
-
-    def drain(self) -> None:
-        while len(self._pending) >= _STALE_LAG:
-            slot, num_reqs, event, rows, generation = self._pending.popleft()
-            event.synchronize()
-            values = slot[:num_reqs].numpy()
-            self._predictions[rows] = values
-            self._generation[rows] = generation
-            self._default = (
-                1.0 - _EMA_WEIGHT
-            ) * self._default + _EMA_WEIGHT * values.mean(axis=0)
-
-    def survival(
-        self, *, req_pool_indices_cpu: np.ndarray, generation_cpu: np.ndarray
-    ) -> np.ndarray:
-        fresh = self._generation[req_pool_indices_cpu] == generation_cpu
-        predictions = np.where(
-            fresh[:, None], self._predictions[req_pool_indices_cpu], self._default
-        )
-        return np.cumprod(predictions, axis=1)
 
 
 class _ResidualCost:
@@ -196,6 +154,7 @@ class EagleAdaptiveVerifier:
         num_draft_tokens: int,
         target_model_runner,
         device: torch.device,
+        overlap: bool,
     ) -> None:
         assert num_draft_tokens == num_steps + 1
         runner = target_model_runner.decode_cuda_graph_runner
@@ -208,70 +167,46 @@ class EagleAdaptiveVerifier:
         self.num_draft_tokens = num_draft_tokens
         self.device = device
         self._model_runner = target_model_runner
+        self._overlap = overlap
         self._capture_bs = list(runner.capture_bs)
         self._tiers_by_slots = {
             slots: list(tiers) for slots, tiers in runner.ragged_tiers_by_slots.items()
         }
         self._max_slots = runner.max_bs
         self._schedule_cfg = DSparkScheduleConfig(gamma=num_steps)
-        self._schedule_cfg.validate()
-        self._full_verify_lens = torch.full(
-            (self._max_slots,), num_draft_tokens, dtype=torch.int32, device=device
+        self._tp_group = get_parallel().tp_group
+        self._tier_costs, self._uniform_costs = self._profile_verify_costs(
+            runner=runner
         )
-
-        tp_group = get_parallel().tp_group
-        tier_shapes = [
-            (slots, tier)
-            for slots, tiers in self._tiers_by_slots.items()
-            for tier in tiers
-        ]
-        tier_costs = [
-            runner.measure_graph_replay_ms(
-                size=slots, num_tokens=tier, ragged=True, num_replays=_PROFILE_REPLAYS
-            )
-            for slots, tier in tier_shapes
-        ]
-        uniform_costs = [
-            runner.measure_graph_replay_ms(
-                size=bs,
-                num_tokens=bs * num_draft_tokens,
-                ragged=False,
-                num_replays=_PROFILE_REPLAYS,
-            )
-            for bs in self._capture_bs
-        ]
-        tier_costs, uniform_costs = tp_group.broadcast_object(
-            (tier_costs, uniform_costs), src=0
-        )
-        self._tier_costs = dict(zip(tier_shapes, tier_costs))
-        self._uniform_costs = np.asarray(uniform_costs, dtype=np.float64)
         self.estimator = OnlineAcceptanceEstimator(num_steps=num_steps, device=device)
-        pool = target_model_runner.req_to_token_pool
-        self._req_generation = pool.req_generation
-        self._stale = _StaleSurvival(
-            pool_size=int(self._req_generation.shape[0]),
-            num_steps=num_steps,
-            max_bs=self._max_slots,
+        self._req_generation = target_model_runner.req_to_token_pool.req_generation
+        self._budget_planner = HostConfidenceBudgetPlanner(
+            sps_table=build_uninitialized_sps_table(
+                max_batch_tokens=self._max_slots * num_draft_tokens
+            ),
+            cfg=self._schedule_cfg,
+            model_runner=target_model_runner,
+            relay_lag_steps=CONFIDENCE_RELAY_RING_LAG if overlap else 0,
         )
         self._residual = _ResidualCost(
-            tp_group=tp_group, is_rank0=tp_group.rank_in_group == 0
+            tp_group=self._tp_group, is_rank0=self._tp_group.rank_in_group == 0
         )
         self._log_interval = envs.SGLANG_ADAPTIVE_VERIFY_LOG_INTERVAL.get()
         self._forced_tier = envs.SGLANG_TEST_ADAPTIVE_VERIFY_FORCE_TIER.get()
         self._num_planned = 0
         self._num_scheduled_tokens = 0
         self._num_full_tokens = 0
-        if tp_group.rank_in_group == 0:
+        if self._tp_group.rank_in_group == 0:
             logger.info(
                 "Adaptive verification enabled: verify cost ms by batch size, "
                 "uniform graph then ragged graphs by token count: %s",
                 {
-                    slots: [round(float(cost), 3)]
+                    slots: [round(self._uniform_costs[slots], 3)]
                     + [
-                        (tier, round(float(self._tier_costs[(slots, tier)]), 3))
+                        (tier, round(self._tier_costs[(slots, tier)], 3))
                         for tier in self._tiers_by_slots[slots]
                     ]
-                    for slots, cost in zip(self._capture_bs, self._uniform_costs)
+                    for slots in self._capture_bs
                 },
             )
 
@@ -287,6 +222,21 @@ class EagleAdaptiveVerifier:
             return False
         return batch.req_pool_indices_cpu is not None
 
+    def prepare_verify_budget(self, batch: ScheduleBatch, future_map: FutureMap):
+        """Scheduler hook under overlap: plan this step's budget on the host."""
+        draft_input = batch.spec_info
+        if (
+            draft_input is None
+            or batch.forward_mode.is_extend()
+            or batch.is_extend_in_batch
+            or not self.applies_to(batch)
+        ):
+            self._budget_planner.note_non_decode_step()
+            return
+        draft_input.verify_token_budget = self._plan_budget(
+            batch=batch, resolved=future_map.resolve_confidence_cpu(batch)
+        )
+
     def begin_step(self):
         return self._residual.begin()
 
@@ -296,49 +246,57 @@ class EagleAdaptiveVerifier:
         batch: ScheduleBatch,
         verify_input: EagleVerifyInput,
         draft_probs: torch.Tensor,
+        verify_token_budget: Optional[int],
     ) -> AdaptiveVerifyStep:
         num_reqs = len(batch.seq_lens)
         features, predictions = self.estimator.predict(draft_probs)
-        self._stale.drain()
-        tier = self._choose_tier(batch=batch, num_reqs=num_reqs)
-        self._stale.push(
-            predictions=predictions,
-            req_pool_indices_cpu=batch.req_pool_indices_cpu,
-            generation_cpu=self._req_generation[batch.req_pool_indices_cpu],
-        )
+        if not self._overlap:
+            rows = batch.req_pool_indices_cpu.to(torch.int64)
+            verify_token_budget = self._plan_budget(
+                batch=batch,
+                resolved=ResolvedConfidence(
+                    confidence=predictions.cpu(),
+                    generation=self._req_generation[rows].clone(),
+                ),
+            )
         self._num_planned += 1
         self._num_full_tokens += num_reqs * self.num_draft_tokens
-        if tier is None:
+        if verify_token_budget is None:
             self._num_scheduled_tokens += num_reqs * self.num_draft_tokens
             return AdaptiveVerifyStep(
-                verify_lens=self._full_verify_lens[:num_reqs],
+                verify_lens=torch.full(
+                    (num_reqs,),
+                    self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
                 features=features,
                 predictions=predictions,
                 num_reqs=num_reqs,
-                verify_cost_ms=self._uniform_cost(num_reqs),
+                verify_cost_ms=self._uniform_costs[self._slots(num_reqs)],
             )
-        budget = min(tier, num_reqs * self.num_draft_tokens) - num_reqs
+        tier = num_reqs + verify_token_budget
         verify_lens = ScheduleVerifyLensTopk.execute(
-            confidence=predictions, budget=budget, cfg=self._schedule_cfg
+            confidence=predictions, budget=verify_token_budget, cfg=self._schedule_cfg
         )
         layout = RaggedVerifyLayout.from_verify_lens_device(
             verify_lens=verify_lens, graph_num_tokens=tier
         )
         verify_input.ragged_verify_layout = layout
-        verify_input.ragged_forward = self._pack(
+        verify_input.ragged_forward = self._build_forward(
             verify_input=verify_input, batch=batch, layout=layout
         )
         verify_input.retrieve_next_token = self._truncate_chain(
             retrieve_next_token=verify_input.retrieve_next_token,
             verify_lens=layout.verify_lens,
         )
-        self._num_scheduled_tokens += num_reqs + budget
+        self._num_scheduled_tokens += tier
         return AdaptiveVerifyStep(
             verify_lens=layout.verify_lens,
             features=features,
             predictions=predictions,
             num_reqs=num_reqs,
-            verify_cost_ms=float(self._tier_costs[(self._slots(num_reqs), tier)]),
+            verify_cost_ms=self._tier_costs[(self._slots(num_reqs), tier)],
         )
 
     def finish_step(
@@ -362,86 +320,135 @@ class EagleAdaptiveVerifier:
         if self._log_interval and self._num_planned % self._log_interval == 0:
             self._log_state()
 
+    def _profile_verify_costs(
+        self, *, runner
+    ) -> tuple[dict[tuple[int, int], float], dict[int, float]]:
+        tier_shapes = [
+            (slots, tier)
+            for slots, tiers in self._tiers_by_slots.items()
+            for tier in tiers
+        ]
+        tier_costs = [
+            runner.measure_graph_replay_ms(
+                size=slots, num_tokens=tier, ragged=True, num_replays=_PROFILE_REPLAYS
+            )
+            for slots, tier in tier_shapes
+        ]
+        uniform_costs = [
+            runner.measure_graph_replay_ms(
+                size=bs,
+                num_tokens=bs * self.num_draft_tokens,
+                ragged=False,
+                num_replays=_PROFILE_REPLAYS,
+            )
+            for bs in self._capture_bs
+        ]
+        tier_costs, uniform_costs = self._tp_group.broadcast_object(
+            (tier_costs, uniform_costs), src=0
+        )
+        return (
+            {shape: float(cost) for shape, cost in zip(tier_shapes, tier_costs)},
+            {bs: float(cost) for bs, cost in zip(self._capture_bs, uniform_costs)},
+        )
+
     def _slots(self, num_reqs: int) -> int:
         return self._capture_bs[bisect.bisect_left(self._capture_bs, num_reqs)]
 
-    def _uniform_cost(self, num_reqs: int) -> float:
-        index = bisect.bisect_left(self._capture_bs, num_reqs)
-        return float(self._uniform_costs[index])
+    def _plan_budget(
+        self, *, batch: ScheduleBatch, resolved: Optional[ResolvedConfidence]
+    ) -> Optional[int]:
+        budget = self._local_budget(batch=batch, resolved=resolved)
+        if self._tp_group.world_size > 1:
+            budget = self._tp_group.broadcast_object(budget, src=0)
+        return budget
 
-    def _choose_tier(self, *, batch: ScheduleBatch, num_reqs: int) -> Optional[int]:
+    def _local_budget(
+        self, *, batch: ScheduleBatch, resolved: Optional[ResolvedConfidence]
+    ) -> Optional[int]:
+        if resolved is None:
+            self._budget_planner.note_non_decode_step()
+            return None
+        num_reqs = len(batch.seq_lens)
         slots = self._slots(num_reqs)
         full_tokens = num_reqs * self.num_draft_tokens
         tiers = [t for t in self._tiers_by_slots[slots] if num_reqs < t < full_tokens]
-        if self._forced_tier > 0:
-            return tiers[min(self._forced_tier, len(tiers)) - 1] if tiers else None
+        rows = batch.req_pool_indices_cpu.to(torch.int64)
+        cost_table = self._cost_table(num_reqs=num_reqs, slots=slots, tiers=tiers)
+        budget = self._budget_planner.compute_budget(
+            confidence=resolved.confidence,
+            generation=resolved.generation,
+            current_generation=self._req_generation[rows],
+            req_pool_indices_cpu=rows,
+            sps_table=cost_table,
+        )
+        if self._forced_tier > 0 and tiers:
+            tier = tiers[min(self._forced_tier, len(tiers)) - 1]
+        elif cost_table is None:
+            return None
+        else:
+            total = local_verify_tier_num_tokens(
+                bs=num_reqs,
+                verify_token_budget=budget,
+                verify_num_draft_tokens=self.num_draft_tokens,
+                min_verify_len=self._schedule_cfg.min_verify_len,
+            )
+            if total > tiers[-1]:
+                return None
+            tier = round_up_grid(total, tiers)
+        return graph_tier_fill_budget(
+            graph_num_tokens=tier,
+            bs=num_reqs,
+            verify_num_draft_tokens=self.num_draft_tokens,
+            min_verify_len=self._schedule_cfg.min_verify_len,
+        )
+
+    def _cost_table(
+        self, *, num_reqs: int, slots: int, tiers: list[int]
+    ) -> Optional[SpsAdditiveCostTable]:
         residual = self._residual.lookup(num_reqs)
         if residual is None or not tiers:
             return None
-        rows = batch.req_pool_indices_cpu.to(torch.int64)
-        survival = self._stale.survival(
-            req_pool_indices_cpu=rows.numpy(),
-            generation_cpu=self._req_generation[rows].numpy(),
+        return SpsAdditiveCostTable(
+            bias_seconds=max(residual, 1e-3) / 1000.0,
+            bs_probes=[num_reqs],
+            alpha_seconds=[0.0],
+            m_probes=tiers + [num_reqs * self.num_draft_tokens],
+            theta_seconds=[self._tier_costs[(slots, t)] / 1000.0 for t in tiers]
+            + [self._uniform_costs[slots] / 1000.0],
         )
-        gains = np.concatenate(
-            ([0.0], np.cumsum(np.sort(survival.ravel())[::-1], dtype=np.float64))
-        )
-        best_tier = None
-        best_rate = (num_reqs + gains[-1]) / (residual + self._uniform_cost(num_reqs))
-        for tier in tiers:
-            rate = (num_reqs + gains[tier - num_reqs]) / (
-                residual + self._tier_costs[(slots, tier)]
-            )
-            if rate > best_rate:
-                best_tier, best_rate = tier, rate
-        return best_tier
 
-    def _pack(
+    def _build_forward(
         self,
         *,
         verify_input: EagleVerifyInput,
         batch: ScheduleBatch,
         layout: RaggedVerifyLayout,
     ) -> RaggedVerifyForward:
-        req_ids, within, valid = CompactRowIndex.execute(
-            verify_lens=layout.verify_lens,
-            padded_total=layout.graph_num_tokens,
+        bs = layout.bs
+        strided = verify_input.draft_token.view(bs, self.num_draft_tokens)
+        window = BuildRaggedVerifyWindow.execute(
+            batch=batch,
+            layout=layout,
+            draft_block_ids=strided,
+            draft_tokens=strided[:, 1:],
+            bs=bs,
             device=self.device,
+            verify_num_draft_tokens=self.num_draft_tokens,
+            model_runner=self._model_runner,
         )
-        safe_req = req_ids.clamp(max=layout.bs - 1)
-        cols = safe_req * self.num_draft_tokens + within
-        window_cols = torch.where(valid, cols, -1)
-
-        def gather(strided: torch.Tensor) -> torch.Tensor:
-            return torch.where(valid, strided[cols], 0)
-
-        out_cache_loc = verify_input.prepared_out_cache_loc
-        if out_cache_loc is None:
-            from sglang.kernels.ops.speculative.cache_locs import (
-                assign_extend_cache_locs_uniform_func,
-            )
-
-            out_cache_loc = assign_extend_cache_locs_uniform_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=batch.req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                batch_size=layout.bs,
-                draft_token_num=self.num_draft_tokens,
-                device=self.device,
-            )
+        valid = window.window_index >= 0
         mrope_positions = verify_input.prepared_mrope_positions
         if mrope_positions is not None:
-            mrope_positions = torch.where(valid, mrope_positions[:, cols], 0)
+            mrope_positions = torch.where(
+                valid, mrope_positions[:, window.window_index.clamp(min=0)], 0
+            )
         elif self._model_runner.model_config.model_is_mrope:
-            positions = gather(verify_input.positions)
-            mrope_positions = positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
+            mrope_positions = window.positions.unsqueeze(0).repeat(3, 1)
         return RaggedVerifyForward(
-            input_ids=gather(verify_input.draft_token),
-            positions=gather(verify_input.positions),
-            out_cache_loc=gather(out_cache_loc),
-            window_cols=window_cols,
+            window=window,
             mrope_positions=mrope_positions,
-            strided_rows=self._strided_rows(layout=layout),
+            layout=layout,
+            num_draft_tokens=self.num_draft_tokens,
         )
 
     def _truncate_chain(
@@ -455,14 +462,8 @@ class EagleAdaptiveVerifier:
             retrieve_next_token,
         )
 
-    def _strided_rows(self, *, layout: RaggedVerifyLayout) -> torch.Tensor:
-        steps = torch.arange(self.num_draft_tokens, device=self.device)
-        last = (layout.verify_lens.to(torch.int64) - 1).unsqueeze(1)
-        starts = layout.qo_indptr_device[:-1].to(torch.int64).unsqueeze(1)
-        return (starts + torch.minimum(steps.unsqueeze(0), last)).reshape(-1)
-
     def _log_state(self) -> None:
-        if get_parallel().tp_group.rank_in_group != 0:
+        if self._tp_group.rank_in_group != 0:
             return
         logger.info(
             "Adaptive verification: steps=%d refits=%d verify_token_ratio=%.3f "

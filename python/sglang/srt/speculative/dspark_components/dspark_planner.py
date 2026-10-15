@@ -962,6 +962,7 @@ class HostConfidenceBudgetPlanner:
         generation: torch.Tensor,
         current_generation: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
+        sps_table: Optional[Union[SpsCostTable, SpsAdditiveCostTable]] = None,
     ) -> int:
         lagged_confidence, lagged_generation = self._shift_to_lag(
             confidence=confidence,
@@ -981,7 +982,7 @@ class HostConfidenceBudgetPlanner:
             return forced_budget
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
-            sps_table=self.sps_table,
+            sps_table=self.sps_table if sps_table is None else sps_table,
             cfg=self.cfg,
         )
         self.last_decision = decision

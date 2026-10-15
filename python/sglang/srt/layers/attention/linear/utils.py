@@ -37,6 +37,21 @@ def ragged_verify_dense_scatter_indices(
     ).clamp_(max=batch_size * draft_token_num)
 
 
+def ragged_verify_scatter_to_dense(
+    packed: torch.Tensor, *, dense_indices: torch.Tensor, num_dense: int
+) -> torch.Tensor:
+    dense = packed.new_zeros((num_dense + 1, *packed.shape[1:]))
+    dense.index_copy_(0, dense_indices, packed)
+    return dense[:num_dense]
+
+
+def ragged_verify_gather_from_dense(
+    dense: torch.Tensor, *, dense_indices: torch.Tensor
+) -> torch.Tensor:
+    ghost = dense.new_zeros((1, *dense.shape[1:]))
+    return torch.cat([dense, ghost])[dense_indices]
+
+
 def pp_spec_stable_rows_enabled() -> bool:
     return envs.SGLANG_ENABLE_PP_SPEC.get()
 
