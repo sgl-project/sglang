@@ -5,6 +5,7 @@ import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from functools import lru_cache
 from typing import NamedTuple
 
 import torch
@@ -978,13 +979,20 @@ def speculative_moe_backend_context():
         moe.runner_backend = original_backend
 
 
+@lru_cache(maxsize=1)
+def _draft_mnnvl_ar_enabled() -> bool:
+    # Read once: the speculative contexts are entered several times per round.
+    return envs.SGLANG_Q35MF_DRAFT_MNNVL_AR.get()
+
+
 def _draft_allreduce_fusion_override() -> AbstractContextManager:
     # Under cutedsl the legacy FlashInfer workspace stands down and the draft builds
     # no CuTe DSL fusion, so its boundaries would run a plain all-reduce + RMSNorm.
+    # The override is process-global: draft and target forwards must share one thread.
     comm = get_exec().comm
     if (
         comm.flashinfer_allreduce_fusion_backend != "cutedsl"
-        or not envs.SGLANG_Q35MF_DRAFT_MNNVL_AR.get()
+        or not _draft_mnnvl_ar_enabled()
     ):
         return nullcontext()
     return comm.override(flashinfer_allreduce_fusion_backend="auto")
