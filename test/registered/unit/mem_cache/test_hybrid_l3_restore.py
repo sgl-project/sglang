@@ -67,7 +67,7 @@ class TestHybridL3Restore(CustomTestCase):
         pool.alloc([req])
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(tokens))
+        req.extend_end = len(tokens)
         req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
         req.last_node = cache.root_node_handle()
         req.lock_receipt = DecLockRefParams()
