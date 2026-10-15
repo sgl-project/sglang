@@ -24,6 +24,14 @@
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
 #                        off (e.g. hosts with a broken RDMA driver)
+#   IB_DEVICES_OVERRIDE
+#                      - this cluster's backend RDMA devices, comma-separated in
+#                        rail order. Recipes name pit2's ports (rdma0..7); with
+#                        this set, a recipe keeps its device count but takes the
+#                        first N names from here, and the spur port check only
+#                        falls back to devices on this list.
+#   ADDR_NIC_OVERRIDE  - host NIC for socket traffic on spur (default eno0);
+#                        also replaces a recipe's runtime.dist_socket_ifname
 #   SGLANG_USE_CHECKOUT_RUNTIME
 #                      - default 1. Reinstall this workflow checkout's Python
 #                        sglang package inside each runtime container, and the
@@ -271,6 +279,26 @@ eval "$RECIPE_VARS"
 # Optional image override from workflow_dispatch input.
 if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
     IMAGE="$IMAGE_OVERRIDE"
+fi
+
+# The recipes spell device names the way pit2 does (RDMA rdma0..7, socket NIC
+# eno0). A cluster that names them differently sets IB_DEVICES_OVERRIDE /
+# ADDR_NIC_OVERRIDE in its runner environment rather than forking every
+# recipe. The recipes always list rdma0..N-1, so taking the first N override
+# names keeps each recipe's rail count.
+IB_POOL=""
+if [[ -n "${IB_DEVICES_OVERRIDE:-}" && -n "$IB" ]]; then
+    IFS=',' read -ra _ib_recipe <<< "$IB"
+    IFS=',' read -ra _ib_cluster <<< "$IB_DEVICES_OVERRIDE"
+    if (( ${#_ib_cluster[@]} < ${#_ib_recipe[@]} )); then
+        echo "ERROR: IB_DEVICES_OVERRIDE names ${#_ib_cluster[@]} devices but recipe $CONFIG_FILE uses ${#_ib_recipe[@]} ($IB)" >&2
+        exit 1
+    fi
+    IB="$(IFS=,; echo "${_ib_cluster[*]:0:${#_ib_recipe[@]}}")"
+    IB_POOL="$IB_DEVICES_OVERRIDE"
+fi
+if [[ -n "${ADDR_NIC_OVERRIDE:-}" && -n "$DIST_SOCK" ]]; then
+    DIST_SOCK="$ADDR_NIC_OVERRIDE"
 fi
 
 # Nodes per engine: an engine whose TP exceeds one node's GPU count spans
@@ -547,7 +575,14 @@ if [[ -n "$IB" && ! "$IB" =~ ^[A-Za-z0-9_,]+$ ]]; then
     echo "ERROR: runtime.ib_devices '$IB' must be a comma-separated list of device names" >&2
     exit 1
 fi
-printf 'IB_RECIPE=%q\n' "$IB" > "$WORKDIR/ib_check.sh"
+if [[ -n "$IB_POOL" && ! "$IB_POOL" =~ ^[A-Za-z0-9_,]+$ ]]; then
+    echo "ERROR: IB_DEVICES_OVERRIDE '$IB_POOL' must be a comma-separated list of device names" >&2
+    exit 1
+fi
+{
+    printf 'IB_RECIPE=%q\n' "$IB"
+    printf 'IB_POOL=%q\n' "$IB_POOL"
+} > "$WORKDIR/ib_check.sh"
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave the extra strings empty, preserving prior behavior.
@@ -1560,7 +1595,11 @@ if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
     if (( ! _ib_spare_init )); then
       _ib_spare=()
       for d in "${_ib_active[@]}"; do
-        [[ ",$IB_RECIPE," == *",$d,"* ]] || _ib_spare+=("$d")
+        [[ ",$IB_RECIPE," == *",$d,"* ]] && continue
+        # With IB_DEVICES_OVERRIDE the cluster has named its backend ports;
+        # anything else that is ACTIVE (e.g. a front-end NIC) is not a rail.
+        [[ -n "${IB_POOL:-}" && ",$IB_POOL," != *",$d,"* ]] && continue
+        _ib_spare+=("$d")
       done
       _ib_spare_init=1
     else
