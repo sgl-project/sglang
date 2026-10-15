@@ -1046,12 +1046,14 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
-            if _is_xpu and layer.weight_scale.ndim == 2:
+            if _is_xpu and layer.weight_scale.ndim in (1, 2):
                 # Normalize channelwise scales to [N, 1] before the rowwise gate.
-                if layer.weight_scale.shape[0] == 1:
+                # Covers both the [1, N] layout this method's own quantize-at-load
+                # path produces and the plain [N] layout some FP8 checkpoints use.
+                if layer.weight_scale.ndim == 1 or layer.weight_scale.shape[0] == 1:
                     with torch.no_grad():
                         layer.weight_scale.set_(
-                            layer.weight_scale.data.t().contiguous()
+                            layer.weight_scale.data.reshape(-1, 1).contiguous()
                         )
                 self.use_per_token_if_dynamic = (
                     layer.weight_scale.shape[1] == 1

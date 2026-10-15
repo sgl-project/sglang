@@ -401,6 +401,55 @@ class TestXPUFP8Linear(CustomTestCase):
                 expected_scale_shapes = ((m, 1), (1, N))
                 self.assertEqual(calls, [expected_scale_shapes])
 
+    def test_static_input_scale_with_channelwise_weight_scale(self):
+        """Static activation_scheme + per-channel weight_scale must not crash.
+
+        process_weights_after_loading forces XPU through the channelwise
+        weight_scale branch unconditionally, but a static checkpoint gives a
+        0-dim per-tensor input_scale (not a per-token one). That combination
+        used to hit `_apply_fallback_scaled_mm`'s `torch.narrow` on a 0-dim
+        tensor.
+        """
+        method = Fp8LinearMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=None)
+        )
+        method.quant_config.activation_scheme = "static"
+        N, K = 384, 256
+        weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) / 3
+        weight_scale = (
+            weight_bf16.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+            / torch.finfo(torch.float8_e4m3fn).max
+        )
+
+        layer = torch.nn.Module()
+        layer.logical_widths = [N]
+        layer.weight = torch.nn.Parameter(
+            weight_bf16.to(torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+        layer.orig_dtype = torch.bfloat16
+        layer.input_scale = torch.nn.Parameter(
+            torch.tensor(0.05, device=self.device), requires_grad=False
+        )
+        method.process_weights_after_loading(layer)
+        self.assertEqual(layer.input_scale.shape, torch.Size([]))
+
+        x = torch.randn(4, K, dtype=torch.bfloat16, device=self.device) / 3
+        output = method.apply(layer, x)
+
+        q_input = (
+            (x.float() / layer.input_scale.float())
+            .clamp(-448, 448)
+            .to(torch.float8_e4m3fn)
+        )
+        # layer.weight is stored transposed as (K, N) after loading.
+        reference = (q_input.float() * layer.input_scale.float()) @ (
+            layer.weight.float() * layer.weight_scale.float().t()
+        )
+        torch.testing.assert_close(
+            output, reference.to(torch.bfloat16), rtol=0.05, atol=0.2
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
