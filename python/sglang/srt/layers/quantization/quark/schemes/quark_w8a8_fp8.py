@@ -208,8 +208,15 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         # The one exception is the per-token (fp8, scale [M, 1]) pair that the
         # Qwen3.5 SGLANG_ROCM_SMALLM_FP8_PROJ producers send on gfx950.
         input_scale = layer.input_scale
+        pre_quant_output_dtype = None
         if isinstance(x, tuple) and _use_aiter and smallm_fp8_gemm_enabled():
-            x, input_scale = x
+            # The fused RMSNorm+per-token-quant producer emits (fp8, scale) or
+            # (fp8, scale, orig_dtype); the dtype slot, when present, sets the
+            # GEMM output dtype (matches the native Fp8LinearMethod contract).
+            if len(x) > 2:
+                x, input_scale, pre_quant_output_dtype = x
+            else:
+                x, input_scale = x
             assert (
                 self.per_token
                 and layer.weight_scale is not None
@@ -235,4 +242,5 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.per_token,
+            pre_quant_output_dtype=pre_quant_output_dtype,
         )
