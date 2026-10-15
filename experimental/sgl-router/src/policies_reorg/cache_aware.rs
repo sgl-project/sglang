@@ -14,21 +14,23 @@ use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixOutcome};
 use tokio::sync::OnceCell;
 
 use crate::config::{AffinityConfig, AffinityMode};
-use crate::policies::admission::FreshLoadLookup;
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
-use crate::policies::ExternalPrefixSignal;
-use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle};
+use crate::state::kv_events::{
+    BlockSizeOracle, CacheNamespace, PrefixLookupResult, RadixTreePrefixProvider,
+};
+use crate::state::load_monitor::engine_ranking::CandidateLoads;
 use crate::state::load_monitor::engine_reported_load::{
     EngineReportedLoadSnapshot, EngineReportedLoadTable,
 };
 use crate::workers::Worker;
 
-use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
+use super::admission::{
+    partition_admitted, AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
+};
 use super::affinity;
 use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
-type Signal = Option<Arc<ExternalPrefixSignal>>;
+type Signal = Option<Arc<PrefixLookupResult>>;
 type Lookup = Arc<OnceCell<Signal>>;
 
 /// Local radix tree or remote indexer. Groups sharing an index namespace share
@@ -51,30 +53,31 @@ impl fmt::Debug for CacheSource {
 }
 
 impl CacheSource {
-    async fn lookup(&self, tokens: Option<&[u32]>) -> Result<Signal, PickError> {
+    async fn lookup(
+        &self,
+        tokens: Option<&[u32]>,
+        namespace: &CacheNamespace,
+    ) -> Result<Signal, PickError> {
         let Some(tokens) = tokens else {
             return Ok(None);
         };
         let (index, oracle) = match self {
             Self::Local(provider) => {
-                return Ok(provider.match_request_tokens(tokens).map(Arc::new))
+                return Ok(provider
+                    .match_request_tokens(tokens, namespace)
+                    .map(Arc::new))
             }
             Self::Remote { index, block_size } => (index, block_size),
         };
-        let Some(block_size) = oracle.get() else {
+        let Some(hashes) = oracle.block_hashes(tokens, namespace) else {
             return Ok(None);
-        };
-        let hashes = if oracle.is_bigram() {
-            compute_block_hashes_bigram(tokens, block_size as usize)
-        } else {
-            compute_block_hashes(tokens, block_size as usize)
         };
         let query_blocks = hashes.len();
         if query_blocks == 0 {
             return Ok(None);
         }
         match index.match_prefix(hashes).await {
-            Ok(outcome) => Ok(Some(Arc::new(ExternalPrefixSignal {
+            Ok(outcome) => Ok(Some(Arc::new(PrefixLookupResult {
                 outcome,
                 query_blocks,
                 block_hashes: None,
@@ -105,7 +108,7 @@ impl fmt::Debug for PrefixMemo {
 
 impl PrefixMemo {
     /// The local tree's answer, once a policy has looked it up.
-    pub fn local_signal(&self) -> Option<Arc<ExternalPrefixSignal>> {
+    pub fn local_signal(&self) -> Option<Arc<PrefixLookupResult>> {
         let cells = self.cells.lock().unwrap_or_else(|e| e.into_inner());
         cells
             .iter()
@@ -133,11 +136,38 @@ struct Candidate<'a> {
 }
 
 /// Less uncached work first, then lower prefill pressure, then worker id.
-fn rank(loads: &FreshLoadLookup<'_>, left: &Candidate<'_>, right: &Candidate<'_>) -> Ordering {
+fn rank(loads: &CandidateLoads<'_>, left: &Candidate<'_>, right: &Candidate<'_>) -> Ordering {
     left.uncached_tokens
         .cmp(&right.uncached_tokens)
-        .then_with(|| loads.compare_prefill_pressure(left.engine, right.engine))
+        .then_with(|| loads.compare_prefill_engines(left.engine, right.engine))
         .then_with(|| left.engine.id.0.cmp(&right.engine.id.0))
+}
+
+/// Each prefix holder's uncached share of `input`, by URL, before hit thresholds.
+fn uncached_by_url(signal: Option<&PrefixLookupResult>, input: u64) -> HashMap<&str, u64> {
+    let Some(PrefixLookupResult {
+        outcome: PrefixOutcome::Matched { matches, .. },
+        query_blocks,
+        ..
+    }) = signal.filter(|signal| signal.query_blocks > 0)
+    else {
+        return HashMap::new();
+    };
+    let query_blocks = *query_blocks as u64;
+    let mut depths = HashMap::<&str, u64>::new();
+    for entry in matches {
+        let depth = depths.entry(entry.address.as_str()).or_default();
+        *depth = (*depth).max(u64::from(entry.matched_prefix_blocks));
+    }
+    depths
+        .into_iter()
+        .map(|(url, blocks)| {
+            (
+                url,
+                input - input.saturating_mul(blocks.min(query_blocks)) / query_blocks,
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -146,7 +176,7 @@ pub struct CacheAwarePolicy {
     engine_load: Arc<EngineReportedLoadTable>,
     config: AffinityConfig,
     pub admission: Arc<dyn EngineAdmission>,
-    /// This policy checks admission on the fallback's pick.
+    /// Picks among the engines this policy's admission accepts.
     pub fallback: Arc<dyn Policy>,
 }
 
@@ -185,39 +215,24 @@ impl CacheAwarePolicy {
         &self,
         engines: &'e [Arc<Worker>],
         request: &PickRequest<'_>,
-        signal: Option<&ExternalPrefixSignal>,
+        uncached: &HashMap<&str, u64>,
         load: &EngineReportedLoadSnapshot,
     ) -> Vec<Candidate<'e>> {
-        let Some(ExternalPrefixSignal {
-            outcome: PrefixOutcome::Matched { matches, .. },
-            query_blocks,
-            ..
-        }) = signal.filter(|signal| signal.query_blocks > 0)
-        else {
-            return Vec::new();
-        };
-        let query_blocks = *query_blocks as u64;
-        let mut depths = HashMap::<&str, u64>::new();
-        for entry in matches {
-            let depth = depths.entry(entry.address.as_str()).or_default();
-            *depth = (*depth).max(u64::from(entry.matched_prefix_blocks));
-        }
         let config = &self.config;
         let input = request.input_tokens;
         let mut candidates: Vec<_> = engines
             .iter()
             .filter_map(|engine| {
-                let blocks = depths.get(engine.url.as_str())?.min(&query_blocks);
-                let matched = input.saturating_mul(*blocks) / query_blocks;
+                let uncached_tokens = *uncached.get(engine.url.as_str())?;
+                let matched = input - uncached_tokens;
                 let ratio = matched as f64 / input.max(1) as f64;
-                let hit = *blocks > 0
+                let hit = matched > 0
                     && config
                         .cache_affinity_min_matched_tokens
                         .is_none_or(|min| matched >= min)
                     && config
                         .cache_affinity_min_match_ratio
                         .is_none_or(|min| ratio >= min);
-                let uncached_tokens = input - matched;
                 hit.then_some(Candidate {
                     engine,
                     uncached_tokens,
@@ -229,7 +244,7 @@ impl CacheAwarePolicy {
             .len()
             .min(config.cache_candidate_max_workers)
             .min(config.cache_candidate_min_workers.max(proportional));
-        let loads = FreshLoadLookup::new(Some(load), candidates.iter().map(|c| c.engine));
+        let loads = CandidateLoads::new(Some(load), candidates.iter().map(|c| c.engine));
         candidates.sort_by(|left, right| rank(&loads, left, right));
         candidates.truncate(limit);
         candidates
@@ -291,7 +306,10 @@ impl Policy for CacheAwarePolicy {
                     "cache-aware selection requires a plain or prefill group".into(),
                 ));
             }
-            let lookup = || self.source.lookup(request.token_ids);
+            let lookup = || {
+                self.source
+                    .lookup(request.token_ids, request.cache_namespace)
+            };
             let signal = match request.prefix {
                 Some(memo) => memo
                     .cell(&self.source)
@@ -302,7 +320,8 @@ impl Policy for CacheAwarePolicy {
             };
             // Capture load after remote I/O; selection and admission share it.
             let load = self.engine_load.capture_snapshot(Instant::now());
-            let candidates = self.candidates(engines, request, signal.as_deref(), &load);
+            let uncached = uncached_by_url(signal.as_deref(), request.input_tokens);
+            let candidates = self.candidates(engines, request, &uncached, &load);
             let mut rejections = Vec::new();
             let admitted = self.admit(&candidates, &load, &mut rejections)?;
             let affinity = admitted.first().map(|c| Pick {
@@ -322,6 +341,10 @@ impl Policy for CacheAwarePolicy {
                 })
                 .cloned()
                 .collect();
+            // The fallback samples only engines that pass admission.
+            let (pool, pool_rejections) =
+                partition_admitted(self.admission.as_ref(), &pool, &load)?;
+            rejections.extend(pool_rejections);
             if pool.is_empty() && affinity.is_none() && !rejections.is_empty() {
                 return Err(PickError::NoAdmissibleEngine(rejections));
             }
@@ -329,9 +352,6 @@ impl Policy for CacheAwarePolicy {
                 let mut pick = self.pick_fallback(&pool, request).await?;
                 if !pool.iter().any(|e| Arc::ptr_eq(e, &pick.engine)) {
                     return Err(PickError::OutsideCandidates(pick.engine.id.clone()));
-                }
-                if let Some(rejection) = self.check(&pick.engine, &load)? {
-                    return Err(PickError::AdmissionRejected(rejection));
                 }
                 pick.reason = if affinity.is_some() {
                     "affinity_load"
@@ -341,7 +361,13 @@ impl Policy for CacheAwarePolicy {
                 Ok(pick)
             }
             .await;
-            affinity::choose(&self.config, affinity, fallback, &load)
+            // The prefix hit covers the longest prompt; the rest of the batch is uncached.
+            let uncached_tokens = |engine: &Worker| {
+                let cached = (uncached.get(engine.url.as_str()))
+                    .map_or(0, |&tokens| request.input_tokens - tokens);
+                request.total_input_tokens.saturating_sub(cached)
+            };
+            affinity::choose(&self.config, affinity, fallback, &load, uncached_tokens)
         })
     }
 

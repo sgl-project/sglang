@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -604,7 +603,6 @@ def test_hopper_indexer_backends_replay(ratio):
     from sglang.srt.layers.attention.dsv4.v41_indexer.full_topk import FullTopKIndexer
     from sglang.srt.layers.attention.dsv4.v41_indexer.types import (
         DecodeInputs,
-        Selection,
     )
 
     batch, width, capacity, topk = 12, 193, 32772, 64
@@ -617,6 +615,14 @@ def test_hopper_indexer_backends_replay(ratio):
     req_table[:, : width * ratio : ratio] = (slots[::6] * ratio).int()
     positions = (lens * ratio - 1).clamp_min(0)
     pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda layer: table)
+    # A unit page keeps the per-row table valid under the shuffled slots below.
+    page_table = torch.empty((batch, capacity), device=q.device, dtype=torch.int32)
+    page_table.copy_(req_table[req.long(), ::ratio] // ratio)
+    metadata = SimpleNamespace(
+        max_compressed_seq_len=capacity,
+        page_table=page_table,
+        compressed_page_size=1,
+    )
     indexer = SimpleNamespace(
         queries=lambda q, freqs: q, head_weights=lambda x: x, index_topk=topk
     )
@@ -628,11 +634,9 @@ def test_hopper_indexer_backends_replay(ratio):
         x=weights,
         positions=positions,
         req_rows=req,
-        paged_metadata=SimpleNamespace(max_compressed_seq_len=capacity),
+        paged_metadata=metadata,
         is_verify=True,
     )
-    inputs = DecodeInputs(q_lora=q, **common)
-    consumer_inputs = DecodeInputs(q_lora=consumer_q, **common)
     kwargs = dict(
         token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
     )
@@ -640,18 +644,22 @@ def test_hopper_indexer_backends_replay(ratio):
     candidates = DenseBlocksBackend(
         **kwargs, candidate_topk_blocks=4, candidate_block_size=8
     )
+    # DeepSelect fills a full top-k buffer of exactly live rows by topk, as at
+    # runtime; the candidate paths also clear padded rows and columns.
     outputs = [
-        Selection(
-            page_indices=torch.empty(
-                (batch + 1, topk + 8), device=q.device, dtype=torch.int32
-            ),
-            raw_indices=torch.empty(
-                (batch + 1, topk + 8), device=q.device, dtype=torch.int32
-            )
-            if ratio == 1
-            else None,
+        SimpleNamespace(
+            page_indices=torch.empty(shape, device=q.device, dtype=torch.int32),
+            raw_indices=None,
         )
-        for _ in range(3)
+        for shape in ((batch, topk), (batch + 1, topk + 8), (batch + 1, topk + 8))
+    ]
+    decode_inputs = [
+        DecodeInputs(
+            q_lora=q if i < 2 else consumer_q,
+            out_page_indices=out.page_indices,
+            **common,
+        )
+        for i, out in enumerate(outputs)
     ]
     captured_scores = []
     captured_masks = []
@@ -663,9 +671,9 @@ def test_hopper_indexer_backends_replay(ratio):
         return result
 
     def run():
-        full.topk_decode(inputs, outputs[0])
-        published = candidates.publish_decode(inputs, outputs[1])
-        candidates.consume_decode(consumer_inputs, published, outputs[2])
+        full.topk_decode(decode_inputs[0])
+        published = candidates.publish_decode(decode_inputs[1])
+        candidates.consume_decode(decode_inputs[2], published)
         return published
 
     for _ in range(3):
@@ -686,6 +694,7 @@ def test_hopper_indexer_backends_replay(ratio):
         positions.copy_(lens * ratio - 1)
         req.copy_(req.roll(1))
         req_table[:, : width * ratio : ratio] = (slots[::6].roll(step, 1) * ratio).int()
+        page_table.copy_(req_table[req.long(), ::ratio] // ratio)
         q.neg_()
         for scores in captured_scores:
             scores.fill_(torch.inf)
@@ -741,7 +750,7 @@ def test_hopper_indexer_backends_replay(ratio):
                     expected_raw = torch.full_like(out.raw_indices[row], -1)
                     expected_raw[:count] = selected.sort().values.int()
                     torch.testing.assert_close(out.raw_indices[row], expected_raw)
-        for out in outputs:
+        for out in outputs[1:]:
             assert (out.page_indices[batch] == -1).all().item()
             if out.raw_indices is not None:
                 assert (out.raw_indices[batch] == -1).all().item()
@@ -750,8 +759,8 @@ def test_hopper_indexer_backends_replay(ratio):
 @pytest.mark.parametrize("rows", [0, 1, 32, 129])
 @pytest.mark.parametrize("topk", [0, 1, 65, 512])
 @pytest.mark.parametrize("write_raw", [False, True])
-def test_flat_indexer_selection_replay(rows, topk, write_raw):
-    from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+def test_flat_indexer_finalization_replay(rows, topk, write_raw):
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import finish_flat_indexer_topk
 
     torch.manual_seed(81 + rows + topk)
     indices = torch.randint(
@@ -762,22 +771,8 @@ def test_flat_indexer_selection_replay(rows, topk, write_raw):
     pages = torch.full((rows + 1, topk + 8), 12345, device="cuda", dtype=torch.int32)
     raw = torch.full_like(pages, 12345) if write_raw else None
 
-    data = SimpleNamespace(k_slots=slots, request_starts=starts)
-    selection = SimpleNamespace(page_indices=pages, raw_indices=raw)
-
     def run():
-        # Use real platform dispatch on Blackwell; also check integer
-        # finalization on other CUDA GPUs through the SM100 runtime entry.
-        platform = scoring.get_platform()
-        context = (
-            nullcontext()
-            if platform.is_sm100
-            else patch.object(
-                scoring, "get_platform", return_value=SimpleNamespace(is_sm100=True)
-            )
-        )
-        with context:
-            scoring.DeepGEMMPrefillData.write_selection(data, indices, selection)
+        finish_flat_indexer_topk(indices, slots, starts, pages, raw)
 
     for _ in range(3):
         run()

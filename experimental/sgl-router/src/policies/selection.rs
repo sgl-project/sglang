@@ -36,9 +36,10 @@ use crate::policies::decode::{
     build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
 };
 use crate::policies::{
-    ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
+    Policy, PrefillProposal, PrefixLookupResult, ProposalKind, SelectionContext,
 };
 use crate::server::metrics::{CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason};
+use crate::state::kv_events::CacheNamespace;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
@@ -59,7 +60,8 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     /// `request_input_tokens` only for a batch.
     pub request_sequence_tokens: u64,
     pub request_tokens: Option<&'a [u32]>,
-    pub external_prefix: Option<&'a ExternalPrefixSignal>,
+    pub cache_namespace: &'a CacheNamespace,
+    pub external_prefix: Option<&'a PrefixLookupResult>,
     /// Required whenever `policy.uses_shared_prefill_admission()`; the
     /// per-domain rung panics without it. `Policy::needs_load_snapshot`
     /// defaults to `uses_shared_prefill_admission`, which is what keeps the
@@ -275,6 +277,7 @@ impl<'a> Selector<'a> {
             .with_candidate_range_id(candidate_range_id)
             .with_input_tokens(inputs.request_input_tokens)
             .with_request_tokens(inputs.request_tokens)
+            .with_cache_namespace(inputs.cache_namespace)
             .with_external_prefix(inputs.external_prefix)
     }
 
@@ -707,7 +710,7 @@ mod tests {
     use crate::policies::buckets::BucketSelector;
     use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-    use crate::policies::{ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal};
+    use crate::policies::{Policy, PrefixLookupResult, ProposalKind, SelectionProposal};
     use crate::server::metrics::{
         CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,
     };
@@ -785,8 +788,8 @@ mod tests {
     }
 
     /// An indexer hit placing `matched_prefix_blocks` on each named worker.
-    fn prefix_signal(matches: &[(&Arc<Worker>, u32)], query_blocks: usize) -> ExternalPrefixSignal {
-        ExternalPrefixSignal {
+    fn prefix_signal(matches: &[(&Arc<Worker>, u32)], query_blocks: usize) -> PrefixLookupResult {
+        PrefixLookupResult {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: matches
                     .iter()
@@ -836,6 +839,7 @@ mod tests {
             request_input_tokens,
             request_sequence_tokens: request_input_tokens,
             request_tokens: None,
+            cache_namespace: crate::state::kv_events::CacheNamespace::NONE,
             external_prefix: None,
             load_snapshot,
             workers,

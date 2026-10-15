@@ -431,6 +431,7 @@ class ScaledActivation(nn.Module):
         self.act = act_module
         self.input_is_parallel = input_is_parallel
         if input_is_parallel:
+            self.tp_rank = get_parallel().tp_rank
             tp_size = get_parallel().tp_size
             intermediate_size_per_partition = divide(intermediate_size, tp_size)
         else:
@@ -448,9 +449,8 @@ class ScaledActivation(nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if self.input_is_parallel:
-            tp_rank = get_parallel().tp_rank
             shard_size = param_data.shape[0]
-            start_idx = tp_rank * shard_size
+            start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)

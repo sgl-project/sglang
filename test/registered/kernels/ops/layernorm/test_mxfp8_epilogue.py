@@ -25,7 +25,9 @@ HIDDEN = 5120
 STREAMS = 4
 
 
-@pytest.mark.parametrize("m", [1, 2, 5, 6, 8])
+# 9-128 pins the single-tile scale-swizzle bound hc_combine_norm_mxfp8 was
+# widened to; 128 is the last row the swizzle addresses without a block offset.
+@pytest.mark.parametrize("m", [1, 2, 5, 6, 8, 9, 17, 33, 96, 127, 128])
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 1e3])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_bitwise_identical_to_norm_then_quantize(m: int, scale: float, backend: str):

@@ -52,6 +52,19 @@ def test_fast_loading_cannot_hide_inference_regression(validator):
         validator.validate_e2e(summary)
 
 
+def test_load_tolerance_widens_only_the_load_check(validator):
+    """A profile's load tolerance widens the load check alone; without one, load
+    stays on the E2E tolerance."""
+    summary = PerformanceSummary(1300, 0, 0, {}, [], {}, {}, load_time_ms=5500)
+    with pytest.raises(AssertionError, match="Load Latency"):
+        validator.validate_load(summary)
+
+    validator.tolerances = ToleranceConfig(0.25, 0, 0, 0, 0, load=0.4)
+    validator.validate_load(summary)
+    with pytest.raises(AssertionError, match="E2E Latency"):
+        validator.validate_e2e(summary)
+
+
 @pytest.mark.parametrize("load_time_ms", [None, 0, float("nan"), 1234.5])
 def test_baseline_script_preserves_required_load_measurement(monkeypatch, load_time_ms):
     case = DiffusionTestCase(
