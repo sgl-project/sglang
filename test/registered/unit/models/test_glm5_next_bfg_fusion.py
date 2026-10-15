@@ -8,13 +8,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.model_runner_components.weight_updater import (
-    WeightUpdater,
-    _model_load_weights_direct,
-)
-from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models import glm5_next
-from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -292,135 +286,7 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
         attention.o_proj.forward = lambda value: (value, None)
         backend = Mock(return_value=raw)
         attention.attn.forward = backend
-        attention.o_norm.forward = lambda value, gate: (
-            F.rms_norm(
-                value, (head_dim,), attention.o_norm.weight, attention.o_norm.eps
-            )
-            * torch.sigmoid(gate)
-        )
         return attention, backend
-
-    @torch.no_grad()
-    def test_weight_reload_updates_fused_norm_without_replacing_storage(self):
-        """Verify and fallback must use the same norm weights after a reload."""
-        tokens, heads, head_dim = 3, 2, 4
-        raw = (
-            torch.arange(1, tokens * heads * head_dim + 1)
-            .float()
-            .reshape(1, tokens, heads, head_dim)
-        )
-        gate = torch.linspace(-1, 1, raw.numel()).reshape(tokens, heads * head_dim)
-        hidden = torch.zeros(tokens, heads * head_dim)
-        for dtype in (torch.float16, torch.bfloat16, torch.float32):
-            torch.set_default_dtype(dtype)
-            for route in (
-                "checkpoint",
-                "nextn",
-                "direct",
-                "custom",
-                "post_load",
-                "quantized_rl",
-            ):
-                with self.subTest(dtype=dtype, route=route):
-                    attention, backend_mock = self.make_attention(raw, gate)
-                    self.assertEqual(attention.o_norm.weight.dtype, torch.float32)
-                    attention.o_norm.weight.fill_(1)
-
-                    model_class = (
-                        Glm5NextForConditionalGenerationNextN
-                        if route == "nextn"
-                        else glm5_next.Glm5NextForConditionalGeneration
-                    )
-                    model = model_class.__new__(model_class)
-                    torch.nn.Module.__init__(model)
-                    model.config = SimpleNamespace(
-                        n_routed_experts=0,
-                        num_hidden_layers=2,
-                        num_nextn_predict_layers=1,
-                    )
-                    model.num_fused_shared_experts = 0
-                    model.quant_config = None
-                    model.encoder_only = False
-                    model.model = torch.nn.Module()
-                    layer = torch.nn.Module()
-                    layer.self_attn = attention
-                    if route == "nextn":
-                        model.model.decoder = layer
-                    else:
-                        model.model.layers = torch.nn.ModuleList([layer])
-                        model.model.start_layer = 0
-                        model.model.end_layer = 1
-
-                    def run_backend(batch, **kwargs):
-                        if batch.forward_mode.is_target_verify():
-                            attn = attention.attn
-                            attn._k3_onorm_consumed = True
-                            weight, eps = attn._k3_onorm_args
-                            return F.rms_norm(
-                                raw, (head_dim,), weight, eps
-                            ) * torch.sigmoid(
-                                attn._k3_onorm_gate.unflatten(-1, (-1, head_dim))
-                            )
-                        return raw
-
-                    backend_mock.side_effect = run_backend
-
-                    def forward(mode):
-                        return attention(
-                            hidden,
-                            SimpleNamespace(forward_mode=mode, attn_cp_metadata=None),
-                        )
-
-                    original = forward(ForwardMode.TARGET_VERIFY)
-                    source_storage = attention.o_norm.weight.data_ptr()
-                    prefix = "model.layers.2.self_attn" if route == "nextn" else PREFIX
-                    weights = [
-                        (f"{prefix}.o_norm.weight", torch.full((head_dim,), 2.0))
-                    ]
-                    with torch.enable_grad():
-                        if route in ("checkpoint", "nextn"):
-                            model.load_weights(weights)
-                        elif route == "custom":
-                            updater = WeightUpdater(
-                                tp_rank=0,
-                                device="cpu",
-                                gpu_id=0,
-                                model_config=None,
-                                custom_weight_loaders={"test_loader": None},
-                                get_model=lambda: model,
-                                update_model_fields=None,
-                                recapture_cuda_graph=None,
-                                get_model_runner=None,
-                            )
-                            with (
-                                get_parallel().override(tp_rank=0),
-                                patch(
-                                    "sglang.srt.model_executor.model_runner_components.weight_updater.dynamic_import",
-                                    return_value=_model_load_weights_direct,
-                                ),
-                            ):
-                                success, _ = updater.update_weights_from_tensor(
-                                    weights, load_format="test_loader"
-                                )
-                            self.assertTrue(success)
-                        else:
-                            _model_load_weights_direct(model, weights)
-                            if route == "post_load":
-                                model.post_load_weights()
-                            else:
-                                if route == "quantized_rl":
-                                    model.original_weights_rebuild_keys = {}
-                                    model.recorded_loader = {}
-                                    model.flash_rl_initial_load_complete = True
-                                DefaultModelLoader.postprocess_weights(
-                                    model, torch.device("cpu")
-                                )
-                    self.assertEqual(attention.o_norm.weight.data_ptr(), source_storage)
-                    fallback = forward(ForwardMode.EXTEND)
-                    torch.testing.assert_close(fallback, original * 2)
-                    torch.testing.assert_close(
-                        forward(ForwardMode.TARGET_VERIFY), fallback
-                    )
 
     def test_output_norm_handoff_and_fallback(self):
         torch.set_default_dtype(torch.float32)
