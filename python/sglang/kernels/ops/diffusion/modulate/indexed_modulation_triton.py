@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
+from sglang.kernels.numerics import round_bf16_to_fp32
 
 # Column tiles per row. One program per whole row padded to a power of two
 # masked off 37.5% of MiniMax-H3's 5376-wide rows; 2048-wide tiles run both

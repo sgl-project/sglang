@@ -18,6 +18,7 @@
 """Inference-only NemotronH model."""
 
 from collections.abc import Iterable
+from functools import partial
 
 import torch
 from torch import nn
@@ -77,7 +78,7 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
-from sglang.srt.models.nemotron_h_utils import make_stage_boundary
+from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
@@ -690,6 +691,7 @@ class NemotronHModel(nn.Module):
             len(config.hybrid_override_pattern),
             get_layer,
             prefix=f"{prefix}.layers",
+            stage_facts=partial(stage_facts, config.hybrid_override_pattern),
         )
         if self.pp_group.is_last_rank:
             self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -733,9 +735,7 @@ class NemotronHModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(
-                hidden_states, forward_batch, preserve_declared=True
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if self.end_layer in self.layers_to_capture:
             aux_hidden_states.append(

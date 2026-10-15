@@ -90,7 +90,7 @@ def main() -> int:
     }
     save_file(fused, str(d / "pdd_fused_heads.safetensors"), metadata={"format": "pt"})
     cfg["fused_steps"] = n // block
-    cfg["num_inference_steps"] = n // block + 1  # H3 counts steps as sigma grid points
+    cfg["num_inference_steps"] = n // block
     cfg["video_shift"], cfg["audio_shift"] = args.video_shift, args.audio_shift
     (d / "pdd_config.json").write_text(json.dumps(cfg, indent=2) + "\n")
 

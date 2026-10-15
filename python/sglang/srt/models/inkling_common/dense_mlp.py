@@ -120,6 +120,8 @@ class InklingDenseMLP(LlamaMLP):
         fused = fused and not lora_compatible_layout_enabled()
         self.layer_id = layer_id
         self.act_fn = InklingSwiglu(interleaved=fused)
+        # DualGemm assumes [gate||up] and SiluAndMul; it would bypass act_fn.
+        self.dual_gemm.mode = None
         self.scattered_sconv = get_exec().comm.enable_scattered_sconv
 
     def forward(
