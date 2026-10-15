@@ -41,8 +41,9 @@ class RequestList:
     waiting: bool = False
     # - with ignore_releasing, all of them.
     releasing: bool = False
-    # The members may own a KV row (`req.kv.holds_kv`): the load leaves their
-    # tokens out of its pending tokens, as the pool counts them as used.
+    # The members may own a KV row (`req.kv.holds_kv`): the busy memory check
+    # counts their private KV, and the load leaves their tokens out of its
+    # pending tokens, as the pool counts them as used.
     holds_kv: bool = False
     # The members' adapters stay in use: LoRA admission fits a new adapter
     # beside them.

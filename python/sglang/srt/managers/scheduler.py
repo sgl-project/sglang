@@ -474,8 +474,6 @@ class Scheduler:
         self.init_step_builder()
         self.init_dp_attn_adapter()
         self.init_pool_stats_observer()
-        self.init_invariant_checker()
-        self.init_watchdog_diagnostics()
         self.init_kv_events_publisher()
         self.init_load_publisher()
         self.init_services()
@@ -483,6 +481,8 @@ class Scheduler:
         self.init_request_retirer()
         self.init_batch_result_processor()
         self.init_request_registry()
+        self.init_invariant_checker()
+        self.init_watchdog_diagnostics()
         self.maybe_init_dllm()
         self.maybe_init_disagg_prefill()
         self.maybe_init_disagg_decode()
@@ -2194,7 +2194,7 @@ class Scheduler:
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
             counters=self.counters,
-            core_lists=self.lists,
+            request_registry=self.request_registry,
             pending=self.pending,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )

@@ -57,7 +57,7 @@ _DECLARED = {
         "PoolStatsObserver",
         "KvResources",
         "KvCapacity",
-        "CoreLists",
+        "RequestRegistry",
         "PendingSteps",
         "LaunchCounters",
         "StageMetrics",

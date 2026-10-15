@@ -175,17 +175,6 @@ _DIRECT_READS = {
         "_DisaggPrefillRing.is_drained",
         "DisaggPrefill.transfer",
     ): 1,
-    # The busy memory check's KV row owners.
-    (
-        "managers/scheduler_components/invariant_checker.py",
-        "SchedulerInvariantChecker._requests_owning_rows",
-        "CoreLists.chunked_req",
-    ): 1,
-    (
-        "managers/scheduler_components/invariant_checker.py",
-        "SchedulerInvariantChecker._requests_owning_rows",
-        "CoreLists.decoding",
-    ): 1,
     # The status logger's queued requests.
     (
         "managers/scheduler_components/metrics_reporter.py",

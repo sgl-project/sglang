@@ -8,7 +8,6 @@ import torch
 from sglang.srt.layers.attention.minicpm.cache import (
     attach_compressed_cache,
 )
-from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -25,6 +24,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_registry
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -198,7 +198,7 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
         req_to_token_pool=pool,
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         counters=LaunchCounters(),
-        core_lists=CoreLists(),
+        request_registry=make_request_registry(),
         pending=PendingSteps(),
         scheduler_stage_metrics=None,
     )
@@ -290,7 +290,7 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
             session_held_mamba_slots=lambda: 0,
         ),
         counters=LaunchCounters(),
-        core_lists=CoreLists(),
+        request_registry=make_request_registry(),
         pending=PendingSteps(),
         scheduler_stage_metrics=None,
     )
