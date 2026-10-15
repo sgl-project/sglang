@@ -46,7 +46,7 @@ class Contribution(msgspec.Struct):
     """
 
     value: Optional[torch.Tensor]
-    update: ResidualUpdate
+    update: Optional[ResidualUpdate]
     owed: Union[UnreducedOutput, DeclaredSum, DeferredFinalize, None] = None
 
     def for_boundary(self):
@@ -66,9 +66,10 @@ class Contribution(msgspec.Struct):
         return value
 
     def release(self):
-        """Drop the tensors of a contribution its consumer has taken."""
+        """Drop a consumed contribution and its per-invocation update state."""
         self.value = None
         self.owed = None
+        self.update = None
 
 
 class OwedOutput(msgspec.Struct, frozen=True):
@@ -134,7 +135,8 @@ class ResidualStream:
         Args:
             output: Complete tensor, UnreducedOutput, or producer-specific DeferredFinalize.
             update: Producer operation that the next boundary must apply.
-            declared_sum: SumGroup statically owed by a raw tensor, or None. Cannot
+            declared_sum: The producer's outstanding sum contract,
+                statically owed by a raw tensor; None when complete. Cannot
                 be combined with another output wrapper's completion contract.
 
         Returns:
@@ -146,13 +148,23 @@ class ResidualStream:
         if declared_sum is not None:
             if not isinstance(output, torch.Tensor):
                 raise RuntimeError("a declared sum cannot carry another completion")
-            contribution = Contribution(output, update, DeclaredSum(declared_sum))
+            owed = (
+                declared_sum
+                if isinstance(declared_sum, DeclaredSum)
+                else DeclaredSum(declared_sum)
+            )
+            contribution = Contribution(output, update, owed)
         elif isinstance(output, UnreducedOutput):
             contribution = Contribution(output.partial, update, output)
         elif isinstance(output, DeferredFinalize):
             contribution = Contribution(None, update, output)
         else:
             contribution = Contribution(output, update)
+        bind = update.bind
+        if bind is not None:
+            raise RuntimeError(
+                "bind an invocation update at the stage before recording it"
+            )
         self.pending = contribution
         return OwedOutput(contribution) if contribution.owed is not None else output
 

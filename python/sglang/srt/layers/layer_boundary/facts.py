@@ -28,6 +28,8 @@ import msgspec
 class UpdateFacts(msgspec.Struct, frozen=True):
     """The capabilities a ResidualUpdate declares (see ResidualUpdate)."""
 
+    bind = None
+
     is_plain_add: bool
     applied_at_exit: bool
     outlives_layer: bool
@@ -51,6 +53,8 @@ class ReadFacts(msgspec.Struct, frozen=True):
     """The capabilities a ResidualReadout declares (see ResidualReadout).
     Binding takes kernels only from the reads of the stages it binds, never
     from a stage recorded by its facts, so these supply none."""
+
+    bind = None
 
     is_plain_norm: bool
     reads_before_dp_gather: bool

@@ -46,6 +46,7 @@ from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import (
     ResidualReadout,
     ResidualUpdate,
+    takes_pending_update,
 )
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
@@ -137,6 +138,7 @@ def _resolve_ffn(
     update=PLAIN_ADD,
     dense_tp_size=None,
     output_complete=False,
+    terminal_accepts_update=False,
 ):
     parallel = get_parallel()
     if dense_tp_size not in (None, 1, parallel.attn_tp_size, parallel.tp_size):
@@ -244,7 +246,7 @@ def _resolve_ffn(
             rows,
             group=group,
             may_defer_to_next=may_leave
-            and not terminal
+            and (not terminal or terminal_accepts_update)
             and not update.applied_at_exit
             and update.outlives_layer
             and output_transform is None,
@@ -372,7 +374,9 @@ def _require(protocol, implementation, facts):
 
 
 def _check_update(update):
-    _require("ResidualUpdate", update, _UPDATE_FACTS)
+    _require("ResidualUpdate", update, _UPDATE_FACTS + ("bind",))
+    if update.bind is not None and not callable(update.bind):
+        raise TypeError("ResidualUpdate.bind must be callable or None")
     name = type(update).__name__
     if update.writes_stream and (update.is_plain_add or not update.applied_at_exit):
         raise ValueError(
@@ -386,7 +390,9 @@ def _check_update(update):
 
 
 def _check_read(read):
-    _require("ResidualReadout", read, _READ_FACTS + _READ_KERNELS)
+    _require("ResidualReadout", read, _READ_FACTS + _READ_KERNELS + ("bind",))
+    if read.bind is not None and not callable(read.bind):
+        raise TypeError("ResidualReadout.bind must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -576,7 +582,7 @@ def _stack_arrival(variant):
     )
 
 
-def _resolve_stage(stage, variant, arrival, following=None):
+def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     """``stage``'s data flow for ``variant``, given what arrives at its entry
     and the stage after it (None when it ends the stack or a branch)."""
     axes, attention, local, full = _row_layouts(variant)
@@ -591,6 +597,8 @@ def _resolve_stage(stage, variant, arrival, following=None):
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
             output_complete=stage.output_complete,
+            terminal_accepts_update=stage.terminal
+            and takes_pending_update(final_read, stage.update),
         )
         exit_rows = resolve_exit_rows(stage.exit_rows)
         if exit_rows is ExitRows.ATTENTION or (
@@ -745,7 +753,9 @@ def _exit_edge(stage, flow, entry):
     )
 
 
-def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
+def _connect_line(
+    line, origins, *, before=None, after=None, arrivals=None, final_read=None
+):
     """The connections along a chain of stages, each resolved once per batch
     variant: into ``line[0]``, between each two, and out of ``line[-1]`` to
     ``after`` (a stage on the next rank, or None at the end of the stack or a
@@ -754,12 +764,33 @@ def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
     rank's own entry is taken as the stack input's. An error resolving a stage
     names the append at ``origins[i]`` that declared ``line[i]``, or the one
     next to the neighbouring rank's stage."""
-    variants = tuple(_active_variants())
+    # The global dense-TP default may be overridden by every FFN declaration.
+    # Odd row counts need a separate path only when some connected FFN would
+    # otherwise slice them over attention TP. Keep neighbours in this decision:
+    # their row choices still determine what crosses the pipeline boundary.
+    needs_unpadded = any(
+        stage is not None
+        and stage.kind is StageKind.FFN
+        and _ffn_on_rank_rows(stage.sparse, stage.dense_tp_size)
+        for stage in (before, *line, after)
+    )
+    variants = tuple(
+        variant
+        for variant in _active_variants()
+        if variant is not BatchVariant.UNPADDED or needs_unpadded
+    )
 
     def resolve(position, stage, arrivals, following=None):
         try:
             return {
-                v: _resolve_stage(stage, v, arrivals[v], following) for v in variants
+                v: _resolve_stage(
+                    stage,
+                    v,
+                    arrivals[v],
+                    following,
+                    final_read=final_read if stage.terminal else None,
+                )
+                for v in variants
             }
         except Exception as error:
             _note_origin(error, origins[position])
@@ -1072,6 +1103,7 @@ def _bind_stack(appends, *, previous, following, final_read=None):
         [append.origin for append, _ in stages],
         before=chained[0].previous,
         after=following,
+        final_read=final_read if following is None else None,
     )
     _bind_line(
         stages,
@@ -1145,6 +1177,8 @@ def _bind_line(stages, chained, connections, bound, sources, *, final_read=None)
                 connections[position],
                 connections[position + 1],
                 final_read=final_read if position == last else None,
+                pipeline_handoff=position == last
+                and connections[position + 1].consumer is not None,
                 capture_preserves_residual=(
                     _preserves_residual(boundaries[position + 1])
                     if consumer is not None
