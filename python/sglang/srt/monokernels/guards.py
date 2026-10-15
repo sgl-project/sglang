@@ -3,7 +3,7 @@
 
 ``handle_monokernel(server_args)``, the config hook, finds the spec, refuses an
 unsupported setup with every reason, and sets the decode capture sizes; it is a
-no-op while ``--enable-monokernel`` is off. ``runtime`` refuses again after load,
+no-op without ``--monokernel-backend``. ``runtime`` refuses again after load,
 with the loaded weights. The deadline of every wait is set here too: half of
 ``--watchdog-timeout``, and one under ``MIN_DEADLINE_S`` is refused.
 """
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # one in SGLang fails a CPU test that names this file, not a server's startup.
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
-        "enable_monokernel",
+        "monokernel_backend",
         "cuda_graph_config",
         "watchdog_timeout",
         "speculative_algorithm",
@@ -151,7 +151,9 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
     if isa is None:
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
-    spec, why = find_spec(architectures=hf_config.architectures, isa=isa)
+    spec, why = find_spec(
+        backend=cfg.monokernel_backend, architectures=hf_config.architectures, isa=isa
+    )
     if spec is None:
         return None, [why]
     req = spec.requires
@@ -210,7 +212,8 @@ def handle_monokernel(server_args) -> None:
     )
 
     cfg = resolving_view(server_args)
-    if not cfg.enable_monokernel:
+    backend = cfg.monokernel_backend
+    if backend is None:
         return
     from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 
@@ -220,7 +223,8 @@ def handle_monokernel(server_args) -> None:
     )
     if reasons:
         raise ValueError(
-            "--enable-monokernel cannot run this setup:\n  - " + "\n  - ".join(reasons)
+            f"--monokernel-backend {backend} cannot run this setup:\n  - "
+            + "\n  - ".join(reasons)
         )
     tokens = (
         int(cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
@@ -237,7 +241,8 @@ def handle_monokernel(server_args) -> None:
             cuda_graph_config=with_phase(graph, Phase.DECODE, bs=new, max_bs=max(new)),
         )
     logger.info(
-        "--enable-monokernel: %s on %s, widths %s (%d tokens a request)",
+        "--monokernel-backend %s: %s on %s, widths %s (%d tokens a request)",
+        backend,
         spec.name,
         isa,
         list(spec.widths(isa)),

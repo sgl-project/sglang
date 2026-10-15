@@ -5,8 +5,9 @@ refuse a setup before any process starts.
 
 Specs live in vendor packages (e.g. sgl-amd-mono), which SGLang loads as general
 plugins (the ``sglang.srt.plugins`` entry points, in every process): the plugin
-calls ``register(architecture, "module:attribute")`` for each spec, and the spec
-module is imported only when a server asks for it. A spec states the
+registers its backend's spec for each architecture, as a "module:attribute" path,
+and ``--monokernel-backend`` names the backend a server runs. A spec module is
+imported only when a server asks for it. A spec states the
 ``API_VERSION`` it was written against; any other version is refused at startup."""
 
 from __future__ import annotations
@@ -139,40 +140,53 @@ class MonoSpec(msgspec.Struct, frozen=True):
         return self.devices[isa].widths
 
 
-# HF architecture -> the "module:attribute" paths of its registered specs
-_REGISTRY: dict[str, tuple[str, ...]] = {}
+# backend name -> HF architecture -> the "module:attribute" path of its spec
+_REGISTRY: dict[str, dict[str, str]] = {}
 
 
-def register(architecture: str, path: str) -> None:
-    """Register the spec at ``path`` ("module:attribute") for an HF architecture;
-    a plugin calls it from its ``sglang.srt.plugins`` entry point."""
-    if path not in _REGISTRY.get(architecture, ()):
-        _REGISTRY[architecture] = _REGISTRY.get(architecture, ()) + (path,)
+def register(*, backend: str, architecture: str, path: str) -> None:
+    """Register ``backend``'s spec for an HF architecture at ``path``
+    ("module:attribute"); a plugin calls it from its ``sglang.srt.plugins`` entry
+    point, which runs in every process."""
+    specs = _REGISTRY.setdefault(backend, {})
+    if specs.get(architecture, path) != path:
+        raise ValueError(
+            f"monokernel backend {backend!r} already has a spec for {architecture}: "
+            f"{specs[architecture]}"
+        )
+    specs[architecture] = path
 
 
-def find_spec(*, architectures, isa: Optional[str]):
-    """(the spec for ``architectures`` on ``isa``, "") or (None, why there is none).
-    A spec that fails to import or states another API version is a reason too."""
+def find_spec(*, backend: str, architectures, isa: Optional[str]):
+    """(``backend``'s spec for ``architectures`` on ``isa``, "") or (None, why there
+    is none). A spec that fails to import or states another API version is a
+    reason too."""
+    if backend not in _REGISTRY:
+        return None, (
+            f"no monokernel backend {backend!r} is registered (registered: "
+            f"{sorted(_REGISTRY)}); install the plugin that provides it"
+        )
     why = []
     for arch in architectures or ():
-        for path in _REGISTRY.get(arch, ()):
-            module, _, attr = path.partition(":")
-            try:
-                spec = getattr(importlib.import_module(module), attr)
-            except Exception as e:
-                why.append(f"{path} does not import: {type(e).__name__}: {e}")
-                continue
-            if not isinstance(spec, MonoSpec):
-                why.append(f"{path} is not a MonoSpec")
-            elif spec.api != API_VERSION:
-                why.append(
-                    f"{path} is written for monokernel API {spec.api}, this SGLang "
-                    f"has {API_VERSION}"
-                )
-            elif isa in spec.devices:
-                return spec, ""
+        path = _REGISTRY[backend].get(arch)
+        if path is None:
+            continue
+        module, _, attr = path.partition(":")
+        try:
+            spec = getattr(importlib.import_module(module), attr)
+        except Exception as e:
+            why.append(f"{path} does not import: {type(e).__name__}: {e}")
+            continue
+        if not isinstance(spec, MonoSpec):
+            why.append(f"{path} is not a MonoSpec")
+        elif spec.api != API_VERSION:
+            why.append(
+                f"{path} is written for monokernel API {spec.api}, this SGLang "
+                f"has {API_VERSION}"
+            )
+        elif isa in spec.devices:
+            return spec, ""
     archs = list(architectures or ())
     return None, "; ".join(why) or (
-        f"no monokernel spec for {archs} on {isa}: install a plugin that registers "
-        "one (e.g. sgl-amd-mono)"
+        f"monokernel backend {backend!r} has no spec for {archs} on {isa}"
     )

@@ -4,6 +4,7 @@ the wait deadlines."""
 
 import inspect
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -35,6 +36,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, stage="base-a", runner_config="cpu")
 
 ARCH = "FakeMonoForCausalLM"
+BACKEND = "fake"
 WIDTHS = (1, 2, 4, 6, 12)
 
 
@@ -81,9 +83,13 @@ OLD_SPEC = replace(SPEC, api=registry.API_VERSION - 1)
 
 
 def server_args(**kw):
-    return ServerArgs(
-        **{"model_path": "dummy", "tp_size": 4, "kv_cache_dtype": "fp8_e4m3", **kw}
-    )
+    defaults = {
+        "model_path": "dummy",
+        "tp_size": 4,
+        "kv_cache_dtype": "fp8_e4m3",
+        "monokernel_backend": BACKEND,
+    }
+    return ServerArgs(**{**defaults, **kw})
 
 
 def reasons_for(cfg, arch=ARCH, isa="gfx950"):
@@ -121,23 +127,47 @@ def switched():
     return lm, built
 
 
-@patch.dict(registry._REGISTRY, {ARCH: (f"{__name__}:SPEC",)})
 class TestMonokernelFramework(CustomTestCase):
+    def setUp(self):
+        registered = patch.dict(registry._REGISTRY, clear=True)
+        registered.start()
+        self.addCleanup(registered.stop)
+        registry.register(backend=BACKEND, architecture=ARCH, path=f"{__name__}:SPEC")
+
     def test_find_spec_refuses_with_a_reason(self):
-        registry.register("Broken", "no_such_module:SPEC")
-        registry.register("Old", f"{__name__}:OLD_SPEC")
-        self.assertIs(registry.find_spec(architectures=[ARCH], isa="gfx950")[0], SPEC)
+        register = partial(registry.register, backend=BACKEND)
+        register(architecture="Broken", path="no_such_module:SPEC")
+        register(architecture="Old", path=f"{__name__}:OLD_SPEC")
+        find = partial(registry.find_spec, backend=BACKEND)
+        self.assertIs(find(architectures=[ARCH], isa="gfx950")[0], SPEC)
         api = f"API {registry.API_VERSION - 1}, this SGLang has {registry.API_VERSION}"
         for archs, isa, why in (
-            ([ARCH], "gfx942", "no monokernel spec"),
-            (["Other"], "gfx950", "no monokernel spec"),
+            ([ARCH], "gfx942", "has no spec"),
+            (["Other"], "gfx950", "has no spec"),
             (["Broken"], "gfx950", "does not import: ModuleNotFoundError"),
             (["Old"], "gfx950", api),
         ):
             with self.subTest(archs=archs, isa=isa):
-                spec, reason = registry.find_spec(architectures=archs, isa=isa)
+                spec, reason = find(architectures=archs, isa=isa)
                 self.assertIsNone(spec)
                 self.assertIn(why, reason)
+        spec, reason = registry.find_spec(
+            backend="nope", architectures=[ARCH], isa="gfx950"
+        )
+        self.assertIsNone(spec)
+        self.assertIn("no monokernel backend 'nope' is registered", reason)
+        self.assertIn(repr(BACKEND), reason)  # the registered ones are listed
+
+    def test_a_backend_has_one_spec_an_architecture(self):
+        # plugins register in every process: the same spec again is a no-op, and
+        # another plugin's spec for the architecture is an error, not a silent swap
+        registry.register(backend=BACKEND, architecture=ARCH, path=f"{__name__}:SPEC")
+        with self.assertRaises(ValueError):
+            registry.register(backend=BACKEND, architecture=ARCH, path="other:SPEC")
+        self.assertIs(
+            registry.find_spec(backend=BACKEND, architectures=[ARCH], isa="gfx950")[0],
+            SPEC,
+        )
 
     def test_features_in_use_are_refused_unless_accepted(self):
         # every probe is off at SGLang's defaults: one stuck on refuses every server
@@ -233,7 +263,7 @@ class TestMonokernelFramework(CustomTestCase):
             ("layers.0.other.weight", torch.ones(16)),
         ]
         with (
-            patch.object(runtime, "enabled", return_value=True),
+            patch.object(runtime, "_backend", return_value=BACKEND),
             patch.object(runtime, "device_isa", return_value="gfx950"),
         ):
             watched = list(mono.watch_weights(model=model, weights=iter(weights)))
@@ -246,7 +276,7 @@ class TestMonokernelFramework(CustomTestCase):
             list(model.__dict__["_mono_copies"]),
             [("shared expert", "layers.0.shared.weight")],
         )
-        with patch.object(runtime, "enabled", return_value=False):
+        with patch.object(runtime, "_backend", return_value=None):
             self.assertIs(mono.watch_weights(model=model, weights=weights), weights)
 
     def test_deadlines_stay_below_the_watchdog(self):

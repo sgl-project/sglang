@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The monokernel framework in each process, after the config checks in ``guards``.
-SGLang's runtime calls it for every model; each call is a no-op while
-``--enable-monokernel`` is off, and for a model no spec covers.
+SGLang's runtime calls it for every model; each call is a no-op without
+``--monokernel-backend``, and for a model the backend has no spec for.
 
 - ``watch_weights``: the model loader's checkpoint tensors, on their way to
   ``model.load_weights``; the spec may keep a copy of a weight that loading rewrites.
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # The SGLang names this module reads (as in ``guards.SGLANG_READS``)
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
-        "enable_monokernel",
+        "monokernel_backend",
         "disable_cuda_graph",
         "disable_decode_cuda_graph",
         "cuda_graph_config",
@@ -71,13 +71,14 @@ SGLANG_READS = {
 }
 
 
-def enabled() -> bool:
+def _backend() -> Optional[str]:
+    """The ``--monokernel-backend`` this process runs, or None."""
     from sglang.srt.runtime_context import get_context, get_exec
 
     # the model loader also runs without a server's config (tools, unit tests)
     if not get_context().is_config_namespace_published("exec"):
-        return False
-    return get_exec().kernel.enable_monokernel
+        return None
+    return get_exec().kernel.monokernel_backend
 
 
 def _gather(obj) -> list:
@@ -97,9 +98,12 @@ def _gather(obj) -> list:
 def watch_weights(*, model, weights):
     """``weights`` as they are, after the spec saw each (name, tensor): the
     checkpoint's names and tensors, before the model renames or converts them."""
-    if not enabled():
+    backend = _backend()
+    if backend is None:
         return weights
-    spec, _ = find_spec(architectures=model.config.architectures, isa=device_isa())
+    spec, _ = find_spec(
+        backend=backend, architectures=model.config.architectures, isa=device_isa()
+    )
     if spec is None or spec.load_tensor is None:
         return weights
     copies = model.__dict__.setdefault("_mono_copies", {})
@@ -138,14 +142,17 @@ class Plan(msgspec.Struct, frozen=True):
 def attach(*, model, hf_config) -> None:
     """After weight load, before KV sizing: refuse with every rank's reasons, or
     build every planned width and switch the model's forward."""
-    if not enabled():
+    backend = _backend()
+    if backend is None:
         return
     import torch
 
     from sglang.srt.runtime_context import get_device
 
     isa = device_isa()
-    spec, why = find_spec(architectures=hf_config.architectures, isa=isa)
+    spec, why = find_spec(
+        backend=backend, architectures=hf_config.architectures, isa=isa
+    )
     copies = model.__dict__.pop("_mono_copies", {})
     if spec is None:
         # the config hook refused a served model without a spec; this one (e.g. a
@@ -162,7 +169,7 @@ def attach(*, model, hf_config) -> None:
     # all ranks refuse together, before any handshake
     reasons = [f"rank {r}: {x}" for r, rs in enumerate(_gather(reasons)) for x in rs]
     if reasons:
-        raise ValueError("--enable-monokernel: " + "; ".join(reasons))
+        raise ValueError(f"--monokernel-backend {backend}: " + "; ".join(reasons))
 
     if spec.tokens_per_request is not None:
         tokens = spec.tokens_per_request(model)
@@ -189,13 +196,14 @@ def attach(*, model, hf_config) -> None:
     routed = [k for k in keys if k in served] if keys else served
     if not routed:
         raise ValueError(
-            f"--enable-monokernel: {spec.name} serves none of this server's steps "
+            f"--monokernel-backend {backend}: {spec.name} serves none of this "
+            "server's steps "
             f"(widths {list(widths)}, {tokens} tokens a request)"
         )
     _switch(model=model, built=built, served=served)
     # SGLang's weight updater refuses each update: the kernels read copies and views
     model._derived_weight_cache_error = (
-        "Online weight updates are not supported with --enable-monokernel "
+        f"Online weight updates are not supported with --monokernel-backend {backend} "
         f"({spec.name})"
     )
     logger.info(
