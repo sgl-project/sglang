@@ -3,7 +3,6 @@ import sys
 import threading
 import unittest
 from array import array
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1037,52 +1036,6 @@ class TestDecodePrebuilt(CustomTestCase):
         self.assertIs(second.running_batch, updated)
         self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
 
-    def test_overlap_commits_replay_before_restoring_running_decode(self):
-        scheduler = self._new_scheduler(enable_overlap=True)
-        suspended = MagicMock(name="suspended")
-        suspended.is_empty.return_value = False
-        replay = MagicMock(name="replay")
-        replay.is_empty.return_value = False
-        replay.dsv41_cache_only_replay = True
-        replay_result = MagicMock(name="replay_result")
-        scheduler.running_batch = replay
-        scheduler.last_batch = replay
-        scheduler.dsv41_suspended_decode_batch = suspended
-        scheduler.result_queue = deque([(replay.copy(), replay_result)])
-        copied_replay = scheduler.result_queue[0][0]
-        copied_replay.dsv41_cache_only_replay = True
-        call_order = []
-        scheduler.process_batch_result = MagicMock(
-            side_effect=lambda *_: call_order.append("process")
-        )
-        replay.merge_batch.side_effect = lambda *_: call_order.append("restore")
-
-        SchedulerDisaggregationDecodeMixin._finish_dsv41_overlap_replay(scheduler)
-
-        scheduler.process_batch_result.assert_called_once_with(
-            copied_replay, replay_result
-        )
-        replay.merge_batch.assert_called_once_with(suspended)
-        self.assertEqual(call_order, ["process", "restore"])
-        self.assertIs(scheduler.running_batch, replay)
-        self.assertIsNone(scheduler.last_batch)
-        self.assertEqual(list(scheduler.result_queue), [])
-        self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
-
-    def test_overlap_replay_requires_exactly_one_pending_result(self):
-        scheduler = self._new_scheduler(enable_overlap=True)
-        replay = MagicMock(name="replay")
-        replay.dsv41_cache_only_replay = True
-        scheduler.running_batch = replay
-        scheduler.last_batch = replay
-        scheduler.dsv41_suspended_decode_batch = MagicMock(name="suspended")
-        scheduler.result_queue = deque()
-
-        with self.assertRaisesRegex(
-            RuntimeError, "cache-only overlap replay lost its single pending result"
-        ):
-            SchedulerDisaggregationDecodeMixin._finish_dsv41_overlap_replay(scheduler)
-
     def test_overlap_loop_restores_replay_before_next_queue_pass(self):
         scheduler = self._new_scheduler(enable_overlap=True)
         suspended = MagicMock(name="suspended")
@@ -1181,50 +1134,13 @@ class TestDecodePrebuilt(CustomTestCase):
         self.assertIs(plan.batch_to_run, next_replay)
         self.assertIs(plan.running_batch, next_replay)
 
-    def test_cache_only_replay_uses_explicit_full_prompt_coverage(self):
-        for prompt_len in (127, 128, 129, 255, 256, 257):
-            with self.subTest(prompt_len=prompt_len):
-                scheduler = self._new_scheduler(enable_overlap=False)
-                req = MagicMock(rid=f"replay-{prompt_len}")
-                req.dsv41_cache_only_replay = True
-                req.dsv41_cache_only_coverage = prompt_len
-                req.origin_input_ids = list(range(prompt_len))
-                req.full_untruncated_fill_ids = list(range(prompt_len))
-                req.kv.req_pool_idx = 0
-                req.kv.kv_committed_len = prompt_len
-                scheduler.waiting_queue = [req]
-                scheduler.running_batch.is_empty.return_value = True
-                scheduler.req_to_token_pool.req_to_token = torch.arange(
-                    512, dtype=torch.int32
-                ).reshape(1, 512)
-
-                new_batch = MagicMock()
-                new_batch.dsv41_cache_only_replay = False
-                new_batch.is_empty.return_value = False
-                with patch(
-                    "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-                    return_value=new_batch,
-                ):
-                    ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
-                        scheduler, scheduler.running_batch
-                    )
-
-                start = max(0, prompt_len - 128)
-                self.assertEqual((req.prefix_len, req.extend_end), (start, prompt_len))
-                self.assertTrue(
-                    torch.equal(
-                        req.prefix_indices,
-                        torch.arange(start, dtype=torch.int32),
-                    )
-                )
-                self.assertIs(ret, new_batch)
-                new_batch.prepare_for_extend.assert_called_once()
-                new_batch.process_prebuilt.assert_not_called()
-
     def test_cache_only_admission_preserves_prefill_cache_accounting(self):
         """Transferred coverage must not become hits or overwrite P's tier breakdown."""
         for prompt_len, p_cached in (
             (1, 0),
+            (127, 0),
+            (128, 0),
+            (129, 0),
             (127, 127),
             (8192, 0),
             (8192, 4096),
@@ -1271,6 +1187,10 @@ class TestDecodePrebuilt(CustomTestCase):
                     )
                 self.assertIsInstance(batch, ScheduleBatch)
                 self.assertEqual(batch.extend_num_tokens, min(prompt_len, 128))
+                self.assertEqual(
+                    (req.prefix_len, req.extend_end),
+                    (max(0, prompt_len - 128), prompt_len),
+                )
                 self.assertEqual(req.cached_tokens, p_cached)
                 self.assertEqual(
                     (

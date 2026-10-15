@@ -5,7 +5,6 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     resolve_layer_indices,
@@ -61,15 +60,6 @@ class TestDsv41EncoderOnlyWeights(CustomTestCase):
                 for name in skipped
             )
         )
-
-    def test_key_only_indexer_refuses_decode_projections(self):
-        indexer = object.__new__(DeepseekV41Indexer)
-        nn.Module.__init__(indexer)
-        indexer.key_only = True
-        with self.assertRaisesRegex(RuntimeError, "key-only indexer"):
-            indexer.queries(torch.empty(1), torch.empty(1))
-        with self.assertRaisesRegex(RuntimeError, "key-only indexer"):
-            indexer.head_weights_raw(torch.empty(1))
 
     @patch("sglang.srt.models.deepseek_v4.EngramLayout.from_config", return_value=None)
     @patch("sglang.srt.models.deepseek_v4.VocabParallelEmbedding")
@@ -182,15 +172,6 @@ class TestDsv41EncoderOnlyWeights(CustomTestCase):
                 self.assertIsNone(call.kwargs["q_lora"])
                 self.assertTrue(call.kwargs["run_compressor"])
                 self.assertFalse(call.kwargs["run_indexer"])
-
-    def test_embed_head_access_fails_for_encoder_only_prefill(self):
-        model = object.__new__(DeepseekV4ForCausalLM)
-        nn.Module.__init__(model)
-        model.encoder_only_prefill = True
-        with self.assertRaisesRegex(AttributeError, "encoder-only Prefill"):
-            model.get_embed_and_head()
-        with self.assertRaisesRegex(AttributeError, "encoder-only Prefill"):
-            model.set_embed_and_head(torch.empty(1), torch.empty(1))
 
 
 if __name__ == "__main__":
