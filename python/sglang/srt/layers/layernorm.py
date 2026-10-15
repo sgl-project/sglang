@@ -1071,8 +1071,26 @@ class LayerNorm(BaseFusedOp):
             return layer_norm(x, self.weight, self.bias, self.variance_epsilon).view(
                 orig_shape
             )
-        else:
-            return self.forward_native(x)
+        if (
+            x.dtype in (torch.bfloat16, torch.float16)
+            and self.dtype == torch.float32
+            and self.elementwise_affine
+            and self.use_bias
+        ):
+            # One Triton launch with fp32 math in place of cast -> layer_norm -> cast.
+            from sglang.kernels.ops.attention.fla.layernorm_gated import (
+                _layer_norm_fwd,
+            )
+
+            orig_shape = x.shape
+            out, _, _ = _layer_norm_fwd(
+                x.reshape(-1, self.hidden_size).contiguous(),
+                self.weight,
+                self.bias,
+                self.variance_epsilon,
+            )
+            return out.view(orig_shape)
+        return self.forward_native(x)
 
     def forward_npu(
         self,

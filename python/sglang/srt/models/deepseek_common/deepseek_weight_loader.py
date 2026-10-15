@@ -580,6 +580,10 @@ class DeepseekV2WeightLoaderMixin:
                 else self.model.decoder.self_attn
             )
 
+            indexer = getattr(self_attn, "indexer", None)
+            if hasattr(indexer, "fuse_x_projections"):
+                indexer.fuse_x_projections()
+
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
 
