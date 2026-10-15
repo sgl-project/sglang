@@ -81,6 +81,9 @@ class KVArgs:
     # scatter transfer can slice each independently head-sharded sub-block; None
     # per tensor when the single contiguous slice already matches the layout.
     state_conv_shard_groups: List[List[Optional[List[int]]]]
+    # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
+    # None when the SWA state is not held in an MHA sub-pool.
+    swa_kv_cache_layout: Optional[str]
     ib_device: str
     gpu_id: int
     kv_head_num: int

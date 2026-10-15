@@ -228,6 +228,8 @@ pub struct Worker {
     services: RwLock<BTreeSet<String>>,
     /// Router in-flight requests per DP rank; one slot per rank.
     dp_rank_inflight: Arc<[AtomicUsize]>,
+    /// Round-robin position over this worker's DP ranks.
+    dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
 }
 
@@ -271,6 +273,7 @@ impl Worker {
             version_group: spec.version_group,
             services: RwLock::new(spec.services),
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
+            dp_rank_turn: AtomicUsize::new(0),
             openai,
         }
     }
@@ -362,6 +365,11 @@ impl Worker {
 
     pub fn dp_rank_inflight(&self, rank: u32) -> usize {
         self.dp_rank_inflight[rank as usize].load(Ordering::Relaxed)
+    }
+
+    /// Advances the round-robin DP-rank position and returns the previous one.
+    pub fn next_dp_rank_turn(&self) -> usize {
+        self.dp_rank_turn.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn dp_rank_guard(&self, rank: u32) -> DpRankGuard {
