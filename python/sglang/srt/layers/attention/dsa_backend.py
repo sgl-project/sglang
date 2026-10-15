@@ -1046,6 +1046,12 @@ class DeepseekSparseAttnBackend(
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
 
+        self.init_kernel_metadata(forward_batch)
+
+    def init_kernel_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Refresh custom kernel state after eager or out-of-graph metadata setup."""
+        pass
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
@@ -1359,6 +1365,7 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        self.init_kernel_metadata(forward_batch)
 
     def _cal_indexer_k_start_end(
         self,
