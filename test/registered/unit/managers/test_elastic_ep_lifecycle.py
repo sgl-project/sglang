@@ -864,6 +864,12 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
                 "sglang.srt.managers.scheduler.get_parallel",
                 return_value=MagicMock(tp_rank=0),
             ),
+            patch(
+                "sglang.srt.managers.scheduler.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_a2a_backend="nixl")
+                ),
+            ),
             patch.object(NixlEPBuffer, "abort_recovery") as abort_recovery,
         ):
             scheduler._maybe_complete_recovery_warmup(MagicMock(reqs=[finished]))
