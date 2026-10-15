@@ -43,7 +43,12 @@ def main():
             )
 
             def run(
-                views=False, conv_tile=256, tiled=False, fused_quant=False, direct=False
+                views=False,
+                conv_tile=256,
+                tiled=False,
+                fused_quant=False,
+                direct=False,
+                pdl=False,
             ):
                 split = (
                     qwen3_5_gdn_prefill_projection_views
@@ -76,7 +81,9 @@ def main():
                     b=b,
                 )
                 opts = dict(block_v=32, num_warps=2) if tiled else {}
-                gdn_replayssm_spec_decode(**inputs, direct_solve=direct, **opts)
+                gdn_replayssm_spec_decode(
+                    **inputs, direct_solve=direct, pdl=pdl, **opts
+                )
                 norm_z = z if views else z.reshape(-1, 128)
                 result, _, _ = _layer_norm_fwd(
                     case["out"].view(-1, 128),
@@ -110,6 +117,7 @@ def main():
                 dict(conv_tile=128),
                 dict(fused_quant=True),
                 dict(views=True, conv_tile=128, tiled=True, fused_quant=True),
+                dict(views=True, conv_tile=128, tiled=True, fused_quant=True, pdl=True),
                 dict(
                     views=True, conv_tile=128, tiled=True, fused_quant=True, direct=True
                 ),

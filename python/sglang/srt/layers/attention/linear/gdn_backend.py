@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 import msgspec
 import torch
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
@@ -1548,6 +1549,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 print_warning_once(
                     "GDN verify tiling is unsupported; using the original path"
                 )
+        if envs.SGLANG_Q35MF_GDN_PDL.get():
+            if q.is_cuda and is_arch_support_pdl():
+                verify_options["pdl"] = True
+            else:
+                print_warning_once("GDN verify PDL is unsupported; using the original path")
         gdn_replayssm_spec_decode(
             q=q,
             k=k,

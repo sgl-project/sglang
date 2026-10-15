@@ -110,11 +110,14 @@ def gdn_replayssm_spec_circular_kernel(
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
     i_hv = tl.program_id(2)
     i_h = i_hv // (HV // H)
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
 
     o_v = i_v * BV + tl.arange(0, BV)
     o_s = tl.arange(0, BS)
@@ -141,12 +144,18 @@ def gdn_replayssm_spec_circular_kernel(
 
     if IS_FLUSH:
         if state_idx <= NULL_BLOCK_ID:
+            if USE_GDC:
+                tl.extra.cuda.gdc_wait()
             return
         b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
         if not b_is_flush:
+            if USE_GDC:
+                tl.extra.cuda.gdc_wait()
             return
     else:
         if state_idx <= NULL_BLOCK_ID:
+            if USE_GDC:
+                tl.extra.cuda.gdc_wait()
             full_mask = (o_s < spec_len)[:, None] & mask_v[None, :]
             tl.store(
                 p_o,
@@ -156,6 +165,8 @@ def gdn_replayssm_spec_circular_kernel(
             return
         b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
         if b_is_flush:
+            if USE_GDC:
+                tl.extra.cuda.gdc_wait()
             return
 
     b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
@@ -218,6 +229,10 @@ def gdn_replayssm_spec_circular_kernel(
             b_d_scaled = b_d_scaled_fp32
         else:
             b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
+
+    # PTX griddepcontrol: consume convolution output only after the prerequisite.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
 
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
@@ -1084,6 +1099,7 @@ def _launch_gdn_spec(
     dot_precision,
     direct_solve=False,
     history_stats=None,
+    pdl=False,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1128,6 +1144,8 @@ def _launch_gdn_spec(
             CHECK_EMPTY_HISTORY=history_stats is not None,
             HISTORY_STATS=history_stats,
         )
+    if pdl:
+        solve_options.update(USE_GDC=True, launch_pdl=True)
     grid = (triton.cdiv(V, BV), B, HV)
     kernel[grid](
         q,
@@ -1296,6 +1314,7 @@ def gdn_replayssm_spec_decode(
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
     direct_solve: bool = False,
     history_stats: torch.Tensor | None = None,
+    pdl: bool = False,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1309,6 +1328,8 @@ def gdn_replayssm_spec_decode(
          checkpoint (statically empty history).
     The circular history and cursors are request-keyed by ``replay_indices``;
     the checkpoint remains keyed by physical ``ssm_state_indices``.
+    PDL overlaps a convolution that writes q/k/v only; gates, metadata, and
+    compact history must already be ready when the verify grid starts.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
@@ -1385,6 +1406,7 @@ def gdn_replayssm_spec_decode(
             dot_precision,
             direct_solve,
             history_stats,
+            pdl,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -1423,6 +1445,7 @@ def gdn_replayssm_spec_decode(
             dot_precision,
             direct_solve,
             history_stats,
+            pdl,
         )
     return out
 
