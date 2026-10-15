@@ -396,9 +396,12 @@ class FlashAttentionBackend(AttentionBackend):
         if isinstance(active_pool, SWAKVPool):
             return active_pool
 
-        if model_runner.is_draft_worker:
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
+        # Only the frozen-KV draft falls back to the allocator pool.
+        if not (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return None
 
         kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
         return kvcache if isinstance(kvcache, SWAKVPool) else None

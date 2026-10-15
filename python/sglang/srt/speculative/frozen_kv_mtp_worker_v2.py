@@ -213,6 +213,24 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             TpModelWorker.init_attention_backends(self)
             self.draft_attn_backend = self._init_draft_attn_backend()
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self._check_draft_swa_pool_is_target()
+
+    def _check_draft_swa_pool_is_target(self) -> None:
+        # FA translates on its own SWA pool; the view swap reads the target pool.
+        # They must be the same object, or ids silently index the wrong buffer.
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        backend = self.draft_attn_backend
+        if not isinstance(backend, FlashAttentionBackend):
+            return
+        if backend._swa_kv_pool is None or self.kv_context is None:
+            return
+        assert backend._swa_kv_pool is self.kv_context.target_token_to_kv_pool, (
+            "Frozen-KV draft translates SWA ids on a different pool than the "
+            "target pool it reads."
+        )
 
     def init_cuda_graphs(self):
         with (
