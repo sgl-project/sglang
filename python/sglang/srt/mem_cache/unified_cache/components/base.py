@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
         PoolBeliefPolicy,
     )
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
     from sglang.srt.mem_cache.unified_radix_cache import (
         NodeId,
@@ -147,7 +149,6 @@ class LinkerTransferPhase(str, Enum):
 
 class ExternalLinkerLoadPhase(str, Enum):
     PREPARE = "prepare"
-    COMMIT = "commit"
     ABORT = "abort"
 
 
@@ -776,6 +777,25 @@ class TreeComponent(ABC):
         policy."""
         return None
 
+    def create_buffer_pipeline(
+        self,
+        *,
+        swa_component: Optional[SWAComponent],
+        write_backlog_cap: int,
+        max_context_len: int = 0,
+        auxiliary_swa_component: Optional[SWAComponent] = None,
+    ) -> BufferModePipeline:
+        """Called on the FULL component to construct the buffer-mode pipeline."""
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        return BufferModePipeline(
+            cache=self.cache,
+            swa_component=swa_component,
+            auxiliary_swa_component=auxiliary_swa_component,
+            write_backlog_cap=write_backlog_cap,
+            max_context_len=max_context_len,
+        )
+
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
     ) -> Optional[BufferLoadBackContext]:
@@ -858,9 +878,6 @@ class TreeComponent(ABC):
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
-        *,
-        insert_result: Optional[InsertResult] = None,
-        canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
-        """Prepare, commit, or abort this component's direct load."""
+        """Prepare or abort this component's direct load into ``req``'s slots."""
         return transfer

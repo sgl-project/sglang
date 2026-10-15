@@ -69,6 +69,44 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
     ] = False
+    enable_watermark: A[
+        bool,
+        "Enable Aaronson-Gumbel text watermarking.",
+    ] = False
+    watermark_config: A[
+        Optional[str],
+        "Watermark settings as a JSON file path or an inline JSON object with "
+        "optional key, key_b, context_window, mixing_probability, max_probability, "
+        "default_enabled, and enforce_all fields.",
+    ] = None
+    watermark_key: A[
+        Optional[str],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_key_b: A[
+        Optional[str],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_context_window: A[
+        int,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 4
+    watermark_mixing_probability: A[
+        float,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 0.5
+    watermark_max_probability: A[
+        float,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 1.0
+    watermark_default_enabled: A[
+        bool,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = False
+    watermark_enforce_all: A[
+        bool,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = False
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "
@@ -673,7 +711,8 @@ class ExecComm(msgspec.Struct):
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "Requires SM90 or SM10X NVIDIA GPUs. "
-                "Defaults to auto. "
+                "When unspecified, supported MiMo configurations use cutedsl; "
+                "other supported models use auto. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
                 "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
