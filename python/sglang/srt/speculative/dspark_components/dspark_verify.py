@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from typing import Optional
 
 import msgspec
@@ -23,6 +24,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     ScatterCompactToStrided,
     build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
+)
+from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
+    accept_sampling_sharded,
 )
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
@@ -890,6 +894,61 @@ def sample_simulated_bonus(
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 
 
+def _accepts_on_shards(
+    draft_block: DraftBlockResult, sampling_info, block_verification: bool
+) -> bool:
+    # The sharded accept is a Triton chain rule on temperature-only target
+    # probabilities; block verification and top-k/top-p need the whole vocab.
+    return (
+        draft_block.vocab_shard is not None
+        and not block_verification
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+    )
+
+
+def _accept_on_shards(
+    draft_block: DraftBlockResult,
+    *,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_probs: None,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    cutoff_verify_lens: Optional[torch.Tensor],
+    block_verification: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AcceptSampling.execute, reading the draft logits on the vocab shards."""
+    del draft_probs, draft_input, gamma, verify_num_draft_tokens, block_verification
+    shard = draft_block.vocab_shard
+    return accept_sampling_sharded(
+        candidates=candidates,
+        target_logits=target_logits,
+        target_temperatures=sampling_info.temperatures.view(-1),
+        draft_logits=draft_block.corrected_logits,
+        draft_temperatures=draft_block.temperatures,
+        vocab_start=shard.start,
+        width=shard.width,
+        gather_stacked=shard.gather.gather_stacked,
+        key=draft_block.noise.key,
+        offset=draft_block.noise.offset,
+        verify_lens=cutoff_verify_lens,
+    )
+
+
+def _whole_vocab_logits(draft_block: DraftBlockResult, vocab_size: int) -> torch.Tensor:
+    logits = draft_block.corrected_logits
+    shard = draft_block.vocab_shard
+    if shard is None:
+        return logits
+    # Kept on the shards, but this batch needs the whole vocab.
+    bs, gamma_rows, width = logits.shape
+    whole = shard.gather(logits.reshape(bs * gamma_rows, width))[:, :vocab_size]
+    return whole.contiguous().view(bs, gamma_rows, vocab_size)
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -914,6 +973,7 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
+    accept_sampling = AcceptSampling.execute
     if draft_block.greedy_draft:
         # An argmax draft is one-hot: rejection accepts at the target probability.
         draft_tokens = draft_block.draft_tokens
@@ -923,16 +983,20 @@ def accept_draft_tokens(
             device=target_logits.device,
         )
         draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
+    elif _accepts_on_shards(draft_block, sampling_info, block_verification):
+        draft_probs = None
+        accept_sampling = functools.partial(_accept_on_shards, draft_block)
     else:
-        bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+        corrected_logits = _whole_vocab_logits(draft_block, target_logits.shape[-1])
+        bs, gamma_rows, vocab = corrected_logits.shape
         draft_probs = SoftmaxTemp.execute(
-            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+            logits=corrected_logits.reshape(bs * gamma_rows, vocab),
             temperatures=draft_block.temperatures,
             rows_per_request=gamma_rows,
         ).view(bs, gamma_rows, vocab)
         expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
-        return AcceptSampling.execute(
+        return accept_sampling(
             candidates=candidates,
             target_logits=target_logits,
             draft_probs=draft_probs,
@@ -950,7 +1014,7 @@ def accept_draft_tokens(
         cutoff_verify_lens=cutoff_verify_lens,
         fused_argmax=fused_argmax,
     )
-    sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
+    sampling_len, sampling_bonus, sampling_trim = accept_sampling(
         candidates=candidates,
         target_logits=target_logits,
         draft_probs=draft_probs,

@@ -56,9 +56,10 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
 
 
 class VocabShard(msgspec.Struct, frozen=True):
-    """Where a rank's vocab slice starts, and the gather over its group."""
+    """A rank's vocab slice [start, start + width), and the gather over its group."""
 
     start: int
+    width: int
     gather: VocabGather
 
 
