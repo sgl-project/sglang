@@ -31,7 +31,10 @@ python3 -m sglang.launch_server \
 
 ## Example Configuration File
 
-Depending on the algorithm selected, the configuration parameters vary.
+The supported keys in `--dllm-algorithm-config` depend on the selected algorithm.
+Unknown keys cause an error at startup.
+This check also covers keys inside Gemma4Renoise's `sampler_config`,
+`temperature_schedule`, and `stopping_config` sections.
 
 LowConfidence Config:
 
