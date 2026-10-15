@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    is_elided_entry,
     resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.environ import envs
@@ -109,7 +110,10 @@ def _pack_mem_desc_lists(mems_per_comp: List[List[MemoryDesc]]) -> bytes:
     if not mems_per_comp:
         return b""
     return msgspec.msgpack.encode(
-        [[mem.pack() for mem in comp] for comp in mems_per_comp]
+        [
+            [None if mem is None else mem.pack() for mem in comp]
+            for comp in mems_per_comp
+        ]
     )
 
 
@@ -117,7 +121,9 @@ def _unpack_mem_desc_lists(blob: bytes) -> List[List[MemoryDesc]]:
     if not blob:
         return []
     nested = msgspec.msgpack.decode(blob)
-    return [[MemoryDesc.unpack(b) for b in comp] for comp in nested]
+    return [
+        [None if b is None else MemoryDesc.unpack(b) for b in comp] for comp in nested
+    ]
 
 
 @dataclasses.dataclass
@@ -388,7 +394,7 @@ class MoriKVManager(CommonKVManager):
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
         self.aux_mem_descs: List[MemoryDesc] = []
-        self.state_mem_descs: List[List[MemoryDesc]] = []
+        self.state_mem_descs: List[List[Optional[MemoryDesc]]] = []
         self.transfer_lock = threading.Lock()
         self._submission_local = _SubmissionLocal()
         self._zmq_ctx = zmq.Context()
@@ -508,8 +514,13 @@ class MoriKVManager(CommonKVManager):
             self.kv_args.state_data_ptrs,
             getattr(self.kv_args, "state_data_lens", []),
         ):
-            component_descs: List[MemoryDesc] = []
+            component_descs: List[Optional[MemoryDesc]] = []
             for ptr, length in zip(component_ptrs, component_lens):
+                if length == 0:
+                    # Elided DSA index-K; ibv_reg_mr would abort on size 0.
+                    # Keep the slot so descs stay index-aligned.
+                    component_descs.append(None)
+                    continue
                 desc = self.engine.register_memory(
                     ptr,
                     length,
@@ -1059,6 +1070,8 @@ class MoriKVManager(CommonKVManager):
                         pass
             for component_descs in self.state_mem_descs:
                 for desc in component_descs:
+                    if desc is None:
+                        continue
                     try:
                         self.engine.deregister_memory(desc)
                     except Exception:
@@ -1641,7 +1654,7 @@ class MoriKVManager(CommonKVManager):
             )
 
             if st == "mamba":
-                if peer_info.decode_tp_size != self.attn_tp_size and 0 in src_dims:
+                if peer_info.decode_tp_size != self.state_tp_size and 0 in src_dims:
                     raise RuntimeError(
                         "Replicated Mamba PD state transfer currently requires "
                         "matching prefill/decode attention TP sizes"
@@ -1681,6 +1694,7 @@ class MoriKVManager(CommonKVManager):
                         src_descs,
                         src_lens,
                         dst_descs,
+                        dst_lens,
                         st,
                         src_layer_ids,
                         dst_layer_ids,
@@ -1713,7 +1727,7 @@ class MoriKVManager(CommonKVManager):
                 f"got src={src_state_indices.size}, dst={dst_state_indices.size}"
             )
 
-        tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
+        tp_mismatch = peer_info.decode_tp_size != self.state_tp_size
 
         # If dim info missing, silently degrade to whole-item copy (Mooncake compat)
         if tp_mismatch and (
@@ -1724,7 +1738,7 @@ class MoriKVManager(CommonKVManager):
         if tp_mismatch:
             logger.warning_once(
                 "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
-                f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={peer_info.decode_tp_size}. "
+                f"Prefill attn_tp_size={self.state_tp_size}, Decode attn_tp_size={peer_info.decode_tp_size}. "
                 "Performance may be affected."
             )
 
@@ -1732,7 +1746,7 @@ class MoriKVManager(CommonKVManager):
         dst_idx = int(dst_state_indices[0])
         statuses: List[TransferStatus] = []
 
-        local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+        local_tp_rank = self.kv_args.engine_rank % self.state_tp_size
         dst_tp_rank = peer_info.decode_tp_rank % peer_info.decode_tp_size
 
         pairs = build_transfer_entry_pairs(
@@ -1778,7 +1792,7 @@ class MoriKVManager(CommonKVManager):
                         src_dim=src_dim,
                         dst_dim=dst_dim,
                         outer_count=outer_count,
-                        src_attn_tp_size=self.attn_tp_size,
+                        src_attn_tp_size=self.state_tp_size,
                         dst_attn_tp_size=peer_info.decode_tp_size,
                         dst_tp_rank_in_group=dst_tp_rank,
                         local_tp_rank_in_group=local_tp_rank,
@@ -1809,6 +1823,7 @@ class MoriKVManager(CommonKVManager):
         src_state_mem_descs: List[MemoryDesc],
         src_state_item_lens: List[int],
         dst_state_mem_descs: List[MemoryDesc],
+        dst_state_item_lens: List[int],
         state_type: str,
         src_layer_ids: List[int],
         dst_layer_ids: List[int],
@@ -1838,7 +1853,13 @@ class MoriKVManager(CommonKVManager):
                     "PP>1 needs peer state_layer_ids for global-layer descriptor "
                     "pairing."
                 )
-            if peer_info.decode_tp_size != self.attn_tp_size:
+            # QSA state is whole on every rank, so it pairs by state TP.
+            src_tp_size = (
+                self.state_tp_size
+                if state_type in ("qsa_pending", "qsa_compressed")
+                else self.attn_tp_size
+            )
+            if peer_info.decode_tp_size != src_tp_size:
                 raise RuntimeError(
                     f"PD disagg: heterogeneous TP not supported for {state_type} yet."
                 )
@@ -1897,6 +1918,12 @@ class MoriKVManager(CommonKVManager):
             src_desc = src_state_mem_descs[i]
             dst_desc = dst_state_mem_descs[j]
             state_item_len = src_state_item_lens[i]
+            if is_elided_entry(state_item_len, dst_state_item_lens, i):
+                # DSA index-K elision gives every shared-topk layer a 0-row
+                # buffer; either peer eliding it means nothing moves, and the
+                # descriptor describes an empty allocation. Skipping keeps the
+                # index alignment with state_mem_descs that registration relies on.
+                continue
 
             statuses.extend(
                 self._submit_batch_transfer_plan(

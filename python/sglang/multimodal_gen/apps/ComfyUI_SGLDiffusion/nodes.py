@@ -25,7 +25,30 @@ from .utils import (
     convert_video_to_comfy_video,
     get_image_path,
     is_empty_image,
+    resolve_video_path,
 )
+
+# The server clamps n to this range (image_api.py).
+MAX_SERVER_IMAGES = 10
+
+
+def _decode_image_batch(response: dict, num_images: int) -> torch.Tensor:
+    """Decode the server's images, in order, into one ComfyUI IMAGE batch."""
+    items = [item.get("b64_json") for item in response.get("data") or []]
+    if not items or not all(items):
+        raise RuntimeError("No image data in response")
+    if len(items) < num_images:
+        raise RuntimeError(
+            f"Requested {num_images} images but the server returned {len(items)}"
+        )
+    images = [convert_b64_to_tensor_image(b64) for b64 in items[:num_images]]
+    shapes = {tuple(image.shape[1:]) for image in images}
+    if len(shapes) > 1:
+        raise RuntimeError(
+            f"Server returned images of different sizes {sorted(shapes)}; "
+            "they cannot be combined into one IMAGE batch"
+        )
+    return torch.cat(images, dim=0)
 
 
 class SGLDH3DistilledSigmas:
@@ -56,6 +79,7 @@ class SGLDOptions:
                         "auto-detect",
                         "qwen_image",
                         "qwen_image_edit",
+                        "qwen_image21",
                         "flux",
                         "lumina2",
                         "minimax_h3",
@@ -418,6 +442,16 @@ class SGLDiffusionGenerateImage:
                         "default": False,
                     },
                 ),
+                "num_images": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": MAX_SERVER_IMAGES,
+                        "tooltip": "Images to generate in one request, returned as "
+                        "one IMAGE batch. Image i uses seed + i.",
+                    },
+                ),
             },
         }
 
@@ -439,10 +473,15 @@ class SGLDiffusionGenerateImage:
         width: int = 1024,
         height: int = 1024,
         enable_teacache: bool = False,
+        num_images: int = 1,
     ):
         """Generate image using SGLang Diffusion API."""
         if not positive_prompt:
             raise ValueError("Prompt cannot be empty")
+        if not 1 <= num_images <= MAX_SERVER_IMAGES:
+            raise ValueError(
+                f"num_images must be between 1 and {MAX_SERVER_IMAGES}, got {num_images}"
+            )
 
         size = f"{width}x{height}"
 
@@ -450,6 +489,7 @@ class SGLDiffusionGenerateImage:
         request_params = {
             "prompt": positive_prompt,
             "size": size,
+            "n": num_images,
             "response_format": "b64_json",
         }
 
@@ -479,13 +519,7 @@ class SGLDiffusionGenerateImage:
         except Exception as e:
             raise RuntimeError(f"Failed to generate image: {str(e)}")
 
-        # Decode base64 image
-        if not response["data"] or not response["data"][0]["b64_json"]:
-            raise RuntimeError("No image data in response")
-        image_data = response["data"][0]["b64_json"]
-        image = convert_b64_to_tensor_image(image_data)
-
-        return (image,)
+        return (_decode_image_batch(response, num_images),)
 
 
 class SGLDiffusionGenerateVideo:
@@ -662,7 +696,9 @@ class SGLDiffusionGenerateVideo:
         # Call API
         try:
             response = sgld_client.generate_video(**request_params)
-            video_path = response.get("file_path", "")
+            video_path = resolve_video_path(
+                response.get("file_path"), response.get("url")
+            )
             video = convert_video_to_comfy_video(video_path, height, width)
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
@@ -870,10 +906,12 @@ class SGLDiffusionGenerateH3:
 
         try:
             response = sgld_client.generate_video(**request_params)
+            video_path = resolve_video_path(
+                response.get("file_path"), response.get("url")
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to generate MiniMax-H3 video: {str(e)}")
 
-        video_path = response.get("file_path", "")
         # H3 aligns the canvas server-side, so the resolved size is only known
         # from the response; short_edge and aspect_ratio cannot reconstruct it
         resolved_size = response.get("size", "")
