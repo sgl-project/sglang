@@ -179,10 +179,12 @@ class FullTopKIndexer:
         lens = metadata.compressed_seq_lens
         page_table = metadata.page_table
         # The paged metadata dispatches to the v1 kernel here (top-k v2 is off
-        # for the low-ratio prefill metadata), which caps k; wider selections
-        # keep the torch top-k over the captured width.
-        topk = min(indexer.index_topk, width)
-        torch_topk = not metadata.use_topk_v2 and topk > TOPK_V1_MAX_K
+        # for the low-ratio prefill metadata), which takes k from the output
+        # width it is handed and caps it; wider outputs keep the torch top-k,
+        # which selects min(k, width) columns as before.
+        out_width = inputs.out_page_indices.shape[1]
+        torch_topk = not metadata.use_topk_v2 and out_width > TOPK_V1_MAX_K
+        topk = min(out_width, width)
         for rows, plan in metadata.row_chunks():
             logits = deep_gemm_fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),

@@ -980,11 +980,15 @@ class TestDSV4FullTopKCapturedFallback(CustomTestCase):
 
     def test_k_within_the_v1_kernel_limit_uses_the_paged_kernel(self):
         self.assertEqual(self._topk_calls(512, 4096), [("kernel", None)])
-        # k is bounded by the captured width before the limit applies.
-        self.assertEqual(self._topk_calls(2048, 512), [("kernel", None)])
+        # The kernel selects min(k, row length) itself when the width is short.
+        self.assertEqual(self._topk_calls(1024, 512), [("kernel", None)])
 
     def test_k_above_the_v1_kernel_limit_keeps_the_torch_topk(self):
         self.assertEqual(self._topk_calls(2048, 4096), [("torch", 2048)])
+        # The kernel takes k from the output width it is handed, so a 2048-wide
+        # output needs the torch path even when the captured width is shorter;
+        # the torch top-k then selects the width.
+        self.assertEqual(self._topk_calls(2048, 512), [("torch", 512)])
         # Top-k v2 has no such cap.
         self.assertEqual(
             self._topk_calls(2048, 4096, use_topk_v2=True), [("kernel", None)]
