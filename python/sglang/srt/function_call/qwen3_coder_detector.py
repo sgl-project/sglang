@@ -1,11 +1,11 @@
 import json
 import logging
+import math
 import re
 from typing import Any, List, Optional
 
 from jsonschema import Draft202012Validator
 from referencing import Registry
-from referencing.exceptions import Unresolvable
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -102,6 +102,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return "string"
         return str(inferred_type).strip().lower()
 
+    @staticmethod
+    def _parse_finite_float(value: str) -> float:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("Non-finite JSON number")
+        return number
+
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
     ) -> Any:
@@ -127,12 +134,20 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 and param_value.lstrip().startswith(("{", "["))
             ):
                 try:
-                    value = json.loads(param_value)
+                    value = json.loads(
+                        param_value,
+                        parse_constant=self._parse_finite_float,
+                        parse_float=self._parse_finite_float,
+                    )
                     if isinstance(value, (dict, list)) and Draft202012Validator(
                         schema, registry=Registry()
                     ).is_valid(value):
                         return value
-                except (json.JSONDecodeError, Unresolvable):
+                except Exception as exc:
+                    logger.debug(
+                        "Structured union conversion failed (%s); preserving the original string.",
+                        type(exc).__name__,
+                    )
                     return param_value
             return param_value
         elif (
