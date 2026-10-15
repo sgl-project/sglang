@@ -486,12 +486,24 @@ flags make it cheaper:
   special tokens with no overlapping added-token spellings. Unsafe candidates
   are excluded; if none remain, encoding proceeds without the cache.
 
+- `--tokenizer-backend toktier` (build feature `toktier`, off by default)
+  encodes each chat as the delta of its session transcript through the
+  [toktier](https://crates.io/crates/toktier) crate: with `--session-id-header`
+  bound, a turn whose rendered prompt extends the stored transcript tokenizes
+  only the appended tail; without a session id the prompt is looked up by
+  content. Every route returns the reference `tokenizers` ids; anything toktier
+  declines, and any `tokenizer.json` outside the 15 artifacts it ships
+  certification data for, encodes on `hf`. Decoding stays on HF, and the L1
+  cache is inert with it. Design and measurements: sgl-project/sglang#44374.
+
 On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
 a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
 case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
 backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
-how much tokenization work the cache reuses.
+how much tokenization work the cache reuses, and with the toktier backend
+`sgl_router_tokenizer_toktier_encodes_total{route=...}` counting encodes by
+route (`session_repair`, `session_seed`, `content_lookup`, `full`, `fallback_hf`).
 
 ## Native `/generate`
 

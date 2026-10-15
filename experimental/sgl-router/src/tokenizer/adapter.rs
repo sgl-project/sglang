@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::stats::{EncodeBackend, L1Counters, L1State, TokenizerStats};
+use super::stats::{EncodeBackend, L1Counters, L1State, TokenizerStats, ToktierCounters};
 use crate::config::{TokenizerBackend, TokenizerConfig};
 
 /// Load a local tokenizer file or Hugging Face repo with the default HF, uncached encoder.
@@ -168,10 +168,20 @@ pub fn prompt_affixes(source: &str, files: &ModelFiles) -> Result<PromptAffixes>
 }
 
 fn build(path: &str, cfg: TokenizerConfig) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
-    let (inner, backend) = encoder(path, cfg.backend)?;
+    let toktier = Arc::new(ToktierCounters::default());
+    let (inner, backend) = encoder(path, cfg.backend, &toktier)?;
     let l1 = Arc::new(L1Counters::default());
     let (tokenizer, l1_state) = if cfg.l1_cache_mb == 0 {
         (Tokenizer::from(inner), L1State::Off)
+    } else if let Err(e) = inner.validate_prefix_cache() {
+        tracing::warn!(
+            path,
+            backend = backend.as_str(),
+            reason = %e,
+            "--tokenizer-l1-cache-mb is set but this encode backend keeps its own prefix \
+             state; the L1 cache is inert"
+        );
+        (Tokenizer::from(inner), L1State::DisabledByBackend)
     } else {
         let specials = boundary_tokens(path)?;
         if specials.is_empty() {
@@ -191,6 +201,7 @@ fn build(path: &str, cfg: TokenizerConfig) -> Result<(Arc<Tokenizer>, Arc<Tokeni
         backend,
         l1_state,
         l1,
+        toktier,
     };
     Ok((Arc::new(tokenizer), Arc::new(stats)))
 }
@@ -216,19 +227,37 @@ fn with_l1(
         })))
 }
 
-/// Build the encoder for `backend`; `fast` falls back to HF when fastokens cannot load the file.
+/// Build the encoder for `backend`; `fast` falls back to HF when fastokens cannot load the
+/// file, `toktier` when toktier cannot use it.
+#[cfg_attr(not(feature = "toktier"), allow(unused_variables))]
 fn encoder(
     path: &str,
     backend: TokenizerBackend,
+    toktier: &Arc<ToktierCounters>,
 ) -> Result<(Arc<dyn traits::Tokenizer>, EncodeBackend)> {
     if !path.ends_with(".json") {
-        if backend == TokenizerBackend::Fast {
+        if backend != TokenizerBackend::Hf {
             tracing::warn!(
                 path,
-                "fastokens needs a tokenizer.json; encoding on tiktoken"
+                backend = ?backend,
+                "this backend needs a tokenizer.json; encoding on tiktoken"
             );
         }
         return Ok((create_tokenizer_from_file(path)?, EncodeBackend::Tiktoken));
+    }
+    #[cfg(feature = "toktier")]
+    if backend == TokenizerBackend::Toktier {
+        let hf = create_tokenizer_from_file(path)?;
+        return Ok(
+            match super::toktier::ToktierTokenizer::open(Path::new(path), hf.clone(), toktier) {
+                Ok(t) => (Arc::new(t), EncodeBackend::Toktier),
+                Err(e) => {
+                    tracing::warn!(path, error = %format!("{e:#}"),
+                        "toktier cannot use this tokenizer; encoding on hf");
+                    (hf, EncodeBackend::ToktierFallbackHf)
+                }
+            },
+        );
     }
     if backend == TokenizerBackend::Fast {
         match FastTokenizer::from_file(path) {
@@ -646,6 +675,7 @@ mod prompt_affix_tests {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+    use clap::ValueEnum;
     use serde_json::{json, Value};
 
     fn added(content: &str) -> Value {
@@ -680,7 +710,7 @@ mod cache_tests {
         } else {
             text.to_owned()
         };
-        for backend in [TokenizerBackend::Hf, TokenizerBackend::Fast] {
+        for &backend in TokenizerBackend::value_variants() {
             let (plain, _) = load_with(
                 path,
                 TokenizerConfig {
@@ -703,6 +733,9 @@ mod cache_tests {
                 match backend {
                     TokenizerBackend::Hf => EncodeBackend::Hf,
                     TokenizerBackend::Fast => EncodeBackend::Fast,
+                    // The tiny fixture is not a toktier artifact: HF answers and L1 applies.
+                    #[cfg(feature = "toktier")]
+                    TokenizerBackend::Toktier => EncodeBackend::ToktierFallbackHf,
                 }
             );
             for pass in 0..3 {
