@@ -17,6 +17,10 @@ Unlike the bit-exact ``rmsnorm_scale_shift_bitexact`` (ERNIE), this kernel does
 *not* reproduce PyTorch's parallel variance reduction order bit-for-bit, so it
 is intended for the request-gated (``quality="lossless"``/``"high"``) fusion
 path, matching the existing quality-gated LingBot RMSNorm fusion.
+
+``rmsnorm_indexed_scale_shift`` is the same chain for MiniMax-H3, whose
+``scale``/``shift`` rows come from small ``[M, D]`` AdaLN tables picked per
+token by an index.
 """
 
 from __future__ import annotations
@@ -143,7 +147,109 @@ def rmsnorm_scale_shift_per_token(
     return _rmsnorm_scale_shift_per_token_cuda(x, weight, scale, shift, eps)
 
 
+@triton.jit
+def _rmsnorm_indexed_scale_shift_kernel(
+    y_ptr,
+    x_ptr,
+    w_ptr,
+    scale_ptr,
+    shift_ptr,
+    idx_ptr,
+    mod_row_stride,
+    idx_stride,
+    DIM: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE_DIM)
+    mask = cols < DIM
+    mod_ptr = tl.load(idx_ptr + row * idx_stride) * mod_row_stride + cols
+
+    x = tl.load(x_ptr + row * DIM + cols, mask=mask, other=0.0).to(tl.float32)
+    rstd = tl.math.rsqrt(tl.sum(x * x, axis=0) / DIM + EPS)
+    w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
+    scale = tl.load(scale_ptr + mod_ptr, mask=mask).to(tl.float32)
+    shift = tl.load(shift_ptr + mod_ptr, mask=mask).to(tl.float32)
+    y = (x * rstd * w) * (1.0 + scale) + shift
+    tl.store(y_ptr + row * DIM + cols, y, mask=mask)
+
+
+@register_custom_op(op_name="rmsnorm_indexed_scale_shift_cuda", out_shape="x")
+def _rmsnorm_indexed_scale_shift_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    S, D = x.shape
+    # one row per program: packing more rows spills the fp32 row tiles
+    # (16 rows of 5376 ran 24x slower on H200)
+    with torch.get_device_module().device(x.device):
+        _rmsnorm_indexed_scale_shift_kernel[(S,)](
+            out,
+            x,
+            weight,
+            scale,
+            shift,
+            indices,
+            scale.stride(0),
+            indices.stride(0),
+            DIM=D,
+            EPS=eps,
+            BLOCK_SIZE_DIM=triton.next_power_of_2(D),
+            num_warps=8,
+        )
+    return out
+
+
+def can_use_rmsnorm_indexed_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    return (
+        x.is_cuda
+        and x.dim() == 2
+        and x.is_contiguous()
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and x.numel() > 0
+        and weight.is_cuda
+        and weight.dim() == 1
+        and weight.numel() == x.shape[1]
+        and shift.dim() == scale.dim() == 2
+        and shift.shape == scale.shape
+        and shift.shape[1] == x.shape[1]
+        and shift.stride(0) == scale.stride(0)
+        and shift.stride(1) == scale.stride(1) == 1
+        and indices.dim() == 1
+        and indices.numel() == x.shape[0]
+        and not indices.dtype.is_floating_point
+    )
+
+
+def rmsnorm_indexed_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fused ``rmsnorm(x) * (1 + scale[indices]) + shift[indices]`` over [T, D]
+    rows, in fp32 with one rounding: the AdaLN modulation tables are indexed
+    per row instead of materialized per token."""
+    return _rmsnorm_indexed_scale_shift_cuda(x, weight, shift, scale, indices, eps)
+
+
 __all__ = [
+    "can_use_rmsnorm_indexed_scale_shift",
     "can_use_rmsnorm_scale_shift_per_token",
+    "rmsnorm_indexed_scale_shift",
     "rmsnorm_scale_shift_per_token",
 ]

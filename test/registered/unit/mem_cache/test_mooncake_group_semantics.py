@@ -79,6 +79,7 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.batch_exist_calls = []
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
@@ -100,6 +101,7 @@ def _fake_store_class():
             return self.objects.get(key)
 
         def batch_is_exist(self, keys):
+            self.batch_exist_calls.append(list(keys))
             return [1 if key in self.existing_keys else 0 for key in keys]
 
         def batch_put_from(self, keys, ptrs, sizes, *args):
@@ -450,6 +452,171 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
+        )
+
+    def test_v2_batches_scalar_and_multi_buffer_pools_in_one_rpc(self):
+        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
+
+        results = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+            ]
+        )
+
+        self.assertEqual(results[PoolName.INDEXER], [True])
+        self.assertEqual(results[PoolName.DEEPSEEK_V4_C4], [True])
+        self.assertEqual(len(fake_store.batch_exist_calls), 1)
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(call["method"], "batch_put_from_multi_buffers")
+        self.assertEqual(
+            call["keys"],
+            ["tag_page0__indexer", "tag_page0__deepseek_v4_c4"],
+        )
+        self.assertEqual(call["ptrs"], [[3000], [4000, 4001]])
+        self.assertEqual(call["sizes"], [[8], [8, 16]])
+        self.assertEqual(
+            call["args"][0].group_ids,
+            ["sglang-hicache:tag_page0", "sglang-hicache:tag_page0"],
+        )
+
+    def test_v2_mixed_hits_build_metadata_only_for_missing_pages(self):
+        """Pages already in the store must not have buffer metadata built for them."""
+
+        class RecordingIndexerPool(FakeIndexerPool):
+            def __init__(self):
+                super().__init__()
+                self.meta_calls = []
+
+            def get_page_buffer_meta(self, indices):
+                self.meta_calls.append(indices.tolist())
+                return [3000 + int(i) for i in indices], [8] * len(indices)
+
+        class RecordingMultiBufferPool(FakeMultiBufferPool):
+            def __init__(self):
+                super().__init__()
+                self.meta_calls = []
+
+            def get_page_buffer_meta(self, indices):
+                self.meta_calls.append(indices.tolist())
+                ptrs, sizes = [], []
+                for i in indices:
+                    ptrs.extend([4000 + int(i) * 10, 4001 + int(i) * 10])
+                    sizes.extend([8, 16])
+                return ptrs, sizes
+
+        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+        indexer_pool = RecordingIndexerPool()
+        c4_pool = RecordingMultiBufferPool()
+        store.register_mem_host_pool_v2(indexer_pool, PoolName.INDEXER)
+        store.register_mem_host_pool_v2(c4_pool, PoolName.DEEPSEEK_V4_C4)
+        fake_store.existing_keys.update(
+            {"tag_page1__indexer", "tag_page1__deepseek_v4_c4"}
+        )
+        keys = ["page0", "page1", "page2"]
+        host_indices = torch.tensor([5, 6, 7])
+
+        results = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER, keys=keys, host_indices=host_indices
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4, keys=keys, host_indices=host_indices
+                ),
+            ]
+        )
+
+        self.assertEqual(results[PoolName.INDEXER], [True, True, True])
+        self.assertEqual(results[PoolName.DEEPSEEK_V4_C4], [True, True, True])
+        # Only the missing pages' host slots are materialized.
+        self.assertEqual(indexer_pool.meta_calls, [[5, 7]])
+        self.assertEqual(c4_pool.meta_calls, [[5, 7]])
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(
+            call["keys"],
+            [
+                "tag_page0__indexer",
+                "tag_page2__indexer",
+                "tag_page0__deepseek_v4_c4",
+                "tag_page2__deepseek_v4_c4",
+            ],
+        )
+        self.assertEqual(call["ptrs"], [[3005], [3007], [4050, 4051], [4070, 4071]])
+        self.assertEqual(call["sizes"], [[8], [8], [8, 16], [8, 16]])
+        self.assertEqual(
+            call["args"][0].group_ids,
+            [
+                "sglang-hicache:tag_page0",
+                "sglang-hicache:tag_page2",
+                "sglang-hicache:tag_page0",
+                "sglang-hicache:tag_page2",
+            ],
+        )
+
+    def test_v2_partly_stored_multi_object_page_puts_only_missing_objects(self):
+        """A page with some objects stored must put the rest with their own pointers."""
+
+        class RecordingKVDraftPool:
+            page_size = 1
+
+            def __init__(self):
+                self.kv_buffer = torch.empty((128,), dtype=torch.uint8)
+                self.meta_calls = []
+
+            def get_page_buffer_meta(self, indices):
+                self.meta_calls.append(indices.tolist())
+                ptrs, sizes = [], []
+                for i in indices:
+                    ptrs.extend([5000 + int(i) * 10, 5001 + int(i) * 10])
+                    sizes.extend([8, 8])
+                return ptrs, sizes
+
+        store, fake_store = _make_store(extra_backend_tag="tag")
+        draft_pool = RecordingKVDraftPool()
+        store.register_mem_host_pool_v2(draft_pool, PoolName.DRAFT)
+        fake_store.existing_keys.update(
+            {"tag_page0_0_draft_k", "tag_page1_0_draft_k", "tag_page1_0_draft_v"}
+        )
+
+        results = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    keys=["page0", "page1", "page2"],
+                    host_indices=torch.tensor([5, 6, 7]),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.DRAFT], [True, True, True])
+        self.assertEqual(draft_pool.meta_calls, [[5, 7]])
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(
+            call["keys"],
+            ["tag_page0_0_draft_v", "tag_page2_0_draft_k", "tag_page2_0_draft_v"],
+        )
+        self.assertEqual(call["ptrs"], [5051, 5070, 5071])
+        self.assertEqual(
+            call["args"][0].group_ids,
+            [
+                "sglang-hicache:tag_page0",
+                "sglang-hicache:tag_page2",
+                "sglang-hicache:tag_page2",
+            ],
         )
 
     def test_model_names_isolate_the_same_logical_key(self):

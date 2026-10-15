@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -291,9 +292,11 @@ class TpModelWorker(BaseTpWorker):
         context_length: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
         random_seed: Optional[int] = None,
+        load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
     ):
         # Parse args
         self.server_args = server_args
+        self.load_group = load_group
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
@@ -486,6 +489,7 @@ class TpModelWorker(BaseTpWorker):
             memory_pool_config=self.memory_pool_config,
             draft_attention_backend=self.draft_attention_backend,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            load_group=self.load_group,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -506,6 +510,7 @@ class TpModelWorker(BaseTpWorker):
                     memory_pool_config=self.memory_pool_config,
                     draft_attention_backend=self.draft_attention_backend,
                     draft_model_idx=i,
+                    load_group=self.load_group,
                 )
             )
 
@@ -604,26 +609,36 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_kv_loc_plan: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
+        folded = None
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
             if get_exec().features.enable_encoder_swa_bounded_replay:
                 from sglang.srt.model_executor.encoder_swa_replay import (
+                    apply_folded_extend,
+                    fold_encoder_swa_replay,
                     run_encoder_swa_replay,
                 )
 
-                # Replay reads restored main/indexer KV before the normal extend.
-                run_encoder_swa_replay(self, batch)
+                if self.model_runner.attn_backend.folds_encoder_swa_replay:
+                    # Hits extend from their replay start, rebuilding the window in-pass.
+                    folded = fold_encoder_swa_replay(self, batch)
+                else:
+                    # Replay reads restored main/indexer KV before the normal extend.
+                    run_encoder_swa_replay(self, batch)
 
             forward_batch = ForwardBatch.init_new(
-                batch,
+                batch if folded is None else folded.batch,
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
+            if folded is not None:
+                apply_folded_extend(folded, forward_batch)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -643,12 +658,27 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if folded is not None:
+                from sglang.srt.model_executor.encoder_swa_replay import (
+                    drop_folded_rows,
+                )
+
+                drop_folded_rows(logits_output=logits_output, folded=folded)
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                kv_loc_plan=(
+                    None
+                    if not return_kv_loc_plan
+                    # A folded forward also wrote the replay rows; the caller's
+                    # plan covers the batch it scheduled.
+                    else forward_batch.kv_loc_plan
+                    if folded is None
+                    else self.model_runner.kv_index_translator.own_plan(batch)
+                ),
             )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
