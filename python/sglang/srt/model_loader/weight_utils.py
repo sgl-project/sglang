@@ -19,6 +19,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     Generator,
@@ -35,10 +36,15 @@ import numpy as np
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadGroup,
+)
 from sglang.srt.configs.model_config import (
     REQUANTIZATION_METHODS,
     ModelConfig,
@@ -57,6 +63,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
@@ -520,11 +527,10 @@ def _find_local_hf_snapshot_dir_unlocked(
                 ),
             )
             rev_to_use = revision
-            if not rev_to_use:
-                ref_main = os.path.join(repo_folder, "refs", "main")
-                if os.path.isfile(ref_main):
-                    with open(ref_main) as f:
-                        rev_to_use = f.read().strip()
+            ref_path = os.path.join(repo_folder, "refs", revision or "main")
+            if os.path.isfile(ref_path):
+                with open(ref_path) as f:
+                    rev_to_use = f.read().strip()
             if rev_to_use:
                 rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
                 if os.path.isdir(rev_dir):
@@ -663,7 +669,18 @@ def download_weights_from_hf(
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
             # Before we download we look at what is available:
             fs = HfFileSystem()
-            file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            try:
+                file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            except HfHubHTTPError as e:
+                # Fail open (e.g. a 429 rate limit): pick the format from the local
+                # snapshot; snapshot_download below re-raises errors it cannot recover.
+                logger.warning(
+                    "Listing %s on the Hub failed, using the local snapshot: %s",
+                    model_name_or_path,
+                    e,
+                )
+                local_dir = find_local_repo_dir(model_name_or_path, revision)
+                file_list = os.listdir(local_dir) if local_dir else []
 
             # depending on what is available we download different things
             for pattern in allow_patterns:
@@ -1138,8 +1155,9 @@ def safetensors_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
 
@@ -1161,6 +1179,91 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
+
+
+def get_pp_stage_load_group() -> LoadGroup:
+    """Select a group for stage-local loads, not all-rank cold startup.
+
+    Call before draft contexts override the target's parallel topology.
+    """
+    parallel = get_parallel()
+    return parallel.tp_group if parallel.pp_size > 1 else _DEFAULT_LOAD_GROUP
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: List[str],
+    extra_config: Optional[dict] = None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over Safetensors weights with InstantTensor."""
+    if current_platform.device_type != "cuda":
+        raise ValueError(
+            "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
+            f"got {current_platform.device_type!r}."
+        )
+
+    unsupported_files = [f for f in hf_weights_files if not f.endswith(".safetensors")]
+    if unsupported_files:
+        raise ValueError(
+            "InstantTensor only supports .safetensors checkpoints; "
+            f"unsupported files: {unsupported_files}"
+        )
+
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            'Please install InstantTensor via `pip install "instanttensor>=0.1.9"`.'
+        ) from e
+
+    kwargs = dict(extra_config or {})
+    backend = kwargs.get("backend")
+    if backend is not None:
+        names = [backend] if isinstance(backend, str) else backend
+        if not isinstance(names, list) or not names:
+            raise ValueError(
+                "InstantTensor backend must be a name or a non-empty list of names"
+            )
+        available = {
+            **instanttensor.Backend.__members__,
+            **instanttensor.BackendPolicy.__members__,
+        }
+        if any(not isinstance(name, str) or name not in available for name in names):
+            raise ValueError(
+                f"Invalid InstantTensor backend {backend!r}; expected names from {sorted(available)}"
+            )
+        kwargs["backend"] = [available[name] for name in names]
+
+    distributed = torch.distributed.is_initialized()
+    if load_group is _DEFAULT_LOAD_GROUP:
+        load_group = get_parallel().world_group if distributed else None
+    process_group = (
+        load_group.device_group
+        if load_group is not None and load_group.world_size > 1
+        else None
+    )
+
+    device = current_platform.get_device(torch.cuda.current_device())
+    enable_tqdm = not distributed or torch.distributed.get_rank() == 0
+    with instanttensor.safe_open(
+        hf_weights_files,
+        framework="pt",
+        device=device,
+        process_group=process_group,
+        copy=True,
+        **kwargs,
+    ) as f:
+        yield from tqdm(
+            f.tensors(),
+            total=len(f.keys()),
+            desc="Loading safetensors using InstantTensor",
+            disable=not enable_tqdm,
+            mininterval=1,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        )
 
 
 def fastsafetensors_weights_iterator(
@@ -1234,8 +1337,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
     enable_tqdm = (
@@ -1287,6 +1391,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     # but later mmap-backed tensor access may fault pages again.
                     _drop_file_cache_after_load(st_file)
                 pbar.update(1)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
 
 
 def _load_pt_file(bin_file: str) -> dict:
@@ -1468,6 +1574,18 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
+def supports_quantized_rl_reload(func: Callable) -> Callable:
+    """Allow FlashRL to defer FP8 parameter writes until this method returns.
+
+    Checkpoint names must use the parameter names or QKV/gate-up aliases supported
+    by QuantizedRLModelLoader. FP8 writes must go through param.weight_loader;
+    the method must not read their values afterward, and source tensors must
+    remain unchanged until return. Non-FP8 parameters are loaded immediately.
+    """
+    func._supports_quantized_rl_reload = func
+    return func
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     if param.numel() == 1 and loaded_weight.numel() == 1:
@@ -1483,30 +1601,47 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         param.data.copy_(loaded_weight)
 
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearParallelGroup
+
+
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 def sharded_weight_loader(
     shard_axis: int,
     tp_rank_getter=None,
+    *,
+    parallel_group: Optional["LinearParallelGroup"] = None,
 ) -> LoaderFunction:
-    """Create a weight loader that shards the weights along the given axis"""
+    """Create a weight loader with placement frozen in its construction scope.
 
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    Without a group selection, retain the attention rank and legacy CPU padding
+    width. An explicit rank getter is evaluated once when creating the loader.
+    """
+    if parallel_group is not None:
+        if tp_rank_getter is not None:
+            raise ValueError("parallel_group cannot be combined with tp_rank_getter")
+        from sglang.srt.layers.linear import resolve_linear_parallel_group
+
+        tp_rank, tp_size = resolve_linear_parallel_group(parallel_group)
+    else:
         tp_rank = (
             tp_rank_getter()
             if tp_rank_getter is not None
             else get_parallel().attn_tp_rank
         )
+        tp_size = get_parallel().tp_size
 
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
 
         if (
             is_cpu()
             and (
-                loaded_weight.size(0) % get_parallel().tp_size != 0
-                or loaded_weight.size(0) < get_parallel().tp_size * shard_size
+                loaded_weight.size(0) % tp_size != 0
+                or loaded_weight.size(0) < tp_size * shard_size
             )
             and loaded_weight.dim() == 1
         ):

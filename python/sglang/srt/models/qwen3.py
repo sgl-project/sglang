@@ -5,7 +5,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -26,6 +32,7 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    supports_quantized_rl_reload,
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -58,6 +65,65 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
 
+def aiter_fused_qk_norm_rope_set_kv(
+    qkv: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    rotary_emb: MRotaryEmbedding,
+    positions: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> torch.Tensor:
+    """QK-norm + 3D mRoPE + KV cache write in one aiter HIP kernel.
+
+    ``qkv`` is the (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim) QKV
+    projection; ``k_cache`` / ``v_cache`` are the NHD (slots, num_kv_heads,
+    head_dim) pool buffers. ``k_scale`` / ``v_scale`` must be CPU tensors: the
+    kernel reads them on the host. Returns q as (num_tokens, num_heads * head_dim).
+    """
+    num_tokens = qkv.shape[0]
+    q_out = torch.empty(
+        num_tokens, num_heads, head_dim, dtype=qkv.dtype, device=qkv.device
+    )
+    # The kernel reads cache strides as (block, token, head); an NHD buffer is
+    # one-slot blocks addressed with block_size=0.
+    fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+        qkv.view(num_tokens, -1, head_dim),
+        q_norm.weight,
+        k_norm.weight,
+        rotary_emb.cos_sin_cache_as(qkv.dtype),
+        positions,
+        num_tokens,
+        num_heads,
+        num_kv_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_emb.is_neox_style,
+        rotary_emb.mrope_section,
+        rotary_emb.mrope_interleaved,
+        q_norm.variance_epsilon,
+        q_out,
+        k_cache.unsqueeze(1),
+        v_cache.unsqueeze(1),
+        out_cache_loc,
+        k_scale,
+        v_scale,
+        None,
+        None,
+        False,
+        False,
+        0,
+        0,
+    )
+    return q_out.view(num_tokens, -1)
+
+
 class Qwen3Attention(nn.Module):
     def __init__(
         self,
@@ -79,9 +145,7 @@ class Qwen3Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.start_layer = start_layer
-        self.tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -102,7 +166,6 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_parallel().tp_rank
 
         norm_kwargs = (
             dict(
@@ -122,8 +185,7 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -131,8 +193,7 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -202,65 +263,26 @@ class Qwen3Attention(nn.Module):
         return q, k, v
 
     def forward_prepare_aiter_fused_mrope(
-        self, positions, hidden_states, forward_batch
+        self, positions, hidden_states, forward_batch, k_cache, v_cache
     ):
-        """Fused QK-norm + 3D mRoPE + KV cache write for decode (ROCm/aiter).
-
-        The fused HIP kernel replaces split → QK norm → mRoPE → cache write,
-        so KV is already in the paged cache when this returns.
-        Returns (q, None, None); caller must pass save_kv_cache=False to attn.
-        """
+        """Decode-only fused path; KV is already in the paged cache when this
+        returns, so the caller must pass save_kv_cache=False to attn."""
         qkv, _ = self.qkv_proj(hidden_states)
-        num_tokens = qkv.shape[0]
-
-        qkv_3d = qkv.view(num_tokens, -1, self.head_dim)
-
-        token_to_kv_pool = get_token_to_kv_pool()
-        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
-        slot_mapping = forward_batch.out_cache_loc
-
-        cos_sin = self.rotary_emb.cos_sin_cache
-        if cos_sin.dtype != qkv.dtype:
-            cos_sin = cos_sin.to(dtype=qkv.dtype)
-
-        q_out = torch.empty(
-            num_tokens,
-            self.num_heads,
-            self.head_dim,
-            dtype=qkv.dtype,
-            device=qkv.device,
-        )
-
-        fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-            qkv_3d,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            cos_sin,
+        q = aiter_fused_qk_norm_rope_set_kv(
+            qkv,
+            self.q_norm,
+            self.k_norm,
+            self.rotary_emb,
             positions,
-            num_tokens,
-            self.num_heads,
-            self.num_kv_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            self.rotary_emb.is_neox_style,
-            self.rotary_emb.mrope_section,
-            self.rotary_emb.mrope_interleaved,
-            self.q_norm.variance_epsilon,
-            q_out,
             k_cache,
             v_cache,
-            slot_mapping,
+            forward_batch.out_cache_loc,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
             self._fused_k_scale,
             self._fused_v_scale,
-            None,
-            None,
-            False,
-            False,
-            0,
-            0,
         )
-
-        q = q_out.reshape(num_tokens, -1)
         return q, None, None
 
     def forward(
@@ -273,15 +295,23 @@ class Qwen3Attention(nn.Module):
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
-        use_aiter_fused = (
+        use_aiter_fused = False
+        can_try_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
             and get_exec().deterministic.rl_on_policy_target is None
         )
+        if can_try_aiter_fused:
+            k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)
+            # The fused write targets the NHD layout in the activation dtype and
+            # does not apply per-layer KV scales.
+            use_aiter_fused = (
+                k_cache.dim() == 3 and k_cache.dtype == hidden_states.dtype
+            )
 
         if use_aiter_fused:
             q, k, v = self.forward_prepare_aiter_fused_mrope(
-                positions, hidden_states, forward_batch
+                positions, hidden_states, forward_batch, k_cache, v_cache
             )
             save_kv_cache = False
         elif not _is_npu:
@@ -351,6 +381,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
 
         norm_kwargs = (
@@ -370,18 +401,20 @@ class Qwen3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=False,
-            is_previous_layer_sparse=False,
-            is_next_layer_sparse=False,
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_deferred_ffn_reduction=False,
+
+    @staticmethod
+    def stage_facts(config: Qwen3Config, layer_id: int):
+        """The stages a Qwen3 layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(sparse=False, next_layer_sparse=False),
         )
 
     def forward(
@@ -389,15 +422,15 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        capture_output=None,
+    ) -> torch.Tensor:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
+        hidden_states = self.attn_boundary.prepare(
             hidden_states,
-            residual,
             forward_batch,
             post_residual_addition=post_residual_addition,
+            capture=capture_output,
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -407,9 +440,9 @@ class Qwen3DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
             hidden_states,
-            residual,
             forward_batch,
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
@@ -422,12 +455,11 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
-        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
-        return hidden_states, residual
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states
 
 
 class Qwen3Model(Qwen2Model):
@@ -444,6 +476,42 @@ class Qwen3Model(Qwen2Model):
             prefix=prefix,
             decoder_layer_type=Qwen3DecoderLayer,
             alt_stream=alt_stream,
+        )
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
+    ):
+        if self.pp_group.is_first_rank:
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            residual_batch.start(forward_batch)
+        else:
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
+        aux_hidden_states = AuxHiddenStateList()
+        for i in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[i](
+                positions,
+                hidden_states,
+                forward_batch,
+                capture_output=aux_hidden_states.capture
+                if i in self.layers_to_capture
+                else None,
+            )
+        if not self.pp_group.is_last_rank:
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
+        return (
+            (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
         )
 
 
@@ -554,6 +622,7 @@ class Qwen3ForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -561,19 +630,16 @@ class Qwen3ForCausalLM(nn.Module):
         # decoder layer
         for i in range(start, end):
             layer = self.model.layers[i]
-            forward_batch.hidden_states, forward_batch.residual = layer(
+            forward_batch.hidden_states = layer(
                 positions,
                 forward_batch.hidden_states,
                 forward_batch,
-                forward_batch.residual,
             )
 
         if end == self.model.config.num_hidden_layers:
-            # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
+            forward_batch.hidden_states = residual_batch.final_norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
             )
-            forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
@@ -591,6 +657,7 @@ class Qwen3ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @supports_quantized_rl_reload
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

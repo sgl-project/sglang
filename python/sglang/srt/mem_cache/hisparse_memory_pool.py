@@ -5,11 +5,16 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.kvcache.cache_move import copy_all_layer_kv_cache_func
 from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
     translate_padded_hisparse_locations,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    MHATokenToKVPool,
+    unwrap_write_loc,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -72,6 +77,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             skip_topk_layers=skip_topk_layers,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+        self.data_strides = torch.full_like(self.data_ptrs, self.bytes_per_token)
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (
@@ -104,20 +110,22 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
         loc = self.translate_loc_to_hisparse_device(loc)
         super().set_kv_buffer(layer, loc, cache_k, cache_v)
 
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
         loc = self.translate_loc_to_hisparse_device(loc)
         super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
@@ -129,6 +137,30 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    def transfer_values_on_device(
+        self, dst_indices: torch.Tensor, src_indices: torch.Tensor
+    ) -> None:
+        """Copy target MLA KV between physical slots, without remapping IDs."""
+        if src_indices.numel() == 0:
+            return
+        config = {
+            "bytes_per_tile": 128,
+            "byte_tiles": (self.bytes_per_token + 127) // 128,
+            "num_warps": 4,
+        }
+        for start in range(0, src_indices.numel(), 256):
+            src = src_indices[start : start + 256].contiguous()
+            dst = dst_indices[start : start + 256].contiguous()
+            copy_all_layer_kv_cache_func(
+                self.data_ptrs,
+                self.data_strides,
+                dst,
+                src,
+                src.numel(),
+                1 << (src.numel() - 1).bit_length(),
+                config,
+            )
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
@@ -210,8 +242,6 @@ class HiSparseMHAMainPool(MHATokenToKVPool):
         *args,
         **kwargs,
     ):
-        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
-
         raw_loc, _, _ = unwrap_write_loc(loc)
         translated = self.translate_loc_to_hisparse_device(raw_loc)
         super().set_kv_buffer(layer, translated, cache_k, cache_v, *args, **kwargs)

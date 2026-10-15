@@ -220,15 +220,13 @@ Develop SGLang's customized DeepGEMM package on the [`dev` branch of `sgl-projec
 
 ### Update sgl-deep-ep
 
-Develop `sgl-deep-ep` in [`sgl-project/DeepEP`](https://github.com/sgl-project/DeepEP). Use `sgl-deepep`, the implementation branch for CUDA 13 on x86_64 or aarch64. Merge packaging changes into `sgl-deepep-packaging`. The [`sgl-deep-ep` README](https://github.com/sgl-project/DeepEP/blob/sgl-deepep-packaging/sgl_deep_ep/README.md) describes the platform prerequisites and release matrix.
+Develop `sgl-deep-ep` in [`sgl-project/DeepEP`](https://github.com/sgl-project/DeepEP). Use `sgl-deepep` for both implementation and packaging changes for CUDA 13 on x86_64 or aarch64. The [`sgl-deep-ep` README](https://github.com/sgl-project/DeepEP/blob/sgl-deepep/sgl_deep_ep/README.md) describes the platform prerequisites and release matrix.
 
-To validate locally, check out the selected implementation branch as `DeepEP-source` and the packaging branch as `DeepEP-packaging`. Install the required build dependencies first. The following example builds a wheel for the host architecture, installs that exact wheel, and verifies that its guarded package import succeeds:
+To validate locally, check out `sgl-deepep` (or your development branch containing both the implementation and `sgl_deep_ep`) as `DeepEP-source`. Install the required build dependencies first. The following example builds a wheel for the host architecture, installs that exact wheel, and verifies that its guarded package import succeeds:
 
 ```bash
 DEEPEP_OUTPUT_DIR="$(mktemp -d)"
-bash DeepEP-packaging/sgl_deep_ep/build_sgl_deep_ep.sh \
-  DeepEP-source \
-  DeepEP-packaging/sgl_deep_ep \
+bash DeepEP-source/sgl_deep_ep/build_sgl_deep_ep.sh \
   "${DEEPEP_OUTPUT_DIR}" \
   13.0 \
   "$(uname -m)"
@@ -243,7 +241,7 @@ The import check validates packaging and binary loading, but not communication c
 python3 DeepEP-source/tests/elastic/test_ep.py --num-processes 8
 ```
 
-Adjust `--num-processes` to the available GPUs and run the internode or low-latency tests when those transports changed. After local validation, ask the SGLang team to run the [sgl-deep-ep release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepep.yml) with the new version and packaging ref. After verifying the published wheels for the supported Python versions and architectures, update the `sgl-deep-ep` pin in `python/pyproject.toml` before landing dependent SGLang changes.
+Adjust `--num-processes` to the available GPUs and run the internode or low-latency tests when those transports changed. After local validation, ask the SGLang team to run the [sgl-deep-ep release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepep.yml) with the new version and DeepEP ref. The workflow builds the implementation and packaging from that single ref (default: `sgl-deepep`). After verifying the published wheels for the supported Python versions and architectures, update the `sgl-deep-ep` pin in `python/pyproject.toml` before landing dependent SGLang changes.
 
 ## Tips for newcomers
 

@@ -12,7 +12,7 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import build_flat_input_top_logprobs_arrays
+from sglang.srt.managers.io_struct import build_flat_top_logprobs_arrays
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.runtime_context import get_exec
 
@@ -96,7 +96,7 @@ class SchedulerLogprobResultProcessor:
                 req.logprob.input_top_logprobs_val_flat,
                 req.logprob.input_top_logprobs_idx_flat,
                 req.logprob.input_top_logprobs_flat_null_prefix,
-            ) = build_flat_input_top_logprobs_arrays(
+            ) = build_flat_top_logprobs_arrays(
                 req.logprob.input_top_logprobs_val,
                 req.logprob.input_top_logprobs_idx,
                 req.logprob.top_logprobs_num,

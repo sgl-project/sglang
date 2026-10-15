@@ -13,9 +13,11 @@ from sglang.srt.managers.scheduler import Scheduler
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _make_req(is_retracted: bool) -> MagicMock:
+def _make_req(is_retracted: bool, holds_kv: bool = False) -> MagicMock:
     req = MagicMock()
     req.is_retracted = is_retracted
+    # Retracted and never-scheduled requests hold no request row.
+    req.kv.holds_kv = holds_kv
     return req
 
 
@@ -84,6 +86,18 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
         self.assertTrue(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_called_once()
+
+    def test_paused_flush_refuses_waiting_req_holding_kv(self):
+        """A PD-decode request whose KV has arrived waits holding its request
+        row; a paused flush would free KV it still owns."""
+        scheduler = self._new_scheduler()
+        scheduler.waiting_queue = [
+            _make_req(is_retracted=False),
+            _make_req(is_retracted=False, holds_kv=True),
+        ]
+
+        self.assertFalse(scheduler.flush_cache())
+        scheduler.tree_cache.reset.assert_not_called()
 
     def test_is_fully_idle_default_ignores_nothing(self):
         """Regression guard: every other is_fully_idle() caller passes no args,
