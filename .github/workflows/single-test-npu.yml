@@ -41,7 +41,7 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            "test/registered/npu/performance/qwen3_5_397b/test_npu_qwen3_5_397b_w4a8_8p_in128k_out1k_50ms.py"
+            #"test/registered/npu/performance/qwen3_5_397b/test_npu_qwen3_5_397b_w4a8_8p_in128k_out1k_50ms.py"
             "test/registered/npu/performance/qwen3_5_397b/test_npu_qwen3_5_397b_w4a8_8p_in128k_out1k_20ms.py"
             #"test/registered/npu/accuracy/glm4_7_flash/test_npu_glm4_7_flash_1p_aime25_gpqa.py"
             #"test/registered/npu/basic_function/malpo/test_npu_mlapo.py"
