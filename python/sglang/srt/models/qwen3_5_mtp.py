@@ -215,10 +215,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             col = start + (self.config.hidden_size if use_hidden else 0)
             self._fc_shard = self.fc.weight[:, col : col + width].contiguous()
             logger.info(
-                "MTP fc split active (input columns %d:%d of %d).",
+                "MTP fc split active (input columns %d:%d of %d; fused norm + GEMV: %s).",
                 col,
                 col + width,
                 2 * self.config.hidden_size,
+                "<= %d rows" % _FC_GEMV_MAX_TOKENS
+                if self._fc_gemv_rows is not None
+                else "off",
             )
         return True
 
