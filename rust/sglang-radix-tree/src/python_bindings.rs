@@ -501,6 +501,7 @@ pub struct TreeCoreInitParamsBinding {
     pub write_through_threshold: i64,
     pub device: String,
     pub swa_sliding_window_size: Option<usize>,
+    pub swa_cache_window_margin: usize,
     pub swa_req_ring: bool,
     pub enable_kv_cache_events: bool,
     pub dynamo_kv_event_format: bool,
@@ -522,6 +523,7 @@ impl TreeCoreInitParamsBinding {
             write_through_threshold: self.write_through_threshold,
             device: parse_device(&self.device)?,
             swa_sliding_window_size: self.swa_sliding_window_size,
+            swa_cache_window_margin: self.swa_cache_window_margin,
             swa_req_ring: self.swa_req_ring,
             // Wired post-construction via set_has_swa_host_pool.
             has_swa_host_pool: false,
@@ -536,7 +538,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, swa_cache_window_margin = 0))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -553,6 +555,7 @@ impl TreeCoreInitParamsBinding {
         tlru_tail_budget: usize,
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
+        swa_cache_window_margin: usize,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -565,6 +568,7 @@ impl TreeCoreInitParamsBinding {
             write_through_threshold,
             device,
             swa_sliding_window_size,
+            swa_cache_window_margin,
             swa_req_ring,
             enable_kv_cache_events,
             dynamo_kv_event_format,
