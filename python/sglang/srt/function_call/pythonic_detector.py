@@ -129,7 +129,7 @@ class PythonicDetector(BaseFormatDetector):
     def _find_matching_bracket(self, buffer: str, start: int) -> int:
         """
         Find the matching closing bracket for the opening bracket at start position.
-        Properly handles nested brackets.
+        Properly handles nested brackets and brackets inside strings.
 
         Args:
             buffer: The text buffer to search in
@@ -139,13 +139,35 @@ class PythonicDetector(BaseFormatDetector):
             Position of the matching closing bracket ']', or -1 if not found
         """
         bracket_count = 0
-        for i in range(start, len(buffer)):
-            if buffer[i] == "[":
+        quote = ""
+        i = start
+        while i < len(buffer):
+            char = buffer[i]
+            if quote:
+                if char == "\\":
+                    i += 2
+                    continue
+                if buffer.startswith(quote, i):
+                    i += len(quote)
+                    quote = ""
+                    continue
+                i += 1
+                continue
+            if char in ("'", '"'):
+                quote = char * 3 if buffer.startswith(char * 3, i) else char
+                i += len(quote)
+                continue
+            elif char == "#":
+                while i < len(buffer) and buffer[i] not in "\r\n":
+                    i += 1
+                continue
+            elif char == "[":
                 bracket_count += 1
-            elif buffer[i] == "]":
+            elif char == "]":
                 bracket_count -= 1
                 if bracket_count == 0:
                     return i
+            i += 1
         return -1  # No matching bracket found
 
     def _strip_and_split_buffer(self, buffer: str) -> tuple[str, str]:
