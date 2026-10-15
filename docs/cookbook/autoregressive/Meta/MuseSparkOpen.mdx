@@ -312,3 +312,96 @@ Finish reason: tool_calls
 </Accordion>
 
 This example inspects the requested tool calls; it does not fetch weather data. Your application executes the corresponding function. To continue the conversation, append the assistant message containing `tool_calls`, then a `role="tool"` message for each result with the matching `tool_call_id`, and send the updated messages with the same tool definitions.
+
+### 3.3 Encode Prefill Decode Disaggregation
+
+Encoder–Prefill–Decode (EPD) disaggregation separates media encoding, prompt processing, and token generation, so encoding-heavy image/video requests can be scheduled separately from language inference. The encoder sends features through `zmq_to_tokenizer`; prefill transfers KV state to decode through Mooncake, with a router exposing one client endpoint.
+
+The examples below use one 8× B300 NVLink host: encoder TP2 shares GPUs 0–1 with prefill TP4/EP4 on GPUs 0–3; decode TP4/EP4 uses GPUs 4–7. Run each command in a separate shell using the NVIDIA image from [Deployment](#deployment), with a shared host network. Start encoder, prefill, decode, then router, waiting for each to become ready. Prefill (`30001`), decode (`30002`), and router (`8000`) match the Playground ports; the encoder uses `30010`.
+
+<Note>
+These are simplified examples derived from [PR #265](https://github.com/radixark/sglang-muse-spark/pull/265). The source run checked transport with simulated outputs; this ordinary-serving configuration still needs runtime and accuracy validation. Leave GPU memory headroom for the encoder sharing the prefill GPUs.
+</Note>
+
+<Accordion title="Encoder server (B300, GPUs 0–1)">
+
+```bash Command
+CUDA_VISIBLE_DEVICES=0,1 sglang serve \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --quantization modelopt_fp4 \
+  --tp-size 2 \
+  --encoder-only \
+  --encoder-transfer-backend zmq_to_tokenizer \
+  --host 0.0.0.0 \
+  --port 30010
+```
+
+</Accordion>
+
+<Accordion title="Prefill server (B300, GPUs 0–3)">
+
+```bash Command
+export MC_INTRANODE_NVLINK=true
+export MC_TCP_ENABLE_CONNECTION_POOL=true
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 sglang serve \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --quantization modelopt_fp4 \
+  --moe-runner-backend flashinfer_trtllm \
+  --tp-size 4 --ep-size 4 \
+  --mem-fraction-static 0.8 \
+  --language-only \
+  --encoder-urls http://127.0.0.1:30010 \
+  --encoder-transfer-backend zmq_to_tokenizer \
+  --encoder-bootstrap-port 8997 \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998 \
+  --reasoning-parser muse --tool-call-parser muse \
+  --host 0.0.0.0 \
+  --port 30001
+```
+
+</Accordion>
+
+<Accordion title="Decode server (B300, GPUs 4–7)">
+
+```bash Command
+export MC_INTRANODE_NVLINK=true
+export MC_TCP_ENABLE_CONNECTION_POOL=true
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 sglang serve \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --quantization modelopt_fp4 \
+  --moe-runner-backend flashinfer_trtllm \
+  --tp-size 4 --ep-size 4 \
+  --mem-fraction-static 0.75 \
+  --language-only \
+  --encoder-urls http://127.0.0.1:30010 \
+  --encoder-transfer-backend zmq_to_tokenizer \
+  --encoder-bootstrap-port 8999 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998 \
+  --reasoning-parser muse --tool-call-parser muse \
+  --host 0.0.0.0 \
+  --port 30002
+```
+
+</Accordion>
+
+<Accordion title="Router">
+
+```bash Command
+sglang-router launch \
+  --pd-disaggregation \
+  --prefill http://127.0.0.1:30001 8998 \
+  --decode http://127.0.0.1:30002 \
+  --host 0.0.0.0 --port 8000
+```
+
+</Accordion>
+
+The language workers use distinct encoder-bootstrap ports (`8997` / `8999`) on this shared host; the router's `8998` matches the prefill KV bootstrap port. Send client requests to `http://localhost:8000/v1`. See the [EPD guide](/docs/advanced_features/epd_disaggregation) for the architecture and additional deployment options.
