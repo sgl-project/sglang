@@ -934,7 +934,9 @@ class InputLogprobProcessor:
                         )
 
                         target_token_ids = (
-                            logits_metadata.extend_input_logprob_token_ids_gpu[lp_lo:lp_hi]
+                            logits_metadata.extend_input_logprob_token_ids_gpu[
+                                lp_lo:lp_hi
+                            ]
                         ).long()
                         target_rows = torch.arange(
                             chunk_logprobs.shape[0],
@@ -948,7 +950,9 @@ class InputLogprobProcessor:
                         if logits_metadata.extend_token_ids_logprob:
                             explicit_plan = _build_token_ids_chunk_plan(
                                 logits_metadata.token_ids_logprobs[chunk_slice],
-                                logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice],
+                                logits_metadata.extend_logprob_pruned_lens_cpu[
+                                    chunk_slice
+                                ],
                                 split_len_token_ids,
                                 chunk_logprobs.shape[0],
                                 chunk_logprobs.device,
@@ -989,7 +993,9 @@ class InputLogprobProcessor:
                         if logits_metadata.extend_token_ids_logprob:
                             explicit_plan = _build_token_ids_chunk_plan(
                                 logits_metadata.token_ids_logprobs[chunk_slice],
-                                logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice],
+                                logits_metadata.extend_logprob_pruned_lens_cpu[
+                                    chunk_slice
+                                ],
                                 split_len_token_ids,
                                 0,
                                 chunk_logprobs.device,
