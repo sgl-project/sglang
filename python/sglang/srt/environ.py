@@ -1017,6 +1017,8 @@ class Envs:
     SGLANG_NPU_TP_MOE_SHARED_GMM1 = EnvBool(False)
     # An explicit mode overrides the legacy SHARED_GMM1 switch.
     SGLANG_NPU_TP_MOE_SHARED_GMM1_MODE = EnvStr("")
+    SGLANG_NPU_TP_MOE_NATIVE_NORM_MXFP8 = EnvBool(False)
+    SGLANG_NPU_TP_MOE_MXFP8_GATE = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
