@@ -1609,15 +1609,6 @@ class DeepseekV4AttnBackend(
             )
         return self._bcg_tail_buffers
 
-    def _prefill_graph_tail_routing_bound(
-        self, non_padded: torch.Tensor, real_rows: int
-    ) -> torch.Tensor:
-        if self._bcg_tail_num_token_non_padded is None:
-            self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
-        return torch.clamp(
-            non_padded, max=real_rows, out=self._bcg_tail_num_token_non_padded
-        )
-
     def _build_late_layer_tail_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -1876,9 +1867,14 @@ class DeepseekV4AttnBackend(
         )
         if tail.real_rows_count is not None:
             forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
-            if forward_batch.global_num_token_non_padded is not None:
-                bound = self._prefill_graph_tail_routing_bound(
-                    forward_batch.global_num_token_non_padded, tail.real_rows_count
+            non_padded = forward_batch.global_num_token_non_padded
+            if non_padded is not None:
+                if self._bcg_tail_num_token_non_padded is None:
+                    self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
+                bound = torch.clamp(
+                    non_padded,
+                    max=tail.real_rows_count,
+                    out=self._bcg_tail_num_token_non_padded,
                 )
                 forward_batch.global_num_token_non_padded = bound
                 forward_batch.num_token_non_padded = bound
