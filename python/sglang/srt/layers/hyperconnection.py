@@ -6,10 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.gemm.hc_mix import (
-    fused_hc_mix,
-    fused_hc_mix_supported,
-)
+from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
 
 
 @lru_cache(None)
@@ -248,8 +245,7 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
             if (
-                not self._packed_sum_weights
-                and self.hc_count == 4
+                self.hc_count == 4
                 and self.hidden_size == 2560
                 and config.hc_per_branch_norm
                 and config.params_dtype == torch.bfloat16
@@ -333,15 +329,11 @@ class GatedResidual(HyperConnectionBase):
         self,
         hyper_input: torch.Tensor,
         normalized_input: Optional[torch.Tensor] = None,
-        *,
-        use_sum_state: bool = False,
     ):
         state_type = _sum_state_type()
         is_state = isinstance(hyper_input, state_type)
         residual = hyper_input.residual if is_state else hyper_input
-        use_prepared = (
-            self._packed_sum_weights or use_sum_state or is_state
-        ) and self.can_use_sum_state(residual)
+        use_prepared = self._packed_sum_weights and self.can_use_sum_state(residual)
         if self._packed_sum_weights and not use_prepared:
             raise ValueError(
                 "Packed HC requires prepared weights and supported inference input"
@@ -448,7 +440,7 @@ class GatedResidual(HyperConnectionBase):
                         sum_sq=prepared_input.sum_sq.clone()
                     )
                 return self.mix(prepared_input)
-            return self.mix(residual, use_sum_state=True)
+            return self.mix(residual)
         return self.mix(residual, normalized_input=prepared_input)
 
     def combine_and_prepare(self, block_output, residuals, next_norm=None):

@@ -18,7 +18,6 @@ from sglang.kernels.ops.elementwise.hc_down_batched_sum import (
     _validate_batched_rows,
     allocate_batched_down_buffers,
     batched_down_from_sum,
-    prepare_batched_down_weights,
 )
 from sglang.kernels.ops.elementwise.hc_sum_state import HCSumState, _bootstrap_module
 
@@ -142,8 +141,8 @@ class LargeTSumHCShell:
         self,
         source,
         *,
-        down_weights=None,
-        norm_weight_permuted=None,
+        down_weights,
+        norm_weight_permuted,
         deterministic=False,
     ):
         self.eps = source.config.rms_norm_eps
@@ -156,20 +155,11 @@ class LargeTSumHCShell:
             raise ValueError(
                 "large-T sum-state requires per-branch RMS and finite positive epsilon"
             )
-        self.weights = (
-            prepare_batched_down_weights(
-                source.input_mix_weight_down.weight,
-                source.block_inject_weight.weight,
-                source.hc_norm.weight,
-                source.hc_count,
-            )
-            if down_weights is None
-            else down_weights
-        )
+        self.weights = down_weights
         w = self.weights
         if w.hidden_size % 512 or w.hidden_size > 16384:
             raise ValueError("Apply/sum requires H a positive multiple of 512 <=16384")
-        up, norm = source.input_mix_weight_up.weight, source.hc_norm.weight
+        up = source.input_mix_weight_up.weight
         if (
             up.shape != (4 * w.hidden_size, w.lowrank)
             or up.dtype != w.matrix.dtype
@@ -178,8 +168,6 @@ class LargeTSumHCShell:
             raise ValueError(
                 "Up weights must match prepared Down dimensions/device/dtype"
             )
-        if norm_weight_permuted is None:
-            norm_weight_permuted = norm.view(4, w.hidden_size).T.contiguous().flatten()
         if (
             norm_weight_permuted.shape != (4 * w.hidden_size,)
             or norm_weight_permuted.dtype != w.matrix.dtype

@@ -13,7 +13,6 @@ from sglang.kernels.ops.elementwise.hc_apply_sum import (
 )
 from sglang.kernels.ops.elementwise.hc_mix_raw import (
     hc_mix_raw,
-    prepare_raw_hc_weights,
     prepare_raw_hc_weights_from_batched,
 )
 from sglang.kernels.ops.elementwise.hc_raw_transition import _validate_state
@@ -57,8 +56,8 @@ class SmallTSumHCShell:
         self,
         source,
         *,
-        down_weights=None,
-        norm_weight_permuted=None,
+        down_weights,
+        norm_weight_permuted,
         deterministic=False,
     ):
         if not source.config.hc_per_branch_norm:
@@ -67,23 +66,11 @@ class SmallTSumHCShell:
         self.deterministic = deterministic
         if not math.isfinite(self.eps) or self.eps <= 0:
             raise ValueError("RMS epsilon must be positive and finite")
-        if down_weights is None:
-            if norm_weight_permuted is not None:
-                raise ValueError("shared RMS storage requires prepared Down weights")
-            self.weights = prepare_raw_hc_weights(
-                source.input_mix_weight_down.weight,
-                source.block_inject_weight.weight,
-                source.input_mix_weight_up.weight,
-                source.hc_norm.weight,
-                source.hc_count,
-            )
-        else:
-            self.weights = prepare_raw_hc_weights_from_batched(
-                down_weights,
-                source.input_mix_weight_up.weight,
-                source.hc_norm.weight.flatten(),
-                norm_weight_permuted=norm_weight_permuted,
-            )
+        self.weights = prepare_raw_hc_weights_from_batched(
+            down_weights,
+            source.input_mix_weight_up.weight,
+            norm_weight_permuted=norm_weight_permuted,
+        )
 
     def bootstrap(self, residual):
         rows, h = _validate_state(residual, self.weights.hc_count, self.eps)

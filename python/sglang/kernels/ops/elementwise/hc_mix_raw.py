@@ -22,7 +22,6 @@ class PreparedRawHCWeights(msgspec.Struct, frozen=True):
     hc_count: int
     hidden_size: int
     lowrank: int
-    branch_packed: bool = False
 
 
 @cache
@@ -37,10 +36,8 @@ def _gemm_runners():
 
 
 @torch.no_grad()
-def prepare_raw_hc_weights_from_batched(
-    weights, up, norm_weight, *, norm_weight_permuted=None
-):
-    """Share prepared Down and optional [H,C] RMS storage with large-T."""
+def prepare_raw_hc_weights_from_batched(weights, up, *, norm_weight_permuted):
+    """Share prepared Down and [H,C] RMS storage with large-T."""
     c, h, lowrank = weights.hc_count, weights.hidden_size, weights.lowrank
     matrix = weights.matrix
     if (
@@ -58,12 +55,6 @@ def prepare_raw_hc_weights_from_batched(
         or matrix.dtype not in (torch.bfloat16, torch.float16)
     ):
         raise ValueError("unsupported shared raw HC weight layout")
-    if norm_weight.shape != (c * h,) or norm_weight.dtype != matrix.dtype:
-        raise ValueError("RMS checkpoint must match prepared HC dimensions/dtype")
-    if norm_weight_permuted is None:
-        if norm_weight.device != matrix.device:
-            raise ValueError("RMS source must match the prepared HC device")
-        norm_weight_permuted = norm_weight.view(c, h).T.contiguous().flatten()
     for tensor, shape in ((up, (c * h, lowrank)), (norm_weight_permuted, (c * h,))):
         if (
             tensor.shape != shape
@@ -81,49 +72,6 @@ def prepare_raw_hc_weights_from_batched(
             (24, pad_lowrank(lowrank)), device=matrix.device, dtype=matrix.dtype
         ),
         c,
-        h,
-        lowrank,
-        branch_packed=True,
-    )
-
-
-@torch.no_grad()
-def prepare_raw_hc_weights(down, inject, up, norm_weight, hc_count=4):
-    if hc_count != 4 or down.ndim != 2:
-        raise ValueError("raw HC requires C=4 and a matrix Down weight")
-    lowrank, width = down.shape
-    h = width // hc_count
-    if (
-        width != hc_count * h
-        or h % 512
-        or not 0 < h <= 16384
-        or lowrank <= 0
-        or lowrank % 8
-        or lowrank + hc_count > pad_lowrank(lowrank)
-    ):
-        raise ValueError("unsupported raw HC hidden/lowrank geometry")
-    for w, shape in (
-        (inject, (hc_count, width)),
-        (up, (width, lowrank)),
-        (norm_weight, (width,)),
-    ):
-        if w.shape != shape or w.dtype != down.dtype or w.device != down.device:
-            raise ValueError(
-                "raw HC weights must have matching device/dtype and shapes"
-            )
-    if not down.is_cuda or down.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("raw HC requires CUDA BF16/FP16 weights")
-    # FP32 folding, one storage cast. This intentionally changes rounding
-    # compared with materializing a low-precision normalized activation.
-    packed = torch.cat((down, inject), dim=0)
-    folded = (packed.float() * (1.0 + norm_weight.float())).to(down.dtype)
-    norm_perm = norm_weight.view(hc_count, h).T.contiguous().flatten()
-    return PreparedRawHCWeights(
-        folded,
-        permute_pad_up_weight(up, hc_count),
-        norm_perm,
-        torch.zeros((24, pad_lowrank(lowrank)), device=down.device, dtype=down.dtype),
-        hc_count,
         h,
         lowrank,
     )
@@ -165,7 +113,7 @@ def hc_mix_raw(
     down_tactic = SplitKTactic(mma_m=64, mma_n=8, split_k=16, ab_stages=3)
     run_splitk_dense_silu_aux(
         residual,
-        weights.down_inject if weights.branch_packed else weights.down_inject.T,
+        weights.down_inject,
         t_pad[:, :packed_n],
         alpha,
         True,
@@ -175,7 +123,7 @@ def hc_mix_raw(
         "alpha_only",
         sum_sq=sum_sq,
         rms_eps=rms_eps,
-        branch_packed=weights.branch_packed,
+        branch_packed=True,
     )
     up_tactic = SplitKTactic(
         mma_m=64,

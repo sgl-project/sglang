@@ -405,7 +405,7 @@ class TestGatedResidualOps(CustomTestCase):
         layer.mix.reset_mock()
         changed = state.residual + 1
         GatedResidual.mix_prepared(layer, changed, state)
-        layer.mix.assert_called_once_with(changed, use_sum_state=True)
+        layer.mix.assert_called_once_with(changed)
 
     def test_prepared_sum_odd_slice_preserves_values_when_realigning(self):
         from sglang.srt.layers.hyperconnection import GatedResidual
