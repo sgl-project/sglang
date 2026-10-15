@@ -11,6 +11,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
+    Flux3PrimsTsMethodMixin,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_memory_usage_of_component,
     load_model_state_dict,
@@ -46,6 +50,19 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_config_cls = Flux3ImagePipelineConfig
     sampling_params_cls = Flux3ImageSamplingParams
     _required_config_modules: list[str] = []
+
+    def _reject_lora_on_packed_weights(self) -> None:
+        super()._reject_lora_on_packed_weights()
+        for layer in self.get_module("transformer").modules():
+            if (
+                isinstance(layer, LinearBase)
+                and isinstance(layer.quant_method, Flux3PrimsTsMethodMixin)
+                and layer.quant_method.prims_ts_role is not None
+            ):
+                raise ValueError(
+                    "Dynamic LoRA cannot wrap PrimsTS-prepared FLUX.3 weights. "
+                    "Start with --lora-path to load the generic quantized layout."
+                )
 
     def validate_disagg_role(self, role: RoleType) -> None:
         if role != RoleType.MONOLITHIC:

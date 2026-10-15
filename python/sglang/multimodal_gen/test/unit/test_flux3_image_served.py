@@ -606,6 +606,28 @@ class TestFlux3RequestControls(unittest.TestCase):
 
 
 class TestFlux3Lora(unittest.TestCase):
+    def test_rejects_late_lora_before_wrapping_prims_ts_weights(self):
+        from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+        from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
+            Flux3PrimsTsMethodMixin,
+            Flux3PrimsTsRole,
+        )
+        from sglang.multimodal_gen.runtime.pipelines.flux3_image import (
+            Flux3ImagePipeline,
+        )
+
+        layer = LinearBase.__new__(LinearBase)
+        torch.nn.Module.__init__(layer)
+        layer.quant_method = Flux3PrimsTsMethodMixin()
+        pipeline = Flux3ImagePipeline.__new__(Flux3ImagePipeline)
+        pipeline.modules = {"transformer": torch.nn.Sequential(layer)}
+        pipeline.lora_target_modules = None
+        pipeline._reject_lora_on_packed_weights()
+        layer.quant_method.prims_ts_role = Flux3PrimsTsRole.SWIGLU
+        with self.assertRaisesRegex(ValueError, "--lora-path"):
+            pipeline._reject_lora_on_packed_weights()
+        self.assertIs(pipeline.get_module("transformer")[0], layer)
+
     def test_prefixed_adapter_keys_reach_the_native_modules(self):
         """Prefixed adapters (BFL/ostris ``dit.``, diffusers ``transformer.``)
         must map onto the native DiT modules, not load onto 0 layers, and load
@@ -620,6 +642,7 @@ class TestFlux3Lora(unittest.TestCase):
         from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
             LoRAFormat,
             detect_lora_format_from_state_dict,
+            normalize_lora_state_dict,
         )
 
         # Resolved as LoRAPipeline.load_lora_adapter does: config, else the DiT.
@@ -630,7 +653,7 @@ class TestFlux3Lora(unittest.TestCase):
         param_map = get_param_names_mapping(
             arch.param_names_mapping or Flux3ImageDiT.param_names_mapping
         )
-        for prefix in ("dit.", "transformer."):
+        for prefix in ("", "dit.", "transformer."):
             targets = {
                 f"{prefix}single_blocks.0.q_proj.lora_A.weight": (
                     "single_blocks.0.to_qkv.lora_A"
@@ -646,6 +669,13 @@ class TestFlux3Lora(unittest.TestCase):
             self.assertEqual(
                 detect_lora_format_from_state_dict(state), LoRAFormat.STANDARD
             )
+            self.assertEqual(set(normalize_lora_state_dict(state)), set(state))
+        self.assertEqual(
+            detect_lora_format_from_state_dict(
+                {"single_blocks.0.linear1.lora_A.weight": torch.zeros(1)}
+            ),
+            LoRAFormat.AI_TOOLKIT_FLUX,
+        )
 
 
 class TestFlux3TextEncoder(unittest.TestCase):
