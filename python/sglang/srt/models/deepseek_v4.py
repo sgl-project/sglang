@@ -651,15 +651,6 @@ def _freqs_cis_to_cos_sin(
     return cos, sin
 
 
-def _freqs_cis_to_cos_sin_table(freqs_cis: torch.Tensor) -> torch.Tensor:
-    key = (id(freqs_cis), torch.float32, freqs_cis.device, "table")
-    cached = _FREQS_CIS_TO_COS_SIN.get(key)
-    if cached is None:
-        cos, sin = _freqs_cis_to_cos_sin(freqs_cis, torch.float32, freqs_cis.device)
-        cached = _FREQS_CIS_TO_COS_SIN[key] = torch.cat((cos, sin), dim=-1)
-    return cached
-
-
 def _fp8_wo_a_einsum(
     o_fp8: torch.Tensor,
     o_s: torch.Tensor,
@@ -1335,12 +1326,13 @@ class MQALayer(MqaAttentionBase):
         if not self.use_mega_attention:
             return
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+            cos_sin_table,
             interleave_output_columns,
             interleave_query_rows,
             quantize_wo_a,
         )
 
-        self.mega_cos_sin_cache = _freqs_cis_to_cos_sin_table(self.freqs_cis)
+        self.mega_cos_sin_cache = cos_sin_table(self.freqs_cis)
         self.mega_wq_b_permuted = (
             self.n_local_heads in (64, 128) and self._wq_b_uses_flashinfer_mxfp8()
         )

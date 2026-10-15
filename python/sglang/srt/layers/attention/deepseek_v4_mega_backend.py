@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -11,6 +12,11 @@ from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBacken
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 HEAD_DIM = 512
+
+
+@lru_cache(2)
+def cos_sin_table(freqs_cis: torch.Tensor) -> torch.Tensor:
+    return torch.view_as_real(freqs_cis).transpose(1, 2).reshape(len(freqs_cis), -1)
 
 
 def interleave_query_rows(x: torch.Tensor, num_heads: int) -> torch.Tensor:
