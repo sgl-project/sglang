@@ -380,6 +380,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.tokenizer = None
         scheduler.dllm_config = _Scheduler(fdfo=False).dllm_config
         scheduler._maybe_namespace_elastic_radix_cache = Mock()
+        scheduler._record_kv_event_lora_name = Mock()
         scheduler._add_request_to_queue = Mock()
         scheduler.init_req_max_new_tokens = Mock()
         scheduler.output_streamer = Mock()
