@@ -152,8 +152,10 @@ __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
 // software cast below. Testing FNUZ too because HIP sets both macros on the host pass and
 // on targets outside its list. Clip rather than ask for __HIP_SATFINITE: the x2 fast path
 // converts the value it was handed, not the clamped one (ROCm 7.2).
+template <int FP8_MAX = 448>
 __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
-  const float2 v{fmaxf(fminf(x, kFP8Max), -kFP8Max), fmaxf(fminf(y, kFP8Max), -kFP8Max)};
+  constexpr float kMax = static_cast<float>(FP8_MAX);
+  const float2 v{fmaxf(fminf(x, kMax), -kMax), fmaxf(fminf(y, kMax), -kMax)};
   return __hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3);
 }
 #else
