@@ -1,19 +1,24 @@
-"""Penalty history in per-request rows, keyed by req_pool_idx.
+"""Penalty history in per-request rows, found through a slot -> row table.
 
-`PenaltyStore` is one per scheduler: `alloc` (re)sets a request's row to the
-history of its `output_ids` each time it enters an extend step, and the
-pool's free-slot hook frees the row with the slot.
+`PenaltyStore` is one per scheduler: `alloc` gives a penalized request a row
+on `req.kv.penalty_row` and (re)sets it to the history of its `output_ids`
+each time the request enters an extend step; the request's release path
+(`free_req_slot`) frees the row with the request's slot.
 
 Invariants:
 - Only a request whose params use a penalty holds a row; a step without one
   has no `StepPenalties`.
 - A row holds history only (per-token output counts and the output length);
   penalty values come from the request's params at build.
-- Host calls (`alloc`, `free`, `build`) update only the host maps; device rows
-  are grown, reset, read, and written only on the sampling stream, so a step
-  sees exactly the tokens of the steps sampled before it.
-- A slot is not reallocated between the build of a step holding it and that
-  step's sampling; a row freed in between may still take the step's commit,
+- Host calls (`alloc`, `free`, `build`) update only host state and queue
+  device writes; the table and the rows are written, grown, reset, and read
+  only on the sampling stream, so a step sees exactly the tokens of the steps
+  sampled before it.
+- A step finds its rows in the table at sampling, from its slots. `free`
+  leaves the table entry, so a step still holding a freed slot (a finished
+  request's last decode under overlap) reads the row it was built with; a
+  slot is not reallocated between the build of a step holding it and that
+  step's sampling. A row freed in between may still take the step's commit,
   and its next `alloc` resets it.
 """
 
@@ -52,40 +57,60 @@ def _to_device(data, dtype: torch.dtype, device, pin: bool) -> torch.Tensor:
     return torch.tensor(data, dtype=dtype, pin_memory=pin).to(device, non_blocking=True)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class PenaltyRow:
+    """A request's row in its store; `req.kv` holds it from `alloc` until the
+    request's slot is freed."""
+
+    store: PenaltyStore
+    index: int
+
+
 class PenaltyStore:
-    def __init__(self, vocab_size: int, device):
+    def __init__(self, vocab_size: int, num_slots: int, device):
         self.vocab_size = vocab_size
         self.device = device
         self.pin = is_pin_memory_available(device)
-        self.row_of_slot: Dict[int, int] = {}
+        self.num_rows = 0
         self.free_rows: List[int] = []
+        # Table entries to write before their next device use.
+        self.pending_slots: Dict[int, int] = {}
         # Rows to reset before their next device use, with the tokens to replay.
         self.pending_init: Dict[int, List[int]] = {}
+        # The row of each request slot, like req_to_token: -1 until the slot's
+        # first penalized request; a freed slot keeps its entry until the next
+        # alloc into it.
+        self.slot_to_row = torch.full(
+            (num_slots,), -1, dtype=torch.int32, device=device
+        )
         self.counts = torch.zeros((0, vocab_size), dtype=torch.int32, device=device)
         self.lens = torch.zeros((0,), dtype=torch.int32, device=device)
 
     def alloc(self, req) -> None:
         if not uses_penalty(req.sampling_params):
             return
-        slot = req.kv.req_pool_idx
-        row = self.row_of_slot.get(slot)
-        if row is None:
-            row = self.free_rows.pop() if self.free_rows else len(self.row_of_slot)
-            self.row_of_slot[slot] = row
+        kv = req.kv
+        if kv.penalty_row is None:
+            if self.free_rows:
+                index = self.free_rows.pop()
+            else:
+                index = self.num_rows
+                self.num_rows += 1
+            kv.penalty_row = PenaltyRow(self, index)
+        row = kv.penalty_row.index
+        self.pending_slots[kv.req_pool_idx] = row
         self.pending_init[row] = list(req.output_ids)
 
-    def free(self, req_pool_idx: int) -> None:
-        row = self.row_of_slot.pop(req_pool_idx, None)
-        if row is None:
-            return
+    def free(self, kv) -> None:
+        row = kv.penalty_row.index
+        kv.penalty_row = None
         self.pending_init.pop(row, None)
         self.free_rows.append(row)
 
     def _flush(self) -> None:
-        num_rows = len(self.row_of_slot) + len(self.free_rows)
         capacity = self.counts.shape[0]
-        if capacity < num_rows:
-            new_capacity = max(num_rows, 2 * capacity)
+        if capacity < self.num_rows:
+            new_capacity = max(self.num_rows, 2 * capacity)
             counts = torch.zeros(
                 (new_capacity, self.vocab_size), dtype=torch.int32, device=self.device
             )
@@ -93,6 +118,14 @@ class PenaltyStore:
             lens = torch.zeros((new_capacity,), dtype=torch.int32, device=self.device)
             lens[:capacity] = self.lens
             self.counts, self.lens = counts, lens
+
+        if self.pending_slots:
+            slots = list(self.pending_slots)
+            rows = list(self.pending_slots.values())
+            self.pending_slots.clear()
+            self.slot_to_row[_to_device(slots, torch.int64, self.device, self.pin)] = (
+                _to_device(rows, torch.int32, self.device, self.pin)
+            )
 
         if not self.pending_init:
             return
@@ -115,6 +148,11 @@ class PenaltyStore:
                 torch.ones(len(replay_rows), dtype=torch.int32, device=self.device),
                 accumulate=True,
             )
+
+    def rows(self, slots: torch.Tensor) -> torch.Tensor:
+        """The rows of the requests in the slots."""
+        self._flush()
+        return self.slot_to_row[slots]
 
     def gather(self, rows: torch.Tensor) -> torch.Tensor:
         """The rows' token counts."""
@@ -155,13 +193,14 @@ class PenaltyStore:
 
 @dataclasses.dataclass(frozen=True)
 class StepPenalties:
-    """The penalized requests of one step: their rows and penalty params."""
+    """The penalized requests of one step: their slots and penalty params."""
 
     store: PenaltyStore
     batch_size: int
-    # [n] step positions of the penalized requests, and their rows in the store.
+    # [n] step positions of the penalized requests, and their slots; their rows
+    # are read from the store's table at sampling.
     positions: torch.Tensor
-    rows: torch.Tensor
+    slots: torch.Tensor
     # [n, 1] per penalized request, None when none of them uses that penalty.
     frequency: Optional[torch.Tensor]
     presence: Optional[torch.Tensor]
@@ -174,25 +213,31 @@ class StepPenalties:
     def build(
         cls,
         reqs: Sequence,
+        req_pool_indices: Optional[torch.Tensor],
         store: Optional[PenaltyStore],
         device,
     ) -> Optional[StepPenalties]:
+        """req_pool_indices: the step's slots on the device, in request order."""
         positions = [i for i, r in enumerate(reqs) if uses_penalty(r.sampling_params)]
         if not positions:
             return None
-        if store is None:
-            raise RuntimeError("requests use sampling penalties but no PenaltyStore")
-        rows = []
+        if store is None or req_pool_indices is None:
+            raise RuntimeError(
+                "requests use sampling penalties but no PenaltyStore or slots"
+            )
         for i in positions:
-            row = store.row_of_slot.get(reqs[i].kv.req_pool_idx)
-            if row is None:
+            if reqs[i].kv.penalty_row is None:
                 raise RuntimeError(
-                    f"request {reqs[i].rid} uses sampling penalties but its slot "
-                    "holds no penalty row; PenaltyStore.alloc was not called"
+                    f"request {reqs[i].rid} uses sampling penalties but holds no "
+                    "penalty row; PenaltyStore.alloc was not called"
                 )
-            rows.append(row)
 
         pin = is_pin_memory_available(device)
+        positions_device = _to_device(positions, torch.int64, device, pin)
+        if len(positions) == len(reqs):
+            slots = req_pool_indices[: len(reqs)]
+        else:
+            slots = req_pool_indices[positions_device]
         params = [reqs[i].sampling_params for i in positions]
 
         def per_row(values, dtype, needed):
@@ -229,8 +274,8 @@ class StepPenalties:
         return cls(
             store=store,
             batch_size=len(reqs),
-            positions=_to_device(positions, torch.int64, device, pin),
-            rows=_to_device(rows, torch.int64, device, pin),
+            positions=positions_device,
+            slots=slots,
             frequency=frequency,
             presence=presence,
             repetition=repetition,
@@ -240,7 +285,8 @@ class StepPenalties:
 
     def logit_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Return (additive, scaling) [batch_size, vocab] penalties, each None if unused."""
-        counts = self.store.gather(self.rows)
+        rows = self.store.rows(self.slots)
+        counts = self.store.gather(rows)
         vocab_size = self.store.vocab_size
         device = counts.device
         # The tokens each row has output, for presence and repetition.
@@ -264,7 +310,7 @@ class StepPenalties:
             if self.presence is not None:
                 additive.addcmul_(present, self.presence, value=-1)
             if self.min_new_tokens is not None:
-                lens = self.store.gather_lens(self.rows)
+                lens = self.store.gather_lens(rows)
                 stop_penalties = torch.zeros(
                     (counts.shape[0], vocab_size + 1),
                     dtype=torch.float32,
@@ -309,7 +355,7 @@ class StepPenalties:
             token_ids = token_ids[self.positions]
             if accept_mask is not None:
                 accept_mask = accept_mask[self.positions]
-        self.store.accumulate(self.rows, token_ids, accept_mask)
+        self.store.accumulate(self.store.rows(self.slots), token_ids, accept_mask)
 
 
 def _stop_token_ids(req) -> List[int]:

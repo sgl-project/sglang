@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -45,6 +46,7 @@ class _FakeReq:
         self.beam_group = None
         self.session = None
         self.multimodal_inputs = None
+        self.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []
@@ -109,6 +111,9 @@ class TestQueuedLimitAbort(CustomTestCase):
         intake.request_retirer = RequestRetirer(
             kv=SimpleNamespace(tree_cache=intake.tree_cache),
             beam_coordinator=intake.beam_coordinator,
+            hisparse_coordinator=None,
+            decode_offload_manager=None,
+            pending=PendingSteps(),
             output_streamer=MagicMock(),
             ipc_channels=intake.ipc_channels,
         )

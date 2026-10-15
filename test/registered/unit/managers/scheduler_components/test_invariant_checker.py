@@ -13,13 +13,14 @@ maybe_stub_sgl_kernel()
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.request_lists import CoreLists
+from sglang.srt.managers.request_lists import CoreLists, RequestList
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
     kv_private_swa_tokens,
@@ -61,6 +62,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             pool_stats_observer=MagicMock(),
             counters=LaunchCounters(),
             core_lists=CoreLists(),
+            pending=PendingSteps(),
             scheduler_stage_metrics=None,
         )
 
@@ -199,6 +201,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             pool_stats_observer=observer,
             counters=self.counters,
             core_lists=self.core_lists,
+            pending=PendingSteps(),
             scheduler_stage_metrics=None,
         )
 
@@ -356,6 +359,18 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         )
         self.assertTrue(leak, msg)
         self.assertIn("align", msg.lower())
+
+
+class TestNoFinishedRequestInLists(CustomTestCase):
+    def test_only_a_releasing_list_holds_finished_requests(self):
+        live = SimpleNamespace(rid="live", finished=lambda: False)
+        done = SimpleNamespace(rid="done", finished=lambda: True)
+        check = SchedulerInvariantChecker.check_no_finished_reqs
+
+        check({"releasing": RequestList(name="releasing", reqs=[done], releasing=True)})
+        check({"decoding": RequestList(name="decoding", reqs=[live])})
+        with self.assertRaisesRegex(AssertionError, "'decoding' list: \\['done'\\]"):
+            check({"decoding": RequestList(name="decoding", reqs=[live, done])})
 
 
 if __name__ == "__main__":

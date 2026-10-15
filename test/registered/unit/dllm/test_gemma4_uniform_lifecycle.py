@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_retirer
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -80,6 +81,14 @@ class _Batch:
 
 
 def _manager(*, fdfo, block_size=4, context_len=128):
+    kv = SimpleNamespace(
+        tree_cache=object(),
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free_group_begin=Mock(),
+            free_group_end=Mock(),
+        ),
+    )
     return DllmManager(
         dllm_config=DllmConfig(
             algorithm="Gemma4Renoise",
@@ -90,14 +99,7 @@ def _manager(*, fdfo, block_size=4, context_len=128):
             first_done_first_out_mode=fdfo,
             requires_separate_context_encoding=True,
         ),
-        kv=SimpleNamespace(
-            tree_cache=object(),
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=SimpleNamespace(
-                free_group_begin=Mock(),
-                free_group_end=Mock(),
-            ),
-        ),
+        kv=kv,
         services=SimpleNamespace(
             metrics_sink=SimpleNamespace(
                 num_generated_tokens=0,
@@ -117,7 +119,7 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         context_len=context_len,
         beam_coordinator=None,
         step_builder=None,
-        request_retirer=Mock(),
+        request_retirer=make_request_retirer(kv=kv),
     )
 
 
@@ -282,7 +284,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         state = {"step": 7}
         next_canvas = torch.tensor([9, 8, 7, 6])
 
-        with patch("sglang.srt.dllm.manager.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             manager._write_blocks(
                 _Batch([req]),
                 _result(
@@ -323,7 +327,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         req.finish_on_update = True
         canvas = torch.tensor([3, 2, 1, 0])
 
-        with patch("sglang.srt.dllm.manager.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             manager._write_blocks(_Batch([req]), _result([canvas]))
 
         release.assert_called_once_with(req, manager.tree_cache, checkpoint=False)
@@ -341,7 +347,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                     algo_states=[None] if fdfo else None,
                 )
 
-                with patch("sglang.srt.dllm.manager.release_kv_cache") as release:
+                with patch(
+                    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+                ) as release:
                     manager._write_blocks(_Batch([req]), result)
 
                 self.assertTrue(req.finished())

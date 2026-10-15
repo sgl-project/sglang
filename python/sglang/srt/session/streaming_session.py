@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.common import free_req_slot
 from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
@@ -234,7 +235,7 @@ class StreamingSession:
 
         if slot.kv.holds_kv:
             self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
-            self.cache.req_to_token_pool.free(slot)
+            free_req_slot(self.cache.req_to_token_pool, slot)
 
         self._free_slot_mamba(slot)
 

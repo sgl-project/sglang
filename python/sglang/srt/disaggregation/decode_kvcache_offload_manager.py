@@ -220,8 +220,8 @@ class DecodeKVCacheOffloadManager:
             incremental_indices
         )
 
-        # Prefill-aligned GPU slots are freed at request finish in
-        # _release_finished_req, NOT here. The decoding request
+        # Prefill-aligned GPU slots are freed at request finish by
+        # RequestRetirer.retire_offloaded, NOT here. The decoding request
         # continues to attend to those slots via req_to_token; freeing
         # them mid-decode races with concurrent admission, which can
         # reuse the slots and produce cross-pollinated KV reads.
@@ -259,8 +259,8 @@ class DecodeKVCacheOffloadManager:
 
     def check_offload_progress(self, releasing: List[Req]) -> List[Req]:
         """Check the progress of offload from device to host and backup from
-        host to storage. A request of ``releasing`` whose last copy landed has
-        its KV released; returns those requests."""
+        host to storage. Returns the requests of ``releasing`` whose last copy
+        landed; their KV can be released."""
         cc = self.cache_controller
 
         qsizes = torch.tensor(
@@ -333,7 +333,6 @@ class DecodeKVCacheOffloadManager:
                 # at finish, or moves there while a copy is in flight.
                 req = self._find_releasing(releasing, rid, ack_id)
                 if req is not None and not self.has_inflight_offload(req):
-                    self._release_finished_req(req)
                     released.append(req)
             finish_count -= 1
         return released
@@ -347,25 +346,6 @@ class DecodeKVCacheOffloadManager:
             if req.rid == rid and state is not None and ack_id in state.ack_ids:
                 return req
         return None
-
-    def _release_finished_req(self, req: Req):
-        # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
-        # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (double free, double unlock).
-        if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
-            return
-
-        # Released only at request finish; a mid-decode free races with
-        # concurrent admission over live slots. The prefix the prealloc match
-        # took from the tree stays with the tree: not freed, only unlocked.
-        self.tree_cache.free_kv_row(
-            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
-        )
-        self.tree_cache.unlock(req.lock)
-        req.lock = None
-        self.req_to_token_pool.free(req)
-        req.kv.mark_kv_released()
-        req.disagg.offload = None
 
     def _check_backup_progress(self, finish_count):
         """Check the progress of backup from host to storage."""
@@ -422,9 +402,3 @@ class DecodeKVCacheOffloadManager:
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
         return page_hashes
-
-    def finalize_release_on_finish(self, req: Req):
-        """Free any remaining tail KV that was not offloaded due to non-aligned length."""
-        if self.has_inflight_offload(req):
-            return
-        self._release_finished_req(req)

@@ -80,6 +80,8 @@ class DisaggregationDecodeRadixCacheTestMixin:
             request_length=384,
             output_length=64,
             max_parallel=4,
+            # The load balancer does not serve /server_info.
+            page_size=decode_info["page_size"],
         )
         self.assertGreater(
             result["overall"]["total_cached_tokens"],

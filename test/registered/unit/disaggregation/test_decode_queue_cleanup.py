@@ -32,10 +32,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     LaunchCounters,
 )
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
-from sglang.srt.managers.scheduler_components.mode_stages import (
-    ModeStages,
-    ScheduleSlot,
-)
+from sglang.srt.managers.scheduler_components.mode_stages import ModeStages
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -101,6 +98,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         ]
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.retracted_queue = reqs.copy()
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
@@ -112,13 +110,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_overlap = False
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
-            return_value=(physical_available, physical_available)
-        )
-        queue._allocatable_token_budgets = MagicMock(
-            side_effect=lambda _decoding, **_: physical_available
-        )
-        queue._swa_tail_allocatable_token_budget = MagicMock(
-            side_effect=lambda _decoding, **_: physical_available
+            side_effect=lambda _decoding, **_: (physical_available, physical_available)
         )
 
         def pre_alloc(_req):
@@ -135,10 +127,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(physical_available, 3 * page_size)
         self.assertEqual(queue._pre_alloc.call_count, 3)
 
-    def test_overlap_resume_restores_after_inflight_forward(self):
-        # Under overlap, a request finished at the last commit can still have
-        # its redundant decode step in flight, writing a slot the resumed
-        # request may reuse: the restore waits for that forward first.
+    def test_overlap_resume_restores_without_waiting_on_the_forward(self):
+        # A released request's slot and written pages go back only at the
+        # commit of the last pending step that carries it, so the slot a
+        # resumed request takes is written by no forward in flight.
         override = get_context().override_server_args(
             disaggregation_decode_retraction_backup="cpu_tensor"
         )
@@ -158,29 +150,22 @@ class TestDecodeQueueCleanup(CustomTestCase):
             )
             for i in range(2)
         ]
-        forward_stream = object()
-        schedule_stream = MagicMock()
-        schedule_stream.wait_stream.side_effect = lambda s: events.append(("wait", s))
-
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.retracted_queue = reqs.copy()
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
         queue.token_to_kv_pool_allocator = MagicMock(page_size=1)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.tree_cache = MagicMock()
-        queue.enable_overlap = True
-        queue.schedule_stream = schedule_stream
-        queue.forward_stream = forward_stream
-        queue._uses_swa_reservation = MagicMock(return_value=False)
-        queue._allocatable_token_budgets = MagicMock(return_value=4096)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(
+            return_value=(4096, None)
+        )
         queue._prealloc_required_tokens = MagicMock(return_value=(8, 0))
         queue._prealloc_reservation_fits = MagicMock(return_value=True)
         queue._pre_alloc = MagicMock()
 
         self.assertEqual(queue.resume_retracted_reqs([]), reqs)
-        self.assertEqual(
-            events, [("wait", forward_stream), ("restore", 0), ("restore", 1)]
-        )
+        self.assertEqual(events, [("restore", 0), ("restore", 1)])
 
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
@@ -196,6 +181,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pp_size = 1
         queue.tp_rank = 0
         queue.gloo_group = object()
@@ -208,7 +194,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # off, so this abort path needs one even though it never allocates.
         queue.token_to_kv_pool_allocator = MagicMock()
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(0, None))
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         queue.enable_priority_scheduling = False
@@ -254,6 +240,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]  # same object, dual ownership
@@ -265,7 +252,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # off, so this abort path needs one even though it never allocates.
         queue.token_to_kv_pool_allocator = MagicMock()
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(0, None))
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         queue.enable_priority_scheduling = False
@@ -302,6 +289,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]
@@ -358,6 +346,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
         # A req whose kv_receiver was already cleared must not crash on .abort().
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue._max_ensure_retries = 1
         queue._ensure_retry_interval = 0
         queue._ensure_retry_count = {"127.0.0.1:11500": 0}
@@ -394,6 +383,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         first = decode_req(7)
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pending_reqs = [first]
         queue._prefill_dp_rank_queries = {}
         queue.kv_manager = SimpleNamespace(
@@ -419,7 +409,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_transfer_failure_cleanup_respects_deferred_release_gates(
@@ -447,9 +437,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
-        queue.batch_result_processor = SimpleNamespace(
-            release_finished_req=tree_release(queue)
-        )
+        queue.request_retirer = SimpleNamespace(retire_finished=tree_release(queue))
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
@@ -535,7 +523,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIs(receiver.kv_mgr, manager)
         self.assertFalse(receiver.abort_notified)
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_failed_fake_transfer_releases_at_once_under_deferred_release(
@@ -565,9 +553,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
-        queue.batch_result_processor = SimpleNamespace(
-            release_finished_req=tree_release(queue)
-        )
+        queue.request_retirer = SimpleNamespace(retire_finished=tree_release(queue))
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
@@ -639,7 +625,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         manager.cache_controller = MagicMock(ack_write_queue=[])
         manager.cache_controller.ack_backup_queue.qsize.return_value = 0
         manager._trigger_backup = MagicMock()
-        manager._release_finished_req = MagicMock()
         out = []
         for rid, finished, ack_ids in reqs:
             req = MagicMock(rid=rid, disagg=DisaggReqState())
@@ -651,6 +636,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             out.append(req)
         owner = scheduler.disagg_decode
         owner.decode_offload_manager = manager
+        owner.request_retirer = MagicMock()
         scheduler.decode_offload_manager = manager
         scheduler.stages = ModeStages(
             schedule=MagicMock(), hold_finished=owner.hold_finished
@@ -678,7 +664,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         # The commit: finished requests leave decoding; the one whose release
         # waits on a copy moves into releasing, the live one keeps decoding.
-        scheduler.leave_finished_reqs(ScheduleSlot())
+        scheduler.leave_finished_reqs()
         self.assertEqual(scheduler.lists.decoding, [live])
         self.assertEqual(owner.releasing, [done])
         assert_one_list_per_request(scheduler)
@@ -688,12 +674,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self._land(manager, 1, 3)
         owner.check_offload_progress()
         self.assertEqual(owner.releasing, [done])
-        manager._release_finished_req.assert_not_called()
+        owner.request_retirer.retire_offloaded.assert_not_called()
 
         self._land(manager, 2)
         owner.check_offload_progress()
         self.assertEqual(owner.releasing, [])
-        manager._release_finished_req.assert_called_once_with(done)
+        owner.request_retirer.retire_offloaded.assert_called_once_with(done)
         assert_one_list_per_request(scheduler)
 
     def test_abort_leaves_releasing_requests_to_their_ack(self):
@@ -708,7 +694,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         registry.abort_request(AbortReq(abort_all=True))
 
         self.assertEqual(owner.releasing, [done])
-        manager._release_finished_req.assert_not_called()
+        owner.request_retirer.retire_offloaded.assert_not_called()
         self._land(manager, 1)
         owner.check_offload_progress()
         self.assertEqual(owner.releasing, [])
@@ -728,6 +714,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def test_abort_reaches_held_rebootstrap_requests(self):
         held, kept = MagicMock(rid="held-1"), MagicMock(rid="other")
+        # A held request owns no KV: the retraction released it.
+        held.kv.holds_kv = held.kv.holds_mamba = False
         scheduler = self._decode_scheduler(held=[held, kept])
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
@@ -737,6 +725,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         retirer = RequestRetirer(
             kv=MagicMock(),
             beam_coordinator=MagicMock(),
+            hisparse_coordinator=None,
+            decode_offload_manager=None,
+            pending=PendingSteps(),
             output_streamer=MagicMock(),
             ipc_channels=scheduler.ipc_channels,
         )
@@ -833,7 +824,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             )
         self.assertEqual(polls, [KVPoll.Transferring])
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     def test_pop_transferred_branches_on_reduced_poll_only(
         self, mock_prepare_abort, mock_release_kv_cache
@@ -848,9 +839,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.req_to_metadata_buffer_idx_allocator = MagicMock()
             queue.tp_rank = 0
             queue.tree_cache = MagicMock()
-            queue.batch_result_processor = SimpleNamespace(
-                release_finished_req=tree_release(queue)
-            )
+            queue.request_retirer = SimpleNamespace(retire_finished=tree_release(queue))
             queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()

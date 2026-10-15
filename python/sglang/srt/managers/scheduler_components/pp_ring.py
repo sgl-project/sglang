@@ -84,7 +84,7 @@ class RingSlot:
     """One microbatch slot of the ring: what it schedules for, and what it
     launched."""
 
-    # Its decoding requests and admission flag.
+    # Its decoding requests.
     schedule_slot: ScheduleSlot
     # The record of the step it launched last; None when it launched nothing.
     # A record is pending until the ring commits it.
@@ -197,8 +197,7 @@ class PPRing:
                     pd.take_ids(mb_id)
 
                 # Schedule the slot's step from the requests tagged with it;
-                # each slot admits up to its own batch size, under its own
-                # admission flag.
+                # each slot admits up to its own batch size.
                 slot = self.slots[mb_id].schedule_slot
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     step = (
@@ -246,8 +245,7 @@ class PPRing:
                         self.slots[next_mb_id].schedule_slot, next_first_rank_mb_id
                     )
 
-                # Commit the next slot's step, launched one ring round ago; the
-                # requests it finishes reopen that slot's admission.
+                # Commit the next slot's step, launched one ring round ago.
                 due = self.slots[next_mb_id].record
                 if due is not None:
                     popped = self.pending.popleft()

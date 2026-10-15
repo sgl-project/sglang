@@ -2,7 +2,7 @@
 
 import unittest
 import zlib
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -16,9 +16,8 @@ from sglang.srt.disaggregation.prefill import DisaggPrefill
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
-    SchedulerBatchResultProcessor,
-)
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.disagg_owner_shells import (
     decode_owner_shell,
@@ -210,9 +209,7 @@ class _FakeOwner(DisaggDecode):
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
-        self.batch_result_processor = SimpleNamespace(
-            release_finished_req=tree_release(self)
-        )
+        self.request_retirer = SimpleNamespace(retire_finished=tree_release(self))
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
         self.metrics_sink = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
@@ -226,7 +223,7 @@ def _make_req(expected_chksum, num_input_tokens, rid="r0"):
     return SimpleNamespace(
         rid=rid,
         bootstrap_room=12345,
-        kv=SimpleNamespace(req_pool_idx=0),
+        kv=SimpleNamespace(req_pool_idx=0, holds_kv=True),
         origin_input_ids=list(range(num_input_tokens)),
         fill_ids=list(range(num_input_tokens)),
         disagg=DisaggReqState(expected_kv_checksum=expected_chksum),
@@ -259,16 +256,17 @@ class TestChecksumMismatchRelease(unittest.TestCase):
             holds_rows=lambda req: True,
             request_finished=lambda req: events.append(("hisparse", req.rid)),
         )
-        processor = SimpleNamespace(
-            hisparse_coordinator=hisparse, kv=SimpleNamespace(tree_cache=None)
-        )
         owner = decode_owner_shell(
             kv_checksum_computer=SimpleNamespace(compute=lambda pages, states: 1),
             tree_cache=None,
-            batch_result_processor=SimpleNamespace(
-                release_finished_req=MethodType(
-                    SchedulerBatchResultProcessor.release_finished_req, processor
-                )
+            request_retirer=RequestRetirer(
+                kv=SimpleNamespace(tree_cache=Mock()),
+                beam_coordinator=None,
+                hisparse_coordinator=hisparse,
+                decode_offload_manager=None,
+                pending=PendingSteps(),
+                output_streamer=None,
+                ipc_channels=None,
             ),
             output_streamer=SimpleNamespace(stream_output=lambda reqs, *args: None),
             metrics_sink=SimpleNamespace(enable_metrics=False),
@@ -284,11 +282,11 @@ class TestChecksumMismatchRelease(unittest.TestCase):
             patch("sglang.srt.disaggregation.decode.state_indices_for_request"),
             patch("sglang.srt.disaggregation.decode.prepare_abort"),
             patch(
-                "sglang.srt.disaggregation.decode.release_kv_cache",
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
                 side_effect=release_kv_cache,
             ),
             patch(
-                "sglang.srt.managers.scheduler_components.batch_result_processor."
+                "sglang.srt.managers.scheduler_components.request_retirer."
                 "release_kv_cache",
                 side_effect=release_kv_cache,
             ),
@@ -333,7 +331,9 @@ class TestAdmissionChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ) as mock_release,
         ):
             verified = sched._verify_kv_checksums([req, valid])
         self.assertEqual(verified, [valid])
@@ -359,7 +359,9 @@ class TestAdmissionChecksum(unittest.TestCase):
         req = _make_req(0xDEADBEEF, self.num_pages, rid="HEALTH_CHECK_1")
         with (
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ) as mock_release,
         ):
             verified = sched._verify_kv_checksums([req])
         self.assertEqual(verified, [req])
