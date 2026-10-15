@@ -159,3 +159,13 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("deepseek_v4_serving_shapes")
+async def deepseek_v4_serving_shapes(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Compile DeepSeek-V4 serving-time kernel variants before the server listens."""
+    from sglang.srt.entrypoints.deepseek_v4_warmup import warm_serving_shapes
+
+    await warm_serving_shapes(disaggregation_mode, tokenizer_manager)
