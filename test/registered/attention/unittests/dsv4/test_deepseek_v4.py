@@ -802,6 +802,31 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 )
                 self.assertIs(cache.ensure_compressed(ratio, table, 64), gather)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_sparse_prefill_gather_does_not_wait_for_queued_gpu_work(self):
+        """The gather runs in an eager break of the prefill graph, where the host is
+        ahead of the GPU; uploading its lengths must not drain the queued replay."""
+
+        def cache_on_cuda():
+            cache = self._make_sparse_prefill_cache(257)
+            for name in ("seq_lens", "query_start_loc", "query_pos", "swa_offsets"):
+                setattr(cache, name, getattr(cache, name).cuda())
+            cache.seq_lens_cpu = [257, 257]
+            return cache
+
+        table = torch.zeros((2, 64), dtype=torch.int32, device="cuda")
+        # The first call loads its kernels, which synchronizes on its own.
+        cache_on_cuda().ensure_compressed(1, table, c_page_size=64)
+        cache = cache_on_cuda()
+        torch.cuda.synchronize()
+        replay_done = torch.cuda.Event()
+        # About 0.5 s of queued GPU work stands in for the replayed graph segments.
+        torch.cuda._sleep(1_000_000_000)
+        replay_done.record()
+        cache.ensure_compressed(1, table, c_page_size=64)
+        self.assertFalse(replay_done.query(), "the gather waited for queued GPU work")
+        torch.cuda.synchronize()
+
     def test_sparse_prefill_c128_uses_live_extent(self):
         from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
 
