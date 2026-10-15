@@ -179,13 +179,13 @@ class HiSparseSpecSwapManager:
             raise ValueError("HiSparse speculative swap is unsupported on XPU.")
         if coordinator.is_dsv4_hisparse:
             raise ValueError("HiSparse spec swap currently supports DSA caches only.")
-        if not 2 <= num_draft_tokens <= 4 or coordinator.top_k < 1024:
+        if not 2 <= num_draft_tokens <= 8 or coordinator.top_k < 1024:
             raise ValueError(
-                "HiSparse spec swap requires 2-4 draft tokens and top_k >= 1024."
+                "HiSparse spec swap requires 2-8 draft tokens and top_k >= 1024."
             )
         workspace_capacity = num_draft_tokens * coordinator.top_k
-        if workspace_capacity > 8192:
-            raise ValueError("HiSparse spec swap supports at most 8192 occurrences.")
+        if workspace_capacity > 32768:
+            raise ValueError("HiSparse spec swap supports at most 32768 occurrences.")
         if max_num_req_slots > coordinator.device_buffer_size:
             raise ValueError(
                 "HiSparse spec request capacity must not exceed device_buffer_size."
@@ -197,6 +197,10 @@ class HiSparseSpecSwapManager:
                 self.MIN_SCRATCH_CAPACITY,
                 workspace_capacity - coordinator.device_buffer_size,
             ),
+        )
+        # The physical allocator and admission budget both operate on whole pages.
+        self.scratch_capacity = (
+            -(-self.scratch_capacity // coordinator.page_size) * coordinator.page_size
         )
         hash_size = 1 << max(1, (2 * coordinator.device_buffer_size - 1).bit_length())
         self._cache_index = torch.full(
@@ -214,6 +218,8 @@ class HiSparseSpecSwapManager:
             self.NUM_COUNTERS_PER_REQUEST * max_num_req_slots,
             self.NUM_METADATA_VALUES_PER_OCCURRENCE * workspace_capacity,
         )
+        # Each metadata row contains int64 atomics; tail columns can make it odd.
+        metadata_width = (metadata_width + 1) // 2 * 2
         self._scratch_state = torch.full(
             (max_num_req_slots + 1, metadata_width),
             -1,
@@ -522,6 +528,7 @@ class HiSparseSpecSwapManager:
             seq_lens=compressed_seq_lens,
             state=self.states[layer_id],
             num_real_reqs=coordinator.num_real_reqs,
+            num_tail_slots=coordinator.num_tail_slots,
             **plan,
         )
         return top_k_indices

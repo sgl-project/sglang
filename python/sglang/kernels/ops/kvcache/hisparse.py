@@ -28,7 +28,8 @@ class HiSparseSpecState(NamedTuple):
     request: ``[1 + num_requests, hot_buffer_size]``.
 
     ``scratch_locs`` and ``scratch_state`` hold reusable miss locations,
-    counters, and metadata shared by all layers.
+    counters, and metadata shared by all layers. Metadata rows need at least
+    ``5 * steps * top_k`` int32 entries and an even row stride for int64 atomics.
     """
 
     cache_index: torch.Tensor
@@ -45,6 +46,7 @@ def _jit_spec_module(
     hot_buffer_size: int,
     num_steps: int,
     record_miss_plan: bool,
+    num_tail_slots: int,
 ) -> Module:
     template_args = make_cpp_args(
         block_size,
@@ -54,6 +56,7 @@ def _jit_spec_module(
         num_steps,
         record_miss_plan,
         is_arch_support_pdl(),
+        num_tail_slots,
     )
     return load_jit(
         "hisparse_spec",
@@ -84,18 +87,28 @@ def load_cache_to_device_buffer_spec_mla(
     miss_src: torch.Tensor | None = None,
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
+    num_tail_slots: int = 0,
 ) -> None:
     """Resolve all speculative steps and swap unique misses in one launch pair.
 
     Optional miss-plan outputs use the same protocol as the single-step HiSparse
     kernel, so shared-index layers can replay only the Host-to-GPU copies with
     ``copy_cache_planned_mla``.
+
+    ``num_tail_slots`` reserves trailing columns for unpooled tail tokens.
+    These remain valid independently of the short-sequence top-k prefix.
     """
     _, num_steps, num_top_k = top_k_tokens.shape
-    if not 2 <= num_steps <= 4:
+    if not 2 <= num_steps <= 8:
         raise ValueError(
-            f"HiSparse speculative swap requires 2-4 steps, got {num_steps}."
+            f"HiSparse speculative swap requires 2-8 steps, got {num_steps}."
         )
+    if num_steps * num_top_k > 32768:
+        raise ValueError(
+            "HiSparse speculative swap supports at most 32768 occurrences."
+        )
+    if not 0 <= num_tail_slots < num_top_k:
+        raise ValueError("num_tail_slots must be in [0, top_k).")
     hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size
     item_size_bytes = host_cache.stride(0) * host_cache.element_size()
@@ -142,6 +155,7 @@ def load_cache_to_device_buffer_spec_mla(
         hot_buffer_size,
         num_steps,
         record_miss_plan,
+        num_tail_slots,
     )
 
     module.load_cache_to_device_buffer_spec(
