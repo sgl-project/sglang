@@ -890,6 +890,18 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 "MIXED_PRECISION quantization requires a non-empty quantized_layers map."
             )
 
+        for name, recipe in quantized_layers.items():
+            quant_algo_for_layer = recipe.get("quant_algo", "").upper()
+            if quant_algo_for_layer in ("Q8_0", "IQ2_XXS"):
+                from sglang.srt.layers.quantization.modelopt_ggml import (
+                    validate_ggml_recipe,
+                )
+
+                try:
+                    validate_ggml_recipe(quant_algo_for_layer, recipe)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid GGML recipe for {name}: {exc}") from exc
+
         group_size = None
         for layer_info in quantized_layers.values():
             if layer_info.get("quant_algo", "").upper() in (
@@ -1059,6 +1071,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
+            if quant_algo in ("Q8_0", "IQ2_XXS"):
+                from sglang.srt.layers.quantization.modelopt_ggml import (
+                    ModelOptGGMLLinearMethod,
+                )
+
+                return ModelOptGGMLLinearMethod(quant_algo)
             return UnquantizedLinearMethod()
 
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
@@ -1088,6 +1106,24 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4a16_config)
+            if quant_algo == "Q8_0":
+                raise ValueError("ModelOpt Q8_0 experts are not supported")
+            if quant_algo == "IQ2_XXS":
+                from sglang.srt.layers.quantization.modelopt_ggml import (
+                    ModelOptGGMLMoEMethod,
+                )
+
+                expert_algos = {
+                    info["quant_algo"].upper()
+                    for candidate in self._quantized_layer_prefix_candidates(prefix)
+                    for name, info in self.quantized_layers.items()
+                    if name == candidate or name.startswith(candidate + ".")
+                }
+                if expert_algos != {quant_algo}:
+                    raise ValueError(
+                        f"Mixed GGML expert formats in {prefix}: {expert_algos}"
+                    )
+                return ModelOptGGMLMoEMethod(quant_algo)
             return None
 
         return None
