@@ -972,9 +972,22 @@ def speculative_moe_backend_context():
     original_backend = moe.runner_backend
     try:
         moe.runner_backend = get_speculative_moe_runner_backend()
-        yield
+        with _draft_allreduce_fusion_override():
+            yield
     finally:
         moe.runner_backend = original_backend
+
+
+def _draft_allreduce_fusion_override() -> AbstractContextManager:
+    # Under cutedsl the legacy FlashInfer workspace stands down and the draft builds
+    # no CuTe DSL fusion, so its boundaries would run a plain all-reduce + RMSNorm.
+    comm = get_exec().comm
+    if (
+        comm.flashinfer_allreduce_fusion_backend != "cutedsl"
+        or not envs.SGLANG_Q35MF_DRAFT_MNNVL_AR.get()
+    ):
+        return nullcontext()
+    return comm.override(flashinfer_allreduce_fusion_backend="auto")
 
 
 @contextmanager

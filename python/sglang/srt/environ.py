@@ -1457,6 +1457,9 @@ class Envs:
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # With --flashinfer-allreduce-fusion-backend cutedsl, build and capture the draft
+    # with the auto (mnnvl) FlashInfer all-reduce fusion instead of a plain all-reduce.
+    SGLANG_Q35MF_DRAFT_MNNVL_AR = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
