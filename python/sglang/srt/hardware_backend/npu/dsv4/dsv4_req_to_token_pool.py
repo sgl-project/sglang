@@ -77,6 +77,12 @@ class DSV4ReqToTokenTablesMixin:
         release C128 KV pages."""
         self._dsv4_allocator = allocator
 
+    def get_dsv4_c4_state_ring_size(self) -> int:
+        """Return the local C4 state-ring size used by the NPU KV pool."""
+        if self._dsv4_allocator is None:
+            raise RuntimeError("DSV4 allocator is not registered")
+        return self._dsv4_allocator.get_kvcache().get_ring_size(4)
+
     def set_c128_prefix_pages(self, req, page_ids: torch.Tensor) -> None:
         """Install pages returned by a Radix match.
 
