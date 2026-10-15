@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_parallel
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -60,6 +61,7 @@ class _Store:
 def _manager() -> TokenizerManager:
     manager = TokenizerManager.__new__(TokenizerManager)
     manager.elastic_worker_count = 4
+    manager.attn_replica_size = 1
     manager.elastic_instance_id = "runtime-1"
     manager.elastic_initial_ep_size = 4
     manager.elastic_allocation_width = 4
@@ -117,6 +119,15 @@ def _manager() -> TokenizerManager:
 
 
 class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_parallel().override(
+                attn_tp_size=1,
+                attn_cp_size=1,
+            )
+        )
+
     async def test_retry_returns_existing_operation_without_resubmitting(self):
         manager = _manager()
         request = ScaleElasticEPReqInput(
@@ -511,6 +522,15 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
 
 
 class TestElasticEPCohortBinding(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_parallel().override(
+                attn_tp_size=1,
+                attn_cp_size=1,
+            )
+        )
+
     def test_cohort_inherits_operation_and_runtime_identity(self):
         store = _Store()
         with patch(
@@ -589,6 +609,13 @@ class TestElasticEPCohortBinding(CustomTestCase):
 
 class TestElasticEPRecoveryLifecycle(CustomTestCase):
     def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_parallel().override(
+                attn_tp_size=1,
+                attn_cp_size=1,
+            )
+        )
         self.store = _Store()
         self.store_patch = patch(
             "sglang.srt.elastic_ep.elastic_ep.get_global_tcp_store",
@@ -996,6 +1023,15 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
 
 
 class TestElasticEPSchedulerIdempotency(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_parallel().override(
+                attn_tp_size=1,
+                attn_cp_size=1,
+            )
+        )
+
     def test_same_operation_is_reconciled_while_pending(self):
         state = ElasticEPState(
             active_ranks=None,
