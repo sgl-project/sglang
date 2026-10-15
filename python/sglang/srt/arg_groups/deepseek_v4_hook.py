@@ -26,12 +26,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _mega_attention_available() -> bool:
-    from sgl_kernel.flash_mla_mega import is_flash_mla_mega_available
-
-    return is_flash_mla_mega_available()
-
-
 def _mega_attention_blocker(server_args: ServerArgs) -> Optional[str]:
     from sglang.srt.utils.common import is_sm100_supported
 
@@ -41,8 +35,6 @@ def _mega_attention_blocker(server_args: ServerArgs) -> Optional[str]:
         return "requires DeepSeek-V4.1"
     if cfg.device != "cuda" or not is_sm100_supported():
         return "requires SM100/SM103"
-    if not _mega_attention_available():
-        return "requires sgl-kernel built with the FlashMLA MegaAttention ops"
     text = model.hf_text_config
     attn_tp_size = cfg.tp_size // cfg.attn_dp_size
     if (

@@ -51,12 +51,6 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
         self.enterContext(
             patch("sglang.srt.utils.common.is_sm100_supported", return_value=True)
         )
-        self.enterContext(
-            patch(
-                "sglang.srt.arg_groups.deepseek_v4_hook._mega_attention_available",
-                return_value=True,
-            )
-        )
         self.enterContext(envs.SGLANG_DSV4_KV_LAYOUT.override("auto"))
 
     def test_auto_selects_mega_only_where_it_runs(self):
