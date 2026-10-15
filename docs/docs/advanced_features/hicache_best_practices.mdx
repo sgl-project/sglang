@@ -107,8 +107,7 @@ TP ownership independently of MLA replication, including when long filenames
 are compacted. Older incompatible recurrent files become cache misses and are
 recomputed, including at DCP1. DCP1 MLA KV keys keep their format except for
 long namespaces compacted to fit the filesystem filename limit; those objects
-also become cold misses. Hybrid write-through now publishes completed chunk
-checkpoints during prefill, including at DCP1 and with L2 alone.
+also become cold misses.
 
 L2 remains host DRAM. To use local SSD as L3, select `file` and place its storage
 directory on an SSD filesystem. Mooncake's own SSD offload is configured in the

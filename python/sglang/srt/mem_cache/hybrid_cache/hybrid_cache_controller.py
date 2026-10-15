@@ -1407,7 +1407,9 @@ class HybridCacheController(BaseHiCacheController):
             }
             for transfer in operation.pool_transfers or ():
                 if transfer.name in pool_hits:
-                    operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
+                    operation.query_pool_hit_pages[transfer.name] = pool_hits[
+                        transfer.name
+                    ]
         if operation.pool_transfers:
             candidates = hit_result.restorable_prefix_pages
             if candidates is None:
@@ -1470,7 +1472,11 @@ class HybridCacheController(BaseHiCacheController):
             if pages != _NO_POOL_VERDICT
         }
         limit = reduced[0] // self.page_size
-        common = [p for p, available in enumerate(reduced[offset:]) if available and p <= limit]
+        common = [
+            p
+            for p, available in enumerate(reduced[offset:])
+            if available == 1 and p <= limit
+        ]
         pages = common[-1] if common else 0
         operation.pool_storage_result.restorable_prefix_pages = common
         operation.pool_storage_result.kv_hit_pages = pages
