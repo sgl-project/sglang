@@ -2598,6 +2598,27 @@ class TestQwen3CoderDetector(unittest.TestCase):
         ):
             self._check_structured_union_value(schema, raw, raw)
 
+    def test_union_nonfinite_numbers_remain_strings(self):
+        """Nested non-finite numbers must not produce invalid argument JSON."""
+        schema = {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}]}
+        for number in ("NaN", "Infinity", "-Infinity", "1e309", "-1e309"):
+            for raw in (f'{{"number":{number}}}', f"[{number}]"):
+                self._check_structured_union_value(schema, raw, raw)
+        self._check_structured_union_value(
+            schema, '[1.5,1e3,"NaN","Infinity"]', [1.5, 1000.0, "NaN", "Infinity"]
+        )
+
+    def test_union_validation_errors_preserve_tool_calls(self):
+        """Invalid or recursive schemas must preserve strings in both parse modes."""
+        for branch in (
+            {"$id": "urn:recursive", "$ref": "urn:recursive"},
+            {"type": "map"},
+            {"type": "array", "items": [{"type": "string"}]},
+        ):
+            schema = {"anyOf": [{"type": "string"}, branch]}
+            raw = '["Paris"]' if branch.get("type") == "array" else "{}"
+            self._check_structured_union_value(schema, raw, raw)
+
     def test_structured_union_conversion_requires_schema_match(self):
         """A decoded structure must satisfy constraints, including oneOf exclusivity."""
         object_schema = {
