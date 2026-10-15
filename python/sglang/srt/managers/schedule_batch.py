@@ -924,7 +924,7 @@ class ReqKvInfo:
     req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
 
     # The request's own KV is [cache_protected_len, kv_allocated_len). Only the
-    # methods below write the lengths.
+    # methods below write the lengths; check_lengths states their order.
     cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
     # This request already inserted [0, here) into the tree; later inserts count
     # a hit only on the nodes past it, so a request counts each node once.
@@ -1065,6 +1065,23 @@ class ReqKvInfo:
             else:
                 setattr(self, f.name, f.default)
         self.retraction_backup = retraction_backup
+
+    def check_lengths(self) -> None:
+        """The order of a held row's lengths: the tree's prefix, the inserted
+        prefix and the window-evicted prefix lie in the committed KV, which lies
+        in the allocated KV."""
+        if not self.holds_kv:
+            return
+        committed, allocated = self.kv_committed_len, self.kv_allocated_len
+        assert (
+            self.cache_protected_len <= committed
+            and self.cache_inserted_len <= committed
+            and self.max_evicted_seqlen <= committed
+            and 0 <= committed <= allocated
+        ), (
+            f"{self.cache_protected_len=}, {self.cache_inserted_len=}, "
+            f"{self.max_evicted_seqlen=}, {committed=}, {allocated=}"
+        )
 
 
 class Req:
