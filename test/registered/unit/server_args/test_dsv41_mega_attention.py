@@ -51,23 +51,14 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
         )
         self.enterContext(envs.SGLANG_DSV4_KV_LAYOUT.override("auto"))
 
-    def test_auto_selects_mega_only_where_it_runs(self):
-        args = mega_args(tp_size=2, attn_dp_size=2)
-        self.assertEqual(resolved_backend(args), "flashmla_mega")
-        self.assertEqual(args.dsv4_attn_backend, "auto")
-        self.assertEqual(
-            resolved_backend(mega_args(dsv4_attn_backend="flashmla")), "flashmla"
-        )
+    def test_auto_keeps_flashmla_where_mega_would_silently_change_the_pool(self):
+        self.assertEqual(resolved_backend(mega_args()), "flashmla_mega")
         for fields in (
             dict(model_type="deepseek_v4"),
             dict(disaggregation_mode="prefill"),
         ):
             with self.subTest(fields=fields):
                 self.assertEqual(resolved_backend(mega_args(**fields)), "flashmla")
-        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
-            self.assertEqual(resolved_backend(mega_args()), "flashmla")
-            with self.assertRaisesRegex(AssertionError, "SM100/SM103"):
-                resolved_backend(mega_args(dsv4_attn_backend="flashmla_mega"))
 
 
 if __name__ == "__main__":
