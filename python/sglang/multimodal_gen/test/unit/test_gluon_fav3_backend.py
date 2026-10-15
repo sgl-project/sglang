@@ -5,6 +5,7 @@ from unittest import mock
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention import selector
 from sglang.multimodal_gen.runtime.layers.attention.backends import gluon_fav3
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
@@ -52,34 +53,6 @@ def test_forward_calls_gluon_kernel_for_supported_contract():
         key,
         value,
         softmax_scale=impl.softmax_scale,
-        wan_fixed_shift=False,
-    )
-
-
-def test_forwards_registered_wan_fixed_shift_opt_in():
-    impl = _impl()
-    query = torch.empty(1, 2, 8, 128)
-    key = torch.empty(1, 3, 8, 128)
-    value = torch.empty_like(key)
-    kernel = mock.Mock(return_value=torch.empty(1))
-
-    with (
-        mock.patch.object(impl, "_unsupported_reason", return_value=None),
-        mock.patch.object(
-            gluon_fav3.envs,
-            "SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT",
-            True,
-        ),
-        mock.patch.object(gluon_fav3, "_load_gluon_fav3", return_value=(kernel, None)),
-    ):
-        impl.forward(query, key, value)
-
-    kernel.assert_called_once_with(
-        query,
-        key,
-        value,
-        softmax_scale=impl.softmax_scale,
-        wan_fixed_shift=True,
     )
 
 
@@ -161,49 +134,41 @@ def test_runtime_head_sharding_remains_supported_for_mha():
     )
 
 
-def test_rocm_resolver_selects_gluon_only_for_exact_static_contract():
-    backend_path = (
-        "sglang.multimodal_gen.runtime.layers.attention.backends."
-        "gluon_fav3.GluonFAv3Backend"
-    )
-    aiter_path = (
-        "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
-    )
-    with mock.patch.object(
-        RocmPlatform,
-        "get_device_capability",
-        return_value=DeviceCapability(12, 5),
-    ):
-        assert (
-            RocmPlatform.get_attn_backend_cls_str(
-                AttentionBackendEnum.GLUON_FAV3, 128, torch.bfloat16
-            )
-            == backend_path
-        )
-        assert (
-            RocmPlatform.get_attn_backend_cls_str(
-                AttentionBackendEnum.GLUON_FAV3, 128, torch.float16
-            )
-            == aiter_path
-        )
-        assert (
-            RocmPlatform.get_attn_backend_cls_str(
-                AttentionBackendEnum.GLUON_FAV3, 64, torch.bfloat16
-            )
-            == aiter_path
-        )
+@pytest.mark.parametrize(
+    ("capability", "head_size", "dtype"),
+    [
+        (DeviceCapability(12, 5), 128, torch.bfloat16),
+        (DeviceCapability(12, 5), 128, torch.float16),
+        (DeviceCapability(12, 5), 64, torch.bfloat16),
+        (DeviceCapability(9, 5), 128, torch.bfloat16),
+        (None, 128, torch.bfloat16),
+    ],
+)
+def test_component_override_preserves_gluon_identity(capability, head_size, dtype):
+    selector._cached_get_attn_backend.cache_clear()
+    try:
+        with (
+            mock.patch.object(
+                RocmPlatform, "get_device_capability", return_value=capability
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                RocmPlatform,
+            ),
+            mock.patch.object(
+                selector, "get_global_forced_attn_backend", return_value=None
+            ),
+            selector.component_attn_backend_context_manager(
+                AttentionBackendEnum.GLUON_FAV3,
+                component_name="transformer",
+                require_backend_selection=True,
+            ),
+        ):
+            backend = selector.get_attn_backend(head_size, dtype)
 
-    with mock.patch.object(
-        RocmPlatform,
-        "get_device_capability",
-        return_value=DeviceCapability(9, 5),
-    ):
-        assert (
-            RocmPlatform.get_attn_backend_cls_str(
-                AttentionBackendEnum.GLUON_FAV3, 128, torch.bfloat16
-            )
-            == aiter_path
-        )
+        assert backend is gluon_fav3.GluonFAv3Backend
+    finally:
+        selector._cached_get_attn_backend.cache_clear()
 
 
 def test_server_args_keep_aiter_as_rocm_default():
@@ -234,3 +199,163 @@ def test_server_args_keep_aiter_as_rocm_default():
 
 def test_server_args_accept_explicit_gluon_backend_name():
     assert ServerArgs._normalize_attention_backend_name("gluon_fav3") == "gluon_fav3"
+
+
+def test_aiter_fallback_passes_nondefault_scale_to_dense_kernel():
+    pytest.importorskip("aiter", reason="AITer is a ROCm-only dependency")
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter
+
+    impl = _impl(causal=True, dropout_p=0.25, softmax_scale=0.37)
+    query = torch.empty(1, 2, 8, 128, dtype=torch.bfloat16)
+    key = torch.empty_like(query)
+    value = torch.empty_like(query)
+    expected = torch.empty_like(query)
+
+    with (
+        mock.patch.object(aiter, "_use_fp8_attn", False),
+        mock.patch.object(
+            aiter.aiter, "flash_attn_func", return_value=expected
+        ) as flash_attn,
+    ):
+        output = impl.forward(query, key, value)
+
+    assert output is expected
+    flash_attn.assert_called_once_with(
+        query,
+        key,
+        value,
+        dropout_p=0.25,
+        softmax_scale=0.37,
+        causal=True,
+        return_attn_probs=False,
+        return_lse=False,
+        how_v3_bf16_cvt=aiter.AITER_BF16_CVT_MODE,
+    )
+
+
+@pytest.fixture
+def gluon_modules():
+    kernel_name = "sglang.kernels.ops.attention.gluon_fav3_gfx1250"
+    modules = {
+        "triton.experimental.gluon": mock.Mock(),
+        "triton.experimental.gluon.language": mock.Mock(),
+        kernel_name: types.SimpleNamespace(gluon_fav3_attention=mock.Mock()),
+    }
+    original_import = gluon_fav3.importlib.import_module
+
+    def import_module(name, *args, **kwargs):
+        if name not in modules:
+            return original_import(name, *args, **kwargs)
+        result = modules[name]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    gluon_fav3._load_gluon_fav3.cache_clear()
+    try:
+        with (
+            mock.patch.object(
+                gluon_fav3.importlib, "import_module", side_effect=import_module
+            ) as loader,
+            mock.patch.object(gluon_fav3, "_logged_fallback_reasons", set()),
+        ):
+            yield modules, loader
+    finally:
+        gluon_fav3._load_gluon_fav3.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("module_name", "api"),
+    [
+        ("triton.experimental.gluon", "aggregate"),
+        ("triton.experimental.gluon.language", "amd.cdna5"),
+        ("triton.experimental.gluon.language", "amd.cdna5.wmma"),
+        ("triton.experimental.gluon.language", "amd.cdna5.buffer_load"),
+        ("triton.experimental.gluon.language", "amd.cdna5.buffer_store"),
+        ("triton.experimental.gluon.language", "amd.cdna5.tdm.async_load"),
+        ("triton.experimental.gluon.language", "amd.cdna5.tdm.async_load_fused"),
+        (
+            "triton.experimental.gluon.language",
+            "amd.cdna5.tdm.update_tensor_descriptor",
+        ),
+        ("triton.experimental.gluon.language", "amd.cdna5.tdm.prefetch"),
+    ],
+)
+def test_missing_gluon_api_falls_back_before_kernel_import(
+    gluon_modules, module_name, api, caplog
+):
+    modules, loader = gluon_modules
+    missing = modules[module_name]
+    path = api.split(".")
+    for attribute in path[:-1]:
+        missing = getattr(missing, attribute)
+    delattr(missing, path[-1])
+
+    impl = _impl()
+    expected = torch.empty(1)
+    impl._aiter_fallback = mock.Mock()
+    impl._aiter_fallback.forward.return_value = expected
+    query = mock.Mock(
+        ndim=4,
+        dtype=torch.bfloat16,
+        is_cuda=True,
+        device=torch.device("cuda:0"),
+        shape=(1, 16, 8, 128),
+    )
+    query.stride.return_value = 1
+    with mock.patch.object(
+        torch.cuda,
+        "get_device_properties",
+        return_value=types.SimpleNamespace(gcnArchName="gfx1250"),
+    ):
+        output = impl.forward(query, query, query)
+
+    assert output is expected
+    impl._aiter_fallback.forward.assert_called_once_with(query, query, query, None)
+    assert f"{module_name}.{api}" in caplog.text
+    kernel_name = "sglang.kernels.ops.attention.gluon_fav3_gfx1250"
+    assert kernel_name not in [call.args[0] for call in loader.call_args_list]
+
+
+def test_compatible_gluon_apis_load_and_cache_kernel(gluon_modules):
+    modules, loader = gluon_modules
+    expected = modules[
+        "sglang.kernels.ops.attention.gluon_fav3_gfx1250"
+    ].gluon_fav3_attention
+
+    assert gluon_fav3._load_gluon_fav3() == (expected, None)
+    assert gluon_fav3._load_gluon_fav3() == (expected, None)
+    assert loader.call_count == 3
+
+
+def test_missing_gluon_dependency_is_reported(gluon_modules):
+    modules, _ = gluon_modules
+    modules["triton.experimental.gluon"] = ImportError("Gluon is unavailable")
+
+    assert gluon_fav3._load_gluon_fav3() == (None, "Gluon is unavailable")
+
+
+@pytest.mark.parametrize("error", [AttributeError, RuntimeError])
+def test_unexpected_kernel_import_errors_propagate(gluon_modules, error):
+    modules, _ = gluon_modules
+    modules["sglang.kernels.ops.attention.gluon_fav3_gfx1250"] = error("kernel bug")
+
+    with pytest.raises(error, match="kernel bug"):
+        gluon_fav3._load_gluon_fav3()
+
+
+@pytest.mark.parametrize("error", [AttributeError, RuntimeError])
+def test_kernel_execution_errors_propagate(error):
+    impl = _impl()
+    impl._aiter_fallback = mock.Mock()
+    query = torch.empty(1, 2, 8, 128)
+    kernel = mock.Mock(side_effect=error("kernel bug"))
+
+    with (
+        mock.patch.object(impl, "_unsupported_reason", return_value=None),
+        mock.patch.object(gluon_fav3, "_load_gluon_fav3", return_value=(kernel, None)),
+        pytest.raises(error, match="kernel bug"),
+    ):
+        impl.forward(query, query, query)
+
+    impl._aiter_fallback.forward.assert_not_called()
