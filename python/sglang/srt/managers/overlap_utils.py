@@ -84,9 +84,9 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
-# Decode relay recorded by the scheduler: (future_indices, draft_input) of the last stash.
 _SKIP_SAME_BATCH_REGATHER = envs.SGLANG_Q35MF_ARRIVE_SKIP_REGATHER.get()
 _SEQ_LENS_INDEX_SELECT = envs.SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT.get()
+# Decode relay recorded by the scheduler: (future_indices, draft_input) of the last stash.
 _last_relay: Optional[tuple] = None
 
 
