@@ -295,7 +295,6 @@ def _handle_output_by_index(output, i):
             tensor_embeddings=_extract_field_by_index(
                 output, "tensor_embeddings", i, check_length=False
             ),
-            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
