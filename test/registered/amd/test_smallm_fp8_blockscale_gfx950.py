@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-SHAPES = [(5120, 4096), (4608, 4096), (4096, 2048)]
+SHAPES = [(5120, 4096), (4608, 4096), (4096, 2048), (2560, 4096), (4096, 1024)]
 MS = (1, 3, 4, 8, 9, 16, 17, 24, 32)
 
 
