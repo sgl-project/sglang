@@ -1,6 +1,7 @@
 """What one StepPlanner admission pass admits: preemption sizes a request by
-its current prefix match, and the row budget counts the new request rows the
-admitted requests take, not the requests."""
+its current prefix match, the row budget counts the new request rows the
+admitted requests take, not the requests, and a spent pass budget stops the
+pass before its first candidate."""
 
 import unittest
 from array import array
@@ -67,6 +68,8 @@ class _Adder(PrefillAdder):
     is PrefillAdder's own, against free_tokens."""
 
     free_tokens = 0
+    # Whether the pass budget is spent before the first candidate.
+    spent = False
 
     def __init__(self, page_size, tree_cache, allocator, running_reqs, *a, **kw):
         self.running_reqs = running_reqs
@@ -83,6 +86,9 @@ class _Adder(PrefillAdder):
         self.preempt_list = []
         self.new_chunked_req = None
         self.rem_chunk_tokens = None
+
+    def budget_state(self):
+        return AddReqResult.OTHER if self.spent else AddReqResult.CONTINUE
 
     def add_chunked_req(self, req):
         # The final chunk: it joins and finishes chunking.
@@ -262,6 +268,24 @@ class TestHeldRowAdmission(_PlannerCase):
         adder = self._admit()
 
         self.assertEqual([r.rid for r in adder.can_run_list], ["a", "beam"])
+
+
+class TestSpentBudget(_PlannerCase):
+    def test_a_chunk_that_spends_the_budget_stops_at_the_head(self):
+        # The resumed chunk spends the pass budget: the head is neither
+        # matched nor offered, and the pass leaves no KV-room record.
+        self.planner.core_lists.decoding = [_req("r", holds_row=True)]
+        self.planner.core_lists.chunked_req = _req("chunk", holds_row=True)
+        head = _req("w")
+        self.planner.core_lists.waiting_queue = [head]
+        _Adder.spent = True
+        self.addCleanup(setattr, _Adder, "spent", False)
+
+        adder = self._admit()
+
+        self.assertEqual([r.rid for r in adder.can_run_list], ["chunk"])
+        head.init_next_round_input.assert_not_called()
+        self.assertEqual(self.planner._no_kv_room, {})
 
 
 if __name__ == "__main__":

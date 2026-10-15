@@ -7,7 +7,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.managers.schedule_batch import (
@@ -25,7 +24,6 @@ from sglang.srt.managers.scheduler_components.request_retirer import make_abort_
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    get_disagg,
     get_lora,
     get_memory,
     get_parallel,
@@ -411,12 +409,6 @@ class StepPlanner:
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.core_lists.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
-        # Read once per admission: only a PD role switch changes it, on an idle
-        # instance.
-        is_pd_prefill = (
-            DisaggregationMode(get_disagg().disaggregation_mode)
-            == DisaggregationMode.PREFILL
-        )
         # Once set, every later request must preempt to be admitted.
         is_full = False
         no_kv_room = False
@@ -424,6 +416,10 @@ class StepPlanner:
         num_admitted_rows = sum(map(self.beam_coordinator.num_rows, adder.can_run_list))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.core_lists.waiting_queue:
+            # A spent pass budget admits no one, even before the first
+            # candidate: the resumed chunk can spend it.
+            if adder.budget_state() == AddReqResult.OTHER:
+                break
             if get_lora().enable_lora and not self.lora_admission.can_schedule_lora_req(
                 req, running_loras
             ):
@@ -446,11 +442,6 @@ class StepPlanner:
                 running_bs + len(adder.can_run_list) + 1, rows_with_req
             ):
                 is_full = True
-            if is_pd_prefill:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if rows_with_req > self.req_to_token_pool.available_size():
-                    is_full = True
 
             if is_full and not self.enable_priority_preemption:
                 break

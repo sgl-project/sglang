@@ -66,6 +66,9 @@ class _Adder:
         self.rem_chunk_tokens = None
         self.offered = []
 
+    def budget_state(self):
+        return AddReqResult.CONTINUE
+
     def add_one_req(self, req, **kwargs):
         self.offered.append(req)
         if len(self.can_run_list) < self.num_fit:
