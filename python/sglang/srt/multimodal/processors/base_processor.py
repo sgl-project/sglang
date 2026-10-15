@@ -1,6 +1,7 @@
 import asyncio
 import concurrent
 import concurrent.futures
+import concurrent.futures.process
 import dataclasses
 import multiprocessing as mp
 import os
@@ -210,6 +211,13 @@ def _tokenizer_of(processor):
     goes through here, so a clone cannot resolve differently from the original.
     """
     return processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+
+def _forget_parent_executor_wakeups():
+    # A forked worker inherits the parent's executor wakeups, whose locks a parent
+    # thread may hold at fork time; since Python 3.12.8 / 3.13.1 the worker's exit
+    # hook takes those locks, so the worker would never exit.
+    concurrent.futures.process._threads_wakeups.clear()
 
 
 class BaseMultimodalProcessor(ABC):
@@ -508,6 +516,7 @@ class BaseMultimodalProcessor(ABC):
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            initializer=_forget_parent_executor_wakeups,
         )
 
     def _replace_broken_cpu_executor(
