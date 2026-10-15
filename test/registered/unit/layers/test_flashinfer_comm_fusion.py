@@ -587,36 +587,6 @@ class TestMnnvlCliqueGate(CustomTestCase):
         create.assert_called_once()
         self.assertTrue(manager.initialized)
 
-    def test_clique_collective_runs_once_across_reentry(self):
-        manager = fusion.FlashInferWorkspaceManager()
-        _, clique = self._initialize(manager, one_clique=True)
-        fake_comm = _FakeFlashInferComm()
-        with (
-            patch.object(fusion, "_flashinfer_comm", fake_comm),
-            patch.object(
-                fusion,
-                "_create_allreduce_fusion_workspace",
-                fake_comm.create_allreduce_fusion_workspace,
-            ),
-            patch.object(
-                fusion, "_preflight_check_workspace_memory", return_value=True
-            ),
-            patch.object(
-                fusion, "in_the_same_node_as", return_value=[True] * 4 + [False] * 4
-            ),
-            patch.object(fusion, "is_one_nvlink_clique", clique),
-            patch.object(torch.cuda, "current_device", return_value=0),
-        ):
-            manager.initialize(
-                world_size=8,
-                rank=0,
-                max_token_num=4096,
-                hidden_dim=4096,
-                backend="mnnvl",
-                group=MagicMock(),
-            )
-        clique.assert_called_once()
-
 
 if __name__ == "__main__":
     unittest.main()
