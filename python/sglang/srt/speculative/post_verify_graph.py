@@ -39,6 +39,7 @@ def post_verify_graph_enabled() -> bool:
 
 
 _SPARSE_VERIFY = os.environ.get("SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING", "0") == "1"
+_SIDE_STREAM_COMMIT = os.environ.get("SGLANG_Q35MF_EDGE_SIDE_STREAM_COMMIT", "0") == "1"
 
 
 def sparse_verify_max_top_k(batch) -> Optional[int]:
@@ -83,6 +84,7 @@ def _count_acceptance_calls():
 class _Slot:
     def __init__(self):
         self.graph: Optional[torch.cuda.CUDAGraph] = None
+        self.commit_graph: Optional[torch.cuda.CUDAGraph] = None
         self.inputs: Dict[str, torch.Tensor] = {}
         self.outputs: Optional[Tuple] = None
         self.logits_ptr = 0
@@ -112,6 +114,12 @@ class PostVerifyGraph:
         self._sim_len_stalls = 0
         self._sim_len_slot = 0
         self._check = os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_CHECK", "0") == "1"
+        # The mamba state commit replays on its own stream so it overlaps the draft
+        # extend; join() must run before any later work that reads that state.
+        self._side_stream = torch.cuda.Stream() if _SIDE_STREAM_COMMIT else None
+        self._main_done = torch.cuda.Event() if _SIDE_STREAM_COMMIT else None
+        self._commit_done = torch.cuda.Event() if _SIDE_STREAM_COMMIT else None
+        self._commit_pending = False
         self._max_top_k: Optional[int] = None
         self._checked = 0
         self._mismatch = 0
@@ -129,6 +137,12 @@ class PostVerifyGraph:
     ):
         """Returns (predict, accept_lens, accept_index, new_seq_lens, bonus_tokens,
         prepared_draft_inputs) or None when the stock path must run."""
+        if self._commit_pending:
+            # The worker did not join after the last round; order the commit before this verify.
+            logger.error(
+                "post-verify graph: side-stream commit was not joined; joining late"
+            )
+            self.join()
         if self.disabled:
             return None
         if self._host_hooked():
@@ -158,6 +172,12 @@ class PostVerifyGraph:
             )
             self.disabled = True
             raise
+
+    def join(self) -> None:
+        """Makes the current stream wait for the last side-stream mamba state commit."""
+        if self._commit_pending:
+            torch.cuda.current_stream().wait_event(self._commit_done)
+            self._commit_pending = False
 
     @staticmethod
     def _host_hooked() -> bool:
@@ -289,14 +309,21 @@ class PostVerifyGraph:
                 st.warmups += 1
                 return self._body(
                     slot.inputs, batch, verify_input, logits_output, num_draft_tokens
-                )
+                )[:6]
             self._capture(slot, batch, verify_input, logits_output, num_draft_tokens)
         else:
             self._load(slot, inputs, sim_len)
         slot.graph.replay()
+        if slot.commit_graph is not None:
+            self._main_done.record()
+            self._side_stream.wait_event(self._main_done)
+            with torch.cuda.stream(self._side_stream):
+                slot.commit_graph.replay()
+            self._commit_done.record(self._side_stream)
+            self._commit_pending = True
         if self._check:
             self._compare(slot, batch, verify_input, logits_output, num_draft_tokens)
-        return slot.outputs
+        return slot.outputs[:6]
 
     def _compare(
         self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens
@@ -305,7 +332,7 @@ class PostVerifyGraph:
         # inputs; the fields compared do not depend on the sampling coins.
         from sglang.srt.speculative.eagle_utils import eagle_sample
 
-        predict, accept_lens, accept_index, new_seq_lens, bonus, _ = slot.outputs
+        predict, accept_lens, accept_index, new_seq_lens, bonus, _ = slot.outputs[:6]
         views = self._views(slot.inputs, batch, verify_input)
         r_predict, r_lens, r_index = eagle_sample(
             views[1],
@@ -377,19 +404,36 @@ class PostVerifyGraph:
                         verify_input,
                         logits_output,
                         num_draft_tokens,
+                        commit=self._side_stream is None,
                     )
         # Injected acceptance only overrides the result; the real acceptance kernel must be in the graph.
         if acceptance_calls[0] == 0:
             raise RuntimeError(
                 "post-verify graph captured without the acceptance kernel"
             )
+        if self._side_stream is not None:
+            # Captured after the main graph in the same pool and replayed after it every round.
+            commit_graph = torch.cuda.CUDAGraph()
+            self._side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.graph(
+                commit_graph,
+                pool=self._pool,
+                stream=self._side_stream,
+                capture_error_mode="thread_local",
+            ):
+                self._commit(
+                    slot.inputs, batch, verify_input, outputs, num_draft_tokens
+                )
+            torch.cuda.current_stream().wait_stream(self._side_stream)
+            slot.commit_graph = commit_graph
         slot.graph = graph
         slot.outputs = outputs
         logger.info("Captured post-verify graph for bs=%d", len(batch.seq_lens))
 
-    def _body(self, x, batch, verify_input, logits_output, num_draft_tokens):
+    def _body(
+        self, x, batch, verify_input, logits_output, num_draft_tokens, commit=True
+    ):
         from sglang.srt.speculative.eagle_utils import eagle_sample
-        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
         batch_view, verify_view = self._views(x, batch, verify_input)
         predict, accept_lens, accept_index = eagle_sample(
@@ -416,21 +460,30 @@ class PostVerifyGraph:
                 mamba_track_interval=track_interval,
             )
         )
-        commit_mamba_states_after_verify(
-            self.target_worker,
-            batch_view,
-            accept_lens,
-            accept_index,
-            num_draft_tokens,
-            prepared_step_indices=commit_steps,
-        )
-        return (
+        outputs = (
             predict,
             accept_lens,
             accept_index,
             new_seq_lens,
             bonus_tokens,
             draft_inputs,
+            commit_steps,
+        )
+        if commit:
+            self._commit(x, batch, verify_input, outputs, num_draft_tokens)
+        return outputs
+
+    def _commit(self, x, batch, verify_input, outputs, num_draft_tokens):
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        batch_view, _ = self._views(x, batch, verify_input)
+        commit_mamba_states_after_verify(
+            self.target_worker,
+            batch_view,
+            outputs[1],
+            outputs[2],
+            num_draft_tokens,
+            prepared_step_indices=outputs[6],
         )
 
     @staticmethod

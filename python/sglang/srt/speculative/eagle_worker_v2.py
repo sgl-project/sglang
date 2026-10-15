@@ -1447,6 +1447,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
+            if self._post_verify_graph is not None:
+                # The mamba state commit may still run on a side stream; later work reads it.
+                self._post_verify_graph.join()
 
             if (
                 get_parallel().pp_size > 1
@@ -1617,6 +1620,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_stage_span("draft_extend"),
         ):
             self.draft_worker._draft_extend_for_decode(batch, result)
+        if self._post_verify_graph is not None:
+            self._post_verify_graph.join()
         return result
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
