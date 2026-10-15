@@ -76,7 +76,7 @@ class TestDisaggPrefillLists(CustomTestCase):
             attn_cp_cpu_group=None,
             attn_tp_cpu_group=None,
         )
-        for target in ("release_kv_cache", "checkpoint_kv_cache"):
+        for target in ("checkpoint_kv_cache",):
             patcher = patch(f"{PREFILL_MODULE}.{target}")
             patcher.start()
             self.addCleanup(patcher.stop)

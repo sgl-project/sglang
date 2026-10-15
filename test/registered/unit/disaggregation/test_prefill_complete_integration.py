@@ -506,10 +506,7 @@ class TestAllocationIntegration(CustomTestCase):
             metrics_sink=SimpleNamespace(enable_metrics=False),
             counters=LaunchCounters(),
         )
-        with (
-            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
-            patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
-        ):
+        with patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"):
             waiting = owner.optimistic_release_and_requeue(req, [])
             self.assertEqual(waiting, [req])
             self.assertEqual(owner.bootstrap_queue.queue, [])

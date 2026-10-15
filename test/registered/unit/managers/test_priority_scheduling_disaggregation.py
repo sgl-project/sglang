@@ -47,7 +47,10 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 from sglang.test.scheduler_request_intake import make_request_intake
-from sglang.test.scheduler_request_lists import make_request_registry
+from sglang.test.scheduler_request_lists import (
+    make_request_registry,
+    make_request_retirer,
+)
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -367,9 +370,12 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req.cache_request_handle = object()
         req.kv.holds_kv = True
         req.kv.holds_mamba = False
+        req.session = None
+        req.release_mm_inputs_on_abort = MagicMock()
         cache.finish = MagicMock()
         owner = prefill_owner_shell(
             tree_cache=cache,
+            request_retirer=make_request_retirer(kv=SimpleNamespace(tree_cache=cache)),
             clear_pending_chunk_send=MagicMock(),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
             output_streamer=MagicMock(),
@@ -380,7 +386,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         with (
             envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True),
             patch(
-                "sglang.srt.disaggregation.prefill.release_kv_cache"
+                "sglang.srt.managers.scheduler_components.request_retirer."
+                "release_kv_cache"
             ) as release_kv_cache,
             patch("sglang.srt.disaggregation.prefill.prepare_abort"),
             patch(

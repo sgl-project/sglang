@@ -88,28 +88,6 @@ _ALLOWED = {
         "DecodePreallocQueue.pop_preallocated",
         "release_kv_cache",
     ): 1,
-    # PD prefill: an aborted prefill result releases its media only at the
-    # end-of-commit sweep, and a bootstrap failure never does.
-    (
-        "disaggregation/prefill.py",
-        "DisaggPrefill._retire_aborted_prefill_result",
-        "release_kv_cache",
-    ): 1,
-    (
-        "disaggregation/prefill.py",
-        "DisaggPrefill._retire_aborted_prefill_result",
-        "tree_cache.finish",
-    ): 1,
-    (
-        "disaggregation/prefill.py",
-        "DisaggPrefill.handle_bootstrap_failure",
-        "release_kv_cache",
-    ): 1,
-    (
-        "disaggregation/prefill.py",
-        "DisaggPrefill.handle_bootstrap_failure",
-        "tree_cache.finish",
-    ): 1,
     # A beam leader aborted mid-chunk keeps its group live.
     (
         "managers/scheduler.py",
