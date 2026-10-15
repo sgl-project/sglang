@@ -271,11 +271,11 @@ class DSAMetadataManagementMixin:
             # cache_seqlens_int32 (just refreshed by the base copy above); keep
             # the exact refresh the recompute path performs -- it is a single
             # small view/copy, not part of the duplicated derived work.
-            seqlens_32_2d = metadata.cache_seqlens_int32.contiguous().view(bs, 1)
-            if metadata.paged_mqa_ctx_lens_2d is None:
-                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
-            else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+            if self.needs_paged_mqa_schedule:
+                self._refresh_paged_mqa_ctx_lens_2d(
+                    metadata=metadata,
+                    seqlens_32_2d=metadata.cache_seqlens_int32.contiguous().view(bs, 1),
+                )
 
         self._copy_kpool_metadata_from_sibling(metadata, src_metadata)
 
