@@ -545,6 +545,30 @@ class TestCalibratorSelection(unittest.TestCase):
             )
         self.assertEqual(module.cache_dit.enable_calls, [])
 
+    def test_dual_transformer_has_separate_cfg_follows_runtime(self):
+        """Under CFG parallel each rank makes one Wan2.2 call per step;
+        cache-dit must not pair consecutive calls as cond/uncond."""
+        for runtime_flag in (True, False):
+            with self.subTest(has_separate_cfg=runtime_flag):
+                module = _import_module_with_stub()
+                module.ParamsModifier = types.SimpleNamespace
+                transformer = _make_transformer("AnyModel")
+                transformer.blocks = ["block_0"]
+                transformer_2 = _make_transformer("AnyModel")
+                transformer_2.blocks = ["block_0"]
+
+                module.enable_cache_on_dual_transformer(
+                    transformer,
+                    transformer_2,
+                    self._config(module),
+                    self._config(module),
+                    model_name="wan2.2",
+                    has_separate_cfg=runtime_flag,
+                )
+
+                adapter = module.cache_dit.enable_calls[0]["target"]
+                self.assertEqual(adapter.has_separate_cfg, runtime_flag)
+
 
 class TestCacheDitLegacyFallback(unittest.TestCase):
     """cache-dit < 1.5.0 (CI base jobs ship 1.3.0): fallback import + DMD guard."""

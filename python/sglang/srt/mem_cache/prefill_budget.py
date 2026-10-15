@@ -62,6 +62,9 @@ def estimate_swa_kv_tokens(
 class PrefillBudget:
     """Fixed token pool. Offsets include pending allocations and decode headroom."""
 
+    # When False, admission skips the FULL spec and passes the host hit length.
+    load_back_needs_full_tokens = False
+
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         self.allocator = allocator
         self.tree_cache = tree_cache
@@ -117,6 +120,7 @@ class PrefillBudget:
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
+        auxiliary_swa_host_hit_length: int = 0,
     ) -> tuple[bool, int | None]:
         """Return admission feasibility and a memory bound on the requested chunk."""
         return (
@@ -232,6 +236,7 @@ class SWAPrefillBudget(PrefillBudget):
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
+        auxiliary_swa_host_hit_length: int = 0,
     ) -> tuple[bool, int | None]:
         if total_tokens >= self.remaining_total:
             return False, None
@@ -315,6 +320,8 @@ class SWAPrefillBudget(PrefillBudget):
 class SharedSWAPrefillBudget(SWAPrefillBudget):
     """FULL and SWA reservations compete for the same physical byte budget."""
 
+    load_back_needs_full_tokens = True
+
     def __init__(self, *args, num_mixed_decode_tokens=0, **kwargs):
         super().__init__(
             *args, num_mixed_decode_tokens=num_mixed_decode_tokens, **kwargs
@@ -393,6 +400,7 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
+        auxiliary_swa_host_hit_length: int = 0,
     ) -> tuple[bool, int | None]:
         needed = self.swa_tokens(
             extend_input_len,

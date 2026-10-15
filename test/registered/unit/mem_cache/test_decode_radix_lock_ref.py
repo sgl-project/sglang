@@ -242,7 +242,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Match prefix (simulates _match_prefix_and_lock in pop_preallocated)
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
-        prefix_len = len(result.device_indices)
+        prefix_len = result.device_prefix_len
         self.assertEqual(prefix_len, 3)
 
         # Step 1: lock (pop_preallocated locks the matched node)
@@ -291,7 +291,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             MatchPrefixParams(key=RadixKey(array("q", full_ids)))
         )
         matched_node = result.last_device_node
-        self.assertEqual(len(result.device_indices), 0)  # no match
+        self.assertEqual(result.device_prefix_len, 0)  # no match
         # matched_node is root
 
         root_lock_before = cache.root_node.lock_ref
@@ -344,7 +344,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Match and lock
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
-        prefix_len = len(result.device_indices)
+        prefix_len = result.device_prefix_len
 
         lock = cache.lock(matched_node)
         # Prefix tokens should now be protected (locked)
@@ -393,7 +393,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
-        prefix_len = len(result.device_indices)
+        prefix_len = result.device_prefix_len
         lock = cache.lock(matched_node)
 
         # Token sequence is 5 long; a 6th KV slot is committed with no token id.
@@ -678,7 +678,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                 MatchPrefixParams(key=RadixKey(array("q", prefix)))
             )
             matched_node = result.last_device_node
-            prefix_len = len(result.device_indices)
+            prefix_len = result.device_prefix_len
 
             lock = cache.lock(matched_node)
 

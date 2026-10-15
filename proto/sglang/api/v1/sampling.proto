@@ -1,5 +1,5 @@
 // The API face of SamplingParams — the ground truth for
-// rust/sglang-server/src/message/sampling.rs's 25 API fields (its 5
+// rust/sglang-server/src/message/sampling.rs's 27 API fields (its 6
 // normalize-internal fields and the msgpack scheduler encoding are IPC, not
 // API, and stay hand-written there). Unknown JSON keys are DENIED: parity with
 // Python's `SamplingParams(**kwargs)` TypeError.
@@ -97,4 +97,13 @@ message SamplingParams {
   // beam_width > 1 turns the request into a beam search request; `n` is then
   // the number of returned sequences (n <= beam_width).
   optional int64 beam_width = 26;
+  WatermarkRequestConfig watermark = 27;
+}
+
+message WatermarkRequestConfig {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+
+  optional bool enabled = 1;
+  optional string key = 2;
+  optional int64 context_window = 3;
 }
