@@ -982,6 +982,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler.tokenizer = object()
         scheduler.disable_radix_cache = False
         scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+        scheduler._record_kv_event_lora_name = MagicMock()
         scheduler._add_request_to_queue = MagicMock()
         scheduler._get_multimodal_inputs = MagicMock(
             side_effect=scheduler_module._MultimodalInputProcessingError("bad image")
@@ -998,6 +999,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             priority=None,
             dimensions=None,
             lora_id=None,
+            lora_name=None,
             http_worker_ipc=None,
             time_stats=None,
             return_pooled_hidden_states=False,
