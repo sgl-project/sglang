@@ -9,6 +9,8 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from types import MappingProxyType
 from typing import Callable, Mapping, NamedTuple, Optional
 
+import msgspec
+
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary.adapters.overlap import (
@@ -42,7 +44,7 @@ from sglang.srt.layers.layer_boundary.layout import (
     moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
-from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.output import OutputTransform, SumImplementation
 from sglang.srt.layers.layer_boundary.residual import (
     ResidualReadout,
     ResidualUpdate,
@@ -300,6 +302,9 @@ class StageDeclaration:
         output_complete: Whether the FFN's compute completes its own output
             sum, so the exit owes none. For an FFN whose output sum is fused
             with a reduction its computation needs anyway.
+        sum_impl: Optional implementation of the declared output sum using
+            the model's custom collective. Its batch predicate, when supplied,
+            preserves eligibility for carrying that sum to the consumer.
         attn_tp_gather: Optional implementation of the gather over attention
             TP that brings rows into this stage: at its own entry, or at its
             producer's exit, which runs its consumer's gather. Given this rank's
@@ -334,6 +339,7 @@ class StageDeclaration:
     writes_at_handoff: bool = False
     output_complete: bool = False
     attn_tp_gather: Optional[Callable] = None
+    sum_impl: Optional[SumImplementation] = None
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -374,7 +380,7 @@ def _require(protocol, implementation, facts):
 
 
 def _check_update(update):
-    _require("ResidualUpdate", update, _UPDATE_FACTS + ("bind",))
+    _require("ResidualUpdate", update, _UPDATE_FACTS + ("bind", "replay_update"))
     if update.bind is not None and not callable(update.bind):
         raise TypeError("ResidualUpdate.bind must be callable or None")
     name = type(update).__name__
@@ -429,6 +435,7 @@ def declare_attn(
     tp_group=SumGroup.ATTN_TP,
     attn_tp_gather=None,
     in_token_order=False,
+    sum_impl=None,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -449,6 +456,8 @@ def declare_attn(
             CP extend its input is gathered into that order, and the next
             stage's input completes the sum and takes this rank's shard back.
             Requires ALWAYS_PARTIAL.
+        sum_impl: Model-specific implementation of the declared output sum.
+
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -469,6 +478,7 @@ def declare_attn(
         tp_group=tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
+        sum_impl=sum_impl,
     )
 
 
@@ -482,6 +492,7 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
+    sum_impl=None,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -498,6 +509,9 @@ def declare_ffn(
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,
             fused with a reduction it needs anyway; the exit then owes none.
+        sum_impl: Model-specific implementation and deferral eligibility of
+            the output sum. Cannot be combined with output_complete.
+
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -511,6 +525,7 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
+        sum_impl=sum_impl,
     )
 
 
@@ -582,6 +597,24 @@ def _stack_arrival(variant):
     )
 
 
+def _custom_sum(stage, variant, group):
+    if stage.sum_impl is None:
+        return None
+    if (
+        variant is not BatchVariant.ORDINARY
+        or get_parallel().attn_dp_size > 1
+        or (
+            stage.kind is StageKind.ATTENTION
+            and stage.reduction is ProducerReduction.EXIT_SCOPED
+        )
+    ):
+        raise NotImplementedError(
+            "custom output sums require ordinary rows without attention DP "
+            "and an always-partial attention or an FFN"
+        )
+    return stage.sum_impl if group is not None and get_parallel().tp_size > 1 else None
+
+
 def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     """``stage``'s data flow for ``variant``, given what arrives at its entry
     and the stage after it (None when it ends the stack or a branch)."""
@@ -599,6 +632,13 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             output_complete=stage.output_complete,
             terminal_accepts_update=stage.terminal
             and takes_pending_update(final_read, stage.update),
+        )
+        declaration = msgspec.structs.replace(
+            declaration,
+            output=msgspec.structs.replace(
+                declaration.output,
+                sum_impl=_custom_sum(stage, variant, declaration.output.group),
+            ),
         )
         exit_rows = resolve_exit_rows(stage.exit_rows)
         if exit_rows is ExitRows.ATTENTION or (
@@ -665,6 +705,7 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             update=stage.update,
             transform=stage.output_transform,
             in_token_order=in_token_order,
+            sum_impl=_custom_sum(stage, variant, group if owes else None),
         ),
     )
     # An attention moves no residual: it keeps the rows it arrives on, except

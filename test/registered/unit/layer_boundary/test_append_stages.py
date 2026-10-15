@@ -1079,6 +1079,7 @@ class TestRowsTheConsumerReads(CustomTestCase):
             """Neither a plain add nor applied at the producer's exit."""
 
             bind = None
+            replay_update = None
 
             is_plain_add = False
             applied_at_exit = False
@@ -1168,6 +1169,7 @@ class TestReadKernels(CustomTestCase):
 
         class Update:
             bind = None
+            replay_update = None
             is_plain_add = True
 
             def slice_residual_attn_tp(self, residual):

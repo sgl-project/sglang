@@ -25,6 +25,7 @@ class PostNormAdd:
     complete output. ``applied_at_exit`` makes the stage write it itself."""
 
     bind = None
+    replay_update = None
 
     is_plain_add = False
     outlives_layer = True

@@ -50,6 +50,8 @@ class ResidualUpdate(Protocol):
 
     # None explicitly declares a stateless update. Bindings take (batch, context).
     bind: Optional[Callable] = None
+    # An invocation may export its reusable producer declaration for graph replay.
+    replay_update: Optional["ResidualUpdate"] = None
 
     # A plain add, which one rank may run before the sum it adds into
     # completes (the DP partial order, a residual that joins the attention
