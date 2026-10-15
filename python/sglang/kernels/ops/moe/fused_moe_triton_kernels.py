@@ -5,6 +5,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -909,10 +910,18 @@ def invoke_fused_moe_kernel(
                 # the matching scales (row- or column-major, strides are
                 # passed to the kernel below).
                 assert A_scale is not None
-            elif _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
-                A, A_scale = per_token_group_quant_fp8(A, block_k)
+                # TP can leave the down-projection K with a partial scale group
+                # (for example, 1280 / TP8 = 160 with a 128-element group).
+                # Quantize a zero-padded temporary tensor; the GEMM still uses
+                # B.shape[2] as its logical K and masks the padding below.
+                pad_k = (-A.shape[-1]) % block_k
+                if pad_k:
+                    A = F.pad(A, (0, pad_k))
+                if _is_cuda:
+                    A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                else:
+                    A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]

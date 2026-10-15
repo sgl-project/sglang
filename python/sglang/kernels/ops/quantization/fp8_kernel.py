@@ -17,6 +17,7 @@ from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -131,6 +132,158 @@ def saturate_to_fp8_range(value: torch.Tensor, dtype: torch.dtype) -> torch.Tens
     # kernel returns the input early for NaN, and the CPU one leaves it to
     # std::min/std::max, which return the NaN operand.
     return value.clamp(-limit, limit)
+
+
+@triton.jit
+def _block_quant_fp8_kernel(
+    x_ptr,
+    output_ptr,
+    scale_ptr,
+    num_rows,
+    num_columns,
+    stride_x_row,
+    stride_x_column,
+    stride_output_row,
+    stride_output_column,
+    stride_scale_row,
+    stride_scale_column,
+    eps,
+    quant_min,
+    quant_max,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLUMNS: tl.constexpr,
+    TILE_COLUMNS: tl.constexpr,
+):
+    """Quantize one logical 2D block per Triton program."""
+    block_row = tl.program_id(0)
+    block_column = tl.program_id(1)
+    row_start = block_row * BLOCK_ROWS
+    column_offsets = block_column * BLOCK_COLUMNS + tl.arange(0, TILE_COLUMNS)
+    column_mask = (column_offsets < num_columns) & (
+        column_offsets < (block_column + 1) * BLOCK_COLUMNS
+    )
+
+    block_amax = 0.0
+    for row_offset in tl.range(0, BLOCK_ROWS):
+        row = row_start + row_offset
+        values = tl.load(
+            x_ptr + row * stride_x_row + column_offsets * stride_x_column,
+            mask=(row < num_rows) & column_mask,
+            other=0.0,
+        ).to(tl.float32)
+        block_amax = tl.maximum(block_amax, tl.max(tl.abs(values)))
+
+    scale = tl.maximum(block_amax, eps) / quant_max
+    inverse_scale = 1.0 / scale
+    for row_offset in tl.range(0, BLOCK_ROWS):
+        row = row_start + row_offset
+        mask = (row < num_rows) & column_mask
+        values = tl.load(
+            x_ptr + row * stride_x_row + column_offsets * stride_x_column,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        quantized = tl.clamp(values * inverse_scale, quant_min, quant_max).to(
+            output_ptr.dtype.element_ty
+        )
+        tl.store(
+            output_ptr
+            + row * stride_output_row
+            + column_offsets * stride_output_column,
+            quantized,
+            mask=mask,
+        )
+
+    tl.store(
+        scale_ptr + block_row * stride_scale_row + block_column * stride_scale_column,
+        scale,
+    )
+
+
+def _block_quant_fp8_torch(
+    x: torch.Tensor,
+    block_shape: Tuple[int, int],
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch reference and non-CUDA fallback for :func:`block_quant_fp8`."""
+    block_rows, block_columns = block_shape
+    num_rows, num_columns = x.shape
+    padded_rows = triton.cdiv(num_rows, block_rows) * block_rows
+    padded_columns = triton.cdiv(num_columns, block_columns) * block_columns
+    padded = F.pad(x, (0, padded_columns - num_columns, 0, padded_rows - num_rows))
+    blocks = padded.view(
+        padded_rows // block_rows,
+        block_rows,
+        padded_columns // block_columns,
+        block_columns,
+    )
+    scales = blocks.abs().float().amax(dim=(1, 3)).clamp(min=eps) / fp8_max
+    quantized = (
+        (blocks.float() / scales[:, None, :, None])
+        .clamp(min=fp8_min, max=fp8_max)
+        .to(fp8_dtype)
+        .reshape(padded_rows, padded_columns)
+    )
+    return quantized[:num_rows, :num_columns].contiguous(), scales.contiguous()
+
+
+def block_quant_fp8(
+    x: torch.Tensor,
+    block_shape: Tuple[int, int],
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dynamically quantize a 2D tensor into FP8 blocks.
+
+    The quantized tensor retains its logical shape, including partial row or
+    column blocks. The returned scale tensor has shape
+    ``(ceil(M / block_rows), ceil(K / block_columns))``.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"block_quant_fp8 expects a 2D tensor, got shape {x.shape}.")
+    if len(block_shape) != 2 or min(block_shape) <= 0:
+        raise ValueError(
+            f"block_shape must contain two positive values, got {block_shape}."
+        )
+    if not x.is_floating_point():
+        raise TypeError(f"block_quant_fp8 expects floating-point input, got {x.dtype}.")
+    if 0 in x.shape:
+        raise ValueError(f"block_quant_fp8 expects a non-empty tensor, got {x.shape}.")
+
+    block_rows, block_columns = int(block_shape[0]), int(block_shape[1])
+    normalized_block_shape = (block_rows, block_columns)
+    if not x.is_cuda:
+        return _block_quant_fp8_torch(x, normalized_block_shape, eps)
+
+    num_rows, num_columns = x.shape
+    output = torch.empty(x.shape, dtype=fp8_dtype, device=x.device)
+    scales = torch.empty(
+        (triton.cdiv(num_rows, block_rows), triton.cdiv(num_columns, block_columns)),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    tile_columns = triton.next_power_of_2(block_columns)
+    _block_quant_fp8_kernel[scales.shape](
+        x,
+        output,
+        scales,
+        num_rows,
+        num_columns,
+        x.stride(0),
+        x.stride(1),
+        output.stride(0),
+        output.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        eps,
+        fp8_min,
+        fp8_max,
+        BLOCK_ROWS=block_rows,
+        BLOCK_COLUMNS=block_columns,
+        TILE_COLUMNS=tile_columns,
+        num_warps=min(max(tile_columns // 32, 1), 8),
+        num_stages=1,
+    )
+    return output, scales
 
 
 @triton.jit

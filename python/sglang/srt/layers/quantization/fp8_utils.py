@@ -1450,8 +1450,19 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             return out
         return output
 
+    # DeepGEMM accepts a partial final K block when the pre-quantized activation
+    # and the weight both carry ceil(K / block_k) scales (Bailing TP K-tails).
+    prequant_k_tail = (
+        input_scale is not None
+        and list(block_size) == [128, 128]
+        and weight.shape[0] % 64 == 0
+        and weight.shape[1] % block_size[1] != 0
+    )
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    if not _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype):
+    if not (
+        prequant_k_tail
+        or _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype)
+    ):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32

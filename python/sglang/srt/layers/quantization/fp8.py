@@ -90,6 +90,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
 )
@@ -1466,6 +1467,44 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         return False
 
+    def _supports_blockwise_fp8_tail(self, layer: Module) -> bool:
+        """Whether this layer can retain partial blocks in native Triton MoE."""
+        if not (_is_cuda and not _is_hip):
+            return False
+        if not getattr(layer, "allow_fp8_blockwise_tail", False):
+            return False
+        if (
+            self.use_mxfp8
+            or self.is_fp4_expert
+            or not self.quant_config.is_checkpoint_fp8_serialized
+        ):
+            return False
+        block_shape = self.quant_config.weight_block_size
+        if block_shape is None or block_shape[0] != block_shape[1]:
+            return False
+
+        parallel = get_parallel()
+        runtime = get_exec()
+        if not (
+            layer.moe_ep_size == 1
+            and parallel.moe_dp_size == 1
+            and layer.moe_tp_size == parallel.tp_size
+            and layer.moe_tp_rank == parallel.tp_rank
+            and get_moe_a2a_backend().is_none()
+            and not runtime.moe.enable_eplb
+            and runtime.moe.ep_num_redundant_experts == 0
+            and runtime.moe.init_expert_location == "trivial"
+            and runtime.offload.cpu_offload_gb == 0
+            and runtime.offload.offload_group_size <= 0
+        ):
+            return False
+
+        moe_runner_backend = get_moe_runner_backend()
+        return moe_runner_backend.is_triton() or (
+            moe_runner_backend.is_auto()
+            and not self.is_deepgemm_moe_runner_backend_enabled()
+        )
+
     @staticmethod
     def create_fp8_moe_weight_(
         layer: Module,
@@ -1480,6 +1519,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         with_bias: bool = False,
         fp4_scale_dtype: Optional[torch.dtype] = None,
+        allow_fp8_blockwise_tail: bool = False,
         **extra_weight_attrs,
     ):
         """
@@ -1507,7 +1547,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             padding_size = get_moe_padding_size(_use_aiter)
-            if not (_use_aiter and padding_size == block_n == block_k):
+            if not (
+                (_use_aiter and padding_size == block_n == block_k)
+                or allow_fp8_blockwise_tail
+            ):
                 # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
                 # Required by column parallel or enabling merged weights
                 if intermediate_size_per_partition % block_n != 0:
@@ -1645,11 +1688,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif block_quant:
             scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
+            # A blockwise tail is requantized onto one merged local w13 grid.
+            w13_scale_rows = (
+                (w13_num_shards * intermediate_size_per_partition + block_n - 1)
+                // block_n
+                if allow_fp8_blockwise_tail
+                else w13_num_shards
+                * ((intermediate_size_per_partition + block_n - 1) // block_n)
+            )
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
-                    w13_num_shards
-                    * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    w13_scale_rows,
                     (hidden_size + block_k - 1) // block_k,
                     dtype=scale_dtype,
                 ),
@@ -1770,6 +1820,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_fp4_expert=self.is_fp4_expert,
             params_dtype=params_dtype,
             with_bias=with_bias,
+            allow_fp8_blockwise_tail=self._supports_blockwise_fp8_tail(layer),
             **extra_weight_attrs,
         )
 

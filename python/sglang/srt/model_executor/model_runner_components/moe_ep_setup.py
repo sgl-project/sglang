@@ -11,6 +11,7 @@ from sglang.srt.eplb.lplb_solver import (
     clear_global_lplb_solvers,
     set_global_lplb_solver,
 )
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -157,13 +158,64 @@ def check_quantized_moe_compatibility(
                 f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({tp_size}) divided by moe_ep_size ({moe_ep_size})."
             )
 
+        has_partial_weight_block = (
+            moe_intermediate_size // moe_tp_size
+        ) % weight_block_size_n != 0
         if (
             not envs.SGLANG_SHARED_EXPERT_TP1.get()
-            and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
+            and has_partial_weight_block
             and not _use_aiter
+            and not _supports_bailing_fp8_tail(
+                model_config=model_config,
+                quantization_config=quantization_config,
+                weight_block_size=weight_block_size,
+                moe_ep_size=moe_ep_size,
+                moe_dp_size=moe_dp_size,
+            )
         ):
             raise ValueError(
                 f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
                 f"where moe_tp_size is equal to tp_size ({tp_size}) divided by ep_size ({moe_ep_size}). "
                 f"You can fix this by setting arguments `--tp` and `--ep` correctly."
             )
+
+
+def _supports_bailing_fp8_tail(
+    *,
+    model_config: ModelConfig,
+    quantization_config: dict,
+    weight_block_size,
+    moe_ep_size: int,
+    moe_dp_size: int,
+) -> bool:
+    """Bailing V3 TP-only block-FP8 MoE loads partial blocks via TP requant."""
+    runtime = get_exec()
+    runtime_moe = runtime.moe
+    moe_runner_backend = runtime_moe.moe_runner_backend
+    moe_a2a_backend = runtime_moe.moe_a2a_backend
+    auto_uses_triton = moe_runner_backend == "auto" and not (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and moe_a2a_backend in ("deepep", "mooncake", "nixl")
+    )
+    architectures = getattr(model_config.hf_config, "architectures", None) or []
+    is_bailing_v3 = "BailingMoeV3ForCausalLM" in architectures or (
+        "BailingMoeForCausalLMNextN" in architectures
+        and model_config.hf_config.model_type == "bailing_hybrid"
+        and getattr(model_config.hf_config, "use_kda", False)
+    )
+    return (
+        is_bailing_v3
+        and quantization_config.get("quant_method") == "fp8"
+        and not quantization_config.get("use_mxfp8", False)
+        and tuple(weight_block_size) == (128, 128)
+        and quantization_config.get("is_checkpoint_fp8_serialized", True)
+        and (moe_runner_backend == "triton" or auto_uses_triton)
+        and moe_a2a_backend == "none"
+        and moe_ep_size == 1
+        and moe_dp_size == 1
+        and not runtime_moe.enable_eplb
+        and runtime_moe.ep_num_redundant_experts == 0
+        and runtime_moe.init_expert_location == "trivial"
+        and runtime.offload.cpu_offload_gb == 0
+        and runtime.offload.offload_group_size <= 0
+    )
