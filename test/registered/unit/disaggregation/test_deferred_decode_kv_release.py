@@ -8,11 +8,17 @@ that its transfer drained (CommonKVManager.is_abort_release_safe). Device
 destinations may also release on timeout; host destinations require the ack.
 """
 
+import multiprocessing
+import tempfile
 import threading
 import unittest
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, call, patch
+
+import torch.distributed as dist
 
 from sglang.srt.disaggregation import decode as decode_mod
 from sglang.srt.disaggregation.base.conn import BaseKVManager, KVPoll
@@ -30,9 +36,18 @@ from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 ABORT_GENERATION = 7
+
+
+def setUpModule():
+    # Queues reduce over the default group; a single rank needs no peer.
+    dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+
+
+def tearDownModule():
+    dist.destroy_process_group()
 
 
 class AbortScenario(NamedTuple):
@@ -668,6 +683,7 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.tree_cache = object()
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
+    q.gloo_group = None
     q.scheduler = SimpleNamespace(
         metrics_reporter=SimpleNamespace(enable_metrics=enable_metrics),
         metrics_collector=SimpleNamespace(
@@ -974,6 +990,123 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertFalse(receiver.abort_notified)
         self.assertEqual(released, [entry])
         self.assertEqual(q._deferred_releases, [])
+
+
+def _resolve_counts(q, steps):
+    """Release counts after each resolve; ``steps`` runs before each call."""
+    counts = []
+    with patch.object(decode_mod, "release_kv_cache") as rel:
+        for step in steps:
+            step()
+            q.resolve_deferred_releases()
+            counts.append(rel.call_count)
+    return counts
+
+
+def _drain_ack_arrives_on_one_rank_first(rank):
+    mgr = _make_manager()
+    q = _make_queue()
+    dreq = _make_decode_req(room=5, idx=1, mgr=mgr)
+    generation = mgr.register_deferred_abort_room(5)
+    q._defer_release(dreq)
+
+    def ack_on(acking_rank):
+        if rank == acking_rank:
+            mgr.note_abort_ack(5, 0, generation)
+
+    # Rank 0's prefill peer acks a step before rank 1's.
+    return _resolve_counts(q, [lambda: ack_on(0), lambda: ack_on(1)])
+
+
+def _deadline_passes_on_one_rank_first(rank):
+    mgr = _make_manager()
+    q = _make_queue()
+    dreq = _make_decode_req(room=6, idx=2, mgr=mgr)
+    mgr.register_deferred_abort_room(6)
+    q._deferred_releases.append((dreq, 0.0, (float("-inf"), float("inf"))[rank], 2, 1))
+
+    def expire():
+        q._deferred_releases[0] = (dreq, 0.0, float("-inf"), 2, 1)
+
+    return _resolve_counts(q, [lambda: None, expire])
+
+
+def _one_rank_cannot_notify(rank):
+    mgr = _make_manager()
+    q = _make_pop_queue(mgr)
+    entry = _make_failed_req(
+        mgr, room=7, idx=3, abort_notified=False, notifiable=rank == 0
+    )
+    if rank == 1:
+        entry.kv_receiver.bootstrap_infos = None
+    else:
+        generation = mgr.register_deferred_abort_room(7)
+    q.queue = [entry]
+    released = []
+    q._release_request = released.append
+    with patch.object(decode_mod, "prepare_abort"):
+        q.pop_transferred()
+    held = len(q._deferred_releases)
+
+    def ack():
+        if rank == 0:
+            mgr.note_abort_ack(7, 0, generation)
+            mgr.note_abort_ack(7, 1, generation)
+
+    q._release_request = lambda decode_req: decode_mod.release_kv_cache(
+        decode_req.req, q.tree_cache, checkpoint=False
+    )
+    return [len(released), held] + _resolve_counts(q, [lambda: None, ack])
+
+
+_RANK_SCENARIOS = {
+    "drain": (_drain_ack_arrives_on_one_rank_first, [0, 1]),
+    "deadline": (_deadline_passes_on_one_rank_first, [0, 1]),
+    "notify": (_one_rank_cannot_notify, [0, 1, 0, 1]),
+}
+
+
+def _rank_agreement_worker(rank, rendezvous):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        for scenario, (run, expected) in _RANK_SCENARIOS.items():
+            counts = run(rank)
+            assert counts == expected, (scenario, rank, counts)
+    finally:
+        dist.destroy_process_group()
+
+
+class TestDeferredReleaseRankAgreement(CustomTestCase):
+    """Every attention TP rank must free a held request's pages on the same step,
+    or admission sees different capacity per rank and the next collective
+    mismatches."""
+
+    @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
+    def test_ranks_release_together(self):
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as directory:
+            rendezvous = str(Path(directory) / "rendezvous")
+            processes = [
+                context.Process(target=_rank_agreement_worker, args=(rank, rendezvous))
+                for rank in range(2)
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                for process in processes:
+                    process.join(timeout=60)
+                self.assertEqual([process.exitcode for process in processes], [0, 0])
+            finally:
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5)
 
 
 class TestBackendOptIn(CustomTestCase):

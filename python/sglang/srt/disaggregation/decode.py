@@ -2749,6 +2749,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Queue-removed but held for deferred release; excluded from the metadata
         # teardown below.
         deferred_indices = set()
+        failed: List[Tuple[int, DecodeRequest, bool]] = []
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -2803,22 +2804,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     # already hold destinations; this path always reaches
                     # _do_release, which clears the tracker.
                     decode_req.kv_receiver.ensure_abort_notified(force_arm=True)
-                if requires_host_drain or (
-                    deferrable and decode_req.kv_receiver.abort_notified
-                ):
-                    # Host pages always await a drain ack. A receiver that could
-                    # not notify (metadata never published, so no prefill holds
-                    # its destination info) has nothing in flight and releases
-                    # immediately below.
-                    self._defer_release(decode_req)
-                    deferred_indices.add(i)
-                    indices_to_remove.add(i)
-                else:
-                    # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                    self._release_request(decode_req)
-                    decode_req.kv_receiver.clear()
-                    decode_req.kv_receiver = None
-                    indices_to_remove.add(i)
+                # Host pages always await a drain ack. A receiver that could
+                # not notify (metadata never published, so no prefill holds
+                # its destination info) has nothing in flight and releases
+                # immediately below.
+                failed.append(
+                    (
+                        i,
+                        decode_req,
+                        requires_host_drain
+                        or (deferrable and decode_req.kv_receiver.abort_notified),
+                    )
+                )
                 self._record_transfer_failure(failure_reason)
                 continue
             elif poll == KVPoll.Success:
@@ -2864,6 +2861,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+        # A peer rank may still be receiving writes for a request this rank could
+        # not notify, so all ranks hold it and later free its pages on one step.
+        defer = self._all_ranks_agree(
+            [held for _, _, held in failed], torch.distributed.ReduceOp.MAX
+        )
+        for (i, decode_req, _), held in zip(failed, defer):
+            if held:
+                self._defer_release(decode_req)
+                deferred_indices.add(i)
+            else:
+                # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                self._release_request(decode_req)
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+            indices_to_remove.add(i)
+
         for i in indices_to_remove:
             if i in deferred_indices:
                 # Held for deferred release; metadata buffer freed at resolve time.
@@ -2895,7 +2908,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         required_acks = (
             0
             if self.enable_host_receive and decode_req.host_staged
-            else len(decode_req.kv_receiver.bootstrap_infos)
+            else len(decode_req.kv_receiver.bootstrap_infos or ())
         )
         self._deferred_releases.append(
             (
@@ -2935,52 +2948,44 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 outcome=outcome,
             )
 
+    def _all_ranks_agree(self, flags: List[bool], op) -> List[bool]:
+        """Reduce per-entry decisions so every attention TP rank acts on the same entries."""
+        if not flags or torch.distributed.get_world_size(self.gloo_group) == 1:
+            return flags
+        reduced = torch.tensor(flags, dtype=torch.int32)
+        torch.distributed.all_reduce(reduced, op=op, group=self.gloo_group)
+        return [bool(flag) for flag in reduced.tolist()]
+
     def resolve_deferred_releases(self) -> None:
         """Release drained transfers; device destinations may also time out."""
         if not self._deferred_releases:
             return
-        host_ready = torch.tensor(
-            [
-                req.kv_receiver.is_abort_release_safe()
-                for req, _, _, _, _ in self._deferred_releases
-                if self.enable_host_receive and req.host_staged
-            ],
-            dtype=torch.int32,
-        )
-        if host_ready.numel() and torch.distributed.get_world_size(self.gloo_group) > 1:
-            # Admission must see identical host capacity and page order on every rank.
-            torch.distributed.all_reduce(
-                host_ready, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
-            )
-        host_ready = iter(host_ready.tolist())
         now = time.monotonic()
+        drained = []
+        ready = []
+        for decode_req, _, deadline, _, required_acks in self._deferred_releases:
+            if self.enable_host_receive and decode_req.host_staged:
+                # A timeout cannot prove that a remote write has stopped.
+                drained.append(decode_req.kv_receiver.is_abort_release_safe())
+                ready.append(drained[-1])
+            else:
+                drained.append(
+                    decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+                        decode_req.req.bootstrap_room, required_acks
+                    )
+                )
+                ready.append(drained[-1] or now >= deadline)
+        # Admission must see identical capacity and page order on every rank.
+        ready = self._all_ranks_agree(ready, torch.distributed.ReduceOp.MIN)
         still_held = []
         to_release = []
-        for (
-            decode_req,
-            start_time,
-            deadline,
-            idx,
-            required_acks,
-        ) in self._deferred_releases:
-            room = decode_req.req.bootstrap_room
-            if self.enable_host_receive and decode_req.host_staged:
-                if next(host_ready):
-                    to_release.append((decode_req, start_time, idx, room, True))
-                else:
-                    # A timeout cannot prove that a remote write has stopped.
-                    still_held.append(
-                        (decode_req, start_time, deadline, idx, required_acks)
-                    )
-                continue
-            kv_mgr = decode_req.kv_receiver.kv_mgr
-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
-                still_held.append(
-                    (decode_req, start_time, deadline, idx, required_acks)
-                )
+        for entry, is_ready, is_drained in zip(self._deferred_releases, ready, drained):
+            decode_req, start_time, _, idx, _ = entry
+            if is_ready:
+                room = decode_req.req.bootstrap_room
+                to_release.append((decode_req, start_time, idx, room, is_drained))
             else:
-                to_release.append((decode_req, start_time, idx, room, drained))
+                still_held.append(entry)
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held

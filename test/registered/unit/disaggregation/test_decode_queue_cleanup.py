@@ -3,6 +3,8 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch.distributed as dist
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
@@ -29,6 +31,15 @@ from sglang.test.separate_buffer_allocator_double import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def setUpModule():
+    # Transfer queues reduce failure decisions over the default group.
+    dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+
+
+def tearDownModule():
+    dist.destroy_process_group()
 
 
 class FakeReceiver:
@@ -381,7 +392,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.enable_staging = False
         queue.enable_deferred_kv_release = False
-        queue.gloo_group = MagicMock()
+        queue.gloo_group = None
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
@@ -497,7 +508,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_host_receive = False
         queue.enable_deferred_kv_release = True
         queue._defer_release = MagicMock()
-        queue.gloo_group = MagicMock()
+        queue.gloo_group = None
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
@@ -632,7 +643,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.enable_staging = False
             queue.enable_host_receive = False
             queue.enable_deferred_kv_release = False
-            queue.gloo_group = MagicMock()
+            queue.gloo_group = None
             queue.req_to_metadata_buffer_idx_allocator = MagicMock()
             queue.tp_rank = 0
             queue.tree_cache = MagicMock()
