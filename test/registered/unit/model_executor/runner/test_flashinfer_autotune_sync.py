@@ -32,7 +32,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 ENV = {"flashinfer_version": "0.6.17", "gpu": "NVIDIA GB300"}
@@ -64,6 +64,45 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         # A 1-rank group would add a collective per tactic for no agreement.
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
+
+
+class TestAutotuneCachePath(CustomTestCase):
+    def test_default_candidate_uses_new_stable_cache_namespace(self):
+        """Pre-default-race winners must not suppress tuning after an upgrade."""
+        runner = SimpleNamespace(
+            device="cuda",
+            dtype=torch.bfloat16,
+            is_draft_worker=False,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            autotune.envs.SGLANG_CACHE_DIR.override(cache_dir),
+            get_context().override_server_args(
+                model_path="dummy",
+                quantization=None,
+                moe_runner_backend="flashinfer_cutlass",
+                tp_size=1,
+                pp_size=1,
+                attn_dp_size=1,
+                ep_size=1,
+                flashinfer_autotune_skip_ops=[],
+            ),
+            get_parallel().override(tp_rank=0, pp_rank=0, dp_rank=0),
+            patch.dict(
+                sys.modules, {"flashinfer": SimpleNamespace(__version__="0.7.1")}
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
+        ):
+            # Frozen output of the pre-default-race cache key for this fixture.
+            legacy_path = (
+                Path(cache_dir)
+                / "flashinfer/autotune/0.7.1/sm90/2bfc06d781688035"
+                / "rank_tp0_pp0_dp0.json"
+            )
+            path = autotune.flashinfer_autotune_cache_path(runner)
+            self.assertNotEqual(path, legacy_path)
+            self.assertEqual(path, autotune.flashinfer_autotune_cache_path(runner))
 
 
 class TestMegaMoEAutotuneStartup(CustomTestCase):
