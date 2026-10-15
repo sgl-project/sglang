@@ -72,12 +72,40 @@ class TestToktierBackend(CustomTestCase):
             )
 
     def test_session_append_matches_reference(self):
+        # The bound session_id is read in "contextvar" mode; the default
+        # "auto" mode looks sessions up by content instead.
+        with patch.dict(os.environ, {"TOKTIER_SGLANG_SESSION_KEY": "contextvar"}):
+            wrapped = _wrap_tokenizer_with_toktier(
+                AutoTokenizer.from_pretrained(BPE_MODEL)
+            )
         request = SimpleNamespace(session_id="session-1", cache_salt=None, rid="r1")
         with _toktier_session_scope(request):
-            first = self.wrapped.encode(TRANSCRIPT)
-            second = self.wrapped.encode(TRANSCRIPT + NEXT_TURN)
+            first = wrapped.encode(TRANSCRIPT)
+            second = wrapped.encode(TRANSCRIPT + NEXT_TURN)
         self.assertEqual(first, self.hf.encode(TRANSCRIPT))
         self.assertEqual(second, self.hf.encode(TRANSCRIPT + NEXT_TURN))
+        stats = wrapped.stats()
+        self.assertEqual(stats["how"], {"session": 2})
+        # The second turn extends the first, so it is served as an append.
+        self.assertEqual(stats["store"]["session_appends"], 1)
+
+    def test_default_mode_is_content_lookup(self):
+        # Without TOKTIER_SGLANG_SESSION_KEY the bound session_id is not read;
+        # a turn that extends a stored text is still served as an append.
+        with patch.dict(os.environ):
+            os.environ.pop("TOKTIER_SGLANG_SESSION_KEY", None)
+            wrapped = _wrap_tokenizer_with_toktier(
+                AutoTokenizer.from_pretrained(BPE_MODEL)
+            )
+        request = SimpleNamespace(session_id="session-1", cache_salt=None, rid="r1")
+        with _toktier_session_scope(request):
+            first = wrapped.encode(TRANSCRIPT)
+            second = wrapped.encode(TRANSCRIPT + NEXT_TURN)
+        self.assertEqual(first, self.hf.encode(TRANSCRIPT))
+        self.assertEqual(second, self.hf.encode(TRANSCRIPT + NEXT_TURN))
+        stats = wrapped.stats()
+        self.assertEqual(stats["how"], {"auto": 2})
+        self.assertEqual(stats["store"]["auto_appends"], 1)
 
     def test_session_scope_binds_session_id_then_cache_salt(self):
         key = toktier_sglang.SESSION_KEY
@@ -92,7 +120,10 @@ class TestToktierBackend(CustomTestCase):
         self.assertIsNone(key.get(None))
 
     def test_chunked_full_encode_matches_reference(self):
+        # In "contextvar" mode a request without a key is stateless, so one
+        # of at least CHUNKED_MIN_CHARS characters takes the chunked route.
         chunked = {
+            "TOKTIER_SGLANG_SESSION_KEY": "contextvar",
             "TOKTIER_SGLANG_CHUNKED_MIN_CHARS": "4096",
             "TOKTIER_SGLANG_CHUNKED_K": "4",
         }
@@ -102,6 +133,9 @@ class TestToktierBackend(CustomTestCase):
             )
         text = (TRANSCRIPT + NEXT_TURN) * 4
         self.assertEqual(wrapped.encode(text), self.hf.encode(text))
+        stats = wrapped.stats()
+        self.assertEqual(stats["how"], {"chunked": 1})
+        self.assertEqual(stats["chunked"]["applied"], 1)
 
     def test_unmodeled_call_shapes_are_delegated(self):
         first, second = "first sentence", "second sentence"
