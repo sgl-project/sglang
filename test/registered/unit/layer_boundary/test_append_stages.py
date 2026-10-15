@@ -1,5 +1,6 @@
 """A layer stack connects the stages appended to it in order."""
 
+import threading
 import unittest
 from functools import partial
 from types import SimpleNamespace
@@ -21,31 +22,42 @@ from sglang.srt.layers.layer_boundary import (
     layer_stack,
 )
 from sglang.srt.layers.layer_boundary import prepare as boundary_prepare
+from sglang.srt.layers.layer_boundary.facts import facts_of
 from sglang.srt.layers.layer_boundary.layout import SumGroup, TokenAxis
 from sglang.srt.layers.layer_boundary.ops import (
     attn_tp_gather_input,
     keep_output,
     update_attn_tp_gather_output,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
     REPLACE_AT_EXIT,
     NormQuantReadout,
 )
-from sglang.srt.layers.rotary_embedding import factory as rope_factory
+from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.utils.common import is_building_neighbour_layer, make_layers
+from sglang.srt.utils.common import make_layers
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def layer_stages(sparse=False):
+    """The stages one decoder layer declares: attention, then an FFN. A
+    pipeline rank reads them for a layer another rank holds."""
+    return (
+        declare_attn(),
+        declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+    )
+
+
 def layer(sparse=False):
-    """One decoder layer's stages: attention, then an FFN."""
+    """One decoder layer, declaring layer_stages."""
     return append_stages(
-        (declare_attn(), fixture.Norm()),
-        (declare_ffn(sparse=sparse, next_layer_sparse=sparse), fixture.Norm()),
+        *((declaration, fixture.Norm()) for declaration in layer_stages(sparse))
     )
 
 
@@ -88,41 +100,39 @@ class TestAppendStages(CustomTestCase):
             layer()
 
     def test_the_previous_layer_gives_the_first_stage_its_producer(self):
-        built = []
+        read = []
 
         def previous_layer():
-            built.append(None)
-            layer(sparse=True)
+            read.append(None)
+            return layer_stages(sparse=True)
 
         with layer_stack(previous_layers=[previous_layer]):
             first, _ = layer()
-        self.assertEqual(len(built), 1)
+        self.assertEqual(len(read), 1)
         self.assertTrue(first.declaration.previous.sparse)
         self.assertFalse(first.plan.enters_stack)
 
     def test_the_next_layer_gives_the_last_stage_its_consumer(self):
-        with layer_stack(
-            next_layers=[lambda: append_stages((declare_ffn(), fixture.Norm()))]
-        ):
+        with layer_stack(next_layers=[lambda: (declare_ffn(),)]):
             (stage,) = append_stages((mixer(), fixture.Norm()))
         self.assertFalse(stage.plan.terminal)
         # It leaves its sum to the FFN that follows it, which completes it.
         for edge in stage.plan.edges.values():
             self.assertTrue(edge.outgoing.produced.always_partial)
 
-    def test_a_stack_without_stages_builds_no_neighbour(self):
+    def test_a_stack_without_stages_reads_no_neighbour(self):
         def unexpected():
-            self.fail("a neighbour was built for a stack without stages")
+            self.fail("a neighbour was read for a stack without stages")
 
         with layer_stack(previous_layers=[unexpected], next_layers=[unexpected]):
             pass
 
-    def test_neighbours_are_built_after_the_stacks_own_layers(self):
+    def test_neighbours_are_read_after_the_stacks_own_layers(self):
         order = []
 
         def neighbour():
             order.append("neighbour")
-            layer()
+            return layer_stages()
 
         with layer_stack(previous_layers=[neighbour], next_layers=[neighbour]):
             order.append("own")
@@ -130,10 +140,12 @@ class TestAppendStages(CustomTestCase):
         self.assertEqual(order, ["own", "neighbour", "neighbour"])
 
     def test_a_neighbour_without_stages_is_passed_over(self):
-        with layer_stack(previous_layers=[lambda: None, lambda: layer(sparse=True)]):
+        with layer_stack(
+            previous_layers=[lambda: (), lambda: layer_stages(sparse=True)]
+        ):
             first, _ = layer()
         self.assertTrue(first.declaration.previous.sparse)
-        with layer_stack(previous_layers=[lambda: None], next_layers=[lambda: None]):
+        with layer_stack(previous_layers=[lambda: ()], next_layers=[lambda: ()]):
             first, last = layer()
         # No earlier layer declares a stage: the stack starts here, and ends
         # here when no later one does.
@@ -142,10 +154,9 @@ class TestAppendStages(CustomTestCase):
 
     def test_a_neighbour_is_read_without_joining_the_stack(self):
         def previous_layer():
-            # A layer with a dense FFN, then one with a MoE: the producer is
-            # the nearest stage, and neither joins this stack.
-            layer(sparse=False)
-            layer(sparse=True)
+            # A dense FFN, then a MoE: the producer is the nearest stage, and
+            # neither joins this stack.
+            return (declare_ffn(sparse=False), declare_ffn(sparse=True))
 
         with layer_stack(previous_layers=[previous_layer]):
             stages = layer()
@@ -165,7 +176,7 @@ class TestAppendStages(CustomTestCase):
         self.assertTrue(all(s.plan is not None for s in branch))
         # The branch reads the MoE's input; the next layer follows the main
         # line's MoE, not the branch's dense FFN.
-        self.assertEqual(branch[0].declaration.prepared_from, moe.declaration)
+        self.assertEqual(branch[0].declaration.prepared_from, facts_of(moe.declaration))
         self.assertTrue(following[0].declaration.previous.sparse)
 
     def test_a_nested_stack_leaves_the_outer_one_untouched(self):
@@ -210,7 +221,7 @@ class TestAppendStages(CustomTestCase):
                 (declare_ffn(), fixture.Norm()), prepared_from=first.declaration
             )
         self.assertIsNot(first.declaration, second.declaration)
-        self.assertIs(branch.declaration.prepared_from, first.declaration)
+        self.assertEqual(branch.declaration.prepared_from, facts_of(first.declaration))
 
     @unittest.skipUnless(hasattr(BaseException, "add_note"), "needs add_note")
     def test_an_error_at_close_names_the_append_it_binds(self):
@@ -233,32 +244,100 @@ class TestAppendStages(CustomTestCase):
 NUM_LAYERS = 4
 
 
+class TestOneStagePerAppend(CustomTestCase):
+    """Appends of one stage each: an attention, then an FFN, alternately."""
+
+    def test_both_sides_of_an_attention_s_edge_agree_across_appends(self):
+        # An a2a MoE returns its output on this rank's attention-TP slice,
+        # so the next attention keeps its residual there; the following FFN
+        # must start from that slice, not from the attention's full rows.
+        with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True):
+            with layer_stack():
+                stages = [
+                    append_stages(
+                        (
+                            declare_attn() if i % 2 == 0 else declare_ffn(sparse=True),
+                            fixture.Norm(),
+                        )
+                    )[0]
+                    for i in range(4)
+                ]
+        for producer, consumer in zip(stages, stages[1:]):
+            if not producer.plan.finishes_directly:
+                continue
+            for variant, edges in producer.plan.edges.items():
+                with self.subTest(variant=variant.name):
+                    incoming = consumer.plan.edges[variant].incoming
+                    self.assertEqual(edges.outgoing.residual, incoming.residual)
+                    self.assertEqual(edges.outgoing.residual_to, incoming.residual_to)
+
+    def test_a_stack_that_ends_on_an_attention_leaves_the_residual_on_its_rows(self):
+        # No exit moves the residual after the last attention: the next rank,
+        # or the final read, takes it on the rows that attention ran on, so
+        # the a2a MoE before it returns it on the attention's rows.
+        def ffn_layer():
+            return (declare_ffn(sparse=True),)
+
+        for next_layers in ((), (ffn_layer,)):
+            with self.subTest(hands_off=bool(next_layers)):
+                with fixture.planning(
+                    fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True
+                ):
+                    with layer_stack(next_layers=next_layers):
+                        stages = [
+                            append_stages(
+                                (
+                                    declare_attn()
+                                    if i % 2 == 0
+                                    else declare_ffn(sparse=True),
+                                    fixture.Norm(),
+                                )
+                            )[0]
+                            for i in range(3)
+                        ]
+                for variant, edges in stages[-1].plan.edges.items():
+                    self.assertEqual(
+                        edges.incoming.residual_to, edges.incoming.need.layout
+                    )
+
+
+def stage_facts(idx):
+    """The shared declaration function of TestMakeLayers' layers: layer 1
+    has a MoE."""
+    return layer_stages(sparse=idx == 1)
+
+
 class TestMakeLayers(CustomTestCase):
     """make_layers builds its layers in one stack, and on a pipeline stage
-    reads the stages the other stages' layers declare next to it."""
+    reads the stages the other stages' layers declare next to it from the
+    model's shared declaration function."""
 
     def setUp(self):
         self.planning = fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2))
         self.planning.__enter__()
         self.addCleanup(self.planning.__exit__, None, None, None)
 
-    def build(self, pp_rank=None, pp_size=None, *, declares=True):
-        """Build the layers; layer 1 has a MoE. Returns each layer_fn call as
-        (index, prefix, device, built as a neighbour) and the stages of the
-        layers built here."""
-        calls, stages = [], {}
+    def build(self, pp_rank=None, pp_size=None, *, declares=True, facts=stage_facts):
+        """Build the layers. Returns the indices layer_fn built and the stages
+        of the layers built here."""
+        built, stages = [], {}
 
         def layer_fn(idx, prefix):
-            device = torch.empty(()).device.type
-            calls.append((idx, prefix, device, is_building_neighbour_layer()))
+            self.assertEqual(prefix, f"layers.{idx}")
+            built.append(idx)
             if declares:
-                stages.setdefault(idx, layer(sparse=idx == 1))
+                stages[idx] = layer(sparse=idx == 1)
             return nn.Identity()
 
         make_layers(
-            NUM_LAYERS, layer_fn, pp_rank=pp_rank, pp_size=pp_size, prefix="layers"
+            NUM_LAYERS,
+            layer_fn,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            prefix="layers",
+            stage_facts=facts,
         )
-        return calls, stages
+        return built, stages
 
     def test_the_layers_form_one_stack(self):
         _, stages = self.build()
@@ -266,27 +345,11 @@ class TestMakeLayers(CustomTestCase):
         self.assertEqual([s.plan.terminal for s in stages], [False] * 7 + [True])
         self.assertEqual([s.plan.enters_stack for s in stages], [True] + [False] * 7)
 
-    def test_a_pipeline_stage_builds_its_neighbours_on_meta_after_its_layers(self):
-        calls, _ = self.build(pp_rank=0, pp_size=2)
-        self.assertEqual(
-            calls,
-            [
-                (0, "layers.0", "cpu", False),
-                (1, "layers.1", "cpu", False),
-                (2, "layers.2", "meta", True),
-            ],
-        )
-        calls, _ = self.build(pp_rank=1, pp_size=2)
-        self.assertEqual(
-            calls,
-            [
-                (2, "layers.2", "cpu", False),
-                (3, "layers.3", "cpu", False),
-                (1, "layers.1", "meta", True),
-            ],
-        )
+    def test_a_pipeline_stage_builds_only_its_own_layers(self):
+        self.assertEqual(self.build(pp_rank=0, pp_size=2)[0], [0, 1])
+        self.assertEqual(self.build(pp_rank=1, pp_size=2)[0], [2, 3])
 
-    def test_the_neighbours_connect_the_stack_across_pipeline_stages(self):
+    def test_the_declaration_function_connects_the_stack_across_stages(self):
         _, first = self.build(pp_rank=0, pp_size=2)
         self.assertTrue(first[0][0].plan.enters_stack)
         self.assertFalse(first[1][1].plan.terminal)
@@ -296,20 +359,31 @@ class TestMakeLayers(CustomTestCase):
         self.assertFalse(last[2][0].plan.enters_stack)
         self.assertTrue(last[3][1].plan.terminal)
 
-    def test_layers_without_stages_build_no_neighbour(self):
-        calls, _ = self.build(pp_rank=1, pp_size=2, declares=False)
-        self.assertEqual([call[0] for call in calls], [2, 3])
-
-    def test_a_neighbour_s_rope_modules_leave_the_cache(self):
+    def test_a_layer_must_declare_what_its_declaration_function_says(self):
         def layer_fn(idx, prefix):
-            rope_factory._ROPE_DICT[("test", idx)] = None
-            layer()
+            layer(sparse=idx == 2)
             return nn.Identity()
 
-        with patch.dict(rope_factory._ROPE_DICT):
-            make_layers(NUM_LAYERS, layer_fn, pp_rank=0, pp_size=2)
-            added = {key for key in rope_factory._ROPE_DICT if key[0] == "test"}
-        self.assertEqual(added, {("test", 0), ("test", 1)})
+        with self.assertRaisesRegex(
+            ValueError,
+            r"layer 2 declares stages .*: stage 1 \(FFN\): sparse is True, "
+            "the function says False",
+        ):
+            make_layers(
+                NUM_LAYERS,
+                layer_fn,
+                pp_rank=1,
+                pp_size=2,
+                stage_facts=lambda idx: (declare_attn(), declare_ffn()),
+            )
+
+    def test_layers_with_stages_need_a_declaration_function(self):
+        with self.assertRaisesRegex(ValueError, "stage_facts"):
+            self.build(pp_rank=1, pp_size=2, facts=None)
+
+    def test_layers_without_stages_need_no_declaration_function(self):
+        built, _ = self.build(pp_rank=1, pp_size=2, declares=False, facts=None)
+        self.assertEqual(built, [2, 3])
 
 
 class TestPipelineHandoff(CustomTestCase):
@@ -331,7 +405,7 @@ class TestPipelineHandoff(CustomTestCase):
         return stage.plan.paths[BatchVariant.ORDINARY]
 
     def test_the_sending_rank_returns_to_the_attention_rows(self):
-        with layer_stack(next_layers=[partial(layer, sparse=True)]):
+        with layer_stack(next_layers=[partial(layer_stages, sparse=True)]):
             first_attn, first_ffn, second_attn, second_ffn = [
                 s for _ in range(2) for s in layer(sparse=True)
             ]
@@ -348,7 +422,7 @@ class TestPipelineHandoff(CustomTestCase):
     def test_the_handoff_writes_what_the_move_leaves(self):
         # A move that leaves the residual, as for an FFN on an unpadded batch's
         # rows: the exit still writes the output into it.
-        with layer_stack(next_layers=[partial(layer, sparse=True)]):
+        with layer_stack(next_layers=[partial(layer_stages, sparse=True)]):
             ffn = [s for s in layer(sparse=True)][-1]
         steps = msgspec.structs.replace(self.path(ffn), output_move=keep_output)
         hidden, residual = torch.ones(4, 4), torch.full((4, 4), 2.0)
@@ -366,7 +440,7 @@ class TestPipelineHandoff(CustomTestCase):
         torch.testing.assert_close(written, want)
 
     def test_the_receiving_rank_reads_the_attention_rows(self):
-        with layer_stack(previous_layers=[partial(layer, sparse=True)]):
+        with layer_stack(previous_layers=[partial(layer_stages, sparse=True)]):
             attention, _ = layer(sparse=True)
         self.assertIsNone(self.path(attention).entry.input_move)
         self.assertIs(attention.declaration.previous.exit_rows, ExitRows.ATTENTION)
@@ -374,7 +448,7 @@ class TestPipelineHandoff(CustomTestCase):
     def test_the_receiving_rank_reads_the_stream_as_written(self):
         # A residual beside it, as a captured graph's input buffer holds, is
         # not read.
-        with layer_stack(previous_layers=[partial(layer, sparse=True)]):
+        with layer_stack(previous_layers=[partial(layer_stages, sparse=True)]):
             attention, _ = layer(sparse=True)
         attention.plan.path_for = lambda _: self.path(attention)
         hidden, stale = torch.ones(4, 4), torch.full((4, 4), 2.0)
@@ -391,7 +465,7 @@ class TestPipelineHandoff(CustomTestCase):
     def test_a_handoff_from_the_attention_rows_carries_its_residual(self):
         # A dense FFN over the TP group computes on the attention's rows and
         # leaves the residual add to the receiver, which requires it.
-        with layer_stack(previous_layers=[partial(layer, sparse=False)]):
+        with layer_stack(previous_layers=[partial(layer_stages, sparse=False)]):
             attention, _ = layer(sparse=False)
         self.assertFalse(attention.declaration.previous.writes_at_handoff)
         attention.plan.path_for = lambda _: self.path(attention)
@@ -403,6 +477,403 @@ class TestPipelineHandoff(CustomTestCase):
         self.assertIs(batch.residual_stream.pending.value, hidden)
         with self.assertRaises(KeyError):
             attention.from_pp(PPProxyTensors({"hidden_states": hidden}), batch)
+
+
+class TestInputScatteredHandoff(CustomTestCase):
+    """On an input-scattered batch the attention keeps the residual on this
+    rank's attention-TP slice; the FFN that hands off to the next pipeline
+    rank runs and exits with the residual on one set of rows."""
+
+    def test_an_ffn_s_entry_leaves_the_rows_its_exit_starts_from(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1, attn_tp=4, enable_attn_tp_input_scattered=True
+        )
+        with fixture.planning(parallel):
+            with layer_stack(next_layers=[layer_stages]):
+                stages = [s for _ in range(2) for s in layer(sparse=True)]
+        for stage in stages:
+            for variant, edges in stage.plan.edges.items():
+                with self.subTest(kind=stage.kind.name, variant=variant.name):
+                    self.assertEqual(
+                        edges.incoming.residual_to, edges.outgoing.residual
+                    )
+
+
+# The stages of a stack cut between pipeline ranks.
+CUT_STAGES = {
+    "attention": declare_attn,
+    "mixer": mixer,
+    "dense": declare_ffn,
+    "sparse": partial(declare_ffn, sparse=True),
+}
+CUT_ROWS = 8
+# A stack binds when it closes, in the one stack the module has open: the
+# simulated ranks bind theirs one at a time.
+BINDING = threading.Lock()
+
+
+def bind_cut(kinds, *, before=(), after=()):
+    """One rank's stages: ``kinds``, with ``before`` and ``after`` held by
+    the pipeline ranks next to it."""
+
+    def held_by_another_rank(kinds):
+        return [lambda: tuple(CUT_STAGES[kind]() for kind in kinds)] if kinds else []
+
+    with (
+        BINDING,
+        layer_stack(
+            previous_layers=held_by_another_rank(before),
+            next_layers=held_by_another_rank(after),
+        ),
+    ):
+        return append_stages(*((CUT_STAGES[kind](), fixture.Norm()) for kind in kinds))
+
+
+class Logged(fixture.Group):
+    """A group that logs each collective, by kind, on the rank that runs it."""
+
+    def all_reduce(self, x):
+        fixture.state().log.append(("all_reduce", self.name))
+        return super().all_reduce(x)
+
+    def reduce_scatter_tensor(self, output, input):
+        fixture.state().log.append(("reduce_scatter", self.name))
+        super().reduce_scatter_tensor(output, input)
+
+    def all_gather_into_tensor(self, output, input):
+        fixture.state().log.append(("all_gather", self.name))
+        super().all_gather_into_tensor(output, input)
+
+
+def computed(kind, hidden, state):
+    """What a stage computes on one rank: an attention or a mixer leaves its
+    sum (3 * x) as this rank's attention-TP partial, a dense FFN its sum
+    (5 * x) as this rank's TP partial, and an a2a MoE, on this rank's slice
+    of the rows, a complete 5 * x."""
+    if kind in ("attention", "mixer"):
+        if hidden.shape[0] != CUT_ROWS:
+            # An input-scattered attention's QKV hook gathers the rows.
+            rows = hidden.new_empty(CUT_ROWS, hidden.shape[1])
+            state.attention_gather.all_gather_into_tensor(rows, hidden)
+            hidden = rows
+        return fixture.attention(hidden, state)
+    if kind == "dense":
+        return fixture.dense_mlp(hidden, state)
+    return 5 * hidden
+
+
+def cut_reference(x, kinds):
+    """The residual after ``kinds``: each stage reads Norm's 2 * residual and
+    adds its output to it."""
+    residual, output = x, None
+    for kind in kinds:
+        if output is not None:
+            residual = output + residual
+        output = (3 if kind in ("attention", "mixer") else 5) * (2 * residual)
+    return output + residual
+
+
+def cut_batch():
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_context_parallel_extend=lambda: False,
+            is_decode_or_idle=lambda: False,
+        ),
+        dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+        global_dp_buffer_len=CUT_ROWS,
+        input_ids=torch.zeros(CUT_ROWS),
+        residual_stream=None,
+    )
+
+
+class TestValuesAcrossAPipelineCut(CustomTestCase):
+    """A stack cut between two pipeline ranks computes what it does uncut, on
+    every attention-TP rank, each a thread over collectives that wait for its
+    whole group. The pipeline sends each tensor as one slice of its rows per
+    attention-TP rank, and the next rank gathers the slices back: a sum left
+    to the next rank's input would reach it as a mixture of the ranks'
+    partials. So the sending rank completes, once, every sum its output still
+    owes; the receiving rank sums nothing it receives, and adds the residual
+    once."""
+
+    def run_world(self, forward, *, attn_tp, scattered, a2a, use_reduce_scatter):
+        world = fixture.World(attn_tp)
+        fixture.WORLD[0] = world
+        # Without attention DP, attention TP is the TP group.
+        tp_group = Logged(world, "tp", range(attn_tp))
+        groups = dict(
+            # An input-scattered attention's own gather of its rows.
+            attention_gather=Logged(world, "attention", range(attn_tp)),
+            # The pipeline's gather of the slices it sent.
+            pipeline=Logged(world, "pipeline", range(attn_tp)),
+        )
+        states = [
+            SimpleNamespace(
+                rank=rank,
+                parallel=fixture.parallel_of(
+                    attn_dp=1,
+                    attn_tp=attn_tp,
+                    tp_rank=rank,
+                    attn_tp_rank=rank,
+                    tp_group=tp_group,
+                    attn_tp_group=tp_group,
+                    enable_attn_tp_input_scattered=scattered,
+                    pp_size=2,
+                ),
+                flags=fixture.Flags(),
+                calls=[],
+                log=[],
+                dp=0,
+                rows=CUT_ROWS,
+                offset=0,
+                local_rows=CUT_ROWS,
+                global_rows=CUT_ROWS,
+                dp_rows=[CUT_ROWS],
+                **groups,
+            )
+            for rank in range(attn_tp)
+        ]
+        with (
+            fixture.running(
+                reduce_scatterv=False, a2a=a2a, use_reduce_scatter=use_reduce_scatter
+            ),
+            patch_communicator(
+                "get_attn_tp_context",
+                lambda: SimpleNamespace(
+                    input_scattered=scattered,
+                    is_dsa=False,
+                    set_attn_inputs=lambda inputs: None,
+                ),
+            ),
+        ):
+            results, errors = world.run(states, lambda rank: forward(states[rank]))
+        failed = [
+            (rank, error) for rank, error in enumerate(errors) if error is not None
+        ]
+        if failed:
+            # A rank that raises breaks the barriers the others wait at.
+            rank, error = next(
+                (
+                    (rank, error)
+                    for rank, error in failed
+                    if not isinstance(error, threading.BrokenBarrierError)
+                ),
+                failed[0],
+            )
+            raise AssertionError(f"rank {rank} raised") from error
+        # Every rank ran the same collectives.
+        self.assertEqual(len({tuple(state.log) for state in states}), 1)
+        return results, states
+
+    @staticmethod
+    def run_stages(stages, kinds, hidden, forward_batch, state):
+        """Run ``stages`` on one rank. Records on ``state`` what each one's
+        input owes as it prepares (``owed``), and where in the log of its
+        collectives its prepare ends (``prepared``)."""
+        for stage, kind in zip(stages, kinds):
+            pending = forward_batch.residual_stream.pending
+            state.owed.append(None if pending is None else pending.owed)
+            hidden = stage.prepare(hidden, forward_batch)
+            state.prepared.append(len(state.log))
+            if stage.plan.finishes_directly:
+                hidden = stage.finish(computed(kind, hidden, state), forward_batch)
+            else:
+                with stage.exit(forward_batch) as scope:
+                    output = computed(kind, hidden, state)
+                hidden = scope.finish(output)
+        return hidden
+
+    @staticmethod
+    def transported(tensors, state):
+        """What the next pipeline rank receives: each attention-TP rank sends
+        its slice of every tensor's rows, and the receiver gathers them."""
+        parallel = state.parallel
+        received = {}
+        for name, value in tensors.tensors.items():
+            part = value.tensor_split(parallel.attn_tp_size)[parallel.attn_tp_rank]
+            received[name] = value.new_empty(value.shape)
+            state.pipeline.all_gather_into_tensor(received[name], part.contiguous())
+        return PPProxyTensors(received)
+
+    def run_cut(
+        self,
+        kinds,
+        cut,
+        *,
+        attn_tp,
+        scattered=False,
+        a2a=False,
+        use_reduce_scatter=True,
+    ):
+        """Run ``kinds`` on every rank uncut, then cut before ``kinds[cut]``.
+        Returns the input, and each run's per-rank (output, residual) and
+        states. A cut run's state also holds what the sending rank's output
+        owed as it was sent (``sent``), the tensors sent (``keys``), and the
+        collectives that sent them (``sending``) and that read them on the
+        receiving rank, up to the end of its first prepare (``receiving``)."""
+        x = torch.arange(1.0, CUT_ROWS * fixture.HIDDEN + 1).double()
+        x = x.view(CUT_ROWS, fixture.HIDDEN)
+
+        def embedded(state):
+            if scattered:
+                # The vocabulary-parallel embedding leaves its TP sum.
+                return x * fixture.WEIGHTS[attn_tp][state.parallel.tp_rank]
+            return x.clone()
+
+        def uncut(state):
+            state.owed, state.prepared = [], []
+            stages = bind_cut(kinds)
+            forward_batch = cut_batch()
+            residual_batch.start(forward_batch)
+            hidden = self.run_stages(
+                stages, kinds, embedded(state), forward_batch, state
+            )
+            return forward_batch.residual_stream.export(hidden)
+
+        def cut_at(state):
+            state.owed, state.prepared = [], []
+            sender = bind_cut(kinds[:cut], after=kinds[cut:])
+            receiver = bind_cut(kinds[cut:], before=kinds[:cut])
+            forward_batch = cut_batch()
+            residual_batch.start(forward_batch)
+            hidden = self.run_stages(
+                sender, kinds[:cut], embedded(state), forward_batch, state
+            )
+            pending = forward_batch.residual_stream.pending
+            state.sent = None if pending is None else pending.owed
+            start = len(state.log)
+            tensors = residual_batch.to_pp(hidden, forward_batch)
+            state.sending = state.log[start:]
+            state.keys = sorted(tensors.tensors)
+            received = self.transported(tensors, state)
+            start = len(state.log)
+            forward_batch = cut_batch()
+            hidden = receiver[0].from_pp(received, forward_batch)
+            state.prepared = []
+            hidden = self.run_stages(
+                receiver, kinds[cut:], hidden, forward_batch, state
+            )
+            state.receiving = state.log[start : state.prepared[0]]
+            return forward_batch.residual_stream.export(hidden)
+
+        world = dict(
+            attn_tp=attn_tp,
+            scattered=scattered,
+            a2a=a2a,
+            use_reduce_scatter=use_reduce_scatter,
+        )
+        uncut_results, uncut_states = self.run_world(uncut, **world)
+        cut_results, cut_states = self.run_world(cut_at, **world)
+        return SimpleNamespace(
+            x=x,
+            kinds=kinds,
+            uncut=uncut_results,
+            uncut_states=uncut_states,
+            cut=cut_results,
+            cut_states=cut_states,
+        )
+
+    def assert_values(self, run):
+        """Every rank gets the output and residual it gets uncut, and their
+        sum is the reference's residual."""
+        want = cut_reference(run.x, run.kinds)
+        for rank, ((hidden, residual), (cut_hidden, cut_residual)) in enumerate(
+            zip(run.uncut, run.cut)
+        ):
+            with self.subTest(rank=rank):
+                torch.testing.assert_close(cut_hidden, hidden, rtol=0, atol=0)
+                self.assertIs(cut_residual is None, residual is None)
+                if residual is not None:
+                    torch.testing.assert_close(cut_residual, residual, rtol=0, atol=0)
+                    hidden = hidden + residual
+                torch.testing.assert_close(hidden, want, rtol=0, atol=0)
+
+    def assert_sums_completed_once(self, run):
+        """The sending rank completes what its output owes as it sends it,
+        once; the receiving rank sums nothing of what it receives."""
+        reductions = ("all_reduce", "reduce_scatter")
+        for state in run.cut_states:
+            with self.subTest(rank=state.rank, side="sending"):
+                sent = [call for call in state.sending if call[0] in reductions]
+                self.assertEqual(len(sent), 0 if state.sent is None else 1)
+            with self.subTest(rank=state.rank, side="receiving"):
+                received = [call for call in state.receiving if call[0] in reductions]
+                self.assertEqual(received, [])
+
+    def test_a_mixer_s_sum_left_to_the_next_ffn(self):
+        run = self.run_cut(("mixer", "dense"), 1, attn_tp=2)
+        # Uncut, the mixer's exit leaves its sum to the FFN's input; cut
+        # between them, the sending rank still owes it.
+        for state in run.uncut_states:
+            self.assertEqual(state.owed[1], DeclaredSum(SumGroup.ATTN_TP))
+        for state in run.cut_states:
+            self.assertEqual(state.sent, DeclaredSum(SumGroup.ATTN_TP))
+        self.assert_values(run)
+        self.assert_sums_completed_once(run)
+
+    def test_an_input_scattered_ffn_s_sum_left_to_a_reduce_scatter(self):
+        kinds = ("attention", "dense", "attention", "dense")
+        run = self.run_cut(kinds, 2, attn_tp=4, scattered=True)
+        # The FFN leaves its TP sum to the next attention's reduce-scatter
+        # onto this rank's slice of the rows.
+        for state in run.uncut_states:
+            self.assertEqual(state.owed[2], DeclaredSum(SumGroup.TP))
+        for state in run.cut_states:
+            self.assertEqual(state.sent, DeclaredSum(SumGroup.TP))
+        self.assert_values(run)
+        self.assert_sums_completed_once(run)
+
+    def test_an_input_scattered_ffn_s_completed_sum(self):
+        kinds = ("attention", "dense", "attention", "dense")
+        run = self.run_cut(
+            kinds, 2, attn_tp=4, scattered=True, use_reduce_scatter=False
+        )
+        # Without a reduce-scatter the FFN completes its own sum, though the
+        # next attention's entry also binds for one left to it.
+        for state in run.uncut_states:
+            self.assertIsNone(state.owed[2])
+        for state in run.cut_states:
+            self.assertIsNone(state.sent)
+        self.assert_values(run)
+        self.assert_sums_completed_once(run)
+
+    def test_an_ffn_on_its_own_rows_hands_on_the_stream_it_writes(self):
+        kinds = ("attention", "sparse", "attention", "sparse")
+        run = self.run_cut(kinds, 2, attn_tp=2, a2a=True)
+        # The a2a MoE's output is complete; it writes it into the residual
+        # and sends the stream alone.
+        for state in run.cut_states:
+            self.assertIsNone(state.sent)
+            self.assertEqual(state.keys, ["hidden_states"])
+        self.assert_values(run)
+        self.assert_sums_completed_once(run)
+
+
+class TestInputScatteredAttentionInput(CustomTestCase):
+    """On an input-scattered batch an attention without a QKV hook, which
+    projects the rows it is given, gets every row of its input."""
+
+    def test_an_attention_without_a_qkv_hook_gets_every_row(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
+        )
+        with fixture.planning(parallel):
+            with layer_stack():
+                attention, _ = layer()
+        entry = attention.plan.paths[BatchVariant.INPUT_SCATTERED].entry
+        rows = torch.ones(2, 4)
+        with (
+            patch.object(
+                boundary_prepare,
+                "get_attn_tp_context",
+                return_value=SimpleNamespace(is_dsa=False),
+            ),
+            patch.object(
+                boundary_prepare, "tp_gather", lambda h, fb: torch.cat([h, h])
+            ),
+        ):
+            hidden = entry.attn_input_adapter(rows, SimpleNamespace(), None)
+        self.assertEqual(hidden.shape[0], 4)
 
 
 class TestUnpaddedBatches(CustomTestCase):
@@ -564,6 +1035,8 @@ class TestRowsTheConsumerReads(CustomTestCase):
             is_plain_add = False
             applied_at_exit = False
             outlives_layer = True
+            writes_stream = False
+            quantized_sum = False
 
         # One pipeline rank: an update other than a plain add can't cross one.
         parallel = fixture.parallel_of(attn_dp=1, attn_tp=2, pp_size=1)
@@ -579,14 +1052,16 @@ class TestRowsTheConsumerReads(CustomTestCase):
                 ):
                     stages = [
                         stage
-                        for _ in range(2)
+                        for i in range(2)
                         for stage in append_stages(
                             (declare_attn(read=GatheringRead()), fixture.Norm()),
                             (
                                 declare_ffn(
                                     sparse=True,
                                     next_layer_sparse=True,
-                                    update=update,
+                                    # The final read adds the last output as a
+                                    # plain add.
+                                    update=update if i == 0 else PLAIN_ADD,
                                 ),
                                 fixture.Norm(),
                             ),

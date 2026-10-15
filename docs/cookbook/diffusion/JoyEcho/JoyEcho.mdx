@@ -9,7 +9,22 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["video + audio", "multi-shot", "minute-scale", "memory bank", "8-step"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/JoyAI/joyecho.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+Prepare the [pinned Echo 1.0 checkpoint](#3-1-prepare-the-echo-1-0-checkpoint) and set `JOY_ECHO_MODEL_PATH` before starting the server.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [JoyAI-Echo](https://huggingface.co/jdopensource/JoyAI-Echo) is an 8-step long-form audio-video model built on LTX-2. Its paired memory bank carries decoded visual context and audio latents across prompt changes, making it strongest for multi-shot, minute-scale sequences that need continuity in both picture and soundtrack.
 
@@ -28,10 +43,6 @@ SGLang materializes the Echo 1.0 monolithic release through the built-in [JoyAI-
 <Warning>
 Review the model license on the [JoyAI-Echo Hugging Face page](https://huggingface.co/jdopensource/JoyAI-Echo) before production or commercial use. SGLang support does not grant additional model usage rights.
 </Warning>
-
-## 2. SGLang-diffusion Installation
-
-Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
 
 ## 3. Model Deployment
 

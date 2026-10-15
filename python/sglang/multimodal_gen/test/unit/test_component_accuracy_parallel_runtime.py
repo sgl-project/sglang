@@ -23,6 +23,20 @@ from sglang.srt.runtime_context import ParallelContext, get_parallel
 _UTILS = "sglang.multimodal_gen.test.single_test_file.component_accuracy.utils"
 
 
+@pytest.fixture(autouse=True)
+def isolate_srt_moe_groups():
+    with (
+        patch.object(parallel_state, "_SRT_MOE_EP", None),
+        patch.object(srt_parallel_state, "_TP", None),
+        patch.object(srt_parallel_state, "_ATTN_TP", None),
+        patch.object(srt_parallel_state, "_MOE_TP", None),
+        patch.object(srt_parallel_state, "_MOE_EP", None),
+        patch.object(parallel_state, "_init_srt_moe_ep_group") as create_group,
+        patch("sglang.srt.runtime_context._PARALLEL", ParallelContext()),
+    ):
+        yield create_group
+
+
 def _tp_group(world_size: int = 1, rank_in_group: int = 0) -> SimpleNamespace:
     """A TP group handle carrying the two members the scope declares to the
     runtime context (`use_tensor_parallel_group` overrides `tp_size` /
@@ -115,6 +129,8 @@ def test_destroy_releases_sequence_parallel_subgroups_after_partial_init():
             "_VAE_DECODE",
             "_DIT",
             "_VAE",
+            "_REPLICA",
+            "_ENCODER_DP",
         ):
             stack.enter_context(patch.object(parallel_state, name, None))
         stack.enter_context(patch.object(PROCESS_GROUP, "ULYSSES_PG", ulysses_group))
@@ -176,6 +192,35 @@ def test_srt_owned_groups_are_not_overwritten_or_cleared():
 
         assert srt_parallel_state._TP is srt_tp_group
         assert srt_parallel_state._ATTN_TP is srt_attention_tp_group
+
+
+@pytest.mark.parametrize("ownership", ["diffusion", "srt", "replaced"])
+def test_srt_moe_ep_group_ownership(isolate_srt_moe_groups, ownership):
+    create_group = isolate_srt_moe_groups
+    owned = create_group.return_value
+    external = SimpleNamespace(destroy=lambda: pytest.fail("destroyed SRT-owned group"))
+    with patch.object(parallel_state, "_TP", _tp_group()):
+        if ownership == "srt":
+            srt_parallel_state._MOE_EP = external
+        parallel_state._sync_srt_tp_group()
+        parallel_state._sync_srt_tp_group()
+        if ownership == "replaced":
+            srt_parallel_state._MOE_EP = external
+
+        parallel_state._clear_srt_tp_group()
+        parallel_state._clear_srt_tp_group()
+
+        if ownership == "srt":
+            create_group.assert_not_called()
+            owned.destroy.assert_not_called()
+        else:
+            create_group.assert_called_once_with()
+            owned.destroy.assert_called_once_with()
+        assert parallel_state._SRT_MOE_EP is None
+        assert srt_parallel_state._MOE_TP is None
+        assert srt_parallel_state._MOE_EP is (
+            None if ownership == "diffusion" else external
+        )
 
 
 @pytest.mark.parametrize("rank", [0, 1])
