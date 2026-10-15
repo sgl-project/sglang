@@ -2,6 +2,7 @@
 
 import unittest
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -9,8 +10,10 @@ import torch
 
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
+    DSV4Metadata,
     LateLayerTail,
 )
+from sglang.srt.layers.cp.bcg import execute_prefill_cp_bcg
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
@@ -18,7 +21,10 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4ForCausalLM,
+    deepseek_v4_low_ratio_sources,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_cp_test_utils import cp_context, simulated_collective
@@ -31,9 +37,84 @@ RUNNER = "sglang.srt.model_executor.runner.eager_runner"
 
 
 class TestDSV41TextCP(CustomTestCase):
+    def test_cp_graph_tail_build_refreshes_live_rows_without_changing_capacity(self):
+        """Upstream rejects CP at graph-tail metadata construction; padding must
+        instead own dummy KV slots while local row/position addresses stay fixed."""
+        for rank in range(4):
+            backend = object.__new__(DeepseekV4AttnBackend)
+            backend.encoder_row_floor = None
+            backend._bcg_tail_capacity = 256
+            backend._bcg_tail_buffers = None
+            backend._bcg_cp_tail_buffers = {}
+            backend.token_to_kv_pool = NS(
+                request_window=None,
+                translate_loc_from_full_to_swa=lambda loc: loc,
+            )
+            built = []
+
+            def metadata_kernel(**kwargs):
+                built.append(kwargs)
+                return DSV4Metadata(NS(), None)
+
+            backend.init_forward_metadata_prefill = metadata_kernel
+            addresses = None
+            for lengths in ([257, 300], [5, 9]):
+                with (
+                    cp_context(4, rank, lengths) as (_, batch),
+                    get_parallel().override(attn_cp_rank=rank, attn_cp_size=4),
+                ):
+                    batch.attn_cp_metadata.per_rank_actual_token = [160] * 4
+                    batch.req_pool_indices = torch.tensor([2, 7])
+                    batch.out_cache_loc = torch.zeros(640, dtype=torch.int64)
+                    batch.out_cache_loc[: sum(lengths)] = torch.arange(
+                        256, 256 + sum(lengths)
+                    )
+                    batch.seq_lens_cpu = torch.tensor([7 + lengths[0], 13 + lengths[1]])
+                    batch.seq_lens = batch.seq_lens_cpu.to(torch.int32)
+                    tail_metadata = backend._build_late_layer_tail_metadata(
+                        batch, for_prefill_graph=True, max_seq_len_override=1024
+                    )
+                    tail = tail_metadata.late_layer_tail
+                    expected = torch.cat(
+                        [
+                            torch.arange(lengths[0] - min(128, lengths[0]), lengths[0]),
+                            torch.arange(
+                                sum(lengths) - min(128, lengths[1]), sum(lengths)
+                            ),
+                        ]
+                    )
+                    local = expected[expected % 4 == rank]
+                    self.assertEqual(tail.token_indices.shape, (64,))
+                    self.assertEqual(tail.real_rows_count, len(local))
+                    torch.testing.assert_close(tail.global_token_indices, expected)
+                    torch.testing.assert_close(
+                        tail.token_indices[: len(local)], local // 4
+                    )
+                    torch.testing.assert_close(
+                        tail.positions[: len(local)], batch.positions[local]
+                    )
+                    torch.testing.assert_close(
+                        tail.pos_global[: len(expected)], batch.positions[expected]
+                    )
+                    self.assertTrue(
+                        torch.all(tail.swa_out_cache_loc[len(expected) :] == 0)
+                    )
+                    self.assertEqual(built[-1]["out_cache_loc"].shape, (256,))
+                    self.assertTrue(built[-1]["use_prefill_cuda_graph"])
+                    pointers = (
+                        tail.token_indices.data_ptr(),
+                        tail.positions.data_ptr(),
+                        tail.scatter_indices.data_ptr(),
+                        tail.cp_metadata.gather_index.data_ptr(),
+                        tail.cp_metadata.moe_local_token_count.data_ptr(),
+                    )
+                    if addresses is not None:
+                        self.assertEqual(addresses, pointers)
+                    addresses = pointers
+
     def test_cp_sources_trim_capture_padding_before_request_expansion(self):
         """A short batch in a larger BCG bucket must not become request rows."""
-        for lengths, bucket in (((5, 9), 16), ((5003, 9777), 14848)):
+        for lengths, bucket in (((1, 3), 32), ((5, 9), 16), ((5003, 9777), 14848)):
             total = sum(lengths)
             full = torch.zeros(bucket, 3)
             full[:total] = torch.arange(total * 3).reshape(total, 3)
@@ -67,6 +148,13 @@ class TestDSV41TextCP(CustomTestCase):
                         _low_ratio_compress_torch=compress,
                         _low_ratio_index_topk=index,
                     )
+                    backend.forward_low_ratio_sources = partial(
+                        DeepseekV4AttnBackend._forward_low_ratio_sources_cp,
+                        backend,
+                        run_compressor=True,
+                        run_indexer=True,
+                    )
+                    batch.global_num_token_non_padded_cpu = total
                     local = full[rank::4].contiguous()
                     with (
                         simulated_collective(strategy, batch, full),
@@ -74,16 +162,20 @@ class TestDSV41TextCP(CustomTestCase):
                             "sglang.srt.layers.attention.deepseek_v4_backend.torch.cuda.current_stream",
                             return_value=None,
                         ),
+                        patch(
+                            "sglang.srt.models.deepseek_v4.get_tc_piecewise_forward_context",
+                            return_value=NS(forward_batch=batch),
+                        ),
+                        patch(
+                            "sglang.srt.models.deepseek_v4.get_attn_backend",
+                            return_value=backend,
+                        ),
                     ):
-                        DeepseekV4AttnBackend._forward_low_ratio_sources_cp(
-                            backend,
-                            layer=NS(compressor=object(), indexer=object()),
+                        deepseek_v4_low_ratio_sources(
+                            NS(compressor=object(), indexer=object()),
                             x=local,
                             q_lora=local + 100,
                             positions=positions[rank::4],
-                            forward_batch=batch,
-                            run_compressor=True,
-                            run_indexer=True,
                         )
                     x, req, pos = outputs["compressed"]
                     torch.testing.assert_close(x, full[:total])
@@ -114,7 +206,10 @@ class TestDSV41TextCP(CustomTestCase):
                 batch.batch_size = 2
                 full_metadata = batch.attn_cp_metadata
                 full_count = strategy.moe_num_token_non_padded(batch)
-                for rows in ([3, 4, 11, 12, 13], [0, 1, 2, 3]):
+                for tail_lens, rows in (
+                    ([2, 3], [3, 4, 11, 12, 13]),
+                    ([1, 1], [4, 13]),
+                ):
                     with patch(
                         "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
                         return_value=NS(attn_cp_rank=rank, attn_cp_size=4),
@@ -122,8 +217,7 @@ class TestDSV41TextCP(CustomTestCase):
                         layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout(
                             None,
                             batch,
-                            torch.tensor(rows),
-                            torch.tensor([2, len(rows) - 2]),
+                            tail_lens,
                         )
                     tail_metadata = layout["cp_metadata"]
                     count = tail_metadata.moe_local_token_count
@@ -148,7 +242,7 @@ class TestDSV41TextCP(CustomTestCase):
                         batch.attn_cp_metadata = full_metadata
                     self.assertEqual(full_count.item(), len(batch.input_ids[rank::4]))
 
-    def test_compact_tail_eager_gather_and_exception_restore_full_cp_layout(self):
+    def test_compact_tail_gather_and_exception_restore_full_cp_layout(self):
         global_rows = torch.tensor([3, 4, 11, 12, 13])
         full = torch.arange(42, dtype=torch.float32).reshape(14, 3)
         for rank in range(4):
@@ -178,7 +272,7 @@ class TestDSV41TextCP(CustomTestCase):
                         return_value=NS(attn_cp_rank=rank, attn_cp_size=4),
                     ):
                         layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout(
-                            None, batch, global_rows, torch.tensor([2, 3])
+                            None, batch, [2, 3]
                         )
                     tail = LateLayerTail(
                         token_indices=layout["local_token_indices"],
@@ -239,13 +333,25 @@ class TestDSV41TextCP(CustomTestCase):
                                 ),
                             )
                         )
-                        if fail:
-                            with self.assertRaisesRegex(
-                                RuntimeError, "collective failed"
-                            ):
-                                EagerRunner._execute_extend_cp(runner, batch, {})
-                        else:
-                            output = EagerRunner._execute_extend_cp(runner, batch, {})
+                        runner.prefill_cp_bcg_input = NS(live_local_tokens=4)
+                        runner._prefill_forward_context = lambda *a, **kw: nullcontext()
+                        runner.backend = NS(
+                            replay=lambda *a, **kw: model.model.return_value
+                        )
+                        for execute in (
+                            lambda: EagerRunner._execute_extend_cp(runner, batch, {}),
+                            lambda: execute_prefill_cp_bcg(
+                                runner, batch, batch, 16, 14
+                            ),
+                        ):
+                            if fail:
+                                with self.assertRaisesRegex(
+                                    RuntimeError, "collective failed"
+                                ):
+                                    execute()
+                                self.assertIs(batch.attn_cp_metadata, full_metadata)
+                                continue
+                            output = execute()
                             args = model.logits_processor.call_args.args
                             torch.testing.assert_close(
                                 args[0], batch.input_ids[global_rows]
@@ -256,6 +362,7 @@ class TestDSV41TextCP(CustomTestCase):
                             torch.testing.assert_close(
                                 output.hidden_states_token_indices, global_rows
                             )
+                            self.assertIs(batch.attn_cp_metadata, full_metadata)
                     self.assertIs(batch.attn_cp_metadata, full_metadata)
 
     def test_interleave_roundtrip_mixed_lengths_prefix_and_padding(self):

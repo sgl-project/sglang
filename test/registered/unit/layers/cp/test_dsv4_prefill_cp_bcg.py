@@ -14,6 +14,11 @@ from sglang.srt.layers.cp.bcg import (
     filter_prefill_cp_bcg_capture_num_tokens,
     supports_prefill_cp_bcg,
 )
+from sglang.srt.layers.cp.bounded_replay import (
+    InterleaveTailBuffers,
+    build_interleave_tail_layout,
+    interleave_tail_local_capacity,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,6 +30,96 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class TestDSV4PrefillCPBCG(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
+
+    def test_cp_tail_replay_keeps_addresses_and_original_owners(self):
+        """Changing request splits must refresh the captured local/global maps.
+
+        Compact row % CP is not original token % CP. Empty owners still have
+        physical rows and a zero MoE count, not a shorter collective input.
+        """
+        cp_size, local_capacity, full_local_rows = 4, 96, 176
+        buffers = [
+            InterleaveTailBuffers.create(
+                local_capacity, cp_size, torch.zeros(704, dtype=torch.int64)
+            )
+            for _ in range(cp_size)
+        ]
+        captured = [tuple(vars(buf).values()) for buf in buffers]
+        addresses = [[t.data_ptr() for t in tensors] for tensors in captured]
+        for lengths, tails in (
+            ([257, 3, 0, 377], [128, 3, 0, 128]),
+            ([5, 9], [2, 3]),
+            ([641 - 4, 4], [1, 1]),
+        ):
+            positions = torch.arange(sum(lengths)) + 1000
+            full = torch.arange(full_local_rows * cp_size * 3).reshape(-1, 3)
+            expected_indices = []
+            start = 0
+            for length, tail in zip(lengths, tails):
+                expected_indices.extend(range(start + length - tail, start + length))
+                start += length
+            locals_, layouts = [], []
+            for rank, buf in enumerate(buffers):
+                layout = build_interleave_tail_layout(
+                    extend_lens=lengths,
+                    tail_lens=tails,
+                    positions=positions,
+                    cp_rank=rank,
+                    cp_size=cp_size,
+                    buffers=buf,
+                    full_local_rows=full_local_rows,
+                )
+                layouts.append(layout)
+                owned = [n for n in expected_indices if n % cp_size == rank]
+                n = len(owned)
+                self.assertEqual(layout["cp_metadata"].moe_local_token_count.item(), n)
+                self.assertEqual(
+                    layout["cp_metadata"].per_rank_logical_token,
+                    [local_capacity] * cp_size,
+                )
+                self.assertEqual(sum(layout["local_lens_cpu"]), n)
+                self.assertEqual(
+                    [t.data_ptr() for t in vars(buf).values()], addresses[rank]
+                )
+                torch.testing.assert_close(
+                    captured[rank][0][:n],
+                    torch.tensor(owned, dtype=torch.int64) // cp_size,
+                )
+                torch.testing.assert_close(buf.positions[:n], positions[owned])
+                self.assertTrue(torch.all(buf.positions[n:] == 0))
+                self.assertTrue(torch.all(buf.scatter_indices[n:] == full_local_rows))
+                local = full[rank::cp_size][buf.token_indices]
+                locals_.append(local)
+                restored = full.new_zeros((full_local_rows + 1, 3))
+                restored.index_copy_(0, buf.scatter_indices, local)
+                torch.testing.assert_close(
+                    restored[torch.tensor(owned, dtype=torch.int64) // cp_size],
+                    full[owned],
+                )
+            gathered = torch.cat(locals_)[buffers[0].gather_index]
+            torch.testing.assert_close(
+                gathered[: len(expected_indices)], full[expected_indices]
+            )
+            # Every metadata row, including rank-specific dummy rows, has one owner.
+            reindexed = torch.cat([item["cp_metadata"].local_index for item in layouts])
+            torch.testing.assert_close(
+                reindexed.sort().values, torch.arange(local_capacity * cp_size)
+            )
+
+    def test_cp_tail_capacity_bounds_offset_requests(self):
+        # 128 is divisible by CP4, but not by CP3; rounding the *total* would
+        # underallocate when several requests each give the same rank 43 rows.
+        self.assertEqual(interleave_tail_local_capacity(512, 3 * 128, 3, 128), 129)
+        self.assertEqual(interleave_tail_local_capacity(8, 3 * 128, 3, 128), 8)
+        for rank in range(3):
+            layout = build_interleave_tail_layout(
+                extend_lens=[129] * 3,
+                tail_lens=[128] * 3,
+                positions=torch.arange(387),
+                cp_rank=rank,
+                cp_size=3,
+            )
+            self.assertEqual(layout["cp_metadata"].per_rank_actual_token, [129] * 3)
 
     def test_sparse_prefill_never_uses_cp_local_queries(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -265,6 +360,7 @@ class TestDSV4PrefillCPBCG(CustomTestCase):
                     torch.zeros(bucket, 1),
                     torch.zeros(bucket, dtype=torch.int64),
                     input_ids=torch.zeros(bucket, dtype=torch.int64),
+                    num_token_non_padded=torch.zeros((), dtype=torch.int32),
                 )
                 for _ in range(cp_size)
             ]
@@ -281,6 +377,10 @@ class TestDSV4PrefillCPBCG(CustomTestCase):
                 batches, shards = [], []
                 for rank in range(cp_size):
                     batch = self._batch(lengths, bucket)
+                    if not capture:
+                        batch.num_token_non_padded = torch.tensor(
+                            sum(lengths), dtype=torch.int32
+                        )
                     cache_loc = batch.out_cache_loc
                     global_positions = batch.positions.clone()
                     with (
@@ -331,6 +431,11 @@ class TestDSV4PrefillCPBCG(CustomTestCase):
                     self.assertEqual(batch.out_cache_loc.shape[0], bucket)
                     self.assertEqual(batch.attn_cp_metadata.total_seq_lens, bucket)
                     self.assertEqual(batch.extend_seq_lens_cpu, list(lengths))
+                    self.assertIs(
+                        batch.attn_cp_metadata.moe_local_token_count,
+                        inputs[rank].num_token_non_padded,
+                    )
+                    self.assertEqual(batch.num_token_non_padded.item(), len(local_ids))
                     self.assertEqual(
                         batch.input_embeds.shape[0],
                         inputs[rank].bucket_local_tokens[bucket],
@@ -386,7 +491,9 @@ class TestDSV4PrefillCPBCG(CustomTestCase):
                 _prefill_forward_context=lambda *args, **kwargs: nullcontext(),
                 backend=SimpleNamespace(replay=lambda *args, **kwargs: body_output),
             )
-            batch = SimpleNamespace(input_ids=torch.arange(11))
+            batch = SimpleNamespace(
+                input_ids=torch.arange(11), attn_cp_metadata=object()
+            )
 
             def gather(value, *args):
                 if isinstance(value, tuple):

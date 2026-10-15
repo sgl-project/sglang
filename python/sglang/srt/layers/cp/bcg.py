@@ -81,12 +81,9 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     except ValueError:
         # Other backends (or an unresolved backend/strategy) cannot use CP BCG.
         return False
-    return (
-        combination in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS
-        and (
-            combination[1] != CPAttentionBackendKind.DSV4
-            or is_deepseek_v4(model_config_of(server_args).hf_config)
-        )
+    return combination in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS and (
+        combination[1] != CPAttentionBackendKind.DSV4
+        or is_deepseek_v4(model_config_of(server_args).hf_config)
     )
 
 
@@ -309,16 +306,20 @@ class PrefillCPBCGInput:
         # rank-local view for hash routing and MegaMoE.
         forward_batch._cp_input_ids = input_ids
         forward_batch.input_ids_global = input_ids
-        if forward_batch.num_token_non_padded is not None:
+        strategy = get_cp_strategy()
+        if forward_batch.num_token_non_padded is not None or isinstance(
+            strategy, InterleaveCPStrategy
+        ):
             assert self.num_token_non_padded is not None
             metadata = forward_batch.attn_cp_metadata
             logical_tokens = (
                 metadata.per_rank_logical_token or metadata.per_rank_actual_token
             )
-            strategy = get_cp_strategy()
             assert strategy is not None
             self.num_token_non_padded.fill_(logical_tokens[strategy.cp_rank])
             forward_batch.num_token_non_padded = self.num_token_non_padded
+            if isinstance(strategy, InterleaveCPStrategy):
+                metadata.moe_local_token_count = self.num_token_non_padded
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):
@@ -360,9 +361,19 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             **kwargs,
         )
-        local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
-
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
+        language_model = getattr(model, "model", None)
+        tail = None
+        if (
+            capture_aux_hidden_states
+            and getattr(language_model, "late_layer_start", None) is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            tail = (
+                runner.model_runner.attn_backend.tail_forward_metadata.late_layer_tail
+            )
+        if tail is None:
+            local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
         aux_hidden_states = None
         if capture_aux_hidden_states:
             hidden_states, aux_hidden_states = local_output
@@ -376,26 +387,30 @@ def execute_prefill_cp_bcg(
                 else hidden_states
             )
 
-        hidden_states = cp_gather_after_forward(
-            hidden_states,
-            static_forward_batch,
-            torch.cuda.current_stream(),
+        full_cp_metadata = static_forward_batch.attn_cp_metadata
+        if tail is not None:
+            static_forward_batch.attn_cp_metadata = tail.cp_metadata
+        gather_rows = (
+            sum(tail.extend_seq_lens_cpu) if tail is not None else raw_num_tokens
         )
-        hidden_states = _slice_output_rows(hidden_states, raw_num_tokens)
-        if aux_hidden_states is not None:
+        try:
 
-            def gather_aux(aux):
+            def gather(rows):
                 return _slice_output_rows(
                     cp_gather_after_forward(
-                        aux, static_forward_batch, torch.cuda.current_stream()
+                        rows, static_forward_batch, torch.cuda.current_stream()
                     ),
-                    raw_num_tokens,
+                    gather_rows,
                 )
 
-            if torch.is_tensor(aux_hidden_states):
-                aux_hidden_states = gather_aux(aux_hidden_states)
-            else:
-                aux_hidden_states = [gather_aux(aux) for aux in aux_hidden_states]
+            hidden_states = gather(hidden_states)
+            if aux_hidden_states is not None:
+                if torch.is_tensor(aux_hidden_states):
+                    aux_hidden_states = gather(aux_hidden_states)
+                else:
+                    aux_hidden_states = [gather(aux) for aux in aux_hidden_states]
+        finally:
+            static_forward_batch.attn_cp_metadata = full_cp_metadata
 
         # Mirror the DSV4 outer forward and the eager CP runner: the body
         # returns (normalized hidden states, pre-mHC-head hidden states).
@@ -406,16 +421,8 @@ def execute_prefill_cp_bcg(
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         input_ids = forward_batch.input_ids
         logits_metadata = forward_batch
-        tail = None
-        language_model = getattr(model, "model", None)
-        if (
-            capture_aux_hidden_states
-            and getattr(language_model, "late_layer_start", None) is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            tail_metadata = runner.model_runner.attn_backend.tail_forward_metadata
-            tail = tail_metadata.late_layer_tail
-            input_ids = tail.rows(input_ids)
+        if tail is not None:
+            input_ids = tail.global_rows(input_ids)
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
@@ -430,5 +437,5 @@ def execute_prefill_cp_bcg(
             **logits_kwargs,
         )
         if tail is not None:
-            output.hidden_states_token_indices = tail.token_indices
+            output.hidden_states_token_indices = tail.global_token_indices
         return output

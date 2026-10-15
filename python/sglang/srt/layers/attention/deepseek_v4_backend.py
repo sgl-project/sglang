@@ -91,6 +91,11 @@ from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
+from sglang.srt.layers.cp.bounded_replay import (
+    InterleaveTailBuffers,
+    build_interleave_tail_layout,
+    interleave_tail_local_capacity,
+)
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     interleave_rows_per_request,
@@ -927,6 +932,12 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     # into the extend, padding rows to a dummy row past the end.
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
+    # CP selects local rows in the model, but logits/DSpark consume global rows.
+    global_token_indices: Optional[torch.Tensor] = None
+
+    def global_rows(self, t: torch.Tensor) -> torch.Tensor:
+        assert self.global_token_indices is not None, "global tail rows require CP"
+        return t[self.global_token_indices]
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1018,9 +1029,6 @@ class DSV4Metadata:
 
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
-    # Captured with the late layers on a tail block (decoder SWA bounded replay
-    # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
-    prefill_graph_tail: bool = False
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
@@ -1230,6 +1238,7 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
+        self._bcg_cp_tail_buffers: Dict[int, InterleaveTailBuffers] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -1620,6 +1629,14 @@ class DeepseekV4AttnBackend(
     def _prefill_graph_tail_block_rows(self, forward_batch: ForwardBatch) -> int:
         """Tail block rows for the captured shape this batch is padded to: the
         shape's token count, capped at the request-cap capacity."""
+        if is_cp_active(forward_batch):
+            local_rows = max(forward_batch.attn_cp_metadata.per_rank_actual_token)
+            return get_parallel().attn_cp_size * interleave_tail_local_capacity(
+                local_rows,
+                self._prefill_graph_tail_capacity(),
+                get_parallel().attn_cp_size,
+                SWA_WINDOW,
+            )
         return min(
             self._prefill_graph_tail_capacity(),
             int(forward_batch.out_cache_loc.shape[0]),
@@ -1637,6 +1654,11 @@ class DeepseekV4AttnBackend(
         # marks them as padding for the compressors (raw_out_loc == 0).
         if self._bcg_tail_buffers is None:
             cap = self._prefill_graph_tail_capacity()
+            cp_size = get_parallel().attn_cp_size
+            if cp_size > 1:
+                cap = cp_size * interleave_tail_local_capacity(
+                    cap, cap, cp_size, SWA_WINDOW
+                )
             self._bcg_tail_buffers = (
                 torch.zeros((cap,), dtype=torch.int64, device=device),
                 torch.zeros((cap,), dtype=pos_dtype, device=device),
@@ -1679,10 +1701,6 @@ class DeepseekV4AttnBackend(
             # Captured segments gather/scatter through persistent buffers of a
             # fixed capacity: real rows first, padding rows gather row 0 and
             # scatter to a dummy row past the extend.
-            assert not is_cp_active(forward_batch), (
-                "decoder SWA bounded replay inside the prefill CUDA graph does not "
-                "support prefill CP"
-            )
             real_rows = int(sum(tail_lens_cpu))
             # The block is sized per captured shape: a shape of N tokens can
             # never hold more than N tail rows, so small shapes get small
@@ -1730,7 +1748,11 @@ class DeepseekV4AttnBackend(
             )
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
-            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
+            self._late_layer_tail_cp_layout(
+                forward_batch,
+                tail_lens_cpu,
+                graph_rows=cap if graph_tail is not None else None,
+            )
             if is_cp_active(forward_batch)
             else None
         )
@@ -1792,14 +1814,34 @@ class DeepseekV4AttnBackend(
                     [req, req[-1:].expand(cap - real_rows)]
                 )
                 metadata.low_ratio_pos_i64 = pos_buf.to(torch.int64)
+            cp_buffers = self._bcg_cp_tail_buffers[cap] if cp_tail is not None else None
             metadata.late_layer_tail = LateLayerTail(
-                token_indices=idx_buf,
-                positions=pos_buf,
+                token_indices=cp_buffers.token_indices
+                if cp_buffers is not None
+                else idx_buf,
+                positions=cp_buffers.positions if cp_buffers is not None else pos_buf,
                 extend_seq_lens=tail_lens,
                 extend_seq_lens_cpu=tail_lens_cpu,
                 swa_out_cache_loc=swa_buf,
-                scatter_indices=scatter_buf,
-                real_rows_count=real_rows,
+                scatter_indices=(
+                    cp_buffers.scatter_indices
+                    if cp_buffers is not None
+                    else scatter_buf
+                ),
+                real_rows_count=(
+                    sum(cp_tail["local_lens_cpu"]) if cp_tail is not None else real_rows
+                ),
+                cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
+                local_lens_cpu=cp_tail["local_lens_cpu"]
+                if cp_tail is not None
+                else None,
+                req_global=metadata.low_ratio_req_indices
+                if cp_tail is not None
+                else None,
+                pos_global=metadata.low_ratio_pos_i64 if cp_tail is not None else None,
+                global_token_indices=idx_buf[:real_rows]
+                if cp_tail is not None
+                else None,
             )
         elif cp_tail is None:
             # Without CP, tail rows index the full extend on this rank.
@@ -1824,78 +1866,36 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices,
             )
         return metadata
 
     def _late_layer_tail_cp_layout(
         self,
         forward_batch: ForwardBatch,
-        token_indices: torch.Tensor,
-        tail_lens: torch.Tensor,
+        tail_lens_cpu: List[int],
+        *,
+        graph_rows: Optional[int] = None,
     ) -> dict:
-        cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size
-        device = token_indices.device
-        total = token_indices.shape[0]
-        owner_rank = token_indices % cp_size
-        counts = torch.bincount(owner_rank, minlength=cp_size).tolist()
-        max_local = max(counts)
-        order = torch.argsort(owner_rank, stable=True)
-        rank_starts = torch.tensor(
-            [sum(counts[:r]) for r in range(cp_size)],
-            dtype=torch.int64,
-            device=device,
-        )
-        slot = torch.empty_like(owner_rank)
-        slot[order] = (
-            torch.arange(total, device=device) - rank_starts[owner_rank[order]]
-        )
-        gather_index = owner_rank * max_local + slot
-
-        local_tail_rows = (owner_rank == cp_rank).nonzero().squeeze(1)
-        pad_rows = max_local - counts[cp_rank]
-        # Give each rank distinct padding rows in the compact tail metadata.
-        pad_start = total + sum(max_local - c for c in counts[:cp_rank])
-        local_metadata_rows = torch.cat(
-            [
-                local_tail_rows,
-                torch.arange(pad_start, pad_start + pad_rows, device=device),
-            ]
-        )
-        tail_request_ids = torch.repeat_interleave(
-            torch.arange(forward_batch.batch_size, device=device),
-            tail_lens.to(torch.int64),
-            output_size=total,
-        )
-        local_positions = torch.cat(
-            [
-                forward_batch.positions[token_indices[local_tail_rows]],
-                forward_batch.positions.new_zeros(pad_rows),
-            ]
-        )
-        cp_metadata = InterleaveContextParallelMetadata(
-            per_rank_actual_token=[max_local] * cp_size,
-            max_rank_len=[max_local] * cp_size,
-            total_seq_lens=total,
-            bs=forward_batch.batch_size,
-            per_rank_logical_token=counts,
-            gather_index=gather_index,
-            local_index=local_metadata_rows,
-            # Prepare an independent tail count before replaying the front graph.
-            # Lazy pageable H2D in the first tail MoE would wait for that graph;
-            # sharing its count buffer would also race with graph execution.
-            moe_local_token_count=async_h2d(
-                [counts[cp_rank]], dtype=torch.int32, device=device
-            ).squeeze(0),
-        )
-        return dict(
-            cp_metadata=cp_metadata,
-            local_token_indices=(token_indices[local_tail_rows] - cp_rank) // cp_size,
-            local_positions=local_positions,
-            local_lens_cpu=torch.bincount(
-                tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
-            ).tolist(),
-            pad_rows=pad_rows,
+        buffers = None
+        if graph_rows is not None:
+            buffers = self._bcg_cp_tail_buffers.get(graph_rows)
+            if buffers is None:
+                buffers = InterleaveTailBuffers.create(
+                    graph_rows // cp_size, cp_size, forward_batch.positions
+                )
+                self._bcg_cp_tail_buffers[graph_rows] = buffers
+        # Lengths already live on the host; do not derive this geometry via a
+        # CUDA bincount/nonzero followed by .tolist() at every replay boundary.
+        return build_interleave_tail_layout(
+            extend_lens=forward_batch.extend_seq_lens_cpu,
+            tail_lens=tail_lens_cpu,
+            positions=forward_batch.positions,
+            cp_rank=get_parallel().attn_cp_rank,
+            cp_size=cp_size,
+            buffers=buffers,
+            full_local_rows=max(forward_batch.attn_cp_metadata.per_rank_actual_token),
         )
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
@@ -1914,7 +1914,9 @@ class DeepseekV4AttnBackend(
             forward_batch.global_num_token_non_padded,
             forward_batch.num_token_non_padded,
         )
-        if tail.real_rows_count is not None:
+        if tail.cp_metadata is not None:
+            forward_batch.num_token_non_padded = tail.cp_metadata.moe_local_token_count
+        elif tail.real_rows_count is not None:
             forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
             non_padded = forward_batch.global_num_token_non_padded
             if non_padded is not None:
@@ -1975,6 +1977,10 @@ class DeepseekV4AttnBackend(
         forward_batch.global_num_token_non_padded_cpu = non_padded
         forward_batch.global_num_token_non_padded = non_padded_gpu
         forward_batch.num_token_non_padded = local_non_padded
+        if self.token_to_kv_pool.request_window is not None:
+            self.token_to_kv_pool.request_window.activate(
+                self.forward_metadata.core_attn_metadata.request_window_layout
+            )
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).

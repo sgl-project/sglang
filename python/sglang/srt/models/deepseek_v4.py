@@ -727,7 +727,11 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = (
+        query.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
 
     if real_num_tokens == 0:
         output.zero_()
@@ -771,7 +775,13 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    # CP collectives keep their captured physical extent, including on ranks
+    # with no real tail rows. The backend trims only the indexer's live queries.
+    real_num_tokens = (
+        x.shape[0]
+        if is_cp_active(forward_batch)
+        else forward_batch.global_num_token_non_padded_cpu
+    )
     if real_num_tokens == 0:
         return
     get_attn_backend().forward_low_ratio_sources(
@@ -2138,7 +2148,7 @@ class MQALayer(MqaAttentionBase):
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
                 and (
-                    dsa_use_prefill_cp(forward_batch)
+                    is_cp_active(forward_batch)
                     or not getattr(attn_backend, "low_ratio_prefill_graph", False)
                 )
             ):
