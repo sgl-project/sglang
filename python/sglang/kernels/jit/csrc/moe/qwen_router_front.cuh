@@ -256,8 +256,6 @@ SGL_DEVICE uint32_t u32x8_at(const U32x8& v, int i) {
   }
 }
 
-// Softmax / top-10 / renormalize for kNT tokens of one warp, interleaved for ILP.
-// Lane layout of the reference kernel: lane holds experts [8l, 8l+8) and [256+8l, 256+8l+8).
 template <bool kTrace>
 SGL_DEVICE void cycle_stamp(const Params& p, uint32_t slot, uint64_t t0) {
   if constexpr (kTrace) {
@@ -265,10 +263,12 @@ SGL_DEVICE void cycle_stamp(const Params& p, uint32_t slot, uint64_t t0) {
   }
 }
 
+// Softmax / top-10 / renormalize for kNT tokens of one warp with a full per-lane
+// sort (the exact fallback of topk_tokens_fast). Lane layout of the reference
+// kernel: lane holds experts [8l, 8l+8) and [256+8l, 256+8l+8).
 template <int kNT, bool kTrace>
 SGL_DEVICE void topk_tokens(const Params& p, const uint32_t (&m)[kNT], uint32_t* s_mask, int16_t* s_ids) {
   const uint32_t lane = threadIdx.x % 32;
-  const uint64_t c0 = kTrace ? clock64() : 0;
   constexpr float kLog2e = 1.44269502162933349609375f;
   float a[kNT][16];
   uint4 r[kNT][2];
@@ -278,7 +278,6 @@ SGL_DEVICE void topk_tokens(const Params& p, const uint32_t (&m)[kNT], uint32_t*
     r[t][0] = ld_produced(row + 8 * lane);
     r[t][1] = ld_produced(row + 256 + 8 * lane);
   }
-  if (r[0][1].w != 0x12345678u) cycle_stamp<kTrace>(p, 4, c0);
   float row_max[kNT], row_sum[kNT];
 #pragma unroll
   for (int t = 0; t < kNT; ++t) {
@@ -318,7 +317,6 @@ SGL_DEVICE void topk_tokens(const Params& p, const uint32_t (&m)[kNT], uint32_t*
     for (int t = 0; t < kNT; ++t) row_sum[t] = __fadd_rn(row_sum[t], __shfl_xor_sync(0xFFFFFFFFu, row_sum[t], off));
   }
 
-  if (row_sum[0] != 12345.0f) cycle_stamp<kTrace>(p, 5, c0);
   // Keys: monotonic value in the high half, (0xFFFF - expert) in the low half, so
   // the warp max is the largest logit with the lowest expert id on ties.
   uint32_t key[kNT][16];
@@ -353,7 +351,6 @@ SGL_DEVICE void topk_tokens(const Params& p, const uint32_t (&m)[kNT], uint32_t*
     }
   }
 
-  if (key[0][0] != 0x12345678u) cycle_stamp<kTrace>(p, 6, c0);
   float sel[kNT][kTopK];
   uint32_t ids[kNT][kTopK];
 #pragma unroll
@@ -372,7 +369,6 @@ SGL_DEVICE void topk_tokens(const Params& p, const uint32_t (&m)[kNT], uint32_t*
       sel[t][rr] = div_full(ex2_approx(__fmul_rn(__fsub_rn(v, row_max[t]), kLog2e)), row_sum[t]);
     }
   }
-  if (sel[0][kTopK - 1] != 12345.0f) cycle_stamp<kTrace>(p, 7, c0);
 #pragma unroll
   for (int t = 0; t < kNT; ++t) {
     // Reference reduction over the 16 top-k slots (10 used): even lanes hold slots 0..7, odd 8..15.
@@ -400,7 +396,171 @@ SGL_DEVICE void topk_tokens(const Params& p, const uint32_t (&m)[kNT], uint32_t*
   }
 }
 
-template <bool kTrace>
+// Out of line: rarely taken, and the tail CTA runs this code cold.
+__device__ __noinline__ void topk_token_full(const Params& p, uint32_t m, uint32_t* s_mask, int16_t* s_ids) {
+  const uint32_t m1[1] = {m};
+  topk_tokens<1, false>(p, m1, s_mask, s_ids);
+}
+
+SGL_DEVICE void cmpx_desc(uint32_t& a, uint32_t& b) {
+  const uint32_t hi = max(a, b), lo = min(a, b);
+  a = hi;
+  b = lo;
+}
+
+// Descending sort of 4 keys (5 comparators).
+SGL_DEVICE void sort4_desc(uint32_t& x0, uint32_t& x1, uint32_t& x2, uint32_t& x3) {
+  cmpx_desc(x0, x1);
+  cmpx_desc(x2, x3);
+  cmpx_desc(x0, x2);
+  cmpx_desc(x1, x3);
+  cmpx_desc(x1, x2);
+}
+
+// Top 4 of two descending 4-lists, descending (bitonic split + clean).
+SGL_DEVICE void merge_top4_desc(uint32_t (&a)[4], const uint32_t (&b)[4]) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) a[i] = max(a[i], b[3 - i]);
+  cmpx_desc(a[0], a[2]);
+  cmpx_desc(a[1], a[3]);
+  cmpx_desc(a[0], a[1]);
+  cmpx_desc(a[2], a[3]);
+}
+
+// Key of a canonical (bf16-exact) fp32 logit: monotonic value bits in the high
+// half, (0xFFFF - expert) in the low half, so the max key is the largest logit
+// with the lowest expert id on ties. NaN ranks below every number.
+SGL_DEVICE uint32_t logit_key(float v, uint32_t expert) {
+  const uint32_t u = __float_as_uint(v);
+  const uint32_t ord = u ^ (static_cast<uint32_t>(static_cast<int32_t>(u) >> 31) | 0x80000000u);
+  return (v == v) ? ((ord & 0xFFFF0000u) | (0xFFFFu - expert)) : (0xFFFFu - expert);
+}
+
+SGL_DEVICE float key_value(uint32_t key) {
+  const uint32_t hi = key & 0xFFFF0000u;
+  return __uint_as_float((hi & 0x80000000u) ? (hi & 0x7FFF0000u) : ~hi & 0xFFFF0000u);
+}
+
+// Softmax / top-10 / renormalize for kNT tokens of one warp. Each lane keeps the
+// top 4 of its 16 keys; a token where some lane runs out before the last round
+// is recomputed with the full per-lane sort (exact either way). Arithmetic on
+// the selected values follows the reference kernel's operations and order.
+template <int kNT, bool kTrace>
+SGL_DEVICE void topk_tokens_fast(
+    const Params& p, const uint32_t (&m)[kNT], const bool (&valid)[kNT], uint32_t* s_mask, int16_t* s_ids) {
+  const uint32_t lane = threadIdx.x % 32;
+  const uint64_t c0 = kTrace ? clock64() : 0;
+  constexpr float kLog2e = 1.44269502162933349609375f;
+  float a[kNT][16];
+  uint4 r[kNT][2];
+#pragma unroll
+  for (int t = 0; t < kNT; ++t) {
+    const bf16_t* row = p.logits + m[t] * kExperts;
+    r[t][0] = ld_produced(row + 8 * lane);
+    r[t][1] = ld_produced(row + 256 + 8 * lane);
+  }
+  if (r[0][1].w != 0x12345678u) cycle_stamp<kTrace>(p, 4, c0);
+  uint32_t top[kNT][4];
+#pragma unroll
+  for (int t = 0; t < kNT; ++t) {
+    const uint32_t w[8] = {r[t][0].x, r[t][0].y, r[t][0].z, r[t][0].w, r[t][1].x, r[t][1].y, r[t][1].z, r[t][1].w};
+    uint32_t k[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      a[t][2 * i] = __fadd_rn(bf16_lo(w[i]), 0.0f);
+      a[t][2 * i + 1] = __fadd_rn(bf16_hi(w[i]), 0.0f);
+    }
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const uint32_t idx = (i < 8) ? (8 * lane + i) : (256 + 8 * lane + (i - 8));
+      k[i] = logit_key(a[t][i], idx);
+    }
+#pragma unroll
+    for (int g = 0; g < 4; ++g) sort4_desc(k[4 * g], k[4 * g + 1], k[4 * g + 2], k[4 * g + 3]);
+    uint32_t q0[4] = {k[0], k[1], k[2], k[3]}, q1[4] = {k[4], k[5], k[6], k[7]};
+    uint32_t q2[4] = {k[8], k[9], k[10], k[11]}, q3[4] = {k[12], k[13], k[14], k[15]};
+    merge_top4_desc(q0, q1);
+    merge_top4_desc(q2, q3);
+    merge_top4_desc(q0, q2);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) top[t][i] = q0[i];
+  }
+  if (top[0][0] != 0x12345678u) cycle_stamp<kTrace>(p, 5, c0);
+
+  float row_max[kNT], row_sum[kNT];
+  uint32_t mine[kNT];
+  bool bad[kNT];
+  uint32_t taken[kNT];
+#pragma unroll
+  for (int t = 0; t < kNT; ++t) {
+    mine[t] = 0;
+    bad[t] = false;
+    taken[t] = 0;
+  }
+#pragma unroll
+  for (int rr = 0; rr < static_cast<int>(kTopK); ++rr) {
+#pragma unroll
+    for (int t = 0; t < kNT; ++t) {
+      const uint32_t winner = __reduce_max_sync(0xFFFFFFFFu, top[t][0]);
+      const bool owner = top[t][0] == winner;
+      top[t][0] = owner ? top[t][1] : top[t][0];
+      top[t][1] = owner ? top[t][2] : top[t][1];
+      top[t][2] = owner ? top[t][3] : top[t][2];
+      top[t][3] = owner ? 0u : top[t][3];
+      taken[t] += owner ? 1u : 0u;
+      bad[t] = bad[t] || (owner && taken[t] == 4u && rr + 1 < static_cast<int>(kTopK));
+      mine[t] = (lane == static_cast<uint32_t>(rr)) ? winner : mine[t];
+      if (rr == 0) {
+        // The largest key is the row max; the reference's exp/sum tree follows.
+        row_max[t] = key_value(winner);
+        float e[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) e[i] = ex2_approx(__fmul_rn(__fsub_rn(a[t][i], row_max[t]), kLog2e));
+        const float lo = __fadd_rn(
+            __fadd_rn(__fadd_rn(e[0], e[2]), __fadd_rn(e[4], e[6])),
+            __fadd_rn(__fadd_rn(e[8], e[10]), __fadd_rn(e[12], e[14])));
+        const float hi = __fadd_rn(
+            __fadd_rn(__fadd_rn(e[1], e[3]), __fadd_rn(e[5], e[7])),
+            __fadd_rn(__fadd_rn(e[9], e[11]), __fadd_rn(e[13], e[15])));
+        row_sum[t] = __fadd_rn(lo, hi);
+      }
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+    for (int t = 0; t < kNT; ++t) row_sum[t] = __fadd_rn(row_sum[t], __shfl_xor_sync(0xFFFFFFFFu, row_sum[t], off));
+  }
+  if (row_sum[0] != 12345.0f) cycle_stamp<kTrace>(p, 6, c0);
+
+#pragma unroll
+  for (int t = 0; t < kNT; ++t) {
+    if (!valid[t]) continue;
+    if (__any_sync(0xFFFFFFFFu, bad[t])) {
+      topk_token_full(p, m[t], s_mask, s_ids);
+      continue;
+    }
+    // Lane rr < 10 owns slot rr: its probability, then the reference's 16-slot sum tree.
+    const float s = div_full(ex2_approx(__fmul_rn(__fsub_rn(key_value(mine[t]), row_max[t]), kLog2e)), row_sum[t]);
+    float w[kTopK];
+#pragma unroll
+    for (int j = 0; j < static_cast<int>(kTopK); ++j) w[j] = __shfl_sync(0xFFFFFFFFu, s, j);
+    const float even = __fadd_rn(
+        __fadd_rn(__fadd_rn(w[0], w[2]), __fadd_rn(w[4], w[6])), __fadd_rn(__fadd_rn(w[1], w[3]), __fadd_rn(w[5], w[7])));
+    const float routed_sum = __fadd_rn(even, __fadd_rn(w[8], w[9]));
+    const float norm = routed_sum > 0.0f ? routed_sum : 1.0f;
+    if (lane < kTopK) {
+      const uint32_t id = 0xFFFFu - (mine[t] & 0xFFFFu);
+      p.topk_weights[m[t] * kTopK + lane] = div_full(s, norm);
+      p.topk_ids[m[t] * kTopK + lane] = static_cast<int32_t>(id);
+      s_ids[m[t] * kTopK + lane] = static_cast<int16_t>(id);
+      atomicOr(&s_mask[id], 1u << m[t]);
+    }
+  }
+  cycle_stamp<kTrace>(p, 7, c0);
+}
+
+template <uint32_t kMaxM, bool kTrace>
 SGL_DEVICE void topk_and_tables(const Params& p, uint32_t* s_mask, int16_t* s_tile, int16_t* s_ids, uint32_t* s_warp) {
   const uint32_t warp = threadIdx.x / 32;
   const uint32_t lane = threadIdx.x % 32;
@@ -409,17 +569,18 @@ SGL_DEVICE void topk_and_tables(const Params& p, uint32_t* s_mask, int16_t* s_ti
   for (uint32_t i = threadIdx.x; i < kExperts; i += kThreads) s_mask[i] = 0;
   __syncthreads();
   trace_stamp<kTrace>(p, kNumCtas * 8 + 1);
-  if (M > kWarps) {
-    if (warp + kWarps < M) {
-      const uint32_t m2[2] = {warp, warp + kWarps};
-      topk_tokens<2, kTrace>(p, m2, s_mask, s_ids);
+  if (warp < M) {
+    if constexpr (kMaxM > kWarps) {
+      // Warp w handles tokens w and w + 8; a missing second token repeats the first unwritten.
+      const bool second = warp + kWarps < M;
+      const uint32_t m2[2] = {warp, second ? warp + kWarps : warp};
+      const bool v2[2] = {true, second};
+      topk_tokens_fast<2, kTrace>(p, m2, v2, s_mask, s_ids);
     } else {
       const uint32_t m1[1] = {warp};
-      topk_tokens<1, kTrace>(p, m1, s_mask, s_ids);
+      const bool v1[1] = {true};
+      topk_tokens_fast<1, kTrace>(p, m1, v1, s_mask, s_ids);
     }
-  } else if (warp < M) {
-    const uint32_t m1[1] = {warp};
-    topk_tokens<1, kTrace>(p, m1, s_mask, s_ids);
   }
   __syncthreads();
   trace_stamp<kTrace>(p, kNumCtas * 8 + 2);
@@ -594,7 +755,7 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
   trace_stamp<kTrace>(p, tb + 5);
   if (s_last) {
     trace_stamp<kTrace>(p, kNumCtas * 8 + 0);
-    topk_and_tables<kTrace>(p, s_mask, s_tile, s_ids, s_warp);
+    topk_and_tables<kMaxM, kTrace>(p, s_mask, s_tile, s_ids, s_warp);
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
