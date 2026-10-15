@@ -162,7 +162,7 @@ jobs:
         needs.check-changes.outputs.sgl_kernel == 'true' ||
         needs.check-changes.outputs.jit_kernel == 'true' ||
         needs.check-changes.outputs.multimodal_gen == 'true' ||
-        needs.check-changes.outputs.renderer == 'true'
+        needs.check-changes.outputs.processor == 'true'
       )
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
