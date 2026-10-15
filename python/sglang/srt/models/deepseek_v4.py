@@ -1337,14 +1337,29 @@ class MQALayer(MqaAttentionBase):
         if not self.use_mega_attention:
             return
         from sglang.srt.layers.attention.dsv4.mega_attention import (
-            permute_mega_wq_b,
-            prepare_mega_wo_a,
+            interleave_output_columns,
+            interleave_query_rows,
+            quantize_wo_a,
         )
 
         self.mega_cos_sin_cache = _freqs_cis_to_cos_sin_table(self.freqs_cis)
-        self.mega_wq_b_permuted = permute_mega_wq_b(self.wq_b, self.n_local_heads)
-        self.mega_wo_a = prepare_mega_wo_a(
-            self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        self.mega_wq_b_permuted = (
+            self.n_local_heads in (64, 128) and self._wq_b_uses_flashinfer_mxfp8()
+        )
+        if self.mega_wq_b_permuted:
+            for param in (self.wq_b.weight, self.wq_b.weight_scale_inv):
+                param.data.copy_(interleave_query_rows(param.data, self.n_local_heads))
+            self.wq_b.quant_method._process_mxfp8_linear_weight_scale(self.wq_b)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
+
+    def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
+        method = self.wq_b.quant_method
+        backend = getattr(method, "mxfp8_dense_backend", None)
+        return bool(
+            getattr(method, "use_mxfp8", False)
+            and backend is not None
+            and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
         )
 
     def _forward_mega(
@@ -1355,12 +1370,12 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsv4.mega_attention import pack_mega_query
+        from sglang.srt.layers.attention.dsv4.mega_attention import pack_query
 
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
         if not self.mega_wq_b_permuted:
-            q = pack_mega_query(q, kernel_num_heads)
+            q = pack_query(q, kernel_num_heads)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
             o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)

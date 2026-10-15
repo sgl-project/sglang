@@ -7,9 +7,10 @@ from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
 from sglang.kernels.ops.attention.dsv4.torch_quant import quantize_k_cache_v41
 from sglang.srt.layers.attention.dsv4.mega_attention import (
-    pack_mega_query,
-    permute_mega_wq_b,
-    prepare_mega_wo_a,
+    interleave_output_columns,
+    interleave_query_rows,
+    pack_query,
+    quantize_wo_a,
 )
 from sglang.srt.models.deepseek_v4 import _fp8_wo_a_einsum
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -73,8 +74,9 @@ class TestMegaAttention(CustomTestCase):
                 )
                 method._process_mxfp8_linear_weight_scale(linear)
                 reference = copy.deepcopy(linear)
-                self.assertFalse(permute_mega_wq_b(linear, 16))
-                self.assertTrue(permute_mega_wq_b(linear, 64))
+                for param in (linear.weight, linear.weight_scale_inv):
+                    param.copy_(interleave_query_rows(param, 64))
+                method._process_mxfp8_linear_weight_scale(linear)
                 x = torch.randn(1536, 1280, device="cuda", dtype=torch.bfloat16)
                 quantized = Mxfp8SwizzledInput(
                     *fp8_utils.flashinfer_mxfp8_quantize(
@@ -84,7 +86,7 @@ class TestMegaAttention(CustomTestCase):
                 for inputs in (x, quantized):
                     torch.testing.assert_close(
                         method.apply(linear, inputs),
-                        pack_mega_query(
+                        pack_query(
                             method.apply(reference, inputs).view(-1, 64, 512), 64
                         ).view(-1, 64 * 512),
                         rtol=0,
@@ -119,7 +121,7 @@ class TestMegaAttention(CustomTestCase):
             with self.subTest(heads=heads):
                 q = torch.randn(3, heads, 512, device="cuda", dtype=torch.bfloat16)
                 data, scale, _ = flash_mla_mega_decode(
-                    pack_mega_query(q, 64),
+                    pack_query(q, 64),
                     main,
                     indices,
                     positions,
@@ -142,7 +144,7 @@ class TestMegaAttention(CustomTestCase):
                 actual = _fp8_wo_a_einsum(
                     data[:, :groups],
                     scale[:, :groups],
-                    *prepare_mega_wo_a(weight),
+                    *quantize_wo_a(interleave_output_columns(weight)),
                     recipe=(1, 1, 32),
                 )
                 expected = torch.einsum(
