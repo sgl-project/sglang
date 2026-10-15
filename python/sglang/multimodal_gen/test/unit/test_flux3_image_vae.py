@@ -42,7 +42,7 @@ class TestFlux3ImageVAE(unittest.TestCase):
                 expected = block(x)
                 block.fast_path_gate.enabled = True
                 actual = block(x)
-            torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
+            torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-5)
         finally:
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
 

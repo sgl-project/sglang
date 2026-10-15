@@ -94,7 +94,7 @@ class AttnBlock(nn.Module):
                 and self.fast_path_gate.enabled
                 and q.is_cuda
                 and q.dtype == torch.float32
-                and q.shape[-2] >= 16384
+                and q.shape[-2] > 16384
             ):
                 # NCHW views force quadratic math SDPA. Dense head channels
                 # allow the existing FP32 memory-efficient kernel, if supported.
