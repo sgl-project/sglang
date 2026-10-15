@@ -230,7 +230,15 @@ def shared_after_routing(tokens: int) -> bool:
     return min(loads) == max(loads)
 
 
-WIDE_FROM = 5  # token counts from here run the expert-grouped MoE
+# Token counts from here run the expert-grouped MoE. The narrow path keeps every
+# token's mids three ways at once (see pool_words), so its pool is the budget's
+# swing term and the width at which it stops fitting depends on INTER -- i.e. on
+# TP. Measured by COMPILE_ONLY builds against the 160 KB gfx950 limit: TP2
+# narrow is clean at S=1-2 but needs 168,416 B at S=3 and 192,416 B at S=4,
+# against 163,840. TP4 narrow fits all of S=1-4 (its mids are half the size), so
+# it keeps the original threshold. Set this from a compile, never from a mirror:
+# the LDS overflow is a non-raising diagnostic.
+WIDE_FROM = 3 if TP == 2 else 5
 
 
 def wide_moe(tokens: int) -> bool:
@@ -285,12 +293,22 @@ assert MID8_SLOTS % 4 == 0, (
 
 
 def pool_words(tokens: int) -> int:
-    """LDS words of the activation pool ``x``. Narrow: every token's bf16 xn (the
-    largest stage operand). Wide: the largest of the split's PV partials, the up /
-    gate stage's MXFP8 xn + scales + up partials + router sigmoids, and the down
+    """LDS words of the activation pool ``x``, the largest of the stages that take
+    turns in it. Wide: the largest of the split's PV partials, the up / gate
+    stage's MXFP8 xn + scales + up partials + router sigmoids, and the down
     stage's MXFP8 mids + scales + a zero row."""
     if not wide_moe(tokens):
-        return HIDDEN // 2 * tokens
+        # The narrow down stage keeps every token's mids three ways at once --
+        # bf16 as they land, then MXFP8 plus E8M0 scales -- and that, not the
+        # bf16 xn, is the largest narrow operand once INTER passes 983.
+        # MOE_SLOTS * INTER * 25/32 is 3000 at TP4, which slips under HIDDEN / 2
+        # = 3072 by 2.4% and is why the xn was mistaken for the maximum; it is
+        # 6000 at TP2. Sizing this from HIDDEN put the mid tail and every scale
+        # word outside the declared array.
+        mids = MOE_SLOTS * INTER // 2  # bf16, as the mids land
+        mid8 = MOE_SLOTS * INTER // 4  # the MXFP8 copy the down GEMV reads
+        midsc = MOE_SLOTS * INTER // 32  # and its E8M0 scales
+        return tokens * max(HIDDEN // 2, mids + mid8 + midsc)
     rows = MOE_SLOTS * tokens + 1
     return max(
         # the split's PV partials, one pass' worth (see H_SUB above)

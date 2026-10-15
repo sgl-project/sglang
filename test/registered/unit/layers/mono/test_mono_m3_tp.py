@@ -57,6 +57,11 @@ print(json.dumps({
     "MID_COPY_ROUNDS": l.MID_COPY_ROUNDS,
     "MID8_SLOTS": l.MID8_SLOTS,
     "MID8_ROUNDS": l.MID8_ROUNDS,
+    "WIDE_FROM": l.WIDE_FROM,
+    "HIDDEN": c.HIDDEN,
+    # lists, not dicts: JSON would turn the int widths into string keys
+    "pool": [l.pool_words(s) for s in range(1, c.MAX_TOKENS + 1)],
+    "wide": [l.wide_moe(s) for s in range(1, c.MAX_TOKENS + 1)],
 }))
 """
 
@@ -213,6 +218,46 @@ class TestMonoM3PerTP(CustomTestCase):
         self.assertEqual(v2["MERGE_PASSES"], 2)
         self.assertEqual(v2["MID_COPY_ROUNDS"], 8)
         self.assertEqual(v2["MID8_ROUNDS"], 2)
+
+    def test_the_narrow_pool_holds_what_the_down_stage_stages(self):
+        """The narrow MoE keeps every token's mids three ways at once -- bf16 as
+        they land, then MXFP8 and its E8M0 scales -- so the pool must cover all
+        three, not just the bf16 xn.
+
+        This is the bug class the thread-map test covers, in a sizing function
+        rather than a thread map: the three mids come to MOE_SLOTS * INTER *
+        25/32, which is 3000 at TP4 and slips under HIDDEN / 2 = 3072 by 2.4%.
+        Sizing the pool from HIDDEN therefore looked right at TP4 and put 2928
+        words per token out of bounds at TP2, where it is 6000. Assert the
+        requirement, not the number."""
+        for tp, v in self.v.items():
+            inter, hidden = v["INTER"], v["HIDDEN"]
+            mids = v["MOE_SLOTS"] * inter
+            need = mids // 2 + mids // 4 + mids // 32
+            for s, wide in enumerate(v["wide"], start=1):
+                if wide:
+                    continue  # the wide path stages by expert, sized separately
+                pool = v["pool"][s - 1]
+                self.assertGreaterEqual(
+                    pool,
+                    s * max(hidden // 2, need),
+                    f"TP{tp} narrow width {s}: pool {pool} words does not "
+                    f"cover {s} x {need} mid words",
+                )
+
+    def test_narrow_widths_are_only_those_that_fit_lds(self):
+        """``WIDE_FROM`` is TP-dependent because the narrow pool is the budget's
+        swing term. Measured by COMPILE_ONLY against the 160 KB gfx950 limit:
+        TP2 narrow needs 168,416 B at width 3 and 192,416 B at width 4, so TP2
+        goes wide from 3; TP4's mids are half the size and fit through 4."""
+        self.assertEqual(self.v[2]["WIDE_FROM"], 3)
+        self.assertEqual(self.v[4]["WIDE_FROM"], 5)
+        self.assertEqual(self.v[8]["WIDE_FROM"], 5)
+        for tp, v in self.v.items():
+            narrow = [s for s, wide in enumerate(v["wide"], start=1) if not wide]
+            self.assertEqual(
+                narrow, list(range(1, v["WIDE_FROM"])), f"TP{tp} narrow widths"
+            )
 
     def test_tp8_merge_still_needs_a_masked_tail(self):
         """A known gap, asserted so it cannot be forgotten: at H = 8 the merge
