@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.checksum import (
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_admit_overlap import (
     DEFER_PREALLOC,
+    NONBLOCKING_ADMIT,
     AdmitOverlap,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -3104,7 +3105,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch,
+                nonblocking_admit=NONBLOCKING_ADMIT in admit_flags,
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -3161,11 +3163,15 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        nonblocking_admit: bool = False,
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        new_prebuilt_batch = self.get_new_prebuilt_batch(
+            running_batch, nonblocking_admit=nonblocking_admit
+        )
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -3193,9 +3199,10 @@ class SchedulerDisaggregationDecodeMixin:
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_new_prebuilt_batch(
-        self, running_batch: ScheduleBatch
+        self, running_batch: ScheduleBatch, nonblocking_admit: bool = False
     ) -> Optional[ScheduleBatch]:
-        batch = self._get_new_prebuilt_batch(running_batch)
+        nonblocking = nonblocking_admit and self._nonblocking_admit_in_scope()
+        batch = self._get_new_prebuilt_batch(running_batch, nonblocking=nonblocking)
         if batch is None:
             return None
         # Verify after host restore and before process_prebuilt caches any KV.
@@ -3205,8 +3212,41 @@ class SchedulerDisaggregationDecodeMixin:
         self.ngram_embedding_manager.prepare_for_forward(
             batch, chunked_req=self.chunked_req
         )
-        batch.process_prebuilt(self.future_map)
+        if nonblocking:
+            self._seed_prebuilt_on_forward_stream(batch)
+        else:
+            batch.process_prebuilt(self.future_map)
         return batch
+
+    def _nonblocking_admit_in_scope(self: Scheduler) -> bool:
+        return (
+            self.enable_overlap
+            and self.spec_algorithm.is_eagle()
+            and not self.enable_hisparse
+            and get_disagg().disaggregation_decode_host_receive_threshold == 1
+            and all(
+                req.grammar is None
+                and req.output_dsa_topk_indices is None
+                and req.kv.retraction_backup is None
+                and req.hidden_states_tensor is not None
+                for req in self.waiting_queue
+            )
+        )
+
+    def _seed_prebuilt_on_forward_stream(self: Scheduler, batch: ScheduleBatch) -> None:
+        # A finished request's last forward may still write the FutureMap rows a new
+        # request reuses. On the forward stream the seed runs after that forward, as
+        # the stock whole-forward wait orders it, and before the next forward reads
+        # the rows; the host never waits for the in-flight forward.
+        from sglang.srt.speculative.eagle_disaggregation import stage_eagle_disagg_seed
+
+        self.forward_stream.wait_stream(self.schedule_stream)
+        with self.forward_stream_ctx:
+            stage_eagle_disagg_seed(batch)
+            batch.process_prebuilt(self.future_map)
+        # Made on the schedule stream and read by the seed, which may run later.
+        batch.req_pool_indices.record_stream(self.forward_stream)
+        batch.seq_lens.record_stream(self.forward_stream)
 
     def _verify_kv_checksums(self, batch: ScheduleBatch) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
@@ -3257,7 +3297,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
 
     def _get_new_prebuilt_batch(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler, running_batch: ScheduleBatch, nonblocking: bool = False
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -3321,8 +3361,8 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         # construct fake completed prefill
-        new_batch.prepare_for_prebuilt()
-        if self.enable_overlap:
+        new_batch.prepare_for_prebuilt(nonblocking=nonblocking)
+        if self.enable_overlap and not nonblocking:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)

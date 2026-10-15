@@ -19,11 +19,22 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
+def _to_device(values: List[int], dtype: torch.dtype, device, nonblocking: bool):
+    if not nonblocking:
+        return torch.tensor(values, dtype=dtype, device=device)
+    pinned = torch.tensor(
+        values, dtype=dtype, pin_memory=is_pin_memory_available(device)
+    )
+    return pinned.to(device, non_blocking=True)
+
+
 class ScheduleBatchDisaggregationDecodeMixin:
-    def prepare_for_prebuilt(self: ScheduleBatch):
+    def prepare_for_prebuilt(self: ScheduleBatch, nonblocking: bool = False):
         """
         Prepare a prebuilt extend by populate metadata
         Adapted from .prepare_for_extend().
+        ``nonblocking``: copy the metadata from pinned host memory without
+        blocking the host.
         """
 
         self.forward_mode = ForwardMode.PREBUILT
@@ -81,15 +92,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # process_prebuilt through FutureMap, so merge/forward-entry rebuilds
         # input_ids from the relay.
         self.input_ids = None
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+        self.req_pool_indices = _to_device(
+            req_pool_indices, torch.int64, self.device, nonblocking
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens = _to_device(seq_lens, torch.int64, self.device, nonblocking)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
+        self.orig_seq_lens = _to_device(seq_lens, torch.int32, self.device, nonblocking)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 

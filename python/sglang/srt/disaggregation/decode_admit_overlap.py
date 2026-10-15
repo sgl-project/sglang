@@ -9,6 +9,9 @@ off keeps the stock path:
 - ``defer_prealloc``: preallocate new requests right after the forward launch. Their
   page-index read-back then no longer waits for the fence; the transfer metadata
   goes out one host iteration later.
+- ``nonblocking_admit``: seed admitted (prebuilt) requests on the forward stream from
+  pinned, non-blocking copies, instead of making the schedule stream wait for the whole
+  in-flight forward and copying with blocking H2Ds.
 
 A control file can switch them between iterations of one server.
 """
@@ -25,7 +28,8 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 DEFER_PREALLOC = "defer_prealloc"
-_KNOWN = frozenset({DEFER_PREALLOC})
+NONBLOCKING_ADMIT = "nonblocking_admit"
+_KNOWN = frozenset({DEFER_PREALLOC, NONBLOCKING_ADMIT})
 
 # Seconds between reads of the A/B control file. A daemon thread does the reads so a
 # slow (e.g. network filesystem) read never stalls the scheduler loop.
@@ -65,6 +69,7 @@ class AdmitOverlap:
             name
             for name, on in (
                 (DEFER_PREALLOC, envs.SGLANG_Q35MF_PDDEC_DEFER_PREALLOC.get()),
+                (NONBLOCKING_ADMIT, envs.SGLANG_Q35MF_PDDEC_NONBLOCKING_ADMIT.get()),
             )
             if on
         )

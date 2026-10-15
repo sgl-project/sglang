@@ -667,8 +667,10 @@ class Envs:
     # PD decode admission overlap (srt/disaggregation/decode_admit_overlap.py):
     # preallocate new requests right after the forward launch.
     SGLANG_Q35MF_PDDEC_DEFER_PREALLOC = EnvBool(False)
+    # Seed admitted requests on the forward stream with non-blocking copies.
+    SGLANG_Q35MF_PDDEC_NONBLOCKING_ADMIT = EnvBool(False)
     # Control file switching the admission overlap between iterations of one
-    # server: whitespace-separated switch names, e.g. "defer_prealloc".
+    # server: whitespace-separated switch names ("defer_prealloc", "nonblocking_admit").
     SGLANG_Q35MF_PDDEC_ADMIT_AB_CTL = EnvStr("")
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.

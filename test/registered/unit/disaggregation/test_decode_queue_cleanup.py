@@ -749,6 +749,89 @@ def _queue_scheduler():
     return scheduler
 
 
+def _admit_req(**overrides):
+    fields = dict(
+        grammar=None,
+        output_dsa_topk_indices=None,
+        kv=SimpleNamespace(retraction_backup=None),
+        hidden_states_tensor=object(),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class TestAdmissionOverlap(CustomTestCase):
+    def test_nonblocking_admit_skips_the_whole_forward_wait(self):
+        """The stock prebuilt path makes the schedule stream wait for the whole
+        in-flight forward; the non-blocking one must not (it seeds on the forward
+        stream instead)."""
+        disagg = SimpleNamespace(
+            disaggregation_decode_enable_radix_cache=False,
+            disaggregation_decode_host_receive_threshold=1,
+        )
+        for nonblocking, waits in ((False, 1), (True, 0)):
+            scheduler = SimpleNamespace(
+                grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
+                waiting_queue=[MagicMock()],
+                enable_priority_scheduling=False,
+                req_to_token_pool=SimpleNamespace(size=4),
+                max_running_requests=4,
+                token_to_kv_pool_allocator=None,
+                tree_cache=None,
+                model_config=None,
+                enable_overlap=True,
+                spec_algorithm=None,
+                schedule_stream=MagicMock(),
+                forward_stream=MagicMock(),
+            )
+            with (
+                patch(
+                    "sglang.srt.disaggregation.decode.ScheduleBatch.init_new"
+                ) as init,
+                patch(
+                    "sglang.srt.disaggregation.decode.get_disagg", return_value=disagg
+                ),
+            ):
+                Scheduler._get_new_prebuilt_batch(
+                    scheduler, SimpleNamespace(batch_size=lambda: 0), nonblocking
+                )
+            self.assertEqual(scheduler.schedule_stream.wait_stream.call_count, waits)
+            init.return_value.prepare_for_prebuilt.assert_called_once_with(
+                nonblocking=nonblocking
+            )
+
+    def test_nonblocking_admit_scope(self):
+        # Paths whose seeding reads the device on the host, or restores KV on the
+        # schedule stream, keep the stock wait.
+        disagg = SimpleNamespace(disaggregation_decode_host_receive_threshold=1)
+
+        def in_scope(reqs, **overrides):
+            fields = dict(
+                enable_overlap=True,
+                spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+                enable_hisparse=False,
+                waiting_queue=reqs,
+            )
+            fields.update(overrides)
+            with patch(
+                "sglang.srt.disaggregation.decode.get_disagg", return_value=disagg
+            ):
+                return Scheduler._nonblocking_admit_in_scope(SimpleNamespace(**fields))
+
+        self.assertTrue(in_scope([_admit_req()]))
+        self.assertFalse(in_scope([_admit_req(), _admit_req(grammar=object())]))
+        self.assertFalse(in_scope([_admit_req(output_dsa_topk_indices=object())]))
+        self.assertFalse(
+            in_scope([_admit_req(kv=SimpleNamespace(retraction_backup=object()))])
+        )
+        self.assertFalse(in_scope([_admit_req()], enable_overlap=False))
+        self.assertFalse(
+            in_scope(
+                [_admit_req()], spec_algorithm=SimpleNamespace(is_eagle=lambda: False)
+            )
+        )
+
+
 class TestDeferredPrealloc(CustomTestCase):
     def test_deferred_prealloc_is_left_to_the_loop(self):
         """A deferring queue step must not preallocate itself (the loop does it once,
