@@ -11,7 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Which config the EAGLE aux-hidden-state resolver sizes the draft KV from.
+"""Which config the EAGLE aux-hidden-state resolver sizes the draft KV from,
+and the stage count it records for a DSpark draft.
 
 python -m pytest test/registered/unit/model_executor/test_spec_aux_hidden_state_resolver.py -v
 """
@@ -84,6 +85,55 @@ class TestEagleResolverDraftConfig(unittest.TestCase):
         self.assertIs(config.draft_model_config, draft)
         self.assertEqual(config.draft_kv_num_layers, 2)
         self.assertEqual(config.eagle_draft_num_layers, 2)
+
+
+class TestDSparkResolverStages(unittest.TestCase):
+    def _resolve(self, architecture):
+        """Run the DFLASH-family resolver for a DSpark draft that inherits a
+        40-layer config but captures three target layers."""
+        config = _mod.SpecAuxHiddenStateConfig()
+        draft = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=[architecture],
+                num_hidden_layers=40,
+                dspark_block_size=5,
+                dspark_markov_rank=1,
+                dspark_target_layer_ids=[1, 20, 39],
+            )
+        )
+        target = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+            hf_text_config=SimpleNamespace(num_hidden_layers=43),
+        )
+        spec = SimpleNamespace(
+            speculative_draft_model_path="/draft",
+            speculative_draft_model_revision=None,
+        )
+        with (
+            patch.object(_mod, "get_spec", return_value=spec),
+            patch.object(_mod.ModelConfig, "from_server_args", return_value=draft),
+            patch.object(_mod, "_resolve_dflash_draft_cell_size", return_value=None),
+        ):
+            _mod._resolve_dflash_aux_hidden_state(
+                config=config,
+                server_args=None,
+                model_config=target,
+                spec_algorithm=SimpleNamespace(
+                    is_dflash_family=lambda: True, is_dspark=lambda: True
+                ),
+                is_draft_worker=False,
+            )
+        self.assertEqual(config.dflash_draft_num_layers, 40)
+        self.assertEqual(config.dflash_target_layer_ids, [1, 20, 39])
+        return config
+
+    def test_deepseek_v4_draft_counts_target_layer_stages(self):
+        config = self._resolve("DeepseekV4ForCausalLMDSpark")
+        self.assertEqual(config.dspark_num_stages, 3)
+
+    def test_dense_draft_leaves_stages_unset(self):
+        config = self._resolve("Qwen3DSparkModel")
+        self.assertIsNone(config.dspark_num_stages)
 
 
 if __name__ == "__main__":
