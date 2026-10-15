@@ -3089,9 +3089,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Chunked prefill can leave an active request off the absolute
             # checkpoint grid. Without DCP, keep tracking snapshots relative to
             # that request prefix so later chunks can continue donating states.
-            mask = req.extend_len >= checkpoint_grid
+            tracked_len = req.extend_len
+            tail = envs.SGLANG_Q35MF_PREFILL_TAIL_SNAPSHOT_OFFSET.get()
+            if (
+                tail > 0
+                and seq_end >= len(req.origin_input_ids)
+                and len(req.output_ids) == 0
+            ):
+                # Final chunk of the prompt: keep the checkpoint `tail` tokens before
+                # the end so a next prompt that diverges there still finds a state.
+                tracked_len -= tail
+            mask = tracked_len >= checkpoint_grid
             mamba_track_seqlen_aligned = (
-                prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
+                prefix_len + (tracked_len // checkpoint_grid) * checkpoint_grid
             )
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx

@@ -1509,6 +1509,9 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Tokens held back from a prompt's end when picking its cached mamba checkpoint,
+    # so a next prompt that re-renders those tokens still resumes; 0 = last full page.
+    SGLANG_Q35MF_PREFILL_TAIL_SNAPSHOT_OFFSET = EnvInt(0)
     # GDN prefill conv runs once per q / k / v channel group when qkv_dim is above the
     # fused split limit (TP1), so the chunk kernels' input guard copies nothing.
     SGLANG_Q35MF_GDN_PREFILL_SPLIT_CONV = EnvBool(False)
