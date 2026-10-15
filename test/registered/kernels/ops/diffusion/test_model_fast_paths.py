@@ -862,6 +862,9 @@ def test_ernie_norm_scale_shift_is_bit_exact(shape):
     assert not ernie_image._ERNIE_GATED_NORM.disabled
 
 
+@pytest.mark.skipif(
+    not is_cuda(), reason="the fused QKNorm+RoPE JIT kernel is CUDA-only"
+)
 def test_ernie_qknorm_rope_is_bit_exact():
     torch.manual_seed(1)
     ernie_image._ERNIE_QKNORM_ROPE.disabled = False
@@ -1131,6 +1134,7 @@ def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
     assert all(x[0, img_tokens - 1, -1, -1].item() == 0 for x in packed)
 
 
+@pytest.mark.skipif(not is_cuda(), reason="FlashInfer CuTe QK RMSNorm is CUDA-only")
 def test_hunyuan_quality_qknorm_matches_rmsnorm():
     torch.manual_seed(1)
     site = torch.nn.Module()
@@ -1302,6 +1306,7 @@ def _qwen_causal_conv(cin, cout, channels_last=True):
 
 
 @torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused cat+pad kernel is CUDA-only")
 def test_qwen_vae_causal_conv_cat_pad_is_bit_exact() -> None:
     # Fused cat + pad + relayout must reproduce the aten chain for no cache,
     # a one-frame cache (partial zero fill) and a full two-frame cache.
@@ -1502,6 +1507,7 @@ def test_autoencoder_kl_fastpath_install():
 
 
 @torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused Q/K norm is CUDA-only")
 def test_qwen21_qk_norm_verifies_and_preserves_native_fallback(monkeypatch):
     x = torch.randn(1, 257, 8, 128, device="cuda", dtype=torch.bfloat16)
     norm = qwen_image21.RMSNorm(
@@ -1546,6 +1552,7 @@ def test_qwen21_qk_norm_does_not_verify_during_capture(monkeypatch):
 
 
 @torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused LayerNorm modulation is CUDA-only")
 def test_qwen21_modulation_verifies_and_preserves_native_fallback(monkeypatch):
     x = torch.randn(1, 257, 4096, device="cuda", dtype=torch.bfloat16)
     scale = torch.randn(1, 1, 4096, device=x.device, dtype=x.dtype)
