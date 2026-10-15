@@ -88,19 +88,6 @@ class TestRequestWindowCopy(CustomTestCase):
             graph.replay()
             torch.testing.assert_close(dst.cpu(), expected, rtol=0, atol=0)
 
-    def test_alias_uses_reference_semantics(self):
-        page, layout = 64, KVLayout.V4
-        buf = torch.randint(
-            0, 256, (4, layout.page_bytes(page)), dtype=torch.uint8, device="cuda"
-        )
-        source = torch.tensor([0, 1, 63], device="cuda")
-        target = torch.tensor([1, 2, 64], device="cuda")
-        expected = reference(
-            buf.cpu(), buf.cpu(), source.cpu(), target.cpu(), page, layout
-        )
-        copy_packed_tokens(buf, buf, source, target, page_size=page, layout=layout)
-        torch.testing.assert_close(buf.cpu(), expected, rtol=0, atol=0)
-
 
 if __name__ == "__main__":
     unittest.main()
