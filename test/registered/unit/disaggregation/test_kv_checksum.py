@@ -279,7 +279,7 @@ class TestChecksumMismatchRelease(unittest.TestCase):
             patch("sglang.srt.disaggregation.decode.state_indices_for_request"),
             patch("sglang.srt.disaggregation.decode.prepare_abort"),
             patch(
-                "sglang.srt.disaggregation.decode.release_kv_cache",
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
                 side_effect=release_kv_cache,
             ),
             patch(
@@ -328,7 +328,9 @@ class TestAdmissionChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ) as mock_release,
         ):
             verified = sched._verify_kv_checksums([req, valid])
         self.assertEqual(verified, [valid])
@@ -354,7 +356,9 @@ class TestAdmissionChecksum(unittest.TestCase):
         req = _make_req(0xDEADBEEF, self.num_pages, rid="HEALTH_CHECK_1")
         with (
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ) as mock_release,
         ):
             verified = sched._verify_kv_checksums([req])
         self.assertEqual(verified, [req])

@@ -723,7 +723,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             q._defer_release(entry)
         with (
             patch.object(decode_mod, "discard_kv_cache_backup") as discard,
-            patch.object(decode_mod, "release_kv_cache") as device_release,
+            patch.object(request_retirer_mod, "release_kv_cache") as device_release,
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.all_reduce") as reduce,
         ):
@@ -745,7 +745,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
     def test_noop_when_nothing_deferred(self):
         q = _make_queue()
-        with patch.object(decode_mod, "release_kv_cache") as rel:
+        with patch.object(request_retirer_mod, "release_kv_cache") as rel:
             q.owner.resolve_deferred_releases()
         rel.assert_not_called()
 
@@ -762,7 +762,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             decode_mod.time, "monotonic", side_effect=[10.0, 11.0, 12.0, 13.0]
         ):
             q._defer_release(dreq)
-            with patch.object(decode_mod, "release_kv_cache") as rel:
+            with patch.object(request_retirer_mod, "release_kv_cache") as rel:
                 # Not yet acked -> held, not released.
                 q.owner.resolve_deferred_releases()
                 rel.assert_not_called()
@@ -803,7 +803,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=42.0),
-            patch.object(decode_mod, "release_kv_cache") as rel,
+            patch.object(request_retirer_mod, "release_kv_cache") as rel,
         ):
             q.owner.resolve_deferred_releases()
             rel.assert_called_once_with(dreq.req, q.tree_cache, checkpoint=False)
@@ -825,7 +825,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=20.0),
-            patch.object(decode_mod, "release_kv_cache") as rel,
+            patch.object(request_retirer_mod, "release_kv_cache") as rel,
         ):
             q.owner.resolve_deferred_releases()
 
@@ -853,7 +853,9 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=40.0),
-            patch.object(decode_mod, "release_kv_cache", side_effect=fake_release),
+            patch.object(
+                request_retirer_mod, "release_kv_cache", side_effect=fake_release
+            ),
         ):
             q.owner.resolve_deferred_releases()  # must not raise
             # The good one still released despite the bad one throwing.
@@ -881,7 +883,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         _hold(q, retry, start_time=11.0, deadline=float("inf"))
         mgr.note_abort_ack(501, 0, mgr.register_deferred_abort_room(501))
 
-        with patch.object(decode_mod, "release_kv_cache") as rel:
+        with patch.object(request_retirer_mod, "release_kv_cache") as rel:
             q.owner.resolve_deferred_releases()
 
         rel.assert_called_once_with(retry.req, q.tree_cache, checkpoint=False)

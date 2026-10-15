@@ -102,7 +102,6 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
-    release_kv_cache,
     restore_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1828,8 +1827,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
             for decode_req in failed_reqs:
-                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
-                    release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
+                # Aborted before preallocation: it holds at most early mamba
+                # state, never a KV row.
+                self.request_retirer.retire_aborted(decode_req.req)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

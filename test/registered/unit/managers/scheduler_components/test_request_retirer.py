@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.beam_search.beam_group import BeamGroup
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import (
@@ -29,6 +30,9 @@ from sglang.srt.session.session_controller import Session
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import prefill_owner_shell
 from sglang.test.scheduler_request_intake import make_request_intake
+from sglang.test.separate_buffer_allocator_double import (
+    bind_separate_buffer_capacity,
+)
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 _RETIRER = "sglang.srt.managers.scheduler_components.request_retirer"
@@ -330,6 +334,48 @@ class TestOptimisticRequeueKeepsMedia(CustomTestCase):
         )
         self.assertIs(req.multimodal_inputs.mm_items[0], item)
         self.assertTrue(torch.equal(item.feature, torch.ones(2)))
+
+
+class TestPreallocAbortLeavesThroughTheRetirer(CustomTestCase):
+    """A PD decode request aborted before preallocation releases its media and
+    ends its cache request like every other abort."""
+
+    def test_aborted_prealloc_request_releases_media_and_cache_request(self):
+        retirer = _retirer()
+        item = _image_item()
+        req = Req("aborted", "", [1, 2], SamplingParams())
+        req.finished_reason = FINISH_ABORT("aborted")
+        req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+        handle = req.cache_request_handle
+        decode_req = SimpleNamespace(req=req, kv_receiver=Mock())
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue._resolve_pending_reqs = Mock()
+        queue._update_handshake_waiters = Mock()
+        queue._uses_swa_tail_prealloc = Mock(return_value=False)
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+        queue._swa_aware_allocatable_token_budgets = Mock(return_value=(0, None))
+        queue._hicache_pending_restore_tokens = Mock(return_value=0)
+        queue.enable_priority_scheduling = False
+        queue.enable_hisparse = False
+        queue.enable_lora = False
+        queue.output_streamer = Mock()
+        queue.tree_cache = retirer.tree_cache
+        queue.request_retirer = retirer
+
+        _, failed = queue.pop_preallocated([])
+
+        self.assertEqual(failed, [decode_req])
+        retirer.tree_cache.finish.assert_called_once_with(
+            handle, CacheRequestOutcome.ABORT
+        )
+        self.assertIsNone(item.feature)
+        self.assertIsNone(req.multimodal_inputs)
 
 
 if __name__ == "__main__":

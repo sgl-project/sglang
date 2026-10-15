@@ -98,6 +98,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         ]
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.retracted_queue = reqs.copy()
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
@@ -154,6 +155,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         schedule_stream.wait_stream.side_effect = lambda s: events.append(("wait", s))
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.retracted_queue = reqs.copy()
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
         queue.token_to_kv_pool_allocator = MagicMock(page_size=1)
@@ -188,6 +190,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pp_size = 1
         queue.tp_rank = 0
         queue.gloo_group = object()
@@ -246,6 +249,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]  # same object, dual ownership
@@ -294,6 +298,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]
@@ -350,6 +355,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
         # A req whose kv_receiver was already cleared must not crash on .abort().
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue._max_ensure_retries = 1
         queue._ensure_retry_interval = 0
         queue._ensure_retry_count = {"127.0.0.1:11500": 0}
@@ -386,6 +392,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         first = decode_req(7)
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pending_reqs = [first]
         queue._prefill_dp_rank_queries = {}
         queue.kv_manager = SimpleNamespace(
@@ -411,7 +418,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_transfer_failure_cleanup_respects_deferred_release_gates(
@@ -525,7 +532,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIs(receiver.kv_mgr, manager)
         self.assertFalse(receiver.abort_notified)
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_failed_fake_transfer_releases_at_once_under_deferred_release(
@@ -824,7 +831,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             )
         self.assertEqual(polls, [KVPoll.Transferring])
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     def test_pop_transferred_branches_on_reduced_poll_only(
         self, mock_prepare_abort, mock_release_kv_cache

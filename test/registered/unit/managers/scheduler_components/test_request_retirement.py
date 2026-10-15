@@ -81,14 +81,6 @@ _ALLOWED = {
         "DecodeHiCacheTransferMixin._clean_hicache_prefetch_resources",
         "tree_cache.finish",
     ): 1,
-    # To be removed: sites that skip a part.
-    # A PD decode request aborted before preallocation frees only its early
-    # mamba state; it skips the media and the cache request.
-    (
-        "disaggregation/decode.py",
-        "DecodePreallocQueue.pop_preallocated",
-        "release_kv_cache",
-    ): 1,
 }
 
 
