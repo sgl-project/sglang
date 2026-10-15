@@ -319,6 +319,19 @@ class TestFusedLowRatioCompress(CustomTestCase):
             with self.subTest(ratio=ratio):
                 self._check_step(_build(64, ratio, seed=164 + ratio), ratio)
 
+    def test_live_rows_under_bucket_sized_metadata(self):
+        """The prefill graph's eager break passes the live rows while the forward
+        metadata keeps the replayed bucket's padded rows at the tail."""
+        n, pad = 8, 5
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                t = _build(n, ratio, seed=400 + ratio)
+                core = t.backend.forward_metadata.core_metadata
+                tail = torch.zeros(pad, dtype=torch.int64, device="cuda")
+                core.raw_out_loc = torch.cat([core.raw_out_loc, tail.int()])
+                core.c1_out_loc = core.c2_out_loc = torch.cat([t.out_loc, tail])
+                self._check_step(t, ratio)
+
     @unittest.skipUnless(is_hip(), "HIP fused pair-state writer")
     def test_pair_state_survives_the_next_decode_step(self):
         t = _build(8, 2, seed=3000)

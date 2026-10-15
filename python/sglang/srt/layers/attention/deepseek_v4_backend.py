@@ -3240,6 +3240,8 @@ class DeepseekV4AttnBackend(
 
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
+        # The prefill graph's eager break passes live rows against bucket-sized metadata.
+        num_tokens = pos.shape[0]
         compressor = layer.compressor
         layer_id = layer.layer_id
         # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
@@ -3260,14 +3262,14 @@ class DeepseekV4AttnBackend(
                 compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                core.raw_out_loc[:num_tokens],
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
                 page_size=page_size,
                 layout=kv_layout,
             )
-            out_loc = core.c1_out_loc
+            out_loc = core.c1_out_loc[:num_tokens]
         else:
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
@@ -3278,7 +3280,7 @@ class DeepseekV4AttnBackend(
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                core.raw_out_loc[:num_tokens],
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3299,7 +3301,7 @@ class DeepseekV4AttnBackend(
                     ring_size=state.ring_size,
                     layout=kv_layout,
                 )
-            out_loc = core.c2_out_loc
+            out_loc = core.c2_out_loc[:num_tokens]
 
         indexer = layer.indexer
         if indexer is not None and indexer.owns_k:
