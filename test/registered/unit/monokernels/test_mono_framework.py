@@ -84,6 +84,8 @@ SPEC = MonoSpec(
     load_tensor=_load_tensor,
 )
 OLD_SPEC = replace(SPEC, api_version=registry.MONOKERNEL_API_VERSION - 1)
+# a DSpark draft at 2 draft tokens with anchor sampling: 1-token blocks
+ONE_TOKEN_DRAFT = replace(SPEC, tokens_per_request=lambda model: 1)
 
 
 def server_args(**kw):
@@ -112,15 +114,21 @@ def batch(mode, bs, rows):
     )
 
 
-def install(*, archs, lookups=None):
+def install(*, archs, lookups=None, is_load_observed=False):
     """install_monokernel_forward on an Lm, as rank 0 of two whose gathered lookups
     are lookups, or as the only rank."""
     lm = Lm()
+    if is_load_observed:
+        lm._mono_copies = {}  # what monokernel_weights_iterator leaves on the model
     gather = {"return_value": lookups} if lookups else {"side_effect": lambda x: [x]}
+    gpu = SimpleNamespace(multi_processor_count=256)
     with (
         patch.object(runtime, "_backend", return_value=BACKEND),
         patch.object(runtime, "device_isa", return_value="gfx950"),
         patch.object(runtime, "_gather_tp", **gather),
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(torch.cuda, "get_device_properties", return_value=gpu),
+        patch.object(torch.cuda, "memory_allocated", return_value=0),
     ):
         runtime.install_monokernel_forward(
             model=lm,
@@ -130,12 +138,9 @@ def install(*, archs, lookups=None):
     return lm
 
 
-def runner(*, capture_bs, attention="dsv4"):
+def runner(*, capture_bs):
     """A decode CUDA graph runner, as the capture tail hook sees it."""
-    return SimpleNamespace(
-        capture_bs=capture_bs,
-        model_runner=SimpleNamespace(decode_attention_backend_str=attention),
-    )
+    return SimpleNamespace(capture_bs=capture_bs)
 
 
 class Lm(torch.nn.Module):
@@ -143,11 +148,13 @@ class Lm(torch.nn.Module):
         return "normal"
 
 
-def switched(tokens=1):
-    """Build a fake model at tokens per request with fixed routing keys."""
+def switched(mode="decode", tokens=1, spec=SPEC):
+    """Build a fake model whose steps of this mode and tokens per request route."""
     lm, built = Lm(), FakeBuilt()
-    served = runtime._served_keys(widths=WIDTHS, tokens=tokens)
-    runtime._install_forward(model=lm, built=built, served=served)
+    served = runtime._served_keys(mode=mode, widths=WIDTHS, tokens=tokens)
+    runtime._install_forward(
+        model=lm, built=built, served=served, spec=spec, backend=BACKEND
+    )
     return lm, built
 
 
@@ -263,7 +270,7 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertEqual(inspect.signature(lm.forward), inspect.signature(Lm().forward))
         x = torch.zeros(1)
         self.assertEqual(lm(x, None, batch("decode", 2, 2)), "mono")
-        verify, _ = switched(tokens=6)
+        verify, _ = switched(mode="target_verify", tokens=6)
         self.assertEqual(
             verify(x, None, forward_batch=batch("target_verify", 2, 12)), "mono"
         )
@@ -313,13 +320,28 @@ class TestMonokernelFramework(CustomTestCase):
     def test_a_load_path_that_skips_the_observer_is_refused(self):
         # the layered, dummy and remote loaders never call monokernel_weights_iterator:
         # the spec would build without its weight copies
-        gpu = SimpleNamespace(multi_processor_count=256)
-        with (
-            patch.object(torch.cuda, "current_device", return_value=0),
-            patch.object(torch.cuda, "get_device_properties", return_value=gpu),
-            self.assertRaisesRegex(ValueError, "monokernel_weights_iterator"),
-        ):
+        with self.assertRaisesRegex(ValueError, "monokernel_weights_iterator"):
             install(archs=[ARCH])
+
+    def test_a_one_token_draft_block_is_a_verify_step(self):
+        # the step mode follows speculation: a mode guessed from 1 token a request
+        # served decode keys, and the draft's verify steps never routed
+        registry.register(
+            backend=BACKEND, architecture="Draft", path=f"{__name__}:ONE_TOKEN_DRAFT"
+        )
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                monokernel_backend=BACKEND,
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=2,
+                disable_cuda_graph=True,
+            ),
+            role="test",
+        )
+        self.addCleanup(reset_context)
+        lm = install(archs=["Draft"], is_load_observed=True)
+        self.assertEqual(lm(torch.zeros(1), None, batch("target_verify", 2, 2)), "mono")
 
     def test_every_rank_takes_the_same_lookup_branch(self):
         # every rank refuses together: one returning alone would hang its peers
@@ -349,19 +371,30 @@ class TestMonokernelFramework(CustomTestCase):
             )
         self.assertTrue(any("decode attention backend 'triton'" in r for r in refused))
         self.assertEqual(accepted, [])
-        # a draft runner resolves its own backend: the capture hook checks the runner's
-        decode = ShapeKey(forward_mode="decode", batch_size=2, tokens_per_request=1)
-        check = runtime._CaptureCheck(
-            spec=dsv4, backend=BACKEND, isa="gfx950", served=frozenset({decode})
-        )
-        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
-            with self.assertRaisesRegex(ValueError, "this runner's is 'triton'"):
-                check(
-                    runner(capture_bs=[2], attention="triton"),
-                    None,
-                    batch("decode", 2, 2),
-                    2,
-                )
+        # a draft runner may override it: the switch reads the backend each step runs
+        # on before the plugin's first forward, with or without CUDA graphs
+        # (the runner's stamp, the configured decode backend, accepted)
+        for stamped, configured, ok in (
+            ("triton", "dsv4", False),  # the runner's own backend wins
+            (None, "dsv4", True),  # an unstamped runner runs the configured one
+            ("dsv4", "triton", True),
+        ):
+            lm, built = switched(spec=dsv4)
+            backend = SimpleNamespace(decode_attention_backend_str=stamped)
+            with (
+                self.subTest(stamped=stamped, configured=configured),
+                patch.object(runtime, "get_attn_backend", return_value=backend),
+                patch.object(
+                    runtime, "attention_backends", return_value=("x", configured)
+                ),
+            ):
+                step = batch("decode", 2, 2)
+                if ok:
+                    self.assertEqual(lm(torch.zeros(1), None, step), "mono")
+                else:
+                    with self.assertRaisesRegex(ValueError, "this runner's is"):
+                        lm(torch.zeros(1), None, step)
+                    self.assertEqual(built.steps, [])  # the plugin never ran
 
     def test_the_captured_graphs_decide_coverage(self):
         # the runner may capture fewer sizes than configured (alignment, the request
@@ -406,12 +439,12 @@ class TestMonokernelFramework(CustomTestCase):
         )
         self.addCleanup(reset_context)
         self.assertEqual(runtime._backend(), BACKEND)
-        tokens = runtime._tokens_per_request()
-        self.assertEqual(tokens, 6)
+        mode, tokens = runtime._server_step()
+        self.assertEqual((mode, tokens), ("target_verify", 6))
         self.assertEqual(
             [
                 (k.forward_mode, k.batch_size, k.rows)
-                for k in runtime._capture_keys(tokens)
+                for k in runtime._capture_keys(mode=mode, tokens=tokens)
             ],
             [
                 ("target_verify", 1, 6),

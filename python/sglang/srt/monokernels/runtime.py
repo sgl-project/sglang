@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.monokernels.guards import deadline_s, device_isa
 from sglang.srt.monokernels.spec import (
     BuildContext,
@@ -23,6 +24,7 @@ from sglang.srt.monokernels.spec import (
     spec_registered,
 )
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_context,
     get_device,
     get_exec,
@@ -163,11 +165,10 @@ def install_monokernel_forward(
     if reasons:
         raise ValueError(f"--monokernel-backend {backend}: " + "; ".join(reasons))
 
+    mode, tokens = _server_step()
     if spec.tokens_per_request is not None:
         tokens = spec.tokens_per_request(model)
-    else:
-        tokens = _tokens_per_request()
-    capture_keys = _capture_keys(tokens)
+    capture_keys = _capture_keys(mode=mode, tokens=tokens)
     capture_rows = {k.rows for k in capture_keys}
     # Eager execution can use every supported width.
     widths = tuple(
@@ -175,7 +176,7 @@ def install_monokernel_forward(
         for w in spec.widths(isa)
         if w % tokens == 0 and (not capture_keys or w in capture_rows)
     )
-    served = _served_keys(widths=widths, tokens=tokens)
+    served = _served_keys(mode=mode, widths=widths, tokens=tokens)
     # Different routes would leave ranks waiting in incompatible collectives.
     if any(other != served for other in _gather_tp(served)):
         raise RuntimeError(
@@ -194,7 +195,9 @@ def install_monokernel_forward(
     )
     build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
     built = spec.build(model, hf_config, build_context)
-    _install_forward(model=model, built=built, served=served)
+    _install_forward(
+        model=model, built=built, served=served, spec=spec, backend=backend
+    )
     # Captured kernels retain weight copies that online updates cannot refresh.
     model._derived_weight_cache_error = (
         f"Online weight updates are not supported with --monokernel-backend {backend} "
@@ -230,8 +233,7 @@ class _CaptureCheck:
     """Check the captured decode graphs, not the configured sizes, once all are in.
 
     Logs the steps that run the monokernels, captured and eager, and refuses a
-    runner none of whose graphs run them or whose decode attention backend the
-    spec does not accept.
+    runner none of whose graphs run them.
     """
 
     def __init__(self, *, spec: MonoSpec, backend: str, isa: str, served: frozenset):
@@ -252,14 +254,6 @@ class _CaptureCheck:
         if not set(runner.capture_bs) <= set(self.captured):
             return
         self.is_done = True
-        attention = runner.model_runner.decode_attention_backend_str
-        allowed = self.spec.requires.attention_backends
-        if allowed and attention not in allowed:
-            raise ValueError(
-                f"--monokernel-backend {self.backend}: {self.spec.name} needs a decode "
-                f"attention backend in {sorted(allowed)}, this runner's is "
-                f"{attention!r}"
-            )
         routed = [k for k in self.captured.values() if k in self.served]
         if not routed:
             raise ValueError(
@@ -297,10 +291,10 @@ def _eager_keys(
     ]
 
 
-def _served_keys(*, widths: tuple[int, ...], tokens: int) -> frozenset[ShapeKey]:
+def _served_keys(
+    *, mode: str, widths: tuple[int, ...], tokens: int
+) -> frozenset[ShapeKey]:
     """The graph keys of the model's step at each width that holds whole requests."""
-    # A speculative target runs verify steps only; a plain server runs decode.
-    mode = "decode" if tokens == 1 else "target_verify"
     return frozenset(
         ShapeKey(forward_mode=mode, batch_size=w // tokens, tokens_per_request=tokens)
         for w in widths
@@ -309,19 +303,39 @@ def _served_keys(*, widths: tuple[int, ...], tokens: int) -> frozenset[ShapeKey]
 
 
 def _install_forward(
-    *, model: torch.nn.Module, built: BuiltMonokernels, served: frozenset[ShapeKey]
+    *,
+    model: torch.nn.Module,
+    built: BuiltMonokernels,
+    served: frozenset[ShapeKey],
+    spec: MonoSpec,
+    backend: str,
 ) -> None:
     """Install shape-based dispatch while preserving the original forward signature."""
     original = model.forward
+    allowed = spec.requires.attention_backends
+    is_backend_checked = not allowed
 
     # Graph runners inspect the original parameters to select forward arguments.
     @functools.wraps(original)
     def forward(*args, **kwargs):
+        nonlocal is_backend_checked
         # model forwards take (input_ids, positions, forward_batch, ...)
         batch = kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         key = shape_key(batch)
         if key not in served:
             return original(*args, **kwargs)
+        if not is_backend_checked:
+            # a draft runner may override the backend the launcher checked: read the
+            # one this step runs on, as model dispatch does, before the first forward
+            _, configured = attention_backends()
+            attention = get_attn_backend().decode_attention_backend_str or configured
+            if attention not in allowed:
+                raise ValueError(
+                    f"--monokernel-backend {backend}: {spec.name} needs a decode "
+                    f"attention backend in {sorted(allowed)}, this runner's is "
+                    f"{attention!r}"
+                )
+            is_backend_checked = True
         return built.forward(Plan(key=key), *args, **kwargs)
 
     model.forward = forward
@@ -351,19 +365,20 @@ def _format_weight_copies(copies: dict[tuple, torch.Tensor]) -> str:
     )
 
 
-def _tokens_per_request() -> int:
-    spec_cfg = get_spec()
-    if spec_cfg.speculative_algorithm is None:
-        return 1
-    return int(spec_cfg.speculative_num_draft_tokens or 1)
+def _server_step() -> tuple[str, int]:
+    """The mode and tokens per request of this server's decode-phase steps."""
+    spec_config = get_spec()
+    if spec_config.speculative_algorithm is None:
+        return "decode", 1
+    # the target's and its draft's steps are verify steps at any token count
+    return "target_verify", int(spec_config.speculative_num_draft_tokens or 1)
 
 
-def _capture_keys(tokens: int) -> list[ShapeKey]:
+def _capture_keys(*, mode: str, tokens: int) -> list[ShapeKey]:
     """Return configured decode or verify graph keys, or [] when graphs are disabled."""
     graph = get_exec().graph
     if graph.disable_cuda_graph or graph.disable_decode_cuda_graph:
         return []
-    mode = "decode" if tokens == 1 else "target_verify"
     sizes = sorted(set(graph.cuda_graph_config.decode.bs or []))
     return [
         ShapeKey(forward_mode=mode, batch_size=bs, tokens_per_request=tokens)
