@@ -55,8 +55,8 @@ def check_scale_boundaries():
     ]
     scales = (torch.linspace(0.1, 20, 256).bfloat16().float() / 448)[:64].tolist()
     kscale = torch.ones(1, device="cuda")
-    for value in scales:
-        vscale = torch.tensor([value], device="cuda")
+
+    def compare_scales(kscale, vscale, target, value):
         q, kn, _ = fused_qk_gemma_rmsnorm_rope_gate(
             qg, k, weight, weight, rope, positions, 1e-6, heads, 1, 256, 64
         )
@@ -81,13 +81,27 @@ def check_scale_boundaries():
         )
         for expected, actual in zip(*caches):
             assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8)), (
-                value
+                target,
+                value,
             )
+
+    for value in scales:
+        compare_scales(kscale, torch.tensor([value], device="cuda"), "v", value)
+    # An anchor keeps normalization from changing the small BF16 boundary values.
+    k.zero_()
+    k[:, 0] = 16
+    k[:, 128] = 1.5273690223693848e-6
+    k[1::2, 128] *= -1
+    v.zero_()
+    vscale = torch.ones(1, device="cuda")
+    for value in scales:
+        compare_scales(torch.tensor([value], device="cuda"), vscale, "k", value)
     print(
         json.dumps(
             dict(
-                scale_boundary_cases=len(scales),
-                bf16_bit_patterns=65536,
+                scale_boundary_cases=2 * len(scales),
+                scale_targets=["k", "v"],
+                v_bf16_bit_patterns=65536,
                 numerical_verdict="PASS",
                 end_to_end_verdict="PENDING",
             )
