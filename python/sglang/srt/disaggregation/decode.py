@@ -96,6 +96,7 @@ from sglang.srt.mem_cache.common import (
     page_align_floor,
     release_kv_cache,
     restore_kv_cache,
+    suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -1659,6 +1660,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _dsa_pages_payload():
+                # Mirror of prefill _dsa_pages_payload: the cached prefix keeps
+                # its own indexer rows, and rows still being restored by
+                # HiCache are not written until the restore commits.
+                return suffix_page_indices(
+                    self.req_to_token_pool.req_to_token,
+                    decode_req.req.kv.req_pool_idx,
+                    total_prefix_len,
+                    seq_len,
+                    self.token_to_kv_pool.page_size,
+                )
+
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool,
@@ -1699,7 +1712,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
