@@ -78,6 +78,11 @@ def test_formal_skip_layer_validation(invalid):
         validate_skip_layers(invalid, 42)
 
 
+def test_unsupported_quantization_is_not_silently_ignored():
+    with pytest.raises(NotImplementedError, match="quantization"):
+        MOSSImageTransformer(MOSSImageDiTConfig(), quant_config=object())
+
+
 def test_formal_guidance_is_unconditional_only_and_request_scoped():
     from sglang.multimodal_gen.configs.sample.moss_image import MOSSImageSamplingParams
 
