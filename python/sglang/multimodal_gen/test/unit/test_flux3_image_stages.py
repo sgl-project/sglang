@@ -110,6 +110,45 @@ class TestFlux3PackedConditioning(unittest.TestCase):
 
 
 class TestFlux3PackedSampler(unittest.TestCase):
+    def test_multiple_requests_keep_cfg_pairs_and_flow_map_targets_isolated(self):
+        samples = [
+            {
+                "image": (torch.full((2, 2), float(index)), torch.zeros(2, 4)),
+                "image_cond": None,
+                TEXT: (torch.full((length, 3), float(value)), torch.zeros(length, 4)),
+            }
+            for index, length, value in ((0, 1, 0), (1, 2, 2), (0, 3, 1), (1, 4, 4))
+        ]
+        channels = {"image": 2, "image_cond": 2, TEXT: 3}
+        schedule = torch.tensor([1.0, 0.0])
+        expected = []
+        for index in range(2):
+            expected.append(
+                denoise_packed(
+                    _text_mean_velocity,
+                    pack([samples[index], samples[index + 2]], channels),
+                    schedule,
+                    3.5,
+                )
+            )
+        for sequential in (False, True):
+            actual = denoise_packed(
+                _text_mean_velocity,
+                pack(samples, channels),
+                schedule,
+                3.5,
+                sequential_cfg=sequential,
+            )
+            torch.testing.assert_close(actual, torch.cat(expected), rtol=0, atol=0)
+        flow = pack(samples[2:], channels)
+        sliced = flow.slice_samples(1, 2)
+        self.assertEqual(sliced.mode_indices[TEXT], [(0, 4)])
+        out = denoise_flow_map(_text_mean_velocity, flow, schedule)
+        torch.testing.assert_close(
+            out, torch.cat([torch.full((2, 2), -1.0), torch.full((2, 2), -3.0)])
+        )
+        self.assertEqual(flow.timesteps_ref.shape, (2,))
+
     def test_flow_map_jumps_to_the_next_time_without_cfg(self):
         """The reference flow map embeds the next schedule time as the jump
         target and steps ``x += (r - t) * u`` on the conditional sample alone;

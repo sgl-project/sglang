@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 _IMAGE_MODES = frozenset({"t2i", "i2i"})
 # Release repos: the distilled flow map and the CFG base model.
 FLUX3_IMAGE_HF_PATHS = [
+    "herzogenhorn/f3-image-small",
     "black-forest-labs/flux-3-image-klein",
     "black-forest-labs/flux-3-image-klein-base",
 ]
@@ -181,7 +183,7 @@ class Flux3ImagePipelineConfig(PipelineConfig):
     flux3_package: "Flux3ImagePackage | None" = field(default=None, repr=False)
     # Dynamic compilation covers the package-defined variable token buckets.
     # Reference-parity tests explicitly construct an eager encoder.
-    flux3_compile_text_encoder: bool = True
+    flux3_compile_text_encoder: bool = False
     # Weight-only FP8 store; dequant on each encode. Default off.
     flux3_text_encoder_fp8: bool = False
     # Keep the visual VAE on GPU after a real request. Default off.
@@ -227,10 +229,13 @@ class Flux3ImagePipelineConfig(PipelineConfig):
             self.flux3_alpha = package.sampler.alpha
 
     def supports_dynamic_batching(self):
-        """FLUX.3's driver, samplers, and CFG doubling are single-sample per
-        forward (one sample plus its CFG negative), so it cannot process a
-        merged prompt batch."""
-        return False
+        return True
+
+    def supports_native_grouped_requests(self):
+        return True
+
+    def supports_batching_image_conditioning(self):
+        return True
 
     def served_modes(self) -> frozenset[str]:
         """Image modes accepted by one FLUX.3 server."""
@@ -243,9 +248,6 @@ class Flux3ImagePipelineConfig(PipelineConfig):
         All defaults are ``None`` so a flag only overrides the config default when
         the user actually passes it (``update_config_from_args`` skips ``None``)."""
 
-        def _bool(v: str) -> bool:
-            return str(v).lower() in ("1", "true", "yes", "y", "on")
-
         g = parser.add_argument_group("FLUX.3")
         g.add_argument(
             "--flux3-alpha",
@@ -254,41 +256,40 @@ class Flux3ImagePipelineConfig(PipelineConfig):
             default=None,
             help="Timestep-shift alpha.",
         )
-        g.add_argument(
-            "--flux3-compile-text-encoder",
-            dest="flux3_compile_text_encoder",
-            type=_bool,
-            default=None,
-            help="Compile the text encoder's language model (default true).",
-        )
-        g.add_argument(
-            "--flux3-text-encoder-fp8",
-            dest="flux3_text_encoder_fp8",
-            type=_bool,
-            default=None,
-            help="Store the Qwen3-VL encoder as weight-only FP8 (default false).",
-        )
-        g.add_argument(
-            "--flux3-keep-visual-vae-resident",
-            dest="flux3_keep_visual_vae_resident",
-            type=_bool,
-            default=None,
-            help="Keep the visual VAE on GPU between requests (default false).",
-        )
-        g.add_argument(
-            "--flux3-dit-keep-non-layer",
-            dest="flux3_dit_keep_non_layer",
-            type=_bool,
-            default=None,
-            help="Keep DiT non-layer weights on GPU through VAE decode (default false).",
-        )
-        g.add_argument(
-            "--flux3-skip-empty-cache-after-request",
-            dest="skip_empty_cache_after_request",
-            type=_bool,
-            default=None,
-            help="Skip post-request empty_cache (default true).",
-        )
+        for flag, dest, help_text in (
+            (
+                "compile-text-encoder",
+                "flux3_compile_text_encoder",
+                "Compile the text encoder (default false).",
+            ),
+            (
+                "text-encoder-fp8",
+                "flux3_text_encoder_fp8",
+                "Store text-encoder weights as FP8 (default false).",
+            ),
+            (
+                "keep-visual-vae-resident",
+                "flux3_keep_visual_vae_resident",
+                "Retain the VAE between requests (default false).",
+            ),
+            (
+                "dit-keep-non-layer",
+                "flux3_dit_keep_non_layer",
+                "Retain non-layer DiT weights during decode (default false).",
+            ),
+            (
+                "skip-empty-cache-after-request",
+                "skip_empty_cache_after_request",
+                "Skip post-request empty_cache (default true).",
+            ),
+        ):
+            g.add_argument(
+                f"--flux3-{flag}",
+                dest=dest,
+                action=StoreBoolean,
+                default=None,
+                help=help_text,
+            )
         return parser
 
 

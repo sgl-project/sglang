@@ -139,6 +139,14 @@ def test_native_module_tree_matches_the_image_checkpoint():
     )
 
 
+def test_attention_backend_failure_is_not_hidden():
+    with mock.patch.object(
+        flux3_image, "USPAttention", side_effect=ValueError("unsupported backend")
+    ):
+        with pytest.raises(ValueError, match="unsupported backend"):
+            flux3_image.Flux3ImageAttention(2, 128)
+
+
 def _reference_weights(native) -> dict[str, torch.Tensor]:
     """The native weights renamed to the FLUX 3 transformer's module tree."""
     state = {}

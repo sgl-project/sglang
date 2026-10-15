@@ -118,22 +118,24 @@ class Packed:
 
     def sample(self, index: int) -> Packed:
         """Return one sample with mode-local bounds rebased to zero."""
-        if not 0 <= index < self.num_samples:
-            raise IndexError(f"packed sample index {index} out of range")
+        return self.slice_samples(index, index + 1)
+
+    def slice_samples(self, first: int, stop: int) -> Packed:
+        if not 0 <= first < stop <= self.num_samples:
+            raise IndexError(f"packed sample range [{first}, {stop}) out of range")
         data = {}
         ids = {}
         timesteps = {}
         mode_indices = {}
         for mode in self.data:
-            start, end = self.mode_indices[mode][index]
+            bounds = self.mode_indices[mode][first:stop]
+            start, end = bounds[0][0], bounds[-1][1]
             data[mode] = self.data[mode][start:end]
             ids[mode] = self.ids[mode][start:end]
             timesteps[mode] = self.timesteps[mode][start:end]
-            mode_indices[mode] = [(0, end - start)]
+            mode_indices[mode] = [(lo - start, hi - start) for lo, hi in bounds]
         timesteps_ref = (
-            None
-            if self.timesteps_ref is None
-            else self.timesteps_ref[index : index + 1]
+            None if self.timesteps_ref is None else self.timesteps_ref[first:stop]
         )
         return Packed(data, ids, timesteps, mode_indices, timesteps_ref)
 
@@ -202,7 +204,7 @@ def pack_cfg(
 def flux3_dit_layer_names(module: nn.Module) -> list[str]:
     """Layerwise ModuleList paths. Expand each ModuleDict group per key."""
     names = ["single_blocks", "txt_mode_blocks"]
-    content = getattr(module, "content_mode_blocks", None)
+    content = module.content_mode_blocks
     if isinstance(content, nn.ModuleDict):
         names.extend(f"content_mode_blocks.{key}" for key in content)
     return names
@@ -301,42 +303,21 @@ class Flux3ImageAttention(nn.Module):
     """Attention over this rank's heads through :class:`USPAttention`.
 
     q/k/v arrive as ``(1, L, H_local, D)`` with QK-norm + RoPE applied.
-    ``USPAttention`` resolves its backend from the global ServerArgs and needs a
-    runtime ``ForwardContext``, so it is built lazily on first use. Without
-    either (the model used outside any runtime), attention falls back to torch
-    SDPA per packed sample.
+    backend selection must succeed before inference; a local SDPA fallback
+    would drop the collectives required by sequence parallelism
     """
 
     def __init__(self, local_heads: int, head_dim: int, prefix: str = ""):
         super().__init__()
-        self.local_heads = local_heads
-        self.head_dim = head_dim
-        self.prefix = prefix
-        self._usp: USPAttention | None = None
-        self._use_fallback = False
-
-    def _native(self) -> USPAttention | None:
-        if self._usp is None and not self._use_fallback:
-            try:
-                get_forward_context()  # must exist for the impl at call time
-                self._usp = USPAttention(
-                    num_heads=self.local_heads,
-                    head_size=self.head_dim,
-                    softmax_scale=self.head_dim**-0.5,
-                    causal=False,
-                    supported_attention_backends=set(_SUPPORTED_ATTENTION_BACKENDS),
-                    prefix=self.prefix,
-                    # sm120 has no FA3/FA4 kernel, so Torch SDPA would otherwise
-                    # fall to the sm80 FA2 path; cuDNN is faster on this shape.
-                    allow_cudnn_sdp=True,
-                )
-            except Exception as e:  # no ServerArgs / ForwardContext -> fall back
-                self._use_fallback = True
-                logger.warning_once(
-                    "Flux3ImageAttention: native backend unavailable "
-                    f"({str(e)[:80]}); falling back to torch SDPA."
-                )
-        return self._usp
+        self._usp = USPAttention(
+            num_heads=local_heads,
+            head_size=head_dim,
+            softmax_scale=head_dim**-0.5,
+            causal=False,
+            supported_attention_backends=set(_SUPPORTED_ATTENTION_BACKENDS),
+            prefix=prefix,
+            allow_cudnn_sdp=True,
+        )
 
     def forward(
         self,
@@ -347,9 +328,7 @@ class Flux3ImageAttention(nn.Module):
         seq_lens: list[int] | None,
         sp: Flux3SequenceShard | None,
     ) -> torch.Tensor:
-        usp = self._native()
-        if usp is None:
-            return self._sdpa(q, k, v, seq_lens or [q.shape[1]])
+        usp = self._usp
         if sp is None:
             # Replicated input: every rank holds the whole packed sequence.
             out = usp(q, k, v, skip_sequence_parallel_override=True, seq_lens=seq_lens)
@@ -363,15 +342,6 @@ class Flux3ImageAttention(nn.Module):
                 attn_mask_meta=sp.attn_mask_meta,
             )
         return out.flatten(2) if out.dim() == 4 else out
-
-    @staticmethod
-    def _sdpa(q, k, v, seq_lens: list[int]) -> torch.Tensor:
-        outputs = []
-        for q_s, k_s, v_s in zip(
-            *(t.transpose(1, 2).split(seq_lens, dim=2) for t in (q, k, v))
-        ):
-            outputs.append(F.scaled_dot_product_attention(q_s, k_s, v_s))
-        return torch.cat(outputs, dim=2).transpose(1, 2).flatten(2)
 
 
 class Flux3ImageQKNorm(nn.Module):
@@ -657,16 +627,11 @@ class Flux3ImageDiT(Flux3Transformer):
         )
 
     # ------------------------------------------------------------------ offload
-    def configure_layerwise_offload(self, *args, **kwargs):
-        super().configure_layerwise_offload(*args, **kwargs)
-        server_args = args[0] if args else kwargs.get("server_args")
-        keep_non_layer = False
-        if server_args is not None:
-            pipeline_config = getattr(server_args, "pipeline_config", None)
-            keep_non_layer = bool(
-                getattr(pipeline_config, "flux3_dit_keep_non_layer", False)
-            )
-        self.park_non_layer_weights_between_uses = not keep_non_layer
+    def configure_layerwise_offload(self, server_args, **kwargs):
+        super().configure_layerwise_offload(server_args, **kwargs)
+        self.park_non_layer_weights_between_uses = (
+            not server_args.pipeline_config.flux3_dit_keep_non_layer
+        )
 
     def should_prefetch_layerwise_manager(self, manager) -> bool:
         return flux3_content_stack_is_active(

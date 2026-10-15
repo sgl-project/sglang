@@ -5,9 +5,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+import msgspec
+from huggingface_hub.utils import validate_repo_id
+from safetensors import safe_open
+
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import snapshot_download
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -104,38 +109,10 @@ class Flux3ImagePackageConfig:
 
     @classmethod
     def from_dict(cls, raw: dict) -> Flux3ImagePackageConfig:
-        raw = _section(
-            raw,
-            cls,
-            "config",
-            nested={"dit", "text_encoder", "vae", "sampler"},
-        )
-        config = cls(
-            **{
-                key: value
-                for key, value in raw.items()
-                if key not in ("dit", "text_encoder", "vae", "sampler")
-            },
-            dit=_build(
-                Flux3ImageDiTPackageConfig,
-                raw["dit"],
-                "dit",
-                tuples=("axes_dim", "out_modes"),
-            ),
-            text_encoder=_build(
-                Flux3ImageTextEncoderPackageConfig,
-                raw["text_encoder"],
-                "text_encoder",
-                tuples=("layers",),
-            ),
-            vae=_build(Flux3ImageVAEPackageConfig, raw["vae"], "vae"),
-            sampler=_build(
-                Flux3ImageSamplerPackageConfig,
-                raw["sampler"],
-                "sampler",
-                tuples=("size",),
-            ),
-        )
+        try:
+            config = msgspec.convert(raw, type=cls)
+        except msgspec.ValidationError as exc:
+            raise Flux3ImagePackageError(str(exc)) from exc
         _validate_config(config)
         return config
 
@@ -330,8 +307,6 @@ def _resolve_flow_map(
 
 
 def _has_flow_map_weights(weights: Path) -> bool:
-    from safetensors import safe_open
-
     try:
         with safe_open(str(weights), framework="pt") as f:
             return FLOW_MAP_KEY in f.keys()
@@ -344,8 +319,6 @@ def _has_flow_map_weights(weights: Path) -> bool:
 def _is_hub_repo_id(source: str) -> bool:
     if source.startswith(("/", ".", "~")) or source.count("/") != 1:
         return False
-    from huggingface_hub.utils import validate_repo_id
-
     try:
         validate_repo_id(source)
     except ValueError:
@@ -356,10 +329,6 @@ def _is_hub_repo_id(source: str) -> bool:
 def _hub_snapshot(
     repo_id: str, *, patterns: list[str], revision: str | None = None
 ) -> Path:
-    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-        snapshot_download,
-    )
-
     try:
         return Path(
             snapshot_download(
@@ -399,40 +368,6 @@ def _download_package(
             patterns += _asset_patterns(reference)
     _hub_snapshot(repo_id, patterns=patterns, revision=revision)
     return root
-
-
-def _section(raw, cls, name: str, nested=frozenset()) -> dict:
-    if not isinstance(raw, dict):
-        raise Flux3ImagePackageError(
-            f"{name} must be an object, got {type(raw).__name__}"
-        )
-    names = {item.name for item in fields(cls)}
-    required = {
-        item.name
-        for item in fields(cls)
-        if item.default is MISSING and item.default_factory is MISSING
-    }
-    missing = required - set(raw)
-    if missing:
-        raise Flux3ImagePackageError(f"missing key(s) in {name}: {sorted(missing)}")
-    unknown = sorted(set(raw) - names)
-    if unknown:
-        # Exports add metadata keys over time; only the known ones drive loading.
-        logger.warning("FLUX.3 package %s: ignoring unknown key(s) %s", name, unknown)
-    for key in nested:
-        if not isinstance(raw.get(key), dict):
-            raise Flux3ImagePackageError(f"{name}.{key} must be an object")
-    return {key: value for key, value in raw.items() if key in names}
-
-
-def _build(cls, raw, name: str, tuples=()):
-    raw = dict(_section(raw, cls, name))
-    for key in tuples:
-        if key in raw:
-            if not isinstance(raw[key], list):
-                raise Flux3ImagePackageError(f"{name}.{key} must be a list")
-            raw[key] = tuple(raw[key])
-    return cls(**raw)
 
 
 def _check(condition: bool, message: str) -> None:
@@ -503,9 +438,15 @@ def _validate_config(config: Flux3ImagePackageConfig) -> None:
         f"unsupported torch_dtype {config.torch_dtype!r}",
     )
     dit = config.dit
-    for key in ("hidden", "heads", "depth", "depth_single", "theta"):
+    for key, value in (
+        ("hidden", dit.hidden),
+        ("heads", dit.heads),
+        ("depth", dit.depth),
+        ("depth_single", dit.depth_single),
+        ("theta", dit.theta),
+    ):
         _check(
-            _is_int(getattr(dit, key)) and getattr(dit, key) > 0,
+            value > 0,
             f"dit.{key} must be a positive integer",
         )
     _check(

@@ -142,6 +142,7 @@ class TestFlux3ServedRegistration(unittest.TestCase):
             local.mkdir()
             (local / "config.json").write_text(json.dumps(_config_dict()))
             for model_path in (
+                "herzogenhorn/f3-image-small",
                 "black-forest-labs/flux-3-image-klein",
                 "black-forest-labs/flux-3-image-klein-base",
                 str(local),
@@ -751,13 +752,12 @@ class TestFlux3PackedCFGParallel(unittest.TestCase):
             ],
             {"image": 2, "image_cond": 2, TEXT: 3},
         )
-        with mock.patch.multiple(
+        with mock.patch.object(
             stages,
-            get_classifier_free_guidance_world_size=mock.Mock(return_value=2),
-            get_classifier_free_guidance_rank=mock.Mock(return_value=0),
-            cfg_model_parallel_all_gather=mock.Mock(
-                side_effect=lambda value, dim: torch.cat((value, value + 1), dim=dim)
-            ),
+            "run_cfg_parallel",
+            side_effect=lambda policy, predict: [
+                predict(branch) for branch in policy.branches
+            ],
         ):
             model = stages._CFGParallelModel(
                 lambda *, packed: {"image": packed.data["image"]}
@@ -766,20 +766,6 @@ class TestFlux3PackedCFGParallel(unittest.TestCase):
         torch.testing.assert_close(
             output["image"], torch.cat((torch.zeros(2, 2), torch.ones(2, 2)))
         )
-
-
-class TestFlux3StrictStateDict(unittest.TestCase):
-    def test_full_state_dict_loads_and_partial_fails(self):
-        from sglang.multimodal_gen.runtime.pipelines.flux3_image import (
-            require_full_state_dict,
-        )
-
-        model = torch.nn.Linear(2, 3)
-        state = dict(model.state_dict())
-        require_full_state_dict(model, state, name="stub")
-        state.pop("bias")
-        with self.assertRaisesRegex(RuntimeError, "missing key"):
-            require_full_state_dict(model, state, name="stub")
 
 
 if __name__ == "__main__":

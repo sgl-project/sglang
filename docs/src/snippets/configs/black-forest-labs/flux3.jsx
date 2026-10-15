@@ -1,11 +1,11 @@
 // Image-only FLUX.3 diffusion command builder. Consumed by _deployment.jsx.
 
 export const config = (() => {
-// B200 and H200 come from the shared catalog; only RTX 5090 is added here.
 const hardware = [
   { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
+  { id: "rtx6000pro", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
 ];
-const hardwareLabels = { b200: "B200", h200: "H200", rtx5090: "RTX 5090" };
+const hardwareLabels = { rtx5090: "RTX 5090", rtx6000pro: "RTX PRO 6000", h100: "H100", h200: "H200", b200: "B200", b300: "B300", gb200: "GB200", gb300: "GB300" };
 
 return {
   modelName: "FLUX.3",
@@ -32,14 +32,13 @@ return {
       title: "Model",
       scope: "serve",
       description:
-        "Distilled (flux-3-image-klein) samples 16 steps without CFG; Base (flux-3-image-klein-base) samples 50 steps with CFG.",
-      default: "distilled",
+        "Base uses CFG; the sd variant is a step-distilled flow map without CFG. Defaults come from the selected checkpoint.",
+      default: "base",
       options: [
         {
           id: "distilled",
           label: "Distilled",
           subtitle: "16-step flow map, no CFG",
-          // A separate repo: resolveDeployment picks the model path.
           flags: [],
         },
         { id: "base", label: "Base", subtitle: "50-step CFG", flags: [] },
@@ -58,17 +57,17 @@ return {
           id: "fp8r",
           label: "FP8R",
           subtitle: "Rowwise FP8 DiT",
-          flags: ["--model-variant fp8r"],
+          flags: [],
         },
         {
           id: "nvfp4",
           label: "NVFP4",
           subtitle: "Blackwell, FP4 DiT",
-          flags: ["--model-variant nvfp4"],
-          disabled: (s) => s.hw === "h200",
+          flags: [],
+          disabled: (s) => ["h100", "h200"].includes(s.hw),
           disableReason: "NVFP4 GEMMs need a Blackwell GPU.",
-          soft: (s) => s.hw !== "b200",
-          softReason: "NVFP4 is verified on B200 only.",
+          soft: true,
+          softReason: "Verify quantized-output fidelity for your workload.",
         },
       ],
     },
@@ -77,28 +76,47 @@ return {
       title: "Placement",
       scope: "serve",
       docsHref: "/docs/sglang-diffusion/api/cli#component-residency",
-      default: "offload",
+      description: "Offload trades host RAM and transfers for lower GPU memory. Resident requires activation headroom.",
+      default: "auto",
       options: [
+        { id: "auto", label: "Auto", recommended: true, flags: [] },
         {
           id: "offload",
           label: "CPU offload",
           flags: [
-            "--dit-layerwise-offload True",
-            "--dit-cpu-offload True",
-            "--text-encoder-cpu-offload True",
-            "--vae-cpu-offload True",
-            "--flux3-dit-keep-non-layer true",
-            "--flux3-keep-visual-vae-resident true",
+            "--component-residency transformer=layerwise-offload,text_encoder=component-offload,vae=component-offload",
           ],
           recommendedWhen: (s) => s.hw === "rtx5090",
         },
         {
           id: "resident",
           label: "GPU resident",
-          flags: [],
+          flags: ["--component-residency all=resident"],
           recommendedWhen: (s) => s.hw !== "rtx5090",
         },
       ],
+    },
+    {
+      id: "attention", title: "Attention", scope: "serve", default: "auto",
+      description: "Keep the backend fixed for numerical comparisons.",
+      options: [
+        { id: "auto", label: "Platform default", flags: [], recommended: true },
+        { id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"] },
+        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"] },
+      ],
+    },
+    {
+      id: "execution", title: "Execution", scope: "serve", default: "eager",
+      description: "CUDA graphs can reduce launch overhead but reserve additional memory.",
+      options: [
+        { id: "eager", label: "Eager", flags: [], recommended: true },
+        { id: "bcg", label: "Breakable CUDA graphs", flags: ["--enable-breakable-cuda-graph"], soft: true, softReason: "Not verified for every hardware and topology." },
+      ],
+    },
+    {
+      id: "quality", title: "Quality", scope: "request", default: "lossless",
+      description: "Quantization and Cache-DiT remain separate, potentially lossy choices.",
+      options: [{ id: "lossless", label: "Lossless" }, { id: "exact", label: "Exact" }],
     },
     {
       id: "resolution",
@@ -148,21 +166,25 @@ return {
     resource: {
       limits: {
         nodes: { min: 1, max: 1 },
-        gpus_per_node: { min: 1, max: 2 },
+        gpus_per_node: { min: 1, max: 8 },
       },
       verifiedRecipes: [],
-      // Two GPUs default to Ulysses sequence parallel; tensor parallel is the
-      // manual alternative. Both are verified on 2x H200 and 2x B200.
       autoTopology: (s) => ({
-        tp_size: 1,
-        ulysses_degree: Number(s.gpus_per_node) || 1,
+        tp_size: Number(s.gpus_per_node) || 1,
+        ulysses_degree: 1,
         ring_degree: 1,
       }),
       validateTopology: (s, t) => {
         const errors = [];
         const gpus = Number(s.gpus_per_node);
-        if (Number(s.nodes) !== 1 || ![1, 2].includes(gpus)) {
-          errors.push("The FLUX.3 image release is configured for one node with one or two GPUs.");
+        if (Number(s.nodes) !== 1 || !Number.isInteger(gpus) || gpus < 1 || gpus > 8) {
+          errors.push("Choose one node with one to eight GPUs.");
+        }
+        if (![t.tp_size, t.ulysses_degree, t.ring_degree].every((n) => Number.isInteger(n) && n > 0)) {
+          errors.push("Parallel degrees must be positive integers.");
+        }
+        if (24 % Number(t.tp_size) || (24 / Number(t.tp_size)) % Number(t.ulysses_degree)) {
+          errors.push("TP and Ulysses must partition the 24 attention heads evenly.");
         }
         if (Number(t.ring_degree) !== 1) {
           errors.push("FLUX.3 sequence parallel uses Ulysses only (ring degree 1).");
@@ -186,9 +208,10 @@ return {
       const errors = resource.validateTopology(s, topology);
       const gpus = Number(s.gpus_per_node) || 1;
       const parallel = [];
-      if (gpus > 1) parallel.push(`--num-gpus ${gpus}`);
-      if (topology.tp_size > 1) parallel.push(`--tp-size ${topology.tp_size}`);
+      if (gpus > 1) parallel.push(`--num-gpus ${gpus}`, `--tp-size ${topology.tp_size}`);
       if (topology.ulysses_degree > 1) parallel.push(`--ulysses-degree ${topology.ulysses_degree}`);
+      const variant = [s.model === "distilled" ? "sd" : "", s.precision === "bf16" ? "" : s.precision].filter(Boolean).join("-");
+      if (variant) parallel.push(`--model-variant ${variant}`);
       return {
         match: { hw: s.hw },
         nnodes: 1,
@@ -196,7 +219,7 @@ return {
         verificationStatus: errors.length ? "error" : "unverified",
         env: [],
         flags: [
-          `--model-path ${s.model === "base" ? "{{WEIGHTS_ROOT}}" : "{{DISTILLED_ROOT}}"}`,
+          "--model-path {{MODEL_NAME}}",
           ...parallel,
           "--host {{HOST_IP}}",
           "--port {{PORT}}",
@@ -205,31 +228,21 @@ return {
           topology,
           topologySummary: `${Number(s.gpus_per_node) || 1}× ${hardwareLabels[s.hw] || s.hw}`,
           errors,
-          warnings: ["No production benchmark is published for this image checkpoint yet."],
+          warnings: ["This exact hardware, checkpoint and topology combination is not yet end-to-end verified."],
           verification: {
             serve: errors.length ? "error" : "unverified",
             request: errors.length ? "error" : "unverified",
           },
           resolvedSettings: {
-            placement: s.placement === "resident" ? "GPU resident" : "CPU offload",
+            placement: s.placement === "resident" ? "GPU resident" : s.placement === "offload" ? "Layerwise offload" : "Auto",
           },
         },
       };
     },
   },
 
-  modelNames: { default: "FLUX.3" },
+  modelNames: { default: "herzogenhorn/f3-image-small" },
   placeholders: {
-    WEIGHTS_ROOT: {
-      target: "command",
-      label: "Base model (Hub id or local repo)",
-      default: "black-forest-labs/flux-3-image-klein-base",
-    },
-    DISTILLED_ROOT: {
-      target: "command",
-      label: "Distilled model (Hub id or local repo)",
-      default: "black-forest-labs/flux-3-image-klein",
-    },
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30010" },
     CURL_HOST: { target: "curl", label: "Server host", default: "localhost" },
@@ -251,6 +264,7 @@ return {
       ...(s.mode === "i2i" ? {} : { size: "1024x1024" }),
       ...(s.model === "base" ? { num_inference_steps: 50, guidance_scale: 3.5 } : {}),
       seed: 0,
+      quality: s.quality,
       n: Number(s.outputs) || 1,
       response_format: "b64_json",
     };

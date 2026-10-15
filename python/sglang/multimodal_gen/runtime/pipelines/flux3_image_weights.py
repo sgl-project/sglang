@@ -439,6 +439,7 @@ def load_flux3_image_dit(
     quant_config: QuantizationConfig | None,
     *,
     enable_prims_ts: bool = True,
+    server_args,
 ):
     """Load a strict FLUX.3 package checkpoint through the standard lifecycle."""
     from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
@@ -457,10 +458,16 @@ def load_flux3_image_dit(
         enable_prims_ts=enable_prims_ts,
     )
 
+    on_cpu = server_args.should_start_component_on_cpu("transformer")
     weight_load_plan = WeightLoadPlan.for_component(
-        checkpoint_load_device=device,
+        checkpoint_load_device=torch.device("cpu")
+        if on_cpu and quant_config is None
+        else device,
         needs_device_weight_postprocess=quant_config is not None,
-        component_starts_on_cpu=False,
+        component_starts_on_cpu=on_cpu,
+        load_full_state_dict_on_device=server_args.should_direct_gpu_weight_load_component(
+            "transformer"
+        ),
     )
     model = maybe_load_fsdp_model(
         model_cls=Flux3ImageDiT,
@@ -471,12 +478,13 @@ def load_flux3_image_dit(
         },
         weight_dir_list=[dit_path],
         device=device,
-        hsdp_replicate_dim=1,
-        hsdp_shard_dim=1,
+        hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+        hsdp_shard_dim=server_args.hsdp_shard_dim,
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.float32,
-        component_starts_on_cpu=False,
-        fsdp_inference=False,
+        component_starts_on_cpu=on_cpu,
+        fsdp_inference=server_args.should_use_fsdp_for_component("transformer"),
+        pin_cpu_memory=server_args.pin_cpu_memory,
         strict=True,
         weight_load_plan=weight_load_plan,
     )

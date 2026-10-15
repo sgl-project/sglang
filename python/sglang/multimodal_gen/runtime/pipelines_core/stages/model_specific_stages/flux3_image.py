@@ -18,12 +18,14 @@ from torch import Tensor
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    cfg_model_parallel_all_gather,
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+    run_cfg_parallel,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    CFGBranch,
+    CFGPolicy,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -33,7 +35,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.models.dits.flux3_image import Packed, pack_cfg
+from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, Packed, pack
 from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
     Flux3ImagePackageConfig,
 )
@@ -51,6 +53,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
@@ -180,8 +183,10 @@ def denoise_packed(
     mode: str = "image",
     sequential_cfg: bool = False,
 ) -> Tensor:
-    if packed.num_samples != 2:
-        raise ValueError(f"packed CFG requires two samples, got {packed.num_samples}")
+    if packed.num_samples % 2:
+        raise ValueError(
+            "packed CFG requires an unconditional and conditional sample per output"
+        )
     device_type = packed.data[mode].device.type
     with torch.autocast(
         device_type="cuda",
@@ -194,8 +199,11 @@ def denoise_packed(
             packed.timesteps[mode].fill_(timestep)
             with _dit_step(step, step_callback):
                 if sequential_cfg:
-                    unconditional = dit(packed=packed.sample(0))[mode]
-                    conditional = dit(packed=packed.sample(1))[mode]
+                    half = packed.num_samples // 2
+                    unconditional = dit(packed=packed.slice_samples(0, half))[mode]
+                    conditional = dit(
+                        packed=packed.slice_samples(half, packed.num_samples)
+                    )[mode]
                 else:
                     unconditional, conditional = dit(packed=packed)[mode].chunk(2)
             velocity = unconditional + guidance * (conditional - unconditional)
@@ -216,12 +224,10 @@ def denoise_flow_map(
 
     The DiT is a step-distilled flow map, so there is no CFG pair.
     """
-    if packed.num_samples != 1:
-        raise ValueError(
-            f"flow-map sampling packs one sample, got {packed.num_samples}"
-        )
     device = packed.data[mode].device
-    packed.timesteps_ref = torch.zeros(1, device=device, dtype=torch.float32)
+    packed.timesteps_ref = torch.zeros(
+        packed.num_samples, device=device, dtype=torch.float32
+    )
     with torch.autocast(
         device_type="cuda",
         dtype=torch.bfloat16,
@@ -245,17 +251,17 @@ def vae_encode(vae, image: Tensor) -> tuple[Tensor, Tensor]:
     return tokens, latent_ids(height, width, latent.device)
 
 
-def vae_decode(vae, tokens: Tensor, ids: Tensor) -> Tensor:
+def vae_decode(vae, tokens: Tensor, ids: Tensor, *, batched: bool = False) -> Tensor:
     height = int(ids[:, 1].max()) + 1
     width = int(ids[:, 2].max()) + 1
     latent = (
         tokens.float()
-        .reshape(height, width, tokens.shape[-1])
-        .permute(2, 0, 1)
-        .unsqueeze(0)
+        .reshape(-1, height, width, tokens.shape[-1])
+        .permute(0, 3, 1, 2)
         .to(next(vae.parameters()).dtype)
     )
-    return vae.decode(latent)[0]
+    decoded = vae.decode(latent)
+    return decoded if batched else decoded[0]
 
 
 def encode_references(
@@ -438,7 +444,7 @@ def _flux3_prims_ts_autotune_context(server_args: ServerArgs):
 
 def _mode(batch: Req, pipeline_config) -> str:
     # One server serves both modes: a request with references is an edit.
-    requested = getattr(batch, "flux3_mode", None)
+    requested = batch.flux3_mode
     mode = requested or ("i2i" if batch.image_path else "t2i")
     if mode not in pipeline_config.served_modes():
         raise ValueError(
@@ -475,7 +481,7 @@ def _steps(batch: Req, package_config) -> int:
 
 def _cfg_scale(batch: Req, package_config) -> float | None:
     """The request's CFG scale, else the package's; ``None`` for a flow map."""
-    value = getattr(batch, "true_cfg_scale", None)
+    value = batch.true_cfg_scale
     if value is None:
         value = batch.guidance_scale
     requested = value is not None and value > 1.0
@@ -511,33 +517,41 @@ class Flux3ImageTextEncodeStage(PipelineStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        pipeline_config = server_args.pipeline_config
-        mode = _mode(batch, pipeline_config)
-        validate_generation(
-            mode,
-            prompt=batch.prompt,
-            image_path=_image_paths(batch),
-        )
-        prompt = (
-            batch.prompt[0] if isinstance(batch.prompt, (list, tuple)) else batch.prompt
-        )
-        if self.package_config.dit.flow_map:
-            if batch.negative_prompt:
-                raise ValueError(
-                    "the FLUX.3 flow-map (distilled) DiT samples without CFG; "
-                    "drop negative_prompt"
-                )
-            prompts = [prompt or ""]
-        else:
-            prompts = [batch.negative_prompt or "", prompt or ""]
+        return self.run_grouped_requests([batch], server_args)[0]
+
+    @torch.no_grad()
+    def run_grouped_requests(self, batches, server_args):
+        prompts = []
+        for batch in batches:
+            validate_generation(
+                _mode(batch, server_args.pipeline_config),
+                prompt=batch.prompt,
+                image_path=_image_paths(batch),
+            )
+            prompt = (
+                batch.prompt[0]
+                if isinstance(batch.prompt, (list, tuple))
+                else batch.prompt
+            )
+            if self.package_config.dit.flow_map:
+                if batch.negative_prompt:
+                    raise ValueError(
+                        "the FLUX.3 flow-map DiT samples without CFG; drop negative_prompt"
+                    )
+                prompts.append(prompt or "")
+            else:
+                prompts.extend([batch.negative_prompt or "", prompt or ""])
         with self.use_declared_component(
             component_name="text_encoder",
             module=self.text_encoder,
             phase="text_encode",
         ):
             with torch.inference_mode():
-                batch.flux3_text = self.text_encoder.encode_batch(prompts)
-        return batch
+                encoded = self.text_encoder.encode_batch(prompts)
+        branches = 1 if self.package_config.dit.flow_map else 2
+        for index, batch in enumerate(batches):
+            batch.flux3_text = encoded[index * branches : (index + 1) * branches]
+        return batches
 
 
 class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
@@ -554,7 +568,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
                 self._component_stage_name(stage_name),
                 "vae",
                 phase="condition_encode",
-                target_dtype=getattr(torch, self.package_config.vae.dtype),
+                target_dtype=precision_to_dtype(self.package_config.vae.dtype),
                 memory_intensive=True,
                 skip_empty_cache_on_release=True,
             )
@@ -571,7 +585,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
             return batch
         references, reference_size, crop = load_references(_image_paths(batch))
         # As in the reference, an unset side takes the first reference's.
-        explicit = getattr(batch.sampling_params, "_explicit_fields", set())
+        explicit = batch.sampling_params._explicit_fields
         width, height, batch.flux3_crop = output_size(
             batch.width if "width" in explicit else None,
             batch.height if "height" in explicit else None,
@@ -595,39 +609,29 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
         return batch
 
 
-_CFG_BRANCHES = 2
-
-
 class _CFGParallelModel:
     """Run one packed CFG sample per rank and restore pack order."""
 
     def __init__(self, model):
-        world_size = get_classifier_free_guidance_world_size()
-        if world_size < _CFG_BRANCHES:
-            raise ValueError(
-                f"FLUX.3 CFG parallelism needs degree >= {_CFG_BRANCHES}, "
-                f"got {world_size}"
-            )
         self.model = model
-        self.rank = min(
-            get_classifier_free_guidance_rank(),
-            _CFG_BRANCHES - 1,
+        self.policy = CFGPolicy(
+            branches=[
+                CFGBranch("unconditional", False, {"index": 0}),
+                CFGBranch("conditional", True, {"index": 1}),
+            ]
         )
 
-    def parameters(self, *args, **kwargs):
-        return self.model.parameters(*args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self.__dict__["model"], name)
-
     def __call__(self, *, packed: Packed):
-        prediction = self.model(packed=packed.sample(self.rank))
-        return {
-            mode: cfg_model_parallel_all_gather(value.contiguous(), dim=0).narrow(
-                0, 0, _CFG_BRANCHES * value.shape[0]
-            )
-            for mode, value in prediction.items()
-        }
+        half = packed.num_samples // 2
+        predictions = run_cfg_parallel(
+            self.policy,
+            lambda branch: self.model(
+                packed=packed.slice_samples(
+                    branch.kwargs["index"] * half, (branch.kwargs["index"] + 1) * half
+                )
+            )["image"],
+        )
+        return {"image": torch.cat(predictions)}
 
 
 class Flux3ImageDenoiseStage(DenoisingStage):
@@ -709,23 +713,43 @@ class Flux3ImageDenoiseStage(DenoisingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        return self._forward_batched([batch], server_args)[0]
+
+    def run_grouped_requests(self, batches, server_args):
+        return self._forward_batched(batches, server_args)
+
+    @torch.no_grad()
+    def _forward_batched(
+        self, batches: list[Req], server_args: ServerArgs
+    ) -> list[Req]:
+        batch = batches[0]
         pipeline_config = server_args.pipeline_config
         width = int(batch.width or self.package_config.sampler.size[0])
         height = int(batch.height or self.package_config.sampler.size[1])
         steps = _steps(batch, self.package_config)
         alpha = float(pipeline_config.flux3_alpha or self.package_config.sampler.alpha)
         guidance = _cfg_scale(batch, self.package_config)
-        image, decode_ids = noise_tokens(
-            height,
-            width,
-            _seed(batch),
-            self.package_config,
-            get_local_torch_device(),
-        )
-        packed = pack_cfg(
-            batch.flux3_text,
-            batch.flux3_condition,
-            image,
+        images = [
+            noise_tokens(
+                int(req.height or height),
+                int(req.width or width),
+                _seed(req),
+                self.package_config,
+                get_local_torch_device(),
+            )
+            for req in batches
+        ]
+        flow_map = self.package_config.dit.flow_map
+        packed = pack(
+            [
+                {
+                    TEXT: req.flux3_text[branch],
+                    "image_cond": req.flux3_condition,
+                    "image": image,
+                }
+                for branch in range(1 if flow_map else 2)
+                for req, (image, _) in zip(batches, images)
+            ],
             dict(self.package_config.dit.in_channels),
         )
         num_steps = max(0, steps)
@@ -736,7 +760,6 @@ class Flux3ImageDenoiseStage(DenoisingStage):
             module=self.transformer,
             phase="denoise",
         ):
-            flow_map = self.package_config.dit.flow_map
             sequential_cfg = (
                 not flow_map
                 and not server_args.enable_cfg_parallel
@@ -763,14 +786,14 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                 )
                 with tune_context:
                     if flow_map:
-                        batch.latents = denoise_flow_map(
+                        latents = denoise_flow_map(
                             self._denoise_model(server_args),
                             packed,
                             schedule,
                             step_callback=progress.update,
                         )
                     else:
-                        batch.latents = denoise_packed(
+                        latents = denoise_packed(
                             self._denoise_model(server_args),
                             packed,
                             schedule,
@@ -778,8 +801,10 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                             step_callback=progress.update,
                             sequential_cfg=sequential_cfg,
                         )
-        batch.latent_ids = decode_ids
-        return batch
+        counts = [image[0].shape[0] for image, _ in images]
+        for req, latent, (_, decode_ids) in zip(batches, latents.split(counts), images):
+            req.latents, req.latent_ids = latent, decode_ids
+        return batches
 
 
 class Flux3ImageDecodeStage(PipelineStage):
@@ -801,7 +826,7 @@ class Flux3ImageDecodeStage(PipelineStage):
                 self._component_stage_name(stage_name),
                 "vae",
                 phase="decode",
-                target_dtype=getattr(torch, self.package_config.vae.dtype),
+                target_dtype=precision_to_dtype(self.package_config.vae.dtype),
                 memory_intensive=True,
                 keep_ready_after_warmup=True,
                 preferred_ready_after_request=keep,
@@ -822,6 +847,31 @@ class Flux3ImageDecodeStage(PipelineStage):
                     batch.flux3_crop,
                 )
         return OutputBatch(output=self._to_display(image), metrics=batch.metrics)
+
+    @torch.no_grad()
+    def run_grouped_requests(self, batches, server_args):
+        groups = {}
+        for index, batch in enumerate(batches):
+            groups.setdefault((batch.width, batch.height), []).append((index, batch))
+        outputs = [None] * len(batches)
+        with self.use_declared_component(
+            component_name="vae", module=self.vae, phase="decode"
+        ):
+            for group in groups.values():
+                decoded = vae_decode(
+                    self.vae,
+                    torch.cat([req.latents for _, req in group]),
+                    group[0][1].latent_ids,
+                    batched=True,
+                )
+                for (index, req), image in zip(group, decoded):
+                    outputs[index] = OutputBatch(
+                        output=[
+                            self._to_display(crop_output(image, req.flux3_crop))[0]
+                        ],
+                        metrics=req.metrics,
+                    )
+        return outputs
 
     @staticmethod
     def _to_display(image: Tensor) -> Tensor:

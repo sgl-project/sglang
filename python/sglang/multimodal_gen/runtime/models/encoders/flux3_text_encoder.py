@@ -174,25 +174,31 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
 
     @torch.no_grad()
     def encode_batch(self, texts: list[str]) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Prompts -> ``(tokens (L_i, C), ids (L_i, 4))``, one forward per prompt.
+        """Prompts -> tokens and IDs, with one forward per unique length bucket.
 
         Matches the FLUX.3 image reference encoder: each prompt is padded to its
-        own bucket and encoded alone with explicit position ids (real tokens
+        own bucket with explicit position ids (real tokens
         count from 0, pads sit at 1), so the pad rows the DiT attends to do not
         depend on the batch or on the transformers default position ids.
         ``ids`` are ``(0, 0, 0, position)``.
         """
-        results = []
-        tokenizer = self.processor.tokenizer
-        for text in texts:
-            prompt = self.processor.apply_chat_template(
+        unique = list(dict.fromkeys(texts))
+        formatted = [
+            self.processor.apply_chat_template(
                 [{"role": "user", "content": text}],
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            length = self._bucket(prompt)
+            for text in unique
+        ]
+        buckets = {}
+        for index, prompt in enumerate(formatted):
+            buckets.setdefault(self._bucket(prompt), []).append(index)
+        results = {}
+        tokenizer = self.processor.tokenizer
+        for length, members in buckets.items():
             toks = tokenizer(
-                prompt,
+                [formatted[index] for index in members],
                 return_tensors="pt",
                 padding="max_length",
                 truncation=True,
@@ -212,9 +218,11 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
                     use_cache=False,
                 )
             tokens = torch.cat(
-                [out.hidden_states[k][0] for k in self.output_layers], dim=-1
+                [out.hidden_states[k] for k in self.output_layers], dim=-1
             ).to(self.embed_dtype)
             positions = torch.arange(length, device=tokens.device)
             zeros = torch.zeros_like(positions)
-            results.append((tokens, torch.stack([zeros, zeros, zeros, positions], -1)))
-        return results
+            ids = torch.stack([zeros, zeros, zeros, positions], -1)
+            for row, index in enumerate(members):
+                results[unique[index]] = (tokens[row], ids)
+        return [results[text] for text in texts]
