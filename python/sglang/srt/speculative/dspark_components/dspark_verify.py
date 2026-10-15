@@ -921,14 +921,14 @@ def _accept_on_shards(
     block_verification: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """AcceptSampling.execute, reading the draft logits on the vocab shards."""
-    del draft_probs, draft_input, gamma, verify_num_draft_tokens, block_verification
+    del draft_probs, sampling_info, draft_input, gamma
+    del verify_num_draft_tokens, block_verification
     shard = draft_block.vocab_shard
     return accept_sampling_sharded(
         candidates=candidates,
         target_logits=target_logits,
-        target_temperatures=sampling_info.temperatures.view(-1),
         draft_logits=draft_block.corrected_logits,
-        draft_temperatures=draft_block.temperatures,
+        temperatures=draft_block.temperatures,
         vocab_start=shard.start,
         width=shard.width,
         gather_stacked=shard.gather.gather_stacked,

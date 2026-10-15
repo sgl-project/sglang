@@ -1,25 +1,19 @@
-"""
-DSpark chain rejection sampling over draft logits held as TP vocab shards.
+"""DSpark rejection sampling with the draft logits on the TP vocab shards.
 
-The rule is ``AcceptSampling``'s without block verification: draft token x_i is
-accepted when u_i * q_i(x_i) < p_i(x_i), p and q being the target's and the
-draft's temperature softmax; the first rejection draws from max(p_i - q_i, 0),
-and a fully accepted chain from p at its last row. Each rank holds only its
-vocab slice of the draft logits, so
+The rule is ``AcceptSampling``'s without block verification: draft token x is
+accepted when u * q(x) < p(x), p and q being the target's and the draft's
+temperature softmax; the first rejection draws the bonus from max(p - q, 0), a
+fully accepted chain from the last row's p. No rank holds the whole draft vocab:
 
-  1. row stats  each rank reduces every verify row over its slice to the max
-                and sum-exp of the target and draft logits, plus both logits of
-                the row's draft token when its slice holds it; the ranks
-                exchange these.
-  2. accept     every rank merges the same stats into p_i(x_i) and q_i(x_i) and
-                tests the chain with the same Philox uniforms, so all reach one
-                decision; it caps at the verify length and picks the bonus row.
-  3. bonus      a Gumbel race over that row's residual (or p) on each slice,
-                whose block candidates the ranks exchange as a draft step does;
-                the winner is an exact draw from the normalized residual.
+  1. ``_stats_kernel``: each rank reduces its slice of every verify row to the
+     max and sum-exp of the target and draft logits, plus both logits of the
+     row's draft token when the slice holds it. The ranks exchange these.
+  2. ``_accept_kernel``: every rank merges them into p(x) and q(x) and tests the
+     chain with the same Philox uniforms, so all ranks decide alike; then it
+     races log(mass) + Gumbel noise over its slice of the bonus row. The ranks
+     exchange the block winners, and the draft's finish kernel picks the bonus.
 
-Neither p nor q is materialized: outcomes match AcceptSampling in distribution,
-not draw for draw.
+The bonus follows AcceptSampling's distribution, not its draws.
 """
 
 from typing import Callable, Optional
@@ -34,21 +28,12 @@ from sglang.kernels.ops.speculative.dspark.markov_sample import (
 )
 
 _BLOCK = 4096
-_PHILOX_ROUNDS = 10
-# 2**-32: maps a 32-bit Philox word to a uniform in (0, 1].
-_UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
-# The finish kernel's index of a block without a candidate.
-_NO_INDEX = tl.constexpr(2147483647)
-# Six stats a row, padded to 32 bytes for the vectorized gathers.
-_STATS = 8
-# The draft block already advanced the noise counter, and draft steps count up
-# from 0, so draws at these steps repeat none of the draft's.
-_ACCEPT_STEP = 0xFFFFFFFE
-_BONUS_STEP = 0xFFFFFFFF
+# Philox steps the draft never reaches, so these draws repeat none of its own.
+_ACCEPT_STEP, _BONUS_STEP = tl.constexpr(0xFFFFFFFE), tl.constexpr(0xFFFFFFFF)
 
 
 @triton.jit
-def _fold_logsumexp(m, s, x):
+def _fold(m, s, x):
     """Fold block ``x`` into the running (max, sum of exp(v - max))."""
     new_m = tl.maximum(m, tl.max(x, 0))
     ref = tl.where(new_m == -float("inf"), 0.0, new_m)
@@ -56,7 +41,7 @@ def _fold_logsumexp(m, s, x):
 
 
 @triton.jit
-def _merge_logsumexp(m, s):
+def _merge(m, s):
     """Merge the ranks' (max, sum-exp) pairs along axis 1."""
     big = tl.max(m, 1)
     ref = tl.where(big == -float("inf"), 0.0, big)
@@ -64,196 +49,150 @@ def _merge_logsumexp(m, s):
 
 
 @triton.jit
-def _row_stats_kernel(
+def _philox(KEY, c0, row, step, OFFSET):
+    """Philox words at (c0, row, step, block counter), the draft's counters."""
+    lane = tl.zeros(c0.shape, tl.int64)
+    return tl.philox(
+        KEY,
+        c0.to(tl.uint32),
+        (lane + row).to(tl.uint32),
+        (lane + step).to(tl.uint32),
+        ((lane + tl.load(OFFSET)) & 0xFFFFFFFF).to(tl.uint32),
+    )
+
+
+@triton.jit
+def _stats_kernel(
     TARGET,
     DRAFT,
     CAND,
-    TARGET_T,
-    DRAFT_T,
+    TEMP,
     STATS,
-    TARGET_S: tl.constexpr,
-    DRAFT_S: tl.constexpr,
-    CAND_S: tl.constexpr,
-    WIDTH: tl.constexpr,
-    VOCAB_START: tl.constexpr,
+    TARGET_S,
+    START,
+    WIDTH,
+    PADDED,
     SLOTS: tl.constexpr,
     GAMMA: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """STATS[r] = (target max, target sum-exp, target logit of x, then the same
-    three for the draft) of verify row r over this slice, logits / T; the
-    logits of x are -inf unless the slice holds the row's draft token x."""
+    """STATS[r] = (max, sum-exp, logit of x) of the target, then the same of the
+    draft, over this slice of verify row r at temperature; x is the row's draft
+    token, its logits -inf off the slice. The last row has no draft token."""
     r = tl.program_id(0)
     b, i = r // SLOTS, r % SLOTS
-    has_draft = i < SLOTS - 1
-    inv_tt = 1.0 / tl.maximum(tl.load(TARGET_T + b).to(tl.float32), 1e-5)
-    inv_dt = 1.0 / tl.maximum(tl.load(DRAFT_T + b).to(tl.float32), 1e-5)
-    target = TARGET + r.to(tl.int64) * TARGET_S + VOCAB_START
-    draft = DRAFT + (b * GAMMA + i).to(tl.int64) * DRAFT_S
-    t_max, t_sum = -float("inf"), 0.0
-    d_max, d_sum = -float("inf"), 0.0
-    for start in range(0, WIDTH, BLOCK):
-        j = start + tl.arange(0, BLOCK)
-        valid = j < WIDTH
-        t = tl.load(target + j, valid, -float("inf")).to(tl.float32) * inv_tt
-        t_max, t_sum = _fold_logsumexp(t_max, t_sum, t)
-        d = tl.load(draft + j, valid & has_draft, -float("inf")).to(tl.float32)
-        d_max, d_sum = _fold_logsumexp(d_max, d_sum, d * inv_dt)
-    local = tl.load(CAND + b * CAND_S + i + 1, has_draft, -1).to(tl.int64)
-    local -= VOCAB_START
-    own = has_draft & (local >= 0) & (local < WIDTH)
-    local = tl.where(own, local, 0)
-    t_x = tl.load(target + local, own, -float("inf")).to(tl.float32) * inv_tt
-    d_x = tl.load(draft + local, own, -float("inf")).to(tl.float32) * inv_dt
-    out = STATS + r * 8
-    tl.store(out, t_max)
-    tl.store(out + 1, t_sum)
-    tl.store(out + 2, t_x)
-    tl.store(out + 3, d_max)
-    tl.store(out + 4, d_sum)
-    tl.store(out + 5, d_x)
+    has_x = i < SLOTS - 1
+    inv_t = 1.0 / tl.maximum(tl.load(TEMP + b), 1e-5)
+    target = TARGET + r.to(tl.int64) * TARGET_S + START
+    draft = DRAFT + (b * GAMMA + i).to(tl.int64) * PADDED
+    t_m, t_s, d_m, d_s = -float("inf"), 0.0, -float("inf"), 0.0
+    for k in range(0, WIDTH, BLOCK):
+        j = k + tl.arange(0, BLOCK)
+        t = tl.load(target + j, j < WIDTH, -float("inf")).to(tl.float32)
+        d = tl.load(draft + j, has_x & (j < WIDTH), -float("inf")).to(tl.float32)
+        t_m, t_s = _fold(t_m, t_s, t * inv_t)
+        d_m, d_s = _fold(d_m, d_s, d * inv_t)
+    x = tl.load(CAND + r + 1, has_x, -1) - START
+    own = has_x & (x >= 0) & (x < WIDTH)
+    out = STATS + r * 6
+    tl.store(out, t_m)
+    tl.store(out + 1, t_s)
+    tl.store(out + 2, tl.load(target + x, own, -float("inf")).to(tl.float32) * inv_t)
+    tl.store(out + 3, d_m)
+    tl.store(out + 4, d_s)
+    tl.store(out + 5, tl.load(draft + x, own, -float("inf")).to(tl.float32) * inv_t)
 
 
 @triton.jit
 def _accept_kernel(
     STATS,
-    CAND,
-    VERIFY_LENS,
-    OFFSET,
-    NORM,
-    CORRECT,
-    TRIM,
-    FIXED,
-    BONUS_ROW,
-    CAND_S,
-    ROWS,
-    KEY,
-    SLOTS: tl.constexpr,
-    SLOTS_P2: tl.constexpr,
-    WORLD: tl.constexpr,
-    WORLD_P2: tl.constexpr,
-    STEP: tl.constexpr,
-    HAS_CUTOFF: tl.constexpr,
-    PHILOX_ROUNDS: tl.constexpr,
-):
-    """Per request: merge the ranks' stats (keeping each row's normalizers in
-    NORM), run the chain test, cap at the verify length, and record the row the
-    bonus is drawn from: the first rejected row, or the last."""
-    b = tl.program_id(0)
-    i = tl.arange(0, SLOTS_P2)
-    w = tl.arange(0, WORLD_P2)
-    in_chain = i < SLOTS
-    mask = in_chain[:, None] & (w < WORLD)[None, :]
-    stats = STATS + (w[None, :] * ROWS + b * SLOTS + i[:, None]) * 8
-    t_max, t_sum = _merge_logsumexp(
-        tl.load(stats, mask, -float("inf")), tl.load(stats + 1, mask, 0.0)
-    )
-    d_max, d_sum = _merge_logsumexp(
-        tl.load(stats + 3, mask, -float("inf")), tl.load(stats + 4, mask, 0.0)
-    )
-    norm = NORM + (b * SLOTS + i) * 4
-    tl.store(norm, t_max, in_chain)
-    tl.store(norm + 1, t_sum, in_chain)
-    tl.store(norm + 2, d_max, in_chain)
-    tl.store(norm + 3, d_sum, in_chain)
-    t_x = tl.max(tl.load(stats + 2, mask, -float("inf")), 1)
-    d_x = tl.max(tl.load(stats + 5, mask, -float("inf")), 1)
-    p = tl.where(t_x == -float("inf"), 0.0, tl.exp(t_x - t_max) / t_sum)
-    q = tl.where(d_x == -float("inf"), 0.0, tl.exp(d_x - d_max) / d_sum)
-    lane = tl.zeros([SLOTS_P2], tl.int64)
-    bits, _, _, _ = tl.philox(
-        KEY,
-        i.to(tl.uint32),
-        (lane + b).to(tl.uint32),
-        (lane + STEP).to(tl.uint32),
-        ((lane + tl.load(OFFSET)) & 0xFFFFFFFF).to(tl.uint32),
-        PHILOX_ROUNDS,
-    )
-    u = tl.uint_to_uniform_float(bits)
-    ok = (q > 0.0) & (q <= 1.0) & (u * q < p)
-    accepted = tl.min(tl.where((i < SLOTS - 1) & ~ok, i, SLOTS - 1), 0)
-    capped = accepted
-    fixed = tl.full((), -1, tl.int64)
-    if HAS_CUTOFF:
-        capped = tl.minimum(accepted, tl.load(VERIFY_LENS + b).to(tl.int32) - 1)
-        # A trimmed chain ends on an accepted draft token, not on a draw.
-        trimmed = capped < accepted
-        fixed = tl.load(CAND + b * CAND_S + capped + 1, trimmed, -1).to(tl.int64)
-    tl.store(CORRECT + b, capped)
-    tl.store(TRIM + b, accepted - capped)
-    tl.store(FIXED + b, fixed)
-    tl.store(BONUS_ROW + b, accepted)
-
-
-@triton.jit
-def _bonus_partial_kernel(
     TARGET,
     DRAFT,
-    TARGET_T,
-    DRAFT_T,
-    NORM,
-    BONUS_ROW,
-    OFFSET,
-    P,
-    PARTS,
+    CAND,
+    TEMP,
+    VERIFY_LENS,
     KEY,
-    TARGET_S: tl.constexpr,
-    DRAFT_S: tl.constexpr,
-    WIDTH: tl.constexpr,
-    VOCAB_START: tl.constexpr,
+    OFFSET,
+    LENS,
+    PARTIAL,
+    BS,
+    TARGET_S,
+    START,
+    WIDTH,
+    PADDED,
+    PARTS,
     SLOTS: tl.constexpr,
+    SLOTS_P2: tl.constexpr,
     GAMMA: tl.constexpr,
-    STEP: tl.constexpr,
+    WORLD: tl.constexpr,
+    WORLD_P2: tl.constexpr,
+    HAS_CUTOFF: tl.constexpr,
     BLOCK: tl.constexpr,
-    PHILOX_ROUNDS: tl.constexpr,
 ):
-    """This slice's block candidates for the bonus: a Gumbel race over
-    max(p - q, 0) on a rejected row, over p on the last row."""
+    """For request b and vocab block ``part``: merge the ranks' stats and test
+    the chain (block 0 stores correct_len, trim and a capped chain's bonus in
+    LENS), then race this block of the bonus row, whose mass is max(p - q, 0)
+    after a rejection and p after a full chain."""
     b, part = tl.program_id(0), tl.program_id(1)
-    i = tl.load(BONUS_ROW + b)
-    r = b * SLOTS + i
-    residual = i < SLOTS - 1
+    slot = tl.arange(0, SLOTS_P2)
+    rank = tl.arange(0, WORLD_P2)
+    mask = (slot < SLOTS)[:, None] & (rank < WORLD)[None, :]
+    stats = STATS + (rank[None, :] * BS * SLOTS + b * SLOTS + slot[:, None]) * 6
+    t_m, t_s = _merge(
+        tl.load(stats, mask, -float("inf")), tl.load(stats + 1, mask, 0.0)
+    )
+    d_m, d_s = _merge(
+        tl.load(stats + 3, mask, -float("inf")), tl.load(stats + 4, mask, 0.0)
+    )
+    p_x = tl.exp(tl.max(tl.load(stats + 2, mask, -float("inf")), 1) - t_m) / t_s
+    q_x = tl.exp(tl.max(tl.load(stats + 5, mask, -float("inf")), 1) - d_m) / d_s
+    u, _, _, _ = _philox(KEY, slot, b, _ACCEPT_STEP, OFFSET)
+    ok = (q_x > 0.0) & (tl.uint_to_uniform_float(u) * q_x < p_x)
+    accepted = tl.min(tl.where((slot < SLOTS - 1) & ~ok, slot, SLOTS - 1), 0)
+    capped = accepted
+    if HAS_CUTOFF:
+        capped = tl.minimum(accepted, tl.load(VERIFY_LENS + b).to(tl.int32) - 1)
+    if part == 0:
+        # A trimmed chain ends on its accepted draft token, not on a draw.
+        fixed = tl.load(CAND + b * SLOTS + capped + 1, capped < accepted, -1)
+        tl.store(LENS + b, capped)
+        tl.store(LENS + BS + b, accepted - capped)
+        tl.store(LENS + 2 * BS + b, fixed.to(tl.int32))
+
+    at = slot == accepted
+    t_m, t_s = tl.sum(tl.where(at, t_m, 0.0), 0), tl.sum(tl.where(at, t_s, 0.0), 0)
+    d_m, d_s = tl.sum(tl.where(at, d_m, 0.0), 0), tl.sum(tl.where(at, d_s, 0.0), 0)
+    residual = accepted < SLOTS - 1
     j = part * BLOCK + tl.arange(0, BLOCK)
     valid = j < WIDTH
-    norm = NORM + r * 4
-    inv_tt = 1.0 / tl.maximum(tl.load(TARGET_T + b).to(tl.float32), 1e-5)
-    t_ptr = TARGET + r.to(tl.int64) * TARGET_S + VOCAB_START + j
-    t = tl.load(t_ptr, valid, -float("inf")).to(tl.float32)
-    p = tl.exp(t * inv_tt - tl.load(norm)) / tl.load(norm + 1)
-    inv_dt = 1.0 / tl.maximum(tl.load(DRAFT_T + b).to(tl.float32), 1e-5)
-    d_ptr = DRAFT + (b * GAMMA + i).to(tl.int64) * DRAFT_S + j
-    d = tl.load(d_ptr, valid & residual, -float("inf")).to(tl.float32) * inv_dt
-    q = tl.exp(d - tl.load(norm + 2)) / tl.load(norm + 3)
-    q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
+    inv_t = 1.0 / tl.maximum(tl.load(TEMP + b), 1e-5)
+    t_row = TARGET + (b * SLOTS + accepted).to(tl.int64) * TARGET_S + START
+    t = tl.load(t_row + j, valid, -float("inf")).to(tl.float32)
+    d_row = DRAFT + (b * GAMMA + accepted).to(tl.int64) * PADDED
+    d = tl.load(d_row + j, valid & residual, -float("inf")).to(tl.float32)
+    p = tl.exp(t * inv_t - t_m) / t_s
+    q = tl.exp(d * inv_t - d_m) / d_s
     mass = tl.where(residual, tl.maximum(p - q, 0.0), p)
-    # One Philox call yields four words; word k goes to token 4 * q + k.
-    quad = (part * BLOCK + VOCAB_START) // 4 + tl.arange(0, BLOCK // 4)
-    lane = tl.zeros([BLOCK // 4], tl.int64)
-    w0, w1, w2, w3 = tl.philox(
-        KEY,
-        quad.to(tl.uint32),
-        (lane + b).to(tl.uint32),
-        (lane + STEP).to(tl.uint32),
-        ((lane + tl.load(OFFSET)) & 0xFFFFFFFF).to(tl.uint32),
-        PHILOX_ROUNDS,
-    )
+    # Word k of a Philox call goes to token 4 * quad + k, keyed by global ids.
+    quad = (part * BLOCK + START) // 4 + tl.arange(0, BLOCK // 4)
+    w0, w1, w2, w3 = _philox(KEY, quad, b, _BONUS_STEP, OFFSET)
     bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
-    exp_noise = -libdevice.log1p(-((bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE))
-    live = valid & (mass > 0.0)
-    key = tl.where(live, tl.log(mass) - tl.log(exp_noise), -float("inf"))
+    # Uniform in (0, 1]: a zero word would give zero noise and win outright.
+    noise = -libdevice.log1p(-(bits.to(tl.float32) + 0.5) * 2.3283064365386963e-10)
+    key = tl.where(valid & (mass > 0.0), tl.log(mass) - tl.log(noise), -float("inf"))
     top = tl.max(key, 0)
-    idx = tl.min(tl.where(valid & (key == top), j + VOCAB_START, _NO_INDEX), 0)
-    tl.store(P + (b * PARTS + part) * 2, top)
-    tl.store(P + (b * PARTS + part) * 2 + 1, idx.to(tl.float32, bitcast=True))
+    # 0x7FFFFFFF is the finish kernel's "no candidate", for an all-padding block.
+    idx = tl.min(tl.where(valid & (key == top), j + START, 0x7FFFFFFF), 0)
+    tl.store(PARTIAL + (b * PARTS + part) * 2, top)
+    tl.store(PARTIAL + (b * PARTS + part) * 2 + 1, idx.to(tl.float32, bitcast=True))
 
 
 def accept_sampling_sharded(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
-    target_temperatures: torch.Tensor,
     draft_logits: torch.Tensor,
-    draft_temperatures: torch.Tensor,
+    temperatures: torch.Tensor,
     vocab_start: int,
     width: int,
     gather_stacked: Callable[[torch.Tensor], torch.Tensor],
@@ -267,92 +206,66 @@ def accept_sampling_sharded(
     target_logits  [bs * slots, vocab], whole on every rank
     draft_logits   [bs, gamma, padded]: this rank's vocab columns
                    [vocab_start, vocab_start + width), then padding
+    temperatures   [bs] float32 sampling temperatures
     key, offset    the draft's Philox key and its block counter
     """
     bs, slots = candidates.shape
     _, gamma, padded = draft_logits.shape
-    assert slots - 1 <= gamma
-    assert target_logits.shape[0] == bs * slots and target_logits.stride(1) == 1
-    assert draft_logits.is_contiguous() and candidates.stride(1) == 1
+    assert slots - 1 <= gamma and target_logits.stride(1) == 1
+    assert candidates.is_contiguous() and draft_logits.is_contiguous()
     # Philox words go to tokens in quads of global ids.
     assert vocab_start % 4 == 0, vocab_start
-    rows = bs * slots
     device = candidates.device
+    parts = triton.cdiv(padded, _BLOCK)
 
-    stats = torch.empty((rows, _STATS), dtype=torch.float32, device=device)
-    _row_stats_kernel[(rows,)](
+    stats = torch.empty((bs * slots, 6), dtype=torch.float32, device=device)
+    _stats_kernel[(bs * slots,)](
         target_logits,
         draft_logits,
         candidates,
-        target_temperatures,
-        draft_temperatures,
+        temperatures,
         stats,
         target_logits.stride(0),
-        draft_logits.stride(1),
-        candidates.stride(0),
-        width,
         vocab_start,
+        width,
+        padded,
         slots,
         gamma,
         _BLOCK,
         num_warps=8,
     )
     stats = gather_stacked(stats)
-    world = stats.shape[0] // rows
+    world = stats.shape[0] // (bs * slots)
 
-    norm = torch.empty((rows, 4), dtype=torch.float32, device=device)
-    correct_len = torch.empty((bs,), dtype=torch.int32, device=device)
-    cap_trim_lens = torch.empty_like(correct_len)
-    fixed_bonus = torch.empty((bs,), dtype=torch.int64, device=device)
-    bonus_row = torch.empty_like(correct_len)
-    _accept_kernel[(bs,)](
+    lens = torch.empty((3, bs), dtype=torch.int32, device=device)
+    partial = torch.empty((bs, parts * 2), dtype=torch.float32, device=device)
+    _accept_kernel[(bs, parts)](
         stats,
-        candidates,
-        correct_len if verify_lens is None else verify_lens,
-        offset,
-        norm,
-        correct_len,
-        cap_trim_lens,
-        fixed_bonus,
-        bonus_row,
-        candidates.stride(0),
-        rows,
-        key,
-        slots,
-        triton.next_power_of_2(slots),
-        world,
-        triton.next_power_of_2(world),
-        _ACCEPT_STEP,
-        verify_lens is not None,
-        _PHILOX_ROUNDS,
-        num_warps=1,
-    )
-
-    parts = triton.cdiv(padded, _BLOCK)
-    partial = torch.empty((bs, parts, 2), dtype=torch.float32, device=device)
-    _bonus_partial_kernel[(bs, parts)](
         target_logits,
         draft_logits,
-        target_temperatures,
-        draft_temperatures,
-        norm,
-        bonus_row,
-        offset,
-        partial,
-        parts,
+        candidates,
+        temperatures,
+        lens if verify_lens is None else verify_lens,  # unread without a cutoff
         key,
+        offset,
+        lens,
+        partial,
+        bs,
         target_logits.stride(0),
-        draft_logits.stride(1),
-        width,
         vocab_start,
+        width,
+        padded,
+        parts,
         slots,
+        triton.next_power_of_2(slots),
         gamma,
-        _BONUS_STEP,
+        world,
+        triton.next_power_of_2(world),
+        verify_lens is not None,
         _BLOCK,
-        _PHILOX_ROUNDS,
         num_warps=8,
     )
-    gathered = gather_stacked(partial.view(bs, parts * 2))
+    gathered = gather_stacked(partial)
     drawn = torch.empty((bs,), dtype=torch.int64, device=device)
     _markov_sample_finish_kernel[(bs,)](
         gathered,
@@ -363,4 +276,5 @@ def accept_sampling_sharded(
         triton.next_power_of_2(parts * world),
         num_warps=4,
     )
-    return correct_len, torch.where(fixed_bonus >= 0, fixed_bonus, drawn), cap_trim_lens
+    correct_len, cap_trim_lens, fixed = lens
+    return correct_len, torch.where(fixed >= 0, fixed.long(), drawn), cap_trim_lens
