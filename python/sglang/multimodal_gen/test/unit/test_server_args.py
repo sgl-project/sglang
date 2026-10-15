@@ -402,10 +402,16 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
 
         self.assertFalse(args.is_component_attention_backend_automatic("text_encoder"))
 
-    def _fasth3_args(self, capability=(9, 0), **kwargs):
-        with patch(
-            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_capability",
-            return_value=DeviceCapability(*capability),
+    def _fasth3_args(self, capability=(9, 0), cuda=True, **kwargs):
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
+                return_value=cuda,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_capability",
+                return_value=DeviceCapability(*capability),
+            ),
         ):
             return _from_dict_without_model_resolution(
                 {"model_path": "FastVideo/FastVideo-FastH3-8-Step-V2", **kwargs},
@@ -441,6 +447,11 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
                 self.assertFalse(
                     args.is_component_attention_backend_automatic("transformer")
                 )
+
+    def test_fasth3_keeps_dense_attention_off_cuda(self):
+        args = self._fasth3_args((9, 0), cuda=False)
+        self.assertEqual(args.component_attention_backends, {})
+        self.assertFalse(args.is_component_attention_backend_automatic("transformer"))
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
