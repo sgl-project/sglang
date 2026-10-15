@@ -758,9 +758,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
 class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
     @staticmethod
-    def _runner(counter, is_full_backend=True):
+    def _runner(counter, waits_for_whole_load=True):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner._is_full_backend = is_full_backend
+        runner._waits_for_whole_load = waits_for_whole_load
         runner.model_runner = SimpleNamespace(
             token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
         )
@@ -792,12 +792,37 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         counter = LayerWiseLoadCounter(num_layers=3)
         counter.set_consumer(counter.update_producer())
         waiter = threading.Thread(
-            target=self._runner(counter, is_full_backend=False)._wait_for_layer_loads,
+            target=self._runner(
+                counter, waits_for_whole_load=False
+            )._wait_for_layer_loads,
             daemon=True,
         )
         waiter.start()
         waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
+
+    def test_breakable_replay_waits_when_it_captures_state_reads(self):
+        """A breakable graph that reads layer state inside a captured segment never
+        runs that layer's load wait, so it must wait for the whole load like Full."""
+        full = runner_module.FullCudaGraphBackend.__new__(
+            runner_module.FullCudaGraphBackend
+        )
+        breakable = runner_module.BreakableCudaGraphBackend.__new__(
+            runner_module.BreakableCudaGraphBackend
+        )
+        for backend, captures, expected in (
+            (full, False, True),
+            (breakable, False, False),
+            (breakable, True, True),
+        ):
+            attn_backend = SimpleNamespace(
+                breakable_graph_reads_captured_state=captures
+            )
+            with self.subTest(backend=type(backend).__name__, captures=captures):
+                self.assertEqual(
+                    runner_module._replay_waits_for_whole_load(backend, attn_backend),
+                    expected,
+                )
 
 
 if __name__ == "__main__":
