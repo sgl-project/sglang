@@ -46,6 +46,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     BLOCKS,
     HEAD_DIM,
     HIDDEN,
+    LOCAL_INDEX_HEADS,
     LOCAL_KV_HEADS,
     LOCAL_Q_HEADS,
     MAX_QKV_ROWS,
@@ -54,6 +55,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     ROTARY_DIM,
     SPARSE_BLOCK,
     THREADS,
+    TOTAL_INDEX_HEADS,
     TP,
     WAVES,
     IndexHeads,
@@ -98,20 +100,33 @@ KV_PAGE_BYTES = LOCAL_KV_HEADS * PAGE_BYTES
 BLOCK_PAGES = SPARSE_BLOCK // PAGE16
 # GEMV tasks, head tasks (every token of a head on one CTA) and the tokens' norm
 # tasks each own a CTA, in this order; a head CTA's half waves hold the tokens.
-# The rank's own rows (q | k | v | its index q | index k) are the first ONE_GEMV
-# tasks under indexer context parallelism too, and its other index q heads' the
-# OTHER_GEMV after the norm tasks, run only in a step that needs them: the CTA
-# layout of a step without long requests is the one-head build's.
+# The rank's own rows (q | k | v | ONE index q | index k) are the first ONE_GEMV
+# tasks in every mode, and the remaining index q heads' the OTHER_GEMV after the
+# norm tasks.
+#
+# When those extra CTAs run differs by mode, and getting it wrong deadlocks:
+#   * CP defers them to a step with a long request -- the only step that reads
+#     the other heads -- so a short step keeps the one-head build's CTA layout.
+#   * Own mode reads every one of the rank's heads in EVERY step (split pass h
+#     selects with head h), so they always run. Gating them on long_step() there
+#     leaves head 1's rows unwritten and every CTA spinning in index_q_row's
+#     unbounded poll: measured as a TP2 hang holding both GPUs at 100%.
 #
 # Sequential task folding: a CTA runs TASKS_PER_CTA row groups in turn. At TP2
 # a rank's projection is 4864 rows = 304 tasks, and 304 + 38 head + 16 norm +
-# 8 other would need 366 CTAs against the 256 the kernel co-schedules, so the
+# 24 other would need 382 CTAs against the 256 the kernel co-schedules, so the
 # unfolded build fails this assert at import. Folding two tasks per CTA gives
-# 152 + 38 + 16 + 8 = 214. TP4 folds by 1 and is unchanged (220).
+# 152 + 38 + 16 + 24 = 230. TP4 folds by 1 and is unchanged (220).
 TASKS_PER_CTA = 2 if TP == 2 else 1
 ONE_GEMV = qkv_rows(1) // ROWS_PER_TASK
 ONE_GEMV_CTAS = (ONE_GEMV + TASKS_PER_CTA - 1) // TASKS_PER_CTA
-OTHER_GEMV = (TP - 1) * HEAD_ROW_GROUPS
+# Budget the larger mode: CP projects TOTAL_INDEX_HEADS, own mode the rank's
+# LOCAL_INDEX_HEADS, one of them already in ONE_GEMV. The kernel bounds the
+# ACTIVE range by heads.count instead -- a CTA past the mode's head count would
+# project a head the fused projection does not have. At TP4 this is the original
+# (TP - 1) * HEAD_ROW_GROUPS, since TP there equals TOTAL_INDEX_HEADS.
+OTHER_HEADS = max(TOTAL_INDEX_HEADS, LOCAL_INDEX_HEADS) - 1
+OTHER_GEMV = OTHER_HEADS * HEAD_ROW_GROUPS
 HT0 = ONE_GEMV_CTAS
 NT0 = HT0 + N_HEAD_TASKS
 XT0 = NT0 + MAX_TOKENS
@@ -377,13 +392,16 @@ def emit_pre_attn(
     other_rg = fx.Int32(0)
     if const_expr(heads.count > 1):
         xt = bid - XT0
-        if (xt >= 0) & (xt < OTHER_GEMV):
+        # this mode's head count, not the budgeted maximum
+        if (xt >= 0) & (xt < (heads.count - 1) * HEAD_ROW_GROUPS):
             other = xt // HEAD_ROW_GROUPS  # the other heads in head order, own skipped
             head = other + (other >= heads.own).select(1, 0)
             other_rg = (
                 LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS + head
             ) * HEAD_ROW_GROUPS + xt % HEAD_ROW_GROUPS
-            is_other_gemv = long_step()
+            # Own mode reads every head every step; only CP can defer these to
+            # the steps with a long request. See the CTA layout note above.
+            is_other_gemv = long_step() if heads.cp else True
     gemv = is_primary_gemv | is_other_gemv
     if gemv:
         if const_expr(tokens <= 2):

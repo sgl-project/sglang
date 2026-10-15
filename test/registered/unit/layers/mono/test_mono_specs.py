@@ -86,7 +86,13 @@ class TestSpecs(CustomTestCase):
         dense3 = types.SimpleNamespace(**vars(M3), moe_layer_freq=[0] * 3 + [1] * 57)
         self.assertEqual(set(self.m3.layers(M3).values()), {LayerMode.WHOLE})
         self.assertEqual(sorted(self.m3.layers(dense3)), list(range(3, 60)))
-        self.assertEqual(max(self.m3.widths), 16)
+        # The widest step is the LDS budget's, which scales with TP (config's
+        # MAX_WIDTH): 16 at the TP4 these tests import under, 12 at TP2.
+        from sglang.kernels.ops.mono.gfx950.minimax_m3.config import TP, MAX_WIDTH
+
+        self.assertEqual(max(self.m3.widths), MAX_WIDTH)
+        if TP == 4:
+            self.assertEqual(max(self.m3.widths), 16)
         self.assertEqual(
             routing.decide_for_batch(self.m3, ctx(), batch("verify", 48)).reason,
             "width",

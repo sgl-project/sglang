@@ -12,6 +12,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     HEAD_DIM,
     HIDDEN,
     INTER,
+    LOCAL_INDEX_HEADS,
     LOCAL_KV_HEADS,
     LOCAL_Q_HEADS,
     MAX_INDEX_BLOCKS,
@@ -23,6 +24,8 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     SPARSE_BLOCK,
     TOP_K,
     TOPK_BLOCKS,
+    TOTAL_INDEX_HEADS,
+    TP,
     WAVES,
 )
 
@@ -56,6 +59,16 @@ assert H_SUB <= 16, f"GQA group {H_SUB} exceeds the split stage's 16-row thread 
 # means stepping over every head, and KV head h of page p starts at
 # (p * LOCAL_KV_HEADS + h) * PAGE_BYTES.
 KV_PAGE_BYTES = LOCAL_KV_HEADS * PAGE16 * HEAD_DIM
+
+# A token's indexer score region, sized for whichever mode needs more: own mode
+# gives each of the rank's heads every block, CP gives all TOTAL_INDEX_HEADS a
+# 1/TP stripe each. The two are equal wherever a rank has one index head, so
+# TP4 and TP8 keep the original MAX_INDEX_BLOCKS; TP2 doubles it. Scratch is
+# global memory, not LDS -- this does not touch the 160 KB budget.
+ISCORE_BLOCKS = max(
+    LOCAL_INDEX_HEADS * MAX_INDEX_BLOCKS,
+    TOTAL_INDEX_HEADS * (MAX_INDEX_BLOCKS // TP),
+)
 O_ROWS = 32  # hidden rows per o_proj / attention-reduce task
 # from this many tokens the attention all-reduce is a reduce-scatter to the row
 # group's owner rank (t % npes) plus an all-gather of the sums: half the bytes over
@@ -93,8 +106,9 @@ SEL_LONG_PAIRS = N_SPLIT * TOPK_BLOCKS * 2
 # every region holds MAX_TOKENS rows (token k at k * the one-token size)
 SCRATCH = _layout(
     [
-        # indexer block scores, token k's block b at pair k * MAX_INDEX_BLOCKS + b
-        ("iscore", MAX_INDEX_BLOCKS * MAX_TOKENS),
+        # indexer block scores, token k's head h block b at pair
+        # k * ISCORE_BLOCKS + h * heads.score_blocks + b (``IndexHeads``)
+        ("iscore", ISCORE_BLOCKS * MAX_TOKENS),
         ("sp_o", N_SPLIT * H * HEAD_DIM // 2 * MAX_TOKENS),  # packed bf16 pairs
         ("sp_m", N_SPLIT * H * MAX_TOKENS),
         ("sp_l", N_SPLIT * H * MAX_TOKENS),
@@ -108,9 +122,16 @@ SCRATCH = _layout(
         # per expert (routing key, sigmoid) pairs, see route_key
         ("scores", 2 * N_ROUTED * MAX_TOKENS * SCORE_COPIES),
         ("mid", MOE_SLOTS * INTER * MAX_TOKENS),
-        # token k's split task p's candidates: rank r at pairs 2 ((k N_SPLIT + p)
-        # TOPK_BLOCKS + r) + (0 key, 1 block)
-        ("sel_long", SEL_LONG_PAIRS * MAX_TOKENS),
+        # token k's split task p's candidates for index head h: rank r at pairs
+        # 2 (((h MAX_TOKENS + k) N_SPLIT + p) TOPK_BLOCKS + r) + (0 key, 1 block)
+        #
+        # The head term is load-bearing in own mode. A share's candidates are
+        # gathered ACROSS CTAs -- every split task polls every other task's
+        # entries -- and the mailbox tag is the step's, the same for both passes.
+        # Without a per-head range a CTA entering pass 1 would overwrite slots a
+        # slower peer is still reading for pass 0. LOCAL_INDEX_HEADS is 1 at TP4
+        # and TP8, where this is the original size.
+        ("sel_long", SEL_LONG_PAIRS * MAX_TOKENS * LOCAL_INDEX_HEADS),
         # wide: the MXFP8 xn and scales as plain words (every token's row), and a
         # done flag per router task
         ("xn8p", HIDDEN // 4 * MAX_TOKENS // 2),

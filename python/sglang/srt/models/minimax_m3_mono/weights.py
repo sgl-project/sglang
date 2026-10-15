@@ -155,7 +155,11 @@ class SparseMoeLayer(msgspec.Struct, frozen=True):
     def from_layer(
         layer, layer_id: int, heads: IndexHeads, cos_sin_tables: dict
     ) -> SparseMoeLayer:
-        _need(heads.count == 1, "indexer context parallelism is not ported")
+        # Own mode holds the rank's own index heads -- one per KV head, each
+        # selecting for the head it pairs with -- at any count. Context
+        # parallelism still divides and strides by TP where it means "index
+        # heads", so it is TP4-only and stays refused.
+        _need(not heads.cp, "indexer context parallelism is not ported")
         attn = layer.self_attn
         _need(
             layer.is_layer_sparse and attn.is_sparse_attention_layer,

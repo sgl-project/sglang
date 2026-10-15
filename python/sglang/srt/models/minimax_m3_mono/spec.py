@@ -37,6 +37,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     LOCAL_Q_HEADS,
     MAX_INDEX_BLOCKS,
     MAX_TOKENS,
+    MAX_WIDTH,
     N_ROUTED,
     ONE_INDEX_HEAD,
     SPARSE_BLOCK,
@@ -523,7 +524,7 @@ MONO_SPEC = MonoSpec(
         "MiniMaxM3SparseForConditionalGeneration",
     ),
     layers=layers,
-    widths=tuple(range(1, MAX_TOKENS + 1)),
+    widths=tuple(range(1, MAX_WIDTH + 1)),
     supports=frozenset(
         {Feature.SPEC_VERIFY, Feature.HIERARCHICAL_CACHE, Feature.EAGER}
     ),

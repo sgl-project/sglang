@@ -79,6 +79,38 @@ MAX_INDEX_BLOCKS = MAX_CONTEXT // SPARSE_BLOCK
 PAGE16 = 16
 
 MAX_TOKENS = 16  # tokens one mono step serves (the MFMA B operand holds 16)
+
+# The widest step the 160 KB LDS budget admits at this TP. The budget scales
+# with H (TOTAL_Q_HEADS // TP) and INTER (TOTAL_INTER // TP), so a *smaller* TP
+# buys *fewer* tokens per step: TP2 carries 32 q heads and INTER 1536 against
+# TP4's 16 and 768.
+#
+# TP2 measured by COMPILE_ONLY builds of the own-mode kernel (ih2): S = 13 and
+# S = 14 compile clean, S = 15 reports local memory 172,960 and S = 16 182,304,
+# against the 163,840 limit. The cap is 12, well inside that, for margin and
+# because the MoE down stage -- the second overflow carrier, which scales with
+# INTER rather than H -- stays out of the binding budget there.
+#
+# Do NOT take these from tools/lds_budget_pr44319.py: that mirror models
+# count = 1 and is low by 256 B per token in own mode, where qs collapses to a
+# single row and K1's index q moves to the pool. It predicted S = 14 to
+# overflow; the compiler says it fits.
+#
+# A step wider than this routes to the modules (srt/layers/mono/routing.py),
+# which is the existing supported fallback rather than a failure. The LDS
+# overflow it avoids is a NON-RAISING compiler diagnostic, so an uncapped TP2
+# build would silently produce over-budget kernels.
+_LDS_MAX_WIDTH = {2: 12}.get(TP, MAX_TOKENS)
+# Test hook (RFC #43949 decision 1 permits the SGLANG_TEST_MONO_ prefix), not a
+# user knob: every declared width is JIT-built during eager warm-up, and one
+# build takes minutes, so a GPU correctness check that only needs a couple of
+# widths would otherwise spend an hour compiling ones it never exercises. It can
+# only narrow the range -- it is clamped to the LDS-safe cap above.
+MAX_WIDTH = min(
+    int(os.environ.get("SGLANG_TEST_MONO_MAX_WIDTH", _LDS_MAX_WIDTH)),
+    _LDS_MAX_WIDTH,
+)
+assert MAX_WIDTH >= 1, "SGLANG_TEST_MONO_MAX_WIDTH must leave at least one width"
 # indexer context parallelism: a rank computes every index q head
 MAX_QKV_ROWS = qkv_rows(TP)
 # indexer context parallelism serves a request past this many index blocks: its
@@ -89,32 +121,52 @@ INDEX_CP_FROM_BLOCKS = 288
 
 @dataclass(frozen=True)
 class IndexHeads:
-    """The index q heads in a rank's fused projection, a build parameter:
-    ``count`` of them (``LOCAL_INDEX_HEADS``, or all TP in head order under
-    indexer context parallelism) and ``own``, the one this rank's selection
-    scores.
+    """The index q heads in a rank's fused projection, a build parameter.
 
-    WARNING -- unresolved at TP != 4. ``count > 1`` is currently also the
-    switch that selects the indexer-context-parallel path
-    (``index_score.py:107,154``, ``post_attn.py:639``), whose meaning is "all
-    ranks' heads in head order, rank r scoring head r". At TP2 SGLang instead
-    gives a rank its OWN contiguous pair (``idx_head_rank == rank``,
-    ``num_idx_heads=2``, probed against the checkpoint). The counts coincide at
-    2 and the semantics do not, so ``count=2`` here compiles but does NOT yet
-    mean what TP2 needs. Separating "my own heads" from "CP over all heads"
-    into an explicit mode is required before any TP2 number is trustworthy.
+    Two modes, which must not be inferred from ``count`` -- at TP2 they have
+    the same count and different meanings:
+
+    * **own** (``cp=False``): the rank's own ``LOCAL_INDEX_HEADS`` heads, each
+      scoring every block for the KV head it pairs with. The model gives a rank
+      as many index heads as KV heads (``num_idx_heads == num_kv_heads``,
+      probed: 1/1 at TP4, 2/2 at TP2), so index head h selects for KV head h
+      and the split stage's pass h reads its blocks.
+    * **cp** (``cp=True``): indexer context parallelism -- all
+      ``TOTAL_INDEX_HEADS`` in head order, a rank scoring only its own 1/TP
+      stripe of blocks (``own``) and exchanging candidates with its peers.
+
+    ``count > 1`` used to select CP on its own, which is why TP2 was refused:
+    its own pair is not context parallelism.
     """
 
     count: int = LOCAL_INDEX_HEADS
     own: int = 0
+    cp: bool = False
 
     def __post_init__(self):
-        assert self.count in (1, TP, LOCAL_INDEX_HEADS)
+        want = TOTAL_INDEX_HEADS if self.cp else LOCAL_INDEX_HEADS
+        assert self.count == want, (
+            f"{'cp' if self.cp else 'own'} mode takes {want} index heads, "
+            f"got {self.count}"
+        )
         assert 0 <= self.own < max(self.count, 1)
 
     @property
     def rows(self) -> int:
         return qkv_rows(self.count)
+
+    @property
+    def score_blocks(self) -> int:
+        """Blocks one head's score region holds. Under CP a rank scores only
+        its 1/TP stripe; in own mode a head scores every block."""
+        return MAX_INDEX_BLOCKS // TP if self.cp else MAX_INDEX_BLOCKS
+
+    @property
+    def score_words(self) -> int:
+        """A token's whole score region, every head. Equal to MAX_INDEX_BLOCKS
+        in both modes wherever a rank has one index head, which is why TP4 and
+        TP8 see no change: CP spreads TOTAL heads over 1/TP blocks each."""
+        return self.count * self.score_blocks
 
     @property
     def iq_off(self) -> int:

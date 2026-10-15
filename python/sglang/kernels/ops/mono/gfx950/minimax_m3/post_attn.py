@@ -91,6 +91,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     HIDDEN,
     INDEX_CP_FROM_BLOCKS,
     INTER,
+    LOCAL_KV_HEADS,
     MAX_INDEX_BLOCKS,
     MAX_TOKENS,
     MOE_SLOTS,
@@ -115,6 +116,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.index_score import (
 from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     AG_RS_FROM,
     DN_ROWS,
+    ISCORE_BLOCKS,
     MID_ROW,
     MIDSC_ROW,
     N_DN,
@@ -211,7 +213,8 @@ assert N_SPLIT * THREADS * CAND_BATCH >= MAX_INDEX_BLOCKS
 # selection still divides and strides by TP where it means "index heads"
 # (`MAX_INDEX_BLOCKS // TP`, `b // TP`, `own0 + TP * j`, here and in
 # index_score.py), which is wrong at TP != 4. CP is only reached when
-# heads.count > 1, so a count == 1 build is unaffected by that.
+# `heads.cp`, so an own-mode build is unaffected by that -- including TP2's,
+# whose two index heads are its own pair and not context parallelism.
 assert N_SPLIT == 2 * TOTAL_INDEX_HEADS
 assert N_SPLIT * TOPK_BLOCKS <= INDEX_CP_FROM_BLOCKS <= THREADS
 assert MAX_TOKENS <= SPARSE_BLOCK
@@ -289,7 +292,11 @@ def build_post_attn_kernel(
     # the JIT cache key holds the kernel's scalar closure values, not objects: the
     # index heads go in as ints (a shared cache otherwise serves one rank's build
     # to every rank)
-    ih_count, ih_own = heads.count, heads.own
+    ih_count, ih_own, ih_cp = heads.count, heads.own, heads.cp
+    # scored heads of the rank's own index heads, 1 unless own mode holds several
+    # (TP2). Under CP the several heads go through the CP path instead.
+    OWN_HEADS = 1 if ih_cp else ih_count  # noqa: N806
+    SCORE_BLOCKS = heads.score_blocks  # noqa: N806
     # with every index head: K1's index q of every head (qs) after its x8 rows in
     # the pool (K1 is done with the pool before K4's stages use it)
     QS_CP = tokens * HIDDEN // 4
@@ -466,7 +473,7 @@ def build_post_attn_kernel(
         emit_k1(
             tid, bid, lane, wave, xs, red, qs_k1, step, layer,
             eps, index_scale_log2e(sm_scale), tokens, q_len, init_blocks,
-            local_blocks, IndexHeads(ih_count, ih_own),
+            local_blocks, IndexHeads(ih_count, ih_own, ih_cp),
             (
                 ar_in, res, h_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin,
                 positions, slot_mapping, k_cache, v_cache, k_scale, v_scale,
@@ -486,7 +493,7 @@ def build_post_attn_kernel(
         # a graph's pad rows carry seq_len 0 and an all-zero block-table row: as one
         # key of page 0 they stay finite and select a real page
         seq_lens_k, n_blks, long_rows = step_rows(
-            seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own)
+            seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own, ih_cp)
         )
         # Up to TOPK_BLOCKS blocks the top-k keeps every block and the scores would
         # only order them. The original selector's own contract calls either order
@@ -608,7 +615,7 @@ def build_post_attn_kernel(
             )
             return sel, slot, n_ctx
 
-        def select_blocks(k, t):
+        def select_blocks(k, t, head=0):
             """blk[0:16] := the pages of selection slots 2t, 2t+1 and blk[16] := the
             sparse context length, exactly as the unfused selector emits them: top
             TOPK_BLOCKS by (score, block id) descending with the init blocks pinned
@@ -616,8 +623,12 @@ def build_post_attn_kernel(
             tail block (the one holding the current token) last. A block's slot
             follows from its rank, the count of blocks that beat it. k: token.
             For a long request ``stage_select_long`` left blk: a one-block
-            stand-in is ranked, placing nothing."""
-            iscore = mb("iscore") + fx.Int64(k) * (MAX_INDEX_BLOCKS * 8)
+            stand-in is ranked, placing nothing. ``head``: the index head whose
+            scores rank the blocks -- own mode's pass h selects for KV head h.
+            One head leaves the offset 0, the original flat region."""
+            iscore = mb("iscore") + fx.Int64(k) * (ISCORE_BLOCKS * 8)
+            if head:  # a Python constant: head 0 emits no offset at all
+                iscore = iscore + fx.Int64(head * SCORE_BLOCKS * 8)
             short = ~pick(long_rows, k)
             n_blk = short.select(pick(n_blks, k), fx.Int32(1))
             seq_len = pick(seq_lens_k, k)
@@ -638,7 +649,7 @@ def build_post_attn_kernel(
                 fx.ptr_store(n_ctx, blk + 16)
             gpu.barrier()
 
-        def select_long(k, part):
+        def select_long(k, part, head=0):
             """Split task (k, part) of a long request's token, before the
             split stage. Its share of the blocks (a thread keys CAND_BATCH) -> each
             wave's TOPK_BLOCKS best -> the CTA's, to a candidate mailbox; then the
@@ -649,11 +660,15 @@ def build_post_attn_kernel(
             part % 2 of this rank's blocks, to the head's rank's sel_cp -- the
             shares its own head's candidates come in."""
             n_blk = pick(n_blks, k)
-            iscore = mb("iscore") + fx.Int64(k) * (MAX_INDEX_BLOCKS * 8)
-            first = k * (N_SPLIT * TOPK_BLOCKS)  # token k's candidates (pair pairs)
+            iscore = mb("iscore") + fx.Int64(k) * (ISCORE_BLOCKS * 8)
+            if head:  # a Python constant: head 0 emits no offset at all
+                iscore = iscore + fx.Int64(head * SCORE_BLOCKS * 8)
+            # token k's candidates (pair pairs), in head ``head``'s range -- the
+            # gather is cross-CTA and the tag does not distinguish the passes
+            first = (head * MAX_TOKENS + k) * (N_SPLIT * TOPK_BLOCKS)
             if tid == 0:
                 fx.ptr_store(fx.Int32(0), blk + 17)
-            if const_expr(ih_count > 1):
+            if const_expr(ih_cp):
                 own0 = init_blocks + (ih_own - init_blocks) % TP  # this rank's first
                 n_own = (n_blk - own0 + TP - 1) // TP
                 # the last scored one: the local blocks' slots hold no score
@@ -664,7 +679,7 @@ def build_post_attn_kernel(
                 js = [lo + tid + THREADS * i for i in range(CAND_BATCH)]
                 blocks = [own0 + TP * j for j in js]
                 live = [j < hi for j in js]
-                src = iscore + fx.Int64(part // 2) * (MAX_INDEX_BLOCKS // TP * 8)
+                src = iscore + fx.Int64(part // 2) * (SCORE_BLOCKS * 8)
                 slots = [fx.min(b, last) // TP for b in blocks]
                 out, out_slot = sy(peer_addr(part // 2), "sel_cp"), 2 * rank
                 out_slot = out_slot + part % 2
@@ -730,7 +745,13 @@ def build_post_attn_kernel(
             """The split tasks of a long request's token select before the
             split stage (``select_long``), each leaving its blk for its split task
             (a CTA runs at most one). Out of the split stage and cold: inline
-            there, this code slows the split for every context."""
+            there, this code slows the split for every context.
+
+            Only with one KV head. Several passes each need their own head's
+            blocks and there is one ``blk``, so they select inside the split
+            stage instead -- see ``stage_split``."""
+            if const_expr(SPLIT_PASSES > 1):
+                return
             ts = start("split")
             k = ts // N_SPLIT
             if unlikely((ts < N_SPLIT * tokens) & pick(long_rows, k)):
@@ -739,92 +760,61 @@ def build_post_attn_kernel(
         # Each stage is its own function: flydsl carries a local reassigned inside a
         # dynamic if / for as region state, so names must not be shared across stages.
         # ============================================================ 1. split
+        # K1 done flags a split task waits on: this token's H q heads, then every
+        # token's KV_TASKS new K / V heads. One wave polls them, a flag a lane,
+        # so a build needs ceil(total / 64) rounds -- 1 at TP4 (16 + 2 * 16 = 48
+        # of 64, the original single round) and 2 at TP2, where H alone is 32 and
+        # the four K / V tasks a token put width 12 at 80.
+        KV_TASKS = 2 * LOCAL_KV_HEADS  # noqa: N806
+        POLLS_PER_LANE = -(-(H + KV_TASKS * tokens) // 64)  # noqa: N806
+
+        def hdone_flag(tok, j):
+            """Flag j of the split task's wait list. Past the list's end the
+            index is clamped onto the last token's, which is already in it."""
+            kv = j - H
+            return (j < H).select(
+                tok * K1_HEAD_TASKS + j,
+                fx.min(kv // KV_TASKS, tokens - 1) * K1_HEAD_TASKS
+                + H
+                + kv % KV_TASKS,
+            )
+
         def stage_split():
             r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
             PPW = SPLIT_KEYS // WAVES // PAGE16  # pages per wave
-            for ts in range(start("split"), N_SPLIT * tokens, G):
-                ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
-                tok = ts // N_SPLIT
-                t = ts % N_SPLIT
-                select_blocks(tok, t)
-                # this token's q heads and every token's new K / V: a request's
-                # tokens of one step (speculative decode) attend to each other's
-                if wave == 0:
-                    kv = lane - H
-                    k1_poll(
-                        [
-                            (
-                                hdone_mb,
-                                (lane < H).select(
-                                    tok * K1_HEAD_TASKS + lane,
-                                    fx.min(kv // 2, tokens - 1) * K1_HEAD_TASKS
-                                    + H
-                                    + kv % 2,
-                                ),
-                                1,
-                            )
-                        ]
-                    )
-                gpu.barrier()
-                acquire()
-                # Every independent load goes out first: this wave's pages and q.
-                # Pages past the context read junk masked below.
+
+            def read_blk():
+                """The current selection's sparse context length and this wave's
+                pages of it. Pages past the context read junk masked below."""
                 n_ctx = uniform(fx.ptr_load(blk + 16))
                 pages = [
                     uniform(fx.ptr_load(blk + (wave * PPW + j))) for j in range(PPW)
                 ]
-                # Every pass' q heads, issued here with the page loads rather than
-                # inside the pass loop: the loads are the latency this block hides,
-                # and q8 is whole-H so all of them have somewhere to land.
-                qvs = [
-                    ld_bf16x4(rsrc(q), tok * O_K + p * O_K_SUB + tid * 4, CM_K1)
-                    for p in range(SPLIT_PASSES)
-                ]
-                # The wave's pages are consecutive: a 64-bit base at the first keeps
-                # the lane offsets 32-bit for a cache of any size. Stepping one page
-                # steps over every KV head, and pass p reads KV head p, so the page
-                # stride is KV_PAGE_BYTES and the head offset p * PAGE_BYTES.
-                # Both passes' loads are issued here rather than inside the pass
-                # loop: this block is the latency the stage hides, and a pass must
-                # not wait on a barrier before its K and V are in flight.
+                return n_ctx, pages
+
+            def kv_loads(p, pages):
+                """Pass p's K (QK B operand, key = lane % 16 of page j) and V (PV
+                B operand: dims 16 jd + lane % 16, keys 8 (lane / 16) .. + 8).
+
+                The wave's pages are consecutive: a 64-bit base at the first keeps
+                the lane offsets 32-bit for a cache of any size. Stepping one page
+                steps over every KV head, and pass p reads KV head p, so the page
+                stride is KV_PAGE_BYTES and the head offset p * PAGE_BYTES."""
                 page_base = fx.Int64(pages[0]) * KV_PAGE_BYTES
                 vpg = (g4 // 2 == 0).select(fx.Int32(0), pages[1] - pages[0])
-                # K (QK B operand, key = lane % 16 of page j), V (PV B operand: dims
-                # 16 jd + lane % 16, keys 8 (lane / 16) .. + 8), per-token scales
-                kws, vws = [], []
-                for p in range_constexpr(SPLIT_PASSES):
-                    head_off = fx.Int64(p * PAGE_BYTES)
-                    r_k = rsrc(k_cache + page_base + head_off)
-                    r_v = rsrc(v_cache + page_base + head_off)
-                    kw = []
-                    for j in range_constexpr(PPW):
-                        for s in range_constexpr(HEAD_DIM // 32):
-                            kw.append(
-                                fx.Vector(
-                                    bo.buffer_load(
-                                        r_k,
-                                        (
-                                            (pages[j] - pages[0]) * KV_PAGE_BYTES
-                                            + (2 * s + g4 // 2) * 256
-                                            + l16 * 16
-                                            + (g4 % 2) * 8
-                                        )
-                                        // 4,
-                                        vec_width=2,
-                                        dtype=T.i32,
-                                        cache_modifier=CM_K1,
-                                    )
-                                ).bitcast(fx.Int64)[0]
-                            )
-                    kws.append(kw)
-                    vws.append(
-                        [
+                r_k = rsrc(k_cache + page_base + fx.Int64(p * PAGE_BYTES))
+                r_v = rsrc(v_cache + page_base + fx.Int64(p * PAGE_BYTES))
+                kw = []
+                for j in range_constexpr(PPW):
+                    for s in range_constexpr(HEAD_DIM // 32):
+                        kw.append(
                             fx.Vector(
                                 bo.buffer_load(
-                                    r_v,
+                                    r_k,
                                     (
-                                        vpg * KV_PAGE_BYTES
-                                        + (16 * jd + l16) * PAGE16
+                                        (pages[j] - pages[0]) * KV_PAGE_BYTES
+                                        + (2 * s + g4 // 2) * 256
+                                        + l16 * 16
                                         + (g4 % 2) * 8
                                     )
                                     // 4,
@@ -833,30 +823,93 @@ def build_post_attn_kernel(
                                     cache_modifier=CM_K1,
                                 )
                             ).bitcast(fx.Int64)[0]
-                            for jd in range(HEAD_DIM // 16)
-                        ]
-                    )
-                ks1 = fx.Float32(bo.buffer_load(r_ks, 0, vec_width=1, dtype=T.f32))
-                vs1 = fx.Float32(bo.buffer_load(r_vs, 0, vec_width=1, dtype=T.f32))
-                kss = [ks1] * PPW
-                vss = [vs1] * PPW
+                        )
+                vw = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            r_v,
+                            (
+                                vpg * KV_PAGE_BYTES
+                                + (16 * jd + l16) * PAGE16
+                                + (g4 % 2) * 8
+                            )
+                            // 4,
+                            vec_width=2,
+                            dtype=T.i32,
+                            cache_modifier=CM_K1,
+                        )
+                    ).bitcast(fx.Int64)[0]
+                    for jd in range(HEAD_DIM // 16)
+                ]
+                return kw, vw
+
+            def store_q8(qvs):
                 for p in range_constexpr(SPLIT_PASSES):
                     qv = qvs[p]
                     fx.ptr_store(
                         fp8_pack4(qv[0], qv[1], qv[2], qv[3]),
                         q8 + (p * (O_K_SUB // 4) + tid),
                     )
+
+            for ts in range(start("split"), N_SPLIT * tokens, G):
+                ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
+                tok = ts // N_SPLIT
+                t = ts % N_SPLIT
+                if const_expr(SPLIT_PASSES == 1):
+                    # one KV head: one selection serves the whole task, so it is
+                    # made here and its K / V go out before the barrier
+                    select_blocks(tok, t)
+                # this token's q heads and every token's new K / V: a request's
+                # tokens of one step (speculative decode) attend to each other's
+                if wave == 0:
+                    k1_poll(
+                        [
+                            (hdone_mb, hdone_flag(tok, lane + 64 * i), 1)
+                            for i in range(POLLS_PER_LANE)
+                        ]
+                    )
+                gpu.barrier()
+                acquire()
+                # Every pass' q heads: q8 is whole-H so all of them have somewhere
+                # to land.
+                qvs = [
+                    ld_bf16x4(rsrc(q), tok * O_K + p * O_K_SUB + tid * 4, CM_K1)
+                    for p in range(SPLIT_PASSES)
+                ]
+                n_ctx = fx.Int32(0)
+                kw0, vw0 = [], []
+                if const_expr(SPLIT_PASSES == 1):
+                    # Every independent load goes out first: this wave's pages and
+                    # q, then K and V, all before the q8 store and the barrier.
+                    n_ctx, pages = read_blk()
+                    kw0, vw0 = kv_loads(0, pages)
+                ks1 = fx.Float32(bo.buffer_load(r_ks, 0, vec_width=1, dtype=T.f32))
+                vs1 = fx.Float32(bo.buffer_load(r_vs, 0, vec_width=1, dtype=T.f32))
+                kss = [ks1] * PPW
+                vss = [vs1] * PPW
+                store_q8(qvs)
                 gpu.barrier()
                 key0 = t * SPLIT_KEYS + wave * (PPW * PAGE16)
-                valid = [key0 + j * PAGE16 + l16 < n_ctx for j in range(PPW)]
                 # The thread map below covers H_SUB heads: a lane holds heads
                 # 4 g4 + e of the pass, and the partial reduction walks O_K_SUB.
-                # SPLIT_PASSES is 1 at TP4, where h0 is 0 and every index is the
-                # original expression. K and V are head-independent and stay
-                # hoisted above this loop -- a pass costs MFMA and LDS traffic,
-                # not another trip to the KV cache.
+                # SPLIT_PASSES is 1 at TP4, where h0 is 0, the selection and the
+                # loads were made above, and every index is the original
+                # expression.
                 for p in range_constexpr(SPLIT_PASSES):
                     h0 = p * H_SUB  # this pass' first head, in the rank's H
+                    if const_expr(SPLIT_PASSES > 1):
+                        # Pass p attends KV head p, and index head p chose that
+                        # head's blocks (own mode): the selection, and so the
+                        # pages and the K / V read through them, are the pass'
+                        # own. They cannot be hoisted the way one KV head's are.
+                        if unlikely(pick(long_rows, tok)):
+                            select_long(tok, t, p)
+                        select_blocks(tok, t, p)
+                        n_ctx, pages = read_blk()
+                        kw, vw = kv_loads(p, pages)
+                    else:
+                        kw, vw = kw0, vw0
+                    valid = [key0 + j * PAGE16 + l16 < n_ctx for j in range(PPW)]
                     # QK per page j: A = q (heads), B = K (keys); lane holds heads 4 g4 + e, key l16
                     sc = []
                     for j in range_constexpr(PPW):
@@ -876,7 +929,7 @@ def build_post_attn_kernel(
                             )
                             c = mfma_fp8(
                                 qw.bitcast(fx.Int64)[0],
-                                kws[p][j * (HEAD_DIM // 32) + s],
+                                kw[j * (HEAD_DIM // 32) + s],
                                 c,
                             )
                         qk = sm_scale * kss[j]
@@ -965,7 +1018,7 @@ def build_post_attn_kernel(
                     )
                     for jd in range_constexpr(HEAD_DIM // 16):
                         cv = mfma_fp8(
-                            pw, vws[p][jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
+                            pw, vw[jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
                         )
                         for e in range_constexpr(4):
                             fx.ptr_store(
