@@ -56,6 +56,37 @@ class FAv3LaunchConfig(NamedTuple):
     llvm_fn_attrs: str
 
 
+@gluon.jit
+def _round_norm_probabilities(probabilities):
+    # Pack eight values with the same RTNE instruction used by the BF16 cast.
+    # Return both the BF16 values for PV and their exact FP32 expansion for the
+    # denominator, avoiding redundant 16-bit moves in the generic conversion.
+    # Outputs 0:4 are packed BF16 words, outputs 4:12 are FP32, inputs 12:20
+    # are FP32. Early-clobber outputs preserve inputs until all four conversions
+    # have consumed them; expanded outputs can then reuse input registers.
+    return gl.inline_asm_elementwise(
+        """
+        v_cvt_pk_bf16_f32 $0, $12, $13
+        v_cvt_pk_bf16_f32 $1, $14, $15
+        v_cvt_pk_bf16_f32 $2, $16, $17
+        v_cvt_pk_bf16_f32 $3, $18, $19
+        v_lshlrev_b32 $4, 16, $0
+        v_and_b32 $5, 0xffff0000, $0
+        v_lshlrev_b32 $6, 16, $1
+        v_and_b32 $7, 0xffff0000, $1
+        v_lshlrev_b32 $8, 16, $2
+        v_and_b32 $9, 0xffff0000, $2
+        v_lshlrev_b32 $10, 16, $3
+        v_and_b32 $11, 0xffff0000, $3
+        """,
+        constraints="=&v,=&v,=&v,=&v,=v,=v,=v,=v,=v,=v,=v,=v,v,v,v,v,v,v,v,v",
+        args=[probabilities],
+        dtype=(gl.bfloat16, gl.float32),
+        is_pure=True,
+        pack=8,
+    )
+
+
 @gluon.aggregate
 class _AttentionConfig:
     SEQLEN_Q: gl.constexpr
@@ -64,6 +95,9 @@ class _AttentionConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_BUFFERS: gl.constexpr
+    FAST_EXP: gl.constexpr
+    NORM_EXP: gl.constexpr
+    query_axis: gl.constexpr
 
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -84,6 +118,8 @@ class _AttentionConfig:
         block_n,
         num_buffers,
         num_warps,
+        fast_exp=False,
+        norm_exp=False,
     ):
         self.SEQLEN_Q = gl.constexpr(seqlen_q)
         self.SEQLEN_K = gl.constexpr(seqlen_k)
@@ -91,6 +127,13 @@ class _AttentionConfig:
         self.BLOCK_M = gl.constexpr(block_m)
         self.BLOCK_N = gl.constexpr(block_n)
         self.NUM_BUFFERS = gl.constexpr(num_buffers)
+        self.FAST_EXP = gl.constexpr(fast_exp)
+        self.NORM_EXP = gl.constexpr(norm_exp)
+        # Keep nearby long-sequence query tiles on the same head to improve
+        # K/V cache reuse across workgroups.
+        self.query_axis = gl.constexpr(
+            0 if block_m == 256 and seqlen_k >= 16_384 else 2
+        )
 
         assert num_warps == 4 or num_warps == 8
         warp_bases = [[1, 0], [2, 0]]
@@ -140,6 +183,7 @@ class _AttentionProgram:
     output_ptr: gl.tensor
     output_offsets: gl.tensor
     output_mask: gl.tensor
+    output_uses_buffer: gl.constexpr
     softmax_scale_log2: gl.constexpr
 
     @gluon.constexpr_function
@@ -155,6 +199,7 @@ class _AttentionProgram:
         output_offsets,
         output_mask,
         softmax_scale,
+        output_uses_buffer,
     ):
         self.cfg = cfg
         self.q = q
@@ -165,6 +210,7 @@ class _AttentionProgram:
         self.output_ptr = output_ptr
         self.output_offsets = output_offsets
         self.output_mask = output_mask
+        self.output_uses_buffer = gl.constexpr(output_uses_buffer)
         self.softmax_scale_log2 = gl.constexpr(softmax_scale * 1.4426950408889634)
 
     @gluon.jit
@@ -191,25 +237,42 @@ class _AttentionProgram:
         stride_os,
         stride_od,
         softmax_scale: gl.constexpr,
+        use_query_buffer: gl.constexpr,
+        use_output_buffer: gl.constexpr,
     ):
-        batch_id = gl.program_id(0)
+        batch_id = gl.program_id(2 - cfg.query_axis)
         head_id = gl.program_id(1)
-        query_start = gl.program_id(2) * cfg.BLOCK_M
+        query_start = gl.program_id(cfg.query_axis) * cfg.BLOCK_M
         batch_id_i64 = batch_id.to(gl.int64)
         head_id_i64 = head_id.to(gl.int64)
 
-        query_rows = query_start + gl.arange(
+        query_local_rows = gl.arange(
             0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout)
         )
+        query_rows = query_start + query_local_rows
         query_dims = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, cfg.q_layout))
-        query_offsets = (
-            stride_qs * query_rows[:, None] + stride_qd * query_dims[None, :]
-        )
         query_mask = query_rows[:, None] < cfg.SEQLEN_Q
-        query_base = q_ptr + stride_qb * batch_id_i64 + stride_qh * head_id_i64
-        q = gl.amd.cdna5.buffer_load(
-            query_base, query_offsets, mask=query_mask, other=0.0
+        # Buffer offsets are 32-bit. Put the sequence tile offset in the
+        # 64-bit base so long videos do not wrap at the buffer-address limit.
+        query_base = (
+            q_ptr
+            + stride_qb * batch_id_i64
+            + stride_qh * head_id_i64
+            + stride_qs * query_start.to(gl.int64)
         )
+        if use_query_buffer:
+            query_offsets = (
+                stride_qs * query_local_rows[:, None] + stride_qd * query_dims[None, :]
+            )
+            q = gl.amd.cdna5.buffer_load(
+                query_base, query_offsets, mask=query_mask, other=0.0
+            )
+        else:
+            # A sparse view can span the buffer range inside one query tile.
+            query_offsets = stride_qs * query_local_rows[:, None].to(
+                gl.int64
+            ) + stride_qd * query_dims[None, :].to(gl.int64)
+            q = gl.load(query_base + query_offsets, mask=query_mask, other=0.0)
 
         k_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=k_ptr + stride_kb * batch_id_i64 + stride_kh * head_id_i64,
@@ -236,17 +299,29 @@ class _AttentionProgram:
             layout=v_desc.layout,
         )
 
-        output_rows = query_start + gl.arange(
+        output_local_rows = gl.arange(
             0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
         )
+        output_rows = query_start + output_local_rows
         output_dims = gl.arange(
             0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout)
         )
-        output_offsets = (
-            stride_os * output_rows[:, None] + stride_od * output_dims[None, :]
-        )
+        if use_output_buffer:
+            output_offsets = (
+                stride_os * output_local_rows[:, None]
+                + stride_od * output_dims[None, :]
+            )
+        else:
+            output_offsets = stride_os * output_local_rows[:, None].to(
+                gl.int64
+            ) + stride_od * output_dims[None, :].to(gl.int64)
         output_mask = output_rows[:, None] < cfg.SEQLEN_Q
-        output_base = output_ptr + stride_ob * batch_id_i64 + stride_oh * head_id_i64
+        output_base = (
+            output_ptr
+            + stride_ob * batch_id_i64
+            + stride_oh * head_id_i64
+            + stride_os * query_start.to(gl.int64)
+        )
 
         return _AttentionProgram(
             cfg,
@@ -259,6 +334,7 @@ class _AttentionProgram:
             output_offsets,
             output_mask,
             softmax_scale,
+            use_output_buffer,
         )
 
     @gluon.jit
@@ -319,107 +395,72 @@ class _AttentionProgram:
 
     @gluon.jit
     def softmax_part0(self, scores, row_max):
-        new_row_max = gl.maximum(row_max, gl.max(scores, 1))
-        new_row_max_scaled = new_row_max * self.softmax_scale_log2
-        shifted = self.softmax_scale_log2 * scores - new_row_max_scaled[:, None]
-        probabilities = gl.exp2(shifted)
-        max_delta = self.softmax_scale_log2 * row_max - new_row_max_scaled
-        alpha = gl.exp2(max_delta)
+        if self.cfg.NORM_EXP:
+            # The norm guard bounds scaled logits by 32, so this fixed shift
+            # keeps every exponent in [-64, 0] without online rescaling.
+            probabilities = gl.exp2(scores * self.softmax_scale_log2 - 32.0)
+            alpha = gl.full(
+                [self.cfg.BLOCK_M],
+                1.0,
+                gl.float32,
+                layout=gl.SliceLayout(1, self.cfg.qk_layout),
+            )
+            new_row_max = gl.full(
+                [self.cfg.BLOCK_M],
+                0.0,
+                gl.float32,
+                layout=gl.SliceLayout(1, self.cfg.qk_layout),
+            )
+        else:
+            new_row_max = gl.maximum(row_max, gl.max(scores, 1))
+            # The fused expression is only enabled after the GPU range check.
+            # Unbounded inputs subtract before scaling so equal large logits have
+            # a zero exponent even when the compiler enables FP fusion.
+            if self.cfg.FAST_EXP:
+                shifted = gl.fma(
+                    scores,
+                    self.softmax_scale_log2,
+                    -new_row_max[:, None] * self.softmax_scale_log2,
+                )
+            else:
+                shifted = (scores - new_row_max[:, None]) * self.softmax_scale_log2
+            probabilities = gl.exp2(shifted)
+            max_delta = (row_max - new_row_max) * self.softmax_scale_log2
+            alpha = gl.exp2(max_delta)
         return probabilities, alpha, new_row_max
 
     @gluon.jit
     def softmax_prepare(self, scores, row_max):
         new_row_max = gl.maximum(row_max, gl.max(scores, 1))
-        new_row_max_scaled = new_row_max * self.softmax_scale_log2
-        max_delta = self.softmax_scale_log2 * row_max - new_row_max_scaled
-        return new_row_max_scaled, max_delta, new_row_max
+        max_delta = (row_max - new_row_max) * self.softmax_scale_log2
+        return max_delta, new_row_max
 
     @gluon.jit
-    def softmax_prepare_fixed(self, row_max):
-        row_max_scaled = row_max * self.softmax_scale_log2
-        max_delta = gl.zeros(row_max.shape, gl.float32, row_max.type.layout)
-        return row_max_scaled, max_delta, row_max
-
-    @gluon.jit
-    def softmax_finish(self, scores, new_row_max_scaled, max_delta):
-        shifted = self.softmax_scale_log2 * scores - new_row_max_scaled[:, None]
+    def softmax_finish(self, scores, new_row_max, max_delta):
+        if self.cfg.FAST_EXP:
+            shifted = gl.fma(
+                scores,
+                self.softmax_scale_log2,
+                -new_row_max[:, None] * self.softmax_scale_log2,
+            )
+        else:
+            shifted = (scores - new_row_max[:, None]) * self.softmax_scale_log2
         return gl.exp2(shifted), gl.exp2(max_delta)
 
     @gluon.jit
-    def softmax_finish_fixed(self, scores, row_max_scaled, row_max):
-        shifted = self.softmax_scale_log2 * scores - row_max_scaled[:, None]
-        # A later Wan key can exceed the first-tile shift. Cap the exponent
-        # below FP32 overflow while retaining an overwhelming softmax weight.
-        shifted = gl.minimum(shifted, 80.0)
-        probabilities = gl.exp2(shifted)
-        alpha = gl.full(row_max.shape, 1.0, gl.float32, row_max.type.layout)
-        return probabilities, alpha
-
-    @gluon.jit
-    def softmax_part0_fixed(self, scores, row_max):
-        row_max_scaled = row_max * self.softmax_scale_log2
-        shifted = self.softmax_scale_log2 * scores - row_max_scaled[:, None]
-        shifted = gl.minimum(shifted, 80.0)
-        probabilities = gl.exp2(shifted)
-        alpha = gl.full(row_max.shape, 1.0, gl.float32, row_max.type.layout)
-        return probabilities, alpha, row_max
-
-    @gluon.jit
-    def softmax_part0_mode(self, scores, row_max, fixed_shift: gl.constexpr):
-        if fixed_shift:
-            return self.softmax_part0_fixed(scores, row_max)
-        return self.softmax_part0(scores, row_max)
-
-    @gluon.jit
-    def softmax_prepare_mode(self, scores, row_max, fixed_shift: gl.constexpr):
-        if fixed_shift:
-            return self.softmax_prepare_fixed(row_max)
-        return self.softmax_prepare(scores, row_max)
-
-    @gluon.jit
-    def softmax_finish_mode(
-        self,
-        scores,
-        row_max_scaled,
-        max_delta,
-        row_max,
-        new_row_max,
-        fixed_shift: gl.constexpr,
-    ):
-        if fixed_shift:
-            probabilities, alpha = self.softmax_finish_fixed(
-                scores, row_max_scaled, row_max
-            )
-            return probabilities, alpha, row_max
-        probabilities, alpha = self.softmax_finish(scores, row_max_scaled, max_delta)
-        return probabilities, alpha, new_row_max
-
-    @gluon.jit
     def softmax_part1(self, probabilities, row_sum, accumulator, alpha):
-        tile_sum = gl.sum(probabilities, 1)
-        accumulator = accumulator * alpha[:, None]
-        probabilities = probabilities.to(gl.bfloat16, fp_downcast_rounding="rtz")
-        row_sum = row_sum * alpha + tile_sum
+        if self.cfg.NORM_EXP:
+            # Use the same rounded probabilities for PV and the denominator.
+            probabilities, rounded = _round_norm_probabilities(probabilities)
+            tile_sum = gl.sum(rounded, 1)
+            row_sum = row_sum + tile_sum
+        else:
+            tile_sum = gl.sum(probabilities, 1)
+            accumulator = accumulator * alpha[:, None]
+            # Round to nearest to avoid biasing every nonnegative probability down.
+            probabilities = probabilities.to(gl.bfloat16, fp_downcast_rounding="rtne")
+            row_sum = row_sum * alpha + tile_sum
         return probabilities, row_sum, accumulator
-
-    @gluon.jit
-    def softmax_part1_fixed(self, probabilities, row_sum, accumulator):
-        tile_sum = gl.sum(probabilities, 1)
-        probabilities = probabilities.to(gl.bfloat16, fp_downcast_rounding="rtz")
-        return probabilities, row_sum + tile_sum, accumulator
-
-    @gluon.jit
-    def softmax_part1_mode(
-        self,
-        probabilities,
-        row_sum,
-        accumulator,
-        alpha,
-        fixed_shift: gl.constexpr,
-    ):
-        if fixed_shift:
-            return self.softmax_part1_fixed(probabilities, row_sum, accumulator)
-        return self.softmax_part1(probabilities, row_sum, accumulator, alpha)
 
     @gluon.jit
     def pv(self, probabilities, v, accumulator):
@@ -429,20 +470,27 @@ class _AttentionProgram:
     @gluon.jit
     def store_output(self, output):
         output = output.to(self.output_ptr.dtype.element_ty)
-        gl.amd.cdna5.buffer_store(
-            output,
-            self.output_ptr,
-            self.output_offsets,
-            mask=self.output_mask,
-        )
+        if self.output_uses_buffer:
+            gl.amd.cdna5.buffer_store(
+                output,
+                self.output_ptr,
+                self.output_offsets,
+                mask=self.output_mask,
+            )
+        else:
+            gl.store(
+                self.output_ptr + self.output_offsets,
+                output,
+                mask=self.output_mask,
+            )
 
     @gluon.jit
     def store_output_tdm(self, output, stride_os, stride_od):
         layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-        query_start = gl.program_id(2) * self.cfg.BLOCK_M
+        query_start = gl.program_id(self.cfg.query_axis) * self.cfg.BLOCK_M
         output_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=self.output_ptr,
-            shape=(self.cfg.SEQLEN_Q, self.cfg.HEAD_SIZE),
+            shape=(self.cfg.SEQLEN_Q - query_start, self.cfg.HEAD_SIZE),
             strides=(stride_os, stride_od),
             block_shape=(self.cfg.BLOCK_M, self.cfg.HEAD_SIZE),
             layout=layout,
@@ -455,7 +503,7 @@ class _AttentionProgram:
         output_buffer.store(output.to(self.output_ptr.dtype.element_ty))
         gl.amd.cdna5.tdm.async_store(
             output_desc,
-            [query_start, 0],
+            [0, 0],
             output_buffer,
             cache_modifier=".cs",
         )
@@ -492,7 +540,8 @@ def _attention_forward_pipeline(
     BLOCK_N: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     TDM_OUTPUT: gl.constexpr = False,
-    FIXED_SHIFT: gl.constexpr = False,
+    USE_QUERY_BUFFER: gl.constexpr = True,
+    USE_OUTPUT_BUFFER: gl.constexpr = True,
 ):
     NUM_BUFFERS: gl.constexpr = 2
     NUM_WARPS: gl.constexpr = 4
@@ -528,6 +577,8 @@ def _attention_forward_pipeline(
         stride_os,
         stride_od,
         SOFTMAX_SCALE,
+        USE_QUERY_BUFFER,
+        USE_OUTPUT_BUFFER,
     )
 
     peeled_iterations: gl.constexpr = 3
@@ -652,14 +703,22 @@ def _attention_forward_pingpong(
     BLOCK_N: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     TDM_OUTPUT: gl.constexpr = False,
-    FIXED_SHIFT: gl.constexpr = False,
+    USE_QUERY_BUFFER: gl.constexpr = True,
+    USE_OUTPUT_BUFFER: gl.constexpr = True,
+    FAST_EXP: gl.constexpr = False,
+    NORM_EXP: gl.constexpr = False,
 ):
     NUM_BUFFERS: gl.constexpr = 2
     NUM_WARPS: gl.constexpr = 8
     REBALANCE_SOFTMAX: gl.constexpr = (
-        HEAD_SIZE == 128 and BLOCK_M == 256 and BLOCK_N == 64
+        HEAD_SIZE == 128 and BLOCK_M == 256 and BLOCK_N == 64 and not NORM_EXP
     )
-    USE_TDM_OUTPUT: gl.constexpr = TDM_OUTPUT and REBALANCE_SOFTMAX
+    # Move half of the score shift into stage1 to balance the two scalar
+    # stages without extending the lifetime of the probability fragments.
+    EARLY_SHIFT: gl.constexpr = REBALANCE_SOFTMAX and SEQLEN_K >= 16_384
+    USE_TDM_OUTPUT: gl.constexpr = (
+        TDM_OUTPUT and HEAD_SIZE == 128 and BLOCK_M == 256 and BLOCK_N == 64
+    )
     cfg = _AttentionConfig(
         SEQLEN_Q,
         SEQLEN_K,
@@ -668,6 +727,8 @@ def _attention_forward_pingpong(
         BLOCK_N,
         NUM_BUFFERS,
         NUM_WARPS,
+        FAST_EXP,
+        NORM_EXP,
     )
     program = _AttentionProgram.create(
         cfg,
@@ -692,11 +753,15 @@ def _attention_forward_pingpong(
         stride_os,
         stride_od,
         SOFTMAX_SCALE,
+        USE_QUERY_BUFFER,
+        USE_OUTPUT_BUFFER,
     )
 
     peeled_iterations: gl.constexpr = 3
     loop_blocks = max((SEQLEN_K + BLOCK_N - 1) // BLOCK_N - peeled_iterations, 1)
-    has_remainder: gl.constexpr = SEQLEN_K < peeled_iterations * BLOCK_N
+    # A single steady-state iteration is not safe for warp-group pipelining.
+    # Route up to four KV tiles through the synchronized remainder path.
+    has_remainder: gl.constexpr = SEQLEN_K <= (peeled_iterations + 1) * BLOCK_N
     if has_remainder:
         loop_blocks -= 1
 
@@ -706,20 +771,12 @@ def _attention_forward_pingpong(
         dtype=gl.float32,
         layout=gl.SliceLayout(1, cfg.pv_layout),
     )
-    if FIXED_SHIFT:
-        row_sum = gl.full(
-            [BLOCK_M],
-            0.0,
-            dtype=gl.float32,
-            layout=gl.SliceLayout(1, cfg.pv_layout),
-        )
-    else:
-        row_sum = gl.full(
-            [BLOCK_M],
-            1.0,
-            dtype=gl.float32,
-            layout=gl.SliceLayout(1, cfg.pv_layout),
-        )
+    row_sum = gl.full(
+        [BLOCK_M],
+        0.0 if NORM_EXP else 1.0,
+        dtype=gl.float32,
+        layout=gl.SliceLayout(1, cfg.pv_layout),
+    )
     accumulator = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
 
     program.prefetch_k(0, 0)
@@ -741,38 +798,86 @@ def _attention_forward_pingpong(
 
         gl.amd.cdna5.tdm.async_wait(2)
         with gl.amd.warp_pipeline_stage("stage1"):
-            probabilities, row_sum, accumulator = program.softmax_part1_mode(
-                probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
+            probabilities, row_sum, accumulator = program.softmax_part1(
+                probabilities, row_sum, accumulator, alpha
             )
             v = program.v_buffer.index(iteration % NUM_BUFFERS).load(
                 layout=program.cfg.v_layout
             )
             program.prefetch_k(next_k_start, (iteration + 1) % NUM_BUFFERS)
+            # Balance scalar work while keeping exponentiation in stage3.
+            if NORM_EXP:
+                norm_left_scores = gl.amd.slice(scores, [BLOCK_M, BLOCK_N // 2], [0, 0])
+                norm_shifted_left = gl.fma(
+                    norm_left_scores, program.softmax_scale_log2, -32.0
+                )
             if REBALANCE_SOFTMAX:
-                (
-                    new_row_max_scaled,
-                    max_delta,
-                    new_row_max,
-                ) = program.softmax_prepare_mode(scores, row_max, FIXED_SHIFT)
+                max_delta, new_row_max = program.softmax_prepare(scores, row_max)
+                if EARLY_SHIFT:
+                    scores_left = gl.amd.slice(scores, [BLOCK_M, BLOCK_N // 2], [0, 0])
+                    if FAST_EXP:
+                        shifted_left = gl.fma(
+                            scores_left,
+                            program.softmax_scale_log2,
+                            -new_row_max[:, None] * program.softmax_scale_log2,
+                        )
+                    else:
+                        shifted_left = (
+                            scores_left - new_row_max[:, None]
+                        ) * program.softmax_scale_log2
 
         with gl.amd.warp_pipeline_stage("stage2"):
             accumulator = program.pv(probabilities, v, accumulator)
 
         gl.amd.cdna5.tdm.async_wait(2)
         with gl.amd.warp_pipeline_stage("stage3"):
-            if REBALANCE_SOFTMAX:
-                probabilities, alpha, row_max = program.softmax_finish_mode(
-                    scores,
-                    new_row_max_scaled,
-                    max_delta,
-                    row_max,
-                    new_row_max,
-                    FIXED_SHIFT,
+            if NORM_EXP:
+                norm_left = gl.exp2(norm_shifted_left)
+                norm_right_scores = gl.amd.slice(
+                    scores, [BLOCK_M, BLOCK_N // 2], [0, BLOCK_N // 2]
                 )
+                norm_right = gl.exp2(
+                    gl.fma(norm_right_scores, program.softmax_scale_log2, -32.0)
+                )
+                probabilities = (
+                    gl.join(norm_left, norm_right)
+                    .permute(0, 2, 1)
+                    .reshape([BLOCK_M, BLOCK_N])
+                )
+                probabilities = gl.convert_layout(
+                    probabilities, cfg.qk_layout, assert_trivial=True
+                )
+            elif REBALANCE_SOFTMAX:
+                if EARLY_SHIFT:
+                    scores_right = gl.amd.slice(
+                        scores, [BLOCK_M, BLOCK_N // 2], [0, BLOCK_N // 2]
+                    )
+                    if FAST_EXP:
+                        shifted_right = gl.fma(
+                            scores_right,
+                            program.softmax_scale_log2,
+                            -new_row_max[:, None] * program.softmax_scale_log2,
+                        )
+                    else:
+                        shifted_right = (
+                            scores_right - new_row_max[:, None]
+                        ) * program.softmax_scale_log2
+                    probabilities = (
+                        gl.join(gl.exp2(shifted_left), gl.exp2(shifted_right))
+                        .permute(0, 2, 1)
+                        .reshape([BLOCK_M, BLOCK_N])
+                    )
+                    probabilities = gl.convert_layout(
+                        probabilities, cfg.qk_layout, assert_trivial=True
+                    )
+                    alpha = gl.exp2(max_delta)
+                else:
+                    probabilities, alpha = program.softmax_finish(
+                        scores, new_row_max, max_delta
+                    )
+                row_max = new_row_max
             else:
-                probabilities, alpha, row_max = program.softmax_part0_mode(
-                    scores, row_max, FIXED_SHIFT
-                )
+                probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
             k = (
                 program.k_buffer.index(iteration % NUM_BUFFERS)
                 .permute([1, 0])
@@ -786,15 +891,13 @@ def _attention_forward_pingpong(
         next_v_start = iteration * BLOCK_N + 2 * BLOCK_N
         next_k_start = iteration * BLOCK_N + 3 * BLOCK_N
         scores = program.qk(k, current_start)
-        probabilities, row_sum, accumulator = program.softmax_part1_mode(
-            probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
+        probabilities, row_sum, accumulator = program.softmax_part1(
+            probabilities, row_sum, accumulator, alpha
         )
         v = program.load_v(iteration % NUM_BUFFERS, 2)
         program.prefetch_k(next_k_start, (iteration + 1) % NUM_BUFFERS)
         accumulator = program.pv(probabilities, v, accumulator)
-        probabilities, alpha, row_max = program.softmax_part0_mode(
-            scores, row_max, FIXED_SHIFT
-        )
+        probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
         k = program.load_k(iteration % NUM_BUFFERS, 2)
         program.prefetch_v(next_v_start, iteration % NUM_BUFFERS)
         iteration += 1
@@ -803,30 +906,26 @@ def _attention_forward_pingpong(
     second_last_start = epilogue_base + 2 * BLOCK_N
     last_start = epilogue_base + 3 * BLOCK_N
 
-    probabilities, row_sum, accumulator = program.softmax_part1_mode(
-        probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
+    probabilities, row_sum, accumulator = program.softmax_part1(
+        probabilities, row_sum, accumulator, alpha
     )
     v = program.load_v(iteration % NUM_BUFFERS, 2)
     accumulator = program.pv(probabilities, v, accumulator)
 
     scores = program.qk(k, second_last_start)
-    probabilities, alpha, row_max = program.softmax_part0_mode(
-        scores, row_max, FIXED_SHIFT
-    )
+    probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
     k = program.load_k(iteration % NUM_BUFFERS, 1)
     program.prefetch_v(last_start, iteration % NUM_BUFFERS)
 
     scores = program.qk(k, last_start)
-    probabilities, row_sum, accumulator = program.softmax_part1_mode(
-        probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
+    probabilities, row_sum, accumulator = program.softmax_part1(
+        probabilities, row_sum, accumulator, alpha
     )
     v = program.load_v((iteration + 1) % NUM_BUFFERS, 1)
     accumulator = program.pv(probabilities, v, accumulator)
-    probabilities, alpha, row_max = program.softmax_part0_mode(
-        scores, row_max, FIXED_SHIFT
-    )
-    probabilities, row_sum, accumulator = program.softmax_part1_mode(
-        probabilities, row_sum, accumulator, alpha, FIXED_SHIFT
+    probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
+    probabilities, row_sum, accumulator = program.softmax_part1(
+        probabilities, row_sum, accumulator, alpha
     )
     v = program.load_v(iteration % NUM_BUFFERS, 0)
     accumulator = program.pv(probabilities, v, accumulator)
@@ -839,6 +938,498 @@ def _attention_forward_pingpong(
         program.store_output_tdm(output, stride_os, stride_od)
     else:
         program.store_output(output)
+
+
+# Specialize tensor strides as in TokenSpeed so TDM address arithmetic folds
+# at compile time. Shape specialization already distinguishes these launches.
+@gluon.jit
+def _attention_forward_selected(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    output_ptr,
+    invalid_ptr,
+    stride_qb: gl.constexpr,
+    stride_qh: gl.constexpr,
+    stride_qs: gl.constexpr,
+    stride_qd: gl.constexpr,
+    stride_kb: gl.constexpr,
+    stride_kh: gl.constexpr,
+    stride_ks: gl.constexpr,
+    stride_kd: gl.constexpr,
+    stride_vb: gl.constexpr,
+    stride_vh: gl.constexpr,
+    stride_vs: gl.constexpr,
+    stride_vd: gl.constexpr,
+    stride_ob: gl.constexpr,
+    stride_oh: gl.constexpr,
+    stride_os: gl.constexpr,
+    stride_od: gl.constexpr,
+    SOFTMAX_SCALE: gl.constexpr,
+    SEQLEN_Q: gl.constexpr,
+    SEQLEN_K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    FAST_EXP: gl.constexpr,
+    TDM_OUTPUT: gl.constexpr = False,
+    USE_QUERY_BUFFER: gl.constexpr = True,
+    USE_OUTPUT_BUFFER: gl.constexpr = True,
+):
+    if (gl.load(invalid_ptr) == 0) == FAST_EXP:
+        _attention_forward_pingpong(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            output_ptr,
+            stride_qb,
+            stride_qh,
+            stride_qs,
+            stride_qd,
+            stride_kb,
+            stride_kh,
+            stride_ks,
+            stride_kd,
+            stride_vb,
+            stride_vh,
+            stride_vs,
+            stride_vd,
+            stride_ob,
+            stride_oh,
+            stride_os,
+            stride_od,
+            SOFTMAX_SCALE,
+            SEQLEN_Q,
+            SEQLEN_K,
+            BLOCK_M,
+            BLOCK_N,
+            HEAD_SIZE,
+            TDM_OUTPUT,
+            USE_QUERY_BUFFER,
+            USE_OUTPUT_BUFFER,
+            FAST_EXP=FAST_EXP,
+        )
+
+
+# Keep layout strides constant through the guarded dispatch as well.
+@gluon.jit
+def _attention_forward_norm_selected(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    output_ptr,
+    invalid_ptr,
+    stride_qb: gl.constexpr,
+    stride_qh: gl.constexpr,
+    stride_qs: gl.constexpr,
+    stride_qd: gl.constexpr,
+    stride_kb: gl.constexpr,
+    stride_kh: gl.constexpr,
+    stride_ks: gl.constexpr,
+    stride_kd: gl.constexpr,
+    stride_vb: gl.constexpr,
+    stride_vh: gl.constexpr,
+    stride_vs: gl.constexpr,
+    stride_vd: gl.constexpr,
+    stride_ob: gl.constexpr,
+    stride_oh: gl.constexpr,
+    stride_os: gl.constexpr,
+    stride_od: gl.constexpr,
+    SOFTMAX_SCALE: gl.constexpr,
+    SEQLEN_Q: gl.constexpr,
+    SEQLEN_K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    ROUTE: gl.constexpr,
+    TDM_OUTPUT: gl.constexpr = False,
+    USE_QUERY_BUFFER: gl.constexpr = True,
+    USE_OUTPUT_BUFFER: gl.constexpr = True,
+):
+    bits = gl.load(invalid_ptr)
+    forward_args = (
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        output_ptr,
+        stride_qb,
+        stride_qh,
+        stride_qs,
+        stride_qd,
+        stride_kb,
+        stride_kh,
+        stride_ks,
+        stride_kd,
+        stride_vb,
+        stride_vh,
+        stride_vs,
+        stride_vd,
+        stride_ob,
+        stride_oh,
+        stride_os,
+        stride_od,
+    )
+    # Route 3 combines the norm-bounded and element-bounded algorithms.
+    # Keep the raw algorithm separate to preserve its register allocation.
+    if ROUTE == 3:
+        if (bits & 1) == 0:
+            _attention_forward_pingpong(
+                *forward_args,
+                SOFTMAX_SCALE,
+                SEQLEN_Q,
+                SEQLEN_K,
+                BLOCK_M,
+                BLOCK_N,
+                HEAD_SIZE,
+                TDM_OUTPUT,
+                USE_QUERY_BUFFER,
+                USE_OUTPUT_BUFFER,
+                FAST_EXP=False,
+                NORM_EXP=True,
+            )
+        elif bits == 1:
+            _attention_forward_pingpong(
+                *forward_args,
+                SOFTMAX_SCALE,
+                SEQLEN_Q,
+                SEQLEN_K,
+                BLOCK_M,
+                BLOCK_N,
+                HEAD_SIZE,
+                TDM_OUTPUT,
+                USE_QUERY_BUFFER,
+                USE_OUTPUT_BUFFER,
+                FAST_EXP=True,
+                NORM_EXP=False,
+            )
+    else:
+        selected = (
+            ((ROUTE == 0) & ((bits & 1) == 0))
+            | ((ROUTE == 1) & (bits == 1))
+            | ((ROUTE == 2) & (bits == 3))
+        )
+        if selected:
+            _attention_forward_pingpong(
+                *forward_args,
+                SOFTMAX_SCALE,
+                SEQLEN_Q,
+                SEQLEN_K,
+                BLOCK_M,
+                BLOCK_N,
+                HEAD_SIZE,
+                TDM_OUTPUT,
+                USE_QUERY_BUFFER,
+                USE_OUTPUT_BUFFER,
+                FAST_EXP=ROUTE == 1,
+                NORM_EXP=ROUTE == 0,
+            )
+
+
+@gluon.jit
+def _range_atomic(
+    q,
+    k,
+    invalid_ptr,
+    NQ: gl.constexpr,
+    NK: gl.constexpr,
+    SQ: gl.constexpr,
+    SK: gl.constexpr,
+    H: gl.constexpr,
+    QB: gl.constexpr,
+    QS: gl.constexpr,
+    QH: gl.constexpr,
+    QD: gl.constexpr,
+    KB: gl.constexpr,
+    KS: gl.constexpr,
+    KH: gl.constexpr,
+    KD: gl.constexpr,
+    BOUND: gl.constexpr,
+    CONTIGUOUS: gl.constexpr,
+    BLOCK: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    q_blocks: gl.constexpr = gl.cdiv(NQ, BLOCK)
+    offsets = gl.arange(0, BLOCK, layout=gl.BlockedLayout([1], [32], [4], [0]))
+    if pid < q_blocks:
+        index = pid.to(gl.int64) * BLOCK + offsets
+        if CONTIGUOUS:
+            ptr = q + index
+        else:
+            batch = index // (SQ * H * 128)
+            seq = (index // (H * 128)) % SQ
+            head = (index // 128) % H
+            dim = index % 128
+            ptr = q + batch * QB + seq * QS + head * QH + dim * QD
+        values = gl.load(ptr, mask=index < NQ, other=0).to(gl.float32)
+    else:
+        index = (pid - q_blocks).to(gl.int64) * BLOCK + offsets
+        if CONTIGUOUS:
+            ptr = k + index
+        else:
+            batch = index // (SK * H * 128)
+            seq = (index // (H * 128)) % SK
+            head = (index // 128) % H
+            dim = index % 128
+            ptr = k + batch * KB + seq * KS + head * KH + dim * KD
+        values = gl.load(ptr, mask=index < NK, other=0).to(gl.float32)
+    invalid = gl.max((~(gl.abs(values) <= BOUND)).to(gl.int32), 0)
+    if invalid != 0:
+        gl.atomic_or(invalid_ptr, invalid, sem="relaxed")
+
+
+@gluon.jit
+def _clear_invalid(invalid):
+    gl.store(invalid, 0)
+
+
+def _guard_bound(scale):
+    # Bound D*max(|Q|)*max(|K|)*scale_log2. Reserve FP32 accumulation margin.
+    # At magnitude <=1024, rounding the scaled maximum introduces at most
+    # 2**-14 of exponent error, keeping its fused exponent near zero.
+    return math.sqrt(1024 / (128 * scale * 1.4426950408889634)) * (1 - 1e-5)
+
+
+def _check_bounded_inputs(query, key, invalid, softmax_scale):
+    block = 8192
+    count = math.ceil(query.numel() / block) + math.ceil(key.numel() / block)
+    _clear_invalid[(1,)](invalid, num_warps=4)
+    _range_atomic[(count,)](
+        query,
+        key,
+        invalid,
+        query.numel(),
+        key.numel(),
+        query.shape[1],
+        key.shape[1],
+        query.shape[2],
+        *query.stride(),
+        *key.stride(),
+        _guard_bound(softmax_scale),
+        query.is_contiguous() and key.is_contiguous(),
+        block,
+        num_warps=4,
+    )
+
+
+def _launch_guarded_attention(query, key, value, output, invalid, softmax_scale):
+    # These ordered kernels are captured together. Every replay clears and
+    # recomputes the flag, so mutated inputs cannot reuse an earlier decision.
+    _check_bounded_inputs(query, key, invalid, softmax_scale)
+    batch, seqlen_q, num_heads, _ = query.shape
+    seqlen_k = key.shape[1]
+    query_tiles = math.ceil(seqlen_q / 256)
+    grid = (
+        (query_tiles, num_heads, batch)
+        if seqlen_k >= 16384
+        else (batch, num_heads, query_tiles)
+    )
+    strides = tuple(
+        s
+        for tensor in (query, key, value, output)
+        for s in (
+            tensor.stride(0),
+            tensor.stride(2),
+            tensor.stride(1),
+            tensor.stride(3),
+        )
+    )
+    query_tile_bytes = (
+        255 * query.stride(1) + 127 * query.stride(3) + 1
+    ) * query.element_size()
+    output_tile_bytes = (
+        255 * output.stride(1) + 127 * output.stride(3) + 1
+    ) * output.element_size()
+    for fast in (True, False):
+        _attention_forward_selected[grid](
+            query,
+            key,
+            value,
+            output,
+            invalid,
+            *strides,
+            softmax_scale,
+            seqlen_q,
+            seqlen_k,
+            256,
+            64,
+            128,
+            fast,
+            TDM_OUTPUT=True,
+            USE_QUERY_BUFFER=query_tile_bytes <= 2**31,
+            USE_OUTPUT_BUFFER=output_tile_bytes <= 2**31,
+            num_warps=8,
+            waves_per_eu=2,
+            llvm_fn_attrs="amdgpu-sched-strategy=max-ilp",
+            enable_fp_fusion=True,
+        )
+
+
+def _norm_guard_bound(scale):
+    # Cauchy-Schwarz bounds |QK| by the product of the row norms. The 1e-4
+    # margin covers FP32 norm reduction and dot-product accumulation rounding;
+    # the fixed shift then keeps exp2 arguments in [-64, 0].
+    return (32.0 / (scale * 1.4426950408889634)) * (1.0 - 1e-4)
+
+
+@gluon.jit
+def _norm_range_atomic(
+    x_ptr,
+    invalid_ptr,
+    B: gl.constexpr,
+    S: gl.constexpr,
+    H: gl.constexpr,
+    SB: gl.constexpr,
+    SS: gl.constexpr,
+    SH: gl.constexpr,
+    SD: gl.constexpr,
+    BOUND: gl.constexpr,
+    FMA_BOUND: gl.constexpr,
+    CONTIGUOUS: gl.constexpr,
+):
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [4, 1], [1, 0])
+    rows = gl.program_id(0).to(gl.int64) * 16 + gl.arange(
+        0, 16, layout=gl.SliceLayout(1, layout)
+    ).to(gl.int64)
+    dims = gl.arange(0, 128, layout=gl.SliceLayout(0, layout)).to(gl.int64)
+    if CONTIGUOUS:
+        offsets = rows[:, None] * 128 + dims[None, :]
+    else:
+        batch = rows // (S * H)
+        seq = (rows // H) % S
+        head = rows % H
+        offsets = (
+            batch[:, None] * SB
+            + seq[:, None] * SS
+            + head[:, None] * SH
+            + dims[None, :] * SD
+        )
+    x = gl.load(x_ptr + offsets, mask=rows[:, None] < B * S * H, other=0.0).to(
+        gl.float32
+    )
+    norm = gl.sum(x * x, 1)
+    invalid_norm = gl.sum(((norm > BOUND) | (norm != norm)).to(gl.int32), 0) != 0
+    invalid_fma = (
+        gl.sum(gl.sum(((gl.abs(x) > FMA_BOUND) | (x != x)).to(gl.int32), 1), 0) != 0
+    )
+    bits = invalid_norm.to(gl.int32) | (invalid_fma.to(gl.int32) << 1)
+    if bits != 0:
+        gl.atomic_or(invalid_ptr, bits, sem="relaxed")
+
+
+@gluon.jit
+def _value_range_atomic(
+    x_ptr,
+    invalid_ptr,
+    B: gl.constexpr,
+    S: gl.constexpr,
+    H: gl.constexpr,
+    SB: gl.constexpr,
+    SS: gl.constexpr,
+    SH: gl.constexpr,
+    SD: gl.constexpr,
+    CONTIGUOUS: gl.constexpr,
+    BLOCK: gl.constexpr,
+):
+    i = gl.program_id(0).to(gl.int64) * BLOCK + gl.arange(
+        0, BLOCK, layout=gl.BlockedLayout([1], [32], [4], [0])
+    ).to(gl.int64)
+    if CONTIGUOUS:
+        offsets = i
+    else:
+        rows = i // 128
+        offsets = (
+            (rows // (S * H)) * SB
+            + ((rows // H) % S) * SS
+            + (rows % H) * SH
+            + (i % 128) * SD
+        )
+    x = gl.abs(
+        gl.load(x_ptr + offsets, mask=i < B * S * H * 128, other=0.0).to(gl.float32)
+    )
+    # With P in [2^-64, 1], this range keeps nonzero P*V products normal
+    # in FP32 and sums finite for the guarded sequence-length limit.
+    invalid = (
+        (x != x)
+        | (x > 18446744073709551616.0)
+        | ((x != 0.0) & (x < 2.3283064365386963e-10))
+    )
+    if gl.sum(invalid.to(gl.int32), 0) != 0:
+        gl.atomic_or(invalid_ptr, 1, sem="relaxed")
+
+
+def _check_norm_bounded_inputs(q, k, v, invalid, scale):
+    _clear_invalid[(1,)](invalid, num_warps=4)
+    for x in (q, k):
+        b, s, h, d = x.shape
+        _norm_range_atomic[(math.ceil(b * s * h / 16),)](
+            x,
+            invalid,
+            b,
+            s,
+            h,
+            *x.stride(),
+            _norm_guard_bound(scale),
+            _guard_bound(scale),
+            x.is_contiguous(),
+            num_warps=4,
+        )
+    b, s, h, d = v.shape
+    _value_range_atomic[(math.ceil(v.numel() / 8192),)](
+        v, invalid, b, s, h, *v.stride(), v.is_contiguous(), 8192, num_warps=4
+    )
+
+
+def _launch_norm_guarded_attention(query, key, value, output, invalid, softmax_scale):
+    # These ordered kernels are captured together. Every replay clears and
+    # recomputes the flag, so mutated inputs cannot reuse an earlier decision.
+    _check_norm_bounded_inputs(query, key, value, invalid, softmax_scale)
+    batch, seqlen_q, num_heads, _ = query.shape
+    seqlen_k = key.shape[1]
+    query_tiles = math.ceil(seqlen_q / 256)
+    grid = (
+        (query_tiles, num_heads, batch)
+        if seqlen_k >= 16384
+        else (batch, num_heads, query_tiles)
+    )
+    strides = tuple(
+        s
+        for tensor in (query, key, value, output)
+        for s in (
+            tensor.stride(0),
+            tensor.stride(2),
+            tensor.stride(1),
+            tensor.stride(3),
+        )
+    )
+    query_tile_bytes = (
+        255 * query.stride(1) + 127 * query.stride(3) + 1
+    ) * query.element_size()
+    output_tile_bytes = (
+        255 * output.stride(1) + 127 * output.stride(3) + 1
+    ) * output.element_size()
+    for route in (3, 2):
+        _attention_forward_norm_selected[grid](
+            query,
+            key,
+            value,
+            output,
+            invalid,
+            *strides,
+            softmax_scale,
+            seqlen_q,
+            seqlen_k,
+            256,
+            64,
+            128,
+            route,
+            TDM_OUTPUT=True,
+            USE_QUERY_BUFFER=query_tile_bytes <= 2**31,
+            USE_OUTPUT_BUFFER=output_tile_bytes <= 2**31,
+            num_warps=8,
+            waves_per_eu=2,
+            llvm_fn_attrs="amdgpu-sched-strategy=max-ilp",
+            enable_fp_fusion=True,
+        )
 
 
 @functools.lru_cache(maxsize=None)
@@ -860,6 +1451,34 @@ def get_num_cus(device: torch.device | int | None = None) -> int:
     return _get_num_cus(device_index)
 
 
+def _get_persistent_query_groups(
+    batch: int, num_heads: int, seqlen_q: int, num_cus: int
+) -> int:
+    """Balance persistent query work without underfilling the device."""
+    if num_cus <= 0:
+        raise ValueError("num_cus must be positive")
+    query_blocks = math.ceil(seqlen_q / 128)
+    query_groups = math.ceil(query_blocks / 29)
+    batch_heads = batch * num_heads
+
+    # Align the grid to a whole multiple of the CU count, while retaining
+    # at least two workgroups per CU. Small grids keep the existing grouping.
+    group_multiple = num_cus // math.gcd(batch_heads, num_cus)
+    aligned_groups = query_groups // group_multiple * group_multiple
+    if aligned_groups * batch_heads < 2 * num_cus:
+        return query_groups
+
+    # Compare the estimated query tiles on the most heavily loaded CU.
+    # Fewer groups reuse K/V longer, but must not increase the longest workload.
+    original_tiles = math.ceil(query_groups * batch_heads / num_cus) * math.ceil(
+        query_blocks / query_groups
+    )
+    aligned_tiles = (aligned_groups * batch_heads // num_cus) * math.ceil(
+        query_blocks / aligned_groups
+    )
+    return aligned_groups if aligned_tiles < original_tiles else query_groups
+
+
 def select_fav3_launch_config(
     batch: int,
     num_heads: int,
@@ -867,22 +1486,30 @@ def select_fav3_launch_config(
     *,
     seqlen_k: int | None = None,
     num_cus: int | None = None,
-    wan_fixed_shift: bool = False,
 ) -> FAv3LaunchConfig:
     """Select the measured gfx1250 D128 launch policy."""
     if min(batch, num_heads, seqlen_q) <= 0:
         raise ValueError("batch, num_heads, and seqlen_q must be positive")
-    if batch == 2 and num_heads == 40 and seqlen_q == 176_400 and seqlen_k == 512:
+    if num_cus is None:
+        num_cus = get_num_cus()
+
+    persistent_groups = _get_persistent_query_groups(
+        batch, num_heads, seqlen_q, num_cus
+    )
+    persistent_workgroups = batch * num_heads * persistent_groups
+    if (
+        seqlen_k is not None
+        and 257 <= seqlen_k <= 512
+        and persistent_workgroups >= num_cus
+    ):
         return FAv3LaunchConfig(
-            "wan_cross",
+            "persistent",
             128,
             256,
             4,
             True,
             "amdgpu-sched-strategy=iterative-ilp",
         )
-    if num_cus is None:
-        num_cus = get_num_cus()
 
     wide_block_m = 256
     workgroups = batch * num_heads * math.ceil(seqlen_q / wide_block_m)
@@ -891,20 +1518,10 @@ def select_fav3_launch_config(
         # that admits the wide ping-pong tile.
         scheduler = (
             "amdgpu-sched-strategy=max-ilp"
-            if seqlen_k is not None and seqlen_k <= 512
+            if seqlen_k is not None and (seqlen_k <= 512 or seqlen_k >= 16_384)
             else ""
         )
-        use_fixed_shift = (
-            batch == 2
-            and num_heads == 40
-            and seqlen_q == 176_400
-            and seqlen_k == seqlen_q
-            and wan_fixed_shift
-        )
-        schedule = "wan_self" if use_fixed_shift else "pingpong"
-        if use_fixed_shift:
-            scheduler = "amdgpu-sched-strategy=max-ilp,amdgpu-post-ra-direction=topdown"
-        return FAv3LaunchConfig(schedule, 256, 64, 8, True, scheduler)
+        return FAv3LaunchConfig("pingpong", 256, 64, 8, True, scheduler)
     return FAv3LaunchConfig(
         "pipeline",
         128,
@@ -922,7 +1539,6 @@ def gluon_fav3_attention(
     *,
     softmax_scale: float | None = None,
     launch_config: FAv3LaunchConfig | None = None,
-    wan_fixed_shift: bool = False,
 ) -> torch.Tensor:
     """Run non-causal BF16 MHA on gfx1250.
 
@@ -951,8 +1567,8 @@ def gluon_fav3_attention(
         raise ValueError("Gluon FAv3 requires full MHA with matching Q/K/V heads")
     if head_size != 128:
         raise ValueError(f"Gluon FAv3 requires head_size=128, got {head_size}")
-    if seqlen_q <= 0 or seqlen_k <= 0:
-        raise ValueError("Gluon FAv3 requires non-empty query and key sequences")
+    if min(batch, num_heads, seqlen_q, seqlen_k) <= 0:
+        raise ValueError("Gluon FAv3 requires non-empty batches, heads, and sequences")
     if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
         raise ValueError("Gluon FAv3 requires contiguous head dimensions")
 
@@ -974,32 +1590,23 @@ def gluon_fav3_attention(
         seqlen_q,
         seqlen_k=seqlen_k,
         num_cus=get_num_cus(query.device),
-        wan_fixed_shift=wan_fixed_shift,
     )
-    wan_self_contract = (
-        batch == 2 and num_heads == 40 and seqlen_q == 176_400 and seqlen_k == seqlen_q
-    )
-    fixed_shift = config.schedule == "wan_self"
-    if fixed_shift and (not wan_self_contract or not wan_fixed_shift):
-        raise ValueError(
-            "wan_self FAv3 requires B2/S176400/H40/D128 and wan_fixed_shift=True"
-        )
-    if config.schedule == "wan_cross":
+    if config.schedule == "persistent":
         expected_geometry = (128, 256, 4)
         actual_geometry = (config.block_m, config.block_n, config.num_warps)
         if actual_geometry != expected_geometry:
             raise ValueError(
-                "wan_cross requires (block_m, block_n, num_warps)="
+                "persistent requires (block_m, block_n, num_warps)="
                 f"{expected_geometry}, got {actual_geometry}"
             )
         if not config.tdm_output:
-            raise ValueError("wan_cross requires TDM output and generic online softmax")
+            raise ValueError("persistent requires TDM output and stable softmax")
         if query.is_contiguous() and key.is_contiguous() and value.is_contiguous():
-            from sglang.kernels.ops.attention.gluon_fav3_wan_cross_gfx1250 import (
-                gluon_fav3_wan_cross_attention,
+            from sglang.kernels.ops.attention.gluon_fav3_persistent_gfx1250 import (
+                gluon_fav3_persistent_attention,
             )
 
-            return gluon_fav3_wan_cross_attention(
+            return gluon_fav3_persistent_attention(
                 query,
                 key,
                 value,
@@ -1013,7 +1620,7 @@ def gluon_fav3_attention(
             True,
             "amdgpu-sched-strategy=max-ilp",
         )
-    if config.schedule not in ("pipeline", "pingpong", "wan_self"):
+    if config.schedule not in ("pipeline", "pingpong"):
         raise ValueError(f"unsupported FAv3 schedule: {config.schedule}")
     expected_geometry = (128, 64, 4) if config.schedule == "pipeline" else (256, 64, 8)
     actual_geometry = (config.block_m, config.block_n, config.num_warps)
@@ -1024,12 +1631,37 @@ def gluon_fav3_attention(
         )
     kernel = (
         _attention_forward_pingpong
-        if config.schedule in ("pingpong", "wan_self")
+        if config.schedule == "pingpong"
         else _attention_forward_pipeline
     )
     output = torch.empty_like(query, memory_format=torch.contiguous_format)
-    grid = (batch, num_heads, math.ceil(seqlen_q / config.block_m))
+    # Keep every tile-local byte offset in the signed 32-bit buffer range.
+    # The constexpr flags preserve the usual buffer path without runtime branches.
+    query_tile_bytes = (
+        (config.block_m - 1) * query.stride(1) + (head_size - 1) * query.stride(3) + 1
+    ) * query.element_size()
+    output_tile_bytes = (
+        (config.block_m - 1) * output.stride(1) + (head_size - 1) * output.stride(3) + 1
+    ) * output.element_size()
+    query_tiles = math.ceil(seqlen_q / config.block_m)
+    grid = (
+        (query_tiles, num_heads, batch)
+        if config.block_m == 256 and seqlen_k >= 16_384
+        else (batch, num_heads, query_tiles)
+    )
     with torch.cuda.device(query.device):
+        if (
+            launch_config is None
+            and config.schedule == "pingpong"
+            and min(seqlen_q, seqlen_k) >= 65_536
+            and seqlen_k < 2**31
+            and softmax_scale == head_size**-0.5
+        ):
+            invalid = torch.empty((), dtype=torch.int32, device=query.device)
+            _launch_norm_guarded_attention(
+                query, key, value, output, invalid, softmax_scale
+            )
+            return output
         kernel[grid](
             query,
             key,
@@ -1058,11 +1690,12 @@ def gluon_fav3_attention(
             config.block_n,
             head_size,
             TDM_OUTPUT=config.tdm_output,
-            FIXED_SHIFT=fixed_shift,
+            USE_QUERY_BUFFER=query_tile_bytes <= 2**31,
+            USE_OUTPUT_BUFFER=output_tile_bytes <= 2**31,
             num_warps=config.num_warps,
-            waves_per_eu=2 if config.schedule in ("pingpong", "wan_self") else 1,
+            waves_per_eu=2 if config.schedule == "pingpong" else 1,
             llvm_fn_attrs=config.llvm_fn_attrs,
-            enable_fp_fusion=config.schedule == "wan_self",
+            enable_fp_fusion=True,
         )
     return output
 
