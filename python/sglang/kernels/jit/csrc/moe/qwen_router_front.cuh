@@ -753,11 +753,13 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
   }
   __syncthreads();
   trace_stamp<kTrace>(p, tb + 5);
+  // The dependent grid reads our outputs only after its own griddepcontrol.wait,
+  // which waits for this grid to complete; triggering here lets it launch during the tail.
+  device::PDLTriggerSecondary<kUsePDL>();
   if (s_last) {
     trace_stamp<kTrace>(p, kNumCtas * 8 + 0);
     topk_and_tables<kMaxM, kTrace>(p, s_mask, s_tile, s_ids, s_warp);
   }
-  device::PDLTriggerSecondary<kUsePDL>();
 }
 
 template <uint32_t kMaxM, bool kUsePDL, bool kTrace>
