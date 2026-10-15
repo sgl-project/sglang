@@ -18,7 +18,7 @@ class ScriptedLockRefExhauster:
         self._locked: list[tuple[Any, Any]] = []
 
     def exhaust(self, leave_refs: int) -> None:
-        tree_cache = self.scheduler.tree_cache
+        tree_cache = self.scheduler.parts.kv.tree_cache
         if tree_cache.disable:
             return
 
@@ -38,13 +38,13 @@ class ScriptedLockRefExhauster:
             self._locked.append((target, result.to_dec_params()))
 
     def release(self) -> None:
-        tree_cache = self.scheduler.tree_cache
+        tree_cache = self.scheduler.parts.kv.tree_cache
         for node, dec_params in self._locked:
             tree_cache.dec_lock_ref(node, dec_params)
         self._locked.clear()
 
     def _evictable_nodes(self) -> list[Any]:
-        tree_cache = self.scheduler.tree_cache
+        tree_cache = self.scheduler.parts.kv.tree_cache
         return [
             node
             for node in iter_node_handles(tree_cache)

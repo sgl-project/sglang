@@ -11,8 +11,8 @@ if TYPE_CHECKING:
 def engine_stats(ctx: ScriptedContext) -> Dict[str, int]:
     s = ctx.scheduler
     return {
-        "kv_pool_free": s.token_to_kv_pool_allocator.available_size(),
-        "req_pool_free": s.req_to_token_pool.available_size(),
-        "req_pool_total": s.req_to_token_pool.size,
+        "kv_pool_free": s.parts.kv.token_to_kv_pool_allocator.available_size(),
+        "req_pool_free": s.parts.kv.req_to_token_pool.available_size(),
+        "req_pool_total": s.parts.kv.req_to_token_pool.size,
         "page_size": get_schedule().page_size,
     }

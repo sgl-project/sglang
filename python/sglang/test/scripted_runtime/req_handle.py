@@ -53,4 +53,6 @@ class ScriptedReqHandle:
         req = self.req
         if req is None:
             return 0
-        return get_node_lock_ref(self.context.scheduler.tree_cache, req.last_node)
+        return get_node_lock_ref(
+            self.context.scheduler.parts.kv.tree_cache, req.last_node
+        )

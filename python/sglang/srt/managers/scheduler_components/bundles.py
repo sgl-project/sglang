@@ -21,6 +21,17 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
+class Workers:
+    """The model workers: the target, the draft under speculative decoding,
+    and the one the scheduler runs its forwards through."""
+
+    tp_worker: Any
+    # None without speculative decoding, and on a PP+spec stage before the last.
+    draft_worker: Any
+    model_worker: Any
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
 class KvResources:
     """The KV memory the components share."""
 

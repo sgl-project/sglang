@@ -16,6 +16,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+from sglang.srt.managers.scheduler_components.bundles import Workers
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.runtime_context import (
@@ -30,6 +31,7 @@ from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -217,6 +219,131 @@ def select_model_worker(
         return tp_worker
     else:
         return draft_worker
+
+
+def init_tp_model_worker(*, server_args: ServerArgs, nccl_port: int):
+    worker_kwargs = dict(
+        server_args=server_args,
+        gpu_id=get_device().gpu_id,
+        nccl_port=nccl_port,
+    )
+
+    # FIXME: move tp worker's init logic outside of the scheduler.
+    from sglang.srt.managers.tp_worker import TpModelWorker
+
+    return TpModelWorker(**worker_kwargs)
+
+
+def maybe_init_draft_worker(
+    *,
+    server_args: ServerArgs,
+    nccl_port: int,
+    spec_algorithm: SpeculativeAlgorithm,
+    tp_worker,
+):
+    if not runs_draft_worker(spec_algorithm):
+        return None
+
+    # Launch a draft worker for speculative decoding. It builds its draft
+    # from this process's own config: what differs for the draft — the
+    # target's context length, the draft load format, its attention backend
+    # — is resolved per runner, not on a config copy.
+    draft_worker_kwargs = dict(
+        server_args=server_args,
+        gpu_id=get_device().gpu_id,
+        nccl_port=nccl_port,
+        target_worker=tp_worker,
+    )
+
+    DraftWorkerClass = spec_algorithm.create_worker(server_args)
+    return DraftWorkerClass(**draft_worker_kwargs)
+
+
+def maybe_init_dllm_worker(*, server_args: ServerArgs, tp_worker):
+    if get_exec().dllm.dllm_algorithm is None:
+        return None
+    from sglang.srt.dllm.worker import DllmWorker
+
+    return DllmWorker(tp_worker, server_args)
+
+
+def init_memory_pools(*, tp_worker, draft_worker) -> None:
+    """Allocate KV cache pools for target and draft workers."""
+    alloc_target_memory_pool(tp_worker=tp_worker, draft_worker=draft_worker)
+    alloc_draft_memory_pool(tp_worker=tp_worker, draft_worker=draft_worker)
+
+
+def init_all_attention_backends(*, tp_worker, draft_worker) -> None:
+    """Initialize attention backends for all workers."""
+    tp_worker.init_attention_backends()
+    if draft_worker is not None:
+        draft_worker.init_attention_backends()
+
+
+# Not DynamicGradMode: tensors created under inference mode here could not
+# be written in place by the no_grad disagg event loops.
+@torch.no_grad()
+def init_all_cuda_graphs(*, tp_worker, draft_worker) -> None:
+    """Capture cuda graphs for all workers."""
+    tp_worker.init_cuda_graphs()
+    if draft_worker is not None:
+        draft_worker.init_cuda_graphs()
+
+
+@dataclass(frozen=True, slots=True)
+class StartedWorkers:
+    """The workers once they are up, and what starting them measured."""
+
+    workers: Workers
+    # The dLLM worker, which reports the worker info in dLLM mode.
+    dllm_worker: Any
+    schedule_stream: Any
+    # Time spent allocating the KV pools, resize included, in seconds.
+    kv_cache_allocation_time: float
+
+
+def start_workers(
+    *, server_args: ServerArgs, nccl_port: int, spec_algorithm: SpeculativeAlgorithm
+) -> StartedWorkers:
+    """Load the workers, allocate their KV pools, capture their graphs and
+    finish their startup."""
+    # Load model weights.
+    tp_worker = init_tp_model_worker(server_args=server_args, nccl_port=nccl_port)
+    if get_model().is_startup_weight_load_overlap:
+        tp_worker.start_startup_weight_load()
+    draft_worker = maybe_init_draft_worker(
+        server_args=server_args,
+        nccl_port=nccl_port,
+        spec_algorithm=spec_algorithm,
+        tp_worker=tp_worker,
+    )
+    dllm_worker = maybe_init_dllm_worker(server_args=server_args, tp_worker=tp_worker)
+
+    # Prepare KV cache pools for all workers
+    tic = time.perf_counter()
+    init_memory_pools(tp_worker=tp_worker, draft_worker=draft_worker)
+    kv_cache_allocation_time = time.perf_counter() - tic
+
+    init_all_attention_backends(tp_worker=tp_worker, draft_worker=draft_worker)
+    init_all_cuda_graphs(tp_worker=tp_worker, draft_worker=draft_worker)
+
+    startup = finish_worker_startup(tp_worker=tp_worker, draft_worker=draft_worker)
+    kv_cache_allocation_time += startup.kv_resize_time
+
+    model_worker = select_model_worker(
+        tp_worker=tp_worker,
+        draft_worker=draft_worker,
+        dllm_worker=dllm_worker,
+        spec_algorithm=spec_algorithm,
+    )
+    return StartedWorkers(
+        workers=Workers(
+            tp_worker=tp_worker, draft_worker=draft_worker, model_worker=model_worker
+        ),
+        dllm_worker=dllm_worker,
+        schedule_stream=startup.schedule_stream,
+        kv_cache_allocation_time=kv_cache_allocation_time,
+    )
 
 
 def set_default_pp_max_micro_batch_size(max_running_requests: int) -> None:

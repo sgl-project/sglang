@@ -16,7 +16,7 @@ class ScriptedKvPoolExhauster:
         self._held: List[torch.Tensor] = []
 
     def exhaust(self, *, leave_pages: int) -> None:
-        allocator = self.scheduler.token_to_kv_pool_allocator
+        allocator = self.scheduler.parts.kv.token_to_kv_pool_allocator
 
         leave_tokens = leave_pages * get_schedule().page_size
         need = allocator.available_size() - leave_tokens
@@ -31,5 +31,5 @@ class ScriptedKvPoolExhauster:
 
     def release(self) -> None:
         for held in self._held:
-            self.scheduler.token_to_kv_pool_allocator.free(held)
+            self.scheduler.parts.kv.token_to_kv_pool_allocator.free(held)
         self._held.clear()

@@ -27,7 +27,9 @@ def _advance_until_decoding(
     rids = {h.rid for h in handles}
     present: set[str] = set()
     for _ in range(max_steps):
-        present = {req.rid for req in t.scheduler.lists.decoding if req.rid in rids}
+        present = {
+            req.rid for req in t.scheduler.parts.lists.decoding if req.rid in rids
+        }
         if present == rids:
             return
         yield
@@ -65,7 +67,7 @@ class TestAbortPPCrossSlot(ScriptedTestCase):
         ]
         yield from _advance_until_decoding(t, *reqs)
 
-        slot_of = {req.rid: req.ring_slot for req in t.scheduler.lists.decoding}
+        slot_of = {req.rid: req.ring_slot for req in t.scheduler.parts.lists.decoding}
         slots = {slot_of[r.rid] for r in reqs}
         assert len(slots) == len(reqs), (
             f"setup invalid: reqs must each occupy a distinct ring slot to exercise "
