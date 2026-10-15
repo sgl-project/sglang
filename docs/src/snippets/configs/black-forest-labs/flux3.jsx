@@ -79,7 +79,7 @@ return {
       title: "Placement",
       scope: "serve",
       docsHref: "/docs/sglang-diffusion/api/cli#component-residency",
-      description: "Offload trades host RAM and transfers for lower GPU memory. Resident requires activation headroom.",
+      description: "A 1 MP, batch-1 workload fits resident on RTX 5090. Larger references or batches need additional headroom; use auto or offload when necessary.",
       default: "auto",
       options: [
         { id: "auto", label: "Auto", recommended: true, flags: [] },
@@ -89,13 +89,13 @@ return {
           flags: [
             "--component-residency transformer=layerwise-offload,text_encoder=component-offload,vae=component-offload",
           ],
-          recommendedWhen: (s) => s.hw === "rtx5090",
+          recommendedWhen: (s) => s.hw === "rtx5090" && Number(s.batch_size) > 1,
         },
         {
           id: "resident",
           label: "GPU resident",
           flags: ["--component-residency all=resident"],
-          recommendedWhen: (s) => s.hw !== "rtx5090",
+          recommendedWhen: (s) => s.hw !== "rtx5090" || Number(s.batch_size) === 1,
         },
       ],
     },
@@ -233,9 +233,14 @@ return {
       if (Number(s.batch_size) > 1) {
         parallel.push(`--batching-max-size ${Number(s.batch_size)}`, `--batching-delay-ms ${Number(s.batch_delay) || 0}`);
       }
-      const verified = s.hw === "gb300" && gpus === 1
-        && ["base", "distilled"].includes(s.variant) && s.quant === "bf16"
-        && s.placement === "resident" && s.attention === "fa"
+      const testedProfile = (["gb300", "h200"].includes(s.hw) && s.attention === "fa"
+          && ["base", "distilled"].includes(s.variant)
+          && (s.quant === "bf16" || s.quality === "exact")
+          && (s.hw === "gb300" || s.quant !== "nvfp4"))
+        || (s.hw === "rtx5090" && s.attention === "sdpa"
+          && s.variant === "base" && s.quant === "bf16");
+      const verified = testedProfile && gpus === 1
+        && s.placement === "resident"
         && s.execution === "eager" && ["exact", "lossless"].includes(s.quality)
         && Number(s.batch_size) === 1 && Number(s.outputs) === 1;
       const warnings = verified ? [] : ["This exact hardware, checkpoint and topology combination is not yet end-to-end verified."];

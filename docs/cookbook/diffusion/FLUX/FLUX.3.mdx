@@ -28,7 +28,7 @@ The picker selects `black-forest-labs/flux-3-image-klein-base` or
 `black-forest-labs/flux-3-image-klein`, each a self-contained repository. Access
 to the selected checkpoint is required. Keep `--model-path` at its repository
 root; `--model-variant` selects only the quantized DiT. Both release BF16
-checkpoints have single-GB300 generation checks; see the validation boundaries
+checkpoints have single-GPU generation checks; see the validation boundaries
 below. Unverified hardware or resource shapes remain selectable but are not
 measured recommendations.
 </Note>
@@ -126,7 +126,18 @@ different kernel paths; a B200 recipe does not establish RTX 5090 performance.
 Both quantization modes can change output quality and need workload-specific
 comparison against BF16.
 
-Both combine with the multi-GPU, offload and CUDA-graph flags below.
+These flags remain separately configurable; see the validation boundaries below
+before combining quantization with other optimizations.
+
+### LoRA adapters
+
+Use the standard LoRA API with native DiT keys, optionally prefixed by `dit.` or
+`transformer.`. BF16 dynamic and merged adapters have a synthetic rank-4 generation
+check, including repeatability and exact restoration after unloading; this does
+not validate every community adapter. For quantized deployments requiring LoRA,
+pass `--lora-path` at startup to select the generic quantized layout. Attaching
+LoRA after PrimsTS weight preparation is rejected before replacing any layers.
+Quantized LoRA combinations still need separate end-to-end validation.
 
 ## 4. Multi-GPU and memory
 
@@ -150,6 +161,15 @@ on several GPUs. Preserve headroom for the longest prompt, references and output
 size you intend to serve; a successful small request is not a capacity guarantee.
 </Note>
 
+For FP32 VAE attention above 1 MP, `quality="lossless"` can use dense-layout,
+full-context memory-efficient SDPA; `quality="exact"` retains the original path.
+It does not prune attention or reduce precision, but reduction order can change
+pixels. In a Base BF16 test with a 2048x2048 reference and 1024x1024 output,
+GB300 peak allocated memory fell from 54.3 to 29.5 GiB; latency was effectively
+unchanged. GB300/H200 image SSIM was 0.9951-0.9992 against the exact path across
+four samples. This is allocated memory, not total device usage: a 32 GB card
+still needs offload or quantization headroom for that reference size.
+
 ## 5. Cache-DiT
 
 [Cache-DiT](/docs/sglang-diffusion/cache_dit) skips the 28 single-stream blocks
@@ -157,6 +177,9 @@ on steps where their input barely changes and reuses the cached residual. Turn
 it on for every request with `SGLANG_CACHE_DIT_ENABLED=true` on `sglang serve`,
 or per request with `"enable_cache_dit": true`. A request can also tune it, for
 example `"cache_dit_params": {"residual_diff_threshold": 0.12, "enable_taylorseer": true}`.
+
+For image editing, send `-F "enable_cache_dit=true"` and a JSON-encoded
+`cache_dit_params` form field; generation uses JSON request fields.
 
 Cache-DiT is approximate and may change composition; measure quality and latency
 on representative prompts rather than treating its threshold as a fidelity guarantee.
@@ -262,12 +285,37 @@ batching rather than assuming a batch-1 recipe fits on a 32 GB card at batch 2.
 
 ## 8. Validation boundaries
 
-Both release BF16 checkpoints have been tested on one GB300 with FlashAttention,
-eager execution, all components resident and batch 1: 1024x1024 T2I and I2I,
-50 steps for Base and 16 for distilled, two prompts/seeds, and repeated requests.
-The repeated requests matched pixel-for-pixel within each quality setting.
-These generation checks do not establish official-reference parity or validate
-the other hardware, quantization and parallel configurations in the picker.
+The release BF16 and FP8R checkpoints have single-GB300/H200 generation checks;
+NVFP4 has GB300 checks. Base BF16 also has an RTX 5090 check. Each uses eager
+execution, all components resident, batch 1, 1024x1024 T2I and I2I, two
+prompts/seeds and repeated requests. Base uses 50 steps and distilled uses 16.
+Repeated requests matched pixel-for-pixel within each tested configuration.
+This does not establish official-reference parity or validate every combination
+of hardware, parallelism, batching and optional features in the picker.
+
+### Single-GPU measurements
+
+Warmed local HTTP medians, including PNG encoding and response transfer, from
+two rounds per prompt. PyTorch 2.14.1+cu130, Transformers 5.19.0, FP32 VAE,
+`quality="exact"`; FlashAttention on GB300/H200 and Torch SDPA on RTX 5090.
+The Base checkpoint revision is `d8acde427a698bdb98b5c1c941c60fa4c97e9f28`.
+SSIM compares each quantized result with BF16 on the same GPU, prompt, seed and
+reference, and reports the lowest value across two samples, not a quality bound.
+
+| GPU | Base DiT | T2I | I2I | Minimum SSIM, T2I / I2I |
+| --- | --- | --- | --- | --- |
+| GB300, 277 GiB | BF16 | 3.21 s | 6.31 s | Reference |
+| GB300, 277 GiB | FP8R | 2.18 s | 4.49 s | 0.958 / 0.981 |
+| GB300, 277 GiB | NVFP4 | 2.14 s | 4.31 s | 0.919 / 0.958 |
+| H200, 140 GiB | BF16 | 7.09 s | 14.52 s | Reference |
+| H200, 140 GiB | FP8R | 5.15 s | 11.24 s | 0.955 / 0.984 |
+| RTX 5090, 32 GB | BF16 | 20.39 s | 43.4 s | Reference |
+
+For the distilled checkpoint, quantization's T2I benefit was small on GB300;
+do not assume Base's speedup transfers to a 16-step workload. Cache-DiT at
+threshold 0.12 reduced Base I2I from 6.31 to 3.08 s on GB300, with sample SSIM
+0.9786-0.9975. It remains opt-in and approximate. Breakable CUDA graphs did not
+provide a clear latency win in the tested GB300 workload; eager stays recommended.
 
 The native DiT's packed CFG forward has focused comparison tests against the
 shared FLUX 3 transformer. Such component tests do not replace full-checkpoint
