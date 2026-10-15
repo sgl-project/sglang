@@ -13,7 +13,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    get_next_token_logits_dtype,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -246,7 +249,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             next_token_logits_buffer = (
                 self.model_runner.graph_shared_output.get_logits_buffer(
-                    vocab_size, rows=self.max_bs
+                    vocab_size,
+                    rows=self.max_bs,
+                    dtype=get_next_token_logits_dtype(
+                        self.model_runner.model_config.hf_text_config
+                    ),
                 )
             )
 
