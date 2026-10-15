@@ -2251,7 +2251,7 @@ MPS and does not read them.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AUTO_NUMA_BIND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Without <code>CAP_SYS_NICE</code>, only CPU affinity is set. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
