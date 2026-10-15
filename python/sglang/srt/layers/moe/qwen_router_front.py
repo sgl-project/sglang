@@ -127,6 +127,7 @@ def _static_supported_rt(block: "Qwen2MoeSparseMoeBlock") -> bool:
         and not experts.quant_method.quant_config.use_per_token_activation
         and experts.trtllm_padded_hidden_size is None
         and not experts._dwdp_bound
+        and not experts.reduce_results
         and not block.enable_shared_expert_fusion
         and experts.hidden_size == _HIDDEN
         and experts.w13_input_scale_quant.numel() == 1
