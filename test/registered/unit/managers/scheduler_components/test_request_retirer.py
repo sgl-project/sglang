@@ -202,5 +202,51 @@ class TestBeamGroupLeavesWithItsLeader(CustomTestCase):
         self.assertEqual(beam._num_live_groups, 0)
 
 
+class TestRetractBacksUpBeforeHiSparse(CustomTestCase):
+    """A PD decode retraction copies the request's KV to host before HiSparse
+    frees the rows and device buffers the copy reads."""
+
+    def test_backup_runs_before_the_hisparse_release(self):
+        enter_scope(
+            self,
+            published_topology(
+                disaggregation_mode="decode",
+                disaggregation_decode_retraction_backup="host_pool",
+            ),
+        )
+        events = []
+        hisparse = SimpleNamespace(
+            retract_req=lambda req: events.append("hisparse"),
+            holds_rows=lambda req: True,
+            request_finished=lambda req: events.append("hisparse"),
+        )
+        retirer = _retirer(
+            kv=SimpleNamespace(
+                tree_cache=MagicMock(),
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+            ),
+            hisparse_coordinator=hisparse,
+        )
+        req = Req("r", "", [1, 2], SamplingParams())
+        req.kv.req_pool_idx = 1
+
+        def release_kv(req, tree_cache, *, checkpoint):
+            events.append("kv")
+            req.kv.req_pool_idx = None
+
+        with (
+            patch(
+                f"{_RETIRER}.backup_kv_cache",
+                side_effect=lambda *args: events.append("backup") or True,
+            ),
+            patch(f"{_RETIRER}.release_kv_cache", side_effect=release_kv),
+            patch(f"{_RETIRER}.evict_from_tree_cache"),
+        ):
+            self.assertTrue(retirer.retract(req, num_remaining_reqs=1))
+
+        self.assertEqual(events, ["backup", "hisparse", "kv"])
+
+
 if __name__ == "__main__":
     unittest.main()

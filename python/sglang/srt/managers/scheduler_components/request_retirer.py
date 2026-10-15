@@ -7,8 +7,8 @@ parts its outcome needs, in this order:
 1. media and streaming session, with the end of the cache request (an aborted
    outcome);
 2. beam group (an aborted outcome);
-3. HiSparse rows;
-4. retraction backup (a retraction; it reads the device KV);
+3. retraction backup (a retraction; it reads the device KV);
+4. HiSparse rows;
 5. KV row and request slot.
 
 One entry keeps a documented exception: a PD transfer that failed after its
@@ -145,10 +145,6 @@ class RequestRetirer:
     ) -> bool:
         """Give a decoding request's KV back so it can be requeued; returns
         False when the KV backup failed and the request cannot be resumed."""
-        hisparse_coordinator = self.hisparse_coordinator
-        if hisparse_coordinator is not None and not req.finished():
-            hisparse_coordinator.retract_req(req)
-
         # In decode disaggregation the retracted KV is offloaded to host so it can be
         # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
         # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
@@ -163,6 +159,10 @@ class RequestRetirer:
                 self.kv.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+        # HiSparse frees the rows and device buffers the backup above reads.
+        hisparse_coordinator = self.hisparse_coordinator
+        if hisparse_coordinator is not None and not req.finished():
+            hisparse_coordinator.retract_req(req)
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, checkpoint=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
