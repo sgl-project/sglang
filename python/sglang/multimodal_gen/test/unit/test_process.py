@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
+import gc
 import importlib.util
 import os
 import subprocess
@@ -16,6 +18,7 @@ assert SPEC is not None and SPEC.loader is not None
 PROCESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROCESS)
 kill_process_tree = PROCESS.kill_process_tree
+defer_full_gc_for_imports = PROCESS.defer_full_gc_for_imports
 
 
 @unittest.skipUnless(os.name == "posix", "requires POSIX process semantics")
@@ -89,6 +92,34 @@ class TestKillProcessTree(unittest.TestCase):
 
     def test_missing_parent_is_noop(self):
         kill_process_tree(0x7FFFFFFF)
+
+
+class TestDeferFullGcForImports(unittest.TestCase):
+    def full_collections_while_allocating(self, block):
+        gc.collect()
+        threshold0, threshold1, threshold2 = gc.get_threshold()
+        # Enough survivors that the collector's own rule makes a full one due.
+        count = len(gc.get_objects()) + 2 * threshold0 * threshold1 * threshold2
+        before = gc.get_stats()[2]["collections"]
+        with block():
+            kept = [[] for _ in range(count)]
+            full = gc.get_stats()[2]["collections"] - before
+        del kept
+        return full
+
+    def test_no_full_collection_inside_and_thresholds_restored(self):
+        thresholds = gc.get_threshold()
+
+        self.assertGreater(
+            self.full_collections_while_allocating(contextlib.nullcontext), 0
+        )
+        self.assertEqual(
+            self.full_collections_while_allocating(defer_full_gc_for_imports), 0
+        )
+        with self.assertRaises(ImportError):
+            with defer_full_gc_for_imports():
+                raise ImportError
+        self.assertEqual(gc.get_threshold(), thresholds)
 
 
 if __name__ == "__main__":
