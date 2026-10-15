@@ -56,6 +56,8 @@ class _Adder:
     """Admits the first num_fit requests offered, then finds no KV room."""
 
     num_fit = 0
+    # The verdict after an admission: NO_TOKEN when it used up the budget.
+    verdict_after_fit = AddReqResult.CONTINUE
 
     def __init__(self, *args, **kwargs):
         self.can_run_list = []
@@ -68,7 +70,7 @@ class _Adder:
         self.offered.append(req)
         if len(self.can_run_list) < self.num_fit:
             self.can_run_list.append(req)
-            return AddReqResult.CONTINUE
+            return self.verdict_after_fit
         return AddReqResult.NO_TOKEN
 
 
@@ -402,3 +404,14 @@ class TestNoKvRoomAfterAdmitting(_AdmissionCase):
         lists.decoding.remove(admitted)
         self.free_rows += 1
         self.assertEqual(self._admit(), ["w1"])
+
+    def test_no_record_when_the_last_waiting_request_used_up_the_budget(self):
+        # The admission that ends the pass on NO_TOKEN took the only waiting
+        # request; no request is left to head the queue.
+        _Adder.verdict_after_fit = AddReqResult.NO_TOKEN
+        self.addCleanup(setattr, _Adder, "verdict_after_fit", AddReqResult.CONTINUE)
+        lists = self.planner.core_lists
+        lists.waiting_queue = [_req("w0")]
+
+        self.assertEqual(self._admit(), ["w0"])
+        self.assertEqual(self.planner._no_kv_room, {})

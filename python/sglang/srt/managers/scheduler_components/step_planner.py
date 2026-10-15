@@ -526,18 +526,22 @@ class StepPlanner:
             and self.hisparse_coordinator is None
         ):
             # As the launch leaves them: the admitted requests out of the
-            # queue, and those without a row holding a new one.
+            # queue, and those without a row holding a new one. An admission
+            # that used up the budget may have taken the last waiting request;
+            # the next pass then skips on the empty queue.
             admitted = set(adder.can_run_list)
-            num_new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
             waiting_queue = self.core_lists.waiting_queue
-            self._no_kv_room[slot.index] = _NoKvRoom(
-                running=tuple(running_reqs),
-                num_free_req_slots=(
-                    self.req_to_token_pool.available_size() - num_new_rows
-                ),
-                head=next(r for r in waiting_queue if r not in admitted),
-                tail=waiting_queue[-1],
-            )
+            head = next((r for r in waiting_queue if r not in admitted), None)
+            if head is not None:
+                num_new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
+                self._no_kv_room[slot.index] = _NoKvRoom(
+                    running=tuple(running_reqs),
+                    num_free_req_slots=(
+                        self.req_to_token_pool.available_size() - num_new_rows
+                    ),
+                    head=head,
+                    tail=waiting_queue[-1],
+                )
 
         # Preemption already released these requests; requeue them even when
         # the request they made room for was not admitted.
