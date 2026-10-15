@@ -182,7 +182,6 @@ class TestBiasedGroupedTopK(CustomTestCase):
 
         for M in num_tokens:
             for num_fused_shared_experts in num_fused_shared_experts_list:
-
                 topk_routed = topk_value - num_fused_shared_experts
                 hidden_states = torch.randn(M, 100, dtype=torch.bfloat16, device=device)
                 gating_output = torch.randn(M, E_num, dtype=gating_dtype, device=device)
@@ -243,7 +242,6 @@ class TestBiasedGroupedTopK(CustomTestCase):
 
         for M in num_tokens:
             for num_fused_shared_experts in num_fused_shared_experts_list:
-
                 topk_routed = topk_value - num_fused_shared_experts
                 hidden_states = torch.randn(M, 100, dtype=torch.bfloat16, device=device)
                 gating_output = torch.randn(M, E_num, dtype=gating_dtype, device=device)
@@ -301,7 +299,6 @@ class TestBiasedGroupedTopK(CustomTestCase):
             for M in num_tokens:
                 for scoring_func in scoring_func_list:
                     for num_fused_shared_experts in num_fused_shared_experts_list:
-
                         topk_routed = topk_value - num_fused_shared_experts
                         hidden_states = torch.randn(
                             M, 100, dtype=gating_dtype, device=device

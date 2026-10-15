@@ -25,12 +25,12 @@ def unpack_from_int32(
     :param packed_dim: Dimension along which weights are packed (0 or 1), defaults to 1
     :return: Unpacked tensor with int8 dtype after applying offset correction
     """
-    assert (
-        weight.dtype == torch.int32
-    ), f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
-    assert (
-        num_bits <= 8
-    ), f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
+    assert weight.dtype == torch.int32, (
+        f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
+    )
+    assert num_bits <= 8, (
+        f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
+    )
 
     pack_factor = 32 // num_bits
     mask = (1 << num_bits) - 1

@@ -72,17 +72,17 @@ class ModelConfig:
 
 
 MI35X_MINIMAX_M3_TP4_MODELS = [
-    # MXFP8 + aiter attn + fp8 KV, with the block-fp8 linear path (PR #32036)
-    # and custom/quick INT4 all-reduce (PR #32230) opted in. Both are opt-in
-    # via env: on gfx950 block convert is not automatic
-    # (mxfp8_block_convert_required() is False), and the M3 overrides otherwise
-    # force --disable-custom-all-reduce.
+    # MXFP8 + aiter attn + aiter MoE + fp8 KV, with the dense-only block-fp8
+    # linear path (PR #32036) and custom/quick INT4 all-reduce (PR #32230)
+    # opted in. Both are opt-in via env: on gfx950 block convert is not
+    # automatic (mxfp8_block_convert_required() is False), and the M3 overrides
+    # otherwise force --disable-custom-all-reduce.
     ModelConfig(
         model_path="MiniMaxAI/MiniMax-M3-MXFP8",
         tp_size=4,
         accuracy_threshold=0.95,
         timeout=5400,
-        variant="TP4+MXFP8+aiterAttn+fp8KV+blockFP8+quickAR",
+        variant="TP4+MXFP8+aiterAttn+aiterMoE+fp8KV+blockFP8dense+quickAR",
         other_args=[
             "--quantization",
             "mxfp8",
@@ -90,6 +90,8 @@ MI35X_MINIMAX_M3_TP4_MODELS = [
             "bfloat16",
             "--trust-remote-code",
             "--attention-backend",
+            "aiter",
+            "--moe-runner-backend",
             "aiter",
             "--kv-cache-dtype",
             "fp8_e4m3",
@@ -107,10 +109,11 @@ MI35X_MINIMAX_M3_TP4_MODELS = [
             # router GEMM (torch.mm(bf16, bf16, out_dtype=float32)); force the
             # fp32 router path. Also gives more precise expert routing.
             "SGLANG_OPT_USE_BF16_ROUTER_GEMM": "0",
-            # Block-fp8 linear path (PR #32036): convert MXFP8 linear weights to
-            # block-fp8 [128,128] and run them through the tuned block-scale
-            # (bpreshuffle) GEMM on gfx950.
-            "SGLANG_FORCE_MXFP8_BLOCK_CONVERT": "1",
+            # Block-fp8 linear path (PR #32036), dense layers only: convert the
+            # dense MXFP8 weights to block-fp8 [128,128] and run them through the
+            # tuned block-scale (bpreshuffle) GEMM on gfx950, while the MoE stays
+            # on native MXFP8 (FlyDSL).
+            "SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE": "1",
             # Custom / quick all-reduce (PR #32230): keep custom all-reduce on so
             # the INT4 quick-reduce path is used for the TP all-reduce.
             "SGLANG_M3_ALLOW_CUSTOM_AR": "1",
@@ -212,9 +215,9 @@ class TestMiniMaxM3TP4EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 GPT_OSS_CALL_TOKEN = 200012
 
@@ -55,6 +55,18 @@ class TestTrimMatchedStop(unittest.TestCase):
 
     def test_token_no_trim_keeps_all(self):
         self.assertEqual(_trim([1, 2, 3], 3, True), [1, 2, 3])
+
+    def test_token_zero_is_a_stop_token(self):
+        # Token id 0 is falsy; the guard checks `matched is None`, not truthiness.
+        self.assertEqual(_trim([123, 0], 0, False), [123])
+        self.assertEqual(_trim([123, 0], 0, True), [123, 0])
+
+    def test_matched_none_inside_a_finished_reason_returns_output(self):
+        stub = SimpleNamespace(is_tool_call_parser_gpt_oss=False)
+        trimmed = DetokenizerManager.trim_matched_stop(
+            stub, [123, 0], {"type": "stop", "matched": None}, False
+        )
+        self.assertEqual(trimmed, [123, 0])
 
     def test_token_gpt_oss_call_kept(self):
         # gpt-oss tool-call token is also an eos; keep it even when trimming.

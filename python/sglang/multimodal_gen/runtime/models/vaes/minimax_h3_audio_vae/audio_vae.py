@@ -140,8 +140,8 @@ def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
 
 
-@torch.jit.script
 def snake(x, alpha):
+    # profiling JIT changes rounding after the first call when it fuses this graph
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
     x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
@@ -222,7 +222,6 @@ class Encoder(nn.Module):
 
         # Wrap black into nn.Sequential
         self.block = nn.Sequential(*self.block)
-        self.enc_dim = d_model
 
     def forward(self, x):
         return self.block(x)

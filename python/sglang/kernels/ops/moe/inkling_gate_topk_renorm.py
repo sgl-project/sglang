@@ -244,9 +244,9 @@ def _get_fused_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor
         # buffers in the capture pool, where other graphs' replays can reuse
         # (clobber) them. Call ensure_gate_gemv_fused_scratch() eagerly first
         # (InklingGate.__init__ does).
-        assert (
-            not torch.cuda.is_current_stream_capturing()
-        ), "fused gate scratch must be allocated before CUDA graph capture"
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "fused gate scratch must be allocated before CUDA graph capture"
+        )
         workspace = torch.empty(
             (_FUSED_MAX_TOKENS, _LOGITS_PAD), dtype=torch.float32, device=device
         )

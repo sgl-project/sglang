@@ -418,16 +418,16 @@ def silu_and_mul_masked_post_quant_fwd(
 
     if output_scale.dtype == torch.int32:
         assert scale_ue8m0, "packed int32 scales are UE8M0 by definition"
-        assert (
-            num_real_tokens is not None and topk is not None
-        ), "the packed schedule sizes its grid from num_real_tokens * topk"
+        assert num_real_tokens is not None and topk is not None, (
+            "the packed schedule sizes its grid from num_real_tokens * topk"
+        )
         E, m_max, _ = input.shape
         G = size_n // quant_group_size
         assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
         BLOCK_N = quant_group_size * 4
-        assert (
-            size_n % BLOCK_N == 0
-        ), "packed UE8M0 path requires size_n % (4*group) == 0"
+        assert size_n % BLOCK_N == 0, (
+            "packed UE8M0 path requires size_n % (4*group) == 0"
+        )
         hidden_dim_split = size_n // BLOCK_N
         assert tuple(output_scale.shape) == (E, hidden_dim_split, m_max)
 
@@ -1155,9 +1155,12 @@ def ep_scatter(
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
     quant_block_size: int = 128,
+    expert_alignment: int = 128,
     expert_start: int = 0,
 ):
-    BLOCK_E = 128  # token num of per expert is aligned to 128
+    # tl.arange needs pow2, and the kernel's unmasked stores need BLOCK_E to
+    # divide the expert_alignment-padded segments; lowbit satisfies both.
+    BLOCK_E = expert_alignment & -expert_alignment
     BLOCK_D = quant_block_size  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -1175,9 +1178,9 @@ def ep_scatter(
 
     is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
     if is_fp8:
-        assert (
-            recv_x_scale.dtype == output_tensor_scale.dtype
-        ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        assert recv_x_scale.dtype == output_tensor_scale.dtype, (
+            f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        )
         assert (
             recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
         )
@@ -1267,13 +1270,13 @@ def ep_scatter_from_psum(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    quant_block_size: int = 128,
 ):
     BLOCK_E = 128
-    BLOCK_D = 128
     num_warps = 8
     num_experts = psum_num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-    scale_hidden_size = hidden_size // BLOCK_D
+    scale_hidden_size = hidden_size // quant_block_size
     if scale_ue8m0:
         scale_hidden_size = ceil_div(scale_hidden_size, 4)
 
@@ -1293,6 +1296,10 @@ def ep_scatter_from_psum(
         BLOCK_E=BLOCK_E,
     )
 
+    # The BF16 specialization never dereferences these scale pointers.
+    recv_x_scale_arg = recv_x_scale if is_fp8 else recv_x
+    output_tensor_scale_arg = output_tensor_scale if is_fp8 else output_tensor
+
     grid = min(recv_topk.shape[0], 1024 * 8)
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
@@ -1300,7 +1307,7 @@ def ep_scatter_from_psum(
         recv_x,
         recv_x.stride(0),
         recv_x.stride(1),
-        recv_x_scale,
+        recv_x_scale_arg,
         recv_x_scale.stride(0) if is_fp8 else 0,
         recv_x_scale.stride(1) if is_fp8 else 0,
         recv_topk,
@@ -1309,12 +1316,15 @@ def ep_scatter_from_psum(
         output_tensor,
         output_tensor.stride(0),
         output_tensor.stride(1),
-        output_tensor_scale,
+        output_tensor_scale_arg,
         output_tensor_scale.stride(0) if is_fp8 else 0,
         output_tensor_scale.stride(1) if is_fp8 else 0,
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        # DeepEP v2 already rebases recv_topk to local expert IDs.
+        0,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
@@ -1323,46 +1333,6 @@ def ep_scatter_from_psum(
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
         ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
         IS_FP8=is_fp8,
-    )
-    return
-
-
-@triton.jit
-def _fwd_kernel_ep_expand_m_indices_init(
-    psum_num_recv_tokens_per_expert,
-    m_indices,
-    BLOCK_E: tl.constexpr,
-):
-    cur_expert = tl.program_id(0)
-    cur_end = tl.load(psum_num_recv_tokens_per_expert + cur_expert)
-    prev_end = tl.load(
-        psum_num_recv_tokens_per_expert + cur_expert - 1,
-        mask=cur_expert > 0,
-        other=0,
-    )
-    cur_start = ((prev_end + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
-    aligned_end = ((cur_end + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
-
-    off_expert = tl.arange(0, BLOCK_E)
-    for start_m in tl.range(0, aligned_end - cur_start, BLOCK_E, num_stages=4):
-        idx = cur_start + start_m + off_expert
-        tl.store(m_indices + idx, cur_expert, mask=idx < aligned_end)
-
-
-@torch.no_grad()
-def ep_expand_init_m_indices_from_psum(
-    psum_num_recv_tokens_per_expert: torch.Tensor,
-    m_indices: torch.Tensor,
-):
-    BLOCK_E = 128
-    num_warps = 8
-    num_experts = psum_num_recv_tokens_per_expert.shape[0]
-    assert m_indices.shape[0] % BLOCK_E == 0
-    _fwd_kernel_ep_expand_m_indices_init[(num_experts,)](
-        psum_num_recv_tokens_per_expert,
-        m_indices,
-        num_warps=num_warps,
-        BLOCK_E=BLOCK_E,
     )
     return
 
@@ -2566,6 +2536,95 @@ def masked_slab_to_expand(
         num_warps=4,
     )
     return output_tensor
+
+
+@triton.jit
+def _fwd_kernel_fill_m_indices_from_psum(
+    psum_ptr,
+    m_indices_ptr,
+    total_rows,
+    ALIGN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # psum is DeepEP's inclusive per-expert count: psum[i] = align(psum[i-1]) +
+    # count_i (only earlier experts aligned), so both start and seg_end round up.
+    # Each expert's whole aligned segment gets its id, padding rows included --
+    # combine ignores them, so the junk the GEMM computes there is discarded.
+    # Only rows past the last segment keep the wrapper's -1 sentinel; with
+    # do_cpu_sync=True there are none, so that fill is pure insurance.
+    e = tl.program_id(0)
+    prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
+    start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
+    end = tl.load(psum_ptr + e)
+    seg_end = ((end + ALIGN - 1) // ALIGN) * ALIGN
+    count = seg_end - start
+    off = tl.arange(0, BLOCK_M)
+    for base in tl.range(0, count, BLOCK_M):
+        idx = start + base + off
+        tl.store(m_indices_ptr + idx, e, mask=(base + off < count) & (idx < total_rows))
+
+
+@torch.no_grad()
+def fill_m_indices_from_psum(
+    psum_num_recv_tokens_per_expert: torch.Tensor,
+    num_local_experts: int,
+    total_rows: int,
+    expert_alignment: int,
+) -> torch.Tensor:
+    """Build contiguous-GEMM `m_indices` from the device psum (deepep_v2
+    `do_expand=True` prefill).
+
+    The psum from DeepEP is already the alignment-padded per-expert prefix sum,
+    so this only labels rows.
+    """
+    # do_cpu_sync=True sizes recv_x to align(psum[-1]); the last expert's segment
+    # therefore ends exactly at total_rows (no capacity tail to skip).
+    assert total_rows % expert_alignment == 0, (
+        f"total_rows {total_rows} not a multiple of expert_alignment {expert_alignment}"
+    )
+    # -1 is DeepGEMM's "empty token" sentinel: uncovered rows are zero-filled and
+    # skipped instead of indexing the weight tensor out of bounds.
+    m_indices = torch.full(
+        (total_rows,),
+        -1,
+        device=psum_num_recv_tokens_per_expert.device,
+        dtype=torch.int32,
+    )
+    _fwd_kernel_fill_m_indices_from_psum[(num_local_experts,)](
+        psum_num_recv_tokens_per_expert,
+        m_indices,
+        total_rows,
+        ALIGN=expert_alignment,
+        BLOCK_M=128,
+        num_warps=4,
+    )
+    return m_indices
+
+
+@torch.no_grad()
+def scale_expanded_rows_(
+    x: torch.Tensor,
+    row_weights: torch.Tensor,
+) -> torch.Tensor:
+    """In-place `x[r, :] *= row_weights[r]` for a 2D `x`, any strides.
+
+    deepep_v2 `do_expand=True` prefill folds the router weights into the
+    down-proj input scale here, because ElasticBuffer.combine ignores
+    topk_weights in expand mode. `row_weights` must be a 1-D `[rows]` tensor
+    (what DeepEP hands back). `x` must be fp32: a packed UE8M0 scale cannot
+    absorb the weight, and a lower-precision `x` would round it.
+    """
+    assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
+    assert x.dtype == torch.float32, f"expected fp32 x, got {x.dtype}"
+    rows, _ = x.shape
+    assert row_weights.dim() == 1, (
+        f"expected 1-D row_weights, got {row_weights.dim()}-D {tuple(row_weights.shape)}"
+    )
+    assert row_weights.numel() == rows, (
+        f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
+    )
+    x.mul_(row_weights.unsqueeze(1))
+    return x
 
 
 def _moe_permute_rows(

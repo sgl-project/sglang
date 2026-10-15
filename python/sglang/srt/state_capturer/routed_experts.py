@@ -71,14 +71,14 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         topk_size = model_config.hf_text_config.num_experts_per_tok
         num_layers = model_config.hf_text_config.num_hidden_layers
 
-        # Scale by dp_size so the buffer covers the full DP-concatenated batch.
+        # Scale by num_dp_ranks so the buffer covers the full DP-concatenated batch.
         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
         max_batch_size = max(
-            get_schedule().chunked_prefill_size * get_parallel().dp_size,
-            max_running_requests * get_parallel().dp_size,
+            get_schedule().chunked_prefill_size * get_parallel().num_dp_ranks,
+            max_running_requests * get_parallel().num_dp_ranks,
         )
 
         super().__init__(
@@ -142,6 +142,12 @@ def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:
 def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
 
     get_resources().experts_capturer = capturer
+
+
+def destroy_global_experts_capturer():
+    if (capturer := get_resources().experts_capturer) is not None:
+        capturer.destroy()
+    get_resources().experts_capturer = None
 
 
 def extract_routed_experts_from_meta_info(data):
