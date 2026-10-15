@@ -270,8 +270,13 @@ def append_distributed_topk_chunk(
     top_logprobs_val: List,
     top_logprobs_idx: List,
     split_pruned_len: int,
+    copy_to_pinned_cpu: bool = False,
 ) -> int:
     """Restore prompt top-k responses from row-major distributed results."""
+    if copy_to_pinned_cpu:
+        values = async_d2h(values)
+        indices = async_d2h(indices)
+
     pt = 0
     next_split_pruned_len = 0
     for n, (k, original_pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
@@ -283,8 +288,14 @@ def append_distributed_topk_chunk(
             continue
 
         available_rows = min(pruned_len, max(values.shape[0] - pt, 0))
-        val = values[pt : pt + available_rows, :k].tolist()
-        idx = indices[pt : pt + available_rows, :k].tolist()
+        if copy_to_pinned_cpu:
+            # Preserve one span per sequence. finalize_input_logprobs waits for
+            # the shared copy event, then converts each span to response rows.
+            val = [values[pt : pt + available_rows, :k]] if available_rows else []
+            idx = [indices[pt : pt + available_rows, :k]] if available_rows else []
+        else:
+            val = values[pt : pt + available_rows, :k].tolist()
+            idx = indices[pt : pt + available_rows, :k].tolist()
         if current_split:
             top_logprobs_val[-1].extend(val)
             top_logprobs_idx[-1].extend(idx)
@@ -349,8 +360,12 @@ def _append_token_ids_chunk_from_flat_scores(
     flat_scores: torch.Tensor,
     token_ids_logprobs_val: List,
     token_ids_logprobs_idx: List,
+    copy_to_pinned_cpu: bool = False,
 ) -> None:
     """Restore the existing per-sequence/per-row response shape."""
+    if copy_to_pinned_cpu:
+        flat_scores = async_d2h(flat_scores)
+
     score_pt = 0
     for entry in plan.entries:
         token_ids = entry.token_ids
@@ -362,12 +377,18 @@ def _append_token_ids_chunk_from_flat_scores(
             values = flat_scores[score_pt : score_pt + count].reshape(
                 entry.num_rows, width
             )
-            val = values.tolist()
+            if copy_to_pinned_cpu:
+                val = [values] if entry.num_rows else []
+            else:
+                val = values.tolist()
             idx = [token_ids for _ in range(entry.num_rows)]
         else:
             # [] requests a zero-width result for every prompt row; None is
             # the opt-out sentinel and returns no rows at all.
-            val = [[] for _ in range(entry.num_rows)]
+            if copy_to_pinned_cpu and entry.num_rows:
+                val = [flat_scores[score_pt:score_pt].reshape(entry.num_rows, 0)]
+            else:
+                val = [[] for _ in range(entry.num_rows)]
             idx = [[] for _ in range(entry.num_rows)]
         score_pt += count
 
@@ -816,6 +837,15 @@ class InputLogprobProcessor:
         use_distributed_logprobs = (
             distributed_context is not None and self.enable_fast_input_logprobs
         )
+        stage_distributed_outputs = (
+            use_distributed_logprobs
+            and pruned_states.is_cuda
+            and is_pin_memory_available(pruned_states.device)
+            and (
+                logits_metadata.extend_return_top_logprob
+                or logits_metadata.extend_token_ids_logprob
+            )
+        )
         borrow_logprob_memory = False
         # Distributed results stay on device; do not borrow graph-pool storage.
         if pruned_states.is_cuda and not use_distributed_logprobs:
@@ -834,6 +864,7 @@ class InputLogprobProcessor:
             logits_metadata,
             chunk_size,
             distributed_context=distributed_context,
+            stage_distributed_outputs=stage_distributed_outputs,
             borrow_logprob_memory=borrow_logprob_memory,
             borrow_logits_memory=(
                 borrow_logprob_memory and not skip_chunking_for_dp_attn
@@ -889,6 +920,7 @@ class InputLogprobProcessor:
         logits_metadata: LogitsMetadata,
         chunk_size: int,
         distributed_context: Optional[DistributedLogprobContext] = None,
+        stage_distributed_outputs: bool = False,
         borrow_logprob_memory: bool = False,
         borrow_logits_memory: bool = False,
     ) -> Tuple[LogprobResult, torch.Tensor]:
@@ -1101,6 +1133,7 @@ class InputLogprobProcessor:
                                 top_logprobs_val,
                                 top_logprobs_idx,
                                 split_len_topk,
+                                copy_to_pinned_cpu=stage_distributed_outputs,
                             )
 
                         if explicit_plan is not None:
@@ -1109,6 +1142,7 @@ class InputLogprobProcessor:
                                 normalized_scores[num_targets:],
                                 token_ids_logprobs_val,
                                 token_ids_logprobs_idx,
+                                copy_to_pinned_cpu=stage_distributed_outputs,
                             )
                             split_len_token_ids = explicit_plan.next_split_pruned_len
                     else:
@@ -1135,6 +1169,7 @@ class InputLogprobProcessor:
                                 top_logprobs_val,
                                 top_logprobs_idx,
                                 split_len_topk,
+                                copy_to_pinned_cpu=stage_distributed_outputs,
                             )
                         if logits_metadata.extend_token_ids_logprob:
                             explicit_plan = _build_token_ids_chunk_plan(
@@ -1151,6 +1186,7 @@ class InputLogprobProcessor:
                                 chunk_logprobs.new_empty(0, dtype=torch.float32),
                                 token_ids_logprobs_val,
                                 token_ids_logprobs_idx,
+                                copy_to_pinned_cpu=stage_distributed_outputs,
                             )
                             split_len_token_ids = explicit_plan.next_split_pruned_len
                     del chunk_logprobs
@@ -1249,11 +1285,12 @@ class InputLogprobProcessor:
             lm_head.reset_lm_head_pass()
 
         input_copy_done = None
-        if borrow_logprob_memory:
-            # The copies and the next replay share the forward stream.
+        if borrow_logprob_memory or stage_distributed_outputs:
+            # The output copies and their source tensors share the forward
+            # stream. Consumers wait once before expanding the staged spans.
             input_copy_done = torch.cuda.Event()
             input_copy_done.record(torch.cuda.current_stream(pruned_states.device))
-        else:
+        if not borrow_logprob_memory:
             # Concatenate the results
             token_logprobs = torch.cat(token_logprobs, dim=0)
 
