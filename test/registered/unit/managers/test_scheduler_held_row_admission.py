@@ -44,6 +44,9 @@ class _Adder:
         self.can_run_list.append(req)
         return None
 
+    def budget_state(self):
+        return AddReqResult.CONTINUE
+
     def add_one_req(self, req, has_chunked_req, truncation_align_size):
         self.can_run_list.append(req)
         return AddReqResult.CONTINUE
