@@ -22,7 +22,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import worker_setup
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -723,9 +723,11 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    def _scheduler(
+    def _start_steps(
         self, worker, trace, *, mode, draft_worker=None, enable_overlap=True, pp_size=1
     ):
+        """Stand in for the worker startup steps that load, allocate and
+        capture; the routing between them runs for real."""
         # The schedule reads the mode from the bags, so the test states it by
         # publishing a record rather than by standing one in.
         reset_context()
@@ -737,19 +739,17 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             ),
             role="scheduler",
         )
-        scheduler = Scheduler.__new__(Scheduler)
         get_context().override("test", disable_overlap_schedule=not enable_overlap)
-        scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
-        scheduler.maybe_init_draft_worker = lambda: setattr(
-            scheduler, "draft_worker", draft_worker
+        steps = dict(
+            init_tp_model_worker=lambda **_: worker,
+            maybe_init_draft_worker=lambda **_: draft_worker,
+            maybe_init_dllm_worker=lambda **_: None,
+            init_memory_pools=lambda **_: trace.append("memory_pool"),
+            init_all_attention_backends=lambda **_: trace.append("attention"),
+            init_all_cuda_graphs=lambda **_: trace.append("capture"),
         )
-        scheduler.maybe_init_dllm_worker = lambda: setattr(
-            scheduler, "dllm_worker", None
-        )
-        scheduler.init_memory_pools = lambda: trace.append("memory_pool")
-        scheduler.init_all_attention_backends = lambda: trace.append("attention")
-        scheduler.init_all_cuda_graphs = lambda: trace.append("capture")
-        return scheduler
+        for name, step in steps.items():
+            enter_scope(self, patch.object(worker_setup, name, step))
 
     def _run_startup(
         self, mode, *, use_draft_worker=False, enable_overlap=True, pp_size=1
@@ -765,7 +765,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             if use_draft_worker
             else None
         )
-        scheduler = self._scheduler(
+        self._start_steps(
             worker,
             trace,
             mode=mode,
@@ -791,11 +791,6 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             self.assertIs(stream, expected_stream)
             return StreamContext()
 
-        def stop_after_startup():
-            raise RuntimeError("stop after startup")
-
-        scheduler.spec_algorithm = SimpleNamespace(is_none=stop_after_startup)
-
         with (
             patch(
                 "sglang.srt.managers.scheduler_components.worker_setup.get_exec",
@@ -816,11 +811,15 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "sglang.srt.managers.scheduler_components.worker_setup.prewarm_graph_pool_borrow",
                 side_effect=lambda: trace.append("borrow_prewarm"),
             ),
-            self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
-            scheduler.init_model_worker()
+            started = worker_setup.start_workers(
+                server_args=None,
+                nccl_port=0,
+                spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            )
 
-        self.assertIs(scheduler.schedule_stream, schedule_stream)
+        self.assertIs(started.schedule_stream, schedule_stream)
+        self.assertIs(started.workers.model_worker, worker)
         worker.model_runner.post_capture_resize_kv_pool.assert_called_once_with(
             draft_runners=(worker.model_runner,) if use_draft_worker else ()
         )

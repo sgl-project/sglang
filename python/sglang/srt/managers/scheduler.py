@@ -38,7 +38,6 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_memory,
     get_mm,
-    get_model,
     get_observability,
     get_parallel,
     get_schedule,
@@ -656,113 +655,33 @@ class Scheduler:
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync()
 
-    def init_tp_model_worker(self):
-        worker_kwargs = dict(
-            server_args=self.server_args,
-            gpu_id=get_device().gpu_id,
-            nccl_port=self.nccl_port,
-        )
-
-        # FIXME: move tp worker's init logic outside of the scheduler.
-        from sglang.srt.managers.tp_worker import TpModelWorker
-
-        self.tp_worker = TpModelWorker(**worker_kwargs)
-
-    def maybe_init_draft_worker(self):
-        if not worker_setup.runs_draft_worker(self.spec_algorithm):
-            self.draft_worker = None
-            self.external_corpus_manager = None
-            return
-
-        # Launch a draft worker for speculative decoding. It builds its draft
-        # from this process's own config: what differs for the draft — the
-        # target's context length, the draft load format, its attention backend
-        # — is resolved per runner, not on a config copy.
-        draft_worker_kwargs = dict(
-            server_args=self.server_args,
-            gpu_id=get_device().gpu_id,
-            nccl_port=self.nccl_port,
-            target_worker=self.tp_worker,
-        )
-
-        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
-
-        if self.spec_algorithm.is_ngram():
-            from sglang.srt.speculative.external_corpus_manager import (
-                ExternalCorpusManager,
-            )
-
-            self.external_corpus_manager = ExternalCorpusManager(
-                self.draft_worker,
-                self.ipc_channels.send_to_tokenizer.send_output,
-            )
-        else:
-            self.external_corpus_manager = None
-
-    def maybe_init_dllm_worker(self):
-        if get_exec().dllm.dllm_algorithm is None:
-            self.dllm_worker = None
-            return
-        from sglang.srt.dllm.worker import DllmWorker
-
-        self.dllm_worker = DllmWorker(self.tp_worker, self.server_args)
-
-    def init_target_memory_pool(self):
-        """Allocate target KV cache pools if they have not been allocated yet."""
-        worker_setup.alloc_target_memory_pool(
-            tp_worker=self.tp_worker, draft_worker=self.draft_worker
-        )
-
-    def init_memory_pools(self):
-        """Allocate KV cache pools for target and draft workers."""
-        self.init_target_memory_pool()
-        worker_setup.alloc_draft_memory_pool(
-            tp_worker=self.tp_worker, draft_worker=self.draft_worker
-        )
-
-    def init_all_attention_backends(self):
-        """Initialize attention backends for all workers."""
-        self.tp_worker.init_attention_backends()
-        if self.draft_worker is not None:
-            self.draft_worker.init_attention_backends()
-
-    # Not DynamicGradMode: tensors created under inference mode here could not
-    # be written in place by the no_grad disagg event loops.
-    @torch.no_grad()
-    def init_all_cuda_graphs(self):
-        """Capture cuda graphs for all workers."""
-        self.tp_worker.init_cuda_graphs()
-        if self.draft_worker is not None:
-            self.draft_worker.init_cuda_graphs()
-
     def init_model_worker(self):
-        # Load model weights.
-        self.init_tp_model_worker()
-        if get_model().is_startup_weight_load_overlap:
-            self.tp_worker.start_startup_weight_load()
-        self.maybe_init_draft_worker()
-        self.maybe_init_dllm_worker()
-
-        # Prepare KV cache pools for all workers
-        tic = time.perf_counter()
-        self.init_memory_pools()
-        self.kv_cache_allocation_time = time.perf_counter() - tic
-
-        self.init_all_attention_backends()
-        self.init_all_cuda_graphs()
-
-        startup = worker_setup.finish_worker_startup(
-            tp_worker=self.tp_worker, draft_worker=self.draft_worker
-        )
-        self.schedule_stream = startup.schedule_stream
-        self.kv_cache_allocation_time += startup.kv_resize_time
-
-        self.model_worker = worker_setup.select_model_worker(
-            tp_worker=self.tp_worker,
-            draft_worker=self.draft_worker,
-            dllm_worker=self.dllm_worker,
+        started = worker_setup.start_workers(
+            server_args=self.server_args,
+            nccl_port=self.nccl_port,
             spec_algorithm=self.spec_algorithm,
+        )
+        self.tp_worker = started.workers.tp_worker
+        self.draft_worker = started.workers.draft_worker
+        self.model_worker = started.workers.model_worker
+        self.dllm_worker = started.dllm_worker
+        self.schedule_stream = started.schedule_stream
+        self.kv_cache_allocation_time = started.kv_cache_allocation_time
+        self.maybe_init_external_corpus_manager()
+
+    def maybe_init_external_corpus_manager(self):
+        """The external corpus of ngram speculative decoding, over its draft
+        worker."""
+        if self.draft_worker is None or not self.spec_algorithm.is_ngram():
+            self.external_corpus_manager = None
+            return
+        from sglang.srt.speculative.external_corpus_manager import (
+            ExternalCorpusManager,
+        )
+
+        self.external_corpus_manager = ExternalCorpusManager(
+            self.draft_worker,
+            self.ipc_channels.send_to_tokenizer.send_output,
         )
 
     def init_worker_info(self):
