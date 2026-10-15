@@ -122,6 +122,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.sampling.penalties import PenaltyRow
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -935,6 +936,10 @@ class ReqKvInfo:
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
+
+    # Penalty history row, from PenaltyStore.alloc until the slot is freed
+    # (free_req_slot).
+    penalty_row: Optional[PenaltyRow] = None
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
@@ -2468,12 +2473,10 @@ def req_pool_indices_of(
 class DecodeRows:
     """The inputs a decode step takes from its requests alone: their slots and
     their sampling params. Consecutive decode steps share them while the same
-    requests stay in the same order, each in the same slot and penalty row."""
+    requests stay in the same order, each in the same slot."""
 
     reqs: List[Req]
     slots: List[int]
-    # PenaltyStore row of each slot, None for a request without penalties.
-    penalty_rows: List[Optional[int]]
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     sampling_info: SamplingBatchInfo

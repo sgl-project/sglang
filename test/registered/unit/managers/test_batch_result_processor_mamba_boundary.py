@@ -190,7 +190,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         scheduler.get_next_batch_to_run = get_next_batch_to_run
         state_at_commit = []
 
-        def process_batch_result(result_batch, batch_result, slot):
+        def process_batch_result(result_batch, batch_result):
             state_at_commit.append(
                 (req.kv.mamba_next_track_idx, req.kv.mamba_last_track_seqlen)
             )
@@ -432,7 +432,6 @@ class TestMambaLazyFinishDonation(unittest.TestCase):
                 PendingStep(
                     step=pending_step,
                     result=None,
-                    slot=ScheduleSlot(),
                     launch_ts=0.0,
                     after_idle_gap=False,
                 )
@@ -531,7 +530,6 @@ class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
             PendingStep(
                 step=decode_step,
                 result=None,
-                slot=ScheduleSlot(),
                 launch_ts=0.0,
                 after_idle_gap=False,
             )

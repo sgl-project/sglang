@@ -4,14 +4,15 @@ selection and retraction, and the retract/reset half of pause and flush."""
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     check_decode_mem,
+    new_tokens_required_next_decode,
     retract_all,
     retract_decode,
 )
@@ -24,9 +25,9 @@ from sglang.srt.managers.scheduler_components.request_retirer import make_abort_
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    get_disagg,
     get_lora,
     get_memory,
+    get_parallel,
     get_schedule,
     hicache_storage_enabled,
 )
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.min_free_slots_delayer import MinFreeSlotsDelayer
     from sglang.srt.managers.prefill_delayer import (
         PrefillDelayer,
@@ -90,6 +92,82 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
+@dataclass(frozen=True, slots=True)
+class _NoKvRoom:
+    """A pass that stopped on a waiting request finding no KV room, and the
+    state it saw. Later passes are skipped while no request has left the slot
+    (its running requests still lead its list; admitted ones join behind
+    them), no request slot has been freed, the request that found no room is
+    still the queue head, under priority scheduling, which sorts a
+    higher-priority arrival first, nothing has arrived, and the KV reserved
+    for a mixed step's decode part has not shrunk (see admission_skip_reason)."""
+
+    running: Tuple[Req, ...]
+    num_free_req_slots: int
+    head: Req
+    tail: Optional[Req]
+    decode_kv_tokens: int
+
+    def holds(
+        self,
+        running_reqs: List[Req],
+        num_free_req_slots: int,
+        waiting_queue: List[Req],
+        priority_scheduling: bool,
+    ) -> bool:
+        return (
+            tuple(running_reqs[: len(self.running)]) == self.running
+            and num_free_req_slots <= self.num_free_req_slots
+            and waiting_queue[0] is self.head
+            and (not priority_scheduling or waiting_queue[-1] is self.tail)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DecodePart:
+    """The decoding requests a mixed step runs as one-token extend rows after
+    its prefill rows. It is reserved before prefill admission as two
+    quantities: its forward tokens, one per row, and the KV its rows allocate
+    (page- and spec-aware, as the decode step's own check counts it)."""
+
+    reqs: List[Req]
+    kv_tokens: int
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.reqs)
+
+
+@dataclass(frozen=True, slots=True)
+class PrefillPart:
+    """The prefill rows of a step: the admitted requests, in row order, and
+    the request left mid-chunk after it."""
+
+    reqs: List[Req]
+    chunked_req: Optional[Req]
+
+
+class CompositionPolicy:
+    """How a mixed step composes its two parts: the decode part that rides,
+    reserved ahead of prefill admission, given the chunk budget (None without
+    chunked prefill). Admission then sees only what the reservation leaves."""
+
+    def decode_part_to_reserve(
+        self, decode_part: DecodePart, chunk_budget: Optional[int]
+    ) -> Optional[DecodePart]:
+        raise NotImplementedError
+
+
+class DecodeFirst(CompositionPolicy):
+    """The whole decode part rides; prefill gets what its rows leave of the
+    budgets, possibly nothing, and the step is then a plain decode step."""
+
+    def decode_part_to_reserve(
+        self, decode_part: DecodePart, chunk_budget: Optional[int]
+    ) -> Optional[DecodePart]:
+        return decode_part
+
+
 class StepPlanner:
     """Decides what a step runs: which waiting requests a prefill admits, which
     decoding requests a decode step takes, and which it retracts when the KV
@@ -111,6 +189,7 @@ class StepPlanner:
         request_registry: RequestRegistry,
         beam_coordinator: BeamCoordinator,
         step_builder: StepBuilder,
+        hisparse_coordinator: Optional[HiSparseCoordinator],
         request_retirer: RequestRetirer,
         grammar_manager: GrammarManager,
         metrics_sink: MetricsSink,
@@ -148,6 +227,7 @@ class StepPlanner:
         self.lora_admission = lora_admission
         self.beam_coordinator = beam_coordinator
         self.step_builder = step_builder
+        self.hisparse_coordinator = hisparse_coordinator
         self.request_retirer = request_retirer
         self.grammar_manager = grammar_manager
         self.metrics_sink = metrics_sink
@@ -176,6 +256,10 @@ class StepPlanner:
         self.max_prefill_bs: int = 0
         # Steps left to decode before the next prefill may run.
         self._prefill_decode_interval_remaining = 0
+        # Per slot, the inputs of its last pass that found no KV room.
+        self._no_kv_room: Dict[Optional[int], _NoKvRoom] = {}
+        # How a mixed step's decode part shares the step with prefill.
+        self.composition_policy: CompositionPolicy = DecodeFirst()
 
     def should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -198,6 +282,51 @@ class StepPlanner:
         )
         if is_extend:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
+
+    def admission_skip_reason(
+        self, slot: ScheduleSlot, running_reqs: List[Req]
+    ) -> Optional[str]:
+        """Why a prefill admission for slot next to running_reqs would admit no
+        request now, or None to run it."""
+        if self.core_lists.chunked_req is not None:
+            # The chunked request continues regardless: under PP it can start in
+            # one slot and end in another, so a slot's request cap is not strict.
+            return None
+        if len(self.core_lists.waiting_queue) == 0:
+            return "no waiting request"
+        if not self.enable_priority_preemption and not self._room_for_one(running_reqs):
+            # Every waiting request meets the request cap and the row budget
+            # before it is added; with priority preemption it may free a
+            # running request's row.
+            return "no request slot"
+        no_kv_room = self._no_kv_room.get(slot.index)
+        if no_kv_room is not None:
+            if no_kv_room.holds(
+                running_reqs,
+                self.req_to_token_pool.available_size(),
+                self.core_lists.waiting_queue,
+                self.policy.enable_priority_scheduling,
+            ) and (
+                # The decode part's KV need moves with page boundaries, with
+                # requests finishing in flight and with whether it rides; a
+                # smaller one may leave the head room.
+                no_kv_room.decode_kv_tokens == 0
+                or self._decode_kv_tokens(slot) >= no_kv_room.decode_kv_tokens
+            ):
+                return "no KV room"
+            del self._no_kv_room[slot.index]
+        return None
+
+    def _room_for_one(self, running_reqs: List[Req]) -> bool:
+        """Whether one more request fits next to running_reqs. A waiting
+        request that already holds a row (a session borrow) needs no free
+        one."""
+        num_reqs = len(running_reqs) + 1
+        if self.beam_coordinator.has_room(num_reqs, 1):
+            return True
+        return self.beam_coordinator.has_room(num_reqs, 0) and any(
+            req.kv.holds_kv for req in self.core_lists.waiting_queue
+        )
 
     def get_new_batch_prefill(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
@@ -237,20 +366,10 @@ class StepPlanner:
             for req in ready_grammar_requests:
                 self.request_intake.add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
-            slot.batch_is_full = False
         # Under PP only the scheduled slot's requests: a slot's batch size
         # is capped, and preemption must not pick a request in flight.
         running_reqs = slot.filter_decoding(self.core_lists.decoding)
-        if not running_reqs:
-            # With nothing decoding no decode step clears the flag, so
-            # admission would stay shut.
-            slot.batch_is_full = False
-
-        if (
-            slot.batch_is_full or len(self.core_lists.waiting_queue) == 0
-        ) and self.core_lists.chunked_req is None:
+        if self.admission_skip_reason(slot, running_reqs) is not None:
             return None
 
         running_bs = len(running_reqs)
@@ -260,24 +379,12 @@ class StepPlanner:
             and self.core_lists.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
-                num_allocatable_reqs=self.beam_coordinator.get_num_allocatable_reqs(
-                    running_bs
+                num_allocatable_reqs=min(
+                    get_parallel().pp_max_micro_batch_size - running_bs,
+                    self.beam_coordinator.row_budget(),
                 ),
             )
         ):
-            return None
-
-        # Ignore the check if self.core_lists.chunked_req is not None.
-        # In the non-PP case, when self.core_lists.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
-        if (
-            self.beam_coordinator.get_num_allocatable_reqs(running_bs) <= 0
-            and self.core_lists.chunked_req is None
-            and not self.enable_priority_preemption
-        ):
-            slot.batch_is_full = True
             return None
 
         # Get priority queue
@@ -312,6 +419,8 @@ class StepPlanner:
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        # A mixed step reserves its decode part before prefill admission.
+        decode_part = self._plan_decode_part(slot, chunked_prefill_size)
         adder = PrefillAdder(
             get_schedule().page_size,
             self.tree_cache,
@@ -320,7 +429,7 @@ class StepPlanner:
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            decode_part.num_tokens if decode_part is not None else 0,
             get_schedule().priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -329,6 +438,9 @@ class StepPlanner:
             waiting_queue_len=len(self.core_lists.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
+            mixed_decode_kv_tokens=(
+                decode_part.kv_tokens if decode_part is not None else 0
+            ),
         )
 
         # The chunked request after this step; the launch moves it into the
@@ -362,14 +474,17 @@ class StepPlanner:
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.core_lists.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
-        # Read once per admission: only a PD role switch changes it, on an idle
-        # instance.
-        is_pd_prefill = (
-            DisaggregationMode(get_disagg().disaggregation_mode)
-            == DisaggregationMode.PREFILL
-        )
+        # Once set, every later request must preempt to be admitted.
+        is_full = False
+        no_kv_room = False
+        # The new request rows the admitted requests take (see num_rows).
+        num_admitted_rows = sum(map(self.beam_coordinator.num_rows, adder.can_run_list))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.core_lists.waiting_queue:
+            # A spent pass budget admits no one, even before the first
+            # candidate: the resumed chunk or the decode part can spend it.
+            if adder.budget_state() == AddReqResult.OTHER:
+                break
             if get_lora().enable_lora and not self.lora_admission.can_schedule_lora_req(
                 req, running_loras
             ):
@@ -384,28 +499,17 @@ class StepPlanner:
             ):
                 continue
 
-            # Preemption below shrinks the requests still decoding.
+            # Preemption below shrinks the requests still decoding and frees
+            # their rows.
             running_bs = len(running_reqs) - len(adder.preempt_list)
-            candidate_beam_width = (
-                req.beam_group.beam_width if req.beam_group is not None else None
-            )
-            if len(
-                adder.can_run_list
-            ) >= self.beam_coordinator.get_num_allocatable_reqs(
-                running_bs, candidate_beam_width
+            rows_with_req = num_admitted_rows + self.beam_coordinator.num_rows(req)
+            if not self.beam_coordinator.has_room(
+                running_bs + len(adder.can_run_list) + 1, rows_with_req
             ):
-                slot.batch_is_full = True
-            if is_pd_prefill:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    slot.batch_is_full = True
+                is_full = True
 
-            if slot.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
-                ):
-                    break
+            if is_full and not self.enable_priority_preemption:
+                break
 
             if hicache_storage_enabled() or get_memory().enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
@@ -427,6 +531,11 @@ class StepPlanner:
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            # Preemption sizes the request by this match: its fill ids and
+            # cached prefix are stale or empty before it.
+            if is_full and not adder.preempt_to_schedule(req):
+                self._revert_match(req)
+                break
             if hicache_storage_enabled() and (
                 self.request_intake.prefetch_after_device_hit_loss(req)
             ):
@@ -445,32 +554,55 @@ class StepPlanner:
 
             if get_lora().enable_lora:
                 running_loras.add(req.lora_id)
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if added:
+                num_admitted_rows = rows_with_req
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    # Set batch_is_full after making sure there are requests that can be served
-                    slot.batch_is_full = len(adder.can_run_list) > 0 or (
-                        len(running_reqs) > len(adder.preempt_list)
-                    )
-                # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                no_kv_room = res == AddReqResult.NO_TOKEN
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.kv.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.kv.mamba_pool_idx = None
+                    self._revert_match(req)
                 break
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        # Remember a pass that stopped on a request finding no KV room, after
+        # admitting others or none: until a request leaves, a request slot
+        # frees or the queue head changes (or, under priority scheduling, a
+        # request arrives), later passes would stop there too. Estimates that
+        # drift between those events (the new token ratio, prefix matches,
+        # the evictable tree size) do not reopen it. With nothing running no
+        # release is coming, so nothing is remembered. Hybrid SWA frees KV as
+        # windows slide and HiSparse admits as host copies land; both run
+        # every pass.
+        if (
+            no_kv_room
+            and running_reqs
+            and not adder.preempt_list
+            and not self.is_hybrid_swa
+            and self.hisparse_coordinator is None
+        ):
+            # As the launch leaves them: the admitted requests out of the
+            # queue, and those without a row holding a new one. An admission
+            # that used up the budget may have taken the last waiting request;
+            # the next pass then skips on the empty queue.
+            admitted = set(adder.can_run_list)
+            waiting_queue = self.core_lists.waiting_queue
+            head = next((r for r in waiting_queue if r not in admitted), None)
+            if head is not None:
+                num_new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
+                self._no_kv_room[slot.index] = _NoKvRoom(
+                    running=tuple(running_reqs),
+                    num_free_req_slots=(
+                        self.req_to_token_pool.available_size() - num_new_rows
+                    ),
+                    head=head,
+                    tail=waiting_queue[-1],
+                    decode_kv_tokens=(
+                        decode_part.kv_tokens if decode_part is not None else 0
+                    ),
+                )
 
         # Preemption already released these requests; requeue them even when
         # the request they made room for was not admitted.
@@ -488,22 +620,20 @@ class StepPlanner:
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
+        if adder.new_chunked_req is not None:
+            assert chunked_req is None
+            chunked_req = adder.new_chunked_req
+        prefill_part = PrefillPart(reqs=can_run_list, chunked_req=chunked_req)
 
         retries = self.tree_cache.storage_prefetch_retries
         if hicache_storage_enabled() and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert chunked_req is None
-            chunked_req = adder.new_chunked_req
-
         set_time_batch(can_run_list, "set_forward_entry_time")
 
-        # Create a new batch
         new_batch = self.step_builder.build_extend_step(
-            can_run_list, chunked_req=chunked_req
+            prefill_part.reqs, chunked_req=prefill_part.chunked_req
         )
 
         # Record prefill stats for logging after forward. The tokens pending
@@ -524,23 +654,18 @@ class StepPlanner:
             num_pending_tokens=num_pending_tokens,
         )
 
-        # Mixed-style chunked prefill: the decoding requests ride this step
-        # as one-token extend rows after the prefill rows.
-        if (
-            self.is_mixed_chunk
-            and running_reqs
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
-            and not new_batch.return_logprob
-            and not any(r.return_logprob for r in running_reqs)
-            # The decode rows carry no input_embeds; shapes would mismatch.
-            and new_batch.input_embeds is None
-            # Beam member rows are not supported inside a mixed extend batch.
-            and all(r.beam_group is None for r in running_reqs)
-        ):
-            decode_reqs = self._select_decode_reqs(slot)
-            # The prefill admitted above may leave no KV room for the decode
-            # rows. They then sit out this step and decode on the next decode
-            # step, which fits them; a mixed step does not retract them.
+        # The reserved decode part rides this step as one-token extend rows
+        # after the prefill rows, unless the prefill part keeps it out.
+        if decode_part is not None and self._may_mix([], prefill_part.reqs):
+            decode_reqs = decode_part.reqs
+            if adder.preempt_list:
+                # Preemption released some of them.
+                preempted = set(adder.preempt_list)
+                decode_reqs = [r for r in decode_reqs if r not in preempted]
+            # Admission estimated the KV the decode rows need; the allocator
+            # decides. Rows that do not fit sit out this step and decode on
+            # the next decode step, which fits them; a mixed step does not
+            # retract them.
             if decode_reqs and check_decode_mem(
                 decode_reqs,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -551,14 +676,67 @@ class StepPlanner:
                     self.step_builder.new_decode_step(decode_reqs)
                 )
 
-        new_batch.sampling_info = self.step_builder.build_sampling_info(new_batch.reqs)
+        new_batch.sampling_info = self.step_builder.build_sampling_info(
+            new_batch.reqs, new_batch.req_pool_indices
+        )
         return new_batch
+
+    @staticmethod
+    def _may_mix(decode_reqs: List[Req], prefill_reqs: List[Req]) -> bool:
+        """Whether decode rows of decode_reqs may share a step with prefill
+        rows of prefill_reqs. These are the per-step conditions; the startup
+        ones (chunked prefill on, and a speculative algorithm, dLLM, HiSparse
+        or other mode that supports it) argument validation settles into
+        is_mixed_chunk."""
+        return (
+            # TODO (lianmin): support return_logprob + mixed chunked prefill
+            not any(r.return_logprob for r in decode_reqs)
+            and not any(r.return_logprob for r in prefill_reqs)
+            # The decode rows carry no input_embeds; shapes would mismatch.
+            and all(r.input_embeds is None for r in prefill_reqs)
+            # Beam member rows are not supported inside a mixed extend batch.
+            and all(r.beam_group is None for r in decode_reqs)
+        )
+
+    def _plan_decode_part(
+        self, slot: ScheduleSlot, chunk_budget: Optional[int]
+    ) -> Optional[DecodePart]:
+        """The decode part a mixed step reserves before prefill admission, or
+        None when the step does not mix."""
+        if not self.is_mixed_chunk:
+            return None
+        reqs = self._select_decode_reqs(slot)
+        if not reqs or not self._may_mix(reqs, []):
+            return None
+        decode_part = DecodePart(
+            reqs=reqs,
+            kv_tokens=new_tokens_required_next_decode(
+                reqs, self.token_to_kv_pool_allocator.page_size, self.spec_algorithm
+            ),
+        )
+        return self.composition_policy.decode_part_to_reserve(decode_part, chunk_budget)
+
+    def _decode_kv_tokens(self, slot: ScheduleSlot) -> int:
+        """The KV a pass now would reserve for the decode part."""
+        decode_part = self._plan_decode_part(slot, self.chunked_prefill_size)
+        return decode_part.kv_tokens if decode_part is not None else 0
+
+    def _revert_match(self, req: Req) -> None:
+        """Undo the mamba state init_next_round_input staged for a request the
+        pass does not admit, so its freshly allocated slot does not leak. A
+        session holds its slot across requests and frees it itself."""
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        if req.kv.holds_mamba and not getattr(req, "session", None):
+            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                req.kv.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.kv.mamba_pool_idx = None
 
     def _select_decode_reqs(self, slot: ScheduleSlot) -> List[Req]:
         """The decoding requests one decode step (or a mixed step's decode
         rows) runs: not prefill-only, and not already reaching max_new_tokens
-        in the steps still in flight. Skipping one reopens admission: it
-        leaves decoding at its commit."""
+        in the steps still in flight."""
         candidates = [
             req
             for req in slot.filter_decoding(self.core_lists.decoding)
@@ -570,15 +748,12 @@ class StepPlanner:
         # Each pending step commits at most one output to a request, so only a
         # request within num_pending outputs of max_new_tokens can finish in
         # flight; the rest skip the exact count.
-        reqs = [
+        return [
             req
             for req in candidates
             if len(req.output_ids) + num_pending < req.sampling_params.max_new_tokens
             or not self._finishes_inflight(req)
         ]
-        if len(reqs) < len(candidates):
-            slot.batch_is_full = False
-        return reqs
 
     def _finishes_inflight(self, req: Req) -> bool:
         """Whether the uncommitted outputs of req reach max_new_tokens."""
@@ -615,7 +790,7 @@ class StepPlanner:
         if kv_full_retract_flag or (
             TEST_RETRACT and self.counters.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
-            reqs = self._retract_decode_reqs(reqs, kv_full_retract_flag, slot)
+            reqs = self._retract_decode_reqs(reqs, kv_full_retract_flag)
         else:
             self.new_token_ratio_tracker.decay_step()
 
@@ -624,7 +799,7 @@ class StepPlanner:
         return self.step_builder.build_decode_step(reqs)
 
     def _retract_decode_reqs(
-        self, reqs: List[Req], kv_full_retract_flag: bool, slot: ScheduleSlot
+        self, reqs: List[Req], kv_full_retract_flag: bool
     ) -> List[Req]:
         """Move decoding requests back to the waiting queue until the rest fit
         one decode step; return the requests that stay."""
@@ -659,8 +834,6 @@ class StepPlanner:
         self.core_lists.decoding = kept_reqs + [
             r for r in self.core_lists.decoding if r not in kept and r not in left
         ]
-        if left:
-            slot.batch_is_full = False
         new_available_tokens = self.token_to_kv_pool_allocator.available_size()
         new_token_gained = new_available_tokens - old_available_tokens
         mamba_num_gained = (
@@ -710,10 +883,10 @@ class StepPlanner:
             self.request_intake.add_request_to_queue(req, is_retracted=True)
         return kept_reqs
 
-    def retract_for_pause(self, slot: ScheduleSlot) -> None:
+    def retract_for_pause(self) -> None:
         """The retract half of a retract-mode pause: every live request
         leaves the device, back to the waiting queue or, on PD decode, held
-        for a rebootstrap; slot reopens to admission."""
+        for a rebootstrap."""
         lists = self.request_registry.request_lists()
         retract_reqs = [
             req
@@ -748,9 +921,6 @@ class StepPlanner:
         else:
             for req in retract_reqs:
                 self.request_intake.add_request_to_queue(req)
-        # Under PP the ring slots keep their flags: as before, a slot whose
-        # decoding requests all left reopens at its next schedule.
-        slot.batch_is_full = False
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.

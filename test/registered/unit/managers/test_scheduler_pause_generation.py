@@ -199,7 +199,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             PendingStep(
                 step=step,
                 result=result,
-                slot=scheduler.flat_slot,
                 launch_ts=0.0,
                 after_idle_gap=False,
             )
@@ -384,7 +383,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         run_req_b = self._make_req("run-b")
         last_req = self._make_req("last")
         scheduler.lists.decoding = [run_req_a, run_req_b, last_req]
-        scheduler.flat_slot.batch_is_full = True
         scheduler.lists.chunked_req = MagicMock()
         requeue_log = self._spy_requeue(scheduler)
 
@@ -399,7 +397,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             [1, 1, 1],
         )
         self.assertEqual(scheduler.lists.decoding, [])
-        self.assertFalse(scheduler.flat_slot.batch_is_full)
         self.assertIsNone(scheduler.lists.chunked_req)
 
     def test_retract_releases_via_scheduler_hisparse_coordinator(self):
@@ -437,10 +434,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(req_finished.is_retracted)
         self.assertEqual(scheduler.lists.decoding, [])
 
-    def test_retract_empty_clears_chunked_req_and_batch_is_full(self):
-        """retract with nothing to retract still clears chunked_req and batch_is_full."""
+    def test_retract_empty_clears_chunked_req(self):
+        """retract with nothing to retract still clears chunked_req."""
         scheduler = self._new_scheduler()
-        scheduler.flat_slot.batch_is_full = True
         scheduler.lists.chunked_req = MagicMock()
         requeue_log = self._spy_requeue(scheduler)
 
@@ -448,7 +444,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         self.assertEqual(requeue_log, [])
         self.assertIsNone(scheduler.lists.chunked_req)
-        self.assertFalse(scheduler.flat_slot.batch_is_full)
 
     def test_retract_all_finished_clears_fields_without_requeue(self):
         """retract with only finished reqs clears fields but releases nothing."""
@@ -456,7 +451,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         req_finished_a = self._make_req("finished-a", finished=True)
         req_finished_b = self._make_req("finished-b", finished=True)
         scheduler.lists.decoding = [req_finished_a, req_finished_b]
-        scheduler.flat_slot.batch_is_full = True
         scheduler.lists.chunked_req = MagicMock()
         requeue_log = self._spy_requeue(scheduler)
 
@@ -466,7 +460,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(req_finished_a.retraction_count, 0)
         self.assertEqual(req_finished_b.retraction_count, 0)
         self.assertEqual(scheduler.lists.decoding, [])
-        self.assertFalse(scheduler.flat_slot.batch_is_full)
         self.assertIsNone(scheduler.lists.chunked_req)
 
     def test_retract_commit_happens_once_before_release(self):
@@ -486,7 +479,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         event_log: List[str] = []
 
-        def process_result(batch, result, slot):
+        def process_result(batch, result):
             self.assertFalse(scheduler.pending)
             event_log.append("drain")
 
@@ -558,9 +551,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-                scheduler.process_batch_result.assert_called_once_with(
-                    batch, result, scheduler.flat_slot
-                )
+                scheduler.process_batch_result.assert_called_once_with(batch, result)
                 self.assertFalse(scheduler.pending)
 
     def test_pd_decode_retract_requeues_for_rebootstrap(self):

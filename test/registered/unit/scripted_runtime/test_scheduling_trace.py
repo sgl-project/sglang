@@ -121,11 +121,11 @@ class TestFirstDivergence(CustomTestCase):
         self.assertEqual(first_divergence(old[:1], old), 1)
 
     def test_ignored_fields_do_not_diverge(self):
-        old = [_schedule(1, batch_is_full=False)]
-        new = [_schedule(1, batch_is_full=True)]
+        old = [_schedule(1, kv_available=8)]
+        new = [_schedule(1, kv_available=0)]
 
         self.assertEqual(first_divergence(old, new), 0)
-        self.assertIsNone(first_divergence(old, new, ignore=["batch_is_full"]))
+        self.assertIsNone(first_divergence(old, new, ignore=["kv_available"]))
 
 
 class TestDiffTraceDirs(CustomTestCase):

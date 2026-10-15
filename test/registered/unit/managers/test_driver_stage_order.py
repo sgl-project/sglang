@@ -305,7 +305,7 @@ class _Shell:
         result.delay_sample_func = None
         self.log("sample", result.name)
 
-    def process_batch_result(self, step, result, *slot):
+    def process_batch_result(self, step, result):
         self.log("commit", step.name)
 
     def run(self, **topology):

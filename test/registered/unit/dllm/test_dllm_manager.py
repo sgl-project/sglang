@@ -6,6 +6,7 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.manager import DllmManager
 from sglang.srt.dllm.req_state import DllmReqPhase, DllmReqState
@@ -22,6 +23,18 @@ from sglang.test.scheduler_request_lists import (
 )
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class _RowBudget:
+    """The admission gate of BeamCoordinator with row_budget() free rows."""
+
+    num_rows = staticmethod(BeamCoordinator.num_rows)
+
+    def __init__(self, row_budget):
+        self.row_budget = row_budget
+
+    def has_room(self, num_reqs, num_rows):
+        return num_rows <= self.row_budget()
 
 
 def _manager(**deps):
@@ -58,9 +71,7 @@ def _manager(**deps):
         enable_priority_scheduling=False,
         truncation_align_size=None,
         context_len=128,
-        beam_coordinator=SimpleNamespace(
-            get_num_allocatable_reqs=lambda running_bs: 64
-        ),
+        beam_coordinator=_RowBudget(lambda: 64),
         step_builder=SimpleNamespace(
             build_extend_step=_Step, build_sampling_info=Mock()
         ),
@@ -112,6 +123,7 @@ class _Step:
     def __init__(self, reqs, kv_reuse_lens):
         self.reqs = list(reqs)
         self.kv_reuse_lens = kv_reuse_lens
+        self.req_pool_indices = None
         self.return_logprob = False
         self.prefill_stats = None
         self.dp_cooperation_info = None
@@ -255,28 +267,14 @@ class TestDllmManagerLists(unittest.TestCase):
         self._assert_lists(manager, waiting=[], staging=[])
         self.checkpoint.assert_not_called()
 
-    def test_commit_reopens_admission(self):
-        manager = _manager()
-        req = _req("a")
-        step, _ = manager.schedule([req])
-        manager.on_launch(step)
-        manager.batch_is_full = True
-
-        manager.commit_extend(step, _fdfo_result([[_MASK_ID] * 4], [0], [None]))
-
-        self.assertFalse(manager.batch_is_full)
-
-    def test_latch_set_with_an_empty_manager_does_not_block_later_requests(self):
+    def test_no_request_slot_with_an_empty_manager_does_not_block_later_requests(
+        self,
+    ):
         allocatable = [0]
-        manager = _manager(
-            beam_coordinator=SimpleNamespace(
-                get_num_allocatable_reqs=lambda running_bs: allocatable[0]
-            )
-        )
+        manager = _manager(beam_coordinator=_RowBudget(lambda: allocatable[0]))
 
         step, rest = manager.schedule([_req("a")])
         self.assertIsNone(step)
-        self.assertTrue(manager.batch_is_full)
 
         allocatable[0] = 64
         step, rest = manager.schedule(rest)
@@ -292,7 +290,6 @@ class TestDllmManagerLists(unittest.TestCase):
 
         step, rest = manager.schedule([_req("a")])
         self.assertIsNone(step)
-        self.assertTrue(manager.batch_is_full)
         manager.abort_waiting(AbortReq(rid="a"))
         self.assertTrue(manager.is_empty())
 
@@ -304,20 +301,27 @@ class TestDllmManagerLists(unittest.TestCase):
 
         self.assertEqual([r.rid for r in step.reqs], ["b"])
 
-    def test_latch_set_with_requests_in_flight_blocks_until_commit(self):
+    def test_no_token_with_a_request_in_flight_does_not_wait_for_its_commit(self):
         manager = _manager()
         step, _ = manager.schedule([_req("a")])
         manager.on_launch(step)
-        manager.batch_is_full = True
+        self._patch(
+            "sglang.srt.dllm.manager.DllmManager._create_dllm_prefill_adder",
+            side_effect=_NoTokenAdder,
+        )
 
         blocked, rest = manager.schedule([_req("b")])
         self.assertIsNone(blocked)
         self.assertEqual([r.rid for r in manager.staging], ["a"])
 
-        manager.commit_extend(step, _fdfo_result([[_MASK_ID] * 4], [0], [None]))
+        # The next pass, before the in-flight step commits, admits b.
+        self._patch(
+            "sglang.srt.dllm.manager.DllmManager._create_dllm_prefill_adder",
+            side_effect=_Adder,
+        )
         step, rest = manager.schedule(rest)
 
-        self.assertIn("b", [r.rid for r in step.reqs])
+        self.assertEqual([r.rid for r in step.reqs], ["b"])
 
     def test_abort_pops_and_releases_the_waiting_requests_it_names(self):
         manager = _manager()

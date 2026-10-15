@@ -450,7 +450,7 @@ class TestAllocationIntegration(CustomTestCase):
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             prealloc_fits_assumes_reclaim=Mock(return_value=False)
         )
-        queue._allocatable_token_budgets = Mock(return_value=100000)
+        queue._swa_aware_allocatable_token_budgets = Mock(return_value=(100000, None))
         queue._hicache_pending_restore_tokens = Mock(return_value=0)
         queue.enable_priority_scheduling = False
         queue.enable_hisparse = False

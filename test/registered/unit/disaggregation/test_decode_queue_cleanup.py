@@ -32,10 +32,7 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     LaunchCounters,
 )
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
-from sglang.srt.managers.scheduler_components.mode_stages import (
-    ModeStages,
-    ScheduleSlot,
-)
+from sglang.srt.managers.scheduler_components.mode_stages import ModeStages
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -112,13 +109,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_overlap = False
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
-            return_value=(physical_available, physical_available)
-        )
-        queue._allocatable_token_budgets = MagicMock(
-            side_effect=lambda _decoding, **_: physical_available
-        )
-        queue._swa_tail_allocatable_token_budget = MagicMock(
-            side_effect=lambda _decoding, **_: physical_available
+            side_effect=lambda _decoding, **_: (physical_available, physical_available)
         )
 
         def pre_alloc(_req):
@@ -171,8 +162,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_overlap = True
         queue.schedule_stream = schedule_stream
         queue.forward_stream = forward_stream
-        queue._uses_swa_reservation = MagicMock(return_value=False)
-        queue._allocatable_token_budgets = MagicMock(return_value=4096)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(
+            return_value=(4096, None)
+        )
         queue._prealloc_required_tokens = MagicMock(return_value=(8, 0))
         queue._prealloc_reservation_fits = MagicMock(return_value=True)
         queue._pre_alloc = MagicMock()
@@ -208,7 +200,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # off, so this abort path needs one even though it never allocates.
         queue.token_to_kv_pool_allocator = MagicMock()
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(0, None))
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         queue.enable_priority_scheduling = False
@@ -265,7 +257,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # off, so this abort path needs one even though it never allocates.
         queue.token_to_kv_pool_allocator = MagicMock()
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(0, None))
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         queue.enable_priority_scheduling = False
@@ -674,7 +666,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         # The commit: finished requests leave decoding; the one whose release
         # waits on a copy moves into releasing, the live one keeps decoding.
-        scheduler.leave_finished_reqs(ScheduleSlot())
+        scheduler.leave_finished_reqs()
         self.assertEqual(scheduler.lists.decoding, [live])
         self.assertEqual(owner.releasing, [done])
         assert_one_list_per_request(scheduler)

@@ -96,6 +96,7 @@ _PLANNER_FIELDS = {
             "new_token_ratio_tracker",
             "beam_coordinator",
             "step_builder",
+            "hisparse_coordinator",
             "request_retirer",
             "metrics_sink",
             "ipc_channels",

@@ -20,13 +20,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 VOCAB_SIZE = 32
+NUM_SLOTS = 16
 DEVICE = "cpu"
 
 
 def _req(slot, rid=None, output_ids=(), **sampling_params):
     return SimpleNamespace(
         rid=rid if rid is not None else f"r{slot}",
-        kv=SimpleNamespace(req_pool_idx=slot),
+        kv=SimpleNamespace(req_pool_idx=slot, penalty_row=None),
         output_ids=list(output_ids),
         sampling_params=SamplingParams(**sampling_params),
         eos_token_ids=None,
@@ -36,6 +37,22 @@ def _req(slot, rid=None, output_ids=(), **sampling_params):
         return_sampling_mask=False,
         sampling_logprobs_mode=None,
     )
+
+
+def _store():
+    return PenaltyStore(VOCAB_SIZE, NUM_SLOTS, DEVICE)
+
+
+def _slots(reqs):
+    return torch.tensor([r.kv.req_pool_idx for r in reqs])
+
+
+def _build(reqs, store):
+    return SamplingBatchInfo.build(reqs, VOCAB_SIZE, DEVICE, store, _slots(reqs))
+
+
+def _held_rows(store):
+    return store.num_rows - len(store.free_rows)
 
 
 def _expected_penalties(reqs, histories):
@@ -81,17 +98,17 @@ class _BuildTestCase(CustomTestCase):
 
 class TestNoPenaltyPath(_BuildTestCase):
     def test_no_penalty_request_allocates_nothing(self):
-        store = PenaltyStore(VOCAB_SIZE, DEVICE)
+        store = _store()
         reqs = [_req(1), _req(2, temperature=0.5, top_k=4)]
         for req in reqs:
             store.alloc(req)
 
-        info = SamplingBatchInfo.build(reqs, VOCAB_SIZE, DEVICE, store)
+        info = _build(reqs, store)
         info.commit_sampled_tokens(torch.tensor([3, 4]))
 
         self.assertIsNone(info.penalties)
         self.assertEqual(info.logit_penalties(), (None, None))
-        self.assertEqual(store.row_of_slot, {})
+        self.assertEqual(store.num_rows, 0)
         self.assertEqual(store.counts.numel(), 0)
 
     def test_penalized_request_without_row_fails(self):
@@ -99,15 +116,13 @@ class TestNoPenaltyPath(_BuildTestCase):
         with self.assertRaises(RuntimeError):
             SamplingBatchInfo.build([req], VOCAB_SIZE, DEVICE, None)
         with self.assertRaises(RuntimeError):
-            SamplingBatchInfo.build(
-                [req], VOCAB_SIZE, DEVICE, PenaltyStore(VOCAB_SIZE, DEVICE)
-            )
+            _build([req], _store())
 
 
 class TestHistory(_BuildTestCase):
     def _step(self, store, reqs, histories, rng):
         """Build, check penalties against the history, sample, commit."""
-        info = SamplingBatchInfo.build(reqs, VOCAB_SIZE, DEVICE, store)
+        info = _build(reqs, store)
         torch.testing.assert_close(
             _apply(*info.logit_penalties(), len(reqs)),
             torch.stack(_expected_penalties(reqs, histories)),
@@ -119,7 +134,7 @@ class TestHistory(_BuildTestCase):
 
     def test_history_follows_join_leave_and_retract(self):
         rng = random.Random(0)
-        store = PenaltyStore(VOCAB_SIZE, DEVICE)
+        store = _store()
         a = _req(1, frequency_penalty=0.5, presence_penalty=0.25)
         b = _req(2)
         c = _req(3, repetition_penalty=1.5, min_new_tokens=3, stop_token_ids=[7, 9])
@@ -138,7 +153,7 @@ class TestHistory(_BuildTestCase):
             self._step(store, running, [r.output_ids for r in running], rng)
 
         # a is retracted: its slot is freed, d takes a new slot meanwhile.
-        store.free(a.kv.req_pool_idx)
+        store.free(a.kv)
         running.remove(a)
         store.alloc(d)
         running.append(d)
@@ -154,14 +169,14 @@ class TestHistory(_BuildTestCase):
             self._step(store, running, [r.output_ids for r in running], rng)
 
         # c finishes and leaves.
-        store.free(c.kv.req_pool_idx)
+        store.free(c.kv)
         running.remove(c)
         self._step(store, running, [r.output_ids for r in running], rng)
-        self.assertEqual(len(store.row_of_slot), 2)
+        self.assertEqual(_held_rows(store), 2)
 
     def test_growth_keeps_rows(self):
         rng = random.Random(1)
-        store = PenaltyStore(VOCAB_SIZE, DEVICE)
+        store = _store()
         running = []
         for slot in range(1, 12):
             req = _req(slot, frequency_penalty=0.1 * slot)
@@ -170,11 +185,11 @@ class TestHistory(_BuildTestCase):
             self._step(store, running, [r.output_ids for r in running], rng)
 
     def test_spec_commit_counts_accepted_tokens_only(self):
-        store = PenaltyStore(VOCAB_SIZE, DEVICE)
+        store = _store()
         reqs = [_req(1, frequency_penalty=1.0), _req(2), _req(3, presence_penalty=1.0)]
         for req in reqs:
             store.alloc(req)
-        info = SamplingBatchInfo.build(reqs, VOCAB_SIZE, DEVICE, store)
+        info = _build(reqs, store)
 
         info.commit_sampled_tokens(
             torch.tensor([[4, 4, 6], [1, 2, 3], [5, 0, 0]]),
@@ -183,41 +198,55 @@ class TestHistory(_BuildTestCase):
             ),
         )
 
-        additive, _ = SamplingBatchInfo.build(
-            reqs, VOCAB_SIZE, DEVICE, store
-        ).logit_penalties()
+        additive, _ = _build(reqs, store).logit_penalties()
         expected, _ = _expected_penalties(reqs, [[4, 4], [], [5]])
         torch.testing.assert_close(additive, expected)
 
     def test_commit_into_freed_row_is_reset_by_next_alloc(self):
-        store = PenaltyStore(VOCAB_SIZE, DEVICE)
+        store = _store()
         a = _req(1, frequency_penalty=1.0)
         store.alloc(a)
-        step = SamplingBatchInfo.build([a], VOCAB_SIZE, DEVICE, store)
+        step = _build([a], store)
 
         # a finishes before its last step samples; b then takes the freed row.
-        store.free(1)
+        store.free(a.kv)
         step.commit_sampled_tokens(torch.tensor([7]))
         b = _req(2, frequency_penalty=1.0, output_ids=[3])
         store.alloc(b)
 
-        additive, _ = SamplingBatchInfo.build(
-            [b], VOCAB_SIZE, DEVICE, store
-        ).logit_penalties()
+        additive, _ = _build([b], store).logit_penalties()
         torch.testing.assert_close(additive, _expected_penalties([b], [[3]])[0])
 
+    def test_step_reads_the_row_its_slot_holds_at_sampling(self):
+        """A decode step's info is shared while its requests keep their slots;
+        a request re-admitted into the same slot with another row is read from
+        that row."""
+        store = _store()
+        a = _req(1, frequency_penalty=1.0, output_ids=[4])
+        b = _req(2, frequency_penalty=1.0, output_ids=[5])
+        store.alloc(a)
+        store.alloc(b)
+        shared = _build([a], store)
+
+        # Both are retracted; a comes back to slot 1 with the row b freed last.
+        store.free(a.kv)
+        store.free(b.kv)
+        store.alloc(a)
+        self.assertEqual(a.kv.penalty_row.index, 1)
+
+        additive, _ = shared.logit_penalties()
+        torch.testing.assert_close(additive, _expected_penalties([a], [[4]])[0])
+
     def test_readmission_resets_a_discarded_chunk_sample(self):
-        store = PenaltyStore(VOCAB_SIZE, DEVICE)
+        store = _store()
         a = _req(1, presence_penalty=1.0)
         store.alloc(a)
-        middle_chunk = SamplingBatchInfo.build([a], VOCAB_SIZE, DEVICE, store)
+        middle_chunk = _build([a], store)
         middle_chunk.commit_sampled_tokens(torch.tensor([9]))
 
         # The next chunk re-admits the request; the discarded sample is gone.
         store.alloc(a)
-        additive, _ = SamplingBatchInfo.build(
-            [a], VOCAB_SIZE, DEVICE, store
-        ).logit_penalties()
+        additive, _ = _build([a], store).logit_penalties()
         torch.testing.assert_close(additive, torch.zeros(1, VOCAB_SIZE))
 
 
@@ -351,26 +380,26 @@ class TestBuildFromRequests(_BuildTestCase):
             self.assertEqual(info.grammars, grammars if any(grammars) else None)
 
     def test_build_twice_gives_same_penalties_and_no_side_effects(self):
-        store = PenaltyStore(VOCAB_SIZE, DEVICE)
+        store = _store()
         reqs = [_req(1, frequency_penalty=0.5, output_ids=[2, 2, 5]), _req(2)]
         store.alloc(reqs[0])
-        first = StepPenalties.build(reqs, store, DEVICE)
-        second = StepPenalties.build(reqs, store, DEVICE)
+        first = StepPenalties.build(reqs, _slots(reqs), store, DEVICE)
+        second = StepPenalties.build(reqs, _slots(reqs), store, DEVICE)
         torch.testing.assert_close(
             first.logit_penalties()[0], second.logit_penalties()[0]
         )
         self.assertEqual(reqs[0].output_ids, [2, 2, 5])
-        self.assertEqual(len(store.row_of_slot), 1)
+        self.assertEqual(_held_rows(store), 1)
 
     def test_step_built_before_the_previous_sample_reads_it(self):
         """Under overlap a step is built while the previous one is in flight;
         its penalties read the rows when it samples, so they include the
         previous step's token (stream order, not build order)."""
-        store = PenaltyStore(VOCAB_SIZE, DEVICE)
+        store = _store()
         req = _req(1, frequency_penalty=1.0, output_ids=[2])
         store.alloc(req)
-        previous = StepPenalties.build([req], store, DEVICE)
-        current = StepPenalties.build([req], store, DEVICE)
+        previous = StepPenalties.build([req], _slots([req]), store, DEVICE)
+        current = StepPenalties.build([req], _slots([req]), store, DEVICE)
         previous.commit(torch.tensor([7]))
 
         additive, _ = current.logit_penalties()

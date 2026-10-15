@@ -229,6 +229,7 @@ from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
 )
 from sglang.srt.managers.scheduler_components.invariant_checker import (
+    CHECK_REQUEST_LISTS,
     SchedulerInvariantChecker,
     SchedulerWatchdog,
 )
@@ -845,9 +846,10 @@ class Scheduler:
 
     def init_penalty_store(self) -> None:
         self.penalty_store = PenaltyStore(
-            self.model_config.vocab_size, self.req_to_token_pool.device
+            self.model_config.vocab_size,
+            self.req_to_token_pool.req_to_token.shape[0],
+            self.req_to_token_pool.device,
         )
-        self.req_to_token_pool.register_on_free_slot(self.penalty_store.free)
 
     def init_kv_canary(self) -> None:
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
@@ -953,8 +955,8 @@ class Scheduler:
         # either the new or the old role; the instance can no longer serve.
         self._pd_role_switch_unhealthy = False
         self.lists = CoreLists()
-        # The flat driver's schedule slot: every decoding request, and the
-        # admission flag (the PP ring keeps one per microbatch slot).
+        # The flat driver's schedule slot: every decoding request (the PP ring
+        # keeps one per microbatch slot).
         self.flat_slot = ScheduleSlot()
         # The launched steps whose results are not committed yet.
         self.pending = PendingSteps()
@@ -1797,7 +1799,6 @@ class Scheduler:
         record = PendingStep(
             step=step,
             result=result,
-            slot=slot,
             launch_ts=launch_ts,
             after_idle_gap=after_idle_gap,
         )
@@ -1839,19 +1840,20 @@ class Scheduler:
 
     def commit_step(self, record: PendingStep) -> None:
         """The host commit of one launched step, popped from pending."""
-        self.process_batch_result(record.step, record.result, record.slot)
+        self.process_batch_result(record.step, record.result)
         self.step_counters.record(record)
+        if CHECK_REQUEST_LISTS:
+            self.invariant_checker.check_no_finished_reqs(
+                self.request_registry.request_lists()
+            )
 
-    def leave_finished_reqs(self, slot: ScheduleSlot) -> None:
+    def leave_finished_reqs(self) -> None:
         """Drop the requests a commit finished from decoding (PD decode holds
         those still releasing KV), and from the mode's own lists (HiSparse
-        staging); the committed slot's admission reopens if decoding shrank."""
-        num_decoding = len(self.lists.decoding)
+        staging)."""
         if (hold_finished := self.stages.hold_finished) is not None:
             hold_finished([r for r in self.lists.decoding if r.finished()])
         self.lists.decoding = [r for r in self.lists.decoding if not r.finished()]
-        if len(self.lists.decoding) < num_decoding:
-            slot.batch_is_full = False
         if (leave_finished := self.stages.leave_finished) is not None:
             leave_finished()
 
@@ -2114,6 +2116,7 @@ class Scheduler:
             request_registry=self.request_registry,
             beam_coordinator=self.beam_coordinator,
             step_builder=self.step_builder,
+            hisparse_coordinator=self.hisparse_coordinator,
             request_retirer=self.request_retirer,
             grammar_manager=self.grammar_manager,
             metrics_sink=self.metrics_sink,
@@ -2471,8 +2474,6 @@ class Scheduler:
             ready_reqs = stages.collect_ready()
             if len(ready_reqs) > 0:
                 self._admit_hisparse_ready_reqs(ready_reqs, slot)
-            # Reset batch_is_full so the scheduler can schedule more prefills.
-            slot.batch_is_full = False
 
         if stages.admit is not None:
             new_batch = stages.admit(slot)
@@ -2609,7 +2610,6 @@ class Scheduler:
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        slot: ScheduleSlot,
     ):
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
@@ -2655,7 +2655,7 @@ class Scheduler:
                 )
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
-        self.leave_finished_reqs(slot)
+        self.leave_finished_reqs()
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -2978,7 +2978,7 @@ class Scheduler:
         if self.pending and get_parallel().pp_size == 1:
             self.commit_pending_steps()
 
-        self.step_planner.retract_for_pause(self.flat_slot)
+        self.step_planner.retract_for_pause()
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

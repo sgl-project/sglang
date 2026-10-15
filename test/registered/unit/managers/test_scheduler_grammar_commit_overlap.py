@@ -118,7 +118,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
             commit_pending_grammar(s.pending)
             return results[step.forward_iter]
 
-        def process_batch_result(step, result, slot):
+        def process_batch_result(step, result):
             events.append(("commit", step.forward_iter))
             # The host commit runs the step's grammar commit if not done yet.
             advance_grammar_fsm(result, step)

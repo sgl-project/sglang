@@ -428,11 +428,11 @@ class _Scheduler:
     def _apply_war_barrier(self):
         pass
 
-    def process_batch_result(self, batch, result, slot):
+    def process_batch_result(self, batch, result):
         assert all(record.result is not result for record in self.pending)
         self.result_processes[batch.forward_iter] += 1
         self.actions.append((self.iteration, "process_result", batch.forward_iter))
-        Scheduler.process_batch_result(self, batch, result, slot)
+        Scheduler.process_batch_result(self, batch, result)
         event = self.copy_events[batch.forward_iter]
         assert event.ready and event.recorded
         assert result.delay_sample_func is None

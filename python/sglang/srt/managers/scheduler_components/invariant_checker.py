@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Deque,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -38,7 +39,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.request_lists import CoreLists
+    from sglang.srt.managers.request_lists import CoreLists, RequestList
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler_components.engine_state import (
         EngineFlags,
@@ -50,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 # Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+# Read once: the check runs after every host commit.
+CHECK_REQUEST_LISTS = envs.SGLANG_CHECK_REQUEST_LIST_INVARIANTS.get()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -340,6 +343,19 @@ class SchedulerInvariantChecker:
 
         if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
             self._check_kv_page_invariants()
+
+    @staticmethod
+    def check_no_finished_reqs(lists: Dict[str, RequestList]) -> None:
+        """After a host commit no request list holds a finished request: the
+        commit moves each one out, except to a releasing list, which holds it
+        until its KV is released."""
+        for entry in lists.values():
+            if entry.releasing:
+                continue
+            finished = [req.rid for req in entry.reqs if req.finished()]
+            assert not finished, (
+                f"Finished requests left in the {entry.name!r} list: {finished}"
+            )
 
     def _check_kv_page_invariants(self):
         """committed<=allocated for every req/slot, and no double free:

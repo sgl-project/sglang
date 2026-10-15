@@ -270,7 +270,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         return PendingStep(
             step=self.make_batch(mode, forward_iter, **kwargs),
             result=GenerationBatchResult(),
-            slot=ScheduleSlot(),
             launch_ts=launch_ts,
             after_idle_gap=False,
         )
@@ -311,7 +310,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             copy_events.append(copy_done)
             return GenerationBatchResult(copy_done=copy_done)
 
-        def process_batch_result(batch, result, slot):
+        def process_batch_result(batch, result):
             clock[0] = RESULT_TIMESTAMPS[batch.forward_iter - 1]
 
         step_counters = scheduler.step_counters

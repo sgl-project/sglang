@@ -22,7 +22,7 @@ VOCAB_SIZE = 32
 def _req(**sampling_params):
     return SimpleNamespace(
         rid="r",
-        kv=SimpleNamespace(req_pool_idx=None),
+        kv=SimpleNamespace(req_pool_idx=None, penalty_row=None),
         output_ids=[],
         grammar=None,
         sampling_params=SamplingParams(**sampling_params),
@@ -51,11 +51,12 @@ class _H2DCopies(TorchDispatchMode):
 
 
 def _step_penalties(reqs, device):
-    store = PenaltyStore(VOCAB_SIZE, device)
+    store = PenaltyStore(VOCAB_SIZE, len(reqs) + 1, device)
     for slot, req in enumerate(reqs, start=1):
         req.kv.req_pool_idx = slot
         store.alloc(req)
-    return StepPenalties.build(reqs, store, device)
+    slots = torch.arange(1, len(reqs) + 1, device=device)
+    return StepPenalties.build(reqs, slots, store, device)
 
 
 class _SamplingMetadataTestBase(CustomTestCase):
