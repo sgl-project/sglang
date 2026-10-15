@@ -1,0 +1,107 @@
+{
+ "aiter": "e7d2453f25e5aaeea72a3a40b284ba453e026624",
+ "modules": {
+  "aiter.ops.flydsl.kernels.buffer_ops": {
+   "classes": {
+    "BufferResourceDescriptor": [
+     "__init__",
+     "from_memref"
+    ]
+   },
+   "names": [
+    "BufferResourceDescriptor",
+    "T",
+    "_RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE",
+    "__all__",
+    "_get_buffer_flags",
+    "_ptr8_to_v4i32",
+    "_unwrap_value",
+    "annotations",
+    "buffer_load",
+    "buffer_store",
+    "create_buffer_resource",
+    "create_buffer_resource_from_addr",
+    "dsl_loc_tracing",
+    "fx",
+    "get_element_ptr",
+    "inspect",
+    "ir",
+    "is_rdna_arch",
+    "llvm",
+    "rocdl"
+   ]
+  },
+  "aiter.ops.flydsl.kernels.dpp_utils": {
+   "classes": {},
+   "names": [
+    "dpp_xor_f32",
+    "fx",
+    "update_dpp_i32"
+   ]
+  },
+  "aiter.ops.flydsl.kernels.kernels_common": {
+   "classes": {},
+   "names": [
+    "Any",
+    "Callable",
+    "F32_INF_BITS",
+    "F32_NAN_KEY",
+    "FX_ADDRESS_SPACE",
+    "LOG2E",
+    "Lock",
+    "T",
+    "_F32_INT32_MIN",
+    "_atomic_rmw_i32",
+    "_compiled_cache_lock",
+    "_gpu",
+    "_llvm",
+    "as_ir_value",
+    "atomic_add_i32",
+    "atomic_max_i32",
+    "atomic_or_i32",
+    "builtin",
+    "ceildiv",
+    "create_llvm_ptr",
+    "default_f8_type",
+    "dtype_to_elem_type",
+    "format_kernel_name",
+    "fx",
+    "get_rocm_arch",
+    "get_warp_size",
+    "ir",
+    "is_rdna_arch",
+    "kernel_signature",
+    "ord_signed_f32",
+    "run_cached",
+    "stream_ptr_to_async_token",
+    "uint32_to_int32"
+   ]
+  },
+  "aiter.ops.flydsl.quick_allreduce_int4_ipc": {
+   "classes": {
+    "UncachedIpcHeap": [
+     "_HIP_DEVICE_MALLOC_UNCACHED",
+     "_HIP_IPC_HANDLE_BYTES",
+     "_HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS",
+     "_HIP_MEMCPY_HOST_TO_DEVICE",
+     "_hip",
+     "_hipIpcMemHandle_t",
+     "_hip_check",
+     "_load_hip",
+     "alloc_uncached",
+     "close_mem_handle",
+     "copy_host_to_device",
+     "free_device_mem",
+     "gather_object_list_via_broadcast",
+     "get_mem_handle_bytes",
+     "open_mem_handle"
+    ]
+   },
+   "names": [
+    "UncachedIpcHeap",
+    "annotations",
+    "ctypes"
+   ]
+  }
+ }
+}

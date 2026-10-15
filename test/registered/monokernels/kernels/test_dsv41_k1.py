@@ -1,28 +1,45 @@
-"""Check that K1 stays bitwise equal to SGLang's decode chain for the seam and the SWA KV write on gfx950."""
+# SPDX-License-Identifier: Apache-2.0
+"""Check DeepSeek-V4.1's k1 span against SGLang's decode chain on gfx950 at every production width, TP2 and TP4:
+the SWA KV records bitwise, the RFC metrics of every other output against the normal path (q from SGLang's q norm,
+MXFP8 wq_b and the K store launch's RoPE), graph replay bitwise against eager, no allocation across a capture and
+100 replays of the k1, attention and ffn sequence, and an output digest per width.
 
-import argparse
+Run directly: ``python3 test_dsv41_k1.py`` relaunches itself under torchrun with 2 and 4 GPUs."""
+
+import json
 import math
-import os
 
 import torch
 import torch.distributed as dist
-from test_dsv41_mono_ffn import (
+from test_dsv41_ffn import (
     HC,
     HC_EPS,
     HIDDEN,
     RMS_EPS,
+    digest,
     finish,
+    init_dist,
     make_weights,
     mono_weights,
+    over_bounds,
+    production_widths,
     seam_inputs,
 )
+
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
+
+register_amd_ci(est_time=600, suite="nightly-amd-8-gpu-mi35x", nightly=True)
 
 RECORD, BLOCK, PAGES, POSITIONS = 584, 64, 64, 131072
 Q_RANK, NOPE, HEAD = 1280, 448, 512
 MIX_TOL = 1e-6  # measured <= 5.4e-7 (TP2 / TP4 synthetic, TP4 server)
-# K1 rounds q as SGLang does but sums wq_b in another order: bf16 flips only
+# diagnostics against an fp64 query: K1 rounds q as SGLang does but sums wq_b in another order
 Q_COS, Q_REL = 0.99999, 0.005
-WIDTHS = "1,2,3,4,5,7,8,12,16,17,24,31,32,33,40,47,48"
+TRIALS = 3
+ALLOC_REPLAYS = 100
+# widths no capture reaches, kept to cover the attention front's odd tilings
+EXTRA_WIDTHS = (3, 5, 7, 17, 31, 33, 47)
 # SGLang's wqkv_a configs K1 is matched to: the GEMV per M bucket up to 32 rows, the split-K tile above
 GEMV = {1: "w16s1r16t16k", 2: "w16s1r16t16k", 4: "w16s1r16t16k", 8: "w8s2r16t16k", 16: "w8s2r16t16k",
         32: "w8s1r16t32k"}  # fmt: skip
@@ -59,10 +76,10 @@ def rope_table(dev):
 
 def check_wqkv_route(M):
     """Return whether SGLang's wqkv_a config at M is the one K1 implements."""
-    from sglang.kernels.ops.quantization import mxfp8_native_amd_gfx95 as mx
-    from sglang.srt.models.deepseek_common.amd.dsv41_mono.attention.plan import (
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.attention.plan import (
         wqkv_order,
     )
+    from sglang.kernels.ops.quantization import mxfp8_native_amd_gfx95 as mx
 
     if M <= 32:
         b = mx._m_bucket(M)
@@ -103,16 +120,17 @@ def query_ref(qkv, a, cos_sin, pos):
     return o
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--widths", default=WIDTHS)
-    ap.add_argument("--trials", type=int, default=3)
-    args = ap.parse_args()
-    rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(rank)
-    dev = torch.device("cuda", rank)
-    dist.init_process_group("nccl")
+def run_k1():
+    """Every check on this rank; True when every rank passed."""
+    rank, tp, dev = init_dist()
     cpu = dist.new_group(backend="gloo")
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.layer import (
+        scratch_layout,
+    )
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
+        DSV41MonoLayer,
+    )
+    from sglang.experimental.monokernels.spec import measure
     from sglang.kernels.ops.attention.dsv4.elementwise import fused_k_norm_rope_flashmla
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
@@ -122,17 +140,20 @@ def main():
         mxfp8_native_blockscaled_linear,
         prepare_mxfp8_native_weight,
     )
-    from sglang.srt.models.deepseek_common.amd.dsv41_mono.layer import (
-        MonoBuild,
-        build_mono_k1,
-        scratch_layout,
+    from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+        rmsnorm_fake_quant_fp8,
     )
-    from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import DSV41MonoLayer
 
+    widths = production_widths(EXTRA_WIDTHS)
     w, _, _ = make_weights(tp, rank, dev, seed=0)
     m = mono_weights(w)
     del w
-    r = DSV41MonoLayer(tp, rank, cpu, dev)
+    r = DSV41MonoLayer(tp, rank, cpu, dev, deadline_s=60.0)
+    r.allocate(widths)
+    builds = r.build(widths, k1=True)
+    if rank == 0:
+        print(f"WIDTHS {widths}", flush=True)
+        print(f"BUILD seconds per width (k1 and ffn) {builds}", flush=True)
     heads = r.q.shape[1]
     g = torch.Generator(device=dev).manual_seed(11)
     a = attn_weights(heads, dev, g)
@@ -143,6 +164,9 @@ def main():
     freqs = torch.complex(cos_sin[:, :32], cos_sin[:, 32:])  # SGLang's freqs_cis
     w_sh, w_su = prepare_mxfp8_native_weight(
         a["wqkv"], torch.exp2(a["wqkv_s"].float() - 127), (32, 32)
+    )
+    wqb_sh, wqb_su = prepare_mxfp8_native_weight(
+        a["wqb"], torch.exp2(a["wqb_s"].float() - 127), (32, 32)
     )
     stride = math.ceil(BLOCK * RECORD / 576) * 576
     edges = torch.tensor(
@@ -169,9 +193,9 @@ def main():
         return res, x, post, comb, pre, pos, slot
 
     fails = []
-    for M in [int(v) for v in args.widths.split(",")]:
+    for M in widths:
         ok, route = check_wqkv_route(M)
-        k1 = build_mono_k1(MonoBuild(M, tp))
+        k1 = r.kernel(M, "k1")
         lay = scratch_layout(M, tp)
         sc = r.scratch(M)
         static = [t.clone() for t in inputs(M)]
@@ -200,7 +224,14 @@ def main():
             launch()
         diff = dict(res=0, x8=0, x8s=0, nope=0, scale=0, rope=0, replay=0)
         mix, q_cos, q_rel = 0.0, 1.0, 0.0
-        for _ in range(args.trials):
+        worst: dict = {}
+
+        def keep(key, out, ref):
+            got = measure(out, ref)
+            for metric, v in got.items():
+                worst[f"{key}.{metric}"] = max(worst.get(f"{key}.{metric}", 0.0), v)
+
+        for _ in range(TRIALS):
             for t, v in zip(static, inputs(M)):
                 t.copy_(v)
             swa.fill_(255)
@@ -252,6 +283,13 @@ def main():
             qkv = mxfp8_native_blockscaled_linear(
                 xq.q[:M], w_sh, w_su, input_scale=xq.scale[:M]
             )
+            # the normal path's query: q norm onto the MXFP8 grid, wq_b, then the K store launch ropes it
+            q8, _ = rmsnorm_fake_quant_fp8(
+                qkv[:, :Q_RANK].contiguous(), a["q_norm"], RMS_EPS, emit_fp8=True
+            )
+            q_np = mxfp8_native_blockscaled_linear(
+                q8.q, wqb_sh, wqb_su, input_scale=q8.scale
+            ).view(M, heads, HEAD)
             ref = torch.full((PAGES, stride), 255, dtype=torch.uint8, device=dev)
             fused_k_norm_rope_flashmla(
                 qkv[:, Q_RANK:].contiguous(),
@@ -262,6 +300,7 @@ def main():
                 slot.int(),
                 ref,
                 BLOCK,
+                q=q_np,
             )
             want = records(ref, slot.long())
 
@@ -289,10 +328,17 @@ def main():
                 (eager[3], comb_r),
             ):
                 mix = max(mix, (k1_t.reshape(ref_t.shape) - ref_t).abs().max().item())
+            keep("k1.kv", got[:, :583].float(), want[:, :583].float())
+            keep("k1.residual", eager[1].float(), ro.float())
+            keep("k1.pre", eager[4].reshape(pre_r.shape), pre_r)
+            keep("k1.post", eager[2].reshape(post_r.shape), post_r)
+            keep("k1.comb", eager[3].reshape(comb_r.shape), comb_r)
+            keep("k1.q", eager[0].float(), q_np.float())
             qr, qk = (
                 query_ref(qkv, a, cos_sin, pos.long()).flatten(),
                 eager[0].double().flatten(),
             )
+            keep("k1.q_fp64", qk, qr)
             q_cos = min(
                 q_cos, torch.nn.functional.cosine_similarity(qk, qr, dim=0).item()
             )
@@ -302,13 +348,82 @@ def main():
         bad += (["mix"] if mix > MIX_TOL else []) + (
             ["q"] if q_cos < Q_COS or q_rel > Q_REL else []
         )
+        bad += over_bounds(worst)
         if rank == 0:
             print(f"M={M:2d} {'PASS' if not bad else 'FAIL ' + ','.join(bad)} | wqkv_a {route} | differing: "
                   f"{diff} | pre/post/comb max|d| {mix:.2e} (bound {MIX_TOL:.0e}) | q cos {q_cos:.7f} "
                   f"rel {q_rel:.2e}", flush=True)  # fmt: skip
+            for key, v in sorted(worst.items()):
+                k, metric = key.rsplit(".", 1)
+                print(
+                    "METRIC",
+                    json.dumps({"tp": tp, "rows": M, "key": k, metric: v}),
+                    flush=True,
+                )
+            print(f"DIGEST k1 tp{tp} M={M} {digest(*eager)}", flush=True)
         fails += [f"M={M} {b}" for b in bad]
-    finish(fails, dev)
+    fails += allocator_check(r, m, widths, a, cos_sin, stride, tp, rank, dev)
+    return finish(fails, dev)
+
+
+def allocator_check(r, m, widths, a, cos_sin, stride, tp, rank, dev):
+    """The k1, attention and ffn sequence of every width in one graph (the attention core stands in as a copy into
+    wo_b's partial): no allocation in its capture beyond a control graph of the same copies, none in 100 replays."""
+    steps = []
+    for M in widths:
+        part, res, post, comb, pre = seam_inputs(M, tp, rank, dev)
+        x = (torch.randn(M, HIDDEN, device=dev) * 0.1).to(torch.bfloat16)
+        pos = torch.arange(M, device=dev)
+        swa = torch.full((PAGES, stride), 255, dtype=torch.uint8, device=dev)
+        attn = torch.empty_like(part)
+        steps.append((M, part, res, x, post, comb, pre, pos, swa, attn))
+
+    def sequence():
+        for M, part, res, x, post, comb, pre, pos, swa, attn in steps:
+            r.kernel(M, "k1")(
+                res.data_ptr(), x.data_ptr(), post.data_ptr(), comb.data_ptr(), pre.data_ptr(),
+                m.hc_ffn_fn.data_ptr(), m.hc_ffn_scale.data_ptr(), m.hc_ffn_base.data_ptr(),
+                m.ffn_norm.data_ptr(),
+                r.res_mid.data_ptr(), r.post_a.data_ptr(), r.comb_a.data_ptr(), r.pre_a.data_ptr(),
+                a["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
+                a["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
+                pos.data_ptr(), swa.data_ptr(), swa.stride(0), BLOCK, r.q.data_ptr(), r.scratch(M).data_ptr(),
+                r.epoch.data_ptr(), stream=torch.cuda.current_stream(),
+            )  # fmt: skip
+            attn.copy_(part)
+            r.ffn(m, attn, r.res_mid[:M], r.post_a[:M], r.comb_a[:M], r.pre_a[:M], M)
+
+    def captured_growth(fn):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated(dev)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fn()
+        torch.cuda.synchronize()
+        return torch.cuda.memory_allocated(dev) - before, g
+
+    sequence()
+    torch.cuda.synchronize()
+    control, _ = captured_growth(lambda: [s[9].copy_(s[1]) for s in steps])
+    capture, graph = captured_growth(sequence)
+    after = torch.cuda.memory_allocated(dev)
+    for _ in range(ALLOC_REPLAYS):
+        graph.replay()
+    torch.cuda.synchronize()
+    replays = torch.cuda.memory_allocated(dev) - after
+    if rank == 0:
+        print(f"ALLOCATOR k1 + attention + ffn at widths {widths}: capture {capture} bytes (control graph "
+              f"{control}), {ALLOC_REPLAYS} replays {replays} bytes", flush=True)  # fmt: skip
+    if capture > control or replays:
+        return [
+            f"allocator grew: capture {capture} (control {control}), replays {replays}"
+        ]
+    return []
+
+
+def test_k1_span():
+    assert run_k1(), "the k1 span failed a check on some rank; see the log"
 
 
 if __name__ == "__main__":
-    main()
+    multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4), timeout=1800)

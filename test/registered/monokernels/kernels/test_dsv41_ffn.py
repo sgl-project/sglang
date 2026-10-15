@@ -1,18 +1,62 @@
-"""Check the mono FFN launch's numerics and graph replay against SGLang's ops on gfx950 (torchrun, TP2 or TP4)."""
+# SPDX-License-Identifier: Apache-2.0
+"""Check DeepSeek-V4.1's ffn span against SGLang's ops on gfx950 at every production width, TP2 and TP4: the
+spec's numerics (max_abs / max_rel per output), graph replay of every width back to back, no allocation across a
+capture and its replays, and a digest of every output for the old-against-new comparison.
 
-import argparse
+Run directly: ``python3 test_dsv41_ffn.py`` relaunches itself under torchrun with 2 and 4 GPUs."""
+
+import hashlib
+import json
 import os
-import sys
+import types
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
+
+register_amd_ci(est_time=900, suite="nightly-amd-8-gpu-mi35x", nightly=True)
+
 HIDDEN, HC, MIX = 5120, 4, 24
 E, TOPK, SCALE, LIMIT = 384, 6, 1.5, 10.0
 INTER, PAD = 2304, 128
-WIDTHS = (1, 2, 4, 8, 12, 16, 24, 32, 40, 48)  # every decode graph width <= 48
 RMS_EPS, HC_EPS = 1e-20, 1e-6
+MAX_ROWS = 48
+REPLAYS = 500
+# widths no capture reaches, kept to cover the kernels' odd shapes
+EXTRA_WIDTHS = (3, 5, 7, 17, 31, 33, 47)
+
+
+def production_widths(extra=EXTRA_WIDTHS):
+    """The widths attach builds (runtime.widths_for) for the cookbook's decode graphs (--cuda-graph-max-bs-decode
+    64, SGLang's capture sizes) without and with DSpark (6 tokens a verify step), plus ``extra``."""
+    from sglang.experimental.monokernels.runtime import widths_for
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_decode_cuda_graph_batch_sizes,
+    )
+
+    out = set(extra)
+    for algorithm, tokens in ((None, None), ("DSPARK", 6)):
+        cfg = types.SimpleNamespace(
+            disable_cuda_graph_padding=False, speculative_algorithm=algorithm
+        )
+        sizes = generate_decode_cuda_graph_batch_sizes(cfg, 64)
+        for widths in widths_for(sizes, tokens, MAX_ROWS).values():
+            out.update(widths)
+    return sorted(out)
+
+
+def init_dist():
+    """This torchrun rank's (rank, TP size, device, CPU group); the process group once per process."""
+    rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+    return rank, tp, torch.device("cuda", torch.cuda.current_device())
+
+
 FP4 = [
     0.0,
     0.5,
@@ -178,7 +222,9 @@ def make_weights(tp, rank, dev, seed=0):
 
 
 def mono_weights(w):
-    from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import MonoLayerWeights
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
+        MonoLayerWeights,
+    )
 
     return MonoLayerWeights(
         hc_ffn_fn=w["hc_fn"], hc_ffn_scale=w["hc_scale"], hc_ffn_base=w["hc_base"],
@@ -267,26 +313,65 @@ def sglang_ffn_seam(part, res, post, comb, pre, w):
     return res2, normed, co.post, co.comb, co.pre
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--replays", type=int, default=500)
-    args = ap.parse_args()
-    rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(rank)
-    dev = torch.device("cuda", rank)
-    dist.init_process_group("nccl")
-    cpu = dist.new_group(backend="gloo")
-    from sglang.srt.models.deepseek_common.amd.dsv41_mono.layer import scratch_layout
-    from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import DSV41MonoLayer
+def digest(*ts):
+    h = hashlib.sha256()
+    for t in ts:
+        h.update(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    return h.hexdigest()[:16]
 
+
+def over_bounds(values):
+    """The ``<span>.<output>.<metric>`` values above the spec's bounds (a bound of None is not checked)."""
+    from sglang.experimental.monokernels.hip.deepseek_v41.spec import NUMERICS
+
+    return [
+        f"{k} {v:.3g} > {NUMERICS.bounds[k]:.3g}"
+        for k, v in sorted(values.items())
+        if NUMERICS.bounds.get(k) is not None and v > NUMERICS.bounds[k]
+    ]
+
+
+def metric_lines(tp, M, outputs, refs):
+    """``METRIC`` json lines: the RFC metrics of each ffn output against its reference (spec.measure); and the
+    values above the spec's bounds."""
+    from sglang.experimental.monokernels.spec import measure
+
+    lines, values = [], {}
+    for name, out in outputs.items():
+        m = measure(out.float(), refs[name].float())
+        lines.append(json.dumps({"tp": tp, "rows": M, "key": f"ffn.{name}", **m}))
+        values.update({f"ffn.{name}.{k}": v for k, v in m.items()})
+    return lines, over_bounds(values)
+
+
+def run_ffn():
+    """Every check on this rank; True when every rank passed."""
+    rank, tp, dev = init_dist()
+    cpu = dist.new_group(backend="gloo")
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.layer import (
+        scratch_layout,
+    )
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
+        DSV41MonoLayer,
+    )
+
+    widths = production_widths()
     w, inter, padded = make_weights(tp, rank, dev)
     mw = mono_weights(w)
     mw.check(tp)
-    runner = DSV41MonoLayer(tp, rank, cpu, dev)
+    runner = DSV41MonoLayer(tp, rank, cpu, dev, deadline_s=60.0)
+    runner.allocate(widths)
+    builds = runner.build(widths, k1=False)
+    if rank == 0:
+        print(f"WIDTHS {widths}", flush=True)
+        print(f"BUILD seconds per width {builds}", flush=True)
     fails, steps = [], []
-    for M in WIDTHS:
+    for M in widths:
         part, res, post, comb, pre = seam_inputs(M, tp, rank, dev)
-        out, res_o, post_o, comb_o, pre_o = runner.ffn(mw, part, res, post, comb, pre)
+        out, res_o, post_o, comb_o, pre_o = (
+            t.clone()
+            for t in runner.ffn(mw, part, res, post, comb, pre, layer_id=M % 2)
+        )
         res2, normed_ref, post2, comb2, pre2 = sglang_ffn_seam(
             part, res, post, comb, pre, w
         )
@@ -337,49 +422,97 @@ def main():
         if rank == 0:
             print(f"M={M:2d} {'PASS' if not bad else 'FAIL ' + ','.join(bad)}"
                   f" (residual exact: {checks['residual exact']}) {stats}", flush=True)  # fmt: skip
+            outputs = {
+                "out": out,
+                "residual": res_o,
+                "post": post_o.view(M, HC),
+                "comb": comb_o,
+                "pre": pre_o,
+            }
+            refs = {
+                "out": gold,
+                "residual": res2,
+                "post": post2,
+                "comb": comb2,
+                "pre": pre2,
+            }
+            lines, over = metric_lines(tp, M, outputs, refs)
+            for line in lines:
+                print("METRIC", line, flush=True)
+            if over:
+                print(f"M={M:2d} above the spec's bounds: {over}", flush=True)
+            fails += [f"M={M} {k}" for k in over]
+            print(
+                f"DIGEST ffn tp{tp} M={M} {digest(out, res_o, post_o, comb_o, pre_o)}",
+                flush=True,
+            )
         fails += [f"M={M} {k}" for k in bad]
-        outs = runner._outs(M, res)
-        steps.append((part, res, post, comb, pre, outs))
+        # the outputs of each width, copied out of the runner's alternating output sets inside the graph
+        dst = [torch.empty_like(t) for t in (out, res_o, post_o, comb_o, pre_o)]
+        steps.append((M, part, res, post, comb, pre, dst))
 
     # the hand-off protocol: every width in one graph, back to back, bit for bit against eager
     def run_all():
-        for part, res, post, comb, pre, outs in steps:
-            runner.ffn(mw, part, res, post, comb, pre, outs=outs)
+        for i, (M, part, res, post, comb, pre, dst) in enumerate(steps):
+            got = runner.ffn(mw, part, res, post, comb, pre, layer_id=i)
+            for d, g in zip(dst, got):
+                d.copy_(g)
 
     run_all()
     torch.cuda.synchronize()
-    ref = [t.clone() for s in steps for t in s[5]]
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_all()
+    ref = [t.clone() for s in steps for t in s[6]]
+
+    def captured_growth(fn):
+        """(bytes the allocator grew during a capture of fn, the graph)."""
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated(dev)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fn()
+        torch.cuda.synchronize()
+        return torch.cuda.memory_allocated(dev) - before, g
+
+    # the same copies without the launches: what torch's capture itself allocates
+    control, _ = captured_growth(lambda: [d.copy_(d) for s in steps for d in s[6]])
+    capture, graph = captured_growth(run_all)
+    after_capture = torch.cuda.memory_allocated(dev)
     bad_replays = 0
-    for i in range(args.replays):
+    for i in range(REPLAYS):
         graph.replay()
-        if i % 50 == 49 or i == args.replays - 1:
+        if i % 50 == 49 or i == REPLAYS - 1:
             torch.cuda.synchronize()
-            got = [t for s in steps for t in s[5]]
+            got = [t for s in steps for t in s[6]]
             bad_replays += sum(not torch.equal(a, b) for a, b in zip(got, ref))
+    torch.cuda.synchronize()
+    replays = torch.cuda.memory_allocated(dev) - after_capture
     if rank == 0:
-        print(f"replay check: {args.replays} replays of widths {WIDTHS} in one graph, outputs sampled "
-              f"every 50 replays: {bad_replays} mismatching checks (stress: stress_dsv41_mono_ffn.py)",
-              flush=True)  # fmt: skip
+        print(f"replay check: {REPLAYS} replays of widths {widths} in one graph, outputs sampled "
+              f"every 50 replays: {bad_replays} mismatching checks", flush=True)  # fmt: skip
+        print(f"ALLOCATOR capture {capture} bytes (control graph {control}), {REPLAYS} replays {replays} "
+              f"bytes", flush=True)  # fmt: skip
     if bad_replays:
         fails.append("replay")
-    finish(fails, dev)
+    if capture > control or replays:
+        fails.append(
+            f"allocator grew: capture {capture} (control {control}), replays {replays}"
+        )
+    return finish(fails, dev)
 
 
 def finish(fails, dev):
-    """Print this rank's failures, then exit nonzero on every rank if any rank failed."""
+    """Print this rank's failures; True when no rank failed."""
     if fails:
         print(f"rank {dist.get_rank()} FAILED: {fails}", flush=True)
     bad = torch.tensor([int(bool(fails))], device=dev)
     dist.all_reduce(bad, op=dist.ReduceOp.MAX)
     if dist.get_rank() == 0:
         print("ALL PASS" if not bad.item() else "FAILED", flush=True)
-    dist.destroy_process_group()
-    if bad.item():
-        sys.exit(1)
+    return not bad.item()
+
+
+def test_ffn_span():
+    assert run_ffn(), "the ffn span failed a check on some rank; see the log"
 
 
 if __name__ == "__main__":
-    main()
+    multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4), timeout=1800)

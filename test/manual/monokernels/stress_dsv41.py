@@ -1,4 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
 """Stress chained FFN launches (with ``--k1``: K1 and FFN launches) across widths, width orders and graph replays (torchrun, 4 GPUs)."""
+
 import argparse
 import gc
 import math
@@ -8,10 +10,22 @@ import time
 
 import torch
 import torch.distributed as dist
+from test_dsv41_ffn import (
+    HC,
+    HIDDEN,
+    WIDTHS,
+    finish,
+    make_weights,
+    mono_weights,
+    seam_inputs,
+)
 
-from test_dsv41_mono_ffn import HC, HIDDEN, WIDTHS, finish, make_weights, mono_weights, seam_inputs
-
-RECORD, BLOCK, PAGES, POSITIONS = 584, 64, 64, 8192  # V4 SWA record bytes, page tokens, pages, rope positions
+RECORD, BLOCK, PAGES, POSITIONS = (
+    584,
+    64,
+    64,
+    8192,
+)  # V4 SWA record bytes, page tokens, pages, rope positions
 MODES = ("graph", "graph_delay", "eager", "eager_delay")
 PHASES = 10
 
@@ -32,22 +46,40 @@ def attn_weights(heads, dev, g):
     wqkv, wqkv_s = fp8(1792, HIDDEN)
     wqb, wqb_s = fp8(heads * 512, 1280)
     one = lambda n: torch.ones(n, dtype=torch.bfloat16, device=dev)  # noqa: E731
-    return dict(wqkv=wqkv, wqkv_s=wqkv_s, q_norm=one(1280), kv_norm=one(512), wqb=wqb, wqb_s=wqb_s)
+    return dict(
+        wqkv=wqkv,
+        wqkv_s=wqkv_s,
+        q_norm=one(1280),
+        kv_norm=one(512),
+        wqb=wqb,
+        wqb_s=wqb_s,
+    )
 
 
 def rope_table(dev):
     """K1's rope table, [POSITIONS, 64] f32: 32 cosines, then 32 sines."""
     j = torch.arange(32, device=dev, dtype=torch.float64)
-    ang = torch.arange(POSITIONS, device=dev, dtype=torch.float64)[:, None] * 10000.0 ** (-j / 32)
+    ang = torch.arange(POSITIONS, device=dev, dtype=torch.float64)[
+        :, None
+    ] * 10000.0 ** (-j / 32)
     return torch.cat([ang.cos(), ang.sin()], -1).float().contiguous()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--k1", action="store_true", help="run K1 before each FFN launch")
-    ap.add_argument("--minutes", type=float, default=25.0, help="stress time, split over the phases")
-    ap.add_argument("--layers", type=int, default=None, help="default 30 with --k1, else 40")
-    ap.add_argument("--sets", type=int, default=None, help="FFN weight sets cycled over the layers (2 with --k1, else 4)")
+    ap.add_argument(
+        "--minutes", type=float, default=25.0, help="stress time, split over the phases"
+    )
+    ap.add_argument(
+        "--layers", type=int, default=None, help="default 30 with --k1, else 40"
+    )
+    ap.add_argument(
+        "--sets",
+        type=int,
+        default=None,
+        help="FFN weight sets cycled over the layers (2 with --k1, else 4)",
+    )
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
@@ -55,8 +87,13 @@ def main():
     dev = torch.device("cuda", rank)
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
-    from sglang.srt.models.deepseek_common.amd.dsv41_mono.layer import MonoBuild, build_mono_k1
-    from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import DSV41MonoLayer
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.layer import (
+        MonoBuild,
+        build_mono_k1,
+    )
+    from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.runner import (
+        DSV41MonoLayer,
+    )
 
     def log(msg):
         if rank == 0:
@@ -64,7 +101,9 @@ def main():
 
     k1 = args.k1
     L = args.layers or (30 if k1 else 40)
-    kinds = ("out", "residual", "post", "comb", "pre") + (("q", "records") if k1 else ())
+    kinds = ("out", "residual", "post", "comb", "pre") + (
+        ("q", "records") if k1 else ()
+    )
     ffn = []
     for s in range(args.sets or (2 if k1 else 4)):
         w, _, _ = make_weights(tp, rank, dev, seed=s)
@@ -73,20 +112,28 @@ def main():
         del w
         gc.collect()
         torch.cuda.empty_cache()
-    r = DSV41MonoLayer(tp, rank, cpu, dev)
+    r = DSV41MonoLayer(tp, rank, cpu, dev, deadline_s=60.0)
+    r.allocate(WIDTHS)
+    r.build(WIDTHS, k1=False)
     heads = r.q.shape[1]
-    g = torch.Generator(device=dev).manual_seed(11)  # the same attention weights on every rank
+    g = torch.Generator(device=dev).manual_seed(
+        11
+    )  # the same attention weights on every rank
     attn = [attn_weights(heads, dev, g) for _ in range(L)] if k1 else None
     cos_sin = rope_table(dev)
     stride = math.ceil(BLOCK * RECORD / 576) * 576  # SGLang's V4 page bytes
-    share = (rank + 1) / (tp * (tp + 1) / 2)  # this rank's share of the next layer's attention output
+    share = (rank + 1) / (
+        tp * (tp + 1) / 2
+    )  # this rank's share of the next layer's attention output
 
     class Width:
         """One step width's fixed inputs, its per-layer outputs, and their eager reference."""
 
         def __init__(self, M):
             self.M = M
-            self.part, self.res, self.post, self.comb, self.pre = seam_inputs(M, tp, rank, dev)
+            self.part, self.res, self.post, self.comb, self.pre = seam_inputs(
+                M, tp, rank, dev
+            )
             b16, f32 = torch.bfloat16, torch.float32
             self.bufs = (
                 torch.empty(L, M, HIDDEN, dtype=b16, device=dev),
@@ -97,11 +144,18 @@ def main():
             )
             if k1:
                 self.k1 = build_mono_k1(MonoBuild(M, tp))
-                self.x = (torch.randn(M, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+                self.x = (torch.randn(M, HIDDEN, generator=g, device=dev) * 0.1).to(
+                    torch.bfloat16
+                )
                 self.pos = torch.randint(0, POSITIONS, (M,), generator=g, device=dev)
                 self.slot = torch.randperm(PAGES * BLOCK, generator=g, device=dev)[:M]
-                self.swa = torch.full((PAGES, stride), 255, dtype=torch.uint8, device=dev)
-                self.bufs += (torch.empty(M, heads, 512, dtype=b16, device=dev), self.swa)
+                self.swa = torch.full(
+                    (PAGES, stride), 255, dtype=torch.uint8, device=dev
+                )
+                self.bufs += (
+                    torch.empty(M, heads, 512, dtype=b16, device=dev),
+                    self.swa,
+                )
             self.parts = torch.empty(L, M, HIDDEN, dtype=b16, device=dev)
             self.ref = None
 
@@ -133,9 +187,21 @@ def main():
                     wd.slot.data_ptr(), wd.swa.data_ptr(), wd.swa.stride(0), BLOCK, r.q.data_ptr(),
                     r.scratch(M).data_ptr(), r.epoch.data_ptr(), stream=torch.cuda.current_stream(),
                 )  # fmt: skip
-                r.ffn(m, part, r.res_mid[:M], r.post_a[:M].view(M, HC, 1), r.comb_a[:M], r.pre_a[:M], outs=outs)
+                got = r.ffn(
+                    m,
+                    part,
+                    r.res_mid[:M],
+                    r.post_a[:M].view(M, HC, 1),
+                    r.comb_a[:M],
+                    r.pre_a[:M],
+                    i,
+                )
+                for o, t in zip(outs, got):
+                    o.copy_(t.view(o.shape))
             else:
-                r.ffn(m, part, res, post, comb, pre, outs=outs)
+                got = r.ffn(m, part, res, post, comb, pre, i)
+                for o, t in zip(outs, got):
+                    o.copy_(t.view(o.shape))
             torch.mul(wd.bufs[0][i], share, out=wd.parts[i])
             x, part = wd.bufs[0][i], wd.parts[i]
             res, post, comb, pre = (b[i] for b in wd.bufs[1:5])
@@ -146,7 +212,9 @@ def main():
     st = {}
     fails = []
     t0 = time.time()
-    for M in sorted(WIDTHS, reverse=True):  # SGLang warms up and captures the largest width first
+    for M in sorted(
+        WIDTHS, reverse=True
+    ):  # SGLang warms up and captures the largest width first
         wd = st[M] = Width(M)
         chain(wd)
         chain(wd)
@@ -160,8 +228,10 @@ def main():
         if not all(torch.isfinite(b).all() for b in first[:6]):
             fails.append(f"M={M} reference not finite")
         wd.ref = first
-    log(f"tp {tp}, {L} layers ({'K1 + ' if k1 else ''}FFN launch each), widths {WIDTHS}; built and eager "
-        f"references in {time.time() - t0:.1f} s: {'ok' if not fails else fails}")
+    log(
+        f"tp {tp}, {L} layers ({'K1 + ' if k1 else ''}FFN launch each), widths {WIDTHS}; built and eager "
+        f"references in {time.time() - t0:.1f} s: {'ok' if not fails else fails}"
+    )
     # the check's own control: a step that writes nothing must flag every element it poisons
     wd = st[4]
     wd.poison()
@@ -186,12 +256,31 @@ def main():
     t0 = time.time()
     graphs = capture(sorted(WIDTHS, reverse=True))
     log(f"captured {len(graphs)} graphs in {time.time() - t0:.1f} s")
-    big = torch.ones(16 << 20, dtype=torch.float32, device=dev)  # 64 MB: another collective's traffic
+    big = torch.ones(
+        16 << 20, dtype=torch.float32, device=dev
+    )  # 64 MB: another collective's traffic
     mat = torch.randn(4096, 4096, device=dev, dtype=torch.bfloat16)
-    count = {"graph": 0, "graph_delay": 0, "eager": 0, "eager_delay": 0, "pre_delay": 0, "foreign": 0}
+    count = {
+        "graph": 0,
+        "graph_delay": 0,
+        "eager": 0,
+        "eager_delay": 0,
+        "pre_delay": 0,
+        "foreign": 0,
+    }
     phases = []
     # this rank's mismatches by phase, width, step mode, rank delay before, foreign work before, kind, layer
-    det = torch.zeros(PHASES, len(WIDTHS), len(MODES), 2, 2, len(kinds), L, dtype=torch.int64, device=dev)
+    det = torch.zeros(
+        PHASES,
+        len(WIDTHS),
+        len(MODES),
+        2,
+        2,
+        len(kinds),
+        L,
+        dtype=torch.int64,
+        device=dev,
+    )
 
     def step(M, j, rng):
         wd = st[M]
@@ -220,7 +309,13 @@ def main():
             graphs[M, "plain"].replay()
             mode = "graph"
         count[mode] += 1
-        d = det[len(phases) - 1, WIDTHS.index(M), MODES.index(mode), int(j % 5 == 4), int(j % 11 == 10)]
+        d = det[
+            len(phases) - 1,
+            WIDTHS.index(M),
+            MODES.index(mode),
+            int(j % 5 == 4),
+            int(j % 11 == 10),
+        ]
         for k, (got, ref) in enumerate(zip(wd.bufs, wd.ref)):
             bad = got != ref
             if k < 5:
@@ -237,7 +332,9 @@ def main():
             if j % 200 == 199:
                 torch.cuda.synchronize()
         torch.cuda.synchronize()
-        log(f"phase {name}: {len(seq)} steps in {time.time() - t:.1f} s, mismatching elements {det.sum().item() - before}")
+        log(
+            f"phase {name}: {len(seq)} steps in {time.time() - t:.1f} s, mismatching elements {det.sum().item() - before}"
+        )
         return time.time() - t
 
     rng = random.Random(args.seed)  # the same sequence on every rank
@@ -253,7 +350,11 @@ def main():
     run("descending", (W[::-1] * (n // len(W) + 1))[:n], rng)
     run("extremes 48 <-> 1", [48 if j % 2 else 1 for j in range(n)], rng)
     jumps = [(1, 48), (2, 40), (48, 4), (12, 32), (40, 1), (24, 2), (8, 48), (16, 12)]
-    run("small <-> large jumps", [jumps[(j // 2) % len(jumps)][j % 2] for j in range(n)], rng)
+    run(
+        "small <-> large jumps",
+        [jumps[(j // 2) % len(jumps)][j % 2] for j in range(n)],
+        rng,
+    )
     runs = []
     while len(runs) < n:
         runs += [rng.choice(W)] * rng.randint(20, 80)
@@ -269,7 +370,9 @@ def main():
     torch.cuda.empty_cache()
     t0 = time.time()
     graphs = capture(sorted(WIDTHS))
-    log(f"destroyed and captured again ({len(graphs)} graphs, smallest first) in {time.time() - t0:.1f} s")
+    log(
+        f"destroyed and captured again ({len(graphs)} graphs, smallest first) in {time.time() - t0:.1f} s"
+    )
     run("after re-capture: random", [rng.choice(W) for _ in range(2 * n)], rng)
     run("after re-capture: extremes", [48 if j % 2 else 1 for j in range(n)], rng)
 
@@ -280,8 +383,11 @@ def main():
             nz = det.nonzero().tolist()
             print(f"[rank {rank}] mismatch cells: {len(nz)}", flush=True)
             for ph, wi, mo, pd, fo, k, lay in nz[:80]:
-                print(f"[rank {rank}] phase '{phases[ph]}' M={WIDTHS[wi]} {MODES[mo]} pre_delay={pd} foreign={fo} "
-                      f"{kinds[k]} layer={lay}: {det[ph, wi, mo, pd, fo, k, lay].item()}", flush=True)
+                print(
+                    f"[rank {rank}] phase '{phases[ph]}' M={WIDTHS[wi]} {MODES[mo]} pre_delay={pd} foreign={fo} "
+                    f"{kinds[k]} layer={lay}: {det[ph, wi, mo, pd, fo, k, lay].item()}",
+                    flush=True,
+                )
         dist.barrier()
     per_layer = det.sum((0, 1, 2, 3, 4))
     dist.all_reduce(per_layer)
@@ -290,10 +396,14 @@ def main():
     agree = torch.tensor([int(torch.equal(ref, st[48].bufs[0]))], device=dev)
     dist.all_reduce(agree, op=dist.ReduceOp.MIN)
     steps = sum(count.values()) - count["pre_delay"] - count["foreign"]
-    log(f"steps {steps} ({count}); {'K1 and ' if k1 else ''}FFN launches {steps * L} each")
+    log(
+        f"steps {steps} ({count}); {'K1 and ' if k1 else ''}FFN launches {steps * L} each"
+    )
     for k, name in enumerate(kinds):
         bad_layers = [i for i in range(L) if per_layer[k, i].item()]
-        log(f"  {name}: mismatching elements {per_layer[k].sum().item()}, layers {bad_layers or 'none'}")
+        log(
+            f"  {name}: mismatching elements {per_layer[k].sum().item()}, layers {bad_layers or 'none'}"
+        )
     log(f"ranks agree on the last output: {bool(agree.item())}")
     if per_layer.sum().item() or not agree.item():
         fails.append("stress")
