@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,6 +22,18 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+_MINI_CONFIG = {
+    "architectures": ["LlamaForCausalLM"],
+    "model_type": "llama",
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 2,
+    "num_hidden_layers": 2,
+    "vocab_size": 128,
+    "max_position_embeddings": 2048,
+}
 
 
 def _args(allocation_index: int, **kwargs) -> ServerArgs:
@@ -175,12 +190,40 @@ class TestElasticEPAutoBootstrap(CustomTestCase):
         self.assertEqual(cfg.attn_dp_size, 8)
         self.assertFalse(cfg.enable_dp_attention)
 
+    def test_full_pipeline_resolves_auto_geometry_before_eplb(self, _device_count):
+        with tempfile.TemporaryDirectory() as model_path:
+            with open(os.path.join(model_path, "config.json"), "w") as config_file:
+                json.dump(_MINI_CONFIG, config_file)
+            with patch(
+                "sglang.srt.elastic_ep.runtime_topology.probe_runtime_topology",
+                return_value=None,
+            ):
+                server_args = _args(
+                    0,
+                    model_path=model_path,
+                    enable_eplb=True,
+                    device="cuda",
+                )
+                server_args.resolve_once()
+
+        cfg = resolved_view(server_args)
+        self.assertTrue(cfg.enable_eplb)
+        self.assertEqual(cfg.moe_a2a_backend, "nixl")
+        self.assertIsNone(cfg.ep_join_mode)
+        self.assertEqual(cfg.elastic_ep_allocation_index, 0)
+        self.assertEqual(cfg.tp_size, 8)
+        self.assertEqual(cfg.ep_size, 8)
+        self.assertEqual(cfg.attn_dp_size, 8)
+        self.assertTrue(cfg.enable_dp_lm_head)
+        self.assertEqual(cfg.node_rank, 0)
+        self.assertEqual(cfg.nnodes, 2)
+
     def test_automatic_mode_rejects_explicit_attention_dp_geometry(self, _device_count):
         with self.assertRaisesRegex(ValueError, "--attn-dp-size=4"):
             handle_elastic_ep(_args(0, attn_dp_size=4))
 
     def test_automatic_mode_rejects_attention_context_parallelism(self, _device_count):
-        with self.assertRaisesRegex(AssertionError, "--attn-cp-size 1"):
+        with self.assertRaisesRegex(AssertionError, "Invalid attention topology"):
             handle_elastic_ep(_args(0, attn_cp_size=2))
 
 
