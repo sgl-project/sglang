@@ -1,45 +1,186 @@
-"""Correctness-gated AITER vs Gluon FAv3 benchmark for Wan2.2 shapes."""
+"""Correctness-gated AITER BF16 vs Gluon FAv3 benchmark on gfx1250."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import platform
 import statistics
+import subprocess
+from pathlib import Path
 
 import aiter
 import torch
 import triton
+from aiter.jit.core import ENABLE_CK
 
 from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
     FAv3LaunchConfig,
     gluon_fav3_attention,
     select_fav3_launch_config,
 )
-from sglang.multimodal_gen import envs
 
 PRESETS = {
     "reference": (1, 8192, 8192, 16),
-    # Wan2.2-T2V-A14B at 720x1280x193: latent tokens are 49*45*80.
-    "wan-cross": (2, 176_400, 512, 40),
-    "wan-self": (2, 176_400, 176_400, 40),
+    # One Wan2.2-T2V-A14B request at 720x1280x193: 49*45*80 tokens.
+    # Conditional and unconditional CFG branches run in separate B1 calls.
+    "wan-cross": (1, 176_400, 512, 40),
+    "wan-self": (1, 176_400, 176_400, 40),
 }
 
 
 def aiter_attention(query, key, value):
+    """Match the default BF16 AITerImpl call, including RTZ conversion."""
     return aiter.flash_attn_func(
         query,
         key,
         value,
         dropout_p=0.0,
+        softmax_scale=query.shape[-1] ** -0.5,
         causal=False,
         return_attn_probs=False,
         return_lse=False,
+        how_v3_bf16_cvt=2,
     )
+
+
+def check_sampled_fp64(query, key, value, outputs):
+    """Check selected batch/head/query positions against all keys in FP64."""
+    batch, seqlen_q, num_heads, head_size = query.shape
+    batches = torch.tensor(sorted({0, batch - 1}), device=query.device)
+    rows = torch.tensor(
+        sorted(
+            {
+                0,
+                min(127, seqlen_q - 1),
+                min(128, seqlen_q - 1),
+                min(255, seqlen_q - 1),
+                min(256, seqlen_q - 1),
+                seqlen_q // 2,
+                seqlen_q - 1,
+            }
+        ),
+        device=query.device,
+    )
+    heads = torch.tensor(
+        sorted({0, num_heads // 2, num_heads - 1}), device=query.device
+    )
+
+    def sample_query(tensor):
+        return (
+            tensor.index_select(1, rows).index_select(2, heads).index_select(0, batches)
+        )
+
+    query_fp64 = sample_query(query).transpose(1, 2).double()
+    key_fp64 = (
+        key.index_select(2, heads).index_select(0, batches).transpose(1, 2).double()
+    )
+    value_fp64 = (
+        value.index_select(2, heads).index_select(0, batches).transpose(1, 2).double()
+    )
+    probabilities = torch.softmax(
+        query_fp64 @ key_fp64.transpose(-1, -2) * head_size**-0.5, dim=-1
+    )
+    reference = (probabilities @ value_fp64).transpose(1, 2)
+    reference_rms = reference.square().mean().sqrt().item()
+    metrics = {}
+    for name, output in outputs.items():
+        actual = sample_query(output).double()
+        difference = actual - reference
+        rms_error = difference.square().mean().sqrt().item()
+        relative_rms = rms_error / max(reference_rms, 1e-30)
+        if not torch.isfinite(actual).all() or relative_rms > 0.005:
+            raise AssertionError(
+                f"{name} failed independent FP64 check: relative RMS={relative_rms}"
+            )
+        torch.testing.assert_close(
+            actual, reference, rtol=0.02, atol=0.01 * reference_rms
+        )
+        metrics[name] = {
+            "relative_rms": relative_rms,
+            "max_abs": difference.abs().max().item(),
+        }
+    print(
+        "independent_fp64="
+        + json.dumps(
+            {
+                "batches": batches.tolist(),
+                "query_rows": rows.tolist(),
+                "heads": heads.tolist(),
+                "all_keys": key.shape[1],
+                "metrics": metrics,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def package_provenance(module):
+    source = Path(module.__file__).resolve()
+    result = {
+        "version": getattr(module, "__version__", "unknown"),
+        "source": str(source),
+    }
+    for parent in source.parents:
+        if not (parent / ".git").exists():
+            continue
+        try:
+            revision = subprocess.run(
+                ["git", "-C", str(parent), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5,
+            )
+            result["revision"] = revision.stdout.strip()
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(parent),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=no",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5,
+            )
+            result["tracked_source_modified"] = bool(status.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            result["revision"] = "unavailable"
+        break
+    return result
+
+
+def print_provenance(device):
+    properties = torch.cuda.get_device_properties(device)
+    provenance = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "torch_revision": torch.version.git_version,
+        "hip": torch.version.hip,
+        "device": properties.name,
+        "architecture": getattr(properties, "gcnArchName", "unknown"),
+        "triton": package_provenance(triton),
+        "aiter": package_provenance(aiter),
+        "ENABLE_CK": bool(ENABLE_CK),
+        "ENABLE_CK_env": os.environ.get("ENABLE_CK", "<unset>"),
+        "aiter_baseline": "AITerImpl-equivalent BF16, default scale, how_v3_bf16_cvt=2",
+    }
+    print("provenance=" + json.dumps(provenance, sort_keys=True))
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--preset", choices=PRESETS, default="reference")
-    parser.add_argument("--batch", type=int)
+    parser.add_argument(
+        "--batch",
+        type=int,
+        help="Override preset batch; Wan defaults to one CFG branch.",
+    )
     parser.add_argument("--sq", type=int)
     parser.add_argument("--sk", type=int)
     parser.add_argument("--heads", type=int)
@@ -53,10 +194,9 @@ def parse_args():
     parser.add_argument("--trace-provider", choices=("aiter", "gluon"))
     parser.add_argument(
         "--schedule",
-        choices=("auto", "pipeline", "pingpong"),
+        choices=("auto", "pipeline", "pingpong", "persistent"),
     )
     parser.add_argument("--scheduler")
-    parser.add_argument("--wan-fixed-shift", action="store_true")
     return parser.parse_args()
 
 
@@ -87,21 +227,28 @@ def main():
     )
     value = torch.randn_like(key)
 
-    wan_fixed_shift = args.wan_fixed_shift or envs.SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT
+    print_provenance(query.device)
+
     config = select_fav3_launch_config(
         batch,
         num_heads,
         seqlen_q,
         seqlen_k=seqlen_k,
-        wan_fixed_shift=wan_fixed_shift,
     )
     if args.schedule not in (None, "auto"):
         schedule_configs = {
             "pipeline": FAv3LaunchConfig("pipeline", 128, 64, 4, False, ""),
             "pingpong": FAv3LaunchConfig("pingpong", 256, 64, 8, True, ""),
+            "persistent": FAv3LaunchConfig(
+                "persistent", 128, 256, 4, True, "amdgpu-sched-strategy=iterative-ilp"
+            ),
         }
         config = schedule_configs[args.schedule]
     if args.scheduler is not None:
+        if config.schedule == "persistent":
+            raise ValueError(
+                "--scheduler cannot override the persistent kernel scheduler"
+            )
         scheduler = (
             ""
             if args.scheduler in ("", "default")
@@ -115,7 +262,6 @@ def main():
             key,
             value,
             launch_config=config,
-            wan_fixed_shift=wan_fixed_shift,
         )
 
     if args.trace_provider is not None:
@@ -135,6 +281,10 @@ def main():
         expected = aiter_attention(query, key, value)
         actual = gluon_attention()
         torch.cuda.synchronize()
+        for name, output in (("aiter", expected), ("gluon", actual)):
+            if not torch.isfinite(output).all():
+                raise AssertionError(f"{name} produced non-finite output")
+        check_sampled_fp64(query, key, value, {"aiter": expected, "gluon": actual})
         difference = (actual.float() - expected.float()).abs()
         torch.testing.assert_close(
             actual.float(),

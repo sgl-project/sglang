@@ -107,7 +107,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`gluon_fav3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`GLUON_FAV3`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense gfx1250 Gluon/Triton FAv3. Supports non-causal BF16 MHA with head dimension 128 and rectangular Q/KV lengths, with dedicated Wan2.2 cross/self schedules for B2/S176400/H40. Unsupported dtype, head, causal, dropout, or GQA contracts that reach this backend use AITER; shared masked-attention routing may use SDPA.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense gfx1250 Gluon/Triton FAv3. Supports non-causal BF16 MHA with head dimension 128 and rectangular Q/KV lengths. It selects stable pipeline/ping-pong kernels generally and a persistent short-KV schedule when 257–512 K/V tokens fit in LDS and the resulting grid fills the device. Unsupported dtype, head, causal, dropout, or GQA contracts that reach this backend use AITER; shared masked-attention routing may use SDPA.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>aiter_sage</code></td>
@@ -867,34 +867,76 @@ sglang generate \
   --attention-backend torch_sdpa
 ```
 
-Select `gluon_fav3` explicitly on gfx1250; the fixed-shift opt-in below does
-not change the backend choice:
+### Gluon FAv3 on gfx1250
+
+On AMD ROCm with a gfx1250 GPU, select `gluon_fav3` explicitly for dense,
+non-causal BF16 multi-head attention with head dimension 128. Q, K, and V
+must have matching batch and head counts in BSHD layout; query and K/V
+sequence lengths can differ. The optimized path requires zero dropout and
+a contiguous head dimension. Unsupported dense contracts use AITER, while
+shared masked-attention routing may use SDPA.
+
+You need a Triton build with Gluon `amd.cdna5` support, including the TDM
+`async_load_fused`, `update_tensor_descriptor`, and `prefetch` APIs used by
+the persistent kernel. The `gfx1250-rocm1000` stage in
+[`docker/rocm.Dockerfile`](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile)
+pins the validated Triton revision
+`76940ad348795521b3dc9f6c79acd7309ff924e3`. Check compiler compatibility
+before comparing performance across ROCm images.
+
+For example, select the backend for the public Wan2.2 T2V checkpoint on one
+GPU:
 
 ```bash
 sglang generate \
-  --model-path <MODEL_PATH_OR_ID> \
-  --prompt "..." \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --num-gpus 1 \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
   --attention-backend gluon_fav3
 ```
 
-The qualified Wan2.2 self-attention fast path uses a fixed softmax shift to
-remove redundant online rescaling. Enable it only for the validated
-`B2/S176400/H40/D128` Wan workload:
+Gluon uses stable softmax with FP32 state and round-to-nearest BF16
+probabilities. Dispatch depends on tensor geometry and device occupancy:
+
+- Small grids use the four-wave pipeline.
+- Grids that fill the device use the eight-wave ping-pong kernel.
+- Contiguous workloads with 257–512 K/V tokens can use persistent K/V reuse
+  when its LDS and occupancy requirements are satisfied.
+
+For automatically selected large ping-pong workloads with both sequence lengths
+at least 65,536 and the default scale, GPU checks of Q/K norms and V magnitudes
+can enable a fixed softmax shift. This keeps exponents bounded and normalizes
+the rounded BF16 probabilities with FP32 sums. Inputs outside these bounds use
+the existing guarded fused exponents or maximum subtraction before scaling.
+The checks run again on every graph replay. Short-KV persistent attention uses
+one maximum across its cached keys.
+
+
+Sequence lengths and softmax scale are JIT compile-time constants. A new
+resolution, frame count, prompt length, or scale can trigger a separate
+compilation; repeated calls reuse cached binaries.
+
+For one Wan2.2-T2V-A14B request at 720×1280 with 193 frames, the latent token
+count is `49 × 45 × 80 = 176400`. Dense self-attention uses
+`B1/Sq176400/Sk176400/H40/D128`, and text cross-attention uses
+`B1/Sq176400/Sk512/H40/D128`. SGLang runs the conditional and unconditional
+CFG branches in separate calls, so CFG alone does not make these B2 shapes.
+
+From a source checkout in the same ROCm environment, benchmark those
+per-call shapes against parameters equivalent to the default BF16
+`AITerImpl` call:
 
 ```bash
-export SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1
+python benchmark/kernels/attention/benchmark_gluon_fav3_gfx1250.py --preset wan-cross
+python benchmark/kernels/attention/benchmark_gluon_fav3_gfx1250.py --preset wan-self
 ```
 
-The fixed shift is model-specific rather than a generic softmax replacement.
-Its exponent is capped before `exp2` so an outlier outside the first K tile
-cannot overflow to `inf`. Other shapes continue to use stable online softmax,
-and the runtime rejects an explicit `wan_self` launch unless both the exact
-shape and this opt-in are present.
-
-The generic Gluon path specializes sequence lengths and softmax scale as JIT
-compile-time constants. A new resolution, frame count, or prompt/KV length can
-therefore trigger a separate compilation; the optimized Wan shapes are fixed
-resolution and reuse their cached binaries.
+The benchmark checks finite outputs, BF16 agreement, and sampled queries against
+independent FP64 attention over all keys before timing. It prints the selected schedule, effective AITER `ENABLE_CK` setting, and
+runtime/compiler provenance alongside repeated measurements. You can use
+`--batch 2` as an additional batch stress case. Interpret the reported ratio
+for the recorded shape and software stack; kernel measurements do not
+establish a pipeline-wide speedup.
 
 ### Override one component
 
@@ -1052,7 +1094,7 @@ sglang generate \
 
 ### Notes for ROCm / MPS
 
-- ROCm gfx1250: `aiter` remains the automatic default. Select `--attention-backend gluon_fav3` explicitly; `SGLANG_GLUON_FAV3_WAN_FIXED_SHIFT=1` only enables the qualified Wan self schedule inside that backend.
+- ROCm gfx1250: `aiter` remains the automatic default. Select `--attention-backend gluon_fav3` explicitly for compatible dense BF16 D128 attention.
 - Other ROCm GPUs: `aiter` is the automatic default.
 - ROCm gfx1151 / Strix Halo (wave32): do **not** use `aiter`; prefer `torch_sdpa` (the image sets `SGLANG_USE_AITER=0`).
 - MPS: the platform implementation always uses `torch_sdpa`.
