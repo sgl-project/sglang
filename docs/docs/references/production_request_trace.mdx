@@ -144,6 +144,10 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
         trace_ctx.rebuild_thread_context()
         ```
 
+## Span Names
+
+Each request's root span is named `Req` (`prefill Req` or `decode Req` under PD disaggregation) and records SGLang's request ID as the `rid` attribute. Thread spans are named after the thread and its ranks, e.g. `Scheduler [TP 0] [DP 1]`; the host and pid are attributes.
+
 ## How to Extend the Tracing Framework to Support Complex Tracing Scenarios
 
 The currently provided tracing package still has potential for further development. If you wish to build more advanced features upon it, you must first understand its existing design principles.

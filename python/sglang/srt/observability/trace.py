@@ -330,14 +330,12 @@ def start_root_span(
         external_trace_header or {}
     )
 
-    # Drop the worker_id added by MultiTokenizer
-    orig_rid = rid.split("_")[-1]
     role = "" if role == "unified" else role
-    attrs = {"rid": orig_rid, "module": f"sglang::{module_name}"}
+    attrs = {"rid": rid, "module": f"sglang::{module_name}"}
     if bootstrap_room:
         attrs["bootstrap_room"] = str(hex(bootstrap_room))
     return tracer.start_span(
-        name=f"{role} Req {orig_rid[:8]}",
+        name=f"{role} Req" if role else "Req",
         start_time=ts,
         context=external_trace_context,
         attributes=attrs,
@@ -404,29 +402,30 @@ class TraceReqContext:
             cur_slice_stack=[],
         )
 
-        thread_name = f"{thread_info.thread_label}"
-        if thread_info.tp_rank is not None:
-            thread_name += f" [TP {thread_info.tp_rank}] "
-        if thread_info.pp_rank is not None:
-            thread_name += f" [PP {thread_info.pp_rank}] "
-        if thread_info.dp_rank is not None:
-            thread_name += f" [DP {thread_info.dp_rank}] "
-        thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
+        ranks = {
+            label: rank
+            for label, rank in (
+                ("TP", thread_info.tp_rank),
+                ("PP", thread_info.pp_rank),
+                ("DP", thread_info.dp_rank),
+            )
+            if rank is not None
+        }
+        thread_name = " ".join(
+            [
+                thread_info.thread_label,
+                *(f"[{label} {rank}]" for label, rank in ranks.items()),
+            ]
+        )
         thread_context.thread_span = tracer.start_span(
             name=thread_name,
             start_time=ts,
             context=self.root_span_context,
         )
-
-        rank_attrs = {}
-        if thread_info.tp_rank is not None:
-            rank_attrs["tp_rank"] = thread_info.tp_rank
-        if thread_info.pp_rank is not None:
-            rank_attrs["pp_rank"] = thread_info.pp_rank
-        if thread_info.dp_rank is not None:
-            rank_attrs["dp_rank"] = thread_info.dp_rank
-        if rank_attrs:
-            thread_context.thread_span.set_attributes(rank_attrs)
+        if ranks:
+            thread_context.thread_span.set_attributes(
+                {f"{label.lower()}_rank": rank for label, rank in ranks.items()}
+            )
 
         thread_context.thread_span.set_attributes(
             {
