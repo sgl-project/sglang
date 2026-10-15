@@ -1,3 +1,4 @@
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -6,11 +7,11 @@ from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
 from sglang.kernels.ops.attention.dsv4.torch_quant import quantize_k_cache_v41
 from sglang.srt.layers.attention.dsv4.mega_attention import (
-    apply_mega_wo_a,
     pack_mega_query,
+    permute_mega_wq_b,
     prepare_mega_wo_a,
-    prepare_mega_wq_b,
 )
+from sglang.srt.models.deepseek_v4 import _fp8_wo_a_einsum
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
     quantize_k_cache_v41_fp4,
@@ -71,8 +72,9 @@ class TestMegaAttention(CustomTestCase):
                     119, 129, (64 * 512, 40), device="cuda", dtype=torch.uint8
                 )
                 method._process_mxfp8_linear_weight_scale(linear)
-                projection = prepare_mega_wq_b(linear, 64)
-                self.assertIsNone(prepare_mega_wq_b(linear, 16))
+                reference = copy.deepcopy(linear)
+                self.assertFalse(permute_mega_wq_b(linear, 16))
+                self.assertTrue(permute_mega_wq_b(linear, 64))
                 x = torch.randn(1536, 1280, device="cuda", dtype=torch.bfloat16)
                 quantized = Mxfp8SwizzledInput(
                     *fp8_utils.flashinfer_mxfp8_quantize(
@@ -81,9 +83,9 @@ class TestMegaAttention(CustomTestCase):
                 )
                 for inputs in (x, quantized):
                     torch.testing.assert_close(
-                        method.apply(projection, inputs),
+                        method.apply(linear, inputs),
                         pack_mega_query(
-                            method.apply(linear, inputs).view(-1, 64, 512), 64
+                            method.apply(reference, inputs).view(-1, 64, 512), 64
                         ).view(-1, 64 * 512),
                         rtol=0,
                         atol=0,
@@ -137,7 +139,12 @@ class TestMegaAttention(CustomTestCase):
                 weight = torch.randn(
                     groups, 64, 4096, device="cuda", dtype=torch.bfloat16
                 )
-                actual = apply_mega_wo_a(data, scale, prepare_mega_wo_a(weight))
+                actual = _fp8_wo_a_einsum(
+                    data[:, :groups],
+                    scale[:, :groups],
+                    *prepare_mega_wo_a(weight),
+                    recipe=(1, 1, 32),
+                )
                 expected = torch.einsum(
                     "tgd,grd->tgr",
                     unpack_output(data, scale)[:, :groups],

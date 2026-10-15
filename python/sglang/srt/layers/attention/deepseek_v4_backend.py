@@ -65,7 +65,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-from sglang.srt.layers.attention.dsv4.mega_attention import use_mega_paged_prefill
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -1111,6 +1110,7 @@ class DeepseekV4AttnBackend(
     folds_encoder_swa_replay: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
+    mega_attn: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -1149,7 +1149,6 @@ class DeepseekV4AttnBackend(
         )
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
-        self.mega_attn = get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
@@ -3570,31 +3569,34 @@ class DeepseekV4AttnBackend(
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)
                 if self._low_ratio_prefill_reads_page_indices(
-                    forward_batch,
-                    num_qo_tokens=x.shape[0],
-                    compress_ratio=layer.compress_ratio,
-                    num_heads=layer.n_local_heads,
+                    forward_batch, layer=layer, num_qo_tokens=x.shape[0]
                 )
                 else None
             ),
         )
 
-    def _low_ratio_prefill_reads_page_indices(
+    def _mega_paged_prefill(
         self,
         forward_batch: ForwardBatch,
         *,
         num_qo_tokens: int,
+        layer_id: int,
         compress_ratio: int,
         num_heads: int,
+    ) -> bool:
+        return False
+
+    def _low_ratio_prefill_reads_page_indices(
+        self, forward_batch: ForwardBatch, *, layer, num_qo_tokens: int
     ):
         return (
             self.trtllm_attn
-            or (
-                self.mega_attn
-                and forward_batch.seq_lens_cpu is not None
-                and use_mega_paged_prefill(
-                    num_qo_tokens, forward_batch.seq_lens_cpu, compress_ratio, num_heads
-                )
+            or self._mega_paged_prefill(
+                forward_batch,
+                num_qo_tokens=num_qo_tokens,
+                layer_id=layer.layer_id,
+                compress_ratio=layer.compress_ratio,
+                num_heads=64 if layer.n_local_heads <= 64 else 128,
             )
             or self.tail_forward_metadata is not None
             or self.forward_metadata.late_layer_tail is not None
@@ -3773,14 +3775,12 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            use_mega_paged = (
-                cos_sin_cache is not None
-                and extra_k_cache is not None
-                and extra_k_cache.shape[-1] == 288
-                and forward_batch.forward_mode.is_extend_without_speculative()
-                and use_mega_paged_prefill(
-                    q.shape[0], forward_batch.seq_lens_cpu, compress_ratio, q.shape[-2]
-                )
+            use_mega_paged = self._mega_paged_prefill(
+                forward_batch,
+                num_qo_tokens=q.shape[0],
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                num_heads=q.shape[-2],
             )
 
             # The tail stays dense: its window floor lives in swa_page_indices,
@@ -3812,25 +3812,21 @@ class DeepseekV4AttnBackend(
                     cos_sin_cache=cos_sin_cache,
                 )
 
-            if cos_sin_cache is not None:
-                from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
-
-                data, scale, _ = flash_mla_mega_decode(
-                    q.squeeze(1),
-                    swa_k_cache,
-                    swa_page_indices.squeeze(1),
-                    match_num_queries(core_attn_metadata.positions, value=0),
-                    cos_sin_cache,
-                    self.softmax_scale,
+            if self.mega_attn:
+                return self._forward_mega_decode(
+                    q=q.squeeze(1),
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices.squeeze(1),
+                    positions=match_num_queries(core_attn_metadata.positions, value=0),
+                    cos_sin_cache=cos_sin_cache,
                     attn_sink=attn_sink,
-                    topk_length=swa_topk_lengths,
-                    extra_kv=extra_k_cache,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
                     extra_indices=None
                     if extra_indices is None
                     else extra_indices.squeeze(1),
-                    extra_topk_length=extra_topk_lengths,
+                    extra_topk_lengths=extra_topk_lengths,
                 )
-                return data, scale
 
             if (
                 self.is_dsv41
@@ -3997,20 +3993,16 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        if cos_sin_cache is not None:
-            from sgl_kernel.flash_mla_mega import flash_mla_mega_prefill
-
-            data, scale, _, _ = flash_mla_mega_prefill(
-                q_flat,
-                kv,
-                combined_indices.unsqueeze(1),
-                core_attn_metadata.positions[: q_flat.shape[0]],
-                cos_sin_cache,
-                self.softmax_scale,
+        if self.mega_attn:
+            return self._forward_mega_prefill(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                positions=core_attn_metadata.positions[: q_flat.shape[0]],
+                cos_sin_cache=cos_sin_cache,
                 attn_sink=attn_sink,
                 topk_length=combined_lens,
             )
-            return data, scale
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,

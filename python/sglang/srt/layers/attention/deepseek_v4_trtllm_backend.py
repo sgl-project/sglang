@@ -539,11 +539,19 @@ def create_deepseek_v4_attn_backend(
     model_runner: ModelRunner, **kwargs
 ) -> DeepseekV4AttnBackend:
     """Construct the DSV4 backend matching --dsv4-attn-backend."""
-    cls = (
-        DeepseekV4TrtllmAttnBackend
-        if is_dsv4_trtllm_attn_enabled()
-        else DeepseekV4AttnBackend
-    )
+    if is_dsv4_trtllm_attn_enabled():
+        cls = DeepseekV4TrtllmAttnBackend
+    elif (
+        get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+        and not model_runner.is_draft_worker
+    ):
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+            DeepseekV4MegaAttnBackend,
+        )
+
+        cls = DeepseekV4MegaAttnBackend
+    else:
+        cls = DeepseekV4AttnBackend
     return cls(model_runner, **kwargs)
 
 

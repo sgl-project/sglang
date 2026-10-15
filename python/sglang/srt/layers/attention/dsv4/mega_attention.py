@@ -5,7 +5,6 @@ import torch
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.runtime_context import get_buffer
 
 
 def pack_mega_query(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
@@ -15,29 +14,7 @@ def pack_mega_query(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
     return out.view(tokens, padded_heads, 512)
 
 
-def use_mega_paged_prefill(
-    num_query_tokens: int,
-    seq_lens_cpu: torch.Tensor,
-    compress_ratio: int,
-    num_heads: int,
-) -> bool:
-    if num_heads != 64 or compress_ratio not in (1, 2) or num_query_tokens > 1024:
-        return False
-    gather_tokens = int(seq_lens_cpu.sum()) // compress_ratio
-    return gather_tokens >= max(32768, 192 * num_query_tokens)
-
-
-def mega_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
-    tables = get_buffer("dsv4_mega_cos_sin", dict)
-    key = freqs_cis.data_ptr()
-    if key not in tables:
-        tables[key] = torch.cat((freqs_cis.real, freqs_cis.imag), dim=-1)
-    return tables[key]
-
-
-def prepare_mega_wq_b(
-    linear: torch.nn.Module, num_heads: int
-) -> torch.nn.Module | None:
+def permute_mega_wq_b(linear: torch.nn.Module, num_heads: int) -> bool:
     method = linear.quant_method
     backend = getattr(method, "mxfp8_dense_backend", None)
     if (
@@ -47,10 +24,7 @@ def prepare_mega_wq_b(
         or backend is None
         or not (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
     ):
-        return None
-
-    from flashinfer import block_scale_interleave
-
+        return False
     weight, scale = linear.weight, linear.weight_scale_inv
     rows, cols = weight.shape
     if (
@@ -59,17 +33,13 @@ def prepare_mega_wq_b(
         or scale.dtype != torch.uint8
         or scale.shape != (rows, cols // 32)
     ):
-        return None
-
-    def permute_rows(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.view(num_heads, 32, 16, -1).transpose(0, 1).reshape(rows, -1)
-
-    projection = torch.nn.Module()
-    projection.weight = permute_rows(weight)
-    projection.weight_scale_inv_swizzled = block_scale_interleave(
-        permute_rows(scale)
-    ).contiguous()
-    return projection
+        return False
+    for tensor in (weight, scale):
+        tensor.data.copy_(
+            tensor.data.view(num_heads, 32, 16, -1).transpose(0, 1).reshape(rows, -1)
+        )
+    method._process_mxfp8_linear_weight_scale(linear)
+    return True
 
 
 def prepare_mega_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -85,25 +55,3 @@ def prepare_mega_wo_a(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
         scale_ue8m0=True,
         masked_m=torch.full((groups,), rank, dtype=torch.int32, device=weight.device),
     )
-
-
-def apply_mega_wo_a(
-    data: torch.Tensor,
-    scale: torch.Tensor,
-    wo_a: tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    import deep_gemm
-
-    weight, weight_scale = wo_a
-    groups, rank = weight.shape[:2]
-    out = torch.empty(
-        (data.shape[0], groups, rank), dtype=torch.bfloat16, device=data.device
-    )
-    deep_gemm.fp8_einsum(
-        "bhr,hdr->bhd",
-        (data[:, :groups], scale[:, :groups]),
-        (weight, weight_scale),
-        out,
-        recipe=(1, 1, 32),
-    )
-    return out
