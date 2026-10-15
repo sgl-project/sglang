@@ -11,9 +11,12 @@ The groups and their order are the stock ones, so the output is bitwise unchange
 
 from __future__ import annotations
 
+import logging
 from typing import Callable, NamedTuple, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class DecodeGroupPlan(NamedTuple):
@@ -29,6 +32,7 @@ class DecodeGroupPlans:
 
     def __init__(self):
         self._plans: dict[tuple, DecodeGroupPlan] = {}
+        self._logged = False
 
     def reset(self) -> None:
         # Call at every forward-metadata init: a plan is only valid within one forward,
@@ -46,6 +50,12 @@ class DecodeGroupPlans:
         )
         plan = self._plans.get(key)
         if plan is None:
+            if not self._logged:
+                self._logged = True
+                logger.info(
+                    "Decode length groups built once per forward (%d requests)",
+                    seq_lens.shape[0],
+                )
             order = torch.argsort(seq_lens)
             plan = DecodeGroupPlan(
                 order=order,
