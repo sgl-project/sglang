@@ -68,14 +68,12 @@ patches:
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
     edits:
       - match: |
-          hidden_states, residual = (
-              self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                  hidden_states,
-                  residual,
-                  forward_batch,
-                  captured_last_layer_outputs=captured_last_layer_outputs,
-                  **kwargs,
-              )
+          hidden_states = self.attn_boundary.prepare(
+              hidden_states,
+              forward_batch,
+              capture_gathered=captured_last_layer_outputs,
+              capture=capture_output,
+              **kwargs,
           )
         append: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated')"
       - match: |
@@ -85,10 +83,7 @@ patches:
               forward_batch=forward_batch,
           )
         append: "dumper.dump('attn_output', hidden_states, dims='t h[attn_tp:partial] # tp:replicated')"
-      - match: |
-          hidden_states, residual = self.layer_communicator.prepare_mlp(
-              hidden_states, residual, forward_batch
-          )
+      - match: "hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)"
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
       - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
@@ -119,20 +114,18 @@ patches:
   #
   # Attn tensors are NOT TP-sharded (attn_tp_size=1).
   # mlp_output is still moe_tp:partial — the reduce-scatter happens in
-  # postprocess_layer(), after the dump point.
-  # layer_input is dumped after prepare_attn which DP-distributes tokens,
+  # the output boundary, after the dump point.
+  # layer_input is dumped after attention preparation, which DP-distributes tokens,
   # so it needs dp:=attn_dp to filter to the non-empty DP rank.
   - target: sglang.srt.models.qwen3_moe.Qwen3MoeDecoderLayer.forward
     edits:
       - match: |
-          hidden_states, residual = (
-              self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                  hidden_states,
-                  residual,
-                  forward_batch,
-                  captured_last_layer_outputs=captured_last_layer_outputs,
-                  **kwargs,
-              )
+          hidden_states = self.attn_boundary.prepare(
+              hidden_states,
+              forward_batch,
+              capture_gathered=captured_last_layer_outputs,
+              capture=capture_output,
+              **kwargs,
           )
         append: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated dp:=attn_dp')"
       - match: |
@@ -142,10 +135,7 @@ patches:
               forward_batch=forward_batch,
           )
         append: "dumper.dump('attn_output', hidden_states, dims='t h # tp:replicated')"
-      - match: |
-          hidden_states, residual = self.layer_communicator.prepare_mlp(
-              hidden_states, residual, forward_batch
-          )
+      - match: "hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)"
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
       - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
@@ -181,7 +171,7 @@ class TestSourcePatcherE2ESGLang:
 
         In dp-attention mode (attn_tp_size=1, attn_dp_size=2), attention
         tensors are NOT TP-sharded and mlp_output is still moe_tp:partial
-        (the reduce-scatter happens in postprocess_layer, after the dump
+        (the reduce-scatter happens at the output boundary, after the dump
         point).  A separate patch config with corrected dims is used for
         the target.
 
@@ -207,7 +197,7 @@ class TestSourcePatcherE2ESGLang:
         _run_e2e_scenario(
             tmp_path=tmp_path,
             target_tp=BASELINE_TP,
-            extra_target_server_args=["--dp", "2", "--enable-dp-attention"],
+            extra_target_server_args=["--attn-dp-size", "2"],
             target_patch_config_yaml=PATCH_CONFIG_DP_ATTENTION_YAML,
             extra_comparator_args=[
                 "--token-aligner",

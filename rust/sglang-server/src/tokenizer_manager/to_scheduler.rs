@@ -81,10 +81,22 @@ impl Runnable for Intake {
                 .wait();
             match next {
                 Some(Lane::Abort(rid)) => self.on_abort(rid),
-                // A fresh request and one returning from either pool.
-                Some(Lane::Event(
-                    TmEvent::Intake(req) | TmEvent::Tokenized(req) | TmEvent::Encoded(req),
-                )) => self.drive(req),
+                // A fresh request first passes the cancellation-safe admission
+                // handoff; requests returning from either worker pool are already
+                // owned by Intake and continue through the state machine directly.
+                Some(Lane::Event(TmEvent::Intake { request, admission })) => {
+                    if admission.try_accept() {
+                        self.drive(request);
+                    } else {
+                        tracing::debug!(
+                            rid = %request.rid,
+                            "intake discarded request cancelled before admission"
+                        );
+                    }
+                }
+                Some(Lane::Event(TmEvent::Tokenized(req) | TmEvent::Encoded(req))) => {
+                    self.drive(req)
+                }
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
                     // on the abort lane first: those requests are in flight on the
@@ -110,8 +122,8 @@ impl Intake {
     /// terminal frame and a hung connection. Python cannot hit this because it
     /// validates before `rid_to_state[obj.rid] = state`.
     fn fail(&self, req: &mut Request, err: Error, registered: bool) {
-        // Log only server faults (500); 4xx/499/503 are expected and would spam.
-        if err.http_status() == 500 {
+        // Expected request, capacity, and cancellation outcomes would spam.
+        if err.is_server_fault() {
             tracing::error!(rid = %req.rid, error = %err, "intake rejected request");
         }
         let _ = req.state.apply(Event::Error(err.clone()));

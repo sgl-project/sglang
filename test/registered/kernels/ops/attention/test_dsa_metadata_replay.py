@@ -6,11 +6,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.kpool_fp8_index import build_pooled_page_table_64
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.dsa_metadata_kit import (
     BS,
     NEXT_N,
+    POOL,
     ROUNDS,
     addresses,
     apply_metadata,
@@ -51,6 +54,23 @@ class TestDSAMetadataReplay(CustomTestCase):
                         self, fused.forward_metadata, ordinary.forward_metadata
                     )
                     self.assertEqual(pointers, addresses(fused.forward_metadata))
+                    if mode.is_target_verify():
+                        metadata = fused.forward_metadata
+                        _, _, table, _ = IndexerKPool._get_kpool_decode_metadata(
+                            SimpleNamespace(index_kpool=POOL),
+                            SimpleNamespace(attn_metadata=metadata),
+                            metadata.real_page_table,
+                            metadata.dsa_seqlens_expanded,
+                            64,
+                            build_schedule_metadata=False,
+                        )
+                        self.assertIs(table, metadata.pooled_real_page_table)
+                        torch.testing.assert_close(
+                            table,
+                            build_pooled_page_table_64(metadata.real_page_table, POOL),
+                            rtol=0,
+                            atol=0,
+                        )
 
     def test_precomputed_verify_retains_live_tail(self):
         mode = ForwardMode.TARGET_VERIFY

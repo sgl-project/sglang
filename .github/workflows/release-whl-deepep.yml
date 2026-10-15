@@ -7,18 +7,18 @@ on:
         description: "Public wheel version (for example, 0.1.0 or 0.1.1rc0)"
         type: string
         required: true
-      packaging-ref:
-        description: "DeepEP ref containing the shared sgl_deep_ep overlay"
+      deepep-ref:
+        description: "DeepEP ref containing the implementation and sgl_deep_ep package"
         type: string
         required: false
-        default: "sgl-deepep-packaging"
+        default: "sgl-deepep"
 
 concurrency:
   group: release-sgl-deep-ep
   cancel-in-progress: false
 
 env:
-  TORCH_VERSION: "2.13.0"
+  TORCH_VERSION: "2.14.1"
 
 jobs:
   build-cu130-matrix:
@@ -31,10 +31,8 @@ jobs:
         include:
           - arch: x86_64
             runner: x64-kernel-build-node
-            source-branch: sgl-deepep
           - arch: aarch64
             runner: arm-kernel-build-node
-            source-branch: sgl-deepep
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Clean workspace
@@ -45,36 +43,22 @@ jobs:
       - name: Checkout SGLang
         uses: actions/checkout@v4
 
-      - name: Checkout DeepEP implementation
+      - name: Checkout DeepEP
         uses: actions/checkout@v4
         with:
           repository: sgl-project/DeepEP
-          ref: ${{ matrix.source-branch }}
+          ref: ${{ inputs['deepep-ref'] || 'sgl-deepep' }}
           path: DeepEP-source
           submodules: recursive
 
-      - name: Checkout DeepEP packaging overlay
-        uses: actions/checkout@v4
-        with:
-          repository: sgl-project/DeepEP
-          ref: ${{ inputs['packaging-ref'] || 'sgl-deepep-packaging' }}
-          path: DeepEP-packaging
-          sparse-checkout: sgl_deep_ep
-
-      - name: Set wheel version
-        env:
-          RELEASE_VERSION: ${{ inputs.version }}
-        run: |
-          printf '%s' "${RELEASE_VERSION}" > DeepEP-packaging/sgl_deep_ep/VERSION
-
       - name: Build wheels
+        env:
+          SGL_DEEP_EP_VERSION: ${{ inputs.version }}
         run: |
-          chmod +x scripts/build_sgl_deepep.sh DeepEP-packaging/sgl_deep_ep/build_sgl_deep_ep.sh
-          scripts/build_sgl_deepep.sh \
+          bash scripts/build_sgl_deepep.sh \
             "${{ matrix.python-version }}" \
             "13.0" \
             "${{ github.workspace }}/DeepEP-source" \
-            "${{ github.workspace }}/DeepEP-packaging/sgl_deep_ep" \
             "${{ matrix.arch }}"
 
       - name: Upload CUDA-tagged wheel

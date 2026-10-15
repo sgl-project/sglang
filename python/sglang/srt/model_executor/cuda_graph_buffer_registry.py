@@ -530,7 +530,7 @@ def build_decode_registry(
     require_mlp_tp_gather: bool = False,
     # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
     attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
-    dp_size: int = 1,
+    num_dp_ranks: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
@@ -700,7 +700,7 @@ def build_decode_registry(
                 buf.fill_(ctx.padded_num_tokens)
 
         _global_shape = (
-            (lambda _bs, _mt: (dp_size,))
+            (lambda _bs, _mt: (num_dp_ranks,))
             if require_mlp_tp_gather
             else (lambda _bs, _mt: (1,))
         )
@@ -837,16 +837,17 @@ def build_prefill_registry(
     enable_prefill_cp: bool = False,
     # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
     attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
-    register_input_embeds: bool = True,
+    register_input_embeds: Optional[bool] = None,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
     piecewise / breakable / full (prefill) cuda-graph runners.
 
-    ``register_input_embeds`` (default ``True``) registers the multimodal
-    ``input_embeds`` slot; the eager extend path passes ``False`` so it is
-    carried from the batch (a read input) rather than written in-graph.
+    ``register_input_embeds`` defaults to ``is_multimodal``. The EAGLE3 draft
+    passes True because the draft model itself is text-only. The eager extend
+    path passes ``False`` so embeddings are carried from the batch rather
+    than written in-graph.
 
     Padding policies match the inline copy/zero in
     ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
@@ -899,6 +900,9 @@ def build_prefill_registry(
             padding_policy=PaddingPolicy.ZERO,
         ),
     ]
+    if register_input_embeds is None:
+        register_input_embeds = is_multimodal
+
     if is_multimodal:
         slots.append(
             GraphSlot(
@@ -910,17 +914,17 @@ def build_prefill_registry(
                 slice_fn=lambda buf, n: buf[:, :n],
             )
         )
-        if register_input_embeds:
-            slots.append(
-                GraphSlot(
-                    "input_embeds",
-                    lambda _bs2, mt: (mt, hidden_size),
-                    embed_dtype,
-                    axis="tokens",
-                    padding_policy=PaddingPolicy.ZERO,
-                    copy_from_fb=False,
-                )
+    if register_input_embeds:
+        slots.append(
+            GraphSlot(
+                "input_embeds",
+                lambda _bs2, mt: (mt, hidden_size),
+                embed_dtype,
+                axis="tokens",
+                padding_policy=PaddingPolicy.ZERO,
+                copy_from_fb=False,
             )
+        )
     if enable_mamba_track:
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
@@ -1048,7 +1052,7 @@ def build_eager_registry(
         register_global_num_tokens=False,
         require_gathered_buffer=False,
         require_mlp_tp_gather=False,
-        dp_size=get_parallel().dp_size,
+        num_dp_ranks=get_parallel().num_dp_ranks,
         share_pool=True,
         source=None,
     )
