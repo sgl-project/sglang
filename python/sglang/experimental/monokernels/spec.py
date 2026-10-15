@@ -1,14 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """What a model declares to the monokernel plugin (RFC #43949), and the registry
 that finds it. A spec module imports without its model, so the config hook can
-refuse a setup before any process starts."""
+refuse a setup before any process starts.
+
+Specs live in vendor packages (e.g. sgl-amd-mono), which list them under the
+``sglang.monokernels`` entry-point group: the name is the HF architecture, the
+value the spec's ``module:attribute`` path. A spec states the ``API_VERSION`` it
+was written against; any other version is refused at startup."""
 
 from __future__ import annotations
 
 import enum
+import functools
 import importlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
+
+# The plugin API a spec is written against: MonoSpec, BuildContext, ShapeKey, the
+# built model's ``kernel(layer_id, point, key)``, and a span's ``fn(plan, *inputs)``
+API_VERSION = 1
+ENTRY_POINTS = "sglang.monokernels"
 
 
 class SpanPoint(enum.IntEnum):
@@ -160,6 +171,7 @@ class MonoSpec:
     # (model, hf_config, copies): after load, with the load hook's copies
     model_disable_reasons: Callable[..., list[str]]
     build: Callable[..., Any]
+    api: int  # the API_VERSION this spec is written against
     # (copies, model, name, tensor): each checkpoint tensor before renames and
     # quantization, to keep a copy of a weight that loading rewrites
     load_tensor: Optional[Callable[..., None]] = None
@@ -168,12 +180,19 @@ class MonoSpec:
         return self.devices[isa].widths
 
 
-# HF architecture -> the "module:attribute" paths of its specs, one a vendor
-_REGISTRY: dict[str, tuple[str, ...]] = {
-    "DeepseekV4ForCausalLM": (
-        "sglang.experimental.monokernels.hip.deepseek_v41.spec:SPEC",
-    ),
-}
+# HF architecture -> the "module:attribute" paths of specs registered in-process
+# (tests); installed packages list theirs under ENTRY_POINTS
+_REGISTRY: dict[str, tuple[str, ...]] = {}
+
+
+@functools.cache
+def _entry_points() -> dict[str, tuple[str, ...]]:
+    from importlib.metadata import entry_points
+
+    out: dict[str, tuple[str, ...]] = {}
+    for ep in entry_points(group=ENTRY_POINTS):
+        out[ep.name] = out.get(ep.name, ()) + (ep.value,)
+    return out
 
 
 def register(architecture: str, path: str) -> None:
@@ -187,11 +206,26 @@ def unregister(architecture: str, path: str) -> None:
 
 
 def find_spec(architectures, isa: Optional[str]):
-    """(the spec for ``architectures`` on ``isa``, "") or (None, why there is none)."""
+    """(the spec for ``architectures`` on ``isa``, "") or (None, why there is none).
+    A spec that fails to import or states another API version is a reason too."""
+    why = []
     for arch in architectures or ():
-        for path in _REGISTRY.get(arch, ()):
+        for path in _REGISTRY.get(arch, ()) + _entry_points().get(arch, ()):
             module, _, attr = path.partition(":")
-            spec = getattr(importlib.import_module(module), attr)
-            if isa in spec.devices:
+            try:
+                spec = getattr(importlib.import_module(module), attr)
+            except Exception as e:
+                why.append(f"{path} does not import: {type(e).__name__}: {e}")
+                continue
+            if getattr(spec, "api", None) != API_VERSION:
+                why.append(
+                    f"{path} is written for monokernel API {getattr(spec, 'api', None)}"
+                    f", this SGLang has {API_VERSION}"
+                )
+            elif isa in spec.devices:
                 return spec, ""
-    return None, f"no monokernel spec for {list(architectures or ())} on {isa}"
+    archs = list(architectures or ())
+    return None, "; ".join(why) or (
+        f"no monokernel spec for {archs} on {isa} (installed packages list theirs "
+        f"under the {ENTRY_POINTS!r} entry points)"
+    )

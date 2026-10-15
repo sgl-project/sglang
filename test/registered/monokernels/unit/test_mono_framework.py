@@ -1,7 +1,8 @@
 """The monokernel plugin on CPU with a fake spec and a fake kernel (RFC #43949):
-spans, the registry, feature refusal, the config checks, the modes that take
-only BITWISE specs, capture sizes, routing by graph key, kernels bound to their
-plan, the load hook's weight copies, and the deadlines."""
+spans, the registry and its entry points, the API version, feature refusal, the
+config checks, the modes that take only BITWISE specs, capture sizes, routing by
+graph key from a table fixed at attach, the normal path's reasons, kernels bound
+to their plan, the load hook's weight copies, and the deadlines."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -50,8 +51,10 @@ class FakeModel:
     def __init__(self, widths):
         self.widths = widths
         self.log = []
+        self.asked = 0
 
     def kernel(self, layer_id, point, key):
+        self.asked += 1
         if key.rows not in self.widths or (key.rows, key.forward_mode) == (4, "decode"):
             return None
         if layer_id == 0 and point == SpanPoint.ATTN_PARTIAL:
@@ -92,8 +95,12 @@ SPEC = MonoSpec(
     ),
     model_disable_reasons=lambda model, hf, copies: [],
     build=lambda model, hf, ctx: FakeModel(ctx.widths),
+    api=registry.API_VERSION,
     load_tensor=_load_tensor,
 )
+
+
+OLD_SPEC = replace(SPEC, api=0)
 
 
 @pytest.fixture(autouse=True)
@@ -137,11 +144,11 @@ def batch(mode, bs, rows):
     )
 
 
-def attached(widths=None):
+def attached(widths=None, tokens=6):
     """A model as attach() leaves it: ``mono`` holds the runtime."""
     widths = widths or SPEC.widths("gfx950")
     built = SPEC.build(None, None, BuildContext("gfx950", widths, 30.0, {}))
-    rt = runtime.MonoRuntime(built, range(LAYERS), widths)
+    rt = runtime.MonoRuntime(built, range(LAYERS), widths, tokens)
     return SimpleNamespace(mono=rt), built
 
 
@@ -151,6 +158,24 @@ def test_partial_span_needs_a_reason():
     with pytest.raises(ValueError):
         Span("backwards", SpanPoint.LAYER_OUT, SpanPoint.LAYER_IN)
     Span("half", SpanPoint.LAYER_IN, SpanPoint.CORE_IN, reason="backend_state")
+
+
+def test_registry_reports_broken_and_mismatched_specs(monkeypatch):
+    registry.register("Broken", "no_such_module:SPEC")
+    registry.register("Old", f"{__name__}:OLD_SPEC")
+    try:
+        spec, why = registry.find_spec(["Broken"], "gfx950")
+        assert spec is None and "does not import: ModuleNotFoundError" in why
+        spec, why = registry.find_spec(["Old"], "gfx950")
+        assert spec is None and f"API 0, this SGLang has {registry.API_VERSION}" in why
+    finally:
+        registry.unregister("Broken", "no_such_module:SPEC")
+        registry.unregister("Old", f"{__name__}:OLD_SPEC")
+    # installed packages list their specs as entry points
+    monkeypatch.setattr(
+        registry, "_entry_points", lambda: {"Pkg": (f"{__name__}:SPEC",)}
+    )
+    assert registry.find_spec(["Pkg"], "gfx950")[0] is SPEC
 
 
 def test_registry_finds_the_spec_for_the_isa():
@@ -256,6 +281,40 @@ def test_route_reads_only_the_graph_key():
     assert rt.decision(ShapeKey("decode", 2, 1, 2)).endswith(
         ": 0.attn_partial 1.layer_in 2.layer_in 3.layer_in"
     )
+
+
+def test_routing_runs_no_spec_code():
+    model, built = attached()
+    asked = built.asked
+    for _ in range(3):
+        plan = mono.route(model, batch("decode", 2, 2))
+        for i in range(LAYERS):
+            mono.kernel(plan, i, "layer_in")
+        mono.route(model, batch("decode", 64, 64))
+    assert built.asked == asked  # the table was fixed at attach
+
+
+def test_the_normal_path_has_a_reason():
+    model, _ = attached()
+    extend = SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False, is_target_verify=lambda: False, name="EXTEND"
+        ),
+        batch_size=2,
+        input_ids=torch.zeros(9, dtype=torch.int64),
+    )
+    uneven = batch("target_verify", 2, 7)
+    uneven.forward_mode.name = "TARGET_VERIFY"
+    for b in (extend, uneven, batch("decode", 64, 64), batch("decode", 4, 4)):
+        assert mono.route(model, b) is None
+    mono.route(model, batch("decode", 2, 2))
+    assert model.mono.counts == {
+        "extend steps": 1,
+        "target_verify with uneven rows a request": 1,
+        "decode over 12 rows": 1,
+        "decode of 4 rows, which the spec leaves normal": 1,
+        "mono": 1,
+    }
 
 
 def test_only_the_built_widths_route():
