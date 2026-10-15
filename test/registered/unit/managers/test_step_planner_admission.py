@@ -282,6 +282,12 @@ class TestHeldRowAdmission(_PlannerCase):
                 self.assertEqual(adder.can_run_list, [final_chunk, waiting])
 
     def test_a_session_request_holding_a_row_runs_without_a_free_one(self):
+        enter_scope(
+            self,
+            published_topology(
+                pp_max_micro_batch_size=64, enable_streaming_session=True
+            ),
+        )
         self.planner.core_lists.decoding = [_req("r", holds_row=True)]
         self.planner.core_lists.waiting_queue = [_req("s", holds_row=True)]
         self.free_rows = 0

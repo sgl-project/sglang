@@ -29,6 +29,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_serving,
     hicache_storage_enabled,
 )
 
@@ -324,8 +325,12 @@ class StepPlanner:
         num_reqs = len(running_reqs) + 1
         if self.beam_coordinator.has_room(num_reqs, 1):
             return True
-        return self.beam_coordinator.has_room(num_reqs, 0) and any(
-            req.kv.holds_kv for req in self.core_lists.waiting_queue
+        # Only a streaming session lends a waiting request its row (at the
+        # request's match); without them no waiting request holds one.
+        return (
+            get_serving().enable_streaming_session
+            and self.beam_coordinator.has_room(num_reqs, 0)
+            and any(req.kv.holds_kv for req in self.core_lists.waiting_queue)
         )
 
     def get_new_batch_prefill(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:

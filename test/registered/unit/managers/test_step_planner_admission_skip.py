@@ -176,6 +176,28 @@ class TestAdmissionSkipReason(_AdmissionCase):
         )
         self.assertIsNone(self._admit())
 
+    def test_no_request_slot_reads_no_waiting_request(self):
+        # Without streaming sessions no waiting request holds a row, so a
+        # pass with every row spent skips without reading the queue.
+        reads = []
+
+        class _Kv(SimpleNamespace):
+            @property
+            def holds_kv(self):
+                reads.append(1)
+                return False
+
+        waiting = [_req(f"w{i}") for i in range(3)]
+        for req in waiting:
+            req.kv = _Kv(holds_mamba=False, kv_allocated_len=8)
+        self.planner.core_lists.waiting_queue = waiting
+        self.free_rows = 0
+
+        self.assertEqual(
+            self.planner.admission_skip_reason(ScheduleSlot(), []), "no request slot"
+        )
+        self.assertEqual(reads, [])
+
     def test_a_chunked_request_always_runs(self):
         self.planner.core_lists.chunked_req = _req("c")
         self.free_rows = 0
