@@ -856,8 +856,9 @@ def test_several_multi_run_items_are_encoded_once_per_request():
     assert torch.equal(torch.cat(chunks), expected)
 
 
-def test_kept_rows_are_read_before_the_cache():
-    # A colliding cache entry appears between two chunks; the kept rows still serve.
+def test_kept_rows_hit_skips_the_cache():
+    # From the second chunk on the kept rows serve without asking the cache, so a
+    # colliding entry there is neither moved in the LRU order nor discarded.
     mm_schedule.init_mm_embedding_cache(1 << 30)
     item = _video_item()
     encoder = _video_encoder()
@@ -866,12 +867,16 @@ def test_kept_rows_are_read_before_the_cache():
     chunks = [_prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])]
     (cache_hash,) = cache.mm_cache
     cache.clear()
-    cache.set(cache_hash, mm_schedule.EmbeddingResult(embedding=torch.zeros(3, HIDDEN)))
+    colliding = mm_schedule.EmbeddingResult(embedding=torch.zeros(3, HIDDEN))
+    cache.set(cache_hash, colliding)
+    cache.get = Mock(wraps=cache.get)
     chunks += [
         _prefill_chunk(encoder, item, prefix_len, extend_len)
         for prefix_len, extend_len in VIDEO_CHUNKS[1:]
     ]
 
+    cache.get.assert_not_called()
+    assert cache.mm_cache[cache_hash] is colliding
     encoder.assert_called_once()
     assert torch.equal(torch.cat(chunks), _video_embedding(item))
     assert not mm_schedule._prefill_rows

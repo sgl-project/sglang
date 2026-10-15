@@ -411,14 +411,25 @@ def _get_chunked_embedding_full(
     """
     item_hashes = [item.hash for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-    embedding_per_req = embedding_cache.get(item_hashes)
+    # The key holds every item's hash and position, so one entry covers the
+    # request's whole layout.
+    rows_key = _rows_key(
+        None if None in item_hashes else embedding_items_hash, items_offset
+    )
+    rows = _find_prefill_rows(key=rows_key, chunk_start=extend_prefix_len)
+    # The cache is asked only when no rows were kept.
+    embedding_per_req = (
+        rows.result if rows is not None else embedding_cache.get(item_hashes)
+    )
 
     # A compact feature hash can collide for inputs with different token
     # counts.  Never feed a stale cache entry into the scheduler: the length
     # mismatch would otherwise surface much later in _adjust_embedding_length
     # as an unrecoverable prefill crash.
-    if embedding_per_req is not None and not isinstance(
-        embedding_per_req, EVSEmbeddingResult
+    if (
+        rows is None
+        and embedding_per_req is not None
+        and not isinstance(embedding_per_req, EVSEmbeddingResult)
     ):
         expected_token_count = sum(end - start + 1 for start, end in items_offset)
         cached_token_count = _embedding_token_count(embedding_per_req.embedding)
@@ -427,15 +438,6 @@ def _get_chunked_embedding_full(
                 embedding_items_hash, expected_token_count, cached_token_count
             )
             embedding_per_req = None
-
-    # The key holds every item's hash and position, so one entry covers the
-    # request's whole layout.
-    rows_key = _rows_key(
-        None if None in item_hashes else embedding_items_hash, items_offset
-    )
-    rows = _find_prefill_rows(key=rows_key, chunk_start=extend_prefix_len)
-    if rows is not None:
-        embedding_per_req = rows.result
 
     if embedding_per_req is None:
         _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
