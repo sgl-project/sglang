@@ -111,6 +111,93 @@ def supported(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> b
     )
 
 
+def _static_supported_rt(block: "Qwen2MoeSparseMoeBlock") -> bool:
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptNvFp4FusedMoEMethod,
+    )
+
+    experts = block.experts
+    cfg = block.topk.topk_config
+    gate_w = block.gate.weight
+    return (
+        isinstance(experts.quant_method, ModelOptNvFp4FusedMoEMethod)
+        and get_moe_runner_backend().is_flashinfer_trtllm()
+        and get_moe_a2a_backend().is_none()
+        and not experts.quant_method.quant_config.use_per_token_activation
+        and experts.trtllm_padded_hidden_size is None
+        and not experts._dwdp_bound
+        and not block.enable_shared_expert_fusion
+        and experts.hidden_size == _HIDDEN
+        and experts.w13_input_scale_quant.numel() == 1
+        and cfg.output_format is None
+        and gate_w.dtype == torch.bfloat16
+        and tuple(gate_w.shape) == (_NUM_EXPERTS, _HIDDEN)
+        and gate_w.is_contiguous()
+    )
+
+
+def supported_rt(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> bool:
+    """Per-call check for the trtllm-runner path; the static part is evaluated once per block."""
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
+    )
+
+    ok = block._route_rt_static_ok
+    if ok is None:
+        ok = block._route_rt_static_ok = _static_supported_rt(block)
+    m = hidden_states.shape[0]
+    return (
+        ok
+        and not torch.compiler.is_compiling()
+        and not is_in_tc_piecewise_cuda_graph()
+        and 0 < m <= _MAX_TOKENS
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and hidden_states.data_ptr() % 32 == 0
+    )
+
+
+def forward_routed_rt(
+    block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor, *, defer_finalize: bool
+):
+    """Routed experts on the trtllm runner with router logits and NVFP4 input from one launch.
+
+    Same runner call as FusedMoE.forward_impl / forward_deferred_finalize, with the
+    activation pre-quantized (the runner's hidden_states_scale passthrough).
+    """
+    from sglang.kernels.ops.moe.qwen_router_front import router_gemm_quant
+    from sglang.srt.distributed import use_symmetric_memory
+    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        flashinfer_trtllm_deferred_finalize_context,
+    )
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.runtime_context import get_parallel
+
+    experts = block.experts
+    logits, x_fp4, x_sf = router_gemm_quant(
+        hidden_states, block.gate.weight, experts.w13_input_scale_quant
+    )
+    topk_output = block.topk(hidden_states, logits)
+    if not TopKOutputChecker.format_is_bypassed(topk_output):
+        raise RuntimeError("router_gemm_quant path requires logits-based bypassed TopK")
+    dispatch_output = experts.dispatcher.dispatch(
+        hidden_states=hidden_states, topk_output=topk_output
+    )._replace(hidden_states=x_fp4, hidden_states_scale=x_sf.view(torch.float8_e4m3fn))
+    if defer_finalize:
+        with flashinfer_trtllm_deferred_finalize_context():
+            combine_input = experts.run_moe_core(dispatch_output=dispatch_output)
+        return experts.dispatcher.combine(combine_input=combine_input)
+    combine_input = experts.run_moe_core(dispatch_output=dispatch_output)
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
+        final_hidden_states = experts.dispatcher.combine(combine_input=combine_input)
+        final_hidden_states = final_hidden_states[..., :_HIDDEN].contiguous()
+    return final_hidden_states
+
+
 def _cutedsl_ready(experts) -> bool:
     from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
         ensure_cutedsl_wrapper,

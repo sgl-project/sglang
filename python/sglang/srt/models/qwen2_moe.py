@@ -413,6 +413,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.register_buffer(
                 "_route_arrival", torch.zeros(1, dtype=torch.int32), persistent=False
             )
+        # Same switch on the trtllm runner: router GEMM + input quant as one kernel.
+        self._route_rt_static_ok = self._route_front_static_ok
 
     def get_moe_weights(self):
         return [
@@ -724,6 +726,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
             if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
                 return self.experts(hidden_states, topk_output)
+        if self._route_rt_static_ok is not False and qwen_router_front.supported_rt(
+            self, hidden_states
+        ):
+            if defer_finalize and not self.supports_deferred_finalize:
+                raise RuntimeError(
+                    "Qwen deferred finalize requires a compatible FlashInfer "
+                    "TRTLLM MoE producer and a separate shared expert"
+                )
+            return qwen_router_front.forward_routed_rt(
+                self, hidden_states, defer_finalize=defer_finalize
+            )
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
