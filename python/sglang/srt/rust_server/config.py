@@ -106,6 +106,13 @@ def _build_server_args(
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        # Every process writes its prometheus_client samples under this
+        # directory (set before the schedulers start); `/metrics` merges them.
+        metrics=(
+            ext.MetricsConfig(multiproc_dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+            if get_observability().enable_metrics
+            else None
+        ),
     )
 
 
