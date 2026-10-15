@@ -1518,6 +1518,7 @@
                   {
                     "group": "FLUX",
                     "pages": [
+                      "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
                     ]
                   },
@@ -1609,6 +1610,12 @@
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
+                    ]
+                  },
+                  {
+                    "group": "MOSS-Image",
+                    "pages": [
+                      "cookbook/diffusion/OpenMOSS/MOSS-Image"
                     ]
                   },
                   {
