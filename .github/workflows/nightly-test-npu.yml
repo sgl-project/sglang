@@ -281,7 +281,7 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
+  #A5
   nightly-acc-4-npu-a5:
     name: nightly-acc-4-npu-a5
     if: ${{ !cancelled() }}
