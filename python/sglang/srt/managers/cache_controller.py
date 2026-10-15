@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -614,6 +614,7 @@ class HiCacheController:
                     "simm",
                     "mori",
                     "tensorcast",
+                    "seaweedfs",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
@@ -842,6 +843,10 @@ class HiCacheController:
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
 
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "write"), completion.finish_event
+        )
+
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -986,6 +991,10 @@ class HiCacheController:
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
 
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "load"), completion.finish_event
+        )
+
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -1108,13 +1117,20 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
-                hit_pages = self._page_transfer_kv_batch(
-                    operation,
-                    batch_hashes,
-                    batch_host_indices,
-                    extra_info,
-                    kv_derived_transfers,
-                )
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                except Exception:
+                    logger.exception(
+                        "HiCache prefetch transfer failed for request %s",
+                        operation.request_id,
+                    )
+                    hit_pages = 0
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
@@ -1175,10 +1191,13 @@ class HiCacheController:
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if operation is None:
-                    continue
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            try:
                 self._page_transfer(operation)
-
+            finally:
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
                         rid=operation.request_id,
@@ -1186,8 +1205,6 @@ class HiCacheController:
                         operation=operation,
                     )
                 )
-            except Empty:
-                continue
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -1208,6 +1225,24 @@ class HiCacheController:
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
+
+    def alloc_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> Optional[torch.Tensor]:
+        """Allocate the host bounce for a storage hit."""
+        return self.mem_pool_host.alloc(need_size)
+
+    def can_fit_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> bool:
+        """Whether a prefetch bounce can fit when its host pools are empty."""
+        return need_size <= self.mem_pool_host.size
+
+    def free_prefetch_host_buffers(
+        self, operation: StorageOperation, host_indices: torch.Tensor
+    ) -> None:
+        """Roll back a hit-sized host bounce before transfer ownership moves."""
+        self.mem_pool_host.free(host_indices)
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
@@ -1243,19 +1278,23 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                if operation.is_terminated():
+                try:
+                    if operation.is_terminated():
+                        hash_value, storage_hit_count = [], 0
+                    else:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                except Exception:
+                    logger.exception(
+                        "HiCache storage query failed for request %s",
+                        operation.request_id,
+                    )
                     hash_value, storage_hit_count = [], 0
-                else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+
+                storage_hit_count = self._sync_prefetch_hit_query(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
@@ -1267,6 +1306,21 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
+        """Rank-reduce a hit query (MIN) so every rank agrees on the usable
+        prefix. Runs for every operation, hit or miss."""
+        hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce(
+            hit_count,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        return int(hit_count.item())
+
+    def extend_storage_prefix(self, prefix_keys: Any, hash_values: List[str]) -> Any:
+        """Advance the backend's prefix context past omitted pages."""
+        return prefix_keys + hash_values if prefix_keys is not None else None
 
     def write_storage(
         self,
@@ -1320,6 +1374,14 @@ class HiCacheController:
                 prefix_keys = prefix_keys + batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
+    def _page_backup_or_log(self, operation):
+        try:
+            self._page_backup(operation)
+        except Exception:
+            logger.exception(
+                "HiCache backup failed after %d tokens", operation.completed_tokens
+            )
+
     def backup_thread_func(self):
         """
         Manage backup operations from host memory to storage backend.
@@ -1331,7 +1393,7 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

@@ -67,27 +67,44 @@ def test_reuse_tables_pass_through_but_distinct_duplicates_raise():
         )
 
 
-def test_model_runner_can_override_decode_graph_runner(monkeypatch):
+def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog):
+    """Startup must not reject local draft buckets using global TP alignment."""
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        get_batch_sizes_to_capture,
+    )
     from sglang.srt.runtime_context import get_context
+    from sglang.srt.utils import common
 
+    capture_bs = [1, 2, 3, 4, 8]
     # The capture decision reads the graph configuration and the MoE backends
     # out of the bags.
     override = get_context().override_server_args(
-        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="default")),
+        cuda_graph_config=SimpleNamespace(
+            decode=SimpleNamespace(backend="default", bs=capture_bs)
+        ),
+        enable_torch_compile=False,
+        enable_two_batch_overlap=False,
     )
     override.install()
 
     class CustomGraphRunner:
         def __init__(self, model_runner):
             self.model_runner = model_runner
+            self.capture_bs, _ = get_batch_sizes_to_capture(
+                model_runner, 7, gathered_buffer_required=False
+            )
 
     class TestModelRunner:
         is_generation = True
         device = "cuda"
         gpu_id = 0
-        is_draft_worker = False
-        spec_algorithm = SimpleNamespace(is_speculative=lambda: False)
+        is_draft_worker = True
+        spec_algorithm = SimpleNamespace(is_speculative=lambda: True)
         server_args = SimpleNamespace(model_impl="auto")
+        req_to_token_pool = SimpleNamespace(size=32)
+
+        def decode_num_tokens_per_req(self):
+            return 7
 
         def _decode_cuda_graph_runner_cls(self):
             return CustomGraphRunner
@@ -95,18 +112,22 @@ def test_model_runner_can_override_decode_graph_runner(monkeypatch):
     model_runner = TestModelRunner()
     monkeypatch.setattr(cuda_graph_setup, "check_cuda_graph_backend", lambda *_: False)
     monkeypatch.setattr(cuda_graph_setup, "get_available_gpu_memory", lambda *_: 10.0)
+    monkeypatch.setattr(common, "require_gathered_buffer", lambda: True)
     monkeypatch.setattr(
-        cuda_graph_setup, "get_batch_sizes_to_capture", lambda *_: ([1], None)
+        common, "get_parallel", lambda: SimpleNamespace(attn_tp_size=16, attn_cp_size=1)
     )
     monkeypatch.setattr(
         cuda_graph_setup.current_platform, "is_out_of_tree", lambda: False
     )
 
     try:
-        capture = capture_decode_graph(model_runner=model_runner)
+        with caplog.at_level("INFO", logger=cuda_graph_setup.__name__):
+            capture = capture_decode_graph(model_runner=model_runner)
 
         assert isinstance(capture.runner, CustomGraphRunner)
         assert capture.runner.model_runner is model_runner
+        assert capture.runner.capture_bs == capture_bs
+        assert f"bs={capture_bs}" in caplog.text
     finally:
         override.restore()
 

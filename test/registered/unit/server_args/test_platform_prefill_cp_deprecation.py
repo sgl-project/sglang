@@ -101,18 +101,18 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
             ("support DeepSeek-V4.1", dict(model_type="deepseek_v41")),
             ("bounded-replay", dict(enable_decoder_swa_bounded_replay=True)),
             ("two-batch-overlap", dict(enable_two_batch_overlap=True)),
-            ("fp8 unified_kv", dict(fp8=True)),
         )
         for regex, overrides in cases:
-            overrides = dict(overrides)
-            fp8 = overrides.pop("fp8", False)
-            args = _cp_args(**overrides)
             with (
                 self.subTest(regex=regex),
-                mock.patch(f"{_ENV_GATE}.is_unified_kv_fp8", return_value=fp8),
                 self.assertRaisesRegex(ValueError, regex),
             ):
-                validate_deepseek_v4_cp(args)
+                validate_deepseek_v4_cp(_cp_args(**overrides))
+
+    @override_platform(is_hip=True, is_npu=False, is_musa=False)
+    def test_hip_deepseek_v4_cp_allows_fp8_unified_kv(self):
+        with mock.patch(f"{_ENV_GATE}.is_unified_kv_fp8", return_value=True):
+            validate_deepseek_v4_cp(_cp_args())
 
     @override_platform(is_hip=False, is_npu=False, is_musa=False)
     def test_cuda_deepseek_v4_cp_allows_multiple_nodes(self):

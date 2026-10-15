@@ -105,6 +105,21 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r3.origin_input_ids), in1 + out1 + in2 + out2 + [9])
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
 
+    def test_multimodal_counts_follow_committed_history(self):
+        """An aborted turn's count edits must not leak into the next turn."""
+        r1 = self._create("r1", [1])
+        r1.mm_image_tokens, r1.mm_audio_tokens, r1.mm_video_tokens = (2, 3, 4)
+        r1.mm_token_counts_ready = True
+        self._decode_and_finish(r1, [])
+
+        r2 = self._create("r2", [2])
+        self.assertEqual(r2.get_mm_token_counts(), (2, 3, 4))
+        r2.mm_image_tokens = 5
+        self.session.abort_req()
+
+        r3 = self._create("r3", [3])
+        self.assertEqual(r3.get_mm_token_counts(), (2, 3, 4))
+
     def test_mid_turn_abort_then_continue(self):
         in1, out1 = list(range(200, 210)), [1, 2, 3]
         r1 = self._create("r1", in1)

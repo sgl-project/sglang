@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import msgspec.msgpack
 import numpy as np
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
@@ -22,6 +23,14 @@ from sglang.multimodal_gen.runtime.realtime.video import (
     build_raw_rgb_frame_batches,
     restore_delta_gzip_raw_rgb_payload,
 )
+
+
+class _WebSocket:
+    def __init__(self):
+        self.payloads = []
+
+    async def send_bytes(self, payload):
+        self.payloads.append(payload)
 
 
 def _unpack_frame_batch_messages(payloads):
@@ -156,14 +165,14 @@ def test_delta_gzip_raw_rgb_payload_roundtrips_exactly():
     assert restored == b"".join(frames)
 
 
-def test_raw_rgb_realtime_output_adapter_uses_lossless_raw_payload_by_default():
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
-
+@pytest.mark.parametrize(
+    "request_id,output_options",
+    [("req-1", {}), ("req-raw", {"realtime_output_format": "raw"})],
+    ids=["default", "explicit-raw"],
+)
+def test_raw_rgb_realtime_output_adapter_sends_lossless_raw_frames(
+    request_id, output_options
+):
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
@@ -171,11 +180,12 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_raw_payload_by_default():
         frame1 = bytes([1, 2, 4]) * 1000
         batch = SimpleNamespace(
             block_idx=0,
-            request_id="req-1",
+            request_id=request_id,
             width=1000,
             height=1,
             enable_upscaling=False,
             realtime_event_id=3,
+            **output_options,
         )
         result = OutputBatch(
             raw_frame_batches=[[frame0, frame1]],
@@ -203,6 +213,7 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_raw_payload_by_default():
     assert first_header["bytes_per_frame"] == 3000
     assert first_header["raw_size"] == 6000
     assert first_header["total_size"] == len(first_payload)
+    assert first_header["total_size"] == 6000
     assert first_header["num_frames"] == 2
     assert first_header["num_frame_batches"] == 1
     assert first_header["frame_batch_index"] == 0
@@ -211,6 +222,7 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_raw_payload_by_default():
     assert stats["num_batches"] == 1
     assert stats["num_frames"] == 2
     assert first_payload == expected_frames
+    assert stats["ws_payload_bytes"] == sum(len(payload) for payload in payloads)
 
 
 def test_raw_rgb_realtime_output_adapter_offloads_default_lossless_payload_build(
@@ -227,13 +239,6 @@ def test_raw_rgb_realtime_output_adapter_offloads_default_lossless_payload_build
         "to_thread",
         fake_to_thread,
     )
-
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
 
     async def run():
         ws = _WebSocket()
@@ -274,68 +279,7 @@ def test_raw_rgb_realtime_output_adapter_offloads_default_lossless_payload_build
     assert first_payload == expected_frames
 
 
-def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
-
-    async def run():
-        ws = _WebSocket()
-        adapter = RawRGBRealtimeOutputAdapter()
-        frame0 = bytes([1, 2, 3]) * 1000
-        frame1 = bytes([1, 2, 4]) * 1000
-        batch = SimpleNamespace(
-            block_idx=0,
-            request_id="req-raw",
-            width=1000,
-            height=1,
-            enable_upscaling=False,
-            realtime_event_id=3,
-            realtime_output_format="raw",
-        )
-        result = OutputBatch(
-            raw_frame_batches=[[frame0, frame1]],
-            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
-            raw_frame_metadata={
-                "format": "rgb24",
-                "width": 1000,
-                "height": 1,
-                "channels": 3,
-                "bytes_per_frame": 3000,
-            },
-        )
-
-        stats = await adapter.send(ws, SimpleNamespace(), result, batch)
-        return ws.payloads, stats, frame0 + frame1
-
-    payloads, stats, expected_frames = asyncio.run(run())
-
-    [(first_header, first_payload)] = _unpack_frame_batch_messages(payloads)
-    assert first_header["content_type"] == RAW_RGB_CONTENT_TYPE
-    assert first_header["encoding"] == "raw"
-    assert first_header["raw_size"] == 6000
-    assert first_header["total_size"] == 6000
-    assert first_header["num_frames"] == 2
-    assert first_header["num_frame_batches"] == 1
-    assert first_header["frame_batch_index"] == 0
-    assert first_payload == expected_frames
-    assert stats["raw_bytes"] == 6000
-    assert stats["num_batches"] == 1
-    assert stats["num_frames"] == 2
-    assert stats["ws_payload_bytes"] == sum(len(payload) for payload in payloads)
-
-
 def test_raw_rgb_realtime_output_adapter_does_not_require_previous_frame_reference():
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
-
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
@@ -391,13 +335,6 @@ def test_raw_rgb_realtime_output_adapter_does_not_require_previous_frame_referen
 
 
 def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
-
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
@@ -441,13 +378,6 @@ def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
 
 
 def test_raw_rgb_realtime_output_adapter_sends_large_payload_separately():
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
-
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
@@ -490,26 +420,29 @@ def test_raw_rgb_realtime_output_adapter_sends_large_payload_separately():
     assert stats["num_frames"] == 1
 
 
-def test_raw_rgb_realtime_output_adapter_can_send_webp_preview_frames():
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
-
+@pytest.mark.parametrize(
+    "output_format,quality,content_type,signature",
+    [
+        ("webp", 90, WEBP_FRAME_CONTENT_TYPE, b"RIFF"),
+        ("jpeg", 85, JPEG_FRAME_CONTENT_TYPE, b"\xff\xd8"),
+    ],
+    ids=["webp", "jpeg"],
+)
+def test_raw_rgb_realtime_output_adapter_can_send_preview_frames(
+    output_format, quality, content_type, signature
+):
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
         batch = SimpleNamespace(
             block_idx=0,
-            request_id="req-webp",
+            request_id=f"req-{output_format}",
             width=2,
             height=1,
             enable_upscaling=False,
             realtime_event_id=5,
-            realtime_output_format="webp",
-            output_compression=90,
+            realtime_output_format=output_format,
+            output_compression=quality,
         )
         result = OutputBatch(
             raw_frame_batches=[[bytes([255, 0, 0, 0, 255, 0])]],
@@ -529,12 +462,12 @@ def test_raw_rgb_realtime_output_adapter_can_send_webp_preview_frames():
     payloads, stats = asyncio.run(run())
 
     [(header, frame_payload)] = _unpack_frame_batch_messages(payloads)
-    assert header["content_type"] == WEBP_FRAME_CONTENT_TYPE
-    assert header["format"] == "webp"
-    assert header["encoding"] == "webp"
+    assert header["content_type"] == content_type
+    assert header["format"] == output_format
+    assert header["encoding"] == output_format
     assert header["num_frames"] == 1
     assert header["is_final_frame_batch"] is True
-    assert frame_payload.startswith(b"RIFF")
+    assert frame_payload.startswith(signature)
     assert stats["num_batches"] == 1
     assert stats["num_frames"] == 1
 
@@ -551,13 +484,6 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
         "to_thread",
         fake_to_thread,
     )
-
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
 
     async def run():
         ws = _WebSocket()
@@ -621,52 +547,3 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
     assert len(second_header["payload_lengths"]) == 1
     assert first_payload.startswith(b"RIFF")
     assert second_payload.startswith(b"RIFF")
-
-
-def test_raw_rgb_realtime_output_adapter_can_send_jpeg_preview_frames():
-    class _WebSocket:
-        def __init__(self):
-            self.payloads = []
-
-        async def send_bytes(self, payload):
-            self.payloads.append(payload)
-
-    async def run():
-        ws = _WebSocket()
-        adapter = RawRGBRealtimeOutputAdapter()
-        batch = SimpleNamespace(
-            block_idx=0,
-            request_id="req-jpeg",
-            width=2,
-            height=1,
-            enable_upscaling=False,
-            realtime_event_id=5,
-            realtime_output_format="jpeg",
-            output_compression=85,
-        )
-        result = OutputBatch(
-            raw_frame_batches=[[bytes([255, 0, 0, 0, 255, 0])]],
-            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
-            raw_frame_metadata={
-                "format": "rgb24",
-                "width": 2,
-                "height": 1,
-                "channels": 3,
-                "bytes_per_frame": 6,
-            },
-        )
-
-        stats = await adapter.send(ws, SimpleNamespace(), result, batch)
-        return ws.payloads, stats
-
-    payloads, stats = asyncio.run(run())
-
-    [(header, frame_payload)] = _unpack_frame_batch_messages(payloads)
-    assert header["content_type"] == JPEG_FRAME_CONTENT_TYPE
-    assert header["format"] == "jpeg"
-    assert header["encoding"] == "jpeg"
-    assert header["num_frames"] == 1
-    assert header["is_final_frame_batch"] is True
-    assert frame_payload.startswith(b"\xff\xd8")
-    assert stats["num_batches"] == 1
-    assert stats["num_frames"] == 1

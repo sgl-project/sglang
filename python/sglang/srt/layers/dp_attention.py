@@ -20,6 +20,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_rank_to_dp_rank,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
@@ -90,16 +94,20 @@ def dp_slot_in(per_rank) -> int:
 def dp_gather_slot() -> int:
     """Return this process's index in the DP gather.
 
-    After elastic scale-up, use the TP rank plus the join offset; otherwise
-    use the attention-DP rank. Inside a draft scope that owns its attention,
-    it is still the slot in the target's gather (see patch_tensor_parallel_group).
+    After elastic scale-up, convert the physical EP rank (the TP rank plus the
+    join offset) to its logical attention-DP replica; otherwise use the local
+    attention-DP rank. Inside a draft scope that owns its attention, it is still
+    the slot in the target's gather (see patch_tensor_parallel_group).
     """
     scoped = get_flags().dp.scoped_gather_slot
     if scoped is not None:
         return scoped
     parallel = get_parallel()
     if world_dp_gather_enabled():
-        return parallel.tp_rank + parallel.ep_join_rank_offset
+        return physical_ep_rank_to_dp_rank(
+            parallel.tp_rank + parallel.ep_join_rank_offset,
+            attn_replica_size(),
+        )
     return parallel.attn_dp_rank
 
 
@@ -355,7 +363,7 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
     global_num_tokens = forward_batch.global_num_tokens_padded_cpu
     if global_num_tokens is None:
         global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    dp_rank = dp_slot_in(global_num_tokens)
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
         global_num_tokens[dp_rank],
@@ -791,10 +799,9 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
     outputs are then discarded by the post-reorder scatter — pure wasted
     compute, and a masked-grouped-GEMM workspace blow-up when they collide
     on the same top-k.  -1 is the drop sentinel both the triton fused_moe
-    (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
-    AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
-    the mapping table's last entry).  Capture-safe: per-batch state is read
-    only from the replay-updated global_num_tokens_gpu tensor.
+    (filter_expert) and the DeepGEMM EP preprocess honor.  Capture-safe:
+    per-batch state is read only from the replay-updated
+    global_num_tokens_gpu tensor.
     """
     counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
     if counts is None:
@@ -1069,6 +1076,15 @@ def can_use_dp_reduce_scatter() -> bool:
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     _note_dp_gather_in_prefill_graph()
+    parallel = get_parallel()
+    if parallel.attn_cp_size > 1 and input.shape[0] % parallel.tp_size:
+        # MAX_LEN padding aligns each DP slot to attention TP, not CP x TP.
+        # Small decode batches cannot be equally split over the full TP group.
+        reduced = parallel.tp_group.all_reduce(input)
+        output.copy_(
+            reduced.narrow(0, parallel.attn_dp_rank * output.shape[0], output.shape[0])
+        )
+        return
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
         # global (sum_len) tensor back to per-rank token counts. Fall through to
@@ -1084,9 +1100,23 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_parallel().tp_rank
         ]
         get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
-        get_parallel().attn_tp_group.all_gather_into_tensor(
-            output, scattered_local_tokens
-        )
+        if parallel.attn_cp_size > 1:
+            # TP reduce-scatter splits each DP slot over CP x attention TP.
+            # Restore both axes: decode (and warmup) holds the full DP slot on
+            # every CP rank, even though prefill uses context-sharded rows.
+            cp_local_tokens = scattered_local_tokens
+            if parallel.attn_tp_size > 1:
+                cp_local_tokens = output.new_empty(
+                    (output.shape[0] // parallel.attn_cp_size, *output.shape[1:])
+                )
+                parallel.attn_tp_group.all_gather_into_tensor(
+                    cp_local_tokens, scattered_local_tokens
+                )
+            parallel.attn_cp_group.all_gather_into_tensor(output, cp_local_tokens)
+        else:
+            parallel.attn_tp_group.all_gather_into_tensor(
+                output, scattered_local_tokens
+            )
 
 
 # ---------------------------------------------------------------------------
