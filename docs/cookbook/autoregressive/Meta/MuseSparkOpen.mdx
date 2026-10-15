@@ -56,3 +56,259 @@ NVFP4 runs on one 8x H200 node with Marlin W4A16 experts (`--moe-runner-backend 
 - Xeon serves the **INT4** checkpoint (quantized by Intel AutoRound, HF id: `intel-ai/Muse-Spark-Open-816B-A42B-INT4`) on the SGLang CPU engine. A typical Xeon 6 P-core platform (e.g., Xeon 6980P) is recommended.
 - Set `--page-size 1` for the `intel_amx` attention backend (the CPU default attention backend).
 - We recommend setting the TP size equal to the NUMA count. See the **Notes** under [Launch of the Serving Engine](/docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) in the SGLang CPU server document for how to configure the arguments, especially TP and NUMA binding.
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+On the server, enable `--reasoning-parser muse` in your `sglang serve` command. The [Deployment](#deployment) recipes above already include this flag; in the [Playground](#playground), keep **Reasoning Parser** enabled under **Parsers**. The parser separates the model's reasoning into `message.reasoning_content` and its final answer into `message.content`.
+
+On the client, set `reasoning_effort` for each chat completion request. Muse Spark Open supports **four levels: `low`, `medium`, `high`, and `xhigh`**. If you omit the parameter, the checkpoint's chat template defaults to **`xhigh`**. Use `low` or `medium` for faster, shorter responses, and `high` or `xhigh` for complex problem solving, coding, and agentic tasks. Other values, including `minimal`, are not supported. See the [model card](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B-NVFP4) for the supported settings.
+
+The example below connects to the server on port `30000` and discovers its model ID, so it works with whichever checkpoint you selected in Deployment. Change `base_url` if the server runs on another host or port. The current checkpoint's chat template does not require `chat_template_kwargs={"thinking": True}`; set the reasoning level with `reasoning_effort`.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:30000/v1",
+    api_key="EMPTY",
+    timeout=600.0,
+)
+model = client.models.list().data[0].id
+response = client.chat.completions.create(
+    model=model,
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Briefly explain: what is SGLang?"},
+    ],
+    max_tokens=16384,
+    reasoning_effort="xhigh",  # low | medium | high | xhigh (default)
+)
+choice = response.choices[0]
+print("Reasoning:", getattr(choice.message, "reasoning_content", None))
+print("Content:", choice.message.content)
+print("Finish reason:", choice.finish_reason)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: We need to briefly explain what is SGLang. Likely want concise explanation. SGLang is structured generation language? It's a framework for programming LLMs. Developed by LMSYS? Actually SGLang is a serving framework.
+
+Need to explain: SGLang is a fast serving framework/DSL for LLMs? Let's recall.
+
+SGLang is a structured generation language, a domain-specific language for LLM programs. Created by LMSYS Org. Allows efficient LLM programming with structured prompting, caching, constrained decoding etc. Provides high-performance serving via RadixAttention, paged attention, etc. Used for chaining calls, multi-turn, function calling, reasoning.
+
+We should give brief explanation.
+
+Possibly user wants simple. Provide definition, key features, use cases.
+
+Make it brief but informative.
+
+Maybe need to distinguish from other? Should be neutral.
+
+Potentially also SGLang = Serving framework?
+
+SGLang is open-source system for efficient LLM serving and programming.
+
+Key features:
+- Front-end language (Python DSL) for controlling generation
+- Backend runtime: RadixAttention for KV cache reuse, continuous batching, tensor parallelism, quantization, speculative decoding.
+- Supports OpenAI-compatible API.
+
+Briefly explain.
+
+Keep concise.
+
+Add example maybe?
+
+User: "Briefly explain: what is SGLang?"
+
+Provide maybe 3-4 bullet points.
+
+Possibly mention origin: developed by LMSYS and UC Berkeley etc.
+
+Ensure not too long. Brief.
+
+Maybe add: SGL for Structured Generation Language.
+
+Make answer accessible.
+
+Probably mention advantages: faster, controllable.
+
+We should not hallucinate too much. Provide accurate info.
+
+SGLang GitHub: sgl-project/sglang.
+
+SGLang latest: SGLang is inference engine?
+
+Let's verify facts: SGLang was introduced in paper "SGLang: Efficient Execution of Structured Language Model Programs" arXiv 2312.07104, Dec 2023, authors Lianmin Zheng etc.
+
+It provides primitives: gen(), select(), etc.
+
+Runtime optimizations: RadixAttention, compressed FSM for constrained decoding, API speculative execution.
+
+Provides high throughput, low latency.
+
+Supports many models: Llama, Mistral, Qwen etc. Supports on NVIDIA GPUs, AMD.
+
+Should answer.
+
+User likely wants short. Provide 1 paragraph + bullets.
+
+Make tone helpful.
+
+Add use cases: agents, reasoning, data extraction.
+
+Probably not over.
+
+Potential need to add date knowledge cutoff 2026?
+
+Add nothing disallowed.
+
+Make final answer succinct.
+
+Maybe add link? Not needed.
+
+Use simple language.
+
+We should not mention reasoning strength.
+
+Proceed to final.
+
+Content: SGLang — **Structured Generation Language** — is an open-source system for programming and serving Large Language Models (LLMs).
+
+Created by LMSYS / UC Berkeley, it has 2 parts:
+
+**1. Frontend - a Python DSL:** Lets you write LLM programs with logic, not just string prompts. Primitives like `gen()`, `select()`, `fork()` for chaining calls, controlling reasoning, forcing JSON/tool-calling structure, multi-agent workflows, etc.
+
+**2. Backend - a high-performance inference engine:** Optimized runtime for fast, cheap serving with features like:
+* **RadixAttention:** automatic KV-cache reuse for prefixes, few-shot examples, multi-turn chat
+* Continuous batching, Tensor Parallelism, quantization, speculative decoding
+* Fast constrained/structured decoding
+
+In short: It's an alternative to vLLM / TensorRT-LLM. You get both a cleaner way to *program* LLMs and a very fast engine to *run* them, with an OpenAI-compatible API.
+
+Finish reason: stop
+```
+
+</Accordion>
+
+### 3.2 Tool calling
+
+On the server, enable `--tool-call-parser muse` alongside `--reasoning-parser muse` in your `sglang serve` command. The [Deployment](#deployment) recipes above already include both flags; in the [Playground](#playground), keep **Tool Call Parser** and **Reasoning Parser** enabled under **Parsers**. SGLang converts Muse Spark Open's native tool-call format into OpenAI-compatible `message.tool_calls`, while keeping reasoning in `message.reasoning_content`.
+
+On the client, pass function definitions in `tools`, with each function's arguments described by a JSON Schema. The checkpoint's [chat template](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B-NVFP4/blob/main/chat_template.jinja) formats these definitions for the model. With `tool_choice="auto"`, the model decides whether to call a tool. The example below requests a weather lookup and prints each returned function name and its JSON arguments.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+import json
+
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:30000/v1",
+    api_key="EMPTY",
+    timeout=600.0,
+)
+model = client.models.list().data[0].id
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City name, for example Beijing.",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                    },
+                },
+                "required": ["location", "unit"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model=model,
+    messages=[
+        {"role": "user", "content": "Use get_weather to check the current weather in Beijing in Celsius."},
+    ],
+    tools=tools,
+    tool_choice="auto",
+    reasoning_effort="xhigh",
+    max_tokens=16384,
+)
+choice = response.choices[0]
+message = choice.message
+print("Reasoning:", getattr(message, "reasoning_content", None))
+print("Content:", message.content)
+for tool_call in message.tool_calls or []:
+    print("Tool call ID:", tool_call.id)
+    print("Function:", tool_call.function.name)
+    print("Arguments:", json.loads(tool_call.function.arguments))
+print("Finish reason:", choice.finish_reason)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: User wants get_weather to check current weather in Beijing in Celsius.
+
+We have function get_weather with parameters: location (string), unit (string enum celsius/fahrenheit)
+
+We need to call it.
+
+We must call the function with location=Beijing, unit=celsius
+
+Add reasoning.
+
+We should not add extra text beyond function call? In this format, we need to provide function call. Probably we need to output function call directly.
+
+We are Meta AI. Follow guidelines.
+
+We need to invoke get_weather.
+
+Be careful to JSON correct.
+
+Probably need thinking tags? But in this environment, we have tool access. We should call get_weather.
+
+We should do that now.
+
+Possibly reasoning strength 512, need thorough reasoning? No, we just need to call tool.
+
+Ensure we use correct recipient format: get_weather
+
+We need to produce "<atem:function_calls>..." block.
+
+We need to provide location: "Beijing", unit: "celsius"
+
+Make call.
+
+Content: Beijing in Celsius — checking the weather for you immediately.
+Tool call ID: call_43c0efae809d46988855bb79
+Function: get_weather
+Arguments: {'location': 'Beijing', 'unit': 'celsius'}
+Finish reason: tool_calls
+```
+
+</Accordion>
+
+This example inspects the requested tool calls; it does not fetch weather data. Your application executes the corresponding function. To continue the conversation, append the assistant message containing `tool_calls`, then a `role="tool"` message for each result with the matching `tool_call_id`, and send the updated messages with the same tool definitions.
