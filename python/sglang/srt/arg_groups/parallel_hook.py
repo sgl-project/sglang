@@ -786,7 +786,9 @@ def handle_elastic_ep(server_args: Any):
             server_args,
             "_handle_elastic_ep",
             enable_dp_attention_local_control_broadcast=True,
+            enable_dp_lm_head=True,
         )
+        resolved = resolved_view(server_args)
         if cfg.ep_join_mode == "scale":
             assert cfg.elastic_ep_initial_size is not None, (
                 "Elastic EP scale joiners require --elastic-ep-initial-size "
