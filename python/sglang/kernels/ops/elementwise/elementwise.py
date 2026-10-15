@@ -389,6 +389,7 @@ def _fused_sigmoid_mul_kernel(
     q_ptr=None,
     s_ptr=None,
     QUANT: tl.constexpr = False,
+    STATIC_QUANT: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
@@ -406,7 +407,12 @@ def _fused_sigmoid_mul_kernel(
     g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
 
     result = attn * tl.sigmoid(g)
-    if QUANT:  # the block is one row: per-token FP8 as _per_token_group_quant_8bit
+    if STATIC_QUANT:
+        y = result.to(attn_output_ptr.dtype.element_ty).to(tl.float32)
+        inv_scale = 1.0 / tl.load(s_ptr)
+        y_q = tl.clamp(y * inv_scale, -448.0, 448.0)
+        tl.store(output_ptr + attn_off, y_q, mask=mask)
+    elif QUANT:  # the block is one row: per-token FP8 as _per_token_group_quant_8bit
         y = tl.where(mask, result.to(output_ptr.dtype.element_ty).to(tl.float32), 0.0)
         y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
         y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(q_ptr.dtype.element_ty)
@@ -421,6 +427,7 @@ def fused_sigmoid_mul(
     gate: torch.Tensor,
     inplace: bool = False,
     quant: bool = False,
+    static_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -454,9 +461,16 @@ def fused_sigmoid_mul(
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
 
-    out = attn_output if inplace else torch.empty_like(attn_output)
+    if static_scale is not None:
+        assert not quant and not inplace
+        assert static_scale.numel() == 1
+        out = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
+    else:
+        out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
     kwargs = {}
+    if static_scale is not None:
+        kwargs = {"s_ptr": static_scale, "STATIC_QUANT": True}
     if quant:  # one block per row; returns per-token FP8 (q, scale [T, 1])
         block_h = triton.next_power_of_2(hidden_dim)
         q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)

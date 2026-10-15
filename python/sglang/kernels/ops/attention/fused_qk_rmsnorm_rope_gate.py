@@ -63,17 +63,30 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     ENABLE_PDL: tl.constexpr,
     WEIGHT_SHIFT: tl.constexpr = 1.0,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
+    v_ptr=None,
+    v_cache_ptr=None,
+    cache_loc_ptr=None,
+    k_scale_ptr=None,
+    v_scale_ptr=None,
+    stride_v_t: tl.constexpr = 0,
+    stride_v_cache_t: tl.constexpr = 0,
+    FP8_CACHE: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
     is_k = head >= NUM_Q_HEADS
     local_head = tl.where(is_k, head - NUM_Q_HEADS, head)
     out_dtype = tl.float16 if FP16 else tl.bfloat16
+    if FP8_CACHE:
+        slot = tl.load(cache_loc_ptr + token).to(tl.int64)
+        inv_k = 1.0 / tl.load(k_scale_ptr)
 
     if is_k:
         in_base = k_ptr + token * stride_k_t + local_head * HEAD_DIM
         w_ptr = k_weight_ptr
         out_base = k_out_ptr + token * stride_ko_t + local_head * HEAD_DIM
+        if FP8_CACHE:
+            out_base = k_out_ptr + slot * stride_ko_t + local_head * HEAD_DIM
     else:
         if HAS_GATE:
             in_base = q_gate_ptr + token * stride_qg_t + local_head * 2 * HEAD_DIM
@@ -94,7 +107,10 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     # Pass-through tail [rotary_dim, head_dim)
     if HAS_PASS:
         pass_mask = head_mask & (head_offs >= ROTARY_DIM)
-        tl.store(out_base + head_offs, x_norm, mask=pass_mask)
+        tail = x_norm
+        if FP8_CACHE and is_k:
+            tail *= inv_k
+        tl.store(out_base + head_offs, tail, mask=pass_mask)
 
     # Reload rotary portion from L1 -> re-norm -> RoPE
     rot_offs = tl.arange(0, ROT_HALF_BLOCK)
@@ -130,8 +146,24 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     else:
         first = xr1 * cos - xr2 * sin
         second = xr2 * cos + xr1 * sin
+    if FP8_CACHE:
+        first = first.to(out_dtype).to(tl.float32)
+        second = second.to(out_dtype).to(tl.float32)
+        if is_k:
+            first *= inv_k
+            second *= inv_k
     tl.store(out_base + rot_offs, first, mask=rot_mask)
     tl.store(out_base + HALF_ROTARY + rot_offs, second, mask=rot_mask)
+
+    if FP8_CACHE and is_k:
+        value = tl.load(
+            v_ptr + token * stride_v_t + local_head * HEAD_DIM + head_offs,
+            head_mask,
+            0.0,
+        ).to(tl.float32)
+        inv_v = 1.0 / tl.load(v_scale_ptr)
+        value_out = v_cache_ptr + slot * stride_v_cache_t + local_head * HEAD_DIM
+        tl.store(value_out + head_offs, value * inv_v, head_mask)
 
     # Gate copy (Q heads only)
     if HAS_GATE and not is_k:
@@ -160,6 +192,12 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     rotary_dim: int,
     has_gate: bool = True,
     mrope_axis_map: Optional[torch.Tensor] = None,
+    *,
+    v: Optional[torch.Tensor] = None,
+    kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    cache_loc: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
@@ -186,8 +224,18 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
 
-    q_out = torch.empty(T, q_size, dtype=q_gate.dtype, device=q_gate.device)
-    k_out = torch.empty(T, kv_size, dtype=k.dtype, device=k.device)
+    fp8_cache = kv_cache is not None
+    q_out = torch.empty(
+        T,
+        q_size,
+        dtype=torch.float8_e4m3fn if fp8_cache else q_gate.dtype,
+        device=q_gate.device,
+    )
+    k_out = (
+        kv_cache[0]
+        if fp8_cache
+        else torch.empty(T, kv_size, dtype=k.dtype, device=k.device)
+    )
     gate_out = (
         torch.empty(T, num_q_heads, head_dim, dtype=q_gate.dtype, device=q_gate.device)
         if has_gate
@@ -199,6 +247,21 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     rot_half_block = triton.next_power_of_2(half_rotary)
 
     grid = (T, num_q_heads + num_kv_heads)
+    kwargs = {}
+    if fp8_cache:
+        assert v is not None and cache_loc is not None
+        assert k_scale is not None and v_scale is not None
+        assert kv_cache[0].dtype == kv_cache[1].dtype == torch.float8_e4m3fn
+        kwargs = dict(
+            v_ptr=v,
+            v_cache_ptr=kv_cache[1],
+            cache_loc_ptr=cache_loc,
+            k_scale_ptr=k_scale,
+            v_scale_ptr=v_scale,
+            stride_v_t=v.stride(0),
+            stride_v_cache_t=kv_cache[1].stride(0),
+            FP8_CACHE=True,
+        )
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,
         k,
@@ -230,6 +293,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_GATE=has_gate,
         MROPE=mrope,
         ENABLE_PDL=_ENABLE_PDL,
+        **kwargs,
     )
 
-    return q_out, k_out, gate_out if has_gate else None
+    return q_out, None if fp8_cache else k_out, gate_out if has_gate else None

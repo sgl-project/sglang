@@ -1315,6 +1315,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             rope_scaling = None
 
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self._attn_gate_quant_requested = (
+            _is_cuda and envs.SGLANG_Q35MF_ATTN_GATE_QUANT.get()
+        )
+        self._attn_front_requested = _is_cuda and envs.SGLANG_Q35MF_ATTN_FRONT.get()
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
@@ -1462,7 +1466,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def forward_prepare_cuda_fused(self, positions, hidden_states):
+    def forward_prepare_cuda_fused(self, positions, hidden_states, forward_batch=None):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
@@ -1471,6 +1475,35 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             q_gate, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        cache_kwargs = {}
+        if self._attn_front_requested and forward_batch is not None:
+            from sglang.srt.layers.cp.utils import is_cp_active
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "full_attn_backend", backend)
+            if (
+                type(backend).__name__ == "TRTLLMHAAttnBackend"
+                and backend.data_type == torch.float8_e4m3fn
+                and not backend.is_xqa_impl
+                and not backend.use_sliding_window_kv_pool
+                and not is_cp_active(forward_batch)
+            ):
+                cache_kwargs = dict(
+                    v=v,
+                    kv_cache=backend.token_to_kv_pool.get_kv_buffer(self.attn.layer_id),
+                    cache_loc=backend._get_layer_cache_loc(self.attn, forward_batch),
+                    k_scale=self.attn.k_scale
+                    if self.attn.k_scale is not None
+                    else backend._default_kv_scale,
+                    v_scale=self.attn.v_scale
+                    if self.attn.v_scale is not None
+                    else backend._default_kv_scale,
+                )
+            else:
+                logger.warning_once(
+                    "Fused FP8 attention preparation is unsupported; using standard preparation."
+                )
         q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_rope_gate(
             q_gate,
             k,
@@ -1485,12 +1518,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
+            **cache_kwargs,
         )
         seq_len = hidden_states.shape[0]
         q = q_out.view(seq_len, -1)
-        k = k_out.view(seq_len, -1)
+        k = k_out.view(seq_len, -1) if k_out is not None else None
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None
-        return q, k, v, gate
+        return q, k, v if k is not None else None, gate
 
     def forward_prepare_native(self, positions, hidden_states):
         if _use_aiter and isinstance(hidden_states, tuple):
@@ -1576,6 +1610,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             return self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         if (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
             return self.forward_prepare_fused_gate(
@@ -1613,7 +1648,23 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
+            use_static_gate = (
+                self._attn_gate_quant_requested
+                and type(self.o_proj.quant_method).__name__ == "ModelOptFp8LinearMethod"
+                and not self.o_proj.quant_method.use_marlin
+                and self.o_proj.input_scale is not None
+                and self.o_proj.input_scale.numel() == 1
+                and attn_output.dtype == torch.bfloat16
+            )
+            if self._attn_gate_quant_requested and not use_static_gate:
+                logger.warning_once(
+                    "Fused static FP8 output gating is unsupported; using standard gating."
+                )
+            if use_static_gate:
+                attn_output = fused_sigmoid_mul(
+                    attn_output, gate, static_scale=self.o_proj.input_scale
+                )
+            elif _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
             elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)

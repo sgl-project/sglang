@@ -990,6 +990,8 @@ class Envs:
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
+    SGLANG_Q35MF_ATTN_GATE_QUANT = EnvBool(False)
+    SGLANG_Q35MF_ATTN_FRONT = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
