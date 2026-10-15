@@ -535,3 +535,53 @@ async fn kimi_chat_lowers_to_generate() {
         "sgl_router_input_ids_forwarding_total{{model_id=\"{MODEL}\",outcome=\"forwarded\"}} 1"
     )));
 }
+
+/// With the cookbook's `qwen3` and `qwen3_coder` parsers, a Qwen3.8 chat is
+/// lowered to `/generate` on the router's ids. Its template reasons unless
+/// `enable_thinking` is false, as SGLang resolves the template's toggle.
+#[tokio::test]
+async fn qwen38_chat_lowers_to_generate() {
+    let mock = MockWorker::start(vec![]).await;
+    // The markers that pick the Qwen3.8 formatter, around a minimal render.
+    let template = "{%- for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+        {%- endfor %}<|im_start|>assistant\n\
+        {%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n\
+        {%- else %}<think>\n{%- endif %}\
+        {#- <function= <parameter= preserve_thinking Reasoning effort is set to #}";
+    let (_dir, cfg) = template_config(json!({"chat_template": template}));
+    let settings = OpenAiSettings {
+        reasoning_parser: Some("qwen3".into()),
+        tool_call_parser: Some("qwen3_coder".into()),
+        context_length: Some(1 << 18),
+        ..Default::default()
+    };
+    let profile = EngineProfile {
+        openai: Some(Arc::new(settings)),
+        ..WireProtocol::default().into()
+    };
+    let ctx = build_ctx_with_profile(mock.url.clone(), cfg, profile);
+    let tool = json!({"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}});
+    for (kwargs, thinking) in [
+        (json!(null), true),
+        (json!({"enable_thinking": false}), false),
+    ] {
+        let request = json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool],
+            "chat_template_kwargs": kwargs,
+            "max_tokens": 8,
+        });
+        let ids = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+        send(ctx.clone(), request).await;
+        let body = captured(&mock);
+        assert!(
+            body.get("messages").is_none(),
+            "lowered to /generate: {body}"
+        );
+        assert_eq!(body["input_ids"], json!(ids));
+        assert_eq!(body["require_reasoning"], thinking);
+        assert_eq!(body["sampling_params"]["skip_special_tokens"], false);
+        assert_eq!(body["sampling_params"]["stop"], Value::Null);
+    }
+}

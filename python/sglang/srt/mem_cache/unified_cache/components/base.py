@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
     from sglang.srt.mem_cache.unified_radix_cache import (
         NodeId,
@@ -779,16 +780,18 @@ class TreeComponent(ABC):
     def create_buffer_pipeline(
         self,
         *,
-        swa_window_pages: int,
+        swa_component: Optional[SWAComponent],
         write_backlog_cap: int,
         max_context_len: int = 0,
+        auxiliary_swa_component: Optional[SWAComponent] = None,
     ) -> BufferModePipeline:
         """Called on the FULL component to construct the buffer-mode pipeline."""
         from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 
         return BufferModePipeline(
             cache=self.cache,
-            swa_window_pages=swa_window_pages,
+            swa_component=swa_component,
+            auxiliary_swa_component=auxiliary_swa_component,
             write_backlog_cap=write_backlog_cap,
             max_context_len=max_context_len,
         )

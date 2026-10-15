@@ -1395,6 +1395,7 @@
                   {
                     "group": "StepFun",
                     "pages": [
+                      "cookbook/autoregressive/StepFun/Step-5-Preview",
                       "cookbook/autoregressive/StepFun/Step-3.7-Flash",
                       "cookbook/autoregressive/StepFun/Step3.5",
                       "cookbook/autoregressive/StepFun/Step3-VL-10B"
@@ -1403,6 +1404,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-3.1-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash-VL",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-tiny",
