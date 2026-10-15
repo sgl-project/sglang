@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.request_lists import RequestList
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
     CacheAwarePolicy,
@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_registry
 from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -48,12 +49,11 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
     def make_inquirer(self, waiting_queue_prefix_matched):
         waiting_req = SimpleNamespace(seqlen=100, num_matched_prefix_tokens=20)
         chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
-        lists = {
-            "waiting": RequestList(name="waiting", reqs=[waiting_req]),
-            "chunked": RequestList(name="chunked", reqs=[chunked_req]),
-        }
+        core_lists = CoreLists()
+        core_lists.waiting_queue = [waiting_req]
+        core_lists.chunked_req = chunked_req
         return SimpleNamespace(
-            request_registry=SimpleNamespace(request_lists=lambda: lists),
+            request_registry=make_request_registry(core_lists=core_lists),
             policy=SimpleNamespace(
                 waiting_queue_prefix_matched=lambda reqs: waiting_queue_prefix_matched
             ),

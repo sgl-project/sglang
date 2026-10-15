@@ -27,7 +27,6 @@ import prometheus_client
 
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     MetricsSink,
     SchedulerMetricsReporter,
@@ -48,6 +47,8 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_context, reset_context
+from sglang.test.disagg_owner_shells import decode_owner_shell
+from sglang.test.scheduler_request_lists import make_request_registry
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 
@@ -235,13 +236,6 @@ class TestHiCacheMetrics(unittest.TestCase):
         )
 
 
-def _empty_decode_lists():
-    return {
-        name: RequestList(name=name, reqs=[])
-        for name in ("prealloc", "retracted", "transfer")
-    }
-
-
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
@@ -294,13 +288,10 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
         reporter.mode_owners = ModeOwners(
-            disagg_decode=SimpleNamespace(
-                transfer_queue=queue, prealloc_queue=SimpleNamespace(queue=[])
-            )
+            disagg_decode=decode_owner_shell(transfer_queue=queue)
         )
-        reporter.core_lists = SimpleNamespace(decoding=[], waiting_queue=[])
-        reporter.request_registry = SimpleNamespace(
-            request_lists=_empty_decode_lists, queued_reqs=lambda: []
+        reporter.request_registry = make_request_registry(
+            mode_owners=reporter.mode_owners
         )
         reporter.grammar_manager = []
         reporter.pool_stats_observer = SimpleNamespace(
@@ -374,16 +365,18 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
         reporter.mode_owners = ModeOwners(
-            disagg_decode=SimpleNamespace(
+            disagg_decode=decode_owner_shell(
                 transfer_queue=queue,
                 prealloc_queue=SimpleNamespace(
-                    queue=[], retracted_queue=[], num_tokens_pre_allocated=0
+                    queue=[],
+                    retracted_queue=[],
+                    held_rebootstrap_reqs=[],
+                    num_tokens_pre_allocated=0,
                 ),
             )
         )
-        reporter.core_lists = SimpleNamespace(decoding=batch.reqs, waiting_queue=[])
-        reporter.request_registry = SimpleNamespace(
-            request_lists=_empty_decode_lists, queued_reqs=lambda: []
+        reporter.request_registry = make_request_registry(
+            mode_owners=reporter.mode_owners
         )
         reporter.grammar_manager = []
         reporter.capacity = SimpleNamespace(max_total_num_tokens=1)

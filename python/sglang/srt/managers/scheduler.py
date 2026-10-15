@@ -2837,7 +2837,7 @@ class Scheduler:
                 message=(
                     "Reject attach: scheduler is not idle. "
                     f"#queue-req={len(self.request_registry.queued_reqs())} "
-                    f"#running-req={len(self.lists.decoding)}"
+                    f"#running-req={len(self.request_registry.running_reqs())}"
                 ),
             )
 
@@ -2892,7 +2892,7 @@ class Scheduler:
                 message=(
                     "Reject detach: scheduler is not idle. "
                     f"#queue-req={len(self.request_registry.queued_reqs())} "
-                    f"#running-req={len(self.lists.decoding)}"
+                    f"#running-req={len(self.request_registry.running_reqs())}"
                 ),
             )
 

@@ -115,6 +115,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
@@ -178,6 +179,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.observability.metrics_collector import (
         SchedulerMetricsCollector,
+        SchedulerStats,
     )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -3432,6 +3434,57 @@ class DisaggDecode:
                 releasing=True,
                 holds_kv=True,
             ),
+        ]
+
+    def report_queue_stats(self, stats: SchedulerStats, priority_enabled: bool) -> None:
+        """The PD decode queue gauges."""
+        transfer_queue = self.transfer_queue
+        stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+            [r.req for r in self.prealloc_queue.queue], priority_enabled
+        )
+        stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+            [r.req for r in transfer_queue.queue], priority_enabled
+        )
+        stats.num_decode_deferred_kv_release_reqs = (
+            transfer_queue.num_pending_deferred_releases()
+        )
+        host_reqs = (
+            [req for req in transfer_queue.queue if req.host_staged]
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1
+            else []
+        )
+        stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
+            host_reqs, priority_enabled
+        )
+
+    def queue_log_msg(self, stats: SchedulerStats, max_total_num_tokens: int) -> str:
+        """The PD decode part of the decode log line."""
+        prealloc_queue = self.prealloc_queue
+        msg = f"pre-allocated usage: {prealloc_queue.num_tokens_pre_allocated / max_total_num_tokens:.2f}, "
+        msg += f"#prealloc-req: {len(prealloc_queue.queue)}, "
+        msg += f"#transfer-req: {len(self.transfer_queue.queue)}, "
+        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            msg += (
+                f"#host-receive-req: {stats.num_decode_host_receive_queue_reqs.total}, "
+            )
+        msg += f"#retracted-req: {len(prealloc_queue.retracted_queue)}, "
+        return msg
+
+    def load_queue_metrics(self) -> Dict[str, int]:
+        """The PD decode queue lengths of the load."""
+        return dict(
+            decode_prealloc_queue_reqs=len(self.prealloc_queue.queue),
+            decode_transfer_queue_reqs=len(self.transfer_queue.queue),
+            decode_retracted_queue_reqs=len(self.prealloc_queue.retracted_queue),
+        )
+
+    def prealloc_ready_reqs(self) -> List[Req]:
+        """The preallocation requests whose peer waits for their KV
+        destinations."""
+        return [
+            decode_req.req
+            for decode_req in self.prealloc_queue.queue
+            if decode_req.waiting_for_input
         ]
 
     def _abort_prealloc_reqs(self, recv_req: AbortReq) -> None:

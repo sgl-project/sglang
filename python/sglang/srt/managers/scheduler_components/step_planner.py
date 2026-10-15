@@ -786,7 +786,7 @@ class StepPlanner:
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.request_registry.queued_reqs())}, "
-                f"#running-req: {len(self.core_lists.decoding)}"
+                f"#running-req: {len(self.request_registry.running_reqs())}"
             )
             success = False
         return success
