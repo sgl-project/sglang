@@ -3,9 +3,7 @@
 // in Playground. NVIDIA uses FA4, MI355X uses Triton for DFlash draft attention.
 // Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node with
 // Marlin W4A16 experts and BF16 at TP16 across two nodes; it has no
-// SP/MegaMoE (SM100-only kernels). Every DFlash recipe sets
-// SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1: the draft config declares
-// 32768 positions and would otherwise cap the target's 1M context.
+// SP/MegaMoE (SM100-only kernels).
 export const config = {
   modelName: "Muse Spark Open",
   supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon"],
@@ -296,7 +294,7 @@ export const config = {
     {
       match: { hw: "b300", quant: "nvfp4" },
       nnodes: 1,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
@@ -322,7 +320,7 @@ export const config = {
     {
       match: { hw: "b300", quant: "bf16" },
       nnodes: 1,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
@@ -347,7 +345,7 @@ export const config = {
     {
       match: { hw: "gb300", quant: "nvfp4" },
       nnodes: 1,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
@@ -373,7 +371,7 @@ export const config = {
     {
       match: { hw: "gb300", quant: "bf16" },
       nnodes: 2,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
@@ -398,7 +396,7 @@ export const config = {
     {
       match: { hw: "b200", quant: "nvfp4" },
       nnodes: 1,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 4",
@@ -424,7 +422,7 @@ export const config = {
     {
       match: { hw: "b200", quant: "bf16" },
       nnodes: 1,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
@@ -452,7 +450,7 @@ export const config = {
     {
       match: { hw: "h200", quant: "nvfp4" },
       nnodes: 1,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
@@ -476,7 +474,7 @@ export const config = {
     {
       match: { hw: "h200", quant: "bf16" },
       nnodes: 2,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
@@ -503,7 +501,6 @@ export const config = {
         "SGLANG_USE_AITER=1",
         "SGLANG_USE_AITER_UNIFIED_ATTN=1",
         "MUSE_MOE_BACKEND=flydsl",
-        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -529,7 +526,6 @@ export const config = {
         "SGLANG_USE_AITER=1",
         "SGLANG_USE_AITER_UNIFIED_ATTN=1",
         "MUSE_MOE_BACKEND=flydsl",
-        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -556,7 +552,6 @@ export const config = {
         "SGLANG_USE_AITER=1",
         "SGLANG_USE_AITER_UNIFIED_ATTN=1",
         "MUSE_MOE_BACKEND=flydsl",
-        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
       ],
       flags: [
         "--model-path {{MODEL_NAME}}",
