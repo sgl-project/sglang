@@ -4219,9 +4219,6 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     cp_all_tokens=cp_extend,
                 )
-                # Capture the token mask even when the dummy batch has no media:
-                # later graph replays can contain image tokens. Text rows retain
-                # the Engram result without depending on Python batch metadata.
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0

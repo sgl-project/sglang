@@ -2104,10 +2104,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         full_path = self._is_full_backend
 
         def replay_layer_forward(*args, **layer_kwargs):
-            # The eager wrapper may remap multimodal hash placeholders to model
-            # token IDs. The captured body must see those IDs as well as the
-            # composed embeddings (e.g. for visual MoE routing and Engram masks).
-            # Update only the private static buffer, leaving scheduler IDs intact.
             prepared_ids = layer_kwargs.get("input_ids")
             if prepared_ids is None and args:
                 prepared_ids = args[0]
