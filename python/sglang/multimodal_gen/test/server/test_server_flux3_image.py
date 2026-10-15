@@ -62,6 +62,7 @@ def test_grouped_requests_multi_output_and_repeat(diffusion_server):
             num_inference_steps=8,
             n=n,
             quality="exact",
+            output_format="png",
             response_format="b64_json",
         )
         if barrier is not None:
@@ -94,10 +95,12 @@ def test_grouped_requests_multi_output_and_repeat(diffusion_server):
             )
         for expected, actual in zip(serial, grouped):
             assert actual.shape == expected.shape == (512, 512, 3)
-            assert (
-                structural_similarity(expected, actual, channel_axis=2, data_range=255)
-                > 0.98
+            # Compare lossless PNGs, not JPEG's amplified rounding differences.
+            score = structural_similarity(
+                expected, actual, channel_axis=2, data_range=255
             )
+            assert score > 0.98, score
+            assert np.abs(expected.astype(float) - actual).mean() < 3.0
         multi = generate(editing=editing, n=2)
         assert not np.array_equal(multi[0], multi[1])
         np.testing.assert_array_equal(generate(editing=editing)[0], serial[0])

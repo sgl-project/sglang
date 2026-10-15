@@ -285,19 +285,6 @@ _SUPPORTED_ATTENTION_BACKENDS = frozenset(
     }
 )
 
-# --------------------------------------------------------------------------- #
-# The native blocks replace the reference's eager elementwise chains with the
-# framework's fused kernels (~15-18% faster DiT forward on the production DiT;
-# bf16-rounding-level divergence from the eager chain):
-#   * pre_norm + AdaLN modulation  -> LayerNormScaleShift (CuTe DSL,
-#     norm(x)*(1+scale)+shift in one kernel; hidden 3072 satisfies D%256==0)
-#   * QKV + QK RMSNorm + RoPE      -> flux3_qkv_qknorm_rope (PrimsTS epilogue
-#     or fused_inplace_qknorm_rope on the shared [cos|sin] table)
-#   * gated MLP                    -> flux3_gated_mlp (PrimsTS SwiGLU epilogue
-#     or sgl_kernel.silu_and_mul)
-#   * gated residual x + g*(a+b)   -> residual_gate_add2 (single kernel;
-#     bit-identical to addcmul over the branch sum, one pass instead of two)
-
 
 class Flux3ImageAttention(nn.Module):
     """Attention over this rank's heads through :class:`USPAttention`.

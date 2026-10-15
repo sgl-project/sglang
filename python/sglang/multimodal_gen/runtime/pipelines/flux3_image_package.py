@@ -199,7 +199,7 @@ def resolve_flux3_image_package(
 
     config = load_flux3_image_package_config(directory / CONFIG_NAME)
     if config.model not in MODEL_NAMES:
-        logger.warning(
+        logger.debug(
             "FLUX.3 package model %r is not one of %s; loading it as FLUX.3 image "
             "since its config has the image DiT layout",
             config.model,

@@ -222,9 +222,57 @@ QPS, and keep batch 1 for low-latency or low-VRAM workloads. Batching does not i
 bitwise equality with separate forwards: GEMM and attention reduction choices can
 change with shape. Check output fidelity with fixed prompts and seeds.
 
+### Measured batching tradeoffs
+
+The following are warmed HTTP measurements on one GB300 (about 277 GiB device
+memory), Base BF16, Torch SDPA, eager execution and all components resident.
+Each row compares two different prompt/seed requests served serially with the
+same two requests served together. Times include local HTTP transfer and JPEG
+output; medians cover three rounds after warming both shapes and reference
+encoding. Software: PyTorch 2.14.1+cu130, Transformers 5.19.0. Checkpoint revision:
+`5de4fe32f17aee3dbc34375a94935f09206dba2c`.
+
+| Workload | Serial pair | Batch-2 pair | Throughput ratio |
+| --- | --- | --- | --- |
+| T2I, 512x512, 8 steps | 0.649 s | 0.324 s | 2.00x |
+| I2I, 512x512, 8 steps | 0.737 s | 0.546 s | 1.35x |
+| T2I, 1024x1024, 50 steps | 6.248 s | 6.050 s | 1.03x |
+| I2I, 1024x1024, 50 steps | 13.171 s | 12.996 s | 1.01x |
+
+Eight steps exercise batching, not the recommended Base image-quality setting.
+The standard 50-step workload shows little batching benefit;
+FlashAttention gives a similarly small gain in this
+setup. Batch 1 remains the default. Do not extrapolate the small-request speedup
+to full-resolution generation or other GPUs.
+
+For these 50-step requests, batch-1 versus batch-2 JPEG outputs had SSIM
+0.9920-0.9977. A separate four-image PNG comparison at 512x512/8 steps had SSIM
+0.9885-0.9955; JPEG can amplify small rounding differences. These are observed
+samples, not a universal quality guarantee. Identical single requests before
+and after batching matched exactly. Preserve additional memory headroom for
+batching rather than assuming a batch-1 recipe fits on a 32 GB card at batch 2.
+
 ## 8. Validation boundaries
 
 The native DiT's packed CFG forward has focused comparison tests against the
 shared FLUX 3 transformer. Such component tests do not replace full-checkpoint
 E2E or establish parity with every upstream release. Keep unverified hardware,
 topologies and optional optimizations separate from measured deployment recipes.
+
+The opt-in full-checkpoint HTTP regression covers concurrent prompts, image
+editing, multiple outputs and a repeated single request:
+
+```bash
+SGLANG_TEST_FLUX3_IMAGE=1 pytest -q \
+  python/sglang/multimodal_gen/test/server/test_server_flux3_image.py
+```
+
+Set `SGLANG_TEST_FLUX3_IMAGE_MODEL` to a local package path when using an
+offline checkpoint. This test needs checkpoint access; it does not substitute
+for an official-reference golden-image comparison.
+
+## 9. ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="image" note="FLUX.3 has no integrated KSampler executor. Use server mode; the plugin-specific FLUX.3 workflow has not been validated." />

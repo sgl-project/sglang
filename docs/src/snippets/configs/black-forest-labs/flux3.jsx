@@ -178,7 +178,14 @@ return {
         nodes: { min: 1, max: 1 },
         gpus_per_node: { min: 1, max: 8 },
       },
-      verifiedRecipes: [],
+      verifiedRecipes: [{
+        id: "gb300-base-bf16", hw: "gb300", nodes: 1,
+        gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1,
+        model: "base", precision: "bf16", placement: "resident",
+        attention: "sdpa", execution: "eager", quality: "exact",
+        batch_size: 1, batch_delay: 5, outputs: 1,
+        default: true,
+      }],
       autoTopology: (s) => ({
         tp_size: Number(s.gpus_per_node) || 1,
         ulysses_degree: 1,
@@ -225,11 +232,19 @@ return {
       if (Number(s.batch_size) > 1) {
         parallel.push(`--batching-max-size ${Number(s.batch_size)}`, `--batching-delay-ms ${Number(s.batch_delay) || 0}`);
       }
+      const verified = s.hw === "gb300" && gpus === 1 && s.model === "base"
+        && s.precision === "bf16" && s.placement === "resident"
+        && ["sdpa", "fa"].includes(s.attention) && s.execution === "eager"
+        && s.quality === "exact" && Number(s.batch_size) <= 2 && Number(s.outputs) <= 2;
+      const warnings = verified ? [] : ["This exact hardware, checkpoint and topology combination is not yet end-to-end verified."];
+      if (s.hw === "rtx5090" && s.placement === "resident" && Number(s.batch_size) > 1) {
+        warnings.push("Full-resolution batching needs additional activation memory. Use offload or batch 1 if the resident batch does not fit.");
+      }
       return {
         match: { hw: s.hw },
         nnodes: 1,
-        verified: false,
-        verificationStatus: errors.length ? "error" : "unverified",
+        verified: verified && !errors.length,
+        verificationStatus: errors.length ? "error" : verified ? "verified" : "unverified",
         env: [],
         flags: [
           "--model-path {{MODEL_NAME}}",
@@ -241,10 +256,10 @@ return {
           topology,
           topologySummary: `${Number(s.gpus_per_node) || 1}× ${hardwareLabels[s.hw] || s.hw}`,
           errors,
-          warnings: ["This exact hardware, checkpoint and topology combination is not yet end-to-end verified."],
+          warnings,
           verification: {
-            serve: errors.length ? "error" : "unverified",
-            request: errors.length ? "error" : "unverified",
+            serve: errors.length ? "error" : verified ? "verified" : "unverified",
+            request: errors.length ? "error" : verified ? "verified" : "unverified",
           },
           resolvedSettings: {
             placement: s.placement === "resident" ? "GPU resident" : s.placement === "offload" ? "Layerwise offload" : "Auto",
