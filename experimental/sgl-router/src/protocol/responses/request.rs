@@ -73,7 +73,7 @@ const CONSUMED: &[&str] = &[
 ];
 
 pub fn to_chat(req: Value) -> Result<Converted, String> {
-    let Value::Object(req) = req else {
+    let Value::Object(mut req) = req else {
         return Err("request body must be a JSON object".into());
     };
 
@@ -99,7 +99,8 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
         Some(Value::String(s)) => messages.push(json!({"role": "system", "content": s})),
         Some(_) => return Err("`instructions` must be a string".into()),
     }
-    match req.get("input") {
+    // Owned, so large image parts are moved rather than copied.
+    match req.remove("input") {
         None | Some(Value::Null) => return Err("`input` is required".into()),
         Some(Value::String(s)) => messages.push(json!({"role": "user", "content": s})),
         Some(Value::Array(items)) => {
@@ -138,11 +139,16 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
         Some(tools) => convert_tools(tools)?,
         None => Default::default(),
     };
+    let mut tools = tools;
+    if let Some(tc) = req.get("tool_choice").filter(|v| !v.is_null()) {
+        let (choice, allowed) = convert_tool_choice(tc)?;
+        if let Some(allowed) = allowed {
+            restrict_tools(&mut tools, &allowed)?;
+        }
+        chat.insert("tool_choice".into(), choice);
+    }
     if !tools.is_empty() {
         chat.insert("tools".into(), Value::Array(tools));
-    }
-    if let Some(tc) = req.get("tool_choice").filter(|v| !v.is_null()) {
-        chat.insert("tool_choice".into(), convert_tool_choice(tc)?);
     }
     if let Some(text) = req.get("text").filter(|v| !v.is_null()) {
         if let Some(rf) = convert_text_format(text)? {
@@ -233,42 +239,54 @@ impl PendingAssistant {
     }
 }
 
-fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), String> {
+fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), String> {
     let mut pending = PendingAssistant::default();
-    for (i, item) in items.iter().enumerate() {
-        let Value::Object(obj) = item else {
+    for (i, item) in items.into_iter().enumerate() {
+        let Value::Object(mut obj) = item else {
             return Err(format!("input[{i}] must be an object"));
         };
         let typ = match obj.get("type").and_then(Value::as_str) {
-            Some(t) => t,
-            None if obj.contains_key("role") => "message",
+            Some(t) => t.to_owned(),
+            None if obj.contains_key("role") => "message".to_owned(),
             None => return Err(format!("input[{i}] is missing `type`")),
         };
+        let typ = typ.as_str();
         match typ {
             "message" => {
                 let role = obj
                     .get("role")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| format!("input[{i}] is missing `role`"))?;
+                    .ok_or_else(|| format!("input[{i}] is missing `role`"))?
+                    .to_owned();
                 let content = obj
-                    .get("content")
+                    .remove("content")
                     .filter(|v| !v.is_null())
                     .ok_or_else(|| format!("input[{i}] is missing `content`"))?;
-                match role {
+                match role.as_str() {
                     "assistant" => {
                         if !pending.tool_calls.is_empty() {
                             pending.flush(messages);
                         }
-                        let text = content_text(content, i)?;
+                        let text = content_text(&content, i)?;
                         match &mut pending.content {
-                            Some(c) => c.push_str(&text),
+                            Some(c) => {
+                                c.push('\n');
+                                c.push_str(&text);
+                            }
                             None => pending.content = Some(text),
                         }
                     }
                     "user" | "system" | "developer" => {
                         pending.flush(messages);
-                        // Chat templates know `system`; some drop `developer` messages.
-                        let role = if role == "developer" { "system" } else { role };
+                        // Templates know `system` (some drop `developer`) but
+                        // several reject it after the first turn, where a
+                        // developer item is sent as `user` instead.
+                        let leading = messages.iter().all(|m| m["role"] == "system");
+                        let role = match role.as_str() {
+                            "developer" if leading => "system",
+                            "developer" => "user",
+                            r => r,
+                        };
                         messages.push(json!({
                             "role": role,
                             "content": convert_content(content, i)?,
@@ -325,10 +343,13 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
                 if pending.content.is_some() || !pending.tool_calls.is_empty() {
                     pending.flush(messages);
                 }
-                let text = reasoning_text(obj);
+                let text = reasoning_text(&obj);
                 if !text.is_empty() {
                     match &mut pending.reasoning {
-                        Some(r) => r.push_str(&text),
+                        Some(r) => {
+                            r.push('\n');
+                            r.push_str(&text);
+                        }
                         None => pending.reasoning = Some(text),
                     }
                 }
@@ -349,19 +370,35 @@ fn convert_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Strin
 /// Join leading text-only system messages into one: templates treat only the
 /// first message as the system prompt.
 fn merge_leading_system(messages: &mut Vec<Value>) {
-    let n = messages
+    let texts: Vec<String> = messages
         .iter()
-        .take_while(|m| m["role"] == "system" && m["content"].is_string())
-        .count();
-    if n < 2 {
+        .map_while(|m| {
+            (m["role"] == "system")
+                .then(|| plain_text(&m["content"]))
+                .flatten()
+        })
+        .collect();
+    if texts.len() < 2 {
         return;
     }
-    let text = messages[..n]
-        .iter()
-        .filter_map(|m| m["content"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    messages.splice(..n, [json!({"role": "system", "content": text})]);
+    let n = texts.len();
+    messages.splice(
+        ..n,
+        [json!({"role": "system", "content": texts.join("\n\n")})],
+    );
+}
+
+/// Content as one string when it is text only.
+fn plain_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|p| (p["type"] == "text").then(|| p["text"].as_str()).flatten())
+            .collect::<Option<Vec<_>>>()
+            .map(|t| t.join("\n")),
+        _ => None,
+    }
 }
 
 /// `content[].text`, else `summary[].text`.
@@ -417,9 +454,9 @@ fn content_text(content: &Value, i: usize) -> Result<String, String> {
 }
 
 /// User / system / developer content → chat content.
-fn convert_content(content: &Value, i: usize) -> Result<Value, String> {
+fn convert_content(content: Value, i: usize) -> Result<Value, String> {
     let parts = match content {
-        Value::String(_) => return Ok(content.clone()),
+        Value::String(_) => return Ok(content),
         Value::Array(parts) => parts,
         _ => {
             return Err(format!(
@@ -429,6 +466,9 @@ fn convert_content(content: &Value, i: usize) -> Result<Value, String> {
     };
     let mut out = Vec::with_capacity(parts.len());
     for part in parts {
+        let Value::Object(mut part) = part else {
+            return Err(format!("input[{i}]: content parts must be objects"));
+        };
         let typ = part.get("type").and_then(Value::as_str).unwrap_or("");
         let converted = match typ {
             "input_text" | "output_text" | "text" => json!({
@@ -441,16 +481,16 @@ fn convert_content(content: &Value, i: usize) -> Result<Value, String> {
                         "input[{i}]: `input_image.file_id` is not supported; pass `image_url`"
                     ));
                 }
-                let url = url_field(part.get("image_url"))
+                let url = url_field(part.remove("image_url"))
                     .ok_or_else(|| format!("input[{i}]: `input_image` is missing `image_url`"))?;
                 let mut image_url = Map::new();
                 image_url.insert("url".into(), Value::String(url));
-                if let Some(d) = part.get("detail").filter(|v| !v.is_null()) {
-                    image_url.insert("detail".into(), d.clone());
+                if let Some(d) = part.remove("detail").filter(|v| !v.is_null()) {
+                    image_url.insert("detail".into(), d);
                 }
                 json!({"type": "image_url", "image_url": image_url})
             }
-            "image_url" => part.clone(),
+            "image_url" => Value::Object(part),
             other => {
                 return Err(format!(
                     "input[{i}]: content part type `{other}` is not supported"
@@ -459,18 +499,21 @@ fn convert_content(content: &Value, i: usize) -> Result<Value, String> {
         };
         out.push(converted);
     }
-    if let [single] = out.as_slice() {
+    if let [single] = out.as_mut_slice() {
         if single["type"] == "text" {
-            return Ok(single["text"].clone());
+            return Ok(single["text"].take());
         }
     }
     Ok(Value::Array(out))
 }
 
-fn url_field(v: Option<&Value>) -> Option<String> {
+fn url_field(v: Option<Value>) -> Option<String> {
     match v? {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(o) => o.get("url").and_then(Value::as_str).map(str::to_owned),
+        Value::String(s) => Some(s),
+        Value::Object(mut o) => match o.remove("url")? {
+            Value::String(s) => Some(s),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -586,29 +629,48 @@ fn convert_tool(
     Ok(())
 }
 
-fn convert_tool_choice(tc: &Value) -> Result<Value, String> {
+/// The chat `tool_choice`, plus the tool names an `allowed_tools` choice
+/// restricts `tools` to.
+fn convert_tool_choice(tc: &Value) -> Result<(Value, Option<Vec<String>>), String> {
     match tc {
-        Value::String(s) if matches!(s.as_str(), "auto" | "none" | "required") => Ok(tc.clone()),
+        Value::String(s) if matches!(s.as_str(), "auto" | "none" | "required") => {
+            Ok((tc.clone(), None))
+        }
         Value::String(s) => Err(format!(
             "`tool_choice` `{s}` is not supported; use auto, none, required or a function"
         )),
         Value::Object(o) => match o.get("type").and_then(Value::as_str) {
             Some(t @ ("function" | "custom")) => {
                 if o.get("function").is_some_and(Value::is_object) {
-                    return Ok(tc.clone());
+                    return Ok((tc.clone(), None));
                 }
                 let name = o
                     .get("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| format!("`tool_choice` of type {t} is missing `name`"))?;
                 let name = flat_name(o.get("namespace").and_then(Value::as_str), name);
-                Ok(json!({"type": "function", "function": {"name": name}}))
+                Ok((
+                    json!({"type": "function", "function": {"name": name}}),
+                    None,
+                ))
             }
-            // Keep the mode, drop the allow-list.
-            Some("allowed_tools") => Ok(o
-                .get("mode")
-                .cloned()
-                .unwrap_or_else(|| Value::String("auto".into()))),
+            Some("allowed_tools") => {
+                let names = o
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| "`tool_choice.tools` must list at least one tool".to_string())?
+                    .iter()
+                    .map(|t| {
+                        let name = t.get("name").and_then(Value::as_str).ok_or_else(|| {
+                            "`tool_choice.tools` entries need a `name`".to_string()
+                        })?;
+                        Ok(flat_name(t.get("namespace").and_then(Value::as_str), name))
+                    })
+                    .collect::<Result<_, String>>()?;
+                let mode = o.get("mode").cloned().unwrap_or_else(|| "auto".into());
+                Ok((mode, Some(names)))
+            }
             other => Err(format!(
                 "`tool_choice` type `{}` is not supported",
                 other.unwrap_or("<missing>")
@@ -616,6 +678,25 @@ fn convert_tool_choice(tc: &Value) -> Result<Value, String> {
         },
         _ => Err("`tool_choice` must be a string or an object".into()),
     }
+}
+
+/// Keeps only the `allowed_tools` names; an unknown name is a client error.
+fn restrict_tools(tools: &mut Vec<Value>, allowed: &[String]) -> Result<(), String> {
+    let name = |t: &Value| {
+        t.pointer("/function/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    if let Some(missing) = allowed
+        .iter()
+        .find(|a| !tools.iter().any(|t| name(t).as_deref() == Some(a.as_str())))
+    {
+        return Err(format!(
+            "`tool_choice.tools` names `{missing}`, which is not in `tools`"
+        ));
+    }
+    tools.retain(|t| name(t).is_some_and(|n| allowed.contains(&n)));
+    Ok(())
 }
 
 /// `text.format` → `response_format`; unknown types go to the engine to reject.
@@ -772,17 +853,19 @@ mod tests {
     #[test]
     fn developer_becomes_system_and_leading_system_merges() {
         let c = chat(json!({"model": "m", "instructions": "A", "input": [
-            {"role": "developer", "content": "B"},
+            {"role": "developer", "content": [
+                {"type": "input_text", "text": "B1"}, {"type": "input_text", "text": "B2"}]},
             {"role": "system", "content": [{"type": "input_text", "text": "C"}]},
             {"role": "user", "content": "hi"},
             {"role": "developer", "content": "D"},
         ]}));
+        // A developer item after the first turn is sent as `user`.
         assert_eq!(
             c["messages"],
             json!([
-                {"role": "system", "content": "A\n\nB\n\nC"},
+                {"role": "system", "content": "A\n\nB1\nB2\n\nC"},
                 {"role": "user", "content": "hi"},
-                {"role": "system", "content": "D"},
+                {"role": "user", "content": "D"},
             ])
         );
     }
@@ -1000,5 +1083,46 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "c1", "content": "ok"})
         );
         assert_eq!(m[3]["tool_calls"][0]["function"]["name"], "mcp__fs__read");
+    }
+
+    #[test]
+    fn adjacent_assistant_and_reasoning_items_join_with_newlines() {
+        let c = chat(json!({"model": "m", "input": [
+            {"role": "user", "content": "q"},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "r1"}]},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "r2"}]},
+            {"role": "assistant", "content": "A."},
+            {"role": "assistant", "content": "B."},
+        ]}));
+        assert_eq!(c["messages"][1]["content"], "A.\nB.");
+        assert_eq!(c["messages"][1]["reasoning_content"], "r1\nr2");
+    }
+
+    #[test]
+    fn allowed_tools_restrict_the_tool_list() {
+        let tools = json!([
+            {"type": "function", "name": "a"},
+            {"type": "function", "name": "b"},
+            {"type": "namespace", "name": "mcp__fs__",
+             "tools": [{"type": "function", "name": "read"}]},
+        ]);
+        let choice = |names: Value| {
+            json!({"model": "m", "input": "x", "tools": tools.clone(),
+                   "tool_choice": {"type": "allowed_tools", "mode": "required", "tools": names}})
+        };
+        let c = chat(choice(json!([
+            {"type": "function", "name": "b"},
+            {"type": "function", "name": "read", "namespace": "mcp__fs__"},
+        ])));
+        let names: Vec<&str> = c["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["b", "mcp__fs__read"]);
+        assert_eq!(c["tool_choice"], "required");
+        let err = to_chat(choice(json!([{"type": "function", "name": "zzz"}]))).unwrap_err();
+        assert!(err.contains("zzz"), "{err}");
     }
 }

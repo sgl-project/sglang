@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chat SSE → Responses events: created, in_progress, one output item at a
-//! time (added … done), then completed | incomplete | failed.
+//! Chat SSE → Responses events: created, in_progress, output items (added …
+//! done), then completed | incomplete | failed.
 
 use serde_json::{json, Value};
 
@@ -12,6 +12,7 @@ use super::{
 };
 use crate::protocol::sse::{data_payload, write_event, Data, LineBuffer, SseTransducer};
 
+/// The open reasoning or message item; at most one at a time.
 enum Open {
     Reasoning {
         id: String,
@@ -23,13 +24,19 @@ enum Open {
         index: usize,
         text: String,
     },
-    Function {
-        id: String,
-        index: usize,
-        call_id: String,
-        name: String,
-        args: String,
-    },
+}
+
+/// An open function call. Calls can interleave, so several stay open until
+/// the response ends.
+struct Call {
+    id: String,
+    index: usize,
+    /// The chat chunk's `index`, which identifies a call only until a new
+    /// call reuses it.
+    tool_index: u64,
+    call_id: String,
+    name: String,
+    args: String,
 }
 
 /// Reasoning or message text held while a function call is open.
@@ -48,9 +55,12 @@ pub struct ResponsesStream {
     started: bool,
     terminal: bool,
     open: Option<Open>,
-    /// Emitted after the open call so it cannot split it.
+    calls: Vec<Call>,
+    /// Emitted after the calls so it cannot split one.
     held: Vec<(Held, String)>,
-    output: Vec<Value>,
+    next_index: usize,
+    /// Finished items with their `output_index`.
+    output: Vec<(usize, Value)>,
     finish_reason: Option<String>,
     usage: Option<Value>,
 }
@@ -66,7 +76,9 @@ impl ResponsesStream {
             started: false,
             terminal: false,
             open: None,
+            calls: Vec::new(),
             held: Vec::new(),
+            next_index: 0,
             output: Vec::new(),
             finish_reason: None,
             usage: None,
@@ -78,9 +90,10 @@ impl ResponsesStream {
             return;
         }
         let chunk = match data_payload(line) {
+            None => return,
+            Some(Data::Done) => return self.complete(out),
+            Some(Data::Invalid) => return self.emit_failed("Stream processing error", out),
             Some(Data::Json(chunk)) => chunk,
-            // [DONE] and non-JSON lines are left to `finish`, as before.
-            _ => return,
         };
         self.ensure_started(out);
         if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
@@ -133,9 +146,14 @@ impl ResponsesStream {
         self.emit("response.in_progress", json!({ "response": resp }), out);
     }
 
+    fn next_index(&mut self) -> usize {
+        self.next_index += 1;
+        self.next_index - 1
+    }
+
     /// `true` when `delta` was held because a function call is open.
     fn hold(&mut self, kind: Held, delta: &str) -> bool {
-        if !matches!(self.open, Some(Open::Function { .. })) {
+        if self.calls.is_empty() {
             return false;
         }
         match self.held.last_mut() {
@@ -145,7 +163,7 @@ impl ResponsesStream {
         true
     }
 
-    /// Emits held text after a call; whitespace alone is dropped.
+    /// Emits held text after the calls; whitespace alone is dropped.
     fn flush_held(&mut self, out: &mut Vec<u8>) {
         for (kind, text) in std::mem::take(&mut self.held) {
             match kind {
@@ -163,7 +181,7 @@ impl ResponsesStream {
         if !matches!(self.open, Some(Open::Reasoning { .. })) {
             self.close_open(Finish::Completed, out);
             let id = new_id("rs");
-            let index = self.output.len();
+            let index = self.next_index();
             let mut item = reasoning_item(&id, "", "in_progress");
             item["content"] = json!([]);
             self.emit(
@@ -199,7 +217,7 @@ impl ResponsesStream {
         if !matches!(self.open, Some(Open::Message { .. })) {
             self.close_open(Finish::Completed, out);
             let id = new_id("msg");
-            let index = self.output.len();
+            let index = self.next_index();
             let mut item = message_item(&id, "", "in_progress");
             item["content"] = json!([]);
             self.emit(
@@ -228,69 +246,69 @@ impl ResponsesStream {
         self.emit("response.output_text.delta", data, out);
     }
 
-    /// SGLang names a call only on its first chunk, so a name starts a new
-    /// item: the index alone can repeat across calls.
-    fn tool_delta(&mut self, call: &Value, out: &mut Vec<u8>) {
-        let named = call
+    /// SGLang names a call only on its first chunk, so a name always starts a
+    /// new call: repeated calls to one tool can share an `index` (Gemma 4) and
+    /// an index-derived `id` (Kimi). Other chunks go to the call with their
+    /// `id`, else to the latest call with their `index`, so interleaved calls
+    /// stay apart.
+    fn tool_delta(&mut self, chunk: &Value, out: &mut Vec<u8>) {
+        let tool_index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let name = chunk
             .pointer("/function/name")
             .and_then(Value::as_str)
-            .is_some_and(|n| !n.is_empty());
-        if named || !matches!(self.open, Some(Open::Function { .. })) {
-            self.close_open(Finish::Completed, out);
-            self.flush_held(out);
-            self.close_open(Finish::Completed, out);
-            let id = new_id("fc");
-            let index = self.output.len();
-            let call_id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| new_id("call"));
-            let name = call
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            self.emit(
-                "response.output_item.added",
-                json!({"output_index": index,
-                       "item": call_item(&id, &call_id, &name, "", "in_progress", &self.echo.tools)}),
-                out,
-            );
-            self.open = Some(Open::Function {
-                id,
-                index,
-                call_id,
-                name,
-                args: String::new(),
-            });
-        }
-        let Some(Open::Function {
-            id,
-            index,
-            name,
-            args,
-            ..
-        }) = &mut self.open
-        else {
-            unreachable!()
+            .filter(|n| !n.is_empty());
+        let chunk_id = chunk
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|i| !i.is_empty());
+        let existing = match name {
+            Some(_) => None,
+            None => chunk_id
+                .and_then(|cid| self.calls.iter().rposition(|c| c.call_id == cid))
+                .or_else(|| self.calls.iter().rposition(|c| c.tool_index == tool_index)),
         };
-        if name.is_empty() {
-            if let Some(n) = call.pointer("/function/name").and_then(Value::as_str) {
-                *name = n.to_owned();
+        let pos = match existing {
+            Some(pos) => pos,
+            None => {
+                self.close_open(Finish::Completed, out);
+                let call = Call {
+                    id: new_id("fc"),
+                    index: self.next_index(),
+                    tool_index,
+                    call_id: chunk_id.map_or_else(|| new_id("call"), str::to_owned),
+                    name: name.unwrap_or("").to_owned(),
+                    args: String::new(),
+                };
+                let item = call_item(
+                    &call.id,
+                    &call.call_id,
+                    &call.name,
+                    "",
+                    "in_progress",
+                    &self.echo.tools,
+                );
+                self.emit(
+                    "response.output_item.added",
+                    json!({"output_index": call.index, "item": item}),
+                    out,
+                );
+                self.calls.push(call);
+                self.calls.len() - 1
             }
-        }
-        if let Some(delta) = call
+        };
+        let Some(delta) = chunk
             .pointer("/function/arguments")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-        {
-            args.push_str(delta);
-            // A custom tool's input is JSON-wrapped; it is sent whole on close.
-            if !self.echo.tools.get(name.as_str()).is_some_and(|t| t.custom) {
-                let data = json!({"item_id": id, "output_index": *index, "delta": delta});
-                self.emit("response.function_call_arguments.delta", data, out);
-            }
+        else {
+            return;
+        };
+        let call = &mut self.calls[pos];
+        call.args.push_str(delta);
+        // A custom tool's input is JSON-wrapped; it is sent whole on close.
+        if !self.echo.tools.get(&call.name).is_some_and(|t| t.custom) {
+            let data = json!({"item_id": call.id, "output_index": call.index, "delta": delta});
+            self.emit("response.function_call_arguments.delta", data, out);
         }
     }
 
@@ -298,7 +316,7 @@ impl ResponsesStream {
         let Some(open) = self.open.take() else {
             return;
         };
-        let item = match open {
+        let (index, item) = match open {
             Open::Reasoning { id, index, text } => {
                 self.emit(
                     "response.reasoning_text.done",
@@ -312,7 +330,7 @@ impl ResponsesStream {
                            "part": {"type": "reasoning_text", "text": text}}),
                     out,
                 );
-                (index, reasoning_item(&id, &text, "completed"))
+                (index, reasoning_item(&id, &text, finish.item_status()))
             }
             Open::Message { id, index, text } => {
                 self.emit(
@@ -329,44 +347,83 @@ impl ResponsesStream {
                 );
                 (index, message_item(&id, &text, finish.item_status()))
             }
-            Open::Function {
-                id,
-                index,
-                call_id,
-                name,
-                args,
-                ..
-            } => {
-                let item = call_item(&id, &call_id, &name, &args, "completed", &self.echo.tools);
-                if item["type"] == "custom_tool_call" {
-                    self.emit(
-                        "response.custom_tool_call_input.done",
-                        json!({"item_id": id, "output_index": index,
-                               "input": custom_input(&args)}),
-                        out,
-                    );
-                } else {
-                    self.emit(
-                        "response.function_call_arguments.done",
-                        json!({"item_id": id, "output_index": index, "name": item["name"],
-                               "arguments": args}),
-                        out,
-                    );
-                }
-                (index, item)
-            }
         };
-        let (index, item) = item;
+        self.item_done(index, item, out);
+    }
+
+    /// Only the last call can have been cut off; earlier ones are complete.
+    fn close_calls(&mut self, finish: Finish, out: &mut Vec<u8>) {
+        let calls = std::mem::take(&mut self.calls);
+        let last = calls.len().saturating_sub(1);
+        for (i, c) in calls.into_iter().enumerate() {
+            let status = if i == last {
+                finish.item_status()
+            } else {
+                "completed"
+            };
+            let item = call_item(
+                &c.id,
+                &c.call_id,
+                &c.name,
+                &c.args,
+                status,
+                &self.echo.tools,
+            );
+            if item["type"] == "custom_tool_call" {
+                self.emit(
+                    "response.custom_tool_call_input.done",
+                    json!({"item_id": c.id, "output_index": c.index,
+                           "input": custom_input(&c.args)}),
+                    out,
+                );
+            } else {
+                self.emit(
+                    "response.function_call_arguments.done",
+                    json!({"item_id": c.id, "output_index": c.index, "name": item["name"],
+                           "arguments": c.args}),
+                    out,
+                );
+            }
+            self.item_done(c.index, item, out);
+        }
+    }
+
+    fn item_done(&mut self, index: usize, item: Value, out: &mut Vec<u8>) {
         self.emit(
             "response.output_item.done",
             json!({"output_index": index, "item": item}),
             out,
         );
-        self.output.push(item);
+        self.output.push((index, item));
     }
 
+    /// Ends the response at upstream EOF or `[DONE]`. No `finish_reason`
+    /// means generation did not finish: report failed.
+    fn complete(&mut self, out: &mut Vec<u8>) {
+        if self.terminal {
+            return;
+        }
+        let Some(reason) = self.finish_reason.clone() else {
+            return self.emit_failed("upstream stream ended before the response completed", out);
+        };
+        self.ensure_started(out);
+        let finish = Finish::from_chat(Some(&reason));
+        self.close_open(finish, out);
+        self.close_calls(finish, out);
+        self.flush_held(out);
+        self.close_open(finish, out);
+        let mut resp = self.response(finish.status());
+        finish.annotate(&mut resp);
+        self.emit(finish.event(), json!({ "response": resp }), out);
+        self.terminal = true;
+    }
+
+    /// Open items are closed as incomplete so `response.failed` keeps them.
     fn emit_failed(&mut self, message: &str, out: &mut Vec<u8>) {
         self.ensure_started(out);
+        self.held.clear();
+        self.close_open(Finish::Aborted, out);
+        self.close_calls(Finish::Aborted, out);
         let mut resp = self.response("failed");
         resp["error"] = failed_error(message);
         self.emit("response.failed", json!({ "response": resp }), out);
@@ -378,12 +435,14 @@ impl ResponsesStream {
             "in_progress" => Value::Null,
             _ => usage_from_chat(self.usage.as_ref()),
         };
+        let mut output = self.output.clone();
+        output.sort_by_key(|(index, _)| *index);
         response_object(
             &self.echo,
             &self.id,
             self.created_at,
             status,
-            self.output.clone(),
+            output.into_iter().map(|(_, item)| item).collect(),
             usage,
         )
     }
@@ -414,31 +473,11 @@ impl SseTransducer for ResponsesStream {
         out
     }
 
-    /// No `finish_reason` means generation did not finish: report failed.
     fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut lines = std::mem::take(&mut self.lines);
         lines.flush(|line| self.handle_line(line, &mut out));
-        if self.terminal {
-            return out;
-        }
-        if self.finish_reason.is_none() {
-            self.emit_failed(
-                "upstream stream ended before the response completed",
-                &mut out,
-            );
-            return out;
-        }
-        let finish = Finish::from_chat(self.finish_reason.as_deref());
-        if !self.held.is_empty() {
-            self.close_open(Finish::Completed, &mut out);
-            self.flush_held(&mut out);
-        }
-        self.close_open(finish, &mut out);
-        let mut resp = self.response(finish.status());
-        finish.annotate(&mut resp);
-        self.emit(finish.event(), json!({ "response": resp }), &mut out);
-        self.terminal = true;
+        self.complete(&mut out);
         out
     }
 
@@ -750,5 +789,72 @@ mod tests {
         let (event, data) = events(&raw).pop().unwrap();
         assert_eq!(event, "response.failed");
         assert_eq!(data["response"]["error"]["message"], "queue full");
+    }
+
+    fn indexed(index: u64, name: Option<&str>, args: &str) -> Value {
+        let mut c = call(name, args);
+        c["tool_calls"][0]["index"] = json!(index);
+        c
+    }
+
+    #[test]
+    fn interleaved_calls_stay_apart() {
+        let evs = run(&[
+            chunk(indexed(0, Some("a"), r#"{"x":"#), None),
+            chunk(indexed(1, Some("b"), r#"{"y":"#), None),
+            chunk(indexed(0, None, "1}"), None),
+            chunk(indexed(1, None, "2}"), Some("tool_calls")),
+        ]);
+        assert_framing(&evs);
+        let fc = |n: &str, a: &str| ("function_call".into(), n.into(), a.into());
+        assert_eq!(items(&evs), [fc("a", r#"{"x":1}"#), fc("b", r#"{"y":2}"#)]);
+    }
+
+    #[test]
+    fn a_cut_off_call_is_incomplete() {
+        let evs = run(&[
+            chunk(indexed(0, Some("a"), "{}"), None),
+            chunk(indexed(1, Some("b"), r#"{"y":"#), Some("length")),
+        ]);
+        assert_framing(&evs);
+        let done = &evs.last().unwrap().1["response"];
+        assert_eq!(done["status"], "incomplete");
+        assert_eq!(done["output"][0]["status"], "completed");
+        assert_eq!(done["output"][1]["status"], "incomplete");
+    }
+
+    #[test]
+    fn failure_keeps_the_partial_item() {
+        let mut s = ResponsesStream::new(echo());
+        let mut raw = s.feed(chunk(json!({"content": "partial answer"}), None).as_bytes());
+        raw.extend(s.feed(b"data: {\"error\": {\"message\": \"boom\"}}\n\n"));
+        let evs = events(&raw);
+        assert_framing(&evs);
+        let done = evs
+            .iter()
+            .find(|(e, _)| e == "response.output_item.done")
+            .unwrap();
+        assert_eq!(done.1["item"]["status"], "incomplete");
+        let failed = &evs.last().unwrap().1["response"];
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["output"][0]["content"][0]["text"], "partial answer");
+    }
+
+    #[test]
+    fn done_marker_and_invalid_json() {
+        let mut s = ResponsesStream::new(echo());
+        let mut raw = s.feed(chunk(json!({"content": "hi"}), Some("stop")).as_bytes());
+        raw.extend(s.feed(b"data: [DONE]\n\n"));
+        assert!(s.is_terminal());
+        assert_eq!(events(&raw).last().unwrap().0, "response.completed");
+
+        let mut s = ResponsesStream::new(echo());
+        let raw = s.feed(b"data: {not json\n\n");
+        let (event, data) = events(&raw).pop().unwrap();
+        assert_eq!(event, "response.failed");
+        assert_eq!(
+            data["response"]["error"]["message"],
+            "Stream processing error"
+        );
     }
 }

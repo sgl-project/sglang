@@ -29,7 +29,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             .filter(|s| !s.is_empty())
     };
     if let Some(r) = str_field("reasoning_content") {
-        output.push(reasoning_item(&new_id("rs"), r, "completed"));
+        output.push(reasoning_item(&new_id("rs"), r, item_status));
     }
     let tool_calls = message
         .and_then(|m| m.get("tool_calls"))
@@ -44,7 +44,14 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             item_status,
         ));
     }
-    for tc in tool_calls.into_iter().flatten() {
+    let calls = tool_calls.map_or(&[][..], Vec::as_slice);
+    for (i, tc) in calls.iter().enumerate() {
+        // Only the last call can have been cut off.
+        let status = if i + 1 == calls.len() {
+            item_status
+        } else {
+            "completed"
+        };
         let call_id = tc
             .get("id")
             .and_then(Value::as_str)
@@ -63,7 +70,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             &call_id,
             name,
             args,
-            "completed",
+            status,
             &echo.tools,
         ));
     }
