@@ -401,7 +401,9 @@ class TestMooncakeDcpHybridController(CustomTestCase):
                 peer.page_size = cc.page_size
                 peer.prefetch_hits_sync_groups = []
                 peer_payload = []
-                peer._all_reduce = lambda values, *_: peer_payload.append(values.clone())
+                peer._all_reduce = lambda values, *_: peer_payload.append(
+                    values.clone()
+                )
                 peer_operation = PrefetchOperation(
                     CacheRequestHandle("peer", 0), list(range(16))
                 )

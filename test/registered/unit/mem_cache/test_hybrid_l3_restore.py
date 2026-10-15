@@ -174,7 +174,9 @@ class TestHybridL3Restore(CustomTestCase):
             leaf = match.last_device_node
             oracles[pages] = (
                 state,
-                self._snapshot_full_kv(pa, prod.path_device_indices(match.last_device_node)),
+                self._snapshot_full_kv(
+                    pa, prod.path_device_indices(match.last_device_node)
+                ),
             )
             self._backup_node(prod, leaf)
             self._write_path_to_l3(prod, leaf)
