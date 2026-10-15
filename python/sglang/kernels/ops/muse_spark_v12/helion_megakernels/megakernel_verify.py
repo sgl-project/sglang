@@ -1,15 +1,14 @@
 """Muse Spark TP4 NVFP4 spec-decode verify layer (B=1, T = 8 or 16 draft
 tokens) on the Helion megakernels; T is a compile-time constant of every kernel.
 
-Per layer, after the previous layer's tail computed this layer's QKVG:
+Per layer, after the stock QKVG GEMM:
     Attention           sliding-window layers: QK norm/RoPE/KV store + paged
                         causal attention over the T new tokens + norm/gate
                         (global layers keep the stock attention)
-    Attention boundary  O-proj + AR + post-attn/pre-FFN norms, pooler + router
-                        top-8, NVFP4 expert input
+    (stock)             O-proj + all-reduce + post-attn/pre-FFN norms
+    Attention boundary  pooler + router top-8, NVFP4 expert input
     MoE                 expert-TP4 NVFP4 MoE + post-expert norm finalize
-    Tail                unpooler shard + post-FFN boundary + next layer's
-                        pre-attn norm and QKVG GEMV
+    (stock)             unpooler shard + all-gather + post-FFN boundary
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ from sglang.kernels.ops.muse_spark_v12.helion_megakernels.attention_verify_megak
 )
 from sglang.kernels.ops.muse_spark_v12.helion_megakernels.moe_tp4_verify_megakernel import (
     MoeTp4VerifyBank,
-    MuseMoeTailVerifyMegakernel,
     MuseMoeTp4VerifyMegakernel,
 )
 
@@ -54,15 +52,11 @@ class LayerScalars(msgspec.Struct, frozen=True):
 
     attn_scale: float
     attn_norm_eps: float  # QK norm and output norm
-    post_attn_eps: float
-    pre_ffn_eps: float
     pre_expert_eps: float
     router_multiplier: float
     route_scale: float
     route_eps: float
     post_expert_eps: float
-    post_ffn_eps: float
-    next_pre_attn_eps: float
 
 
 class MoeVerifyWeights(msgspec.Struct, frozen=True):
@@ -71,12 +65,6 @@ class MoeVerifyWeights(msgspec.Struct, frozen=True):
     output1_scale_gate_scalar: torch.Tensor
     output2_scale_scalar: torch.Tensor
     post_expert_norm: torch.Tensor
-    unpool: torch.Tensor  # [8192 / W, 4096] local row block
-    alpha: torch.Tensor
-    beta: torch.Tensor
-    post_weight: torch.Tensor
-    pre_weight: torch.Tensor
-    next_qkv: torch.Tensor | None  # [Nq, 8192] the next layer's QKV rows, if fused
 
 
 class MegakernelVerify:
@@ -104,8 +92,6 @@ class MegakernelVerify:
             device,
             group,
             AttentionBoundaryVerifyScalars(
-                post_eps=scalars.post_attn_eps,
-                pre_eps=scalars.pre_ffn_eps,
                 quant_eps=scalars.pre_expert_eps,
                 router_multiplier=scalars.router_multiplier,
                 route_scale=scalars.route_scale,
@@ -115,13 +101,6 @@ class MegakernelVerify:
         )
         self._moe = MuseMoeTp4VerifyMegakernel(
             device, group, tokens=tokens, norm_eps=scalars.post_expert_eps
-        )
-        self._tail = MuseMoeTailVerifyMegakernel(
-            device,
-            group,
-            tokens=tokens,
-            post_eps=scalars.post_ffn_eps,
-            pre_eps=scalars.next_pre_attn_eps,
         )
         self.topk_ids: torch.Tensor | None = None
 
@@ -141,22 +120,15 @@ class MegakernelVerify:
             attention.seq_lens,
         )
 
-    def layer(
-        self,
-        *,
-        gated: torch.Tensor,
-        stream: torch.Tensor,
-        attention_boundary: object,
-        moe: MoeVerifyWeights,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """From the gated attention output, returns the new FP32 residual stream,
-        the next attention input and, with moe.next_qkv, the next layer's QKV
-        projection."""
+    def experts(
+        self, *, ffn_in: torch.Tensor, attention_boundary: object, moe: MoeVerifyWeights
+    ):
+        """From the pre-FFN-normed hidden state, returns the post-expert-normed
+        route sum [T, H_e] (replicated); the top-8 ids land in topk_ids."""
 
         inputs = self._moe.inputs
-        prepared = self.attention_boundary(gated, stream, attention_boundary, inputs)
-        self.topk_ids = prepared["topk_ids"]
-        expert_output = self._moe(
+        self.topk_ids = self.attention_boundary(ffn_in, attention_boundary, inputs)
+        return self._moe(
             bank=moe.bank,
             packed_routing=inputs.packed,
             hidden_states=inputs.fp4,
@@ -166,16 +138,6 @@ class MegakernelVerify:
             output1_scale_gate_scalar=moe.output1_scale_gate_scalar,
             output2_scale_scalar=moe.output2_scale_scalar,
             norm_weight=moe.post_expert_norm,
-        )
-        return self._tail(
-            expert_output=expert_output,
-            unpool_weight=moe.unpool,
-            stream=prepared["new_stream"],
-            alpha=moe.alpha,
-            beta=moe.beta,
-            post_weight=moe.post_weight,
-            pre_weight=moe.pre_weight,
-            next_qkv_weight=moe.next_qkv,
         )
 
 

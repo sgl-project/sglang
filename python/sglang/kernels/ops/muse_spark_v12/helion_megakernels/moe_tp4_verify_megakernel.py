@@ -214,8 +214,10 @@ def _muse_moe_tp4_verify_megakernel(
     # Activation block scales load as bytes and are viewed as e4m3.
     e4m3 = torch.float8_e4m3fn
 
-    # The previous launch writes the cross-loop state; dependents launch at exit.
     hl.pdl_wait()
+    # Trigger at entry: the stock unpooler GEMM that follows streams its weights
+    # in while R3 finishes; its own wait still orders it after this grid.
+    hl.pdl_launch_dependents()
     # R1. Stock: the FlashInfer TRT-LLM MoE's routing, GEMM1 (W13, SwiGLU) and
     # its NVFP4 quant of the intermediate.
     for w13_tile_q, w13_tile_j in hl.tile([q_tiles, slots], block_size=[1, 1]):
@@ -349,7 +351,6 @@ def _muse_moe_tp4_verify_megakernel(
             y3[fin_tile_s.id, r, fin_tile_c] = torch.sum(
                 parts[r].to(torch.float32) * nw_r[None, :] * scale[:, None], dim=0
             ).to(torch.bfloat16)
-    hl.pdl_launch_dependents()
     return y
 
 
