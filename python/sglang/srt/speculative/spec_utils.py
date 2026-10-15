@@ -1117,43 +1117,25 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        accept_indices_offset = torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            dtype=accept_lens.dtype,
-            device=accept_lens.device,
-        )
-        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        last_correct_step_indices = (
-            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-            - accept_indices_offset
-        )
-        # extra_buffer: the interval-crossing step whose state must snapshot into
-        # the track ping-pong slot (mirrors the regular commit's
-        # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
-        # `temporal` stays current and no device-side force-flush is needed.
-        mamba_track_indices = batch.mamba_track_indices
-        mamba_steps_to_track = None
-        if mamba_track_indices is not None:
-            ti = mamba_track_grid(batch.tree_cache.page_size)
-            seq_pre = batch.seq_lens
-            seq_post = batch.seq_lens + accept_lens
-            to_track_mask = seq_pre // ti != seq_post // ti
-            tracking_point = seq_post // ti * ti
-            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
-                torch.int64
+        # extra_buffer: commit_kda_replayssm_spec also folds the interval-crossing
+        # step into the track slot, so `temporal` stays current without a flush.
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
             )
-            candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
-            mamba_steps_to_track = torch.where(
-                to_track_mask, candidate, torch.full_like(candidate, -1)
-            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,  # incl. bonus token
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=mamba_track_indices,
+            mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
