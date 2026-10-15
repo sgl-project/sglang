@@ -58,7 +58,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    get_next_token_logits_dtype,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
@@ -428,7 +431,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
-                self.model_runner.model_config.vocab_size, rows=logits_buffer_rows
+                self.model_runner.model_config.vocab_size,
+                rows=logits_buffer_rows,
+                dtype=get_next_token_logits_dtype(
+                    self.model_runner.model_config.hf_text_config
+                ),
             ),
             dtype=self.model_runner.model_config.dtype,
             num_dp_ranks=self.num_dp_ranks,

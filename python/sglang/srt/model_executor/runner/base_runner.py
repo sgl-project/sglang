@@ -32,6 +32,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.logits_processor import get_next_token_logits_dtype
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -76,6 +77,7 @@ def _allocate_decode_buffers(
     hidden_size: int,
     vocab_size: int,
     dtype: torch.dtype,
+    logits_dtype: torch.dtype,
     is_encoder_decoder: bool,
     require_mlp_tp_gather: bool,
     seq_len_fill_value: int,
@@ -114,7 +116,7 @@ def _allocate_decode_buffers(
         next_token_logits_buffer = (
             torch.zeros(
                 (max_num_token, vocab_size),
-                dtype=torch.float,
+                dtype=logits_dtype,
             )
             if allocate_logits_buffer
             else None
@@ -429,6 +431,7 @@ class BaseRunner(ABC):
             hidden_size=mr.model_config.hidden_size,
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
+            logits_dtype=get_next_token_logits_dtype(mr.model_config.hf_text_config),
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather(),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
