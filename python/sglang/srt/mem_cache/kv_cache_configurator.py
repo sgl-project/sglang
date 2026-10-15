@@ -124,13 +124,19 @@ logger = logging.getLogger(__name__)
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
+    # Ascend PD slices the KV list positionally (index-K rides in it, not in
+    # StateType.DSA), so a compact layout would mis-slice PP>1 against PP=1.
+    if _is_npu and get_disagg().disaggregation_mode != "null":
+        return False
+    # The NPU HiCache host pool has no compact index-K layout.
+    if _is_npu and memory_config.enable_hierarchical_cache:
+        return False
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
         and not memory_config.enable_unified_cache_external_linker
-        and get_disagg().disaggregation_mode == "null"
     )
 
 
@@ -682,6 +688,18 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
+            elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+                # HiSparse's target allocator hands out logical IDs from its
+                # host-expanded address space. Draft KV is direct-indexed by
+                # those shared IDs, so its GPU pool must span the same space.
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                page = max(int(self.pool_page_size or 1), 1)
+                draft_virtual_id_space = (
+                    (draft_virtual_id_space + page - 1) // page * page
+                )
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -1420,16 +1438,13 @@ class KVCacheConfigurator:
         )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
-        mamba_layer_ids = [
+        # Target layers on this rank only; a draft holding linear state gets its own
+        # pool via clone_with_new_mamba.
+        return [
             i
             for i in self.mambaish_config.mamba2_cache_params.layers
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
-        if max_speculative_num_draft_tokens():
-            for layer_id in getattr(self.mambaish_config, "nextn_layer_ids", []):
-                if layer_id not in mamba_layer_ids:
-                    mamba_layer_ids.append(layer_id)
-        return mamba_layer_ids
 
     def _get_ple_req_pool_kwargs(self) -> dict[str, Any]:
         from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
@@ -2012,7 +2027,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             reject_out_of_tree_path(
                 current_platform, subsystem="the HiSparse DSA KV pool"
             )
@@ -2036,6 +2051,8 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
+        if self.loc_space_scale > 1:
+            pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
