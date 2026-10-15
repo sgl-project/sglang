@@ -576,7 +576,8 @@ class TestRingDriverStageOrder(CustomTestCase):
 
     def test_pd_prefill(self):
         shell = _RingShell("prefill", 3, prefill={0: _step("p0")})
-        schedule = ("ingest", "dp.intake", "dp.poll_transfer", "dp.chunk", "hicache")
+        schedule = ("ingest", "dp.intake", "dp.poll_transfer", "chunked_abort")
+        schedule += ("dp.chunk", "hicache")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
