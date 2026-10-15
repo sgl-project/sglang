@@ -397,15 +397,21 @@ class TestMooncakeDcpHybridController(CustomTestCase):
                         "hint should skip lookup"
                     )
 
+                peer = HybridCacheController.__new__(HybridCacheController)
+                peer.page_size = cc.page_size
+                peer.prefetch_hits_sync_groups = []
+                peer_payload = []
+                peer._all_reduce = lambda values, *_: peer_payload.append(values.clone())
+                peer_operation = PrefetchOperation(
+                    CacheRequestHandle("peer", 0), list(range(16))
+                )
+                peer_operation.pool_storage_result.restorable_prefix_pages = [2]
+                peer._sync_prefetch_hit_query(peer_operation, 8)
+
                 def peer_reduction(tensor, reduce_op, groups):
-                    # External collective boundary: the peer can restore only
-                    # page 2. The production query/worker chooses the payload.
-                    if tensor.ndim == 0:
-                        tensor.fill_(min(int(tensor), 8))
-                    else:
-                        peer = torch.zeros_like(tensor)
-                        peer[2] = 1
-                        tensor.mul_(peer)
+                    # Reduce an actual peer payload, independent of wire offsets.
+                    self.assertEqual(reduce_op, dist.ReduceOp.MIN)
+                    tensor.copy_(torch.minimum(tensor, peer_payload[0]))
                     cc.storage_stop_event.set()
 
                 cc._all_reduce = peer_reduction
