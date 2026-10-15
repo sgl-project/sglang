@@ -33,9 +33,17 @@ class SingleTokenDraftMoe:
         self._router_scratch: Optional[Tuple[torch.Tensor, ...]] = None
 
     def _unsupported_reason(self, block, hidden_states, topk_output) -> Optional[str]:
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
         experts, shared = block.experts, block.shared_expert
         if shared is None or block.shared_expert_gate is None:
             return "no separate shared expert"
+        # The GEMV passes read W13 as [gate rows | up rows] in checkpoint order.
+        method = experts.quant_method
+        if not isinstance(method, UnquantizedFusedMoEMethod):
+            return f"expert weights handled by {type(method).__name__}"
+        if method.use_flashinfer_trtllm_moe or method.w13_swiglu_interleaved:
+            return "expert weights in a kernel-specific layout"
         if get_parallel().moe_ep_size != 1:
             return "expert parallelism"
         if not TopKOutputChecker.format_is_standard(topk_output):
