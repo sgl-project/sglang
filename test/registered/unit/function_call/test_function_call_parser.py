@@ -3440,9 +3440,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
         )
         result = self.detector.parse_streaming_increment(incomplete, self.tools)
 
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(result.calls[0].parameters, "")
+        self.assertEqual(result.calls, [])
 
         result = self.detector.parse_streaming_increment(
             "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>",
@@ -3450,11 +3448,21 @@ class TestGlm47MoeDetector(unittest.TestCase):
         )
 
         self.assertEqual(len(result.calls), 1)
-        self.assertIsNone(result.calls[0].name)
+        self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(
             result.calls[0].parameters,
             '{"city": "Beijing", "date": "2024-06-27"}',
         )
+
+    def test_streaming_drops_truncated_buffered_tool_call(self):
+        result = self.detector.parse_streaming_increment(
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Bei",
+            self.tools,
+        )
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(self.detector.finish(self.tools).calls, [])
+        self.assertFalse(self.detector.prev_tool_call_arr[0]["complete"])
 
     def test_array_argument_with_escaped_json(self):
         """Test that array arguments with escaped JSON are properly handled without double-escaping."""

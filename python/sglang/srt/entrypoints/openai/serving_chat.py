@@ -2969,8 +2969,14 @@ class OpenAIServingChat(OpenAIServingBase):
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
             return None
 
+        tracked_call = detector.prev_tool_call_arr[tool_index]
+        # Some detectors buffer a call until its closing marker. Never turn a
+        # truncated buffered call into an apparently valid empty-argument call.
+        if tracked_call.get("complete") is False:
+            return None
+
         # Get expected vs actual arguments
-        expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
+        expected_args = tracked_call.get("arguments", {})
         if isinstance(expected_args, str):
             expected_call = expected_args
         else:
