@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_resources
+from sglang.srt.runtime_context import get_parallel, get_resources
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -267,6 +267,13 @@ def process_tracing_init(
 
 def get_global_tracing_enabled():
     return opentelemetry_initialized
+
+
+def should_trace_rank() -> bool:
+    if envs.SGLANG_TRACE_ALL_RANKS.get():
+        return True
+    parallel = get_parallel()
+    return parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
 
 
 def fastapi_telemetry_disabled_kwargs() -> Dict[str, Any]:

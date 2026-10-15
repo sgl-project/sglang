@@ -160,4 +160,6 @@ TraceReqContext (req_id="req-123")
 
 Each traced request maintains a global `TraceReqContext` and creates a corresponding request span. For every thread that processes the request, a `TraceThreadContext` is recorded and a thread span is created. The `TraceThreadContext` is nested within the `TraceReqContext`, and each currently traced code slice—potentially nested—is stored in its associated `TraceThreadContext`.
 
+The ranks of an attention TP/CP group run the same requests in lockstep, so by default only the first rank of each group exports spans (`TP 0` above). Set `SGLANG_TRACE_ALL_RANKS=1` to trace every rank, as in the diagram.
+
 In addition to the above hierarchy, each slice also records its previous slice via Span.add_link(), which can be used to trace the execution flow.

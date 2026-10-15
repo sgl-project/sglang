@@ -319,7 +319,11 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.observability.trace import (
+    process_tracing_init,
+    should_trace_rank,
+    trace_set_thread_info,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
@@ -6190,7 +6194,7 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
 
     # Set up tracing
-    if get_observability().enable_trace:
+    if get_observability().enable_trace and should_trace_rank():
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
             get_observability().otlp_service_name,

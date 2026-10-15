@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import sglang.srt.observability.trace as mod
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import (
     SpanAttributes,
     TraceEvent,
@@ -22,6 +23,7 @@ from sglang.srt.observability.trace import (
     get_global_trace_level,
     process_tracing_init,
     set_global_trace_level,
+    should_trace_rank,
     trace_set_thread_info,
 )
 
@@ -72,6 +74,26 @@ class TestTraceFunctions(unittest.TestCase):
             self.assertEqual(get_global_trace_level(), 3)
         finally:
             get_resources().trace_level = orig
+
+
+class TestShouldTraceRank(unittest.TestCase):
+    def test_only_the_first_rank_of_each_attention_group_traces(self):
+        from sglang.srt.runtime_context import get_parallel
+
+        for attn_tp_rank, attn_cp_rank, all_ranks, traces in [
+            (0, 0, False, True),
+            (1, 0, False, False),
+            (0, 1, False, False),
+            (1, 1, True, True),
+        ]:
+            with (
+                self.subTest(tp=attn_tp_rank, cp=attn_cp_rank, all_ranks=all_ranks),
+                get_parallel().override(
+                    attn_tp_rank=attn_tp_rank, attn_cp_rank=attn_cp_rank
+                ),
+                envs.SGLANG_TRACE_ALL_RANKS.override(all_ranks),
+            ):
+                self.assertEqual(should_trace_rank(), traces)
 
 
 class TestTraceNullContext(unittest.TestCase):
