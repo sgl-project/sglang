@@ -1612,6 +1612,12 @@
                     ]
                   },
                   {
+                    "group": "MOSS-Image",
+                    "pages": [
+                      "cookbook/diffusion/OpenMOSS/MOSS-Image"
+                    ]
+                  },
+                  {
                     "group": "SANA Video",
                     "pages": [
                       "cookbook/diffusion/SANA-Video/SANA-Video"
