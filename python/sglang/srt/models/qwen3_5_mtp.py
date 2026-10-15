@@ -199,6 +199,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             use_hidden, start, width = self.fc_split_slice
             col = start + (self.config.hidden_size if use_hidden else 0)
             self._fc_shard = self.fc.weight[:, col : col + width].contiguous()
+            logger.info(
+                "MTP fc split active (input columns %d:%d of %d).",
+                col,
+                col + width,
+                2 * self.config.hidden_size,
+            )
         return True
 
     def _split_fc(self, input_embeds, hidden_states, forward_batch):
