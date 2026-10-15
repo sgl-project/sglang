@@ -4,12 +4,14 @@ wiring and spatial-parallel decode wiring (GPU-free, no checkpoint).
 """
 
 import unittest
+import weakref
 from unittest import mock
 
 import torch
 
 from sglang.multimodal_gen.configs.models.vaes.flux3_image import Flux3ImageVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.flux3_image_vae import (
+    Encoder,
     Flux3ImageVAE,
     Upsample,
     enable_spatial_parallel_decoder,
@@ -22,6 +24,18 @@ def _meta_vae() -> Flux3ImageVAE:
 
 
 class TestFlux3ImageVAE(unittest.TestCase):
+    def test_encoder_releases_dead_activations(self):
+        encoder = Encoder(32, 3, 32, [1, 1], 1, 4).eval()
+        activations = []
+        encoder.conv_in.register_forward_hook(
+            lambda _module, _args, output: activations.append(weakref.ref(output))
+        )
+        encoder.mid.block_1.register_forward_pre_hook(
+            lambda _module, _args: self.assertIsNone(activations[0]())
+        )
+        with torch.inference_mode():
+            encoder(torch.randn(1, 3, 32, 32))
+
     def test_fused_norm_act_is_wired(self):
         """apply_group_norm_silu only fuses when handed an nn.SiLU; without it
         every GroupNorm -> swish chain silently runs eager."""

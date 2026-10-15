@@ -168,7 +168,10 @@ def _reference_weights(native) -> dict[str, torch.Tensor]:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA kernels")
-def test_packed_cfg_forward_matches_flux3_transformer_per_sample(request):
+@pytest.mark.parametrize("compact_timesteps", [False, True])
+def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
+    request, compact_timesteps
+):
     """Packing both CFG samples into one varlen sequence must not let them see
     each other: each sample's prediction equals the shared FLUX 3 transformer
     run on that sample alone (bf16 fused-kernel tolerance)."""
@@ -180,8 +183,19 @@ def test_packed_cfg_forward_matches_flux3_transformer_per_sample(request):
     samples = [_sample(3, image_cond=True), _sample(5, image_cond=True)]
     packed = _pack(samples)
     packed.timesteps["image"].fill_(0.7)
+    if compact_timesteps:
+        packed.timesteps = {mode: time[:1] for mode, time in packed.timesteps.items()}
+        sliced = packed.sample(1)
+        assert sliced.timesteps["image"].shape == (1,)
+        assert torch.equal(sliced.timesteps["image"], packed.timesteps["image"])
     with torch.inference_mode():
         predicted = native(packed)["image"].float()
+        packed.rope = {mode: native.rope(ids) for mode, ids in packed.ids.items()}
+        cached = native(packed)["image"].float()
+        torch.testing.assert_close(cached, predicted, rtol=0, atol=0)
+        for mode, rows in packed.sample(1).rope.items():
+            start, end = packed.mode_indices[mode][1]
+            assert torch.equal(rows, packed.rope[mode][start:end])
         with set_forward_context(current_timestep=0, attn_metadata=None):
             expected = []
             for image, condition, text in samples:

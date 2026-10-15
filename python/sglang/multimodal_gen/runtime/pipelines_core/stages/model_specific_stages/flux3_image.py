@@ -754,6 +754,15 @@ class Flux3ImageDenoiseStage(DenoisingStage):
             ],
             dict(self.package_config.dit.in_channels),
         )
+        packed.rope = {
+            mode: self.transformer.rope(ids) for mode, ids in packed.ids.items()
+        }
+        if not flow_map and batch.quality != "exact":
+            # Each mode has one timestep. Project it once, then broadcast the
+            # modulation; exact keeps the reference GEMM shapes and rounding.
+            packed.timesteps = {
+                mode: time[:1] for mode, time in packed.timesteps.items()
+            }
         num_steps = max(0, steps)
         schedule = build_timesteps(steps, alpha)
         batch.timesteps = schedule

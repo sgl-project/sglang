@@ -106,11 +106,14 @@ class Packed:
 
     data: dict[str, Tensor]
     ids: dict[str, Tensor]
+    # Either one shared timestep or one per token, independently for each mode.
     timesteps: dict[str, Tensor]
     mode_indices: dict[str, list[tuple[int, int]]]
     # Flow map only: the time each sample jumps to, ``(num_samples,)``. A tensor,
     # not a float, so a captured CUDA graph reads the live value.
     timesteps_ref: Tensor | None = None
+    # Request-owned positional tables; the ids do not change during denoising.
+    rope: dict[str, Tensor] | None = None
 
     @property
     def num_samples(self) -> int:
@@ -127,17 +130,21 @@ class Packed:
         ids = {}
         timesteps = {}
         mode_indices = {}
+        rope = None if self.rope is None else {}
         for mode in self.data:
             bounds = self.mode_indices[mode][first:stop]
             start, end = bounds[0][0], bounds[-1][1]
             data[mode] = self.data[mode][start:end]
             ids[mode] = self.ids[mode][start:end]
-            timesteps[mode] = self.timesteps[mode][start:end]
+            time = self.timesteps[mode]
+            timesteps[mode] = time if time.numel() == 1 else time[start:end]
             mode_indices[mode] = [(lo - start, hi - start) for lo, hi in bounds]
+            if rope is not None:
+                rope[mode] = self.rope[mode][start:end]
         timesteps_ref = (
             None if self.timesteps_ref is None else self.timesteps_ref[first:stop]
         )
-        return Packed(data, ids, timesteps, mode_indices, timesteps_ref)
+        return Packed(data, ids, timesteps, mode_indices, timesteps_ref, rope)
 
 
 def pack(
@@ -785,12 +792,26 @@ class Flux3ImageDiT(Flux3Transformer):
 
         vec = {mode: self._token_vector(timesteps[mode]) for mode in modes}
         self._add_reference_time(packed, modes, vec)
+
+        def broadcast_modulation(values, mode):
+            length = data[mode].shape[0]
+            return tuple(
+                value
+                if value.shape[0] == length
+                else value.expand(length, -1).contiguous()
+                for value in values
+            )
+
         early = {
-            mode: self.early_stream_modulations[mod_key(mode)](vec[mode])
+            mode: broadcast_modulation(
+                self.early_stream_modulations[mod_key(mode)](vec[mode]), mode
+            )
             for mode in modes
         }
         single = {
-            mode: self.single_stream_modulations[mod_key(mode)](vec[mode])
+            mode: broadcast_modulation(
+                self.single_stream_modulations[mod_key(mode)](vec[mode]), mode
+            )
             for mode in modes
         }
         x = {
@@ -802,7 +823,12 @@ class Flux3ImageDiT(Flux3Transformer):
             for mode in modes
         }
         rope = {
-            mode: rope_cos_sin(ids[mode], self.axes_dim, self.theta) for mode in modes
+            mode: (
+                packed.rope[mode]
+                if packed.rope is not None and packed.ids[mode].shape[0]
+                else rope_cos_sin(ids[mode], self.axes_dim, self.theta)
+            )
+            for mode in modes
         }
         layout = _JointLayout(packed, modes)
         if get_sp_world_size() == 1:
