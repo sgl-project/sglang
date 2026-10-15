@@ -1379,6 +1379,17 @@ class SchedulerMetricsReporter:
             self.scheduler_stage_metrics.start(now_wall_ns)
             return
 
+        # CRIU restore can move monotonic time below the saved baseline.
+        # Skip the unknowable gap, but flush buffered idle and stage totals
+        # before rebasing. drain() also preserves the current stage.
+        clock_reset = now_wall_ns < accounting.last_sample_ns
+        if clock_reset:
+            accounting.last_sample_ns = now_wall_ns
+            if ENABLE_METRICS_DEVICE_TIMER:
+                self._forward_occupancy_log_window.reset(now_wall_ns)
+            if not self.enable_metrics:
+                accounting.reset(now_wall_ns, 0, is_idle)
+
         # Clamp delayed events to the still-unaccounted wall-time range.
         event_ns = max(accounting.last_sample_ns, min(event_ns, now_wall_ns))
         if ENABLE_METRICS_DEVICE_TIMER and is_idle and not accounting.is_idle:
@@ -1395,11 +1406,17 @@ class SchedulerMetricsReporter:
             self._forward_occupancy_log_window.idle_ns += (
                 accounting.accumulate_idle_ns - idle_ns_before
             )
-        if not self.enable_metrics or not accounting.should_record(now_wall_ns):
+        if not self.enable_metrics or (
+            not clock_reset and not accounting.should_record(now_wall_ns)
+        ):
             return
 
         now_process_cpu_ns = time.process_time_ns()
         elapsed_process_cpu_ns = now_process_cpu_ns - accounting.start_process_cpu_ns
+        if elapsed_process_cpu_ns < 0:
+            # CRIU restore restarts the process CPU clock near zero, so its
+            # reading is the CPU time since restore. Never decrement the counter.
+            elapsed_process_cpu_ns = now_process_cpu_ns
         if accounting.accumulate_idle_ns > 0:
             self.metrics_collector.increment_scheduler_idle_seconds(
                 accounting.accumulate_idle_ns / 1e9
