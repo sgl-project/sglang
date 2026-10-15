@@ -28,6 +28,7 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                 layer = SimpleNamespace(forward=None)
                 runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
                 runner._is_full_backend = False
+                runner.is_dsv41_model = True
                 runner._qwen_bcg_hc_sidechannel = False
                 runner._use_draft_input_embeds = False
                 runner.layer_model = layer
@@ -54,10 +55,7 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
 
                 runner.model_runner = SimpleNamespace(
                     pp_group=SimpleNamespace(is_first_rank=True),
-                    model=SimpleNamespace(
-                        forward=outer_forward,
-                        config=SimpleNamespace(model_type="deepseek_v41"),
-                    ),
+                    model=SimpleNamespace(forward=outer_forward),
                 )
                 live = SimpleNamespace(input_ids=scheduler_ids, mm_input_embeds=None)
                 static = SimpleNamespace(
