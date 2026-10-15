@@ -36,7 +36,7 @@ class SplitKVGraphVariants:
     def select(self, forward_batch: ForwardBatch) -> str:
         if forward_batch.batch_size != 1:
             return SPLIT_KV_STOCK
-        length = getattr(forward_batch, "attention_kv_len_lower_bound", None)
+        length = forward_batch.attention_kv_len_lower_bound
         if length is None:
             lengths = forward_batch.seq_lens_cpu
             if (
