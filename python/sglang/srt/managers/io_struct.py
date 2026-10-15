@@ -1982,6 +1982,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # See BatchTokenIDOutput.request_stats.
     request_stats: Optional[List[Optional[RequestOutputStats]]] = None
+    # Seconds the detokenizer spent on this batch; set only when tracing.
+    detokenize_duration: Optional[float] = None
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None

@@ -15,6 +15,7 @@
 
 import logging
 import signal
+import time
 import traceback
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
@@ -133,6 +134,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.tool_close_token_ids = tool_close_token_ids(
             get_serving().tool_call_parser, self.tokenizer
         )
+        self.enable_trace = get_observability().enable_trace
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -398,6 +400,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return ipcs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        start_time = time.perf_counter()
         maybe_perturb_batch_token_id_out(recv_obj)
         states = self._update_detokenize_states(recv_obj)
         headers = [None if s is None else s.header for s in states]
@@ -419,7 +422,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
-        return BatchStrOutput(
+        output = BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=self._route_rows(recv_obj, headers),
             finished_reasons=recv_obj.finished_reasons,
@@ -464,6 +467,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
         )
+        if self.enable_trace:
+            output.detokenize_duration = time.perf_counter() - start_time
+        return output
 
     def handle_detokenize_release_req(self, recv_req: DetokenizeReleaseReq):
         self.detokenize_state_table.release(recv_req.rid)

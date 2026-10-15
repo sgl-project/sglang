@@ -257,6 +257,7 @@ _NOT_SPLIT_FIELDS = frozenset(
         "output_ids_flat",
         "output_ids_offsets",
         "pooled_hidden_states",
+        "detokenize_duration",
     }
 )
 
@@ -283,6 +284,8 @@ def _handle_output_by_index(output, i):
         )
     else:
         split_fields.update(_extract_output_ids_by_indices(output, [i]))
+    if isinstance(output, BatchStrOutput):
+        split_fields["detokenize_duration"] = output.detokenize_duration
     return type(output)(
         rids=[output.rids[i]],
         placeholder_tokens_idx=None,
@@ -307,6 +310,8 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
         for field in _cached_output_fields(type(output))
         if field.name not in _NOT_SPLIT_FIELDS
     }
+    if isinstance(output, BatchStrOutput):
+        split_fields["detokenize_duration"] = output.detokenize_duration
     return type(output)(
         rids=[output.rids[index] for index in indices],
         placeholder_tokens_idx=None,
