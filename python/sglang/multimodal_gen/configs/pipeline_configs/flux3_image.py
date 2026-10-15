@@ -33,9 +33,9 @@ if TYPE_CHECKING:
 _IMAGE_MODES = frozenset({"t2i", "i2i"})
 # Release repos: the distilled flow map and the CFG base model.
 FLUX3_IMAGE_HF_PATHS = [
-    "herzogenhorn/f3-image-small",
     "black-forest-labs/flux-3-image-klein",
     "black-forest-labs/flux-3-image-klein-base",
+    "herzogenhorn/f3-image-small",
 ]
 # Lower-case substrings of a Hub id or path that name a FLUX.3 image model.
 FLUX3_IMAGE_NAME_PATTERNS = ("flux-3-image", "flux.3-image", "flux3-image")

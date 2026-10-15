@@ -1,6 +1,9 @@
 // Image-only FLUX.3 diffusion command builder. Consumed by _deployment.jsx.
 
 export const config = (() => {
+const modelOf = (s) => s.model === "distilled"
+  ? "black-forest-labs/flux-3-image-klein"
+  : "black-forest-labs/flux-3-image-klein-base";
 const hardware = [
   { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
   { id: "rtx6000pro", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
@@ -32,7 +35,7 @@ return {
       title: "Model",
       scope: "serve",
       description:
-        "Base uses CFG; the sd variant is a step-distilled flow map without CFG. Defaults come from the selected checkpoint.",
+        "Base and distilled are self-contained repositories. Base uses CFG; distilled is a flow map without CFG.",
       default: "base",
       options: [
         {
@@ -178,14 +181,7 @@ return {
         nodes: { min: 1, max: 1 },
         gpus_per_node: { min: 1, max: 8 },
       },
-      verifiedRecipes: [{
-        id: "gb300-base-bf16", hw: "gb300", nodes: 1,
-        gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1,
-        model: "base", precision: "bf16", placement: "resident",
-        attention: "sdpa", execution: "eager", quality: "exact",
-        batch_size: 1, batch_delay: 5, outputs: 1,
-        default: true,
-      }],
+      verifiedRecipes: [],
       autoTopology: (s) => ({
         tp_size: Number(s.gpus_per_node) || 1,
         ulysses_degree: 1,
@@ -227,27 +223,22 @@ return {
       const parallel = [];
       if (gpus > 1) parallel.push(`--num-gpus ${gpus}`, `--tp-size ${topology.tp_size}`);
       if (topology.ulysses_degree > 1) parallel.push(`--ulysses-degree ${topology.ulysses_degree}`);
-      const variant = [s.model === "distilled" ? "sd" : "", s.precision === "bf16" ? "" : s.precision].filter(Boolean).join("-");
-      if (variant) parallel.push(`--model-variant ${variant}`);
+      if (s.precision !== "bf16") parallel.push(`--model-variant ${s.precision}`);
       if (Number(s.batch_size) > 1) {
         parallel.push(`--batching-max-size ${Number(s.batch_size)}`, `--batching-delay-ms ${Number(s.batch_delay) || 0}`);
       }
-      const verified = s.hw === "gb300" && gpus === 1 && s.model === "base"
-        && s.precision === "bf16" && s.placement === "resident"
-        && ["sdpa", "fa"].includes(s.attention) && s.execution === "eager"
-        && s.quality === "exact" && Number(s.batch_size) <= 2 && Number(s.outputs) <= 2;
-      const warnings = verified ? [] : ["This exact hardware, checkpoint and topology combination is not yet end-to-end verified."];
+      const warnings = ["Release-checkpoint validation is pending. Earlier measurements used a pre-release checkpoint."];
       if (s.hw === "rtx5090" && s.placement === "resident" && Number(s.batch_size) > 1) {
         warnings.push("Full-resolution batching needs additional activation memory. Use offload or batch 1 if the resident batch does not fit.");
       }
       return {
         match: { hw: s.hw },
         nnodes: 1,
-        verified: verified && !errors.length,
-        verificationStatus: errors.length ? "error" : verified ? "verified" : "unverified",
+        verified: false,
+        verificationStatus: errors.length ? "error" : "unverified",
         env: [],
         flags: [
-          "--model-path {{MODEL_NAME}}",
+          `--model-path ${modelOf(s)}`,
           ...parallel,
           "--host {{HOST_IP}}",
           "--port {{PORT}}",
@@ -258,8 +249,8 @@ return {
           errors,
           warnings,
           verification: {
-            serve: errors.length ? "error" : verified ? "verified" : "unverified",
-            request: errors.length ? "error" : verified ? "verified" : "unverified",
+            serve: errors.length ? "error" : "unverified",
+            request: errors.length ? "error" : "unverified",
           },
           resolvedSettings: {
             placement: s.placement === "resident" ? "GPU resident" : s.placement === "offload" ? "Layerwise offload" : "Auto",
@@ -269,7 +260,7 @@ return {
     },
   },
 
-  modelNames: { default: "herzogenhorn/f3-image-small" },
+  modelNames: { default: modelOf({ model: "base" }) },
   placeholders: {
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30010" },

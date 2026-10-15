@@ -34,7 +34,8 @@ def case():
         "flux3_image_batching",
         DiffusionServerArgs(
             model_path=os.environ.get(
-                "SGLANG_TEST_FLUX3_IMAGE_MODEL", "herzogenhorn/f3-image-small"
+                "SGLANG_TEST_FLUX3_IMAGE_MODEL",
+                "black-forest-labs/flux-3-image-klein-base",
             ),
             extras=[
                 "--performance-mode manual --component-residency all=resident",

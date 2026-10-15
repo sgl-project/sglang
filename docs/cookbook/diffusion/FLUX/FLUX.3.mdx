@@ -24,11 +24,13 @@ pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@r
 <Deployment config={config} />
 
 <Note>
-The picker uses `herzogenhorn/f3-image-small`. Access to this checkpoint is
-required. Keep `--model-path` at the repository root; select the distilled or
-quantized checkpoint with `--model-variant`. SGLang also accepts a local package
-with the same `config.json` and weight layout. Unverified hardware or resource
-shapes remain selectable but are not measured recommendations.
+The picker selects `black-forest-labs/flux-3-image-klein-base` or
+`black-forest-labs/flux-3-image-klein`, each a self-contained repository. Access
+to the selected checkpoint is required. Keep `--model-path` at its repository
+root; `--model-variant` selects only the quantized DiT. Release-checkpoint
+validation is pending; earlier measurements used a pre-release checkpoint.
+Unverified hardware or resource shapes remain selectable but are not measured
+recommendations.
 </Note>
 
 <Warning>
@@ -58,7 +60,7 @@ Start the server:
 
 ```bash
 sglang serve \
-  --model-path herzogenhorn/f3-image-small \
+  --model-path black-forest-labs/flux-3-image-klein-base \
   --host 0.0.0.0 \
   --port 30010
 ```
@@ -76,12 +78,14 @@ output takes the first one's size.
 
 ## 3. Checkpoints and precision
 
-| Model | `--model-variant` | Default sampling |
+| Repository | `--model-variant` | Sampling |
 | --- | --- | --- |
-| Base | Omit | 50 steps, CFG 3.5 |
-| Distilled | `sd` | From the variant configuration; no CFG |
-| Quantized Base | `fp8r` / `nvfp4` | From the variant configuration |
-| Quantized distilled | `sd-fp8r` / `sd-nvfp4` | From the variant configuration; no CFG |
+| `black-forest-labs/flux-3-image-klein-base` | Omit / `fp8r` / `nvfp4` | Base CFG; defaults from the selected configuration |
+| `black-forest-labs/flux-3-image-klein` | Omit / `fp8r` / `nvfp4` | Step-distilled flow map; no CFG |
+
+Both repositories use `flux-3-image-klein` in configuration and safetensors
+metadata. This shared identifier does not determine the sampling mode. The
+release repositories do not need the pre-release `sd-*` variant names.
 
 The distilled model is a step-distilled flow-map DiT: each step jumps straight
 to the next time of the schedule, so it samples without CFG. SGLang tells a
@@ -98,13 +102,14 @@ comparing outputs.
 
 Each repo ships quantized DiTs under `variants/`: select one with
 `--model-variant fp8r` or `--model-variant nvfp4` and keep `--model-path`
-pointing at the repo root. The text encoder and VAE stay BF16. The quantization
+pointing at the repo root. Text encoder and VAE precision follow their own
+package settings; quantizing the DiT does not quantize them. The quantization
 comes from the variant's `hf_quant_config.json`, so do not also pass
 `--quantization`.
 
 ```bash
 sglang serve \
-  --model-path herzogenhorn/f3-image-small \
+  --model-path black-forest-labs/flux-3-image-klein-base \
   --model-variant fp8r \
   --host 0.0.0.0 \
   --port 30010
@@ -189,7 +194,7 @@ curl -sS -X POST http://localhost:30010/v1/images/edits \
 
 ```bash
 sglang generate \
-  --model-path herzogenhorn/f3-image-small \
+  --model-path black-forest-labs/flux-3-image-klein-base \
   --height 1024 --width 1024 \
   --num-inference-steps 50 \
   --guidance-scale 3.5 \
@@ -206,7 +211,7 @@ Pass `--image-path` (one or more images) to edit references instead.
 Enable a small batching window to collect concurrent requests:
 
 ```bash Serve concurrent requests
-sglang serve --model-path herzogenhorn/f3-image-small \
+sglang serve --model-path black-forest-labs/flux-3-image-klein-base \
   --batching-max-size 2 --batching-delay-ms 5
 ```
 
@@ -222,7 +227,10 @@ QPS, and keep batch 1 for low-latency or low-VRAM workloads. Batching does not i
 bitwise equality with separate forwards: GEMM and attention reduction choices can
 change with shape. Check output fidelity with fixed prompts and seeds.
 
-### Measured batching tradeoffs
+### Pre-release batching measurements
+
+These measurements used pre-release weights, not the release repositories
+above. They do not establish release-checkpoint performance.
 
 The following are warmed HTTP measurements on one GB300 (about 277 GiB device
 memory), Base BF16, Torch SDPA, eager execution and all components resident.

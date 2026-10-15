@@ -19,7 +19,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     Flux3ImageSamplingParams,
 )
 
-_MODEL = "flux-3-image-klein-base"
+_MODEL = "flux-3-image-klein"
 _SNAPSHOT_DOWNLOAD = (
     "sglang.multimodal_gen.runtime.pipelines.flux3_image_package.snapshot_download"
 )
@@ -88,7 +88,7 @@ def _write_dit(path: Path, flow_map: bool = False) -> None:
     tensors = {"img_in.weight": torch.zeros(1)}
     if flow_map:
         tensors["ref_time_in.in_layer.weight"] = torch.zeros(1)
-    save_file(tensors, str(path))
+    save_file(tensors, str(path), metadata={"model": _MODEL})
 
 
 def _write_package(
@@ -152,6 +152,9 @@ class TestFlux3ServedRegistration(unittest.TestCase):
             local = Path(directory) / "any-name"
             local.mkdir()
             (local / "config.json").write_text(json.dumps(_config_dict()))
+            # A Diffusers export may coexist with the native package. The native
+            # config still identifies it without probing/downloading the export.
+            (local / "modular_model_index.json").write_text("{}")
             for model_path in (
                 "herzogenhorn/f3-image-small",
                 "black-forest-labs/flux-3-image-klein",
@@ -423,37 +426,64 @@ class TestFlux3ReleasePackages(unittest.TestCase):
                 resolve_flux3_image_package(base, variant="sd-fp8r")
 
     def test_hub_repo_id_fetches_only_the_selected_dit(self):
-        """A Hub package holds several DiTs (root, variants) of 5-11 GB each;
-        serving one must not download the others."""
+        """Both release repos are self-contained and use identical variant names.
+        Serving one DiT must not download another model or the Diffusers export."""
         from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
             resolve_flux3_image_package,
         )
 
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory)
-            _write_package(snapshot)
-            _write_variant(snapshot / "variants" / "sd", flow_map=True)
-
-            with mock.patch(_SNAPSHOT_DOWNLOAD, return_value=str(snapshot)) as fetch:
-                package = resolve_flux3_image_package(
-                    "black-forest-labs/flux-3-image-klein", variant="sd", revision="r1"
+            for flow_map in (False, True):
+                repo = "black-forest-labs/flux-3-image-klein" + (
+                    "" if flow_map else "-base"
                 )
-            self.assertTrue(package.config.dit.flow_map)
-            self.assertEqual(
-                package.weights, snapshot / "variants/sd/model.safetensors"
-            )
-            patterns = [
-                pattern
-                for call in fetch.call_args_list
-                for pattern in call.kwargs["allow_patterns"]
-            ]
-            self.assertIn("variants/sd/model.safetensors", patterns)
-            self.assertIn("text_encoder/*", patterns)
-            self.assertNotIn("model.safetensors", patterns)
-            self.assertFalse([p for p in patterns if "*" in p.split("/")[0]])
-            self.assertEqual(
-                {call.kwargs["revision"] for call in fetch.call_args_list}, {"r1"}
-            )
+                root = snapshot / repo
+                _write_package(root, flow_map=flow_map)
+                (root / "modular_model_index.json").write_text("{}")
+                for variant, manifest in (
+                    (None, None),
+                    ("fp8r", _FP8R_MANIFEST),
+                    ("nvfp4", _NVFP4_MANIFEST),
+                ):
+                    with self.subTest(repo=repo, variant=variant):
+                        prefix = f"variants/{variant}/" if variant else ""
+                        if variant:
+                            _write_variant(
+                                root / prefix, variant, manifest, flow_map=flow_map
+                            )
+                        with mock.patch(
+                            _SNAPSHOT_DOWNLOAD, return_value=str(root)
+                        ) as fetch:
+                            package = resolve_flux3_image_package(
+                                repo, variant=variant, revision="r1"
+                            )
+                        self.assertEqual(package.config.model, _MODEL)
+                        self.assertEqual(package.config.dit.flow_map, flow_map)
+                        self.assertEqual(
+                            package.weights, root / prefix / "model.safetensors"
+                        )
+                        self.assertEqual(package.vae, root / "ae.safetensors")
+                        patterns = [
+                            pattern
+                            for call in fetch.call_args_list
+                            for pattern in call.kwargs["allow_patterns"]
+                        ]
+                        self.assertIn(prefix + "model.safetensors", patterns)
+                        self.assertIn("text_encoder/*", patterns)
+                        self.assertNotIn("modular_model_index.json", patterns)
+                        if variant:
+                            self.assertNotIn("model.safetensors", patterns)
+                        self.assertFalse(
+                            [p for p in patterns if "*" in p.split("/")[0]]
+                        )
+                        self.assertEqual(
+                            {
+                                (c.kwargs["repo_id"], c.kwargs["revision"])
+                                for c in fetch.call_args_list
+                            },
+                            {(repo, "r1")},
+                        )
 
 
 class TestFlux3RequestControls(unittest.TestCase):

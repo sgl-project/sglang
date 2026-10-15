@@ -18,7 +18,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 FORMAT_VERSION = 1
-# flux-3-image-klein is the distilled flow map, -base the CFG model.
+# Both release repos use flux-3-image-klein in their config and weight metadata.
+# Sampling mode comes from the weights, not this shared identifier.
 MODEL_NAMES = ("flux-3-image-klein", "flux-3-image-klein-base")
 CONFIG_NAME = "config.json"
 MANIFEST_NAME = "manifest.json"
