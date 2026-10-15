@@ -449,6 +449,9 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
                 )
 
     def test_fasth3_keeps_the_rocm_default_backend(self):
+        if not current_platform.is_rocm():
+            # FastH3 validation resolves the aiter backend class, ROCm-only
+            self.skipTest("requires ROCm")
         args = self._fasth3_args((9, 0), rocm=True)
         self.assertEqual(args.attention_backend, "aiter")
         self.assertEqual(args.component_attention_backends, {})
