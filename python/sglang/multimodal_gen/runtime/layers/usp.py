@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import contextlib
 import logging
 import math
 from typing import TYPE_CHECKING
@@ -15,9 +16,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
+SHM_ALLTOALL_MAX_BYTES = 32 * 1024 * 1024
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -28,6 +31,25 @@ logger = logging.getLogger(__name__)
 
 
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+# depth of open uncached_a2a_staging() blocks
+_UNCACHED_STAGING = 0
+
+
+@contextlib.contextmanager
+def uncached_a2a_staging():
+    """Run the Ulysses exchanges inside the block over NCCL on per-call buffers.
+
+    For a one-off exchange the steady state never repeats (the pipelined
+    attention's first-sight reference): the staging cache and the IPC
+    transports' staging pairs would otherwise stay allocated at its size. An
+    all-to-all is a permutation, so the transport never changes its bytes.
+    """
+    global _UNCACHED_STAGING
+    _UNCACHED_STAGING += 1
+    try:
+        yield
+    finally:
+        _UNCACHED_STAGING -= 1
 
 
 def drop_a2a_staging_buffers() -> None:
@@ -59,7 +81,8 @@ def _a2a_staging_buffer(
     not be shared with eager replays.
     """
     if (
-        torch.is_grad_enabled()
+        _UNCACHED_STAGING
+        or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or device.type != "cuda"
         or torch.cuda.is_current_stream_capturing()
@@ -84,17 +107,41 @@ def _a2a_staging_buffer(
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
-    ulysses_pg = get_sp_group().ulysses_group
+    sp_group = get_sp_group()
+    ulysses_pg = sp_group.ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
+    if x.is_cuda and not _UNCACHED_STAGING and not torch.compiler.is_compiling():
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+            IPC_A2A_MULTI,
+            ipc_a2a_multi_ready,
+        )
+
+        if ipc_a2a_multi_ready(ulysses_pg):
+            world_size = torch.distributed.get_world_size(group=ulysses_pg)
+            received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
+            if received is not None:
+                return received.view(x_shape)
     if role is None:
         output = torch.empty_like(x)
     else:
         output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
+
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
-    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    handle = sp_group.ulysses_shm_handle
+    input_bytes = x.numel() * x.element_size()
+    if (
+        current_platform.is_cpu()
+        and handle is not None
+        and handle >= 0
+        and input_bytes <= SHM_ALLTOALL_MAX_BYTES
+    ):
+        torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
+    else:
+        torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+
     return output.reshape(x_shape)
 
 
@@ -137,6 +184,10 @@ def _ipc_ready_group():
         ipc_a2a_ready,
     )
 
+    # The transport's custom-class handles cannot be traced; a compiled graph
+    # keeps the NCCL all-to-all (traceable) instead of breaking here.
+    if _UNCACHED_STAGING or torch.compiler.is_compiling():
+        return None
     group = get_sp_group().ulysses_group
     return group if ipc_a2a_ready(group) else None
 

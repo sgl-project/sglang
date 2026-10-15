@@ -210,7 +210,6 @@ def build_pool_entry(
     device_evict_fn: Optional[Callable[[int], Any]] = None,
     device_alloc_fn: Optional[Callable[[int], Any]] = None,
     device_free_fn: Optional[Callable[[Any], Any]] = None,
-    device_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
     packed_draft_device_pools: tuple[Any, ...] = (),
 ) -> PoolEntry:
     return PoolEntry(
@@ -223,7 +222,6 @@ def build_pool_entry(
         device_evict_fn=device_evict_fn,
         device_alloc_fn=device_alloc_fn,
         device_free_fn=device_free_fn,
-        device_indices_from_anchor_fn=device_indices_from_anchor_fn,
         packed_draft_device_pools=packed_draft_device_pools,
     )
 
@@ -271,20 +269,15 @@ def build_kv_only_group(
     )
 
 
-def _swa_allocation_callbacks(allocator, bind=None, free_bound=None) -> dict:
+def _swa_allocation_callbacks(allocator) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
     from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 
     if isinstance(allocator, MultiEndedAllocator):
+        # Unified SWA loads into physical reservations, bound before the H2D.
         return dict(
             device_alloc_fn=allocator.alloc_physical,
             device_free_fn=allocator.cancel_physical_reservation,
-        )
-    if bind is not None:
-        assert free_bound is not None
-        return dict(
-            device_indices_from_anchor_fn=bind,
-            device_free_fn=free_bound,
         )
     if allocator is None:
         return {}
@@ -295,13 +288,13 @@ def _uses_unified_page_envelope_host(
     full_kv_pool: Any,
     swa_kv_pool: Any,
     use_mla: bool,
-    mtp_swa_device_pools: tuple[Any, ...] = (),
+    mtp_device_pools: tuple[Any, ...] = (),
 ) -> bool:
     from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
 
     return (
         not use_mla
-        and not mtp_swa_device_pools
+        and not mtp_device_pools
         and all(
             isinstance(pool, UnifiedMHATokenToKVPool)
             for pool in (full_kv_pool, swa_kv_pool)
@@ -327,16 +320,29 @@ def build_hybrid_swa_group(
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     swa_attn_allocator: Any = None,
-    swa_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
-    swa_free_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
+    mtp_full_device_pools: tuple[Any, ...] = (),
     mtp_swa_device_pools: tuple[Any, ...] = (),
+    mtp_swa_full_device_pools: tuple[Any, ...] = (),
+    transfer_layer_id_max: Optional[int] = None,
 ) -> HostPoolGroup:
     """Anchor (full) + SWA host pool group for a hybrid-SWA device pool."""
-    transfer_layer_id_max = (
-        max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
-    )
+    if transfer_layer_id_max is None:
+        transfer_layer_id_max = (
+            max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
+        )
+    if mtp_swa_full_device_pools and kv_host_size:
+        # The sidecar has the anchor's token capacity. Reserve its bytes from
+        # the full-KV budget rather than exceeding an explicit --hicache-size.
+        anchor_pools = (full_kv_pool, *mtp_full_device_pools)
+        shares = _split_hicache_size(
+            kv_host_size, (*anchor_pools, *mtp_swa_full_device_pools)
+        )
+        kv_host_size = sum(shares[: len(anchor_pools)])
     if _uses_unified_page_envelope_host(
-        full_kv_pool, swa_kv_pool, use_mla, mtp_swa_device_pools
+        full_kv_pool,
+        swa_kv_pool,
+        use_mla,
+        mtp_full_device_pools + mtp_swa_device_pools + mtp_swa_full_device_pools,
     ):
         memory = get_memory()
         kv_host_pool, swa_host_pool = (
@@ -358,6 +364,7 @@ def build_hybrid_swa_group(
             page_size=page_size,
             use_mla=use_mla,
             host_size=kv_host_size,
+            mtp_draft_device_pools=mtp_full_device_pools,
             pool_label="full",
         )
         swa_host_pool = build_kv_host_pool(
@@ -368,6 +375,13 @@ def build_hybrid_swa_group(
             mtp_draft_device_pools=mtp_swa_device_pools,
             pool_label="swa",
         )
+    if mtp_full_device_pools:
+        full_layer_mapping = with_packed_draft_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=full_kv_pool.layer_num,
+            draft_layer_num=len(mtp_full_device_pools),
+        )
     if mtp_swa_device_pools:
         swa_layer_mapping = with_packed_draft_layer_mapping(
             swa_layer_mapping,
@@ -375,16 +389,18 @@ def build_hybrid_swa_group(
             target_device_layer_num=swa_kv_pool.layer_num,
             draft_layer_num=len(mtp_swa_device_pools),
         )
-    return HostPoolGroup(
+    group = HostPoolGroup(
         [
             build_pool_entry(
                 name=PoolName.KV,
                 host_pool=kv_host_pool,
                 device_pool=full_kv_pool,
                 layer_mapping=full_layer_mapping,
-                transfer_layer_id_max=transfer_layer_id_max,
+                transfer_layer_id_max=transfer_layer_id_max
+                + len(mtp_full_device_pools),
                 is_anchor=True,
                 host_evict_fn=host_full_evict_fn if has_shared_arena else None,
+                packed_draft_device_pools=mtp_full_device_pools,
             ),
             build_pool_entry(
                 name=PoolName.SWA,
@@ -394,15 +410,58 @@ def build_hybrid_swa_group(
                 transfer_layer_id_max=transfer_layer_id_max + len(mtp_swa_device_pools),
                 host_evict_fn=host_swa_evict_fn,
                 device_evict_fn=device_swa_evict_fn,
-                **_swa_allocation_callbacks(
-                    swa_attn_allocator,
-                    swa_indices_from_anchor_fn,
-                    swa_free_from_anchor_fn,
-                ),
+                **_swa_allocation_callbacks(swa_attn_allocator),
                 packed_draft_device_pools=mtp_swa_device_pools,
             ),
         ]
     )
+    if mtp_swa_full_device_pools:
+        # SWA drafts with full-token addressing may have different head geometry
+        # from full attention. Use a separate host pool with KV indices instead of
+        # packing their bytes into either target pool.
+        first, *rest = mtp_swa_full_device_pools
+        draft_host_pool = get_mha_host_pool_cls(first)(
+            first,
+            host_to_device_ratio=kv_host_pool.size / first.size,
+            host_size=0,
+            page_size=page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            mtp_draft_device_pools=rest,
+            pool_label="draft_swa",
+        )
+        group.add_entry(
+            build_pool_entry(
+                name=PoolName.DRAFT_SWA,
+                host_pool=draft_host_pool,
+                device_pool=first,
+                layer_mapping=with_packed_draft_layer_mapping(
+                    {0: 0},
+                    transfer_layer_start=transfer_layer_id_max,
+                    target_device_layer_num=first.layer_num,
+                    draft_layer_num=len(rest),
+                ),
+                transfer_layer_id_max=transfer_layer_id_max + len(rest),
+                packed_draft_device_pools=tuple(rest),
+            )
+        )
+    return group
+
+
+def _mtp_swa_device_pools(
+    params: CacheInitParams, *, full_indices: bool
+) -> tuple[Any, ...]:
+    return tuple(
+        pool.swa_kv_pool
+        for pool in params.mtp_draft_device_pools
+        if pool.swa_kv_pool.layer_num and pool.swa_uses_full_indices == full_indices
+    )
+
+
+def _mtp_swa_sidecar_specs(group: HostPoolGroup) -> list[SidecarPoolSpec]:
+    if PoolName.DRAFT_SWA not in group.entry_map:
+        return []
+    return [SidecarPoolSpec(PoolName.DRAFT_SWA, indices_from_pool=PoolName.KV)]
 
 
 def build_kv_only_stack(
@@ -471,15 +530,18 @@ def build_hybrid_swa_stack(
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
     )
-    # MTP draft pools follow the target SWA layout; select their SWA storage.
-    mtp_swa_device_pools = tuple(
-        pool.swa_kv_pool for pool in params.mtp_draft_device_pools
+    # Each draft depth may use full or sliding-window attention.
+    mtp_full_device_pools = tuple(
+        pool.full_kv_pool
+        for pool in params.mtp_draft_device_pools
+        if pool.full_kv_pool.layer_num
     )
+    mtp_swa_device_pools = _mtp_swa_device_pools(params, full_indices=False)
 
     kv_host_size = swa_host_size = None
     memory = get_memory()
     if memory.hicache_size > 0 and not _uses_unified_page_envelope_host(
-        full_kv_pool, swa_kv_pool, use_mla, mtp_swa_device_pools
+        full_kv_pool, swa_kv_pool, use_mla, params.mtp_draft_device_pools
     ):
         kv_host_size, swa_host_size = _split_hicache_size(
             memory.hicache_size, (full_kv_pool, swa_kv_pool)
@@ -499,18 +561,9 @@ def build_hybrid_swa_stack(
         device_swa_evict_fn=device_swa_evict_fn,
         # For SWA hybrid, device allocation goes through the inner allocator.
         swa_attn_allocator=params.token_to_kv_pool_allocator.swa_attn_allocator,
-        # Unified SWA binds pages to the full pool's virtual IDs instead.
-        swa_indices_from_anchor_fn=(
-            params.token_to_kv_pool_allocator.bind_swa_for_loaded_rows
-            if get_memory().enable_unified_memory
-            else None
-        ),
-        swa_free_from_anchor_fn=(
-            params.token_to_kv_pool_allocator.free_swa
-            if get_memory().enable_unified_memory
-            else None
-        ),
+        mtp_full_device_pools=mtp_full_device_pools,
         mtp_swa_device_pools=mtp_swa_device_pools,
+        mtp_swa_full_device_pools=_mtp_swa_device_pools(params, full_indices=True),
     )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1128,6 +1181,30 @@ def build_deepseek_v4_hicache_stack(
     return host_pool_group, cache_controller
 
 
+def build_mamba_host_pool(
+    mamba_pool, *, host_size: float, layout: str, mtp_draft_device_pools=()
+):
+    (pool_info,) = mamba_pool.get_device_pool_infos()
+    pool_info.buffer_info.validate(layer_ids=pool_info.layer_ids)
+    draft_buffer_infos = []
+    for draft_pool in mtp_draft_device_pools:
+        (draft_info,) = draft_pool.get_device_pool_infos()
+        draft_info.buffer_info.validate(layer_ids=draft_info.layer_ids)
+        draft_buffer_infos.append(draft_info.buffer_info)
+    capacity = mamba_pool.host_capacity_tokens
+    if capacity is None:
+        capacity = mamba_pool.size
+    return MambaPoolHost(
+        pool_info.buffer_info,
+        get_memory().hicache_ratio,
+        host_size,
+        device_capacity=capacity,
+        mtp_draft_buffer_infos=draft_buffer_infos,
+        allocator_type=_get_allocator_type(),
+        layout=layout,
+    )
+
+
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
@@ -1191,12 +1268,17 @@ def build_hybrid_mamba_stack(
         if get_memory().hicache_mem_layout == "page_first_kv_split"
         else get_memory().hicache_mem_layout
     )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
+        host_size=mamba_host_size,
         layout=mamba_layout,
+        mtp_draft_device_pools=params.mtp_draft_mamba_pools,
+    )
+    mamba_layer_mapping = with_packed_draft_layer_mapping(
+        mamba_layer_mapping,
+        transfer_layer_start=transfer_layer_id_max,
+        target_device_layer_num=mamba_pool.num_mamba_layers,
+        draft_layer_num=len(params.mtp_draft_mamba_pools),
     )
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
         build_pool_entry(
@@ -1204,12 +1286,14 @@ def build_hybrid_mamba_stack(
             host_pool=mamba_host_pool,
             device_pool=mamba_pool,
             layer_mapping=mamba_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max,
+            transfer_layer_id_max=transfer_layer_id_max
+            + len(params.mtp_draft_mamba_pools),
             host_evict_fn=host_mamba_evict_fn,
             device_evict_fn=device_mamba_evict_fn,
             device_alloc_fn=mamba_allocator.alloc,
             device_free_fn=mamba_allocator.free,
-        )
+            packed_draft_device_pools=params.mtp_draft_mamba_pools,
+        ),
     ]
     if qsa_pool is not None:
         entries.append(
@@ -1291,67 +1375,54 @@ def build_hybrid_mamba_swa_stack(
         kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
         )
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=full_kv_pool,
+    host_pool_group = build_hybrid_swa_group(
         page_size=page_size,
+        full_kv_pool=full_kv_pool,
+        swa_kv_pool=swa_kv_pool,
+        full_layer_mapping=full_layer_mapping,
+        swa_layer_mapping=swa_layer_mapping,
         use_mla=False,
-        host_size=kv_host_size,
-        pool_label="full",
+        kv_host_size=kv_host_size,
+        swa_host_size=swa_host_size,
+        host_swa_evict_fn=host_swa_evict_fn,
+        device_swa_evict_fn=device_swa_evict_fn,
+        swa_attn_allocator=swa_attn_allocator,
+        mtp_full_device_pools=tuple(
+            pool.full_kv_pool
+            for pool in params.mtp_draft_device_pools
+            if pool.full_kv_pool.layer_num
+        ),
+        mtp_swa_device_pools=_mtp_swa_device_pools(params, full_indices=False),
+        mtp_swa_full_device_pools=_mtp_swa_device_pools(params, full_indices=True),
+        transfer_layer_id_max=transfer_layer_id_max,
     )
-    swa_host_pool = build_kv_host_pool(
-        kv_pool=swa_kv_pool,
-        page_size=page_size,
-        use_mla=False,
-        host_size=swa_host_size,
-        pool_label="swa",
-    )
-    mamba_host_pool = MambaPoolHost(
+    mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(),
+        host_size=mamba_host_size,
         layout=get_memory().hicache_mem_layout,
+        mtp_draft_device_pools=params.mtp_draft_mamba_pools,
     )
-    entries = [
-        build_pool_entry(
-            name=PoolName.KV,
-            host_pool=kv_host_pool,
-            device_pool=full_kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max,
-            is_anchor=True,
-        ),
-        build_pool_entry(
-            name=PoolName.SWA,
-            host_pool=swa_host_pool,
-            device_pool=swa_kv_pool,
-            layer_mapping=swa_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max,
-            host_evict_fn=host_swa_evict_fn,
-            device_evict_fn=device_swa_evict_fn,
-            **_swa_allocation_callbacks(
-                swa_attn_allocator,
-                params.token_to_kv_pool_allocator.bind_swa_for_loaded_rows
-                if get_memory().enable_unified_memory
-                else None,
-                params.token_to_kv_pool_allocator.free_swa
-                if get_memory().enable_unified_memory
-                else None,
-            ),
-        ),
+    mamba_layer_mapping = with_packed_draft_layer_mapping(
+        mamba_layer_mapping,
+        transfer_layer_start=transfer_layer_id_max,
+        target_device_layer_num=mamba_pool.num_mamba_layers,
+        draft_layer_num=len(params.mtp_draft_mamba_pools),
+    )
+    host_pool_group.add_entry(
         build_pool_entry(
             name=PoolName.MAMBA,
             host_pool=mamba_host_pool,
             device_pool=mamba_pool,
             layer_mapping=mamba_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max,
+            transfer_layer_id_max=transfer_layer_id_max
+            + len(params.mtp_draft_mamba_pools),
             host_evict_fn=host_mamba_evict_fn,
             device_evict_fn=device_mamba_evict_fn,
             device_alloc_fn=mamba_allocator.alloc,
             device_free_fn=mamba_allocator.free,
+            packed_draft_device_pools=params.mtp_draft_mamba_pools,
         ),
-    ]
-    host_pool_group = HostPoolGroup(entries)
+    )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,
@@ -1936,6 +2007,7 @@ class _SwaStrategy(StackStrategy):
                 ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
             },
             pools_desc="Full + SWA",
+            sidecars=_mtp_swa_sidecar_specs(host_pool_group),
         )
 
 
@@ -2005,6 +2077,7 @@ class _MambaSwaStrategy(StackStrategy):
             },
             register_req_to_token_counter=True,
             pools_desc="KV + SWA + MAMBA",
+            sidecars=_mtp_swa_sidecar_specs(host_pool_group),
         )
 
 
