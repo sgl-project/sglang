@@ -729,17 +729,21 @@ class DisaggPrefill:
                 name="bootstrap",
                 reqs=self.bootstrap_queue.queue,
                 abort=self._abort_bootstrap_reqs,
+                counts_queued=True,
             ),
             RequestList(
                 name="prefilling",
                 reqs=self.prefilling,
                 inflight=True,
                 health_check=True,
+                holds_kv=True,
             ),
+            # Their KV is sent until the transfer concludes.
             RequestList(
                 name="transfer",
                 reqs=self.transfer,
                 abort=self._abort_transfer_reqs,
+                holds_kv=True,
             ),
         ]
 

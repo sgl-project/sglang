@@ -1157,7 +1157,6 @@ class Scheduler:
             batch_result_processor=self.batch_result_processor,
             flags=self.flags,
             core_lists=self.lists,
-            pending=self.pending,
             policy=self.policy,
             future_map=self.future_map,
             ngram_embedding_manager=self.ngram_embedding_manager,
@@ -1248,10 +1247,11 @@ class Scheduler:
                 ),
             )
         elif (owner := self.disagg_decode) is not None:
+            lora_ids_in_use = self.request_registry.lora_ids_in_use
             stages = dict(
                 schedule=self.get_next_disagg_decode_batch_to_run,
                 prefetch=owner.prefetch_prefill_dp_rank_queries,
-                intake=owner.intake,
+                intake=functools.partial(owner.intake, lora_ids_in_use=lora_ids_in_use),
                 hold_finished=(
                     owner.hold_finished
                     if self.decode_offload_manager is not None
@@ -1261,6 +1261,7 @@ class Scheduler:
                     _DisaggDecodeRing,
                     owner,
                     schedule=self.get_next_disagg_decode_batch_to_run,
+                    lora_ids_in_use=lora_ids_in_use,
                 ),
             )
         else:

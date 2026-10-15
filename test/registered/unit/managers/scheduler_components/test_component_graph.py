@@ -111,7 +111,6 @@ _DECLARED = {
         "BeamCoordinator",
         "EngineFlags",
         "CoreLists",
-        "PendingSteps",
         "FutureMap",
         "RequestRetirer",
     ],

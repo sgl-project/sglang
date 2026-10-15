@@ -119,7 +119,7 @@ class _DecodeOwner:
     def prefetch_prefill_dp_rank_queries(self):
         self.shell.log("dd.prefetch")
 
-    def intake(self):
+    def intake(self, *, lora_ids_in_use):
         self.shell.log("dd.intake")
 
     def pop_reqs_to_admit(self, slot):
@@ -148,7 +148,7 @@ class _DecodeOwner:
         self.shell.log("dd.apply_retract", slot.index)
         return rids
 
-    def apply_prealloc_consensus(self, rids, slot):
+    def apply_prealloc_consensus(self, rids, slot, *, lora_ids_in_use):
         self.shell.log("dd.apply_prealloc", slot.index)
         return rids
 
@@ -230,6 +230,7 @@ class _Shell:
             s.disaggregation_mode = DisaggregationMode.PREFILL
         elif mode == "decode":
             s.mode_owners.disagg_decode = _DecodeOwner(self)
+            s.request_registry = SimpleNamespace(lora_ids_in_use=set)
             s.disaggregation_mode = DisaggregationMode.DECODE
             s.decode_offload_manager = None
         elif mode == "dllm":

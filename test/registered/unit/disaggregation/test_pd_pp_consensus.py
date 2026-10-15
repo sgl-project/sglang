@@ -41,7 +41,7 @@ class _Channel:
 
 
 def _decode_ring(owner, channel):
-    return _DisaggDecodeRing(owner, channel, 2, schedule=Mock())
+    return _DisaggDecodeRing(owner, channel, 2, schedule=Mock(), lora_ids_in_use=set)
 
 
 class TestDisaggDecodeRing(CustomTestCase):
@@ -86,7 +86,9 @@ class TestDisaggDecodeRing(CustomTestCase):
         ring.exchange_ids(next_slot, next_first_rank_mb_id=0)
 
         owner.apply_retract_consensus.assert_called_once_with(["r", "q"], next_slot)
-        owner.apply_prealloc_consensus.assert_called_once_with([["p"], []], next_slot)
+        owner.apply_prealloc_consensus.assert_called_once_with(
+            [["p"], []], next_slot, lora_ids_in_use=set
+        )
         owner.apply_transfer_consensus.assert_called_once_with(["t"], next_slot)
         self.assertEqual(channel.sent, [["old"]])
         self.assertEqual(ring.consensus_retract_rids, ["r"])

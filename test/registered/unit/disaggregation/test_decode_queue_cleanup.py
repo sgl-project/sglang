@@ -221,7 +221,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             "sglang.srt.disaggregation.decode.poll_and_all_reduce",
             return_value=[KVPoll.Failed],
         ) as poll:
-            preallocated, failed = queue.pop_preallocated([])
+            preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         poll.assert_called_once_with([receiver], queue.gloo_group)
         self.assertEqual(preallocated, [])
@@ -274,7 +274,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.output_streamer = MagicMock()
 
         # Must not raise on the receiver __eq__ above.
-        preallocated, failed = queue.pop_preallocated([])
+        preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [decode_req])
@@ -341,7 +341,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_lora = False
         queue.output_streamer = MagicMock()
 
-        preallocated, failed = queue.pop_preallocated([])
+        preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [decode_req])

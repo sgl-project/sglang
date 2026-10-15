@@ -555,7 +555,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # when the SWA lock was already released for fresh tail allocation.
         queue._allocatable_token_budgets = MagicMock(return_value=3)
 
-        preallocated, failed = queue.pop_preallocated(running_batch.reqs)
+        preallocated, failed = queue.pop_preallocated(
+            running_batch.reqs, lora_ids_in_use=set
+        )
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
