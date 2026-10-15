@@ -226,6 +226,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     dllm_input_preparation = None
     dllm_attention = None
+    # Speculative runners inherit capture without running decode initialization.
+    capture_beam_trie_graph: bool = False
 
     def __init__(
         self,
@@ -1318,11 +1320,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "Breakable CUDA graph is required for --debug-cuda-graph"
             )
 
+        capture_kwargs = {"beam_trie": True} if beam_trie else {}
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs,
             stream_idx=stream_idx,
             num_tokens=num_tokens,
-            beam_trie=beam_trie,
+            **capture_kwargs,
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
