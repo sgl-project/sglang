@@ -79,7 +79,8 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     out_dtype = tl.float16 if FP16 else tl.bfloat16
     if FP8_CACHE:
         slot = tl.load(cache_loc_ptr + token).to(tl.int64)
-        inv_k = 1.0 / tl.load(k_scale_ptr)
+        # Match the cache writer's round-to-nearest reciprocal.
+        inv_k = tl.div_rn(1.0, tl.load(k_scale_ptr).to(tl.float32))
 
     if is_k:
         in_base = k_ptr + token * stride_k_t + local_head * HEAD_DIM
@@ -161,7 +162,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
             head_mask,
             0.0,
         ).to(tl.float32)
-        inv_v = 1.0 / tl.load(v_scale_ptr)
+        inv_v = tl.div_rn(1.0, tl.load(v_scale_ptr).to(tl.float32))
         value_out = v_cache_ptr + slot * stride_v_cache_t + local_head * HEAD_DIM
         tl.store(value_out + head_offs, value * inv_v, head_mask)
 
@@ -198,7 +199,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     cache_loc: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
     Args:

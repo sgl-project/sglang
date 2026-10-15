@@ -35,11 +35,73 @@ def timing(fn):
     return samples
 
 
+def check_scale_boundaries():
+    tokens, heads = 256, 4
+    qg = torch.zeros(tokens, heads * 512, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(tokens, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16)
+    v = torch.nan_to_num(v.view(torch.bfloat16), nan=0, posinf=0, neginf=0)
+    v = v.reshape(tokens, 256)
+    weight = torch.zeros(256, device="cuda", dtype=torch.bfloat16)
+    rope = torch.ones(1, 64, device="cuda")
+    positions = torch.zeros(tokens, device="cuda", dtype=torch.int64)
+    locations = torch.arange(tokens, device="cuda")
+    caches = [
+        tuple(
+            torch.zeros(tokens, 1, 256, device="cuda", dtype=torch.float8_e4m3fn)
+            for _ in range(2)
+        )
+        for _ in range(2)
+    ]
+    scales = (torch.linspace(0.1, 20, 256).bfloat16().float() / 448)[:64].tolist()
+    kscale = torch.ones(1, device="cuda")
+    for value in scales:
+        vscale = torch.tensor([value], device="cuda")
+        q, kn, _ = fused_qk_gemma_rmsnorm_rope_gate(
+            qg, k, weight, weight, rope, positions, 1e-6, heads, 1, 256, 64
+        )
+        fused_fp8_qkv_kv_cache(q, kn, v, *caches[0], locations, kscale, vscale)
+        fused_qk_gemma_rmsnorm_rope_gate(
+            qg,
+            k,
+            weight,
+            weight,
+            rope,
+            positions,
+            1e-6,
+            heads,
+            1,
+            256,
+            64,
+            v=v,
+            kv_cache=caches[1],
+            cache_loc=locations,
+            k_scale=kscale,
+            v_scale=vscale,
+        )
+        for expected, actual in zip(*caches):
+            assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8)), (
+                value
+            )
+    print(
+        json.dumps(
+            dict(
+                scale_boundary_cases=len(scales),
+                bf16_bit_patterns=65536,
+                numerical_verdict="PASS",
+                end_to_end_verdict="PENDING",
+            )
+        ),
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
+    check_scale_boundaries()
     torch.manual_seed(42)
     records = []
     for m in (1, 2, 7, 14):
@@ -67,9 +129,11 @@ def main():
                 )
                 loc = torch.randperm(1024, device="cuda")[:m]
                 loc = loc.int() if seed % 2 else loc
-                value = (0.001, 0.013, 0.1, 1.0)[seed % 4]
+                value = (0.001, 0.013, 0.1, 1.0, 3 / 256, 7 / 256)[seed % 6]
                 kscale = torch.tensor([value], device="cuda")
-                vscale = torch.tensor([value * 1.3], device="cuda")
+                vscale = torch.tensor(
+                    [value if seed % 6 >= 4 else value * 1.3], device="cuda"
+                )
                 stride = 512 if seed % 2 else 256
                 old_kv = tuple(
                     torch.zeros(

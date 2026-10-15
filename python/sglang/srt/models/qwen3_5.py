@@ -1484,6 +1484,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             backend = getattr(backend, "full_attn_backend", backend)
             if (
                 type(backend).__name__ == "TRTLLMHAAttnBackend"
+                and q_gate.dtype == torch.bfloat16
                 and backend.data_type == torch.float8_e4m3fn
                 and not backend.is_xqa_impl
                 and not backend.use_sliding_window_kv_pool
