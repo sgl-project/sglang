@@ -5,11 +5,17 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.numerics import round_bf16_to_fp32
+from sglang.kernels.ops.diffusion.common.platform import is_xpu
 
 # Column tiles per row. One program per whole row padded to a power of two
 # masked off 37.5% of MiniMax-H3's 5376-wide rows; 2048-wide tiles run both
 # kernels ~10% faster on H200 (elementwise, so the bytes are unchanged).
 _MAX_BLOCK_N = 2048
+
+_is_xpu = is_xpu()
+if _is_xpu:
+    from sgl_kernel import indexed_scale_shift_bf16_ as indexed_scale_shift_bf16_xpu
+    from sgl_kernel import indexed_gate_bf16_ as indexed_gate_bf16_xpu
 
 
 def _row_tiles(hidden_size: int) -> tuple[int, int]:
@@ -102,6 +108,9 @@ def indexed_scale_shift_bf16_(
     rows, hidden_size = x.shape
     if rows == 0:
         return x
+    if _is_xpu:
+        indexed_scale_shift_bf16_xpu(x, shift, scale, indices)
+        return x
     block_n, tiles = _row_tiles(hidden_size)
     _indexed_scale_shift_bf16_kernel[(rows, tiles)](
         x,
@@ -129,6 +138,13 @@ def _indexed_gate_bf16(
 ) -> torch.Tensor:
     rows, hidden_size = x.shape
     if rows == 0:
+        return output
+    if _is_xpu:
+        # The SYCL op is in-place only; out-of-place callers (output is not x)
+        # seed output with x first so the mutation lands there instead.
+        if output is not x:
+            output.copy_(x)
+        indexed_gate_bf16_xpu(output, gate, other, indices)
         return output
     block_n, tiles = _row_tiles(hidden_size)
     _indexed_gate_bf16_kernel[(rows, tiles)](
