@@ -56,6 +56,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -179,16 +180,44 @@ class Qwen2MoeMLP(nn.Module):
         prefix: str = "",
         *,
         parallel_group: LinearParallelGroup = "tp",
+        allow_mixed_precision: bool = False,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-            parallel_group=parallel_group,
+        gate_prefix = add_prefix("gate_proj", prefix)
+        up_prefix = add_prefix("up_proj", prefix)
+        split_gate_up = (
+            allow_mixed_precision
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+            and quant_config.should_split_merged_linear([gate_prefix, up_prefix])
         )
+        if split_gate_up:
+            self.gate_up_proj = None
+            self.gate_proj = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=gate_prefix,
+                parallel_group=parallel_group,
+            )
+            self.up_proj = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=up_prefix,
+                parallel_group=parallel_group,
+            )
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+                parallel_group=parallel_group,
+            )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -243,7 +272,12 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
-        gate_up, _ = self.gate_up_proj(x)
+        if self.gate_up_proj is None:
+            gate, _ = self.gate_proj(x)
+            up, _ = self.up_proj(x)
+            gate_up = torch.cat((gate, up), dim=-1)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
