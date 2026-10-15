@@ -1,9 +1,12 @@
 """Launch the inference server."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import sys
 import warnings
+from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.plugins import load_plugins
@@ -13,8 +16,11 @@ from sglang.srt.utils.common import suppress_noisy_warnings
 
 suppress_noisy_warnings()
 
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
-def run_server(server_args):
+
+def run_server(server_args: ServerArgs):
     """Run the server based on the gRPC flags and server_args.encoder_only."""
     # smg-grpc-servicer reads the raw `server_args.tokenizer_path`, which
     # resolution defaults into the stash but never writes back. Seed it here,
