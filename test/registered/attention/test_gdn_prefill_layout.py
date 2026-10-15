@@ -83,6 +83,83 @@ class TestGdnPrefillLayout(unittest.TestCase):
                 )
                 torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
 
+    def test_split_prefill_conv_matches_packed_output_and_cache(self):
+        """Per-group conv on channel slices of x, weight and the cache must equal the packed conv bitwise."""
+        torch.manual_seed(0)
+        q_dim = self.NUM_QK_HEADS * self.HEAD_DIM
+        v_dim = self.NUM_V_HEADS * self.HEAD_DIM
+        dim, width = 2 * q_dim + v_dim, 4
+        # Ragged batches build the compact block table; [300, 7] keeps the rectangular grid.
+        for seq_lens, with_bias in (
+            ([65, 1, 0, 1, 1, 1, 1, 1], True),
+            ([8065] + [1] * 127, False),
+            ([300, 7, 129], False),
+        ):
+            with self.subTest(batch_size=len(seq_lens)):
+                batch_size = len(seq_lens)
+                lengths = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+                starts = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)]).int()
+                qkv = torch.randn(
+                    sum(seq_lens), dim + 256, device="cuda", dtype=torch.bfloat16
+                )[:, :dim]
+                cache_indices = torch.randperm(batch_size + 2, device="cuda")[
+                    :batch_size
+                ].int()
+                cache_indices[-1] = -1
+                states = torch.randn(
+                    batch_size + 2, dim, width - 1, device="cuda", dtype=qkv.dtype
+                )
+                expected_states = states.clone()
+                layer = SimpleNamespace(
+                    conv_weights=torch.randn(
+                        dim, width, device="cuda", dtype=qkv.dtype
+                    ),
+                    bias=(
+                        torch.randn(dim, device="cuda", dtype=qkv.dtype)
+                        if with_bias
+                        else None
+                    ),
+                    activation="silu",
+                    num_q_heads=self.NUM_QK_HEADS,
+                    num_k_heads=self.NUM_QK_HEADS,
+                    num_v_heads=self.NUM_V_HEADS,
+                    head_q_dim=self.HEAD_DIM,
+                    head_k_dim=self.HEAD_DIM,
+                    head_v_dim=self.HEAD_DIM,
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.MIXED,
+                    tbo_parent_token_range=None,
+                    extend_seq_lens_cpu=seq_lens,
+                    extend_prefix_lens=torch.ones(batch_size, device="cuda"),
+                )
+                batch.extend_prefix_lens[0] = 0
+                backend = object.__new__(GDNAttnBackend)
+                backend.device = "cuda"
+                backend.mis_metadata = None
+                backend.forward_metadata = ForwardMetadata(
+                    query_start_loc=starts, mamba_cache_indices=cache_indices
+                )
+                backend._init_prefill_conv_block_table(batch)
+                packed = backend._convolve_prefill(
+                    layer, batch, qkv, expected_states, cache_indices
+                )
+                split = backend._convolve_prefill_split(
+                    layer, batch, qkv, states, cache_indices
+                )
+                valid_tokens = sum(seq_lens[:-1])
+                for actual, expected in zip(
+                    split, packed.split([q_dim, q_dim, v_dim], dim=-1)
+                ):
+                    self.assertTrue(actual.is_contiguous())
+                    torch.testing.assert_close(
+                        actual[0, :valid_tokens].flatten(1),
+                        expected[:valid_tokens],
+                        rtol=0,
+                        atol=0,
+                    )
+                torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+
     def _projection_views(self, dtype):
         qkv_dim = (
             2 * self.NUM_QK_HEADS * self.HEAD_DIM + self.NUM_V_HEADS * self.HEAD_DIM
