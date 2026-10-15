@@ -776,11 +776,10 @@ class ByteApplyGroup:
 
 def plan_apply(outputs):
     """One affine batch with runtime contracts, without model names."""
-    groups, transformed = {}, []
+    groups = {}
     for binding, offset, size in outputs:
         if not binding.destinations:
-            transformed.append((binding, offset, size))
-            continue
+            raise ValueError("GPU delta apply requires affine byte destinations")
         canonical = torch.empty(size, dtype=torch.uint8, device="meta")
         source = binding.selected_bytes(canonical)
         ss, st = _normalize(source.shape, source.stride())
@@ -791,10 +790,10 @@ def plan_apply(outputs):
             sources.append(offset + source.storage_offset())
             targets.append(target.data_ptr())
     if not groups:
-        return None, transformed
+        return None
     sources, targets, contracts = [], [], []
     for contract, (group_sources, group_targets) in groups.items():
         contracts.append((contract, len(group_sources)))
         sources.extend(group_sources)
         targets.extend(group_targets)
-    return ByteApplyGroup(sources, targets, tuple(contracts)), transformed
+    return ByteApplyGroup(sources, targets, tuple(contracts))

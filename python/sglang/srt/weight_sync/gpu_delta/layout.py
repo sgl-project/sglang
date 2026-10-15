@@ -13,23 +13,28 @@ import hashlib
 import math
 import os
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Callable
 
 import numpy as np
 import orjson
 import torch
-
 from sglang.srt.weight_sync.gpu_delta.bindings import (
     _ITEMSIZES,
     BACKEND_LAYOUTS,
     ConsumerSnapshot,
     _digest,
     _tensor_identity,
-    moe_derived_images,
+    validate_ue8m0_payload,
 )
+from sglang.srt.weight_sync.gpu_delta.derived import (
+    nvfp4_derived_update,
+    plan_updates,
+    prepare_updates,
+)
+from sglang.srt.weight_sync.gpu_delta.flashinfer import consumer_objects
 from sglang.srt.weight_sync.gpu_delta.models import model_mapping
 
 
@@ -42,11 +47,12 @@ class GpuDeltaLayout:
         self.model = model
         if not inventory:
             raise ValueError("canonical checkpoint metadata is unavailable")
-        self.inventory = inventory
+        # Normalize negotiated wire metadata without changing checkpoint inventory.
+        self.inventory = {name: dict(meta) for name, meta in inventory.items()}
         mapping = model_mapping(model)
         self.bindings = []
         self.excluded = mapping.parameters.excluded
-        for name, meta in inventory.items():
+        for name, meta in self.inventory.items():
             binding = mapping.bind(name, meta)
             if binding is not None:
                 self.bindings.append(binding)
@@ -56,19 +62,26 @@ class GpuDeltaLayout:
 
             _require_fixed_moe_topology(get_exec().moe)
         self.derived = []
+        self.derived_updates = []
         self._consumers = []
         for prefix, layer in mapping.parameters.moe_layers.items():
-            self.derived.extend(moe_derived_images(prefix, layer))
+            layout = mapping.parameters.moe_layouts[prefix]
+            if layout.format == "nvfp4":
+                self.derived_updates.append(nvfp4_derived_update(layer, layout.backend))
             self._consumers.append(
                 ConsumerSnapshot(
-                    lambda layer=layer: (
-                        layer._cutedsl_wrapper,
-                        layer._cutedsl_scales,
-                        layer._cutedsl_scales[0],
-                        layer._cutedsl_scales[2],
-                    )
+                    lambda layer=layer, layout=layout: consumer_objects(layer, layout)
                 )
             )
+        self.derived_updates = plan_updates(
+            self.derived_updates,
+            [
+                target
+                for binding in self.bindings
+                if binding.encoding == "raw_bytes"
+                for target in binding.storage
+            ],
+        )
         mapping.finish()
         self.derived.extend(mapping.derived)
         self._consumers.extend(mapping.consumers)
@@ -132,12 +145,18 @@ def _require_fixed_moe_topology(moe):
         or moe.elastic_ep_backend is not None
         or moe.init_expert_location != "trivial"
         or moe.ep_num_redundant_experts != 0
-        or moe.moe_a2a_backend != "none"
-        or moe.moe_runner_backend != "flashinfer_cutedsl"
+        or (moe.moe_runner_backend, moe.moe_a2a_backend)
+        not in {
+            ("flashinfer_trtllm", "none"),
+            ("flashinfer_trtllm_routed", "none"),
+            ("flashinfer_mxfp4", "none"),
+            ("flashinfer_cutedsl", "none"),
+            ("flashinfer_megamoe", "flashinfer_megamoe"),
+        }
     ):
         raise ValueError(
             "direct GPU deltas require fixed trivial EP, no redundant experts or EPLB, "
-            "and flashinfer_cutedsl with moe_a2a_backend=none"
+            "and a native FlashInfer runner with its matching dispatcher"
         )
 
 
@@ -181,8 +200,9 @@ class GpuDeltaBackend:
         }
 
     def prepare(self, manifest_path, manifest_sha256, metadata):
-        # Called by the session's background worker: no weight reads, writes,
-        # collectives, loader hooks or generation-stream synchronization here.
+        # Called by the background worker. Small scalar calibration may be read
+        # to prepare derived values; no live writes, collectives, loader hooks
+        # or generation-stream synchronization occur here.
         with torch.cuda.device(self.device):
             prepared = PreparedDelta.__new__(PreparedDelta)
             try:
@@ -201,7 +221,6 @@ class GpuDeltaBackend:
 class _PreparedBatch:
     decoder: object
     apply: Callable[[], None] | None
-    transformed: list[tuple[Callable, torch.Tensor]]
     zero_ranges: list[torch.Tensor]
     check_status: Callable[[], None]
 
@@ -241,8 +260,14 @@ def _plan_layers(backend, bindings, entries, layers_per_batch=1):
                 nbytes = entries[binding.name]["nbytes"]
                 outputs.append((binding, offset, nbytes))
                 size = offset + nbytes
-            apply, transformed = plan_apply(outputs)
-            plans.append((outputs, size, apply, transformed))
+            # Segment views share one decoded canonical payload. Only the apply
+            # plan expands them; DE membership and output offsets stay unique.
+            apply_outputs = [
+                (view, offset, nbytes)
+                for binding, offset, nbytes in outputs
+                for view in binding.apply_bindings()
+            ]
+            plans.append((outputs, size, plan_apply(apply_outputs)))
         backend.batch_plan = (key, plans)
     return backend.batch_plan[1]
 
@@ -251,12 +276,12 @@ def _plan_decode(plans, entries, records):
     """Pack fresh frame rows and omitted ranges for every cached layer batch."""
     counts = [
         sum(len(entries[binding.name]["frames"]) for binding, _, _ in outputs)
-        for outputs, _, _, _ in plans
+        for outputs, _, _ in plans
     ]
     gaps = [[] for _ in plans]
 
     def rows():
-        for batch, (outputs, _, _, _) in enumerate(plans):
+        for batch, (outputs, _, _) in enumerate(plans):
             for binding, output_offset, size in outputs:
                 input_offset = records[binding.name]["offset"]
                 cursor = 0
@@ -303,12 +328,20 @@ def _qualify_canonical_plan(backend, manifest):
         if entry["nbytes"] != math.prod(entry["shape"]) * _ITEMSIZES[
             entry["dtype"]
         ] or entry["encoding"] != (
-            "raw_bytes" if len(entry["shape"]) <= 1 else "xor_bytes"
+            canonical.get(
+                "encoding", "raw_bytes" if len(entry["shape"]) <= 1 else "xor_bytes"
+            )
         ):
             raise ValueError(f"unsupported canonical tensor size/encoding: {name}")
-        definitions.append(
-            {key: entry[key] for key in ("name", "dtype", "shape", "encoding", "views")}
-        )
+        definition = {
+            key: entry[key] for key in ("name", "dtype", "shape", "encoding", "views")
+        }
+        # Wire format is bound by the negotiated plan digest. Publication frames
+        # intentionally carry only byte payload geometry, not another format copy.
+        for key in ("format", "checkpoint_dtype"):
+            if key in canonical:
+                definition[key] = canonical[key]
+        definitions.append(definition)
     for binding in backend.layout.bindings:
         views = entries[binding.name]["views"]
         matching = [view for view in views if view["id"] == binding.view_id]
@@ -392,14 +425,18 @@ class PreparedDelta:
         self.timings["host_rank_prepare_s"] = time.perf_counter() - payload_started
 
         tensors_started = time.perf_counter()
-        compressed, raw_entries = [], []
+        compressed, raw_entries, ue8m0_entries = [], [], []
         for binding in backend.layout.bindings:
             entry = entries[binding.name]
             if binding.encoding == "raw_bytes":
                 if entry["changed_bytes"]:
-                    raw_entries.append((binding, entry))
+                    group = ue8m0_entries if binding.raw_ue8m0 else raw_entries
+                    group.append((binding, entry))
             elif entry["frames"]:
                 compressed.append(binding)
+        # Compact scales form one prefix for validation and native GPU expansion.
+        raw_entries = ue8m0_entries + raw_entries
+        self.raw_ue8m0_bytes = sum(entry["nbytes"] for _, entry in ue8m0_entries)
         previous_plan = backend.batch_plan
         self.static_plans = _plan_layers(backend, compressed, entries, layers_per_batch)
         self.timings["host_batch_plan_reused"] = int(
@@ -418,7 +455,9 @@ class PreparedDelta:
         raw_started = time.perf_counter()
         raw_targets, raw_h2d_bytes = [], 0
         for binding, entry in raw_entries:
-            position = (raw_h2d_bytes + 7) // 8 * 8
+            position = (
+                raw_h2d_bytes if binding.raw_ue8m0 else (raw_h2d_bytes + 7) // 8 * 8
+            )
             size = entry["nbytes"]
             raw_targets.append((binding, position, size))
             raw_h2d_bytes = position + size
@@ -429,6 +468,8 @@ class PreparedDelta:
         for binding, position, size in raw_targets:
             source = memoryview(self.host_snapshot.get(binding.name).numpy())
             raw_view[position : position + size] = source
+        if self.raw_ue8m0_bytes:
+            validate_ue8m0_payload(self.raw_pinned[: self.raw_ue8m0_bytes])
         changed_storages = {
             pointer
             for binding in compressed + [binding for binding, _ in raw_entries]
@@ -469,20 +510,37 @@ class PreparedDelta:
         self.decoded_free = [torch.cuda.Event() for _ in range(self.decode_stages)]
         with torch.cuda.stream(self.stream):
             self.raw_device = self.raw_pinned.to(self.device, non_blocking=True)
+            expanded_ue8m0 = None
+            if self.raw_ue8m0_bytes:
+                # Native UE8M0 conversion preserves every finite value, including
+                # exponent byte zero (2^-127), in one cast for the entire prefix.
+                expanded_ue8m0 = (
+                    self.raw_device[: self.raw_ue8m0_bytes]
+                    .view(torch.float8_e8m0fnu)
+                    .to(torch.float32)
+                )
             for binding, position, size in raw_targets:
                 payload = self.raw_device[position : position + size]
-                target = binding.storage[0]
-                source = binding.selected_bytes(payload).view(binding.torch_dtype)
-                source = source.reshape(target.shape).to(target.dtype)
-                targets, sources = self.raw_copies.setdefault(target.dtype, ([], []))
-                targets.append(target)
-                sources.append(source)
+                expanded = (
+                    expanded_ue8m0[position : position + size]
+                    if binding.raw_ue8m0
+                    else None
+                )
+                for target, source in binding.raw_sources(payload, expanded):
+                    targets, sources = self.raw_copies.setdefault(
+                        target.dtype, ([], [])
+                    )
+                    targets.append(target)
+                    sources.append(source)
+            self.derived.extend(
+                prepare_updates(backend.layout.derived_updates, self.raw_copies)
+            )
             self.error = torch.zeros(1, dtype=torch.int32, device=self.device)
             from sglang.srt.weight_sync.gpu_delta.apply import _compiled
 
             compile_started = time.perf_counter()
             cache_before = _compiled.cache_info()
-            for _, _, group, _ in self.static_plans:
+            for _, _, group in self.static_plans:
                 if group is not None:
                     group.prepare_metadata(self.device.index)
             cache_after = _compiled.cache_info()
@@ -497,7 +555,7 @@ class PreparedDelta:
             self.apply_host_metadata = torch.empty(
                 sum(
                     2 * len(group.sources) + group.metadata_size
-                    for _, _, group, _ in self.static_plans
+                    for _, _, group in self.static_plans
                     if group is not None
                 ),
                 dtype=torch.int64,
@@ -554,7 +612,7 @@ class PreparedDelta:
         indices = [[] for _ in range(self.decode_stages)]
         offsets = [[] for _ in range(self.decode_stages)]
         position = 0
-        for index, (_, _, group, _) in enumerate(self.static_plans):
+        for index, (_, _, group) in enumerate(self.static_plans):
             if group is None:
                 self.apply_bindings.append(None)
                 continue
@@ -587,7 +645,7 @@ class PreparedDelta:
     def _bind_apply_metadata(self):
         """Patch only actual source bases; misalignment retains the generic path."""
         groups, calls = [], []
-        for index, (_, _, group, _) in enumerate(self.static_plans):
+        for index, (_, _, group) in enumerate(self.static_plans):
             if group is None:
                 calls.append(None)
                 continue
@@ -632,22 +690,13 @@ class PreparedDelta:
             )
             apply_groups, apply_calls = self._bind_apply_metadata()
             self.apply_metadata.copy_(self.apply_host_metadata, non_blocking=True)
-            for index, ((_, _, group, transformed), decode) in enumerate(
-                zip(self.static_plans, decoders)
-            ):
+            for index, decode in enumerate(decoders):
                 scratch = self.decoded[index % self.decode_stages]
                 apply = apply_calls[index]
                 self.batches.append(
                     _PreparedBatch(
                         decode,
                         apply,
-                        [
-                            (
-                                binding.xor,
-                                binding.selected_bytes(scratch[offset : offset + size]),
-                            )
-                            for binding, offset, size in transformed
-                        ],
                         [
                             scratch[offset : offset + size]
                             for offset, size in self.gaps[index]
@@ -668,7 +717,7 @@ class PreparedDelta:
             apply_word32_contracts=sum(
                 group.word32_contracts for group in apply_groups
             ),
-            transformed_tensors=sum(len(batch.transformed) for batch in self.batches),
+            transformed_tensors=0,
             decoded_buffers=len(self.decoded),
             decoded_scratch_bytes=len(self.decoded) * self.max_decoded,
         )
@@ -786,13 +835,12 @@ class PreparedDelta:
             batch.check_status()
             if batch.apply is not None:
                 batch.apply()
-            for apply, payload in batch.transformed:
-                apply(torch.where(self.error == 0, payload, 0))
 
     def _release_gpu(self):
         self.batches.clear()
         self.status_checks.clear()
         self.raw_copies.clear()
+        self.derived = []
         self.apply_bindings.clear()
         self.apply_source_patches.clear()
         self.apply_fallback_groups.clear()

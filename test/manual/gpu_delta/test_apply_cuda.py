@@ -12,7 +12,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.weight_sync.gpu_delta.apply import (
     BLOCK,
     ByteApplyGroup,
@@ -173,8 +172,7 @@ def test_changed_counts_layouts_and_alignment_reuse_three_fixed_modules_and_exac
         scratch = torch.zeros(length, dtype=torch.uint8, device="cuda")
         for (_, offset, size), (_, mask, *_) in zip(outputs, items):
             scratch[offset : offset + size].copy_(mask)
-        group, transformed = plan_apply(outputs)
-        assert not transformed
+        group = plan_apply(outputs)
         group.prepare_metadata(scratch.device.index)
         assert group.kernels == kernels
         group.bind(scratch)
@@ -252,7 +250,7 @@ def test_grid_stride_covers_group_boundaries_empty_groups_and_partial_tiles():
 
 def prepared(groups):
     owner = PreparedDelta.__new__(PreparedDelta)
-    owner.static_plans = [(None, None, group, []) for group in groups]
+    owner.static_plans = [(None, None, group) for group in groups]
     owner.decode_stages = 2
     owner.apply_bindings = []
     owner.apply_source_patches = []

@@ -12,7 +12,6 @@ from __future__ import annotations
 import re
 
 import torch
-
 from sglang.srt.weight_sync.gpu_delta.bindings import (
     ConsumerSnapshot,
     DerivedImage,
@@ -39,7 +38,6 @@ def _indexer_norm_binding(name, meta, target):
         meta["dtype"],
         tuple(meta["shape"]),
         _full_slices(meta["shape"]),
-        None,
         (target,),
         encoding="raw_bytes",
     )

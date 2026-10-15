@@ -13,47 +13,22 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
-from typing import Callable
 
 import torch
+from sglang.srt.weight_sync.gpu_delta.flashinfer import (
+    DestinationSegment,
+    FlashInferLayout,
+    expert_destinations,
+    expert_scale_target,
+    identify_layout,
+)
 
 BACKEND_LAYOUTS = {
     "dense": "unquantized-tp",
-    "moe": "flashinfer-cutedsl-nvfp4-w4a16",
+    "moe": "flashinfer-native-byte-layouts",
 }
-
-
-def swizzle_scale_bytes(scale: torch.Tensor) -> torch.Tensor:
-    """NVFP4 128x4 block-scale permutation, with *zero* mask padding."""
-    if scale.dtype != torch.uint8 or scale.ndim < 2:
-        raise ValueError("block-scale layout requires uint8 matrices")
-    rows, cols = scale.shape[-2:]
-    padded_rows, padded_cols = (rows + 127) // 128 * 128, (cols + 3) // 4 * 4
-    out = scale.new_zeros((*scale.shape[:-2], padded_rows, padded_cols))
-    out[..., :rows, :cols].copy_(scale)
-    batch = math.prod(out.shape[:-2])
-    return (
-        out.reshape(batch, padded_rows // 128, 4, 32, padded_cols // 4, 4)
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-        .reshape(out.shape)
-    )
-
-
-def cutedsl_scale_delta(mask: torch.Tensor, projection: str) -> torch.Tensor:
-    """Map one NVFP4 projection's XOR mask to CuTe's padded scale storage."""
-    if projection != "down":
-        rows, cols = mask.shape
-        if rows % 64:
-            raise ValueError("CuTe DSL gate/up scale rows must be divisible by 64")
-        # CuTe gate/up storage interleaves up-first 64-row groups.
-        grouped = mask.reshape(rows // 64, 64, cols)
-        zero = torch.zeros_like(grouped)
-        pair = (zero, grouped) if projection == "gate" else (grouped, zero)
-        mask = torch.stack(pair, dim=1).reshape(2 * rows, cols)
-    return swizzle_scale_bytes(mask)
 
 
 _DTYPES = {
@@ -91,15 +66,23 @@ class TensorBinding:
     dtype: str
     shape: tuple[int, ...]
     slices: list[list[int]]
-    xor: Callable[[torch.Tensor], None] | None
     storage: tuple[torch.Tensor, ...]
     encoding: str = "xor_bytes"
     destinations: tuple[torch.Tensor, ...] = ()
+    segments: tuple[DestinationSegment, ...] = ()
+    format: str | None = None
+    checkpoint_dtype: str | None = None
 
     def __post_init__(self):
         # The admitted binding is immutable for the session. Keep dtype and
         # slicing metadata off the paused per-tensor application path.
         self.torch_dtype = _TORCH_DTYPES[self.dtype]
+        self.raw_ue8m0 = self.format == "fp8-block128-ue8m0" and self.dtype == "U8"
+        if self.raw_ue8m0 and (
+            self.encoding != "raw_bytes"
+            or any(target.dtype != torch.float32 for target in self.storage)
+        ):
+            raise ValueError("block128 UE8M0 requires the admitted FP32 API image")
         self._selection = tuple(slice(start, stop) for start, stop in self.slices)
         layer = re.search(r"(?:^|\.)layers\.(\d+)\.", self.name)
         self.layer = int(layer[1]) if layer else None
@@ -113,19 +96,67 @@ class TensorBinding:
         return _digest({"name": self.name, "slices": self.slices})
 
     def describe(self):
-        return {
+        result = {
             "name": self.name,
             "dtype": self.dtype,
             "shape": list(self.shape),
             "encoding": self.encoding,
             "views": [{"id": self.view_id, "slices": self.slices}],
         }
+        if self.format is not None:
+            result["format"] = self.format
+        if self.checkpoint_dtype is not None:
+            result["checkpoint_dtype"] = self.checkpoint_dtype
+        return result
+
+    def apply_bindings(self):
+        """Return byte-layout pieces without adding negotiated tensor views."""
+        return self._apply_views
+
+    @cached_property
+    def _apply_views(self):
+        if not self.segments:
+            return (self,)
+        return tuple(
+            replace(
+                self,
+                slices=[list(axis) for axis in segment.slices],
+                destinations=segment.destinations,
+                segments=(),
+            )
+            for segment in self.segments
+        )
+
+    def raw_sources(self, payload, expanded=None):
+        """Bind complete values; UE8M0 expansion is batched by the preparer."""
+        if self.encoding != "raw_bytes":
+            raise ValueError("raw sources require a complete-value binding")
+        if self.raw_ue8m0:
+            if expanded is None:
+                raise ValueError("UE8M0 scales require a prepared FP32 payload")
+            value = expanded.reshape(self.shape)[self._selection]
+            return tuple(
+                (target, value.reshape(target.shape)) for target in self.storage
+            )
+        value = self.selected_bytes(payload).view(self.torch_dtype)
+        return tuple(
+            (target, value.reshape(target.shape).to(target.dtype))
+            for target in self.storage
+        )
 
     def selected_bytes(self, canonical_bytes):
         value = canonical_bytes.view(self.torch_dtype).reshape(self.shape)
         # Keep column-sharded selections as views of reusable decoded scratch.
         # The decoder fills this storage after preparation; never cache a copy.
         return _byte_view(value[self._selection])
+
+
+def validate_ue8m0_payload(payload):
+    """Validate the complete packed scale prefix on CPU before its single H2D."""
+    if payload.device.type != "cpu" or payload.dtype != torch.uint8:
+        raise ValueError("UE8M0 admission requires a CPU byte payload")
+    if payload.numpy().max(initial=0) == 255:
+        raise ValueError("UE8M0 scale payload contains NaN")
 
 
 def _byte_view(tensor):
@@ -154,111 +185,117 @@ def _direct_binding(name, meta, target, slices=None):
         meta["dtype"],
         tuple(meta["shape"]),
         slices,
-        None,
         (target,),
         encoding="raw_bytes" if direct else "xor_bytes",
         destinations=() if direct else (_byte_view(target),),
+        format=meta.get("format"),
+        checkpoint_dtype=meta.get("checkpoint_dtype"),
     )
 
 
-def _same_storage(a, b):
-    return (
-        a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
-        and a.storage_offset() * a.element_size()
-        == b.storage_offset() * b.element_size()
-        and a.numel() * a.element_size() == b.numel() * b.element_size()
-    )
+def _normalize_expert_meta(meta, layout, suffix):
+    if layout.format != "fp8-block128-ue8m0":
+        return
+    if suffix == "weight":
+        if meta["dtype"] != "F8_E4M3":
+            raise ValueError("block128 FP8 requires canonical E4M3 weights")
+    elif suffix == "weight_scale_inv":
+        if meta["dtype"] == "F32":
+            meta["checkpoint_dtype"] = "F32"
+            meta["dtype"] = "U8"
+        elif meta["dtype"] != "U8":
+            raise ValueError("block128 FP8 requires exact UE8M0 scale values")
+        meta["encoding"] = "raw_bytes"
+    else:
+        raise ValueError(f"unclassified block128 FP8 expert tensor: {suffix}")
+    meta["format"] = layout.format
 
 
-def _scale_images(layer, stem, expert):
-    """Return each independent swizzled image, including the MMA view."""
-    primary = getattr(layer, f"{stem}_blockscale_swizzled")[expert]
-    images = [primary]
-    mma = getattr(layer, f"{stem}_blockscale_mma", None)
-    if mma is not None:
-        # Public FlashInfer MMA logical axes: (32,4,mtiles,4,ktiles,E).
-        # Permuting them back describes physical storage, without rebuilding it.
-        physical = mma[..., expert].permute(2, 4, 0, 1, 3)
-        if not physical.is_contiguous():
-            raise ValueError("unsupported nonstandard CuTe DSL MMA physical strides")
-        physical = physical.view(primary.shape).view(primary.dtype)
-        if not any(_same_storage(physical, current) for current in images):
-            images.append(physical)
-    source = getattr(layer, f"{stem}_weight_scale")[expert]
-    if not any(_same_storage(source, current) for current in images):
-        # Ordinary process_weights_after_loading keeps this swizzled too when
-        # aliasing succeeds. A distinct canonical reload buffer is not consumed
-        # by the kernel and needs its own explicit mapping; reject for now.
-        raise ValueError("NVFP4 source scale does not alias the prepared scale image")
-    return images
-
-
-def _moe_binding(name, meta, layer, expert, projection, suffix):
-    local = layer._map_global_expert_id_to_local_expert_id(expert)
+def _moe_binding(name, meta, layer, expert, projection, suffix, layout=None):
+    # Keep the direct CuTe binding helper usable independently of serving setup.
+    if layout is None:
+        layout = FlashInferLayout("nvfp4", "cutedsl", True, "w4a16", up_first=True)
+    _normalize_expert_meta(meta, layout, suffix)
+    if not layout.gated and projection == "gate":
+        raise ValueError("non-gated experts have no gate projection")
     stem = "w2" if projection == "down" else "w13"
     half = 0 if projection == "gate" else 1  # scalar metadata stays gate-first
-    if suffix == "input_scale":
-        # ModelOpt's CuTe DSL W4A16 preparation neutralizes checkpoint activation
-        # scales; BF16 activations never consume these calibration buffers.
-        return None
+    if suffix == "input_scale" and layout.format == "nvfp4":
+        if layout.quant_mode == "w4a16" or layer.quant_config.use_per_token_activation:
+            return None
+        # Calibration is global even when this expert's weights belong to a
+        # different EP rank: the ordinary consumer uses the shared maximum.
+        target = getattr(layer, f"{stem}_input_scale")
+        target = (
+            target[expert, half]
+            if projection != "down" and layout.gated
+            else target[expert]
+        )
+        return _direct_binding(name, meta, target)
+    local = layer._map_global_expert_id_to_local_expert_id(expert)
     if local < 0:
         return None
-    if suffix == "weight_scale_2":
+    if suffix == "weight_scale_2" and layout.format == "nvfp4":
         target = getattr(layer, f"{stem}_weight_scale_2")
-        target = target[local] if projection == "down" else target[local, half]
+        target = (
+            target[local, half]
+            if projection != "down" and layout.gated
+            else target[local]
+        )
         return _direct_binding(name, meta, target)
-    if suffix == "weight":
-        target = getattr(layer, f"{stem}_weight")[local]
-        if projection != "down":
-            rows, cols = target.shape
-            if rows % 128:
-                raise ValueError("CuTe DSL gate/up rows must be divisible by 128")
-            # Inference weights are [up0:64,gate0:64,up64:128,gate64:128,...].
-            target = target.reshape(rows // 128, 2, 64, cols)[:, 1 - half]
-        return _direct_binding(name, meta, target)
-    if suffix != "weight_scale":
-        raise ValueError(f"unclassified NVFP4 canonical expert tensor: {name}")
-    if meta["dtype"] != "F8_E4M3" or len(meta["shape"]) != 2:
-        raise ValueError(f"invalid NVFP4 blockscale tensor: {name}")
-    rows, cols = meta["shape"]
-    full_rows = rows if projection == "down" else 2 * rows
-    images = _scale_images(layer, stem, local)
-    for image in images:
-        if image.numel() != ((full_rows + 127) // 128 * 128) * ((cols + 3) // 4 * 4):
-            raise ValueError(f"unexpected scale padding geometry: {name}")
-
-    group = 128 if projection == "down" else 64
-    destinations = []
-    xor = None
-    if (
-        rows % group == 0
-        and cols % 4 == 0
-        and all(image.is_contiguous() for image in images)
-    ):
-        # Physical scale axes: row tile, column tile, row within 32,
-        # row group within 128, column within 4. Gate/up own disjoint groups.
-        for image in images:
-            view = image.view(torch.uint8).view(rows // group, cols // 4, 32, 4, 4)
-            if projection != "down":
-                start = 2 if projection == "gate" else 0  # CuTe DSL is up-first.
-                view = view[:, :, :, start : start + 2, :]
-            destinations.append(view.permute(0, 3, 2, 1, 4))
-    else:
-
-        def xor(mask):
-            transformed = cutedsl_scale_delta(mask.reshape(rows, cols), projection)
-            for image in images:
-                image.view(torch.uint8).bitwise_xor_(transformed)
-
+    if layout.format == "fp8-block128-ue8m0" and suffix == "weight_scale_inv":
+        target = expert_scale_target(layer, layout, local, projection, meta["shape"])
+        return TensorBinding(
+            name,
+            meta["dtype"],
+            tuple(meta["shape"]),
+            _full_slices(meta["shape"]),
+            (target,),
+            encoding="raw_bytes",
+            format=meta["format"],
+            checkpoint_dtype=meta.get("checkpoint_dtype"),
+        )
+    byte_suffix = suffix
+    if layout.format == "mxfp8" and suffix == "weight_scale_inv":
+        byte_suffix = "weight_scale"
+    elif layout.format == "mxfp4" and suffix == "weight_packed":
+        byte_suffix = "weight"
+    segments = expert_destinations(
+        layer,
+        layout,
+        local,
+        projection,
+        byte_suffix,
+        tuple(meta["shape"]),
+        meta["dtype"],
+    )
+    storage = {}
+    for segment in segments:
+        for target in segment.destinations:
+            storage.setdefault(target.untyped_storage().data_ptr(), target)
     return TensorBinding(
         name,
         meta["dtype"],
         tuple(meta["shape"]),
         _full_slices(meta["shape"]),
-        xor,
-        tuple(images),
-        destinations=tuple(destinations),
+        tuple(storage.values()),
+        segments=segments,
+        format=meta.get("format"),
+        checkpoint_dtype=meta.get("checkpoint_dtype"),
     )
+
+
+def _identify_moe_layout(layer):
+    # All ordinary expert methods initialize runner. The direct TRTLLM wrapper
+    # sets it to None and dispatches using the explicit runtime selection.
+    runner = layer.quant_method.runner
+    if runner is None:
+        from sglang.srt.runtime_context import get_exec
+
+        backend = get_exec().moe.moe_runner_backend
+    else:
+        backend = runner.runner_backend
+    return identify_layout(layer, backend)
 
 
 @dataclass
@@ -329,44 +366,6 @@ def dense_target(name, meta, module, target, slices):
     return target, slices
 
 
-def moe_derived_images(prefix, layer):
-    derived = []
-    # W4A16 neutralizes activation scales, so no reciprocal/reduction of
-    # arbitrary mask bit patterns appears here. ModelOpt's FP32 scale
-    # parameters supply live views, never admission-time value copies.
-    gate = layer.w13_weight_scale_2[:, 0]
-    up = layer.w13_weight_scale_2[:, 1]
-    down = layer.w2_weight_scale_2
-    for name, destination, source in (
-        ("g1_alphas", layer.g1_alphas, gate),
-        ("g1_alphas_up", layer.g1_alphas_up, up),
-        ("g2_alphas", layer.g2_alphas, down),
-    ):
-        derived.append(DerivedImage(f"{prefix}.{name}", destination, source))
-    if layer._cutedsl_wrapper is None:
-        raise ValueError(
-            "CuTe DSL warmup must initialize its wrapper before delta admission"
-        )
-    if layer._cutedsl_wrapper.quant_mode != "w4a16":
-        raise ValueError("prepared CuTe DSL wrapper is not W4A16")
-    # Standard CuTe DSL uses the gate alpha for its fused GEMM1.
-    derived.extend(
-        (
-            DerivedImage(
-                f"{prefix}._cutedsl_scales.0",
-                layer._cutedsl_scales[0],
-                gate,
-            ),
-            DerivedImage(
-                f"{prefix}._cutedsl_scales.2",
-                layer._cutedsl_scales[2],
-                down,
-            ),
-        )
-    )
-    return derived
-
-
 class ConsumerSnapshot:
     """Read live consumer fields without retaining a stale replacement tensor."""
 
@@ -415,6 +414,7 @@ class ParameterBindings:
         ]
         self.excluded = {}
         self.moe_layers = {}
+        self.moe_layouts = {}
 
     def bind(self, name, meta, target_name, target=None):
         if meta["dtype"] not in _DTYPES.values():
@@ -428,21 +428,24 @@ class ParameterBindings:
             if layer is None:
                 raise ValueError(f"canonical expert has no runtime layer: {name}")
             if prefix not in self.moe_layers:
-                if (
-                    layer.moe_tp_size != 1
-                    or not layer.quant_method._is_cutedsl_v2_standard
-                    or not layer.moe_runner_config.is_gated
-                    or layer.use_presharded_weights
-                ):
+                if layer.moe_tp_size != 1 or layer.use_presharded_weights:
                     raise ValueError(
-                        "GPU delta requires standard gated CuTe DSL experts, TP=1 "
-                        "and an unsharded canonical checkpoint"
+                        "GPU delta requires expert TP=1 and an unsharded canonical checkpoint"
                     )
+                self.moe_layouts[prefix] = _identify_moe_layout(layer)
                 self.moe_layers[prefix] = layer
-            binding = _moe_binding(name, meta, layer, int(expert), projection, suffix)
+            binding = _moe_binding(
+                name,
+                meta,
+                layer,
+                int(expert),
+                projection,
+                suffix,
+                self.moe_layouts[prefix],
+            )
             if binding is None:
                 self.excluded[name] = (
-                    "static W4A16 activation calibration"
+                    "static activation calibration"
                     if suffix == "input_scale"
                     else "expert owned by another EP rank"
                 )

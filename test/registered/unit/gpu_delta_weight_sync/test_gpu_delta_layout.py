@@ -14,7 +14,6 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -32,6 +31,16 @@ _spec.loader.exec_module(layout)
 
 from sglang.srt.weight_sync.gpu_delta import bindings as byte_layout
 from sglang.srt.weight_sync.gpu_delta import models
+from sglang.srt.weight_sync.gpu_delta.flashinfer import FlashInferLayout
+
+
+def _nvfp4_method():
+    cls = type("ModelOptNvFp4FusedMoEMethod", (), {})
+    method = cls()
+    method.runner = None
+    method._is_cutedsl_v2_standard = True
+    method.quant_config = SimpleNamespace(is_checkpoint_nvfp4_serialized=True)
+    return method
 
 
 def _bytes(tensor):
@@ -39,11 +48,25 @@ def _bytes(tensor):
 
 
 def _apply_binding(binding, mask):
-    if binding.destinations:
-        for destination in binding.destinations:
-            destination.bitwise_xor_(mask.reshape(destination.shape))
-    else:
-        binding.xor(mask)
+    for view in binding.apply_bindings():
+        selected = view.selected_bytes(mask.reshape(-1)) if binding.segments else mask
+        for destination in view.destinations:
+            destination.bitwise_xor_(selected.reshape(destination.shape))
+
+
+def _reference_scale_swizzle(source):
+    """Independent coordinate oracle for the loader's padded scale bytes."""
+    rows, cols = source.shape
+    padded_rows, padded_cols = (rows + 127) // 128 * 128, (cols + 3) // 4 * 4
+    row = torch.arange(rows)[:, None]
+    col = torch.arange(cols)[None, :]
+    offsets = (
+        ((row // 128 * (padded_cols // 4) + col // 4) * 32 + row % 32) * 4
+        + row % 128 // 32
+    ) * 4 + col % 4
+    expected = torch.zeros(padded_rows * padded_cols, dtype=torch.uint8)
+    expected[offsets.flatten()] = source.flatten()
+    return expected.reshape(padded_rows, padded_cols)
 
 
 class TestCanonicalPlanCache(unittest.TestCase):
@@ -102,6 +125,32 @@ class TestCanonicalPlanCache(unittest.TestCase):
                 backend, updated | {"plan_digest": "changed"}
             )
 
+    def test_compact_scale_format_is_negotiated_without_duplicate_wire_fields(self):
+        backend, publication = self.publication()
+        definitions = []
+        for entry in publication["tensors"]:
+            entry["encoding"] = "raw_bytes"
+            canonical = backend.layout.inventory[entry["name"]]
+            canonical.update(
+                encoding="raw_bytes",
+                format="fp8-block128-ue8m0",
+                checkpoint_dtype="F32",
+            )
+            definition = {
+                key: entry[key]
+                for key in ("name", "dtype", "shape", "encoding", "views")
+            }
+            definition.update(format="fp8-block128-ue8m0", checkpoint_dtype="F32")
+            definitions.append(definition)
+        publication["plan_digest"] = layout._digest(
+            sorted(definitions, key=lambda x: x["name"])
+        )
+        layout._qualify_canonical_plan(backend, publication)
+        backend._canonical_plan_digest = None
+        backend.layout.inventory["local"]["checkpoint_dtype"] = "U8"
+        with self.assertRaisesRegex(ValueError, "negotiated canonical view plan"):
+            layout._qualify_canonical_plan(backend, publication)
+
     def test_failed_cold_qualification_does_not_admit_a_cache(self):
         backend, publication = self.publication()
         invalid = copy.deepcopy(publication)
@@ -117,29 +166,33 @@ class TestCanonicalPlanCache(unittest.TestCase):
         self.assertIsNone(backend._canonical_plan_digest)
         self.assertFalse(layout._qualify_canonical_plan(backend, publication)[1])
         backend, publication = self.publication()
-        backend.layout.excluded["local"] = "static W4A16 activation calibration"
+        backend.layout.excluded["local"] = "static activation calibration"
         with self.assertRaisesRegex(ValueError, "unadmitted tensor"):
             layout._qualify_canonical_plan(backend, publication)
 
 
 class TestFlashInferDeltaLayout(unittest.TestCase):
-    def test_scale_swizzle_matches_physical_offsets_and_zero_padding(self):
-        for rows, cols in ((17, 3), (128, 64), (256, 19)):
-            source = torch.randint(256, (2, rows, cols), dtype=torch.uint8)
-            swizzled = byte_layout.swizzle_scale_bytes(source)
-            row = torch.arange(rows)[:, None]
-            col = torch.arange(cols)[None, :]
-            # Physical order: row tile, column tile, row within 32,
-            # row group within 128, column within 4. Padding stays zero.
-            offsets = (
-                ((row // 128 * ((cols + 3) // 4) + col // 4) * 32 + row % 32) * 4
-                + row % 128 // 32
-            ) * 4 + col % 4
-            expected = torch.zeros_like(swizzled).reshape(2, -1)
-            expected[:, offsets.flatten()] = source.reshape(2, -1)
-            torch.testing.assert_close(
-                swizzled, expected.reshape_as(swizzled), rtol=0, atol=0
-            )
+    def setUp(self):
+        patcher = patch.object(
+            byte_layout,
+            "_identify_moe_layout",
+            side_effect=lambda layer: byte_layout.identify_layout(
+                layer, "flashinfer_cutedsl"
+            ),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        consumer = patch.object(
+            layout,
+            "consumer_objects",
+            side_effect=lambda layer, _: (
+                layer._cutedsl_wrapper,
+                layer._cutedsl_scales,
+                *layer._cutedsl_scales,
+            ),
+        )
+        consumer.start()
+        self.addCleanup(consumer.stop)
 
     def test_prepared_tp_selection_reads_reused_decoder_scratch(self):
         for dtype, name in (
@@ -179,7 +232,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     lambda: _apply_binding(
                         binding, torch.where(prepared.error == 0, payload, 0)
                     ),
-                    [],
                     [],
                     lambda: prepared.error.bitwise_or_(
                         (decoder.statuses != 0).any().to(torch.int32)
@@ -222,7 +274,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                             expanded[2 * row + start : 2 * row + start + 64] = mask[
                                 row : row + 64
                             ]
-                    transformed = byte_layout.swizzle_scale_bytes(expanded)
+                    transformed = _reference_scale_swizzle(expanded)
                     primary = torch.randint(256, transformed.shape, dtype=torch.uint8)
                     padded_rows, padded_cols = primary.shape
                     physical = primary.view(
@@ -235,7 +287,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     layer = SimpleNamespace(
                         moe_tp_size=1,
                         use_presharded_weights=False,
-                        quant_method=SimpleNamespace(_is_cutedsl_v2_standard=True),
+                        quant_method=_nvfp4_method(),
                         moe_runner_config=SimpleNamespace(is_gated=True),
                         _map_global_expert_id_to_local_expert_id=lambda _: 0,
                         **{
@@ -253,17 +305,20 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                         "weight_scale",
                     )
                     self.assertEqual(len(binding.storage), 2 if independent_mma else 1)
-                    before = [image.clone() for image in binding.storage]
-                    pointers = [image.data_ptr() for image in binding.storage]
+                    images = [primary]
+                    if independent_mma:
+                        images.append(
+                            mma[..., 0].permute(2, 4, 0, 1, 3).view_as(primary)
+                        )
+                    before = [image.clone() for image in images]
+                    pointers = [image.data_ptr() for image in images]
                     _apply_binding(binding, mask)
-                    for image, original in zip(binding.storage, before):
+                    for image, original in zip(images, before):
                         torch.testing.assert_close(image, original ^ transformed)
                     # Alias duplication would cancel the first XOR. A second
                     # update also proves cached destinations stay live.
                     _apply_binding(binding, mask)
-                    for image, original, pointer in zip(
-                        binding.storage, before, pointers
-                    ):
+                    for image, original, pointer in zip(images, before, pointers):
                         torch.testing.assert_close(image, original)
                         self.assertEqual(image.data_ptr(), pointer)
 
@@ -407,6 +462,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             ),
         ):
             for offset in (1, 7):
+                prepared.derived = plan.derived
                 prepared.error = torch.tensor([0])
                 target = torch.arange(6, dtype=torch.float32) + offset
                 prepared.raw_copies = {
@@ -431,7 +487,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         layer = SimpleNamespace(
             moe_tp_size=1,
             use_presharded_weights=False,
-            quant_method=SimpleNamespace(_is_cutedsl_v2_standard=True),
+            quant_method=_nvfp4_method(),
             moe_runner_config=SimpleNamespace(is_gated=True),
             _map_global_expert_id_to_local_expert_id=lambda expert: (
                 expert if expert < 2 else -1
@@ -443,14 +499,15 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         plan = byte_layout.ParameterBindings.__new__(byte_layout.ParameterBindings)
         plan.modules, plan.moe_layers, plan.excluded = {prefix: layer}, {}, {}
+        plan.moe_layouts = {}
+        plan.moe_layers[prefix] = layer
+        plan.moe_layouts[prefix] = FlashInferLayout("nvfp4", "cutedsl", True, "w4a16")
         meta = {"dtype": "F32", "shape": []}
         for projection in ("gate", "up", "down"):
             for expert in (0, 3):
                 name = f"{prefix}.{expert}.{projection}_proj.input_scale"
                 self.assertIsNone(plan.bind(name, meta, name))
-                self.assertEqual(
-                    plan.excluded[name], "static W4A16 activation calibration"
-                )
+                self.assertEqual(plan.excluded[name], "static activation calibration")
             name = f"{prefix}.0.{projection}_proj.weight_scale_2"
             binding = plan.bind(name, meta, name)
             after = torch.tensor(0.5)
@@ -465,10 +522,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         tail = SimpleNamespace(name="tail")
         omitted = SimpleNamespace(name="omitted")
         plans = [
-            ([(sparse, 0, 48), (omitted, 64, 16)], 80, None, []),
-            ([], 0, None, []),
-            ([(tail, 0, 32)], 32, None, []),
-            ([(omitted, 0, 24)], 24, None, []),
+            ([(sparse, 0, 48), (omitted, 64, 16)], 80, None),
+            ([], 0, None),
+            ([(tail, 0, 32)], 32, None),
+            ([(omitted, 0, 24)], 24, None),
         ]
         entries = {
             "sparse": {
@@ -609,7 +666,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             sys.modules,
             {
                 "sglang.srt.weight_sync.gpu_delta.apply": SimpleNamespace(
-                    plan_apply=lambda outputs: (None, outputs)
+                    plan_apply=lambda outputs: None
                 )
             },
         ):
@@ -730,8 +787,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         layer.mlp = torch.nn.Module()
         experts = layer.mlp.experts = torch.nn.Module()
         experts.moe_tp_size, experts.use_presharded_weights = 1, False
-        experts.quant_method = SimpleNamespace(_is_cutedsl_v2_standard=True)
-        experts.moe_runner_config = SimpleNamespace(is_gated=True)
+        experts.quant_method = _nvfp4_method()
+        experts.moe_runner_config = SimpleNamespace(
+            is_gated=True, activation="silu", gemm1_clamp_limit=None, swiglu_limit=None
+        )
+        experts.num_local_experts = experts.num_experts = 1
+        experts.moe_ep_rank = 0
+        experts.w13_input_scale_quant = experts.w2_input_scale_quant = torch.ones(1)
         experts._map_global_expert_id_to_local_expert_id = lambda expert: expert
         experts.w13_weight_scale_2 = torch.nn.Parameter(
             torch.ones(1, 2), requires_grad=False
@@ -743,7 +805,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             torch.ones(1) for _ in range(3)
         ]
         experts._cutedsl_wrapper = SimpleNamespace(quant_mode="w4a16")
-        experts._cutedsl_scales = [torch.ones(1), None, torch.ones(1)]
+        experts._cutedsl_scales = (torch.ones(1), torch.ones(1), torch.ones(1))
+        experts._cutedsl_input_scale = torch.ones(1)
+        experts.quant_config = SimpleNamespace(use_per_token_activation=False)
         inventory["model.layers.0.mlp.experts.0.gate_proj.weight_scale_2"] = {
             "dtype": "F32",
             "shape": [],
@@ -847,24 +911,19 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 )
 
     def test_invalid_layout_geometry_rejected(self):
-        with self.assertRaisesRegex(ValueError, "divisible by 64"):
-            byte_layout.cutedsl_scale_delta(
-                torch.zeros(16, 4, dtype=torch.uint8), "gate"
-            )
         prefix = "model.layers.0.mlp.experts"
         name = prefix + ".0.gate_proj.input_scale"
         for override in (
             {"moe_tp_size": 2},
             {"use_presharded_weights": True},
-            {"quant_method": SimpleNamespace(_is_cutedsl_v2_standard=False)},
-            {"moe_runner_config": SimpleNamespace(is_gated=False)},
+            {"quant_method": type("UnadmittedMoE", (), {"runner": None})()},
         ):
             layer = SimpleNamespace(
                 **(
                     dict(
                         moe_tp_size=1,
                         use_presharded_weights=False,
-                        quant_method=SimpleNamespace(_is_cutedsl_v2_standard=True),
+                        quant_method=_nvfp4_method(),
                         moe_runner_config=SimpleNamespace(is_gated=True),
                     )
                     | override
@@ -872,9 +931,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             )
             plan = byte_layout.ParameterBindings.__new__(byte_layout.ParameterBindings)
             plan.modules, plan.moe_layers, plan.excluded = {prefix: layer}, {}, {}
+            plan.moe_layouts = {}
             with (
                 self.subTest(override=override),
-                self.assertRaisesRegex(ValueError, "standard gated CuTe"),
+                self.assertRaises(ValueError),
             ):
                 plan.bind(name, {"dtype": "F32", "shape": []}, name)
             self.assertFalse(plan.moe_layers)

@@ -15,7 +15,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.srt.weight_sync.gpu_delta.layout import PreparedDelta
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -65,6 +64,13 @@ def planner(monkeypatch):
 
 def linear(size):
     return size, (size,), (1,), (size,), (1,)
+
+
+def test_apply_plan_rejects_missing_affine_destinations(planner):
+    assert planner.plan_apply([]) is None
+    with pytest.raises(ValueError, match="affine byte destinations"):
+        planner.plan_apply([(SimpleNamespace(destinations=()), 0, 16)])
+    assert not planner.warmed and not planner.launched
 
 
 def scratch(size=1 << 24, address=4096):
@@ -238,7 +244,7 @@ def test_aligned_bind_uses_immutable_template_without_replanning(planner, monkey
 
 def owner(groups):
     value = PreparedDelta.__new__(PreparedDelta)
-    value.static_plans = [(None, None, g, []) for g in groups]
+    value.static_plans = [(None, None, g) for g in groups]
     value.decode_stages = 2
     value.apply_bindings, value.apply_source_patches = [], []
     value.apply_fallback_groups = set()
