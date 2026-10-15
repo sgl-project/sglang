@@ -48,9 +48,11 @@ def clear(forward_batch):
     """Release invocation state on completion or an exception."""
     stream = forward_batch.residual_stream
     if stream is not None:
+        if stream.transport is not None:
+            stream.transport[1].release()
         if stream.pending is not None:
             stream.pending.release()
-        stream.pending = stream.residual = None
+        stream.pending = stream.residual = stream.transport = None
     forward_batch.residual_stream = None
 
 

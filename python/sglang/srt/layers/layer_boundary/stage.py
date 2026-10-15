@@ -40,6 +40,11 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 )
 from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
+from sglang.srt.layers.layer_boundary.row_transport import (
+    ComputeTransport,
+    TransportExit,
+    validate_invocation,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_forward
 
@@ -96,6 +101,7 @@ class StageBoundary:
         (``call``: what the stage's read takes, e.g. the attention's
         ``quant_format``)."""
         entry = self.entry(forward_batch, steps)
+        context = call.get("read_context")
         if (
             stream.pending is None
             and stream.residual is None
@@ -123,6 +129,25 @@ class StageBoundary:
                 hidden_states, forward_batch, self.plan.qkv_latent_func
             )
         stream.write(residual)
+        transport = self.declaration.row_transport
+        if transport is not None:
+            if stream.transport is not None:
+                raise RuntimeError("cannot replace an unconsumed compute transport")
+            variant = self.plan.variant_for(forward_batch)
+            ordinary = transport.rows[variant]
+            overlapped = (
+                transport.overlapped_rows.get(variant)
+                if transport.overlapped_rows is not None
+                else None
+            )
+            invocation = transport.bind(
+                hidden_states, forward_batch, context, ordinary, overlapped
+            )
+            if not isinstance(invocation, ComputeTransport):
+                raise TypeError("row transport must bind a ComputeTransport invocation")
+            validate_invocation(invocation, ordinary, overlapped)
+            stream.transport = (self, invocation)
+            hidden_states = invocation.input
         return hidden_states, stream
 
     @property
@@ -175,6 +200,9 @@ class StageBoundary:
         actual contribution, or an FFN's or a mixer's output with its sum
         completed or carried on. An FFN whose boundary has fusions (which may
         take a MoE finalize handoff) finishes through exit() instead."""
+        if self.declaration.row_transport is not None:
+            with self.exit(forward_batch, update_context=update_context) as output:
+                return output.finish(hidden_states)
         if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
             produced = self.plan.path_for(forward_batch).output
             completion = (
@@ -201,6 +229,13 @@ class StageBoundary:
             hidden_states
         )
 
+    def transport_context(self, forward_batch):
+        """Borrow this prepared compute's operand transport until finish()."""
+        stream = stream_of(forward_batch)
+        if stream.transport is None or stream.transport[0] is not self:
+            raise RuntimeError("no prepared compute transport for this stage")
+        return stream.transport[1]
+
     def exit(self, forward_batch, *, update_context=None):
         """Select and scope one FFN or single-stage mixer's output decision,
         for an FFN whose MoE may hand off its finalize (see finish()).
@@ -215,6 +250,8 @@ class StageBoundary:
             when compute is skipped for an empty input. It completes or carries work
             using the same decision rather than selecting a second path.
         """
+        if self.declaration.row_transport is not None:
+            return TransportExit(self, forward_batch, update_context=update_context)
         result = (
             self.plan.output.ffn_exit(
                 forward_batch,

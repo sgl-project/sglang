@@ -101,11 +101,12 @@ class ResidualStream:
     selection live on the bound stage, not on tensor values.
     """
 
-    __slots__ = ("residual", "pending")
+    __slots__ = ("residual", "pending", "transport")
 
     def __init__(self, residual=None):
         self.residual = residual
         self.pending = None
+        self.transport = None
 
     @classmethod
     def from_handoff(cls, hidden, residual, update):
