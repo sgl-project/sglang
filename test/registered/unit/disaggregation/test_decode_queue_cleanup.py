@@ -472,6 +472,39 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIs(receiver.kv_mgr, manager)
         self.assertFalse(receiver.abort_notified)
 
+    def test_fake_transfer_without_bootstrap_address_enqueues(self):
+        # A fake-transfer request may carry no bootstrap host; enqueueing it
+        # must not try to format a network address (it used to raise).
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.kv_manager = FakeKVManager.__new__(FakeKVManager)
+        queue.transfer_backend = MagicMock()
+        queue.queue = []
+        req = SimpleNamespace(
+            bootstrap_host=None, bootstrap_port=None, bootstrap_room=7
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode._is_fake_transfer", return_value=True
+        ):
+            decode_req = queue._create_receiver_and_enqueue(req)
+
+        self.assertIsInstance(decode_req.kv_receiver, FakeKVReceiver)
+        self.assertEqual(queue.queue, [decode_req])
+
+        # A real backend still requires a bootstrap address.
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode._is_fake_transfer",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.get_kv_class",
+                return_value=MagicMock(),
+            ),
+            self.assertRaises(AttributeError),
+        ):
+            queue._create_receiver_and_enqueue(req)
+
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")

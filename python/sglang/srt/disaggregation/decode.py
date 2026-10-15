@@ -882,7 +882,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=_bootstrap_addr(req),
+            # A fake transfer may arrive without any bootstrap address.
+            bootstrap_addr=(
+                None
+                if backend == TransferBackend.FAKE and req.bootstrap_host is None
+                else _bootstrap_addr(req)
+            ),
             bootstrap_room=req.bootstrap_room,
         )
 
