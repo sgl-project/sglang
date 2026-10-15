@@ -399,14 +399,18 @@ def test_persistent_finalize_kwargs_share_one_tensor(monkeypatch):
     _use_cpu_for_shared_tensor(monkeypatch)
     _install_fake_finalize_mode(monkeypatch)
 
-    first = module._persistent_finalize_kwargs()
-    second = module._persistent_finalize_kwargs()
+    first_layer = types.SimpleNamespace(_flashinfer_megamoe_num_valid_tokens=None)
+    second_layer = types.SimpleNamespace(_flashinfer_megamoe_num_valid_tokens=None)
+    first = module._persistent_finalize_kwargs(layer=first_layer)
+    second = module._persistent_finalize_kwargs(layer=second_layer)
 
     # PERSISTENT, not AUTO: AUTO would pick FlashInfer's CAKE reducer where it can.
     assert first["finalize_mode"] is _FakeFinalizeMode.PERSISTENT
     tensor = first["num_valid_tokens_tensor"]
     assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (1,)
     assert second["num_valid_tokens_tensor"] is tensor
+    assert first_layer._flashinfer_megamoe_num_valid_tokens is tensor
+    assert second_layer._flashinfer_megamoe_num_valid_tokens is tensor
 
 
 def test_persistent_finalize_env_off_requests_nothing(monkeypatch):
@@ -415,7 +419,9 @@ def test_persistent_finalize_env_off_requests_nothing(monkeypatch):
         types.SimpleNamespace(get=lambda: False)
     )
 
-    assert module._persistent_finalize_kwargs() == {}
+    layer = types.SimpleNamespace(_flashinfer_megamoe_num_valid_tokens=None)
+    assert module._persistent_finalize_kwargs(layer=layer) == {}
+    assert layer._flashinfer_megamoe_num_valid_tokens is None
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):
@@ -514,33 +520,9 @@ def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_vie
     assert mega.return_workspace_view is supports_output_view
 
 
-def test_persistent_finalize_uses_runtime_sized_output(monkeypatch):
-    module = _load_megamoe_module(monkeypatch)
-
-    output = torch.empty((2, 4), dtype=torch.bfloat16)
-
-    class Mega:
-        supports_output_view = True
-        _megakernel_config = types.SimpleNamespace(
-            finalize_mode=_FakeFinalizeMode.PERSISTENT
-        )
-
-        def forward(self, tensors, *, return_workspace_view=False):
-            self.return_workspace_view = return_workspace_view
-            return output
-
-    mega = Mega()
-    forward = module._select_megamoe_forward(mega)
-
-    assert forward(mega, object()) is output
-    assert mega.return_workspace_view is False
-
-
-def test_adapter_refreshes_the_tensor_the_layer_holds_on_every_call(monkeypatch):
+def test_adapter_refreshes_the_tensor_the_quant_info_holds_on_every_call(monkeypatch):
     """The kernel reads the count at launch, so a stale value from an earlier
-    batch (or another graph shape) would make it reduce the wrong row count.
-    It must be the tensor the layer's config holds (the one the workspace
-    borrowed), not whatever a fresh buffer lookup returns."""
+    batch (or another graph shape) would make it reduce the wrong row count."""
     module = _load_megamoe_module(monkeypatch)
 
     class FakeMoEEpTensors:
@@ -560,21 +542,11 @@ def test_adapter_refreshes_the_tensor_the_layer_holds_on_every_call(monkeypatch)
     class Mega:
         supports_output_view = False
 
-        def __init__(self, persistent):
-            self._megakernel_config = types.SimpleNamespace(
-                finalize_mode=(
-                    _FakeFinalizeMode.PERSISTENT
-                    if persistent
-                    else _FakeFinalizeMode.AUTO
-                ),
-                num_valid_tokens_tensor=owned,
-            )
-
         def forward(self, tensors):
             seen.append(int(owned.item()))
             return tensors.hidden_states
 
-    def run(rows, persistent):
+    def run(rows, num_valid_tokens):
         module.run_flashinfer_megamoe(
             types.SimpleNamespace(
                 hidden_states=torch.zeros((rows, 4), dtype=torch.bfloat16),
@@ -583,15 +555,40 @@ def test_adapter_refreshes_the_tensor_the_layer_holds_on_every_call(monkeypatch)
                     topk_weights=torch.ones((rows, 2)),
                 ),
             ),
-            module.FlashInferMegaMoeQuantInfo(mega=Mega(persistent)),
+            module.FlashInferMegaMoeQuantInfo(
+                mega=Mega(), num_valid_tokens=num_valid_tokens
+            ),
             types.SimpleNamespace(routed_scaling_factor=1.0),
         )
 
-    run(5, persistent=True)
-    run(3, persistent=True)
-    run(9, persistent=False)
+    run(5, owned)
+    run(3, owned)
+    run(9, None)
 
     assert seen == [5, 3, 3]
+
+
+def test_autotune_geometry_key_serializes_enum_and_skips_tensor():
+    """Startup autotune keys on the megakernel config; the persistent finalize
+    config carries an enum and a tensor, neither of which json.dumps accepts."""
+    import dataclasses
+
+    from sglang.srt.layers.moe.flashinfer_megamoe_autotune import MegaMoeTunedForward
+
+    @dataclasses.dataclass
+    class Config:
+        knobs: object = None
+        finalize_mode: _FakeFinalizeMode = _FakeFinalizeMode.PERSISTENT
+        num_valid_tokens_tensor: torch.Tensor = dataclasses.field(
+            default_factory=lambda: torch.zeros(1, dtype=torch.int32)
+        )
+
+    tuned = MegaMoeTunedForward.__new__(MegaMoeTunedForward)
+    tuned.backend = types.SimpleNamespace(megakernel=Config())
+    tuned.bootstrap = types.SimpleNamespace(world_size=4)
+    tuned.fleet_params = types.SimpleNamespace(token_hidden_size=4096, num_experts=256)
+
+    assert '"finalize_mode": "PERSISTENT"' in tuned._geometry_key
 
 
 def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):

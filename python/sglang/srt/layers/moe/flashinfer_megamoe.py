@@ -123,6 +123,8 @@ class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
     fc2_alpha: torch.Tensor | None = None
     fc1_norm_const: torch.Tensor | None = None
     apply_routed_scaling_factor: bool = False
+    # Live-token count the persistent finalize kernel reads; None when it is off.
+    num_valid_tokens: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.mega_forward is None:
@@ -137,16 +139,8 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
     return mega.forward(tensors)
 
 
-def _megamoe_uses_persistent_finalize(mega: Any) -> bool:
-    mode = getattr(getattr(mega, "_megakernel_config", None), "finalize_mode", None)
-    return getattr(mode, "name", None) == "PERSISTENT"
-
-
 def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
-    # Persistent finalize needs the output extent to be the runtime token
-    # count. The workspace view is capacity-sized, so keep it for the static
-    # reducer only.
-    if mega.supports_output_view and not _megamoe_uses_persistent_finalize(mega):
+    if mega.supports_output_view:
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
 
@@ -222,16 +216,19 @@ def _num_valid_tokens_tensor() -> torch.Tensor:
     )
 
 
-def _persistent_finalize_kwargs() -> dict[str, Any]:
+def _persistent_finalize_kwargs(*, layer: FusedMoE) -> dict[str, Any]:
+    """Config kwargs for persistent finalize; records the shared tensor on `layer`."""
     if not envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT.get():
         return {}
     from flashinfer.moe_ep import FinalizeMode
 
+    tensor = _num_valid_tokens_tensor()
+    layer._flashinfer_megamoe_num_valid_tokens = tensor
     # Explicit PERSISTENT: AUTO would prefer FlashInfer's CAKE reducer wherever it
     # supports the problem.
     return {
         "finalize_mode": FinalizeMode.PERSISTENT,
-        "num_valid_tokens_tensor": _num_valid_tokens_tensor(),
+        "num_valid_tokens_tensor": tensor,
     }
 
 
@@ -281,6 +278,7 @@ def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
     layer._flashinfer_megamoe_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
+    layer._flashinfer_megamoe_num_valid_tokens = None
 
 
 def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
@@ -419,7 +417,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_routing_weights_before_fc2=True,
             enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
-            **_persistent_finalize_kwargs(),
+            **_persistent_finalize_kwargs(layer=layer),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
         ),
@@ -443,7 +441,7 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             enable_in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
-            **_persistent_finalize_kwargs(),
+            **_persistent_finalize_kwargs(layer=layer),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -614,11 +612,10 @@ def run_flashinfer_megamoe(
     topk_ids = topk_output.topk_ids
     mega = quant_info.mega
 
-    if _megamoe_uses_persistent_finalize(mega):
-        # Write the tensor the workspace borrowed, not a fresh lookup. Refreshed
-        # every call: the kernel reads it at launch, and inside a CUDA graph the
-        # fill replays with the value baked for that capture shape.
-        mega._megakernel_config.num_valid_tokens_tensor.fill_(x.shape[0])
+    if quant_info.num_valid_tokens is not None:
+        # Refreshed every call: the kernel reads it at launch, and inside a CUDA
+        # graph the fill replays with the value baked for that capture shape.
+        quant_info.num_valid_tokens.fill_(x.shape[0])
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
