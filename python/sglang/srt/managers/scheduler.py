@@ -229,6 +229,7 @@ from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
 )
 from sglang.srt.managers.scheduler_components.invariant_checker import (
+    CHECK_REQUEST_LISTS,
     SchedulerInvariantChecker,
     SchedulerWatchdog,
 )
@@ -1844,6 +1845,10 @@ class Scheduler:
         """The host commit of one launched step, popped from pending."""
         self.process_batch_result(record.step, record.result)
         self.step_counters.record(record)
+        if CHECK_REQUEST_LISTS:
+            self.invariant_checker.check_no_finished_reqs(
+                self.request_registry.request_lists()
+            )
 
     def leave_finished_reqs(self) -> None:
         """Drop the requests a commit finished from decoding (PD decode holds
