@@ -231,7 +231,53 @@ Pass `--image-path` (one or more images) to edit references instead.
 </Tab>
 </Tabs>
 
-## 7. Dynamic batching
+## 7. Prompt upsampler
+
+[black-forest-labs/flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup)
+is a Qwen3.5-9B vision-language fine-tune that expands a short prompt into the detailed
+caption FLUX.3 works best with. The BFL reference code runs it in front of the image model
+by default. It is a standard `Qwen3_5ForConditionalGeneration` checkpoint, so it is served
+as a regular LLM, separately from the image pipeline. The system prompt (`system_prompts.json`
+in the repository) selects the mode; `t2i` is the text-to-image upsampler.
+
+Download the package and start the upsampler on its own port:
+
+```bash
+PUP_PATH="<local-path>"
+hf download black-forest-labs/flux-3-image-klein-pup --local-dir ${PUP_PATH}
+
+CUDA_VISIBLE_DEVICES=1 sglang serve ${PUP_PATH} \
+      --model-type llm \
+      --served-model-name flux-3-image-klein-pup \
+      --host 0.0.0.0 --port 8001 \
+      --context-length 16384 \
+      --mem-fraction-static 0.90 \
+      --reasoning-parser qwen3
+```
+
+Upsample a text prompt through the OpenAI-compatible chat endpoint. The `t2i` system
+prompt is read from the downloaded package; thinking is disabled and decoding follows the
+model card (greedy, presence penalty 1.5):
+
+```bash
+jq -n --slurpfile p ${PUP_PATH}/system_prompts.json '{
+    model: "flux-3-image-klein-pup",
+    messages: [
+      {role: "system", content: $p[0].t2i},
+      {role: "user",   content: "A man walking with his dog, afternoon sun"}
+    ],
+    max_tokens: 3584,
+    temperature: 0,
+    presence_penalty: 1.5,
+    chat_template_kwargs: {enable_thinking: false}
+  }' | curl -s http://0.0.0.0:8001/v1/chat/completions \
+         -H 'Content-Type: application/json' -d @- \
+     | jq -r '.choices[0].message.content'
+```
+
+You can then pass the returned caption as the `--prompt` of a `t2i` request to the Flux3 pipeline.
+
+## 8. Dynamic batching
 
 Enable a small batching window to collect concurrent requests:
 
@@ -285,7 +331,7 @@ samples, not a universal quality guarantee. Identical single requests before
 and after batching matched exactly. Preserve additional memory headroom for
 batching rather than assuming a batch-1 recipe fits on a 32 GB card at batch 2.
 
-## 8. Validation boundaries
+## 9. Validation boundaries
 
 The release BF16 and FP8R checkpoints have single-GB300/H200 generation checks;
 NVFP4 has GB300 checks. Base BF16 also has an RTX 5090 check. Each uses eager
@@ -336,7 +382,7 @@ Set `SGLANG_TEST_FLUX3_IMAGE_MODEL` to a local package path when using an
 offline checkpoint. This test needs checkpoint access; it does not substitute
 for an official-reference golden-image comparison.
 
-## 9. ComfyUI
+## 10. ComfyUI
 
 import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
 
