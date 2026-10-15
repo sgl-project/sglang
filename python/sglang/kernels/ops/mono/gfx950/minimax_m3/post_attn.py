@@ -120,6 +120,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     N_DN,
     N_O,
     N_ROUTER,
+    KV_PAGE_BYTES,
     N_SPLIT,
     O_K,
     O_K_SUB,
@@ -780,22 +781,50 @@ def build_post_attn_kernel(
                     for p in range(SPLIT_PASSES)
                 ]
                 # The wave's pages are consecutive: a 64-bit base at the first keeps
-                # the lane offsets 32-bit for a cache of any size.
-                page_base = fx.Int64(pages[0]) * PAGE_BYTES
-                r_k, r_v = rsrc(k_cache + page_base), rsrc(v_cache + page_base)
+                # the lane offsets 32-bit for a cache of any size. Stepping one page
+                # steps over every KV head, and pass p reads KV head p, so the page
+                # stride is KV_PAGE_BYTES and the head offset p * PAGE_BYTES.
+                # Both passes' loads are issued here rather than inside the pass
+                # loop: this block is the latency the stage hides, and a pass must
+                # not wait on a barrier before its K and V are in flight.
+                page_base = fx.Int64(pages[0]) * KV_PAGE_BYTES
+                vpg = (g4 // 2 == 0).select(fx.Int32(0), pages[1] - pages[0])
                 # K (QK B operand, key = lane % 16 of page j), V (PV B operand: dims
                 # 16 jd + lane % 16, keys 8 (lane / 16) .. + 8), per-token scales
-                kw = []
-                for j in range_constexpr(PPW):
-                    for s in range_constexpr(HEAD_DIM // 32):
-                        kw.append(
+                kws, vws = [], []
+                for p in range_constexpr(SPLIT_PASSES):
+                    head_off = fx.Int64(p * PAGE_BYTES)
+                    r_k = rsrc(k_cache + page_base + head_off)
+                    r_v = rsrc(v_cache + page_base + head_off)
+                    kw = []
+                    for j in range_constexpr(PPW):
+                        for s in range_constexpr(HEAD_DIM // 32):
+                            kw.append(
+                                fx.Vector(
+                                    bo.buffer_load(
+                                        r_k,
+                                        (
+                                            (pages[j] - pages[0]) * KV_PAGE_BYTES
+                                            + (2 * s + g4 // 2) * 256
+                                            + l16 * 16
+                                            + (g4 % 2) * 8
+                                        )
+                                        // 4,
+                                        vec_width=2,
+                                        dtype=T.i32,
+                                        cache_modifier=CM_K1,
+                                    )
+                                ).bitcast(fx.Int64)[0]
+                            )
+                    kws.append(kw)
+                    vws.append(
+                        [
                             fx.Vector(
                                 bo.buffer_load(
-                                    r_k,
+                                    r_v,
                                     (
-                                        (pages[j] - pages[0]) * PAGE_BYTES
-                                        + (2 * s + g4 // 2) * 256
-                                        + l16 * 16
+                                        vpg * KV_PAGE_BYTES
+                                        + (16 * jd + l16) * PAGE16
                                         + (g4 % 2) * 8
                                     )
                                     // 4,
@@ -804,21 +833,9 @@ def build_post_attn_kernel(
                                     cache_modifier=CM_K1,
                                 )
                             ).bitcast(fx.Int64)[0]
-                        )
-                vpg = (g4 // 2 == 0).select(fx.Int32(0), pages[1] - pages[0])
-                vw = [
-                    fx.Vector(
-                        bo.buffer_load(
-                            r_v,
-                            (vpg * PAGE_BYTES + (16 * jd + l16) * PAGE16 + (g4 % 2) * 8)
-                            // 4,
-                            vec_width=2,
-                            dtype=T.i32,
-                            cache_modifier=CM_K1,
-                        )
-                    ).bitcast(fx.Int64)[0]
-                    for jd in range(HEAD_DIM // 16)
-                ]
+                            for jd in range(HEAD_DIM // 16)
+                        ]
+                    )
                 ks1 = fx.Float32(bo.buffer_load(r_ks, 0, vec_width=1, dtype=T.f32))
                 vs1 = fx.Float32(bo.buffer_load(r_vs, 0, vec_width=1, dtype=T.f32))
                 kss = [ks1] * PPW
@@ -858,7 +875,9 @@ def build_post_attn_kernel(
                                 )
                             )
                             c = mfma_fp8(
-                                qw.bitcast(fx.Int64)[0], kw[j * (HEAD_DIM // 32) + s], c
+                                qw.bitcast(fx.Int64)[0],
+                                kws[p][j * (HEAD_DIM // 32) + s],
+                                c,
                             )
                         qk = sm_scale * kss[j]
                         sc.append(
@@ -946,7 +965,7 @@ def build_post_attn_kernel(
                     )
                     for jd in range_constexpr(HEAD_DIM // 16):
                         cv = mfma_fp8(
-                            pw, vw[jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
+                            pw, vws[p][jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
                         )
                         for e in range_constexpr(4):
                             fx.ptr_store(

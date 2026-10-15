@@ -12,6 +12,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     HEAD_DIM,
     HIDDEN,
     INTER,
+    LOCAL_KV_HEADS,
     LOCAL_Q_HEADS,
     MAX_INDEX_BLOCKS,
     MAX_SPARSE_KEYS,
@@ -29,22 +30,32 @@ H = LOCAL_Q_HEADS
 SPLIT_KEYS = 256  # keys per split task (one paged-attention context partition)
 N_SPLIT = MAX_SPARSE_KEYS // SPLIT_KEYS
 O_K = H * HEAD_DIM
-# The split stage's thread map covers exactly 16 q heads per pass: its MFMA A
-# operand is 16 rows, a lane holds heads 4 * (lane // 16) + e, and the partial
-# reduction walks O_K with THREADS * 4 = 2048 elements. At TP4 H is 16 and one
-# pass is the whole rank. Below TP4 the rank holds more heads than the map
-# covers, so the stage runs SPLIT_PASSES of H_SUB heads each
-# (post_attn.stage_split), and only the PV partials (``opart``) are sized for a
-# pass -- every other region stays whole-H and is indexed by absolute head.
+# The split stage runs one pass per KV head: a pass attends that head's GQA
+# group (H // LOCAL_KV_HEADS q heads) to its own K and V. The model is 64 q over
+# 4 KV heads, so a group is 16 q heads at every TP -- which is also exactly what
+# the stage's thread map covers (the MFMA A operand is 16 rows, a lane holds
+# heads 4 * (lane // 16) + e, and the partial reduction walks O_K_SUB with
+# THREADS * 4 = 2048 elements). The assert below is what ties the two together.
 #
-# This is also what keeps K4 inside the 160 KB LDS below TP4: the partials are
-# WAVES * O_K, which at TP2's 32 heads alone is 131 072 B of a 163 840 B budget.
-# At TP4 H_SUB == H, so SPLIT_PASSES == 1 and every expression below is the
-# original value -- the TP4 build is unchanged byte for byte.
-H_SUB = min(H, 16)
+# At TP4 and TP8 a rank holds one KV head, so SPLIT_PASSES is 1, h0 is 0, and
+# every expression is the original value -- those builds are unchanged.
+#
+# This is also what keeps K4 inside the 160 KB LDS at TP2: the PV partials are
+# WAVES * O_K, which at 32 q heads alone is 131 072 B of a 163 840 B budget.
+# Only ``opart`` is sized for a pass; every other region stays whole-H and is
+# indexed by absolute head.
+H_SUB = H // LOCAL_KV_HEADS  # q heads sharing one KV head
 O_K_SUB = H_SUB * HEAD_DIM
-SPLIT_PASSES = H // H_SUB
-assert H % H_SUB == 0, f"H={H} is not a whole number of {H_SUB}-head passes"
+SPLIT_PASSES = LOCAL_KV_HEADS
+assert H % LOCAL_KV_HEADS == 0, f"{H} q heads do not divide over {LOCAL_KV_HEADS} KV heads"
+assert H_SUB <= 16, f"GQA group {H_SUB} exceeds the split stage's 16-row thread map"
+
+# A page-16 of ONE KV head (``pre_attn.PAGE_BYTES``). The cache is
+# [page16][kv head][...] -- aiter's sparse views are k.view(-1, heads, 8, 16, 16)
+# and v.view(-1, heads, 1, 128, 16), both 2048 B a head -- so stepping one page
+# means stepping over every head, and KV head h of page p starts at
+# (p * LOCAL_KV_HEADS + h) * PAGE_BYTES.
+KV_PAGE_BYTES = LOCAL_KV_HEADS * PAGE16 * HEAD_DIM
 O_ROWS = 32  # hidden rows per o_proj / attention-reduce task
 # from this many tokens the attention all-reduce is a reduce-scatter to the row
 # group's owner rank (t % npes) plus an all-gather of the sums: half the bytes over

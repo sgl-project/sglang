@@ -80,12 +80,20 @@ CHUNKS_PER_WAVE = K_CHUNKS // WAVES
 Q_OFF = 0
 K_OFF = LOCAL_Q_HEADS * HEAD_DIM
 V_OFF = (LOCAL_Q_HEADS + LOCAL_KV_HEADS) * HEAD_DIM
-# q heads, k, v, the rank's index_q, index_k
+# q heads, k, v, the rank's index_q, index_k -- one task a head, so a rank with
+# several KV heads has a run of k tasks and a run of v tasks, not one of each.
 N_HEAD_TASKS = LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS + 2
+K_TASK0 = LOCAL_Q_HEADS
+V_TASK0 = LOCAL_Q_HEADS + LOCAL_KV_HEADS
+IQ_TASK = LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS
 IK_TASK = LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS + 1
 HEAD_ROW_GROUPS = HEAD_DIM // ROWS_PER_TASK  # GEMV tasks a head
 ELEMS = 4  # per lane in a head task: 32 lanes x 4 = 128, the aiter kernel's split
 PAGE_BYTES = PAGE16 * HEAD_DIM  # one page-16 of one kv head (fp8)
+# The cache is [page16][kv head][...], so stepping one page steps over every
+# head and KV head h of page b starts at b * KV_PAGE_BYTES + h * PAGE_BYTES.
+# At one head a rank these are the same number and the offset vanishes.
+KV_PAGE_BYTES = LOCAL_KV_HEADS * PAGE_BYTES
 # page-16 ids a cache block spans in a K or V plane
 BLOCK_PAGES = SPARSE_BLOCK // PAGE16
 # GEMV tasks, head tasks (every token of a head on one CTA) and the tokens' norm
@@ -509,13 +517,25 @@ def emit_pre_attn(
         tk = tid // 32
         l32 = tid % 32
         is_q = ht < LOCAL_Q_HEADS
-        is_k = ht == LOCAL_Q_HEADS
-        is_v = ht == LOCAL_Q_HEADS + 1
-        is_iq = ht == LOCAL_Q_HEADS + 2
+        is_iq = ht == IQ_TASK
+        # ``ht`` comes from the block index, so it and everything below are
+        # uniform across the CTA. One KV head a rank keeps the original
+        # equality tests and constant offsets.
+        if const_expr(LOCAL_KV_HEADS == 1):
+            is_k = ht == K_TASK0
+            is_v = ht == V_TASK0
+            kv_head = 0
+            k_base, v_base = K_OFF, V_OFF
+        else:
+            is_k = (ht >= K_TASK0) & (ht < V_TASK0)
+            is_v = (ht >= V_TASK0) & (ht < IQ_TASK)
+            kv_head = is_k.select(ht - K_TASK0, ht - V_TASK0)
+            k_base = K_OFF + kv_head * HEAD_DIM
+            v_base = V_OFF + kv_head * HEAD_DIM
         base = tk * rows + is_q.select(
             ht * HEAD_DIM,
             is_k.select(
-                K_OFF, is_v.select(V_OFF, is_iq.select(heads.iq_off, heads.ik_off))
+                k_base, is_v.select(v_base, is_iq.select(heads.iq_off, heads.ik_off))
             ),
         )
         if tk < tokens:
@@ -547,7 +567,11 @@ def emit_pre_attn(
                         store(32 * h, *args)
 
             def page_rsrc(cache_ptr, first_lane):
-                return rsrc(cache_ptr + fx.Int64(readlane(b, first_lane)) * PAGE_BYTES)
+                off = fx.Int64(readlane(b, first_lane)) * KV_PAGE_BYTES
+                if const_expr(LOCAL_KV_HEADS > 1):
+                    # this task's KV head within the page (uniform over the CTA)
+                    off = off + fx.Int64(kv_head) * PAGE_BYTES
+                return rsrc(cache_ptr + off)
 
             def store_v(first_lane, vs):
                 r_v = page_rsrc(v_cache, first_lane)

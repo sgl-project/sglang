@@ -33,6 +33,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     HEAD_DIM,
     HIDDEN,
     LAYER_SLOTS,
+    LOCAL_KV_HEADS,
     LOCAL_Q_HEADS,
     MAX_INDEX_BLOCKS,
     MAX_TOKENS,
@@ -302,7 +303,7 @@ class Packed:
         }
 
     def _bind_caches(self, sparse_ids) -> None:
-        """Bind FP8 K / V / index-K, one KV head a rank and page-128 allocation.
+        """Bind FP8 K / V / index-K, LOCAL_KV_HEADS heads a rank, page-128 allocation.
 
         Logical views stay NHD. Sparse K / V bytes use page-16 SHUFFLE storage;
         index-K and HiCache transfer rows remain NHD.
@@ -337,7 +338,10 @@ class Packed:
             main.kv_cache_layout == "nhd",
             f"KV cache logical layout {main.kv_cache_layout!r}, expected NHD views",
         )
-        _need(main.head_num == 1, f"{main.head_num} kv heads a rank, kernels write 1")
+        _need(
+            main.head_num == LOCAL_KV_HEADS,
+            f"{main.head_num} kv heads a rank, kernels write {LOCAL_KV_HEADS}",
+        )
         k0 = pool.get_key_buffer(sparse_ids[0])
         v0 = pool.get_value_buffer(sparse_ids[0])
         i0 = pool.get_index_k_buffer(sparse_ids[0])
