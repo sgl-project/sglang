@@ -167,7 +167,9 @@ def forward_routed_rt(
     activation pre-quantized (the runner's hidden_states_scale passthrough).
     """
     from sglang.kernels.ops.moe.qwen_router_front import router_gemm_quant
-    from sglang.srt.distributed import use_symmetric_memory
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        use_symmetric_memory,
+    )
     from sglang.srt.layers.dp_attention import is_allocation_symmetric
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         flashinfer_trtllm_deferred_finalize_context,
