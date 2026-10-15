@@ -484,6 +484,8 @@ class Envs:
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_TRACE_ASYNC = EnvBool(False)
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
+    # Trace only the first rank of each attention TP/CP group.
+    SGLANG_TRACE_SKIP_DUPLICATE_RANKS = EnvBool(False)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
