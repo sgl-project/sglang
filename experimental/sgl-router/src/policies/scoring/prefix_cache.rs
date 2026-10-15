@@ -5,9 +5,7 @@
 
 use super::{EligibilityFilter, ScoringPolicy};
 use crate::policies::SelectionContext;
-use crate::state::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
-};
+use crate::state::kv_events::{BlockSizeOracle, HashTree};
 use crate::workers::Worker;
 use std::sync::Arc;
 
@@ -60,17 +58,13 @@ impl PrefixCachePolicy {
         let Some(tokens) = ctx.request_tokens().filter(|t| !t.is_empty()) else {
             return flat();
         };
-        let Some(block_size) = self.block_size_oracle.get() else {
+        let Some(hashes) = self
+            .block_size_oracle
+            .block_hashes(tokens, ctx.cache_namespace())
+            .filter(|hashes| !hashes.is_empty())
+        else {
             return flat();
         };
-        let hashes = if self.block_size_oracle.is_bigram() {
-            compute_block_hashes_bigram(tokens, block_size as usize)
-        } else {
-            compute_block_hashes(tokens, block_size as usize)
-        };
-        if hashes.is_empty() {
-            return flat();
-        }
 
         let depths = self.tree.prefix_depths(None, &hashes);
         let total = hashes.len() as f32;
@@ -122,7 +116,7 @@ impl EligibilityFilter for PrefixCachePolicy {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-    use crate::state::kv_events::KvWorkerId;
+    use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram, KvWorkerId};
 
     const BLOCK: usize = 4;
 
