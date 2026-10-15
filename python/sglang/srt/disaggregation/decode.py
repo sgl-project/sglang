@@ -141,7 +141,6 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
@@ -151,9 +150,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import SchedulePolicy
-    from sglang.srt.managers.scheduler_components.batch_result_processor import (
-        SchedulerBatchResultProcessor,
-    )
     from sglang.srt.managers.scheduler_components.bundles import (
         KvCapacity,
         KvResources,
@@ -2568,7 +2564,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         metrics_collector: Optional[SchedulerMetricsCollector],
         output_streamer: SchedulerOutputStreamer,
         model_config: ModelConfig,
-        batch_result_processor: SchedulerBatchResultProcessor,
+        request_retirer: RequestRetirer,
         hold_release: Callable[[Req], None],
     ):
         self.queue: List[DecodeRequest] = []
@@ -2589,7 +2585,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metrics_collector = metrics_collector
         self.output_streamer = output_streamer
         self.model_config = model_config
-        self.batch_result_processor = batch_result_processor
+        self.request_retirer = request_retirer
         # Moves a failed transfer's request into the owner's releasing list.
         self.hold_release = hold_release
         # The preallocation queue that hands its requests over; set by the
@@ -2827,7 +2823,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             discard_kv_cache_backup(req, self.tree_cache, "host_pool")
             if host_staged:
                 return
-        self.batch_result_processor.release_finished_req(req, checkpoint=False)
+        self.request_retirer.retire_finished(req, checkpoint=False)
 
     def _record_transfer_failure(self, failure_reason: str) -> None:
         if self.metrics_sink.enable_metrics:
@@ -3161,8 +3157,6 @@ class DisaggDecode:
         pool_stats_observer: SchedulerPoolStatsObserver,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         request_retirer: RequestRetirer,
-        beam_coordinator: BeamCoordinator,
-        batch_result_processor: SchedulerBatchResultProcessor,
         flags: EngineFlags,
         core_lists: CoreLists,
         pending: PendingSteps,
@@ -3228,8 +3222,6 @@ class DisaggDecode:
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.decode_offload_manager = decode_offload_manager
         self.request_retirer = request_retirer
-        self.beam_coordinator = beam_coordinator
-        self.batch_result_processor = batch_result_processor
         self.flags = flags
         # The requests whose KV has arrived: they own it and wait for a row of
         # the running set.
@@ -3271,7 +3263,7 @@ class DisaggDecode:
             metrics_collector=metrics_collector,
             output_streamer=output_streamer,
             model_config=model_config,
-            batch_result_processor=batch_result_processor,
+            request_retirer=request_retirer,
             hold_release=self.hold_release,
         )
 
@@ -3465,7 +3457,7 @@ class DisaggDecode:
                 r for r in held if r not in aborted
             ]
             for req in aborted:
-                self.request_retirer.release_aborted_request(req)
+                self.request_retirer.retire_aborted(req)
                 self.request_retirer.send_abort_output(
                     req, finished_reason=recv_req.finished_reason
                 )
@@ -3496,8 +3488,6 @@ class DisaggDecode:
             # Abort method 1: directly pop from the list.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.ready.pop(i)
-            self.request_retirer.release_aborted_request(req)
-            self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.request_retirer.send_abort_output(
@@ -3508,7 +3498,7 @@ class DisaggDecode:
                 discard_kv_cache_backup(req, self.tree_cache, "host_pool")
             if req.finished_reason is None:
                 req.finished_reason = FINISH_ABORT()
-            self.batch_result_processor.release_finished_req(req, checkpoint=True)
+            self.request_retirer.retire_aborted(req, checkpoint=True)
             logger.debug(f"Abort queued request. {req.rid=}")
 
     def hold_for_rebootstrap(self, reqs: List[Req]) -> None:
@@ -3808,7 +3798,7 @@ class DisaggDecode:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                self.batch_result_processor.release_finished_req(req, checkpoint=True)
+                self.request_retirer.retire_finished(req, checkpoint=True)
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(
             reqs, any(req.return_logprob for req in reqs)
@@ -3921,6 +3911,6 @@ class DisaggDecode:
         self.output_streamer.stream_output([req], req.return_logprob)
         # A ready request holds its HiSparse rows (preallocation, then the
         # move to ready), so it releases like any leaving request.
-        self.batch_result_processor.release_finished_req(req, checkpoint=False)
+        self.request_retirer.retire_finished(req, checkpoint=False)
         if self.metrics_sink.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()

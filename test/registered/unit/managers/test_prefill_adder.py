@@ -58,10 +58,9 @@ class TestPrefillAdder(CustomTestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_token_allocator = self.create_token_allocator()
-        # Preemption releases a running request through this function.
-        release_patch = patch("sglang.srt.managers.schedule_policy.release_req")
-        self.release_req = release_patch.start()
-        self.addCleanup(release_patch.stop)
+        # Preemption releases a running request through the retirer.
+        self.request_retirer = MagicMock()
+        self.release_req = self.request_retirer.retract
 
     def create_tree_cache(
         self,
@@ -158,6 +157,7 @@ class TestPrefillAdder(CustomTestCase):
             rem_chunk_tokens=None,
             num_mixed_decode_tokens=0,
             priority_scheduling_preemption_threshold=0,
+            request_retirer=self.request_retirer,
         )
         defaults.update(kwargs)
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]

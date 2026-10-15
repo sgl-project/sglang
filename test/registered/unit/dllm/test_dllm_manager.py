@@ -16,7 +16,10 @@ from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_request_lists import make_request_registry
+from sglang.test.scheduler_request_lists import (
+    make_request_registry,
+    make_request_retirer,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -61,9 +64,11 @@ def _manager(**deps):
         step_builder=SimpleNamespace(
             build_extend_step=_Step, build_sampling_info=Mock()
         ),
-        request_retirer=Mock(),
     )
     kwargs.update(deps)
+    if "request_retirer" not in kwargs:
+        kwargs["request_retirer"] = make_request_retirer()
+        kwargs["request_retirer"].send_abort_output = Mock()
     return DllmManager(**kwargs)
 
 
@@ -133,7 +138,9 @@ def _fdfo_result(blocks, accept_lengths, algo_states):
 class TestDllmManagerLists(unittest.TestCase):
     def setUp(self):
         self.checkpoint = self._patch("sglang.srt.dllm.manager.checkpoint_kv_cache")
-        self._patch("sglang.srt.dllm.manager.release_kv_cache")
+        self._patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        )
         self._patch(
             "sglang.srt.dllm.manager.DllmManager._create_dllm_prefill_adder",
             side_effect=_Adder,
@@ -318,7 +325,9 @@ class TestDllmManagerLists(unittest.TestCase):
         holding_kv.kv.req_pool_idx = 3
         manager.waiting = [named, kept, holding_kv]
 
-        with patch("sglang.srt.dllm.manager.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             manager.abort_waiting(AbortReq(rid="abort"))
 
         self.assertEqual(manager.waiting, [kept])
@@ -330,7 +339,7 @@ class TestDllmManagerLists(unittest.TestCase):
             [named, holding_kv],
         )
         release.assert_called_once_with(
-            holding_kv, manager.tree_cache, checkpoint=False
+            holding_kv, manager.request_retirer.tree_cache, checkpoint=False
         )
 
     def test_scheduler_abort_reaches_each_list(self):

@@ -76,6 +76,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             request_retirer=RequestRetirer(
                 kv=SimpleNamespace(tree_cache=tree_cache),
                 beam_coordinator=MagicMock(),
+                hisparse_coordinator=None,
                 output_streamer=MagicMock(),
                 ipc_channels=ipc_channels,
             ),
@@ -431,7 +432,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         owner.bootstrap_queue.finalize_bootstrap.assert_called_once_with(req)
         owner.checkpoint.assert_called_once_with(req)
 
-    def test_waiting_abort_releases_without_insert(self):
+    def test_waiting_abort_tears_down_the_transfer_only(self):
         owner = prefill_owner_shell(
             tree_cache=MagicMock(),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
@@ -445,14 +446,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         owner.kv_senders[req.rid] = sender
 
-        with patch(
-            "sglang.srt.disaggregation.prefill.release_kv_cache"
-        ) as release_kv_cache:
-            owner.release_aborted_waiting_req(req)
+        owner.release_aborted_waiting_req(req)
 
-        release_kv_cache.assert_called_once_with(
-            req, owner.tree_cache, checkpoint=False
-        )
+        # The KV is the retirer's to release (without an insert).
+        owner.tree_cache.assert_not_called()
         sender.abort.assert_called_once()
         self.assertFalse(req.disagg.pending_bootstrap)
         self.assertNotIn(req.rid, owner.kv_senders)
@@ -469,6 +466,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             request_retirer=RequestRetirer(
                 kv=kv,
                 beam_coordinator=MagicMock(),
+                hisparse_coordinator=None,
                 output_streamer=MagicMock(),
                 ipc_channels=ipc_channels,
             ),
@@ -482,7 +480,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 "sglang.srt.managers.scheduler_components.request_retirer.get_serving"
             ) as get_serving,
             patch(
-                "sglang.srt.managers.scheduler_components.request_registry.release_kv_cache"
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
             ) as release,
         ):
             get_serving.return_value.weight_version = None
@@ -490,7 +488,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
         disagg_prefill.release_aborted_waiting_req.assert_called_once()
         kv.tree_cache.finish.assert_called_once()
-        release.assert_not_called()
+        (req,) = release.call_args.args[:1]
+        release.assert_called_once_with(req, kv.tree_cache, checkpoint=False)
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):

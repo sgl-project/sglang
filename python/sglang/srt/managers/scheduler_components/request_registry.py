@@ -12,11 +12,9 @@ from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
-    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.constrained.grammar_manager import GrammarManager
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
@@ -44,7 +42,6 @@ class RequestRegistry:
         core_lists: CoreLists,
         grammar_manager: GrammarManager,
         request_retirer: RequestRetirer,
-        beam_coordinator: BeamCoordinator,
         ipc_channels: SchedulerIpcChannels,
         kv: KvResources,
         mm_receiver: Optional[MMReceiverBase],
@@ -55,7 +52,6 @@ class RequestRegistry:
         self.core_lists = core_lists
         self.grammar_manager = grammar_manager
         self.request_retirer = request_retirer
-        self.beam_coordinator = beam_coordinator
         self.ipc_channels = ipc_channels
         self.tree_cache = kv.tree_cache
         self.mm_receiver = mm_receiver
@@ -156,18 +152,17 @@ class RequestRegistry:
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.core_lists.waiting_queue.pop(i)
-            self.request_retirer.release_aborted_request(req)
-            self.beam_coordinator.retire_group(req)
+            if self.mode_owners.disagg_prefill is not None:
+                # A PD prefill request may hold KV here (an optimistic retry).
+                self.mode_owners.disagg_prefill.release_aborted_waiting_req(req)
+                self.request_retirer.retire_aborted(req)
+            else:
+                self.request_retirer.retire_aborted_waiting(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.ipc_channels.send_to_tokenizer.send_output(
                 make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
-            if self.mode_owners.disagg_prefill is not None:
-                self.mode_owners.disagg_prefill.release_aborted_waiting_req(req)
-            # For mamba radix cache
-            elif req.kv.holds_mamba:
-                release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
     def _defer_chunked_abort(self, recv_req: AbortReq) -> None:

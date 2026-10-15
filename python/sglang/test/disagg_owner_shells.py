@@ -42,14 +42,14 @@ def decode_owner_shell(**attrs) -> DisaggDecode:
 
 
 def tree_release(owner):
-    """The result processor's release_finished_req without HiSparse, for a PD
-    decode owner or queue shell: the tree release, looked up in the decode
-    module so a test can patch it there."""
+    """The retirer's retire_finished without HiSparse, for a PD decode owner or
+    queue shell: the tree release, looked up in the decode module so a test
+    can patch it there."""
 
-    def release_finished_req(req, *, checkpoint):
+    def retire_finished(req, *, checkpoint):
         decode_mod.release_kv_cache(req, owner.tree_cache, checkpoint=checkpoint)
 
-    return release_finished_req
+    return retire_finished
 
 
 def result_processor_shell(**attrs) -> SimpleNamespace:

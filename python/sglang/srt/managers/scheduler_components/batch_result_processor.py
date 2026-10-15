@@ -27,10 +27,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.common import (
-    checkpoint_kv_cache,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     get_required_capture_hidden_mode,
@@ -68,6 +65,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.pending_steps import (
         PendingStep,
         PendingSteps,
+    )
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
@@ -226,6 +226,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     beam_coordinator: BeamCoordinator
     pending: PendingSteps
+    request_retirer: RequestRetirer
 
     def _maybe_collect_routed_experts(self, req: Req):
         """Collect routed experts for a finished request.
@@ -479,7 +480,7 @@ class SchedulerBatchResultProcessor:
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        self.release_finished_req(
+                        self.request_retirer.retire_finished(
                             req,
                             checkpoint=discard_finish_reason is None
                             and not self._mamba_lazy_keep_pending_write(req),
@@ -573,7 +574,7 @@ class SchedulerBatchResultProcessor:
                 ):
                     req.to_finish = req.discard_output_reason
                     req.update_finish_state(0)
-                    release_kv_cache(req, self.kv.tree_cache, checkpoint=False)
+                    self.request_retirer.retire_finished(req, checkpoint=False)
                     req.time_stats.set_completion_time()
                     continue
 
@@ -587,7 +588,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.kv.tree_cache, checkpoint=True)
+                        self.request_retirer.retire_finished(req, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
                         checkpoint_kv_cache(req, self.kv.tree_cache)
@@ -1327,23 +1328,13 @@ class SchedulerBatchResultProcessor:
             "InternalServerError",
         )
 
-    def release_finished_req(self, req: Req, *, checkpoint: bool) -> None:
-        """Give a leaving request's KV back: HiSparse frees the rows it holds
-        for it first, then the row goes back to the tree (with ``checkpoint``,
-        the tree first keeps what it can key)."""
-        hisparse = self.hisparse_coordinator
-        if hisparse is not None and hisparse.holds_rows(req):
-            hisparse.request_finished(req)
-        release_kv_cache(req, self.kv.tree_cache, checkpoint=checkpoint)
-
     def _handle_sampling_mask_abort(self, req: Req) -> None:
         """Release a request whose sampled token must not be committed."""
-        if req.multimodal_inputs is not None and req.session is None:
-            req.multimodal_inputs.release_features()
+        self.request_retirer.release_finished_features(req)
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
-            self.release_finished_req(req, checkpoint=False)
+            self.request_retirer.retire_finished(req, checkpoint=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1374,8 +1365,7 @@ class SchedulerBatchResultProcessor:
                 )
 
             # delete feature to save memory
-            if req.multimodal_inputs is not None and req.session is None:
-                req.multimodal_inputs.release_features()
+            self.request_retirer.release_finished_features(req)
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
@@ -1384,7 +1374,7 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                self.release_finished_req(
+                self.request_retirer.retire_finished(
                     req,
                     checkpoint=not self._mamba_lazy_keep_written(req, batch, result, i),
                 )

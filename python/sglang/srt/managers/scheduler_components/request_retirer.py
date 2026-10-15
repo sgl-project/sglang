@@ -1,19 +1,45 @@
-"""Finish or reject a request that never ran."""
+"""Every way a request leaves the scheduler, or gives its KV back to be
+requeued.
+
+A request that leaves releases up to five parts. Each entry point runs the
+parts its outcome needs, in this order:
+
+1. media and streaming session, with the end of the cache request (an aborted
+   outcome);
+2. beam group (an aborted outcome);
+3. HiSparse rows;
+4. retraction backup (a retraction; it reads the device KV);
+5. KV row and request slot.
+
+One entry keeps a documented exception: a PD transfer that failed after its
+prefill checkpoints the KV before it ends the cache request.
+
+Only this module calls the part functions (`release_kv_cache`,
+`tree_cache.finish`, `beam_coordinator.retire_group`, the HiSparse release
+calls and the media release); a CPU test enforces it.
+"""
 
 from __future__ import annotations
 
 import logging
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Iterable, Optional
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.mem_cache.common import (
+    backup_kv_cache,
+    evict_from_tree_cache,
+    release_kv_cache,
+)
+from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler_components.bundles import KvResources
     from sglang.srt.managers.scheduler_components.ipc_channels import (
@@ -32,13 +58,54 @@ class RequestRetirer:
         *,
         kv: KvResources,
         beam_coordinator: BeamCoordinator,
+        hisparse_coordinator: Optional[HiSparseCoordinator],
         output_streamer: SchedulerOutputStreamer,
         ipc_channels: SchedulerIpcChannels,
     ):
+        self.kv = kv
         self.tree_cache = kv.tree_cache
         self.beam_coordinator = beam_coordinator
+        self.hisparse_coordinator = hisparse_coordinator
         self.output_streamer = output_streamer
         self.ipc_channels = ipc_channels
+
+    # ------------------------------------------------------------------
+    # Entry points, one per outcome.
+    # ------------------------------------------------------------------
+    def retire_finished(self, req: Req, *, checkpoint: bool) -> None:
+        """A request its commit finished (or a PD handoff finished at once):
+        HiSparse rows, then the KV row (with ``checkpoint``, the tree first
+        keeps what it can key). A successful cache request needs no finish."""
+        self._release_hisparse_rows(req)
+        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+
+    def retire_aborted_waiting(self, req: Req) -> None:
+        """A request aborted in the waiting queue: media and session with the
+        cache request, the beam group, then the mamba state a mamba cache may
+        have allocated ahead of its KV (a KV row it shows is borrowed from its
+        streaming session, which keeps it)."""
+        self.release_aborted_request(req)
+        self.beam_coordinator.retire_group(req)
+        if req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
+
+    def retire_aborted(self, req: Req, *, checkpoint: bool = False) -> None:
+        """A request aborted once it may hold KV (running, chunked, or in a PD
+        queue that allocated it): media and session with the cache request,
+        the beam group, HiSparse rows, then whatever KV or mamba state it
+        holds."""
+        self.release_aborted_request(req)
+        self.beam_coordinator.retire_group(req)
+        self._release_hisparse_rows(req)
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+
+    def retire_transfer_failed(self, req: Req) -> None:
+        """A PD prefill request whose KV transfer failed after its prefill: the
+        prefill KV is valid, so the tree keeps it first; then media and session
+        with the cache request."""
+        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        self.release_aborted_request(req)
 
     def retire_unadmitted_request(self, req: Req) -> None:
         """Finish a request the disaggregation queues rejected at their door."""
@@ -65,13 +132,77 @@ class RequestRetirer:
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
 
-    def release_aborted_request(self, req: Req) -> None:
-        """Drop the cache-side state an aborted request left behind."""
-        req.release_mm_inputs_on_abort()
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        if req.session is not None and req.session.streaming:
-            req.session.abort_req()
+    def abandon_attempt(self, req: Req, *, release_kv: bool) -> None:
+        """End this attempt's cache request; the request stays, in a queue its
+        owner drains, or is requeued for another attempt (``release_kv``
+        frees the KV the attempt holds, without inserting it)."""
+        self.release_aborted_request(req)
+        if release_kv:
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
 
+    def retract(
+        self, req: Req, *, num_remaining_reqs: int, offload_kv: bool = True
+    ) -> bool:
+        """Give a decoding request's KV back so it can be requeued; returns
+        False when the KV backup failed and the request cannot be resumed."""
+        hisparse_coordinator = self.hisparse_coordinator
+        if hisparse_coordinator is not None and not req.finished():
+            hisparse_coordinator.retract_req(req)
+
+        # In decode disaggregation the retracted KV is offloaded to host so it can be
+        # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
+        # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
+        # pass offload_kv=False to skip the wasteful device->host copy.
+        backup_saved = True
+        # The config bag reflects role flips; server_args keeps the launch role.
+        if get_disagg().disaggregation_mode == "decode" and offload_kv:
+            backup_saved = backup_kv_cache(
+                req,
+                self.tree_cache,
+                self.kv.req_to_token_pool,
+                self.kv.token_to_kv_pool_allocator,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
+        # TODO (csy): for preempted requests, we may want to insert into the tree
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        # NOTE(lsyin): we should use the newly evictable memory instantly.
+        num_tokens = num_remaining_reqs * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        evict_from_tree_cache(self.tree_cache, num_tokens)
+
+        req.reset_for_retract()
+        return backup_saved
+
+    def retire_retracted_abort(self, req: Req) -> None:
+        """A retracted request that cannot resume is aborted; its KV is gone,
+        so only its beam group leaves."""
+        self.beam_coordinator.retire_group(req)
+
+    def release_finished_features(self, req: Req) -> None:
+        """Drop a finished request's media features early to save memory; a
+        session keeps them for its next request."""
+        if req.multimodal_inputs is not None and req.session is None:
+            req.multimodal_inputs.release_features()
+
+    def clear_finished_media(self, reqs: Iterable[Req]) -> None:
+        """After a commit, drop the media of the requests it finished; a
+        session keeps its media unless the request was aborted."""
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        for req in reqs:
+            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
+                continue
+            # For session requests, keep mm_inputs for the next request
+            if req.session:
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    req.release_mm_inputs_on_abort()
+                continue
+            # For non-session requests, clear features and mm_inputs
+            mm_inputs.release_features()
+            req.multimodal_inputs = None
+
+    # ------------------------------------------------------------------
+    # Outputs of a leaving request.
+    # ------------------------------------------------------------------
     def send_abort_output(
         self, req: Req, finished_reason: Optional[FinishReasonDict] = None
     ) -> None:
@@ -85,6 +216,22 @@ class RequestRetirer:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.output_streamer.stream_output([req], req.return_logprob)
+
+    # ------------------------------------------------------------------
+    # Parts.
+    # ------------------------------------------------------------------
+    def release_aborted_request(self, req: Req) -> None:
+        """Drop the media and the cache-side state an aborted request left
+        behind, and detach its streaming session."""
+        req.release_mm_inputs_on_abort()
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        if req.session is not None and req.session.streaming:
+            req.session.abort_req()
+
+    def _release_hisparse_rows(self, req: Req) -> None:
+        hisparse = self.hisparse_coordinator
+        if hisparse is not None and req.kv.holds_kv and hisparse.holds_rows(req):
+            hisparse.request_finished(req)
 
 
 def make_abort_req(

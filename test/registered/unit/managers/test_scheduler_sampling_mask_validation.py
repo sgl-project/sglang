@@ -55,6 +55,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     request_retirer=RequestRetirer(
                         kv=MagicMock(),
                         beam_coordinator=MagicMock(),
+                        hisparse_coordinator=None,
                         output_streamer=output_streamer,
                         ipc_channels=MagicMock(),
                     ),

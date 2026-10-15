@@ -302,7 +302,14 @@ class _Scheduler:
         self.load_inquirer = SimpleNamespace(get_loads=Mock())
         self.enable_fpm = False
         self.step_counters = Mock()
-        self._maybe_clear_mm_inputs = Mock()
+        self.request_retirer = RequestRetirer(
+            kv=SimpleNamespace(tree_cache=self.tree_cache),
+            beam_coordinator=None,
+            hisparse_coordinator=None,
+            output_streamer=None,
+            ipc_channels=None,
+        )
+        self.request_retirer.clear_finished_media = Mock()
         self.output_streamer = Mock(spec=["maybe_reply_health_check"])
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
@@ -939,7 +946,9 @@ class TestPrefillResultPolling(CustomTestCase):
             )
         with (
             _single_rank_gloo_group(),
-            patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release_kv,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ) as release_kv,
         ):
             _run_loop(scheduler)
 
@@ -1508,6 +1517,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 scheduler.request_retirer = RequestRetirer(
                     kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
                     beam_coordinator=None,
+                    hisparse_coordinator=None,
                     output_streamer=None,
                     ipc_channels=None,
                 )
@@ -1536,7 +1546,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 with (
                     _single_rank_gloo_group(),
                     patch(
-                        "sglang.srt.disaggregation.prefill.release_kv_cache",
+                        "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
                         side_effect=release,
                     ) as release_kv,
                 ):

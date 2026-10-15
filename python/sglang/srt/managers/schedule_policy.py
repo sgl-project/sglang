@@ -41,11 +41,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Req,
-    release_req,
-    split_cached_prefix_by_tier,
-)
+from sglang.srt.managers.schedule_batch import Req, split_cached_prefix_by_tier
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -75,9 +71,10 @@ from sglang.srt.mem_cache.unified_cache.components import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -595,8 +592,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
-        req_to_token_pool: Optional[ReqToTokenPool] = None,
-        hisparse_coordinator: Optional[HiSparseCoordinator] = None,
+        request_retirer: Optional[RequestRetirer] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -605,8 +601,8 @@ class PrefillAdder:
         # The decoding requests; preemption releases some (preempt_list) but
         # leaves the list to the caller.
         self.running_reqs = running_reqs if running_reqs is not None else []
-        self.req_to_token_pool = req_to_token_pool
-        self.hisparse_coordinator = hisparse_coordinator
+        # Preemption gives a running request's KV back through it.
+        self.request_retirer = request_retirer
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
@@ -1433,7 +1429,7 @@ class PrefillAdder:
         priority_sign = 1 if get_schedule().schedule_low_priority_values_first else -1
 
         # A finished request has released its KV already; skip it to avoid a
-        # double-free on release_req.
+        # double-free on its retraction.
         valid_running_reqs = (
             r
             for r in self.running_reqs
@@ -1482,13 +1478,8 @@ class PrefillAdder:
                 self._get_running_request_total_token_offset(running_req)
             )
             self.preempt_list.append(running_req)
-            release_req(
-                req=running_req,
-                remaing_req_count=self._num_running_reqs(),
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tree_cache=self.tree_cache,
-                hisparse_coordinator=self.hisparse_coordinator,
+            self.request_retirer.retract(
+                running_req, num_remaining_reqs=self._num_running_reqs()
             )
         return True
 

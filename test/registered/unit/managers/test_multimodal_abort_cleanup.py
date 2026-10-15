@@ -102,6 +102,7 @@ def _intake(**deps):
         request_retirer=RequestRetirer(
             kv=SimpleNamespace(tree_cache=tree_cache),
             beam_coordinator=beam_coordinator,
+            hisparse_coordinator=None,
             output_streamer=MagicMock(),
             ipc_channels=ipc_channels,
         ),
@@ -121,10 +122,10 @@ def _queued_registry(req):
         request_retirer=RequestRetirer(
             kv=kv,
             beam_coordinator=beam_coordinator,
+            hisparse_coordinator=None,
             output_streamer=MagicMock(),
             ipc_channels=ipc_channels,
         ),
-        beam_coordinator=beam_coordinator,
         ipc_channels=ipc_channels,
         kv=kv,
     )

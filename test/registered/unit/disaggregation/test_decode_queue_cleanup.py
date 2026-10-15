@@ -447,9 +447,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
-        queue.batch_result_processor = SimpleNamespace(
-            release_finished_req=tree_release(queue)
-        )
+        queue.request_retirer = SimpleNamespace(retire_finished=tree_release(queue))
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
@@ -565,9 +563,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
-        queue.batch_result_processor = SimpleNamespace(
-            release_finished_req=tree_release(queue)
-        )
+        queue.request_retirer = SimpleNamespace(retire_finished=tree_release(queue))
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
@@ -728,6 +724,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def test_abort_reaches_held_rebootstrap_requests(self):
         held, kept = MagicMock(rid="held-1"), MagicMock(rid="other")
+        # A held request owns no KV: the retraction released it.
+        held.kv.holds_kv = held.kv.holds_mamba = False
         scheduler = self._decode_scheduler(held=[held, kept])
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
@@ -737,6 +735,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         retirer = RequestRetirer(
             kv=MagicMock(),
             beam_coordinator=MagicMock(),
+            hisparse_coordinator=None,
             output_streamer=MagicMock(),
             ipc_channels=scheduler.ipc_channels,
         )
@@ -848,9 +847,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.req_to_metadata_buffer_idx_allocator = MagicMock()
             queue.tp_rank = 0
             queue.tree_cache = MagicMock()
-            queue.batch_result_processor = SimpleNamespace(
-                release_finished_req=tree_release(queue)
-            )
+            queue.request_retirer = SimpleNamespace(retire_finished=tree_release(queue))
             queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -516,7 +517,10 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 manager.req_to_token_pool.free.side_effect = lambda req: setattr(
                     req.kv, "req_pool_idx", None
                 )
-                processor = SimpleNamespace(decode_offload_manager=manager)
+                processor = SimpleNamespace(
+                    decode_offload_manager=manager,
+                    request_retirer=make_request_retirer(),
+                )
                 if inflight:
                     _in_flight(manager, req, 1)
                     manager.cache_controller = MagicMock()

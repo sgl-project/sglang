@@ -482,8 +482,8 @@ class Scheduler:
         self.init_load_publisher()
         self.init_services()
         self.init_beam_coordinator()
-        self.init_batch_result_processor()
         self.init_request_retirer()
+        self.init_batch_result_processor()
         self.init_request_registry()
         self.maybe_init_dllm()
         self.maybe_init_disagg_prefill()
@@ -1153,8 +1153,6 @@ class Scheduler:
             pool_stats_observer=self.pool_stats_observer,
             decode_offload_manager=self.decode_offload_manager,
             request_retirer=self.request_retirer,
-            beam_coordinator=self.beam_coordinator,
-            batch_result_processor=self.batch_result_processor,
             flags=self.flags,
             core_lists=self.lists,
             pending=self.pending,
@@ -1168,7 +1166,6 @@ class Scheduler:
             core_lists=self.lists,
             grammar_manager=self.grammar_manager,
             request_retirer=self.request_retirer,
-            beam_coordinator=self.beam_coordinator,
             ipc_channels=self.ipc_channels,
             kv=self.kv,
             mm_receiver=self.mm_receiver,
@@ -2117,7 +2114,7 @@ class Scheduler:
             request_registry=self.request_registry,
             beam_coordinator=self.beam_coordinator,
             step_builder=self.step_builder,
-            hisparse_coordinator=self.hisparse_coordinator,
+            request_retirer=self.request_retirer,
             grammar_manager=self.grammar_manager,
             metrics_sink=self.metrics_sink,
             ipc_channels=self.ipc_channels,
@@ -2306,12 +2303,14 @@ class Scheduler:
             ),
             beam_coordinator=self.beam_coordinator,
             pending=self.pending,
+            request_retirer=self.request_retirer,
         )
 
     def init_request_retirer(self) -> None:
         self.request_retirer = RequestRetirer(
             kv=self.kv,
             beam_coordinator=self.beam_coordinator,
+            hisparse_coordinator=self.hisparse_coordinator,
             output_streamer=self.output_streamer,
             ipc_channels=self.ipc_channels,
         )
@@ -2357,19 +2356,6 @@ class Scheduler:
             startup_time=self.startup_time,
             record_step_time=RECORD_STEP_TIME,
         )
-
-    def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
-        for req in batch.reqs:
-            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
-                continue
-            # For session requests, keep mm_inputs for the next request
-            if req.session:
-                if isinstance(req.finished_reason, FINISH_ABORT):
-                    req.release_mm_inputs_on_abort()
-                continue
-            # For non-session requests, clear features and mm_inputs
-            mm_inputs.release_features()
-            req.multimodal_inputs = None
 
     def handle_generate_request(self, recv_req: TokenizedGenerateReqInput):
         self.request_intake.handle_generate_request(recv_req)
@@ -2680,7 +2666,7 @@ class Scheduler:
         if self.enable_fpm:
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
-        self._maybe_clear_mm_inputs(batch)
+        self.request_retirer.clear_finished_media(batch.reqs)
         self.output_streamer.maybe_reply_health_check()
         self.metrics_sink.update_device_timer()
 

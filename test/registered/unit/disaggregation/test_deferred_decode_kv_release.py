@@ -10,7 +10,7 @@ destinations may also release on timeout; host destinations require the ack.
 
 import threading
 import unittest
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, call, patch
 
@@ -28,11 +28,9 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.managers.scheduler_components import (
-    batch_result_processor as batch_result_processor_mod,
+    request_retirer as request_retirer_mod,
 )
-from sglang.srt.managers.scheduler_components.batch_result_processor import (
-    SchedulerBatchResultProcessor,
-)
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
 from sglang.test.test_utils import CustomTestCase
@@ -673,7 +671,7 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.enable_staging = False
     q.staging_handler = None
     q.tree_cache = object()
-    q.batch_result_processor = SimpleNamespace(release_finished_req=tree_release(q))
+    q.request_retirer = SimpleNamespace(retire_finished=tree_release(q))
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.metrics_sink = SimpleNamespace(enable_metrics=enable_metrics)
@@ -1042,17 +1040,15 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         q = _make_pop_queue(mgr)
         q.enable_hisparse = True
         q.hisparse_coordinator = _FakeHiSparse({5: [100, 101]})
-        q.batch_result_processor = SimpleNamespace(
-            release_finished_req=MethodType(
-                SchedulerBatchResultProcessor.release_finished_req,
-                SimpleNamespace(
-                    hisparse_coordinator=q.hisparse_coordinator,
-                    kv=SimpleNamespace(tree_cache=q.tree_cache),
-                ),
-            )
+        q.request_retirer = RequestRetirer(
+            kv=SimpleNamespace(tree_cache=q.tree_cache),
+            beam_coordinator=None,
+            hisparse_coordinator=q.hisparse_coordinator,
+            output_streamer=None,
+            ipc_channels=None,
         )
         entry = _make_failed_req(mgr, room=11, idx=2, abort_notified=False)
-        entry.req.kv = SimpleNamespace(req_pool_idx=5)
+        entry.req.kv = SimpleNamespace(req_pool_idx=5, holds_kv=True)
         q.queue = [entry]
         return mgr, q, entry
 
@@ -1066,7 +1062,7 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         room = entry.req.bootstrap_room
         generation = mgr.register_deferred_abort_room(room)
 
-        with patch.object(batch_result_processor_mod, "release_kv_cache") as rel:
+        with patch.object(request_retirer_mod, "release_kv_cache") as rel:
             self._pop(q)
             self.assertEqual(len(q._deferred_releases), 1)
             self.assertTrue(hs.holds_rows(entry.req))
@@ -1090,7 +1086,7 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         _, q, entry = self._make(deferred=False)
         hs = q.hisparse_coordinator
 
-        with patch.object(batch_result_processor_mod, "release_kv_cache") as rel:
+        with patch.object(request_retirer_mod, "release_kv_cache") as rel:
             self._pop(q)
             rel.assert_called_once()
 

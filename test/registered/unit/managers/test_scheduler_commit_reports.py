@@ -42,7 +42,7 @@ def _scheduler(order: Mock, *, mode: str) -> Scheduler:
     s.leave_finished_reqs = order.leave_finished_reqs
     s.tree_cache = Mock()
     s.enable_fpm = False
-    s._maybe_clear_mm_inputs = Mock()
+    s.request_retirer = Mock()
     s.output_streamer = Mock()
     s.scripted_scheduler_hook = None
     return s

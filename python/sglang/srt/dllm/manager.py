@@ -12,7 +12,7 @@ from sglang.srt.dllm.req_state import DllmReqPhase, DllmReqState
 from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, SchedulePolicy
-from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_schedule
@@ -157,10 +157,8 @@ class DllmManager:
         if not aborted:
             return reqs
         for req in aborted:
-            self.request_retirer.release_aborted_request(req)
+            self.request_retirer.retire_aborted(req)
             self.request_retirer.send_abort_output(req)
-            if req.kv.holds_kv or req.kv.holds_mamba:
-                release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort dLLM queued request. {req.rid=}")
         return [req for req in reqs if req not in aborted]
 
@@ -331,9 +329,8 @@ class DllmManager:
             req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
 
         if req.finished():
-            release_kv_cache(
+            self.request_retirer.retire_finished(
                 req,
-                self.tree_cache,
                 checkpoint=not self.dllm_config.requires_separate_context_encoding,
             )
             req.time_stats.set_completion_time()

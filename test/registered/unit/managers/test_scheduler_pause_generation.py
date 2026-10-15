@@ -9,7 +9,11 @@ import torch
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
-from sglang.test.scheduler_request_lists import request_registry_of, step_planner_of
+from sglang.test.scheduler_request_lists import (
+    make_request_retirer,
+    request_registry_of,
+    step_planner_of,
+)
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -64,6 +68,18 @@ class _Scheduler(Scheduler):
     def step_planner(self):
         # Over the scheduler's fields as each test last set them.
         return step_planner_of(self)
+
+    @property
+    def request_retirer(self):
+        # Over the scheduler's pools and HiSparse as each test last set them.
+        return make_request_retirer(
+            kv=SimpleNamespace(
+                tree_cache=self.tree_cache,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            ),
+            hisparse_coordinator=self.hisparse_coordinator,
+        )
 
 
 def _all_reduce_with_peer(ops, peer_queue_sizes, peer_pending):

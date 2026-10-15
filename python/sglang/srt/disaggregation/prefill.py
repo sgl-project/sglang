@@ -748,7 +748,8 @@ class DisaggPrefill:
         for req in self.bootstrap_queue.queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.request_retirer.release_aborted_request(req)
+                # The bootstrap failure the abort causes retires it.
+                self.request_retirer.abandon_attempt(req, release_kv=False)
 
                 if hasattr(self.kv_senders[req.rid], "abort"):
                     self.kv_senders[req.rid].abort()
@@ -815,13 +816,13 @@ class DisaggPrefill:
         checkpoint_kv_cache(req, cache)
 
     def release_aborted_waiting_req(self, req: Req) -> None:
+        """Tear down the PD transfer state of a waiting request the abort
+        removes; the retirer releases the rest."""
         self.clear_pending_chunk_send(req)
         sender = self.kv_senders.get(req.rid)
         if sender is not None and hasattr(sender, "abort"):
             sender.abort()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.disagg.pending_bootstrap = False
         self.kv_senders.pop(req.rid, None)
 
@@ -1209,10 +1210,7 @@ class DisaggPrefill:
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
-                self.tree_cache.finish(
-                    req.cache_request_handle, CacheRequestOutcome.SUCCESS
-                )
+                self.request_retirer.retire_finished(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 self.kv_senders[req.rid].clear()
                 done_reqs.append(req)
@@ -1285,8 +1283,7 @@ class DisaggPrefill:
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
         # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
-        self.request_retirer.release_aborted_request(req)
+        self.request_retirer.retire_transfer_failed(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1706,10 +1703,9 @@ class DisaggPrefill:
                 req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
             )
         )
-        self.request_retirer.release_aborted_request(req)
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self.request_retirer.abandon_attempt(req, release_kv=True)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.disagg.start_send_idx = 0

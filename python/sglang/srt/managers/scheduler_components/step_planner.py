@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.min_free_slots_delayer import MinFreeSlotsDelayer
     from sglang.srt.managers.prefill_delayer import (
         PrefillDelayer,
@@ -76,6 +75,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.request_registry import (
         RequestRegistry,
     )
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -109,7 +111,7 @@ class StepPlanner:
         request_registry: RequestRegistry,
         beam_coordinator: BeamCoordinator,
         step_builder: StepBuilder,
-        hisparse_coordinator: Optional[HiSparseCoordinator],
+        request_retirer: RequestRetirer,
         grammar_manager: GrammarManager,
         metrics_sink: MetricsSink,
         ipc_channels: SchedulerIpcChannels,
@@ -146,7 +148,7 @@ class StepPlanner:
         self.lora_admission = lora_admission
         self.beam_coordinator = beam_coordinator
         self.step_builder = step_builder
-        self.hisparse_coordinator = hisparse_coordinator
+        self.request_retirer = request_retirer
         self.grammar_manager = grammar_manager
         self.metrics_sink = metrics_sink
         self.ipc_channels = ipc_channels
@@ -326,8 +328,7 @@ class StepPlanner:
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             waiting_queue_len=len(self.core_lists.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
-            req_to_token_pool=self.req_to_token_pool,
-            hisparse_coordinator=self.hisparse_coordinator,
+            request_retirer=self.request_retirer,
         )
 
         # The chunked request after this step; the launch moves it into the
@@ -643,10 +644,10 @@ class StepPlanner:
         )
         kept_reqs, retracted_reqs, reqs_to_abort = retract_decode(
             reqs,
+            request_retirer=self.request_retirer,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
-            hisparse_coordinator=self.hisparse_coordinator,
             spec_algorithm=self.spec_algorithm,
         )
         new_token_ratio = NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
@@ -689,7 +690,7 @@ class StepPlanner:
         for req in reqs_to_abort:
             # Member rows were freed inside retract_decode; the group only
             # has to leave the live set.
-            self.beam_coordinator.retire_group(req)
+            self.request_retirer.retire_retracted_abort(req)
 
         msg_prefix = (
             "KV cache pool is full. Retract requests. "
@@ -738,10 +739,7 @@ class StepPlanner:
             # discarded. Non-decode modes ignore offload_kv (they never offload).
             retract_all(
                 reqs=retract_reqs,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tree_cache=self.tree_cache,
-                hisparse_coordinator=self.hisparse_coordinator,
+                request_retirer=self.request_retirer,
                 offload_kv=False,
             )
         self.core_lists.decoding = []

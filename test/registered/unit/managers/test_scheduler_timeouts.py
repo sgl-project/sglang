@@ -109,6 +109,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         intake.request_retirer = RequestRetirer(
             kv=SimpleNamespace(tree_cache=intake.tree_cache),
             beam_coordinator=intake.beam_coordinator,
+            hisparse_coordinator=None,
             output_streamer=MagicMock(),
             ipc_channels=intake.ipc_channels,
         )
