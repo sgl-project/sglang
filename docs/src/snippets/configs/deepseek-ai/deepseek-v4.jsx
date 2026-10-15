@@ -53,7 +53,7 @@ export const config = {
   // The strategy presets use c16 / c48 / c256. Pro uses its MTP head;
   // Pro Official is the InferenceX checkpoint. Acceptance simulation is omitted.
   // Pro Official kernel/routing updates follow the optimized AgentX recipe;
-  // see section 3.7 for required image patches and the c1 / c512 overrides.
+  // see section 3.7 for the c1 / c512 overrides.
   overlayDims: [
     { id: "pdMode", title: "PD role", default: "prefill",
       showWhen: (s) => s.hw === "mi355x" && s.quant === "fp4"
@@ -90,10 +90,7 @@ export const config = {
       "  --health-check-timeout-secs 600 --health-check-interval-secs 30",
     ].join(" \\\n");
     const common = { ...cell, nnodes: 1, dockerImage: image, pdMode: role,
-      router: { port: 8000, command: router },
-      hints: official ? [
-        "Requires an optimized image: SGLang #44007, #44016 and router #42027 / #43483 (see section 3.7). The pinned image is only the base build; replace it with your patched image.",
-      ] : [] };
+      router: { port: 8000, command: router } };
     if (role === "router") return { ...common,
       commands: { python: router, docker: `docker run --network host --rm ${image} ${router}` } };
     // Emit overrides only. Defaults checked against the pinned image:
@@ -163,11 +160,11 @@ export const config = {
     ];
     return { ...common, env, flags,
       dockerMounts: prefill ? ["/tmp/umbp:/tmp/umbp"] : [],
-      hints: [...common.hints, ...(prefill ? [
+      hints: prefill ? [
         "Start the standalone UMBP tier on this prefill node before this worker (see section 3.9).",
         "Reserve hugepages for its 1.5 TB DRAM pool; wait for: host memory registered for GPU access.",
         "The Docker worker shares /tmp/umbp with the UMBP process.",
-      ] : [])],
+      ] : [],
     };
   },
 

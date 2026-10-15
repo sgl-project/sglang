@@ -950,17 +950,6 @@ docker run \
 
 The Deployment and Playground Docker outputs retain this `v0.5.21` base image for the MI355X Pro and Pro Official FP4 multi-node recipes. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
 
-<Warning>
-**The optimized Pro Official recipes require a patched image.** Replace the image in the generated commands with a build containing the following changes; the stock `20261001` image is insufficient:
-
-- **Dense mxscale GEMM:** [SGLang #44007](https://github.com/sgl-project/sglang/pull/44007), plus an AITER build with `get_mxscale_bpreshuffle_config`, for `SGLANG_DSV4_DENSE_MXSCALE=1`.
-- **Fast FP8 KV decode/verify:** [SGLang #44016](https://github.com/sgl-project/sglang/pull/44016), with the FlyDSL v4 nm FP8 decode kernel from [ROCm/aiter #5882](https://github.com/ROCm/aiter/pull/5882) or its in-tree copy. The FP8 layout works without this fast path, but does not provide the same decode improvement.
-- **DP-aware power-of-two routing:** [SGLang #42027](https://github.com/sgl-project/sglang/pull/42027) and [#43483](https://github.com/sgl-project/sglang/pull/43483). Without the first change, a 1P1D router using `power_of_two` refuses to start; without the second, it does not use the requested in-flight request metric.
-- **Concurrency 512 only:** MegaMoE prefill EPLB support for `SGLANG_AITER_MEGA_RANK_SYNC`, `SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY`, and `SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD`.
-
-Check these features when replacing the image: unrecognized environment switches can be silently ignored. The original **Pro** EAGLE/MTP presets retain their existing kernel and routing settings.
-</Warning>
-
 For the **MI355X Pro / Pro Official FP4** presets, **High-Throughput** sets `MORI_IO_QP_MAX_SEND_WR=32767` and `MORI_IO_QP_MAX_CQE=32768` on both MORI roles. Low-Latency and Balanced use the transport's default queue sizes. The send-queue backoff timeout uses MORI's default of 5 seconds.
 
 #### Role-based configuration
