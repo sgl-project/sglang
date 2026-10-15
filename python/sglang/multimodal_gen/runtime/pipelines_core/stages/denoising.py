@@ -153,8 +153,13 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
-    RolloutDenoisingMixin,
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    rollout_transition,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    finalize_rollout_if_enabled,
+    init_rollout_env_if_enabled,
+    prepare_rollout_if_enabled,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -328,7 +333,7 @@ class DualTransformerExecutionMode(str, Enum):
     PAIRED_PER_STEP = "paired_per_step"
 
 
-class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
+class DenoisingStage(PipelineStage):
     """
     Stage for running the denoising loop in diffusion pipelines.
 
@@ -1277,13 +1282,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if freshly_loaded:
             register_loaded_transformer(self, server_args, pipeline)
 
-        if batch.rollout:
-            self._maybe_prepare_rollout(batch)
+        prepare_rollout_if_enabled(
+            batch=batch, pipeline_config=server_args.pipeline_config
+        )
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
+            {
+                "generator": batch.generator,
+                "eta": batch.eta,
+                "transition": rollout_transition(batch),
+            },
         )
 
         # Setup precision and autocast settings
@@ -2045,15 +2055,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Run the denoising loop.
         """
         ctx = self._prepare_denoising_loop(batch, server_args)
-        if batch.rollout:
-            self._maybe_init_denoising_env_collection(
-                batch=batch,
-                pipeline_config=server_args.pipeline_config,
-                image_kwargs=ctx.image_kwargs,
-                pos_cond_kwargs=ctx.pos_cond_kwargs,
-                neg_cond_kwargs=ctx.neg_cond_kwargs,
-                guidance=ctx.guidance,
-            )
+        init_rollout_env_if_enabled(
+            batch=batch,
+            image_kwargs=ctx.image_kwargs,
+            pos_cond_kwargs=ctx.pos_cond_kwargs,
+            neg_cond_kwargs=ctx.neg_cond_kwargs,
+            guidance=ctx.guidance,
+        )
         denoising_start_time = time.time()
         self._before_denoising_loop(ctx, batch, server_args)
         # to avoid device-sync caused by timestep comparison
@@ -2097,19 +2105,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                             t_host,
                             timesteps_cpu,
                         )
-                        # Capture the raw (pre-scale, pre-I2V-concat) noisy latent
-                        # x_{t_i} for rollout trajectory collection. Must run
-                        # BEFORE _run_denoising_step so ctx.latents is still the
-                        # pre-step value. Gated on batch.rollout to keep the
-                        # non-rollout path strictly untouched.
-                        if batch.rollout:
-                            batch._rollout_loop_step_index = step_index
-                            self._maybe_append_dit_trajectory_step(
-                                batch=batch,
-                                latents=ctx.latents,
-                                timestep_value=step.t_host,
-                                step_index=step_index,
-                            )
                         self._run_denoising_step(ctx, step, batch, server_args)
                         self._record_trajectory(ctx, step, batch, server_args)
 
@@ -2139,14 +2134,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # the final scheduler.step output (ctx.latents) is still SP-sharded and
         # can be gathered uniformly alongside the per-step dit_trajectory via
         # gather_stacked_latents_for_sp.
-        if batch.rollout:
-            self._postprocess_rollout_outputs(
-                batch=batch,
-                latents=ctx.latents,
-                num_inference_steps=num_timesteps,
-                final_timestep=timesteps_cpu.new_zeros(()),
-                server_args=server_args,
-            )
+        finalize_rollout_if_enabled(
+            batch=batch,
+            latents=ctx.latents,
+            num_inference_steps=num_timesteps,
+            final_timestep=timesteps_cpu.new_zeros(()),
+            pipeline_config=server_args.pipeline_config,
+        )
         self._finalize_denoising_loop(ctx, batch, server_args)
         return batch
 

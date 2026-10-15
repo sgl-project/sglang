@@ -22,7 +22,7 @@
 # ==============================================================================
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import scipy.stats
@@ -32,9 +32,6 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import BaseOutput
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
-from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
-    SchedulerRLMixin,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -54,9 +51,7 @@ class FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
     prev_sample: torch.FloatTensor
 
 
-class FlowMatchEulerDiscreteScheduler(
-    SchedulerMixin, ConfigMixin, BaseScheduler, SchedulerRLMixin
-):
+class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
     """
     Euler scheduler.
 
@@ -454,7 +449,7 @@ class FlowMatchEulerDiscreteScheduler(
         s_noise: float = 1.0,
         generator: torch.Generator | None = None,
         per_token_timesteps: torch.Tensor | None = None,
-        batch=None,
+        transition: Callable[..., torch.FloatTensor] | None = None,
         return_dict: bool = True,
     ) -> FlowMatchEulerDiscreteSchedulerOutput | tuple[torch.FloatTensor, ...]:
         """
@@ -477,6 +472,10 @@ class FlowMatchEulerDiscreteScheduler(
                 A random number generator.
             per_token_timesteps (`torch.Tensor`, *optional*):
                 The timesteps for each token in the sample.
+            transition (`Callable`, *optional*):
+                Replaces this scheduler's own `_transition` for this call, with the
+                same keyword arguments; rollout passes
+                `FlowRolloutController.transition` here.
             return_dict (`bool`):
                 Whether or not to return a
                 [`~schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteSchedulerOutput`] or tuple.
@@ -524,24 +523,18 @@ class FlowMatchEulerDiscreteScheduler(
             next_sigma = sigma_next
             dt = sigma_next - sigma
 
-        if batch is not None and batch.rollout:
-            if not self.already_prepared_rollout(batch):
-                raise RuntimeError("Rollout not prepared before step")
-            prev_sample = self.flow_sde_sampling(
-                batch, model_output, sample, current_sigma, next_sigma, generator
-            )
-        else:
-            if self.config.stochastic_sampling:
-                x0 = sample - current_sigma * model_output
-                noise = torch.randn(
-                    sample.shape,
-                    generator=generator,
-                    device=sample.device,
-                    dtype=sample.dtype,
-                )
-                prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
-            else:
-                prev_sample = sample + dt * model_output
+        if transition is None:
+            transition = self._transition
+        prev_sample = transition(
+            model_output=model_output,
+            sample=sample,
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            dt=dt,
+            generator=generator,
+            step_index=self.step_index,
+            timestep=timestep,
+        )
 
         # upon completion increase step index by one
         assert self._step_index is not None, "_step_index should not be None"
@@ -644,6 +637,31 @@ class FlowMatchEulerDiscreteScheduler(
             ]
         )
         return sigmas
+
+    def _transition(
+        self,
+        *,
+        model_output: torch.FloatTensor,
+        sample: torch.FloatTensor,
+        current_sigma: torch.FloatTensor,
+        next_sigma: torch.FloatTensor,
+        dt: torch.FloatTensor,
+        generator: torch.Generator | None,
+        step_index: int,
+        timestep: int | torch.Tensor,
+    ) -> torch.FloatTensor:
+        if self.config.stochastic_sampling:
+            x0 = sample - current_sigma * model_output
+            noise = torch.randn(
+                sample.shape,
+                generator=generator,
+                device=sample.device,
+                dtype=sample.dtype,
+            )
+            prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
+        else:
+            prev_sample = sample + dt * model_output
+        return prev_sample
 
     def _time_shift_exponential(
         self, mu: float, sigma: float, t: torch.Tensor | np.ndarray
