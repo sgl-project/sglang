@@ -60,10 +60,18 @@ def build_eagle_disagg_draft_input(
         num_states *= spec.speculative_num_steps
 
     topk_p = async_h2d_stack(
-        [req.output_topk_p[:num_states] for req in batch.reqs], device=batch.device
+        [
+            torch.as_tensor(req.output_topk_p[:num_states], dtype=torch.float32)
+            for req in batch.reqs
+        ],
+        device=batch.device,
     )
     topk_index = async_h2d_stack(
-        [req.output_topk_index[:num_states] for req in batch.reqs], device=batch.device
+        [
+            torch.as_tensor(req.output_topk_index[:num_states], dtype=torch.int64)
+            for req in batch.reqs
+        ],
+        device=batch.device,
     )
     hidden_states = async_h2d_stack(
         [req.hidden_states_tensor for req in batch.reqs], device=batch.device
