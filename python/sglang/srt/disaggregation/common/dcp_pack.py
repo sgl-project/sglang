@@ -69,6 +69,10 @@ def try_pack_dcp_src(
         )
         return None
 
+    # Transfer threads start on device 0. Select the buffer's device before
+    # StreamContext saves the current stream, which would otherwise create
+    # an unused device-0 context in every nonzero rank.
+    torch.cuda.set_device(pack_buffer.buffer.device)
     pack = pack_buffer.buffer.narrow(0, pack_offset_bytes, required)
     row_indices = torch.as_tensor(
         src_token_indices, device=pack.device, dtype=torch.int64
