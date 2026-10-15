@@ -567,6 +567,9 @@ class Envs:
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)
+    # With the fc split, draft steps (1-2 rows) run the pre-fc norm and the slice GEMV
+    # as one kernel instead of the norm plus a cuBLAS fp32 GEMM.
+    SGLANG_Q35MF_DRAFT_FC_GEMV = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

@@ -23,6 +23,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.speculative.draft_fc_partial import (
+    MAX_TOKENS as _FC_GEMV_MAX_TOKENS,
+    draft_fc_partial,
+    draft_fc_partial_rows,
+)
 from sglang.kernels.ops.speculative.ordered_partial_sum import ordered_partial_sum
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -134,6 +139,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.fc_split_slice = self._fc_split_slice(config.hidden_size)
         # This rank's fc input-column slice, copied on the first eager split call.
         self._fc_shard: Optional[torch.Tensor] = None
+        # Weight rows per CTA of the fused norm + slice GEMV, or None to keep cuBLAS.
+        self._fc_gemv_rows: Optional[int] = None
+        if self.fc_split_slice is not None and envs.SGLANG_Q35MF_DRAFT_FC_GEMV.get():
+            self._fc_gemv_rows = draft_fc_partial_rows(
+                config.hidden_size,
+                self.fc_split_slice[2],
+                torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count,
+            )
         self._fc_gather = (
             triton_symm_mem_ag.MultimemAllGatherer(
                 max_tokens=_FC_SPLIT_MAX_TOKENS, enabled=True, skip_entry_sync=True
@@ -212,8 +227,24 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         rank order, rounded once to bf16 (the replicated fc's rounding points)."""
         use_hidden, start, width = self.fc_split_slice
         x = hidden_states if use_hidden else input_embeds
+        norm = self.pre_fc_norm_hidden if use_hidden else self.pre_fc_norm_embedding
+        if (
+            self._fc_gemv_rows is not None
+            and 0 < x.shape[0] <= _FC_GEMV_MAX_TOKENS
+            and x.shape[0] == input_embeds.shape[0]
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            partial = draft_fc_partial(
+                x.contiguous(),
+                norm.weight.data,
+                norm.variance_epsilon,
+                self._fc_shard,
+                start,
+                x.new_empty((x.shape[0], self.config.hidden_size), dtype=torch.float32),
+                self._fc_gemv_rows,
+            )
+            return self._gather_partials(partial)
         if not forward_batch.forward_mode.is_idle():
-            norm = self.pre_fc_norm_hidden if use_hidden else self.pre_fc_norm_embedding
             x = norm(x)
         if use_hidden and x.shape[0] != input_embeds.shape[0]:
             rows = min(x.shape[0], input_embeds.shape[0])
@@ -223,6 +254,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         partial = torch.mm(
             x[:, start : start + width], self._fc_shard.T, out_dtype=torch.float32
         )
+        return self._gather_partials(partial)
+
+    def _gather_partials(self, partial: torch.Tensor) -> torch.Tensor:
         gathered = self._fc_gather(partial.view(torch.bfloat16))
         out = partial.new_empty(partial.shape, dtype=torch.bfloat16)
         return ordered_partial_sum(
