@@ -554,6 +554,19 @@ class LlamaForCausalLM(nn.Module):
         ".up_proj": (".gate_up_proj", 1),
     }
 
+    stacked_params_mapping = (
+        # (param_name, shard_name, shard_id)
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
+    )
+    _llama_scale_remap_patterns = (
+        (".activation_scale", ".activation_scale", ".input_scale"),
+        (".weight_scale_inv", ".weight_scale_inv", ".weight_scale"),
+    )
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -579,16 +592,15 @@ class LlamaForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
 
         self.capture_aux_hidden_states = False
+
+    def custom_scale_remap(self, name: str) -> str:
+        """Llama: activation_scale->input_scale, weight_scale_inv->weight_scale."""
+        for suffix, pattern, replacement in self._llama_scale_remap_patterns:
+            if name.endswith(suffix) and pattern in name:
+                return name.replace(pattern, replacement)
+        return name
 
     def _init_model(
         self,
@@ -706,23 +718,11 @@ class LlamaForCausalLM(nn.Module):
         return self._legacy_load_weights(weights)
 
     def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
 
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
-            if name.endswith(".activation_scale"):
-                name = name.replace(".activation_scale", ".input_scale")
-            if name.endswith(".weight_scale_inv"):
-                name = name.replace(".weight_scale_inv", ".weight_scale")
-
+            name = self.custom_scale_remap(name)
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -749,7 +749,7 @@ class LlamaForCausalLM(nn.Module):
                 if name is None:
                     continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)

@@ -521,6 +521,7 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(cfg)
+        self.init_unified_loader_mappings()
         self.capture_aux_hidden_states = False
 
         self.attn_cp_size = get_parallel().attn_cp_size

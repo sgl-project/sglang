@@ -582,6 +582,10 @@ class BaseFusedOp(nn.Module, ABC):
             _record_trace(self, _dispatch_label(method), args, kwargs)
         return result
 
+    def dispatch_forward(self) -> Callable:
+        """The static dispatch target for this op on the current platform."""
+        return self._resolve_forward_method()
+
     # --- torch.compile mode ---
 
     def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
