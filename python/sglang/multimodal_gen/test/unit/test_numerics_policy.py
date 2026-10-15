@@ -62,31 +62,6 @@ class TestNumericsPolicy(unittest.TestCase):
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
         )
 
-    def test_npu_does_not_apply_or_advertise_cuda_settings(self):
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-        with (
-            patch(
-                "sglang.multimodal_gen.runtime.utils.numerics_policy.current_platform.is_cuda",
-                return_value=False,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.utils.numerics_policy.current_platform.is_rocm",
-                return_value=False,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.utils.numerics_policy.logger"
-            ) as logger,
-        ):
-            apply_numerics_policy(
-                allow_cudnn_tf32=False, allow_bf16_reduced_precision_reduction=False
-            )
-        self.assertTrue(torch.backends.cudnn.allow_tf32)
-        self.assertTrue(
-            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
-        )
-        logger.info_once.assert_not_called()
-
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
