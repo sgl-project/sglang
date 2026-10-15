@@ -17,11 +17,12 @@ import torch
 
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 _HAS_CUDA = torch.cuda.is_available()
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 DTYPE = torch.bfloat16
 HEAD_NUM = 2

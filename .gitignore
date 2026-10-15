@@ -166,8 +166,6 @@ cython_debug/
 *.swp
 
 # SGL
-benchmark/mmlu/data
-benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl

@@ -1,7 +1,7 @@
 """CPU-only unit tests for the mamba pool ratio vs the prefill->decode peak.
 
 Pins the sizing invariant behind MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO:
-at the first cache_unfinished_req, a request still holds its admission-locked
+at the first checkpoint, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
 1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and
@@ -195,6 +195,7 @@ class TestDecSwaLockSkip(unittest.TestCase):
         mamba = _RecordingComp(ComponentType.MAMBA, 0)
         node = SimpleNamespace(id=7)
         tree_core = SimpleNamespace(
+            root_node=object(),
             components=(full, swa, mamba),
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
@@ -203,7 +204,11 @@ class TestDecSwaLockSkip(unittest.TestCase):
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,
             node.id,
-            DecLockRefParams(skipped_lock_components=skipped_lock_components),
+            DecLockRefParams(
+                node_id=node.id,
+                skipped_lock_components=skipped_lock_components,
+                component_lock_uuids={ComponentType.SWA: None},
+            ),
         )
         return full, mamba
 
@@ -294,6 +299,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         start, end = get_pp_indices(cls.TOTAL_LAYERS, pp_rank, pp_size)
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
+            extra_mamba_cache_bytes_per_req=0,
             server_args=SimpleNamespace(),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
@@ -327,6 +333,103 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         self.assertEqual(
             len(sizes), 1, f"per-rank pool sizes diverged: {sorted(sizes)}"
         )
+
+
+class TestExtraMambaCacheSizing(unittest.TestCase):
+    @staticmethod
+    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import get_schedule
+
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    layers=[0, 1, 2, 3], mamba_cache_per_req=4 << 20
+                )
+            ),
+            extra_mamba_cache_bytes_per_req=extra_bytes,
+            spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
+            attn_dp_size=dp_size,
+            pp_size=pp_size,
+            model_config=SimpleNamespace(num_hidden_layers=4),
+            _calculate_mamba_ratio=lambda: 2,
+        )
+        args = dict(
+            disable_radix_cache=False,
+            max_mamba_cache_size=None,
+            max_running_requests=256 if draft_tokens is not None else None,
+            mamba_full_memory_ratio=0.5,
+            enable_linear_replayssm_spec=False,
+            speculative_num_draft_tokens=draft_tokens,
+        )
+        args.update(schedule)
+        with rc.get_context().override_server_args(**args):
+            remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
+            return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
+
+    def test_auto_capacity_reserves_backend_state(self):
+        self.assertEqual(self._size(0), (9, 80 << 20))
+        self.assertEqual(self._size(4 << 20), (4, 80 << 20))
+
+    def test_fixed_capacity_charges_padding_and_partitioned_state(self):
+        for pp_size in (1, 2):
+            for dp_size in (1, 2):
+                for schedule in (
+                    dict(max_mamba_cache_size=8),
+                    dict(disable_radix_cache=True, max_running_requests=8),
+                ):
+                    with self.subTest(pp=pp_size, dp=dp_size, **schedule):
+                        slots, remaining = self._size(
+                            8 << 20, pp_size=pp_size, dp_size=dp_size, **schedule
+                        )
+                        self.assertEqual(slots, 8 // dp_size)
+                        self.assertEqual(
+                            remaining,
+                            (120 << 20) - (slots + 1) * (12 << 20) // pp_size,
+                        )
+
+    def test_speculative_auto_capacity_keeps_scratch_separate(self):
+        self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
+        self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+
+    def test_pd_prefill_does_not_reserve_speculative_scratch(self):
+        """A PD prefill server's hybrid req pool never allocates the per-draft-token
+        verify snapshots, so none of the three capacity branches may charge them."""
+        prefill = dict(disaggregation_mode="prefill")
+        # Fixed capacity: 8 slots, ratio 2 -> 4 capped reqs; the (4 + 1) * 2 * 4 MiB
+        # scratch is only charged outside PD prefill.
+        self.assertEqual(
+            self._size(0, draft_tokens=2, max_mamba_cache_size=8), (8, 44 << 20)
+        )
+        self.assertEqual(
+            self._size(0, draft_tokens=2, max_mamba_cache_size=8, **prefill),
+            (8, 84 << 20),
+        )
+        # Capacity from max_running_requests with the radix cache disabled.
+        fixed = dict(disable_radix_cache=True, max_running_requests=8)
+        self.assertEqual(self._size(0, draft_tokens=2, **fixed), (8, 12 << 20))
+        self.assertEqual(
+            self._size(0, draft_tokens=2, **fixed, **prefill), (8, 84 << 20)
+        )
+        # Auto capacity sizes like a non-speculative server.
+        self.assertEqual(self._size(0, draft_tokens=2, **prefill), self._size(0))
+        # Prefill pools that still allocate the snapshots keep the reserve.
+        for allocates in (
+            dict(enable_pd_role_switch=True),
+            dict(enable_unified_memory=True),
+        ):
+            with self.subTest(**allocates):
+                self.assertEqual(
+                    self._size(
+                        0,
+                        draft_tokens=2,
+                        max_mamba_cache_size=8,
+                        **prefill,
+                        **allocates,
+                    ),
+                    (8, 44 << 20),
+                )
 
 
 if __name__ == "__main__":
