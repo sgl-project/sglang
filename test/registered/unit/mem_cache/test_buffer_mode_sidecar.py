@@ -49,6 +49,48 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestBufferModeSidecar(unittest.TestCase):
+    def test_cancelled_query_distinguishes_skipped_query_from_miss(self):
+        for peer_kv_pages in (-1, 0):
+            with self.subTest(peer_kv_pages=peer_kv_pages):
+
+                def reduce(values, *_):
+                    peer = torch.full_like(values, -1)
+                    peer[0] = 0
+                    peer[1 + list(PoolName).index(PoolName.KV)] = peer_kv_pages
+                    values.copy_(torch.minimum(values, peer))
+
+                controller = SimpleNamespace(
+                    page_size=2,
+                    storage_backend=SimpleNamespace(batch_exists=lambda *_: 2),
+                    prefetch_hits_sync_groups=[],
+                    _all_reduce=reduce,
+                )
+                operation = PrefetchOperation(
+                    CacheRequestHandle("cancelled", 0), list(range(4))
+                )
+                _, hit_tokens = HybridCacheController._storage_hit_query(
+                    controller, operation
+                )
+                operation.mark_terminate()
+                operation.storage_hit_count = (
+                    HybridCacheController._sync_prefetch_hit_query(
+                        controller, operation, hit_tokens
+                    )
+                )
+                cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+                cache.host_memory_mode = "buffer_only"
+                cache.tree_core = SimpleNamespace(page_size=2)
+                cache.components = {}
+                cache.storage_existence_cache = StorageExistenceCache()
+                beliefs = cache.storage_existence_cache.pool(PoolName.KV)
+                chain = operation.all_hash_values
+                beliefs.add(chain)
+                cache._invalidate_absent_from_hit_query(operation)
+                self.assertEqual(
+                    [beliefs.contains(h) for h in chain],
+                    [peer_kv_pages == -1] * len(chain),
+                )
+
     @staticmethod
     def _swa_component():
         return SimpleNamespace(
@@ -406,7 +448,12 @@ class TestBufferModeSidecar(unittest.TestCase):
 
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = cache
-        pipeline._swa_window_pages = 1
+        pipeline._swa_component = SimpleNamespace(
+            pool_name=PoolName.SWA,
+            component_type=ComponentType.SWA,
+            full_window_pages=1,
+        )
+        pipeline._auxiliary_swa_component = None
         pipeline.write_backlog_cap = 8
         pipeline.reset()
         pipeline._build_backup_transfers = lambda node_id, *, kv_only=False: (
