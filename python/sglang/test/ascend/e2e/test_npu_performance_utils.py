@@ -388,6 +388,9 @@ def run_bench_serving(
     repeat_rate=None,
     temperature=None,
     top_p=None,
+    gsp_num_groups=None,
+    gsp_prompts_per_group=None,
+    cache_report=False,
     env=None,
 ):
     metrics_path = os.getenv("METRICS_DATA_FILE")
@@ -416,9 +419,11 @@ def run_bench_serving(
             "--dataset-name",
             dataset_name,
             "--gsp-num-groups",
-            "1",
+            str(gsp_num_groups) if gsp_num_groups else "1",
             "--gsp-prompts-per-group",
-            str(num_prompts),
+            str(gsp_prompts_per_group)
+            if gsp_prompts_per_group
+            else str(num_prompts),
             "--gsp-system-prompt-len",
             (
                 str(int((repeat_rate if repeat_rate is not None else 0.9) * input_len))
@@ -449,6 +454,12 @@ def run_bench_serving(
             cmd_args.extend(["--temperature", str(temperature)])
         if top_p is not None:
             cmd_args.extend(["--top-p", str(top_p)])
+        if seed:
+            cmd_args.extend(["--seed", str(seed)])
+        if warmup_requests:
+            cmd_args.extend(["--warmup-requests", str(warmup_requests)])
+        if cache_report:
+            cmd_args.append("--cache-report")
     else:
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
@@ -589,6 +600,17 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 3:
                         metrics["accept_length"] = parts[2]
+                elif stripped_line.startswith("Cache hit rate:"):
+                    # Format: "Cache hit rate:    82.2%" (from --cache-report)
+                    parts = stripped_line.split()
+                    if len(parts) >= 4:
+                        metrics["cache_hit_rate_pct"] = parts[-1].rstrip("%")
+                elif stripped_line.startswith("Device:") and stripped_line.endswith("%"):
+                    metrics["device_hit_rate_pct"] = stripped_line.split()[-1].rstrip(
+                        "%"
+                    )
+                elif stripped_line.startswith("Host:") and stripped_line.endswith("%"):
+                    metrics["host_hit_rate_pct"] = stripped_line.split()[-1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
