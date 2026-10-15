@@ -114,6 +114,22 @@ def test_eagle3_defaults_to_model_layers():
     ServerArgs(model_path="dummy", aux_hidden_state_capture="eagle3").resolve_once()
 
 
+def test_capture_defaults_return_hidden_states_mode_to_full():
+    args = ServerArgs(model_path="dummy", aux_hidden_state_capture="eagle3")
+    args.resolve_once()
+    assert args.return_hidden_states_mode == "full"
+
+
+def test_capture_keeps_an_explicit_return_hidden_states_mode():
+    args = ServerArgs(
+        model_path="dummy",
+        aux_hidden_state_capture="eagle3",
+        return_hidden_states_mode="last",
+    )
+    args.resolve_once()
+    assert args.return_hidden_states_mode == "last"
+
+
 # --- aux capture config ------------------------------------------------------
 
 
@@ -212,6 +228,31 @@ def test_dflash_family_hook_routing(is_dspark, hooks, expected):
     assert model.calls == [(expected, [2, 3])]
 
 
+def test_eagle3_hook_routing():
+    model = _Model("set_eagle3_layers_to_capture")
+    configure_aux_hidden_state_capture(
+        model=model,
+        eagle_use_aux_hidden_state=True,
+        eagle_aux_hidden_state_layer_ids=[1, 5],
+        dflash_use_aux_hidden_state=False,
+        dflash_target_layer_ids=None,
+        is_dspark=False,
+    )
+    assert model.calls == [("set_eagle3_layers_to_capture", [1, 5])]
+
+
+def test_model_without_eagle3_hook_is_rejected():
+    with pytest.raises(ValueError, match="set_eagle3_layers_to_capture"):
+        configure_aux_hidden_state_capture(
+            model=_Model("set_dflash_layers_to_capture"),
+            eagle_use_aux_hidden_state=True,
+            eagle_aux_hidden_state_layer_ids=None,
+            dflash_use_aux_hidden_state=False,
+            dflash_target_layer_ids=None,
+            is_dspark=False,
+        )
+
+
 # --- logits processor --------------------------------------------------------
 
 
@@ -255,6 +296,25 @@ def test_full_capture_keeps_last_hidden_next_to_aux():
     )
     torch.testing.assert_close(output.hidden_states, torch.cat(aux, dim=-1))
     torch.testing.assert_close(output.last_hidden_states, hidden_states)
+
+
+def test_fewer_captured_layers_than_requested_fails_fast():
+    with pytest.raises(ValueError, match="captured 3 aux hidden states"):
+        _run_logits_processor(
+            CaptureHiddenMode.FULL,
+            aux_hidden_state_capture="dflash",
+            return_aux_hidden_state_layer_ids=[0, 1, 2, 3],
+        )
+
+
+def test_missing_aux_in_capture_only_mode_fails_fast():
+    with pytest.raises(ValueError, match="captured 0 aux hidden states"):
+        _run_logits_processor(
+            CaptureHiddenMode.NULL,
+            with_aux=False,
+            aux_hidden_state_capture="dflash",
+            return_aux_hidden_state_layer_ids=[0, 1, 2],
+        )
 
 
 def test_last_hidden_is_not_kept_without_the_flag():

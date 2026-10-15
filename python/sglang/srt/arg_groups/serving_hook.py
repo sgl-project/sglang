@@ -721,7 +721,8 @@ def handle_return_hidden_states_mode(server_args: Any):
             "return_hidden_states_mode must be one of: None, 'last', or 'full'."
         )
     if cfg.return_hidden_states_mode is None:
-        if cfg.enable_return_hidden_states:
+        # Capture-only aux capture is only useful with every row captured.
+        if cfg.enable_return_hidden_states or cfg.aux_hidden_state_capture is not None:
             declare_resolution(
                 server_args,
                 "_handle_return_hidden_states_mode",

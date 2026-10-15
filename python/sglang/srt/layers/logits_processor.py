@@ -500,9 +500,17 @@ class LogitsProcessor(nn.Module):
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
-        self.keep_last_hidden_states = (
-            get_exec().features.aux_hidden_state_capture is not None
+        features = get_exec().features
+        self.keep_last_hidden_states = features.aux_hidden_state_capture is not None
+        # Capture-only mode: how many layers the model must capture, when
+        # --return-aux-hidden-state-layer-ids names them.
+        layer_ids = features.return_aux_hidden_state_layer_ids
+        self.expected_aux_hidden_states = (
+            len(layer_ids)
+            if self.keep_last_hidden_states and layer_ids is not None
+            else None
         )
+        self._aux_hidden_states_checked = False
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
@@ -558,6 +566,11 @@ class LogitsProcessor(nn.Module):
             input_ids=input_ids,
             forward_mode=logits_metadata.forward_mode,
         )
+
+        if self.expected_aux_hidden_states is not None:
+            self._check_aux_hidden_states(
+                aux_hidden_states, hidden_states, logits_metadata
+            )
 
         # Setwise scoring (CausalLM): read label-token logprobs AT each anchor
         # position instead of the last token. Takes precedence over the MIS
@@ -902,6 +915,39 @@ class LogitsProcessor(nn.Module):
         ):
             return hidden_states
         return None
+
+    def _check_aux_hidden_states(
+        self,
+        aux_hidden_states: Optional[AuxHiddenStates],
+        hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> None:
+        """Fail at the first forward if the model captured fewer layers than asked.
+
+        Most models cannot capture their last layer: the hooks capture a layer's
+        output as the next layer's input, and nothing follows the last one.
+        """
+        if (
+            self._aux_hidden_states_checked
+            or logits_metadata.forward_mode.is_idle()
+            or hidden_states.shape[0] == 0
+        ):
+            return
+        expected = self.expected_aux_hidden_states
+        if aux_hidden_states is None:
+            captured = 0
+        elif isinstance(aux_hidden_states, torch.Tensor):
+            captured = aux_hidden_states.shape[-1] / hidden_states.shape[-1]
+        else:
+            captured = len(aux_hidden_states)
+        if captured != expected:
+            raise ValueError(
+                f"The model captured {captured:g} aux hidden states, but "
+                f"--return-aux-hidden-state-layer-ids names {expected} layers. A "
+                "layer this model cannot capture, usually its last layer, is the "
+                "likely cause."
+            )
+        self._aux_hidden_states_checked = True
 
     def _get_logits(
         self,

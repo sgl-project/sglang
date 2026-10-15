@@ -2843,7 +2843,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--aux-hidden-state-capture`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Capture auxiliary hidden states on the target model without a speculative draft, through the model's EAGLE3, DFLASH, or DSPARK capture hook. Requests with `return_hidden_states` then receive the concatenated aux hidden states in place of the last-layer hidden states. Requires `pp_size == 1` and cannot be combined with `--speculative-algorithm`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Capture auxiliary hidden states on the target model without a speculative draft, through the model's EAGLE3, DFLASH, or DSPARK capture hook. Requests with `return_hidden_states` then receive the concatenated aux hidden states in place of the last-layer hidden states. Sets `--return-hidden-states-mode` to `full` when unset. Requires `pp_size == 1` and cannot be combined with `--speculative-algorithm`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>eagle3</code>, <code>dflash</code>, <code>dspark</code></td>
     </tr>

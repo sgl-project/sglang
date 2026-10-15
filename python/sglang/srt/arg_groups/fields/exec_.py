@@ -130,7 +130,8 @@ class ExecFeatures(msgspec.Struct):
             "speculative draft, through the model's EAGLE3, DFLASH, or DSPARK "
             "capture hook. Requests with return_hidden_states then receive the "
             "concatenated aux hidden states in place of the last-layer hidden "
-            "states. Requires pp_size == 1 and cannot be combined with "
+            "states. Sets --return-hidden-states-mode to full when unset. "
+            "Requires pp_size == 1 and cannot be combined with "
             "--speculative-algorithm.",
             choices=["eagle3", "dflash", "dspark"],
         ),
