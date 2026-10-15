@@ -37,13 +37,15 @@ inline constexpr uint32_t kTopK = 10;
 inline constexpr uint32_t kMaxTokens = 16;
 inline constexpr uint32_t kThreads = 256;
 inline constexpr uint32_t kWarps = kThreads / 32;
-inline constexpr uint32_t kExpertsPerCta = 4;
+// 64 CTAs: leaves SMs free for the shared expert running concurrently on the side stream.
+inline constexpr uint32_t kExpertsPerCta = 8;
 inline constexpr uint32_t kNumCtas = kExperts / kExpertsPerCta;
 inline constexpr uint32_t kKPerWarp = kHidden / kWarps;  // 512
 inline constexpr uint32_t kKPerLane = kKPerWarp / 32;    // 16: one NVFP4 block
 inline constexpr uint32_t kSfVec = 16;
 inline constexpr uint32_t kBlocksPerRow = kHidden / kSfVec;  // 256
 static_assert(kKPerLane == kSfVec, "each lane must own exactly one quantization block");
+static_assert(kExpertsPerCta <= 8, "a CTA's experts form one n8 MMA tile");
 static_assert(kExperts == 2 * 256, "the top-k lane layout assumes 2 x 256 experts");
 
 struct Params {
@@ -642,9 +644,9 @@ SGL_DEVICE void topk_and_tables(const Params& p, uint32_t* s_mask, int16_t* s_ti
 // Router GEMV in the order of the cuBLAS router GEMM it replaces (bitwise equal
 // for this shape): K split into two halves, each half a sequential chain of
 // 16-wide MMAs in increasing K, the two fp32 halves added, rounded to bf16.
-// Per CTA: kExpertsPerCta experts as the n8 tile (columns 4..7 repeat expert 0
-// and are discarded), tokens as the m16 tile (rows >= M repeat token 0); warp 0
-// runs the chain of the first half, warp 1 the second, operands from shared memory.
+// Per CTA: kExpertsPerCta experts as the n8 tile, tokens as the m16 tile (rows
+// >= M repeat token 0); warp 0 runs the chain of the first half, warp 1 the
+// second, operands from shared memory.
 inline constexpr uint32_t kSplitK = kHidden / 2;
 inline constexpr uint32_t kChainSteps = kSplitK / 16;
 // Shared-memory rows are padded by 16 B so the 8 rows of an ldmatrix hit distinct banks.
