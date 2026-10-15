@@ -2045,13 +2045,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _active_reserved_tokens(
-        self,
-        decoding: List[Req],
-        n_active: Optional[int] = None,
-        extra_reserved_reqs: int = 0,
+        self, decoding: List[Req], n_active: Optional[int] = None
     ) -> int:
         if n_active is None:
-            n_active = self._active_req_count(decoding, extra_reserved_reqs)
+            n_active = self._active_req_count(decoding)
         return self.num_reserved_decode_tokens * n_active
 
     def _swa_aware_allocatable_token_budgets(
@@ -2092,7 +2089,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decoding: List[Req],
         retractable_tokens: Optional[int] = None,
         count_retracted: bool = True,
-        extra_reserved_reqs: int = 0,
         reserved_tokens: Optional[int] = None,
         hicache_reserved_tokens: int = 0,
     ) -> int:
@@ -2100,9 +2096,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decoding, retractable_tokens
         )
         if reserved_tokens is None:
-            reserved_tokens = self._active_reserved_tokens(
-                decoding, extra_reserved_reqs=extra_reserved_reqs
-            )
+            reserved_tokens = self._active_reserved_tokens(decoding)
 
         if self.enable_hisparse:
             logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
@@ -2144,7 +2138,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         count_retracted: bool = True,
         n_active: Optional[int] = None,
         reserved_tokens: Optional[int] = None,
-        extra_reserved_reqs: int = 0,
     ) -> int:
         need_swa_space_for_single_req = self._need_space_for_single_req(
             decoding, retractable_tokens
@@ -2158,7 +2151,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if n_active is None:
-            n_active = self._active_req_count(decoding, extra_reserved_reqs)
+            n_active = self._active_req_count(decoding)
         if reserved_tokens is None:
             reserved_tokens = self._active_reserved_tokens(decoding, n_active)
 
