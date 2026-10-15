@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import patch
 
 import torch
@@ -35,3 +36,9 @@ def test_dispatch_preserves_negative_routing_sentinel():
 
     expected = torch.tensor([[-1, 1], [0, -1]], dtype=torch.int32)
     assert torch.equal(output.topk_output.topk_ids, expected)
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

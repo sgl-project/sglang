@@ -241,10 +241,8 @@ class StandardDispatcher(BaseDispatcher):
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure
                     # wasted compute (and a masked-grouped-GEMM workspace
-                    # blow-up when they collide on the same top-k).  Must
-                    # run POST-translation (a pre-translation -1 aliases to
-                    # the mapping table's last entry); -1 is the drop
-                    # sentinel both the triton and deep_gemm runners honor.
+                    # blow-up when they collide on the same top-k). -1 is the
+                    # drop sentinel both the triton and deep_gemm runners honor.
                     if _MASK_DP_PAD_MOE and is_dp_max_padding():
                         mask_dp_pad_moe_topk_ids(topk_ids_local)
                     topk_output = topk_output._replace(topk_ids=topk_ids_local)
