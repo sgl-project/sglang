@@ -19,6 +19,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
+from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
     forward_hc_pre_from_prev_fused_boundary,
@@ -29,6 +30,8 @@ from sglang.srt.utils import is_gfx95_supported
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
 wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
+stash_k1_weights = dsv41_mono_decode.stash_k1_weights
+stash_shared_expert = dsv41_mono_decode.stash_shared_expert
 
 _is_gfx95_supported = is_gfx95_supported()
 
@@ -165,6 +168,7 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer.hc_boundary_fused = (
         _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
     )
+    dsv41_mono_decode.init_layer(layer)
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
