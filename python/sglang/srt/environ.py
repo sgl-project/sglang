@@ -553,6 +553,12 @@ class Envs:
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
     # ===================================================================
+    # MTP draft-path kernels (default off; off keeps the stock path)
+    # ===================================================================
+    # Single-token bf16 draft MoE as two GEMV passes (routed top-k + shared expert).
+    SGLANG_Q35MF_DRAFT_MOE_GEMV = EnvBool(False)
+
+    # ===================================================================
     # Memory pools and KV-cache sizing
     # ===================================================================
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)

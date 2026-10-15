@@ -67,6 +67,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
 from sglang.srt.layers.moe import qwen_router_front
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.single_token_draft_moe import SingleTokenDraftMoe
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -400,6 +401,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+        self._single_token_draft_moe = (
+            SingleTokenDraftMoe(layer_id)
+            if is_nextn and _is_cuda and envs.SGLANG_Q35MF_DRAFT_MOE_GEMV.get()
+            else None
+        )
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
@@ -865,6 +871,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
+
+        draft_moe = self._single_token_draft_moe
+        if draft_moe is not None and draft_moe.active and num_tokens == 1:
+            if not defer_finalize and not self.reduce_results:
+                out = draft_moe.forward(self, hidden_states)
+                if out is not None:
+                    return out.view(num_tokens, hidden_dim)
 
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)
