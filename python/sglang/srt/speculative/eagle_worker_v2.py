@@ -106,6 +106,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 from sglang.srt.speculative.post_verify_graph import (
     PostVerifyGraph,
     post_verify_graph_enabled,
+    sparse_verify_max_top_k,
 )
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1914,6 +1915,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
+        max_top_k = sparse_verify_max_top_k(batch)
         return run_eagle_verify(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
@@ -1929,4 +1931,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
             post_verify_graph=self._post_verify_graph,
+            uno_target_max_top_k=max_top_k,
+            sparse_bonus_argmax=max_top_k is not None,
         )

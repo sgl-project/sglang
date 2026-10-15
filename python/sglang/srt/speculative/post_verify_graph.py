@@ -3,8 +3,9 @@
 After the verify graph, a decode round runs sampling/acceptance (eagle_sample),
 the verify commit outputs and the mamba state commit as ~30 eager launches.
 For a batch whose Python-visible branches are fixed (same sampling flags,
-no grammar / logprobs / penalties) this replays the same calls, on static
-copies of their per-round inputs, as one captured graph.
+no grammar / penalties) this replays the same calls, on static copies of
+their per-round inputs, as one captured graph; logprobs are computed after
+the replay from its outputs, as on the eager path.
 
 The injected acceptance length (benchmark mode) is drawn on the host exactly
 as before and enters the graph as a device scalar, so real and injected
@@ -36,6 +37,22 @@ def post_verify_graph_enabled() -> bool:
     return os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_GRAPH", "0") == "1"
 
 
+_SPARSE_VERIFY = os.environ.get("SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING", "0") == "1"
+
+
+def sparse_verify_max_top_k(batch) -> Optional[int]:
+    """Support size for eagle_sample's compact top-k sampling branch, or None for the dense
+    branch. Every request must sample with a finite top-k within the compact limit."""
+    if not _SPARSE_VERIFY or batch.forward_mode.is_idle():
+        return None
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    top_ks = [req.sampling_params.top_k for req in batch.reqs]
+    if not top_ks or any(k <= 1 or k > _SPARSE_TOP_K_LIMIT for k in top_ks):
+        return None
+    return max(top_ks)
+
+
 class _Slot:
     def __init__(self):
         self.graph: Optional[torch.cuda.CUDAGraph] = None
@@ -65,6 +82,7 @@ class PostVerifyGraph:
         ]
         self._sim_len_turn = 0
         self._check = os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_CHECK", "0") == "1"
+        self._max_top_k: Optional[int] = None
         self._checked = 0
         self._mismatch = 0
 
@@ -77,6 +95,7 @@ class PostVerifyGraph:
         num_draft_tokens: int,
         topk: int,
         token_to_kv_pool_allocator,
+        uno_target_max_top_k: Optional[int] = None,
     ):
         """Returns (predict, accept_lens, accept_index, new_seq_lens, bonus_tokens,
         prepared_draft_inputs) or None when the stock path must run."""
@@ -97,6 +116,8 @@ class PostVerifyGraph:
         )
         if key is None:
             return None
+        key = key + (uno_target_max_top_k,)
+        self._max_top_k = uno_target_max_top_k
         try:
             return self._run(key, batch, verify_input, logits_output, num_draft_tokens)
         except Exception:
@@ -121,7 +142,6 @@ class PostVerifyGraph:
             or topk != 1
             or bs > _MAX_BS
             or batch.has_grammar
-            or batch.return_logprob
             or batch.hisparse_coordinator is not None
             or get_parallel().pp_size > 1
             or get_spec().speculative_use_rejection_sampling
@@ -217,7 +237,13 @@ class PostVerifyGraph:
         predict, accept_lens, accept_index, new_seq_lens, bonus, _ = slot.outputs
         views = self._views(slot.inputs, batch, verify_input)
         r_predict, r_lens, r_index = eagle_sample(
-            views[1], views[0], logits_output, None, simulated_acc_len=slot.inputs["sim_len"]
+            views[1],
+            views[0],
+            logits_output,
+            None,
+            uno_target_max_top_k=self._max_top_k,
+            simulated_acc_len=slot.inputs["sim_len"],
+            sparse_bonus_argmax=self._max_top_k is not None,
         )
         r_seq, r_bonus = prepare_verify_commit_outputs(
             r_predict, r_index, r_lens, slot.inputs["seq_lens"]
@@ -271,7 +297,9 @@ class PostVerifyGraph:
             batch_view,
             logits_output,
             None,
+            uno_target_max_top_k=self._max_top_k,
             simulated_acc_len=x["sim_len"],
+            sparse_bonus_argmax=self._max_top_k is not None,
         )
         track_interval = (
             mamba_track_grid(batch.tree_cache.page_size)

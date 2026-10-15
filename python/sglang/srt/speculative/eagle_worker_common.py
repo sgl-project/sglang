@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -393,6 +394,17 @@ def prepare_for_draft(
     return forward_batch, can_run_decode_cuda_graph, kv_loc_plan
 
 
+_EDGE_CHAIN_TREE = os.environ.get("SGLANG_Q35MF_EDGE_CHAIN_TREE", "0") == "1"
+
+
+def _tree_mask_unread(attn_backend) -> bool:
+    # trtllm-gen target-verify attention masks the draft window causally and has no
+    # custom-mask input; the hybrid linear backends do not read the mask either.
+    if type(attn_backend).__name__ == "HybridLinearAttnBackend":
+        attn_backend = attn_backend.full_attn_backend
+    return type(attn_backend).__name__ == "TRTLLMHAAttnBackend"
+
+
 def build_eagle_verify_input(
     batch: ScheduleBatch,
     draft_input: EagleDraftInput,
@@ -429,6 +441,10 @@ def build_eagle_verify_input(
     verify_mask = target_attn_backend.verify_mask
     if verify_mask is None:
         tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
+        if _EDGE_CHAIN_TREE and topk == 1 and _tree_mask_unread(target_attn_backend):
+            # Chain drafts against a backend that masks the draft window itself:
+            # the fused chain-tree build replaces the full-context mask build.
+            mask_mode, fill_mask = TreeMaskMode.QLEN_ONLY, False
     else:
         mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
         tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
@@ -580,6 +596,7 @@ def run_eagle_verify(
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
     post_verify_graph: Optional[PostVerifyGraph] = None,
+    sparse_bonus_argmax: bool = False,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -687,12 +704,15 @@ def run_eagle_verify(
             num_draft_tokens=num_draft_tokens,
             topk=topk,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            uno_target_max_top_k=uno_target_max_top_k,
         )
-        if post_verify_graph is not None and uno_target_max_top_k is None
+        if post_verify_graph is not None
         else None
     )
     if fused is not None:
         predict, accept_lens, accept_index, new_seq_lens, bonus_tokens, prepared_draft_inputs = fused
+        if batch.return_logprob:
+            compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -732,6 +752,7 @@ def run_eagle_verify(
         logits_output,
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
+        sparse_bonus_argmax=sparse_bonus_argmax,
         watermark_state=target_worker.model_runner.watermark_state,
         watermark_full_mask=(
             target_worker.model_runner.attn_backend.verify_mask is None

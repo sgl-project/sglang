@@ -748,6 +748,7 @@ def eagle_sample(
     watermark_state: Optional[WatermarkState] = None,
     watermark_full_mask: bool = True,
     simulated_acc_len: Optional[torch.Tensor] = None,
+    sparse_bonus_argmax: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -1080,7 +1081,7 @@ def eagle_sample(
                 )
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
-            if target_predict is None:
+            if target_predict is None or sparse_bonus_argmax:
                 target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
                     bs, verify_input.draft_token_num
                 )
