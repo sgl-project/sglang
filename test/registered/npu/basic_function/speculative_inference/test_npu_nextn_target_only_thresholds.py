@@ -95,7 +95,10 @@ class TestNpuNextnTargetOnlyThresholds(CustomTestCase):
             )
             self.assertEqual(info_response.status_code, 200)
             info = info_response.json()
-            self.assertEqual(info["speculative_algorithm"], "NEXTN")
+            # NEXTN is normalized to EAGLE in resolved server args; the launch
+            # command preserves the user-facing CLI algorithm.
+            self.assertEqual(info["speculative_algorithm"], "EAGLE")
+            self.assertIn("--speculative-algorithm NEXTN", info["launch_command"])
             self.assertEqual(info["speculative_num_steps"], 1)
             self.assertEqual(info["speculative_num_draft_tokens"], 2)
             self.assertEqual(info["speculative_accept_threshold_single"], 0.5)
