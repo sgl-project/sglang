@@ -1332,7 +1332,7 @@ class SchedulerBatchResultProcessor:
         """Release a request whose sampled token must not be committed."""
         self.request_retirer.release_finished_features(req)
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
-            self.decode_offload_manager.finalize_release_on_finish(req)
+            self.request_retirer.retire_offloaded(req)
         else:
             self.request_retirer.retire_finished(req, checkpoint=False)
         req.time_stats.set_completion_time()
@@ -1372,7 +1372,7 @@ class SchedulerBatchResultProcessor:
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
+                    self.request_retirer.retire_offloaded(req)
             else:
                 self.request_retirer.retire_finished(
                     req,

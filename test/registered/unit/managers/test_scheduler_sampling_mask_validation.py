@@ -56,6 +56,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         kv=MagicMock(),
                         beam_coordinator=MagicMock(),
                         hisparse_coordinator=None,
+                        decode_offload_manager=None,
                         output_streamer=output_streamer,
                         ipc_channels=MagicMock(),
                     ),

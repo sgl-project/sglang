@@ -72,6 +72,7 @@ _DECLARED = {
     "RequestRetirer": [
         "BeamCoordinator",
         "HiSparse",
+        "DecodeOffloadManager",
         "OutputStreamer",
         "IpcChannels",
         "KvResources",

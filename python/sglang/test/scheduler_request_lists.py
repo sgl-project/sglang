@@ -28,6 +28,7 @@ def make_request_retirer(**deps) -> RequestRetirer:
         kv=SimpleNamespace(tree_cache=Mock()),
         beam_coordinator=Mock(),
         hisparse_coordinator=None,
+        decode_offload_manager=None,
         output_streamer=Mock(),
         ipc_channels=Mock(),
     )

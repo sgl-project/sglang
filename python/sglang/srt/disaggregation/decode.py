@@ -3306,6 +3306,7 @@ class DisaggDecode:
         copy landed has its KV released and leaves releasing."""
         manager = self.decode_offload_manager
         for req in manager.check_offload_progress(self.releasing):
+            self.request_retirer.retire_offloaded(req)
             self.releasing.remove(req)
 
     def drain_offloads_before_retraction(self) -> None:

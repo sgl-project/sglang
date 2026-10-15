@@ -262,6 +262,7 @@ class TestChecksumMismatchRelease(unittest.TestCase):
                 kv=SimpleNamespace(tree_cache=Mock()),
                 beam_coordinator=None,
                 hisparse_coordinator=hisparse,
+                decode_offload_manager=None,
                 output_streamer=None,
                 ipc_channels=None,
             ),

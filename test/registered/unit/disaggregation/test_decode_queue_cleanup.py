@@ -634,7 +634,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         manager.cache_controller = MagicMock(ack_write_queue=[])
         manager.cache_controller.ack_backup_queue.qsize.return_value = 0
         manager._trigger_backup = MagicMock()
-        manager._release_finished_req = MagicMock()
         out = []
         for rid, finished, ack_ids in reqs:
             req = MagicMock(rid=rid, disagg=DisaggReqState())
@@ -646,6 +645,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             out.append(req)
         owner = scheduler.disagg_decode
         owner.decode_offload_manager = manager
+        owner.request_retirer = MagicMock()
         scheduler.decode_offload_manager = manager
         scheduler.stages = ModeStages(
             schedule=MagicMock(), hold_finished=owner.hold_finished
@@ -683,12 +683,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self._land(manager, 1, 3)
         owner.check_offload_progress()
         self.assertEqual(owner.releasing, [done])
-        manager._release_finished_req.assert_not_called()
+        owner.request_retirer.retire_offloaded.assert_not_called()
 
         self._land(manager, 2)
         owner.check_offload_progress()
         self.assertEqual(owner.releasing, [])
-        manager._release_finished_req.assert_called_once_with(done)
+        owner.request_retirer.retire_offloaded.assert_called_once_with(done)
         assert_one_list_per_request(scheduler)
 
     def test_abort_leaves_releasing_requests_to_their_ack(self):
@@ -703,7 +703,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         registry.abort_request(AbortReq(abort_all=True))
 
         self.assertEqual(owner.releasing, [done])
-        manager._release_finished_req.assert_not_called()
+        owner.request_retirer.retire_offloaded.assert_not_called()
         self._land(manager, 1)
         owner.check_offload_progress()
         self.assertEqual(owner.releasing, [])
@@ -735,6 +735,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             kv=MagicMock(),
             beam_coordinator=MagicMock(),
             hisparse_coordinator=None,
+            decode_offload_manager=None,
             output_streamer=MagicMock(),
             ipc_channels=scheduler.ipc_channels,
         )

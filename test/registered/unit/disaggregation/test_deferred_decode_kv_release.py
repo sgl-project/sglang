@@ -1046,6 +1046,7 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
             kv=SimpleNamespace(tree_cache=q.tree_cache),
             beam_coordinator=None,
             hisparse_coordinator=q.hisparse_coordinator,
+            decode_offload_manager=None,
             output_streamer=None,
             ipc_channels=None,
         )

@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     backup_kv_cache,
     evict_from_tree_cache,
+    free_req_slot,
     release_kv_cache,
 )
 from sglang.srt.runtime_context import get_disagg, get_serving
@@ -39,6 +40,9 @@ from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
+    from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+        DecodeKVCacheOffloadManager,
+    )
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler_components.bundles import KvResources
@@ -59,6 +63,7 @@ class RequestRetirer:
         kv: KvResources,
         beam_coordinator: BeamCoordinator,
         hisparse_coordinator: Optional[HiSparseCoordinator],
+        decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         output_streamer: SchedulerOutputStreamer,
         ipc_channels: SchedulerIpcChannels,
     ):
@@ -66,6 +71,7 @@ class RequestRetirer:
         self.tree_cache = kv.tree_cache
         self.beam_coordinator = beam_coordinator
         self.hisparse_coordinator = hisparse_coordinator
+        self.decode_offload_manager = decode_offload_manager
         self.output_streamer = output_streamer
         self.ipc_channels = ipc_channels
 
@@ -106,6 +112,30 @@ class RequestRetirer:
         with the cache request."""
         release_kv_cache(req, self.tree_cache, checkpoint=True)
         self.release_aborted_request(req)
+
+    def retire_offloaded(self, req: Req) -> None:
+        """A finished PD decode request whose KV was offloaded to host: once
+        its last offload copy landed, the rest of its row (the tail the copies
+        did not cover) goes back without an insert; until then, nothing."""
+        if self.decode_offload_manager.has_inflight_offload(req):
+            return
+        # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
+        # so a previously-released request must be skipped here to avoid
+        # non-idempotent side effects (double free, double unlock).
+        if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
+            return
+
+        # Released only at request finish; a mid-decode free races with
+        # concurrent admission over live slots. The prefix the prealloc match
+        # took from the tree stays with the tree: not freed, only unlocked.
+        self.tree_cache.free_kv_row(
+            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
+        )
+        self.tree_cache.unlock(req.lock)
+        req.lock = None
+        free_req_slot(self.kv.req_to_token_pool, req)
+        req.kv.mark_kv_released()
+        req.disagg.offload = None
 
     def retire_unadmitted_request(self, req: Req) -> None:
         """Finish a request the disaggregation queues rejected at their door."""

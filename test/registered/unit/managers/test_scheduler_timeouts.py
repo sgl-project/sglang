@@ -111,6 +111,7 @@ class TestQueuedLimitAbort(CustomTestCase):
             kv=SimpleNamespace(tree_cache=intake.tree_cache),
             beam_coordinator=intake.beam_coordinator,
             hisparse_coordinator=None,
+            decode_offload_manager=None,
             output_streamer=MagicMock(),
             ipc_channels=intake.ipc_channels,
         )

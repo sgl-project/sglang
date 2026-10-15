@@ -2311,6 +2311,7 @@ class Scheduler:
             kv=self.kv,
             beam_coordinator=self.beam_coordinator,
             hisparse_coordinator=self.hisparse_coordinator,
+            decode_offload_manager=self.decode_offload_manager,
             output_streamer=self.output_streamer,
             ipc_channels=self.ipc_channels,
         )

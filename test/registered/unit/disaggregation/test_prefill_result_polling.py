@@ -306,6 +306,7 @@ class _Scheduler:
             kv=SimpleNamespace(tree_cache=self.tree_cache),
             beam_coordinator=None,
             hisparse_coordinator=None,
+            decode_offload_manager=None,
             output_streamer=None,
             ipc_channels=None,
         )
@@ -1518,6 +1519,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
                     beam_coordinator=None,
                     hisparse_coordinator=None,
+                    decode_offload_manager=None,
                     output_streamer=None,
                     ipc_channels=None,
                 )
