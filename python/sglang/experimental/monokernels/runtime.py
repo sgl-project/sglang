@@ -233,7 +233,8 @@ def attach(model, hf_config) -> None:
         raise ValueError("--enable-monokernel: " + "; ".join(reasons))
 
     # the widths the capture plan routes (every width a step can have without graphs)
-    keys, tokens = _capture_keys(), _tokens_per_request()
+    tokens = (spec.tokens_per_request or (lambda _: _tokens_per_request()))(model)
+    keys = _capture_keys(tokens)
     rows = {k.rows for k in keys}
     widths = tuple(
         w for w in spec.widths(isa) if w % tokens == 0 and (not keys or w in rows)
@@ -310,15 +311,15 @@ def _tokens_per_request() -> int:
     return int(spec_cfg.speculative_num_draft_tokens or 1)
 
 
-def _capture_keys() -> list[ShapeKey]:
-    """The decode graph keys: DECODE, or TARGET_VERIFY with speculative decoding."""
+def _capture_keys(tokens: int) -> list[ShapeKey]:
+    """The decode graph keys at ``tokens`` a request: DECODE, or TARGET_VERIFY (a
+    speculative verify step, or a draft's block)."""
     from sglang.srt.runtime_context import get_exec
 
     graph = get_exec().graph
     if graph.disable_cuda_graph or graph.disable_decode_cuda_graph:
         return []
     decode = getattr(graph.cuda_graph_config, "decode", None)
-    tokens = _tokens_per_request()
     mode = "decode" if tokens == 1 else "target_verify"
     sizes = sorted(set(getattr(decode, "bs", None) or []))
     return [ShapeKey(mode, bs, tokens, bs * tokens) for bs in sizes]

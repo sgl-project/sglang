@@ -134,6 +134,9 @@ class MonoSpec:
     # (copies, model, name, tensor): each checkpoint tensor before renames and
     # quantization, to keep a copy of a weight that loading rewrites
     load_tensor: Optional[Callable[..., None]] = None
+    # (model) -> the rows a request of the steps it serves, where they are not the
+    # server's (1, or the verify width): e.g. a speculative draft's block
+    tokens_per_request: Optional[Callable[..., int]] = None
 
     def widths(self, isa: str) -> tuple[int, ...]:
         return self.devices[isa].widths
