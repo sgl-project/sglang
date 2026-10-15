@@ -66,16 +66,8 @@ def _server_args(
         "--device",
         "cuda",
         "--trust-remote-code",
-        "--tp",
-        "2",
-        "--nnodes",
-        "2",
-        "--node-rank",
-        str(allocation_index),
         "--dist-init-addr",
         DIST_INIT_ADDR,
-        "--attn-dp-size",
-        "2",
         "--enable-dp-lm-head",
         "--elastic-ep-backend",
         "mooncake",
@@ -103,7 +95,20 @@ def _server_args(
         "0.7",
     ]
     if recover:
-        args.extend(["--elastic-ep-join-mode", "recover"])
+        args.extend(
+            [
+                "--tp",
+                "2",
+                "--nnodes",
+                "2",
+                "--node-rank",
+                str(allocation_index),
+                "--attn-dp-size",
+                "2",
+                "--elastic-ep-join-mode",
+                "recover",
+            ]
+        )
     else:
         args.extend(
             [
