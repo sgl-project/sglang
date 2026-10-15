@@ -105,10 +105,11 @@ outputs, not just HTTP requests. A request can also use `n` to generate multiple
 images from one prompt. Higher batch sizes need more activation VRAM and can
 increase individual-request latency; the default remains one output at a time.
 
-At `quality=lossless` (the default) or `high`, the DiT groups samples by their actual text length, including text refinement,
+At `quality=lossless` (the default) or `high`, the DiT groups samples by their actual text length
 and restores their original output order. Different lengths run in separate
 groups without padding or switching attention backends. Empty negative prompts
-can share one group even when positive prompts differ. Batched GEMM shapes can
+can share one group even when positive prompts differ. The text refiner retains
+per-sample GEMM shapes to reduce numerical drift. Batched DiT GEMM shapes can
 change floating-point rounding, which denoising can amplify into visible changes;
 cross-batch-size pixel identity is not guaranteed. `quality=exact` retains the
 per-sample DiT path instead. Neither mode promises batch-invariant text encoding
@@ -124,12 +125,13 @@ The environment used PyTorch 2.14.1+cu130, Transformers 5.19.0, and eager execut
 
 | Workload | Per-sample DiT | Grouped DiT | Throughput Change |
 | --- | --- | --- | --- |
-| 512 x 512, 8 steps | 2.51 images/s | 2.94 images/s | +17% |
+| 512 x 512, 8 steps | 2.51 images/s | 2.92 images/s | +16% |
 | 1024 x 1024, 20 steps | 0.293 images/s | 0.296 images/s | Essentially unchanged |
 
-Across these eight outputs, agreement with the per-sample DiT path ranged from
-22.6 to 48.2 dB PSNR and 0.680 to 0.996 SSIM. These measure output agreement, not
-semantic quality. Visible composition changes are possible; use `quality=exact`
+At 512 pixels, agreement with the per-sample DiT path ranged from 28.3 to 46.2 dB
+PSNR and 0.939 to 0.996 SSIM. All four 1024-pixel outputs were pixel-identical.
+These measure output agreement, not semantic quality or a guarantee for other
+prompts. Visible differences remain possible; use `quality=exact`
 to retain per-sample DiT execution. Fixed-batch repeated requests are checked
 separately from cross-batch agreement.
 
