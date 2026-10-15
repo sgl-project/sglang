@@ -61,6 +61,9 @@ class BatchVariant(Enum):
     # A batch whose rows do not divide over attention TP, which only arrives
     # unpadded (--disable-attn-tp-gather without attention DP).
     UNPADDED = auto()
+    # A prefill under --moe-replicate-tp: the residual stays on each rank's
+    # attention-TP slice and the replicated MoE runs on it.
+    REPLICATED_MOE_SP = auto()
 
 
 class InputContract(msgspec.Struct, frozen=True):

@@ -47,6 +47,7 @@ class Flags:
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False
+        self.replicated_moe_sp_rows = 0
 
     @contextlib.contextmanager
     def scoped(self, **flags):

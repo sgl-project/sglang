@@ -116,6 +116,17 @@ class Parallel(msgspec.Struct):
             aliases=["--moe-data-parallel-size"],
         ),
     ] = 1
+    moe_replicate_tp: A[
+        bool,
+        "Replicate the MoE experts and the shared expert on every TP rank, and run "
+        "prefill as sequence parallel over the TP group: each rank computes the MoE "
+        "on its own tokens with no MoE collective, while attention and linear "
+        "attention keep their TP heads (all-gather in, reduce-scatter out). Trades "
+        "full MoE weights per GPU for less prefill communication; meant for small "
+        "TP sizes and long prompts on prefill instances, since decode then reads "
+        "every expert on every rank. Sets --moe-dp-size to --tp-size and disables "
+        "the prefill CUDA graph. Qwen3.5 MoE only.",
+    ] = False
     dwdp_size: A[
         int,
         Arg(

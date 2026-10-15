@@ -90,6 +90,7 @@ def stub_plan():
     plan._publish_lora_layout = False
     plan._next_input_rows = None
     plan._unpadded_attn_tp_size = None
+    plan._binds_replicated_moe_sp = False
     plan.paths = {}
     plan.enters_stack = False
     plan.finishes_directly = False

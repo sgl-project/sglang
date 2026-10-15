@@ -55,7 +55,7 @@ from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualU
 from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import (
     is_npu,
 )
@@ -384,11 +384,14 @@ def _attn_tp_reduce_scatter_update_read(
     the same way, then write the output into it and read the input; the first
     of the read's ``read_fusions`` that takes the batch does all of this
     instead."""
-    result = _run_read_fusions(
-        read_fusions, hidden_states, residual, forward_batch, norm, read=read
-    )
-    if result is not None:
-        return result
+    # The fused kernels take rows that divide over attention TP; a
+    # --moe-replicate-tp prefill pads its rows on the way instead.
+    if not get_forward().replicated_moe_sp_rows:
+        result = _run_read_fusions(
+            read_fusions, hidden_states, residual, forward_batch, norm, read=read
+        )
+        if result is not None:
+            return result
     hidden_states = attn_tp_reduce_scatter(hidden_states)
     if scatters_residual and residual is not None:
         residual = update.slice_residual_attn_tp(residual)

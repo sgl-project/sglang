@@ -38,6 +38,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary import layout as comm_layout
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
+from sglang.srt.layers.layer_boundary.adapters import attention as attn_adapter
 from sglang.srt.layers.layer_boundary.adapters import branch
 from sglang.srt.layers.layer_boundary.construction import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_ffn_input
@@ -1648,6 +1649,7 @@ class Flags:
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False
+        self.replicated_moe_sp_rows = 0
 
     @contextmanager
     def scoped(self, **flags):
@@ -2207,6 +2209,85 @@ class TestTheFfnInputReduction(CustomTestCase):
                         update=update,
                     )
                 self.assertEqual(calls, [reduction])
+
+
+def replicated_moe(attn_tp=2):
+    """What --moe-replicate-tp resolves: moe_dp_size is the TP size, so every
+    rank holds all experts."""
+    return parallel_of(attn_dp=1, attn_tp=attn_tp, moe_dp_size=attn_tp, moe_tp_size=1)
+
+
+def entry_step(prepare):
+    return prepare.keywords["step"] if prepare.func is comm_ops._run_entry else prepare
+
+
+class TestReplicatedMoeSequenceParallel(CustomTestCase):
+    """--moe-replicate-tp: a prefill keeps the residual on each rank's
+    attention-TP slice around the MoE every rank holds whole, and gathers it
+    for the attention; decode keeps every row. The MoE output owes no sum."""
+
+    def layers(self, parallel):
+        return [
+            build(
+                layer_case(
+                    i, 3, sparse=True, previous_sparse=i > 0, next_layer_sparse=i < 2
+                ),
+                parallel,
+            )
+            for i in range(3)
+        ]
+
+    def test_a_prefill_runs_the_moe_on_each_rank_s_slice(self):
+        first, middle, last = self.layers(replicated_moe())
+        for layer, scatters_residual in ((first, True), (middle, False), (last, False)):
+            with self.subTest(layer=layer):
+                ffn = layer.ffn.plan.paths.get(BatchVariant.REPLICATED_MOE_SP)
+                step = entry_step(ffn.entry.prepare)
+                self.assertIs(step.func, comm_ops._attn_tp_reduce_scatter_update_read)
+                self.assertEqual(step.keywords["scatters_residual"], scatters_residual)
+                self.assertIsNone(ffn.output.group)
+        attn = middle.attn.plan.paths.get(BatchVariant.REPLICATED_MOE_SP)
+        self.assertIsNotNone(attn.entry.input_move)
+        self.assertIs(
+            last.ffn.plan.paths.get(BatchVariant.REPLICATED_MOE_SP).output_move.func,
+            update_attn_tp_gather_output,
+        )
+        for layer in self.layers(parallel_of(attn_dp=1, attn_tp=2)):
+            self.assertIsNone(layer.ffn.plan.paths.get(BatchVariant.REPLICATED_MOE_SP))
+
+    def test_decode_keeps_every_row_and_the_moe_owes_no_sum(self):
+        for layer in self.layers(replicated_moe()):
+            ffn = layer.ffn.plan.paths.get(BatchVariant.ORDINARY)
+            self.assertEqual(ffn.entry.input_rows.sharded, frozenset())
+            self.assertIsNone(ffn.output.group)
+
+    def test_rows_that_do_not_divide_over_attention_tp_round_trip(self):
+        """The slices of 5 rows over 2 ranks are padded to 3 rows each, and the
+        gather drops the padding again."""
+        rows = torch.arange(20.0).view(5, 4)
+        flags = SimpleNamespace(replicated_moe_sp_rows=5)
+        slices = []
+        for rank in (0, 1):
+            context = SimpleNamespace(attn_tp_size=2, attn_tp_rank=rank)
+            with (
+                patch_communicator("get_parallel", lambda c=context: c),
+                patch_communicator("get_forward", lambda: flags),
+            ):
+                slices.append(attn_adapter.attn_tp_slice(rows))
+        self.assertEqual([s.shape[0] for s in slices], [3, 3])
+        torch.testing.assert_close(slices[1][-1], torch.zeros(4))
+        with (
+            patch_communicator(
+                "get_parallel", lambda: SimpleNamespace(attn_tp_size=2, attn_tp_rank=0)
+            ),
+            patch_communicator("get_forward", lambda: flags),
+            patch_communicator(
+                "attn_tp_all_gather_into_tensor",
+                lambda output, tensor: output.copy_(torch.cat(slices)),
+            ),
+        ):
+            gathered = attn_adapter.attn_tp_gather(slices[0])
+        torch.testing.assert_close(gathered, rows)
 
 
 if __name__ == "__main__":

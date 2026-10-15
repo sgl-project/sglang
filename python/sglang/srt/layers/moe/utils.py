@@ -751,6 +751,17 @@ def is_moe_input_scattered_across_dp_ranks() -> bool:
     )
 
 
+def moe_replicated_over_tp(parallel) -> bool:
+    """Whether every TP rank of ``parallel`` holds all experts and the shared
+    expert (--moe-replicate-tp, which alone resolves moe_dp_size == tp_size
+    without attention CP): the MoE output owes no sum over TP."""
+    return (
+        parallel.moe_dp_size > 1
+        and parallel.attn_cp_size == 1
+        and parallel.moe_dp_size == parallel.tp_size
+    )
+
+
 def should_use_dp_reduce_scatterv():
     """
     Use reduce_scatterv in the standard dispatcher's combine() for DP attention
@@ -789,7 +800,7 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     This is a property of the MoE configuration. Whether the MoE block or a later
     step runs a sum that is still owed is decided separately.
     """
-    if get_parallel().dwdp_size > 1:
+    if get_parallel().dwdp_size > 1 or moe_replicated_over_tp(get_parallel()):
         return True
     if should_use_flashinfer_cutlass_moe_fp4_allgather():
         # The standard dispatcher all-gathers tokens and reduce-scatters the

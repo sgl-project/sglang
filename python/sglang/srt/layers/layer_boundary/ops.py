@@ -50,6 +50,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary.adapters.attention import (
     attn_tp_gather,
     attn_tp_slice,
+    pad_rows_to_attn_tp,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
@@ -147,6 +148,7 @@ def attn_tp_reduce_scatter(
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     parallel = get_parallel()
+    hidden_states = pad_rows_to_attn_tp(hidden_states)
     local_hidden_states = hidden_states.tensor_split(parallel.attn_tp_size)[
         parallel.attn_tp_rank
     ]

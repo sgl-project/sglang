@@ -71,6 +71,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    moe_replicated_over_tp,
     sum_post_experts_output,
     uses_per_rank_fused_shared_slots,
 )
@@ -372,6 +373,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer()
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
+                        or moe_replicated_over_tp(get_parallel())
                     )
                     else {}
                 ),
