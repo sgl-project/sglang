@@ -162,7 +162,6 @@ Leave its pipeline-group policy automatic; short sequences need not benefit.
 TP-only deployments do not use this path. Encoding-while-decoding overlaps
 video-frame decoding with video-file encoding, so it does not apply to this
 still-image pipeline.
-
 <Note>
 Under sequence parallelism every rank holds the full DiT, so combining it with
 layerwise offload streams the whole model to each GPU every step. TP also
@@ -332,7 +331,6 @@ samples, with no quantization or caching. At 1024x1024, automatic dispatch
 selected no streaming groups and gave no speedup. TP and SP themselves are
 not bit-identical: sample SSIM was 0.9890-0.9985. None of these comparisons
 establishes which path is closer to an official reference.
-
 ### Single-GPU measurements
 
 Warmed local HTTP medians, including PNG encoding and response transfer, from
