@@ -1101,17 +1101,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # allocate memory
         resumed_reqs = []
         indices_to_remove = set()
-        swa_allocatable_tokens = None
-        if self._uses_swa_reservation():
-            full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(
-                    decoding, count_retracted=False
-                )
-            )
-        else:
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                decoding, count_retracted=False
-            )
+        full_allocatable_tokens, swa_allocatable_tokens = (
+            self._swa_aware_allocatable_token_budgets(decoding, count_retracted=False)
+        )
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
@@ -1146,17 +1138,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                decoding,
-                count_retracted=False,
-                extra_reserved_reqs=len(resumed_reqs),
-            )
-            if swa_allocatable_tokens is not None:
-                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+            full_allocatable_tokens, swa_allocatable_tokens = (
+                self._swa_aware_allocatable_token_budgets(
                     decoding,
                     count_retracted=False,
                     extra_reserved_reqs=len(resumed_reqs),
                 )
+            )
 
             if len(resumed_reqs) == 1 and self.enable_overlap:
                 # A request finished at the last commit can still have its
@@ -1434,24 +1422,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
-        swa_allocatable_tokens = None
+        retractable_swa_tokens = 0
         if self._uses_swa_reservation():
             retractable_swa_tokens = sum(self._swa_retractable_len(r) for r in decoding)
-            full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(
-                    decoding,
-                    retractable_tokens=retractable_tokens,
-                    retractable_swa_tokens=retractable_swa_tokens,
-                    count_retracted=True,
-                )
-            )
-        else:
-            retractable_swa_tokens = 0
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                decoding, retractable_tokens=retractable_tokens, count_retracted=True
-            )
         reserved_restore_tokens = self._hicache_pending_restore_tokens()
-        full_allocatable_tokens -= reserved_restore_tokens
+        full_allocatable_tokens, swa_allocatable_tokens = (
+            self._swa_aware_allocatable_token_budgets(
+                decoding,
+                retractable_tokens=retractable_tokens,
+                retractable_swa_tokens=retractable_swa_tokens,
+                count_retracted=True,
+                hicache_reserved_tokens=reserved_restore_tokens,
+            )
+        )
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         if self.enable_priority_scheduling:
@@ -1680,21 +1663,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
                 reserved_restore_tokens += prefix_match.restore_token_count
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                decoding,
-                retractable_tokens=retractable_tokens,
-                count_retracted=True,
-                extra_reserved_reqs=num_device_preallocated + 1,
-                hicache_reserved_tokens=reserved_restore_tokens,
-            )
-            if swa_allocatable_tokens is not None:
-                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+            full_allocatable_tokens, swa_allocatable_tokens = (
+                self._swa_aware_allocatable_token_budgets(
                     decoding,
                     retractable_tokens=retractable_tokens,
                     retractable_swa_tokens=retractable_swa_tokens,
                     count_retracted=True,
                     extra_reserved_reqs=num_device_preallocated + 1,
+                    hicache_reserved_tokens=reserved_restore_tokens,
                 )
+            )
             decode_req.req.kv.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
@@ -2001,23 +1979,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             retractable_tokens,
         )
         swa_required_tokens = 0
-        swa_allocatable_tokens = None
+        retractable_swa_tokens = 0
         if self._uses_swa_reservation():
             _, swa_required_tokens = self._prealloc_required_tokens(req)
-            full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(
-                    decoding,
-                    retractable_tokens=retractable_tokens,
-                    retractable_swa_tokens=sum(
-                        self._swa_retractable_len(r) for r in decoding
-                    ),
-                    count_retracted=True,
-                )
+            retractable_swa_tokens = sum(self._swa_retractable_len(r) for r in decoding)
+        full_allocatable_tokens, swa_allocatable_tokens = (
+            self._swa_aware_allocatable_token_budgets(
+                decoding,
+                retractable_tokens=retractable_tokens,
+                retractable_swa_tokens=retractable_swa_tokens,
+                count_retracted=True,
             )
-        else:
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                decoding, retractable_tokens=retractable_tokens, count_retracted=True
-            )
+        )
         if not self._prealloc_reservation_fits(
             required_tokens,
             swa_required_tokens,
@@ -2092,8 +2065,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         retractable_tokens: Optional[int] = None,
         retractable_swa_tokens: Optional[int] = None,
         count_retracted: bool = True,
-    ) -> Tuple[int, int]:
-        n_active = self._active_req_count(decoding)
+        extra_reserved_reqs: int = 0,
+        hicache_reserved_tokens: int = 0,
+    ) -> Tuple[int, Optional[int]]:
+        """The full and SWA admission budgets; the SWA one is None when the
+        allocator keeps no SWA reservation."""
+        n_active = self._active_req_count(decoding, extra_reserved_reqs)
         reserved_tokens = self._active_reserved_tokens(decoding, n_active)
 
         full_allocatable_tokens = self._allocatable_token_budgets(
@@ -2101,7 +2078,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             retractable_tokens=retractable_tokens,
             count_retracted=count_retracted,
             reserved_tokens=reserved_tokens,
+            hicache_reserved_tokens=hicache_reserved_tokens,
         )
+        if not self._uses_swa_reservation():
+            return full_allocatable_tokens, None
 
         return full_allocatable_tokens, self._swa_tail_allocatable_token_budget(
             decoding,
