@@ -207,7 +207,15 @@ else
   docker exec "$CI_CONTAINER_NAME" bash -c "pip install --no-deps --force-reinstall ${AOT_WHEEL_DIR}/*.whl"
 
   docker exec "$CI_CONTAINER_NAME" bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
-  install_with_retry docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+  # No in-place Rust build: in a source checkout the loader never imports
+  # in-package modules (SGLANG_RUST_BUILD_MODE=auto), only fingerprinted ones
+  # from its cache, so the _multimodal this would compile went unused.
+  install_with_retry docker exec -e SGLANG_BUILD_RUST_EXTS=none "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+
+  # Seed that cache with what stage-a built, when the workflow downloaded it.
+  if [[ -d rust-ext-amd ]]; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/amd_ci_rust_ext_cache.sh" import rust-ext-amd
+  fi
 fi
 
 # serving_responses.py imports responses_tools/beam.py, which needs
