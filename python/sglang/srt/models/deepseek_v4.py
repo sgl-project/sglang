@@ -799,22 +799,12 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> None:
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
-    if real_num_tokens == 0:
-        output.zero_()
-        return
-    live_query = query[:real_num_tokens]
-    data, scale = get_attn_backend().forward(
-        q=live_query,
-        k=live_query,
-        v=live_query,
-        layer=layer.attn_mqa,
-        forward_batch=forward_batch,
-        compress_ratio=layer.compress_ratio,
-        attn_sink=attn_sink,
-        save_kv_cache=False,
-        cos_sin_cache=layer.mega_cos_sin_cache,
-    )
-    output[:real_num_tokens].copy_(layer._project_mega_wo_a(data, scale))
+    if real_num_tokens:
+        output[:real_num_tokens].copy_(
+            layer._mega_core(
+                query[:real_num_tokens], attn_sink, forward_batch, get_attn_backend()
+            )
+        )
     output[real_num_tokens:].zero_()
 
 
@@ -1179,6 +1169,7 @@ class MQALayer(MqaAttentionBase):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         compress_ratio_override: Optional[int] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__(
             config,
@@ -1309,6 +1300,7 @@ class MQALayer(MqaAttentionBase):
         self.use_mega_attention = (
             self.is_dsv41
             and _is_cuda
+            and not is_nextn
             and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
         )
         self.mega_cos_sin_cache = self.mega_wo_a = None
@@ -1341,8 +1333,7 @@ class MQALayer(MqaAttentionBase):
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
 
-    def setup_mega_attention(self, enabled: bool) -> None:
-        self.use_mega_attention = self.use_mega_attention and enabled
+    def setup_mega_attention(self) -> None:
         if not self.use_mega_attention:
             return
         from sglang.srt.layers.attention.dsv4.mega_attention import (
@@ -1356,9 +1347,44 @@ class MQALayer(MqaAttentionBase):
             self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         )
 
-    def _project_mega_wo_a(
-        self, data: torch.Tensor, scale: torch.Tensor
+    def _forward_mega(
+        self,
+        q: torch.Tensor,
+        kernel_num_heads: int,
+        attn_sink: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
     ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsv4.mega_attention import pack_mega_query
+
+        if forward_batch.forward_mode.is_idle():
+            return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
+        if not self.mega_wq_b_permuted:
+            q = pack_mega_query(q, kernel_num_heads)
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
+            bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
+            return o
+        return self._mega_core(q, attn_sink, forward_batch, attn_backend)
+
+    def _mega_core(
+        self,
+        q: torch.Tensor,
+        attn_sink: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> torch.Tensor:
+        data, scale = attn_backend.forward(
+            q=q,
+            k=q,
+            v=q,
+            layer=self.attn_mqa,
+            forward_batch=forward_batch,
+            compress_ratio=self.compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=False,
+            cos_sin_cache=self.mega_cos_sin_cache,
+        )
         groups = self.n_local_groups
         return _fp8_wo_a_einsum(
             data[:, :groups], scale[:, :groups], *self.mega_wo_a, recipe=(1, 1, 32)
@@ -2508,32 +2534,9 @@ class MQALayer(MqaAttentionBase):
             )
 
         if self.use_mega_attention:
-            from sglang.srt.layers.attention.dsv4.mega_attention import pack_mega_query
-
-            if forward_batch.forward_mode.is_idle():
-                o = x.new_zeros(x.shape[0], self.n_local_groups, self.o_lora_rank)
-            else:
-                if not self.mega_wq_b_permuted:
-                    q = pack_mega_query(q, kernel_num_heads)
-                if (
-                    forward_batch.forward_mode.is_extend()
-                    and is_in_breakable_cuda_graph()
-                ):
-                    o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
-                    bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
-                else:
-                    data, scale = attn_backend.forward(
-                        q=q,
-                        k=q,
-                        v=q,
-                        layer=self.attn_mqa,
-                        forward_batch=forward_batch,
-                        compress_ratio=self.compress_ratio,
-                        attn_sink=attn_sink,
-                        save_kv_cache=False,
-                        cos_sin_cache=self.mega_cos_sin_cache,
-                    )
-                    o = self._project_mega_wo_a(data, scale)
+            o = self._forward_mega(
+                q, kernel_num_heads, attn_sink, forward_batch, attn_backend
+            )
             return self._project_wo_b(o, defer_all_reduce)
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
@@ -2867,6 +2870,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
+            is_nextn=is_nextn,
         )
         moe_alt_stream = (
             alt_streams[0]
@@ -2959,6 +2963,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str,
         alt_streams: Optional[List[torch.cuda.Stream]],
         compress_ratio_override: Optional[int],
+        is_nextn: bool,
     ) -> MQALayer:
         return MQALayer(
             config=config,
@@ -2967,6 +2972,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=prefix,
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
+            is_nextn=is_nextn,
         )
 
     def bind_next(self, next_layer: Optional[nn.Module]) -> None:
@@ -5094,7 +5100,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         for module in self.modules():
             if isinstance(module, MQALayer):
-                module.setup_mega_attention(enabled=not is_nextn)
+                module.setup_mega_attention()
 
         if is_nextn:
             return

@@ -3575,23 +3575,13 @@ class DeepseekV4AttnBackend(
             ),
         )
 
-    def _mega_paged_prefill(
-        self,
-        forward_batch: ForwardBatch,
-        *,
-        num_qo_tokens: int,
-        layer_id: int,
-        compress_ratio: int,
-        num_heads: int,
-    ) -> bool:
-        return False
-
     def _low_ratio_prefill_reads_page_indices(
         self, forward_batch: ForwardBatch, *, layer, num_qo_tokens: int
     ):
         return (
             self.trtllm_attn
-            or self._mega_paged_prefill(
+            or self.mega_attn
+            and self._mega_paged_prefill(
                 forward_batch,
                 num_qo_tokens=num_qo_tokens,
                 layer_id=layer.layer_id,
@@ -3775,7 +3765,7 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            use_mega_paged = self._mega_paged_prefill(
+            use_mega_paged = self.mega_attn and self._mega_paged_prefill(
                 forward_batch,
                 num_qo_tokens=q.shape[0],
                 layer_id=layer_id,
