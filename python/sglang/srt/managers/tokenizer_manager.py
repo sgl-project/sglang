@@ -453,6 +453,9 @@ _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    tokenized_generate_req_type = TokenizedGenerateReqInput
+    batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
@@ -1589,7 +1592,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
-            tokenized_obj = TokenizedGenerateReqInput(
+            tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
@@ -1843,7 +1846,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-                batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+                batch_req = self.batch_tokenized_generate_req_type(batch=tokenized_objs)
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
