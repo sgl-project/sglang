@@ -29,6 +29,19 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 _ACTIVATION_PARAMS = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
 
 
+def _fake_aiter_moe_common() -> types.ModuleType:
+    module = types.ModuleType("aiter.ops.flydsl.moe_common")
+    module.GateMode = SimpleNamespace(
+        SEPARATED=SimpleNamespace(value="separated"),
+        INTERLEAVE=SimpleNamespace(value="interleave"),
+    )
+    return module
+
+
+def _passthrough(tensor, *args, **kwargs):
+    return tensor
+
+
 class TestFp8MoERunnerOwnership(CustomTestCase):
     def setUp(self):
         moe = get_flags().moe
@@ -143,14 +156,11 @@ class TestFp8MoEAiterQuantInfo(CustomTestCase):
             _aiter_gate_up_interleaved=False,
             dispatcher=SimpleNamespace(expert_mask_gpu=torch.tensor([True, False])),
         )
-        fake_moe_common = types.ModuleType("aiter.ops.flydsl.moe_common")
-        fake_moe_common.GateMode = SimpleNamespace(
-            SEPARATED=SimpleNamespace(value="separated"),
-            INTERLEAVE=SimpleNamespace(value="interleave"),
-        )
 
         with (
-            patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": fake_moe_common}),
+            patch.dict(
+                sys.modules, {"aiter.ops.flydsl.moe_common": _fake_aiter_moe_common()}
+            ),
             patch.object(fp8_module, "_use_aiter", True),
         ):
             quant_info = method.maybe_get_hip_aiter_quant_info(layer)
@@ -160,6 +170,120 @@ class TestFp8MoEAiterQuantInfo(CustomTestCase):
         self.assertEqual(quant_info.swiglu_limit, 10.0)
         self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
         self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
+
+    @staticmethod
+    def _make_native_fp4_method(swiglu_limit: float) -> Fp8MoEMethod:
+        method = Fp8MoEMethod(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[1, 32],
+                is_fp4_experts=True,
+            )
+        )
+        method.moe_runner_config = MoeRunnerConfig(swiglu_limit=swiglu_limit)
+        return method
+
+    def test_native_fp4_interleaves_gate_up_only_for_clamped_swiglu(self):
+        """AITER's interleaved FP4 kernels serve only clamped SwiGLU; shuffling an
+        unclamped-SiLU checkpoint into that layout corrupts every expert output."""
+        for configured_interleave, swiglu_limit, expected_interleave in (
+            (False, 0.0, False),
+            (True, 0.0, False),
+            (False, 10.0, False),
+            (True, 10.0, True),
+        ):
+            with self.subTest(
+                configured_interleave=configured_interleave, swiglu_limit=swiglu_limit
+            ):
+                method = self._make_native_fp4_method(swiglu_limit)
+                layer = SimpleNamespace(
+                    w13_weight=torch.zeros((1, 256, 2), dtype=torch.uint8),
+                    w2_weight=torch.zeros((1, 2, 64), dtype=torch.uint8),
+                    w13_weight_scale_inv=torch.ones((1, 256, 1), dtype=torch.uint8),
+                    w2_weight_scale_inv=torch.ones((1, 2, 4), dtype=torch.uint8),
+                )
+                shuffle_scale = patch.object(
+                    fp8_module, "shuffle_scale", side_effect=_passthrough, create=True
+                )
+                shuffle_weight = patch.object(
+                    fp8_module, "shuffle_weight", side_effect=_passthrough, create=True
+                )
+
+                with (
+                    patch.object(fp8_module, "_use_aiter", True),
+                    patch.object(fp8_module, "_is_gfx1250_supported", False),
+                    patch.object(fp8_module, "_is_shuffle_moe_mxfp4", True),
+                    patch.object(fp8_module, "_use_aiter_a8w4", False),
+                    patch.object(
+                        fp8_module, "_require_fp4_dtype", return_value=torch.uint8
+                    ),
+                    patch.object(
+                        fp8_module,
+                        "get_moe_a2a_backend",
+                        return_value=SimpleNamespace(is_megamoe=lambda: False),
+                    ),
+                    patch.object(
+                        fp8_module.envs.SGLANG_USE_AITER_MOE_GU_ITLV,
+                        "get",
+                        return_value=configured_interleave,
+                    ),
+                    shuffle_scale as scale_mock,
+                    shuffle_weight as weight_mock,
+                ):
+                    method.process_weights_after_loading_block_quant(layer)
+
+                self.assertIs(layer._aiter_gate_up_interleaved, expected_interleave)
+                self.assertEqual(
+                    [call.args[2] for call in scale_mock.call_args_list],
+                    [expected_interleave] * 2,
+                )
+                self.assertEqual(
+                    [
+                        call.kwargs["is_guinterleave"]
+                        for call in weight_mock.call_args_list
+                    ],
+                    [expected_interleave] * 2,
+                )
+
+    def test_native_fp4_forwards_gate_up_layout_without_clamp(self):
+        """Unclamped native-FP4 experts must tell AITER the layout they were
+        shuffled into; without a gate_mode the kernel assumes its own default."""
+        method = self._make_native_fp4_method(swiglu_limit=0.0)
+        for gate_up_interleaved, expected_mode in (
+            (False, "separated"),
+            (True, "interleave"),
+        ):
+            with self.subTest(gate_up_interleaved=gate_up_interleaved):
+                layer = SimpleNamespace(
+                    w13_weight=torch.zeros((1, 4, 2), dtype=torch.uint8),
+                    w2_weight=torch.zeros((1, 2, 2), dtype=torch.uint8),
+                    w13_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.uint8),
+                    w2_weight_scale_inv=torch.ones((1, 2, 1), dtype=torch.uint8),
+                    hidden_pad=0,
+                    intermediate_pad=0,
+                    _aiter_gate_up_interleaved=gate_up_interleaved,
+                    dispatcher=SimpleNamespace(
+                        expert_mask_gpu=torch.tensor([True, False])
+                    ),
+                )
+
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {"aiter.ops.flydsl.moe_common": _fake_aiter_moe_common()},
+                    ),
+                    patch.object(fp8_module, "_use_aiter", True),
+                    patch.object(
+                        fp8_module, "_require_fp4_dtype", return_value=torch.uint8
+                    ),
+                ):
+                    quant_info = method.maybe_get_hip_aiter_quant_info(layer)
+
+                self.assertEqual(quant_info.quant_type, AiterQuantType.PER_1X32)
+                self.assertEqual(quant_info.swiglu_limit, 0.0)
+                self.assertEqual(
+                    quant_info.fused_moe_kwargs, {"gate_mode": expected_mode}
+                )
 
 
 if __name__ == "__main__":
