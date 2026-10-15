@@ -326,6 +326,7 @@ def attach(model, architecture: str) -> None:
     scratch = rt.build_widths(widths)
     _compare_plans(rt, widths)
     setattr(model, _RUNTIME, rt)
+    _SKIP_METADATA.append(spec.skip_metadata)
     # the weight updater refuses online updates on this (the kernels hold views and copies of the loaded weights)
     model._derived_weight_cache_error = (
         f"Online weight updates are not supported with {guards.SWITCH}: the {spec.name} monokernels "
@@ -366,6 +367,15 @@ def _compare_plans(rt: MonoRuntime, widths: tuple[int, ...]) -> None:
 
 class Plan(NamedTuple):
     runtime: MonoRuntime
+
+
+_SKIP_METADATA: list = []  # each attached spec's skip_metadata
+
+
+def skip_metadata(name: str, forward_batch, key, source) -> bool:
+    """True when the attached kernels never read SGLang's per-step metadata ``name`` (``key``, built from
+    ``source``) this step, so the backend need not build it. False with the switch off."""
+    return any(f(name, forward_batch, key, source) for f in _SKIP_METADATA)
 
 
 def route(model, forward_batch) -> Optional[Plan]:

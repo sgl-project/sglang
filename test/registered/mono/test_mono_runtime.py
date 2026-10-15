@@ -407,6 +407,14 @@ class TestHooks(CustomTestCase):
         with self.assertRaises(guards.MonoRefused):
             make_runtime(fake_spec(kernel=build))
 
+    def test_skip_metadata(self):
+        fb = batch("decode", 2, 2)
+        with unittest.mock.patch.object(runtime, "_SKIP_METADATA", []):
+            self.assertFalse(runtime.skip_metadata("sched", fb, 4, None))
+            runtime._SKIP_METADATA.append(lambda name, fb, key, src: name == "sched")
+            self.assertTrue(runtime.skip_metadata("sched", fb, 4, None))
+            self.assertFalse(runtime.skip_metadata("other", fb, 4, None))
+
 
 class TestStateBindings(CustomTestCase):
     def test_routed_layer_waits_for_its_state(self):

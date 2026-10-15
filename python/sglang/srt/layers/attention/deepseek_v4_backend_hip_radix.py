@@ -20,6 +20,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops import mono
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
@@ -1692,6 +1693,12 @@ class DeepseekV4HipRadixBackend(
                         # Identity rows are not scored, so they need no schedule.
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
+                        )
+                        and not mono.skip_metadata(
+                            "low_ratio_decode_schedule",
+                            forward_batch,
+                            ratio,
+                            indexer_metadata,
                         )
                     }
                 )

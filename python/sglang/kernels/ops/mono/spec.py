@@ -221,10 +221,18 @@ class MonoSpec:
         lambda ctx, model: {}
     )
     eligible: Callable[[MonoContext, MonoStep], Optional[str]] = lambda ctx, step: None
+    # (name, forward_batch, key, source) -> True when the kernels never read that per-step SGLang metadata this step
+    skip_metadata: Callable[[str, Any, Any, Any], bool] = (
+        lambda name, forward_batch, key, source: False
+    )
 
 
 # Model architecture -> its spec, by import path: config-time code reads a spec without importing the model.
-_SPECS: dict[str, str] = {}
+_SPECS = {
+    "DeepseekV41ForCausalLM": "sglang.kernels.ops.mono.deepseek_v41_gfx950.spec:MONO_SPEC",
+    # V4 and V4.1 share the model class; the spec refuses anything but V4.1-Flash's config
+    "DeepseekV4ForCausalLM": "sglang.kernels.ops.mono.deepseek_v41_gfx950.spec:MONO_SPEC",
+}
 
 
 def spec_path(architecture: str) -> Optional[str]:

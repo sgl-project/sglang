@@ -410,10 +410,12 @@ class Envs:
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
-    # Monokernels (kernels/ops/mono): check mode (eager steps against the normal path) and a stalled wait on one
-    # rank (rank:site[:after])
+    # Monokernels (kernels/ops/mono): check mode (eager steps against the normal path), DeepSeek-V4.1's K2i
+    # indexer A/B, and a stalled wait on one rank (rank:site[:after])
     SGLANG_TEST_MONO_CHECK = EnvBool(False)
     SGLANG_TEST_MONO_CHECK_STEPS = EnvInt(4)
+    SGLANG_TEST_MONO_DSV41_K2A = EnvInt(1)
+    SGLANG_TEST_MONO_DSV41_K2A_CHECK = EnvBool(False)
     SGLANG_TEST_MONO_FAULT_INJECT = EnvStr("")
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)

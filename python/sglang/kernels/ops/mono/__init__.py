@@ -3,7 +3,8 @@ launches (RFC #43949).
 
 SGLang calls the plugin's hooks, each a no-op while ``--enable-monokernel`` is off: ``handle_monokernel`` in the
 config pipeline (``guards``: refuse an unsupported setup with every reason), then ``load_tensor`` / ``loaded``,
-``attach``, ``route`` and ``kernel`` in each process (``runtime``). ``spec`` holds what a model declares and the
+``attach``, ``route`` and ``kernel`` in each process (``runtime``); attention backends ask ``skip_metadata`` before
+building per-step metadata the kernels never read. ``spec`` holds what a model declares and the
 registry of specs. Shared device primitives live in ``common_<vendor>/``, each model's kernels, spec and glue in
 ``<model>_<vendor>/``.
 
@@ -12,6 +13,21 @@ step only with every peer's data for it, so no token of a failed step is sent an
 """
 
 from sglang.kernels.ops.mono.guards import handle_monokernel
-from sglang.kernels.ops.mono.runtime import attach, kernel, load_tensor, loaded, route
+from sglang.kernels.ops.mono.runtime import (
+    attach,
+    kernel,
+    load_tensor,
+    loaded,
+    route,
+    skip_metadata,
+)
 
-__all__ = ["attach", "handle_monokernel", "kernel", "load_tensor", "loaded", "route"]
+__all__ = [
+    "attach",
+    "handle_monokernel",
+    "kernel",
+    "load_tensor",
+    "loaded",
+    "route",
+    "skip_metadata",
+]
