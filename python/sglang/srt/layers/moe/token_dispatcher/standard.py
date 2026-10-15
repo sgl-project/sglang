@@ -28,7 +28,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_lora, get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
@@ -44,6 +44,7 @@ _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
 
 
 try:
@@ -102,8 +103,30 @@ def _map_topk_ids_to_local_experts(
     )
 
 
+def _keeps_global_expert_ids(backend: MoeRunnerBackendLike) -> bool:
+    # These runners handle EP with global expert IDs:
+    # - cutlass / cutedsl / trtllm_routed handle EP internally
+    # - mxfp4 dispatcher mapping is already global
+    # - hpc_ops consumes global ids together with rank_ep / num_expert_total
+    # - flashinfer_megamoe routes by global expert ID inside the mega kernel
+    return (
+        backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_cutedsl()
+        or backend.is_flashinfer_trtllm()
+        or backend.is_experimental_sgl_trtllm()
+        or backend.is_flashinfer_trtllm_routed()
+        or backend.is_hpc_ops()
+        or backend.is_flashinfer_megamoe()
+        or backend.is_flashinfer_mxfp4()
+    )
+
+
 class StandardDispatcher(BaseDispatcher):
-    def __init__(self, moe_runner_config: MoeRunnerConfig):
+    def __init__(
+        self,
+        moe_runner_config: MoeRunnerConfig,
+        runner_backend: Optional[MoeRunnerBackendLike] = None,
+    ):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
@@ -115,21 +138,29 @@ class StandardDispatcher(BaseDispatcher):
         self.use_aiter_moe_runner = backend.is_aiter() or (
             backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
         )
-        # Skip local expert mapping when the backend handles EP with global expert IDs:
-        # - cutlass / cutedsl / trtllm_routed handle EP internally
-        # - mxfp4 dispatcher mapping is already global
-        # - hpc_ops consumes global ids together with rank_ep / num_expert_total
-        # - flashinfer_megamoe routes by global expert ID inside the mega kernel
-        self.skip_local_expert_mapping = (
-            backend.is_flashinfer_cutlass()
-            or backend.is_flashinfer_cutedsl()
-            or backend.is_flashinfer_trtllm()
-            or backend.is_experimental_sgl_trtllm()
-            or backend.is_flashinfer_trtllm_routed()
-            or backend.is_hpc_ops()
-            or backend.is_flashinfer_megamoe()
-            or self.enable_flashinfer_mxfp4_moe
-        )
+        self.skip_local_expert_mapping = _keeps_global_expert_ids(backend)
+        # A quant method can run its experts on a runner that needs local ids
+        # while --moe-runner-backend keeps global ones (Fp8MoEMethod runs fp8
+        # experts on triton under a flashinfer_cutlass pin). Without local ids,
+        # EP ranks index experts they do not hold. The runner only ever turns
+        # the mapping on; every other flag follows the global backend.
+        if (
+            self.skip_local_expert_mapping
+            and runner_backend is not None
+            and not _keeps_global_expert_ids(runner_backend)
+        ):
+            # The LoRA pool keys experts by the global backend's convention, so
+            # it would read the wrong adapters for this layer under EP.
+            if self.moe_ep_size > 1 and (
+                get_lora().enable_lora or get_lora().lora_paths
+            ):
+                raise ValueError(
+                    "LoRA with expert parallelism is not supported on this MoE "
+                    f"layer: --moe-runner-backend {backend.value} keeps global "
+                    f"expert ids, but the layer's quantization method runs the "
+                    f"'{runner_backend.value}' runner, which needs local ids."
+                )
+            self.skip_local_expert_mapping = False
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
