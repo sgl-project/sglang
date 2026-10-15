@@ -12,7 +12,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin, MMMUProMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin, _run_accuracy_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -25,7 +25,7 @@ register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
 
-class DSV41FlashAccuracyMixin(GSM8KMixin, MMMUProMixin):
+class DSV41FlashAccuracyMixin(GSM8KMixin, _run_accuracy_eval):
     # Use the zero-shot chat evaluator, not the legacy five-shot completion path.
     gsm8k_backend = "sgl_eval"
     gsm8k_score_threshold = 0.95
@@ -35,6 +35,8 @@ class DSV41FlashAccuracyMixin(GSM8KMixin, MMMUProMixin):
     mmmu_pro_score_threshold = 0.75
     mmmu_pro_num_examples = 200
     mmmu_pro_num_threads = 64
+    # Bound long reasoning responses consistently across all three CI recipes.
+    mmmu_pro_max_tokens = 32768
     mmmu_pro_load_preset_from_model_id = MODEL
 
     mem_fraction_static = "0.8"
@@ -93,7 +95,16 @@ class DSV41FlashAccuracyMixin(GSM8KMixin, MMMUProMixin):
         self.assert_dspark_accepts_draft_tokens()
 
     def test_mmmu_pro(self):
-        super().test_mmmu_pro()
+        _run_accuracy_eval(
+            self,
+            eval_name="mmmu_pro",
+            score_threshold=self.mmmu_pro_score_threshold,
+            num_examples=self.mmmu_pro_num_examples,
+            num_threads=self.mmmu_pro_num_threads,
+            model=None,
+            load_preset_from_model_id=self.mmmu_pro_load_preset_from_model_id,
+            max_tokens=self.mmmu_pro_max_tokens,
+        )
         self.assert_dspark_accepts_draft_tokens()
 
 
