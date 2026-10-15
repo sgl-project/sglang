@@ -1179,7 +1179,7 @@ class RequestIntake:
             get_serving().allow_auto_truncate,
         )
         if error_msg:
-            self.add_request_to_queue(req)
+            self._reject(req, error_msg)
             return
 
         # Copy more attributes

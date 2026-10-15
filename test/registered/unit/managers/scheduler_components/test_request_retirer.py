@@ -1,6 +1,7 @@
 """Exits that skipped a release part, now retired through RequestRetirer."""
 
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -11,6 +12,7 @@ from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
@@ -246,6 +248,46 @@ class TestRetractBacksUpBeforeHiSparse(CustomTestCase):
             self.assertTrue(retirer.retract(req, num_remaining_reqs=1))
 
         self.assertEqual(events, ["backup", "hisparse", "kv"])
+
+
+class TestOverLengthEmbeddingIsRejected(CustomTestCase):
+    """An embedding prompt over the input limit, without auto-truncation, is
+    rejected like a generate prompt: queued only as a stub that finishes with
+    a 400 abort."""
+
+    def test_over_length_embedding_finishes_with_an_abort(self):
+        enter_scope(self, published_topology(allow_auto_truncate=False))
+        intake = make_request_intake(
+            request_retirer=_retirer(), max_req_input_len=4, tokenizer=None
+        )
+        intake._maybe_namespace_elastic_radix_cache = Mock()
+        intake._prefetch_kvcache = Mock()
+        recv_req = SimpleNamespace(
+            rid="long-embedding",
+            input_text="",
+            input_ids=list(range(8)),
+            sampling_params=SamplingParams(max_new_tokens=0),
+            positional_embed_overrides=None,
+            token_type_ids=None,
+            routed_dp_rank=None,
+            priority=None,
+            dimensions=None,
+            lora_id=None,
+            http_worker_ipc=None,
+            time_stats=None,
+            return_pooled_hidden_states=False,
+            multi_item_delimiter_indices=None,
+            token_indices_to_pool=None,
+            decision_layout=None,
+            mm_inputs=None,
+        )
+
+        intake.handle_embedding_request(recv_req)
+
+        (req,) = intake.lists.waiting_queue
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("exceeds the maximum allowed length", req.to_finish.message)
 
 
 if __name__ == "__main__":
