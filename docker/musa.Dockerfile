@@ -60,24 +60,24 @@ RUN echo "deb [trusted=true] ${MUSA_APT_SOURCE} jammy main" \
     && apt-get install -y --no-install-recommends \
         libmthreads-compute \
         libmthreads-mtml \
-        libmublas-5-2 \
-        libmublaslt-5-2 \
-        libmudnn3-dev-musa-5-2 \
-        libmudnn3-musa-5-2 \
-        libmufft-5-2 \
-        libmupp-5-2 \
-        libmurand-5-2 \
-        libmusolver-5-2 \
-        libmusparse-5-2 \
+        libmublas-5-3 \
+        libmublaslt-5-3 \
+        libmudnn3-dev-musa-5-3 \
+        libmudnn3-musa-5-3 \
+        libmufft-5-3 \
+        libmupp-5-3 \
+        libmurand-5-3 \
+        libmusolver-5-3 \
+        libmusparse-5-3 \
         mccl-s5000 \
         mccl-s5000-dev \
-        mtcc-5-2 \
-        musa-mualg-5-2 \
-        musa-mupti-5-2 \
-        musa-musart-5-2 \
-        musa-muthrust-5-2 \
-        musa-toolkit-5-2 \
-        musa-toolkit-5-2-config-common \
+        mtcc-5-3 \
+        musa-mualg-5-3 \
+        musa-mupti-5-3 \
+        musa-musart-5-3 \
+        musa-muthrust-5-3 \
+        musa-toolkit-5-3 \
+        musa-toolkit-5-3-config-common \
     && printf '%s\n' \
         "${MUSA_HOME}/lib" \
         "${MUSA_HOME}/mudnn/lib" \

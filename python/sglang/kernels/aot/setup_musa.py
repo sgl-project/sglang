@@ -142,7 +142,7 @@ mcc_flags = [
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
     "-O3",
     "-fPIC",
-    "-std=c++17",
+    "-std=c++20",
     f"--cuda-gpu-arch={mtgpu_target}",
     "-x",
     "musa",
