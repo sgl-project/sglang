@@ -218,6 +218,29 @@ def test_tensor_encoder_chunks_survive_cache_pressure(
     assert mm_schedule.embedding_cache.current_size <= cache_bytes
 
 
+def test_oversize_entry_leaves_the_cache_alone():
+    """An entry larger than the cache is refused; the entries already there stay."""
+    row_bytes = HIDDEN * 4
+    cache = mm_schedule.MultiModalStaticCache(max_size=4 * row_bytes)
+    kept = {
+        mm_hash: mm_schedule.EmbeddingResult(embedding=torch.ones(2, HIDDEN))
+        for mm_hash in (1, 2)
+    }
+    for mm_hash, entry in kept.items():
+        assert cache.set(mm_hash=mm_hash, embedding=entry)
+
+    oversize = mm_schedule.EmbeddingResult(embedding=torch.ones(5, HIDDEN))
+    assert not cache.set(mm_hash=3, embedding=oversize)
+    assert list(cache.mm_cache) == [1, 2]
+    assert all(cache.peek(mm_hash) is entry for mm_hash, entry in kept.items())
+    assert cache.current_size == 4 * row_bytes
+
+    # An entry that fills the cache exactly is still admitted.
+    exact = mm_schedule.EmbeddingResult(embedding=torch.ones(4, HIDDEN))
+    assert cache.set(mm_hash=4, embedding=exact)
+    assert list(cache.mm_cache) == [4]
+
+
 def test_by_item_mismatched_cache_entry_is_reencoded():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
