@@ -153,7 +153,8 @@ def assert_one_list_per_request(scheduler: Scheduler) -> None:
 
 
 def assert_progress_lengths(scheduler: Scheduler) -> None:
-    """At an iteration boundary: every held row's lengths are in order, and a
+    """At an iteration boundary: every held row's lengths are in order (a
+    request's, a session's, or one released and held for a pending step), and a
     live request's KV allocated past its committed length belongs to its pending
     decode steps: one token per step without speculation; with it, at least the
     bonus token per step, and the rest is the verify reservation."""
@@ -186,3 +187,7 @@ def assert_progress_lengths(scheduler: Scheduler) -> None:
         )
     for kv in scheduler.tree_cache.session_records().values():
         kv.check_lengths()
+    # A record held for a pending step is its row as the request released it:
+    # in order, but no live request's, so the pending-step relation skips it.
+    for held in scheduler.pending.held():
+        held.kv.check_lengths()

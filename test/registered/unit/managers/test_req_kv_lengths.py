@@ -4,10 +4,17 @@ check_lengths rejects an out-of-order row."""
 import ast
 import unittest
 import warnings
+from array import array
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -142,6 +149,57 @@ class TestReqKvLengthOrder(CustomTestCase):
         self.assertIs(kv.retraction_backup, backup)
         kv.retraction_backup = None
         self.assertEqual(kv, ReqKvInfo())
+
+
+class TestRetractWhileHeld(CustomTestCase):
+    def setUp(self):
+        # release_kv_cache reads the serving and speculative config bags.
+        reset_context()
+        publish(ServerArgs(model_path="dummy"), role="test")
+
+    def tearDown(self):
+        reset_context()
+
+    def test_retract_resets_the_live_record_and_leaves_the_held_one(self):
+        # A decode step is in flight: prompt 8 committed, its token allocated.
+        req = Req(
+            rid="r",
+            origin_input_text="",
+            origin_input_ids=array("q", range(8)),
+            sampling_params=SamplingParams(max_new_tokens=4),
+        )
+        req.kv.req_pool_idx = 3
+        req.kv.allocate_extend(8)
+        req.kv.protect_prefix(4)
+        req.kv.record_insert(4)
+        req.kv.allocate_decode(1)
+        req.kv.retraction_backup = backup = object()
+        tree_cache = Mock(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+            req_to_token_pool=Mock(),
+        )
+        tree_cache.claim_kv_row.return_value = False
+
+        held = []
+        release_kv_cache(req, tree_cache, checkpoint=False, hold=held.append)
+        req.reset_for_retract()
+
+        (snapshot,) = held
+        self.assertIsNot(snapshot.kv, req.kv)
+        self.assertEqual(
+            (
+                snapshot.kv.req_pool_idx,
+                snapshot.kv.cache_protected_len,
+                snapshot.kv.cache_inserted_len,
+                snapshot.kv.kv_committed_len,
+                snapshot.kv.kv_allocated_len,
+            ),
+            (3, 4, 4, 8, 9),
+        )
+        snapshot.kv.check_lengths()
+        self.assertIs(req.kv.retraction_backup, backup)
+        req.kv.retraction_backup = None
+        self.assertEqual(req.kv, ReqKvInfo())
 
 
 if __name__ == "__main__":
