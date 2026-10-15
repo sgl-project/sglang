@@ -11,9 +11,7 @@ try:
 
     __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 except ImportError as exc:
-    # ComfyUI dependencies not available (e.g., in test environment). Log it:
-    # a silent except here previously made every node disappear from ComfyUI
-    # with no clue why whenever any import in the chain failed.
+    # Missing ComfyUI or SGLang deps; log why, or every node vanishes silently.
     logger.error(
         "ComfyUI_SGLDiffusion failed to register nodes: %r. If this is a "
         "real ComfyUI install, install the diffusion extras with "

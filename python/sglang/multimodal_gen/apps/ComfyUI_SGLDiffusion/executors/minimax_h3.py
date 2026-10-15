@@ -13,12 +13,8 @@ import torch
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
 
-# Mirrors base.py's guard: keep this module importable (so nodes.py still
-# loads and ComfyUI can show *why* H3 is unavailable) even when the
-# sglang[diffusion] extras aren't installed. Previously these imports ran
-# unguarded at module scope, which raised ImportError out of
-# `core/generator.py`'s own unconditional executor import and took every
-# node in the plugin down with it, silently (see __init__.py's bare except).
+# Same guard as base.py: generator.py imports this module unconditionally, so
+# a missing runtime must surface on first use instead of hiding every node.
 try:
     from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
     from sglang.multimodal_gen.configs.sample.minimax_h3_vdn import VDNH3SamplingParams

@@ -13,12 +13,10 @@ from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
 
 
 def _list_unet_names_including_gguf() -> list[str]:
-    """SGLDUNETLoader's own file list, with ``.gguf`` DiTs included.
+    """SGLDUNETLoader's file list plus ``.gguf`` DiTs.
 
-    Previously this mutated ``folder_paths.folder_names_and_paths`` globally,
-    which also made ComfyUI's stock "Load Diffusion Model" node offer GGUF
-    files it cannot load. Scan for ``.gguf`` locally instead so only this
-    node's dropdown is affected.
+    Kept local: registering ``.gguf`` in ``folder_paths`` would make ComfyUI's
+    stock loader offer files it cannot load.
     """
     names = set(folder_paths.get_filename_list("diffusion_models"))
     for folder in folder_paths.get_folder_paths("diffusion_models"):
