@@ -297,6 +297,24 @@ def test_any_member_subset_loads_with_the_absent_members_zero(kind, tp_rank):
             assert torch.equal(b_buffer[:, :_RANK], expected_b), present
 
 
+def test_zero_element_placeholders_load_as_absent_members():
+    """PEFT can ship an untrained up_proj as zero-element tensors; they must load as zeros."""
+    module_path, members, full_rows, wrapper, reference_slice = _gate_up(tp_rank=0)
+    weights, a, b = _member_weights(members, full_rows, ["gate_proj"])
+    weights[f"{_PREFIX}mlp.up_proj.lora_A.weight"] = torch.empty(0)
+    weights[f"{_PREFIX}mlp.up_proj.lora_B.weight"] = torch.empty(0)
+
+    a_buffer, b_buffer = _load(
+        _pool(module_path, wrapper, full_rows, _RANK), module_path, wrapper, weights
+    )
+
+    expected_a, expected_b = _expected(
+        members, full_rows, a, b, ["gate_proj"], reference_slice
+    )
+    assert torch.equal(a_buffer[: len(members) * _RANK], expected_a)
+    assert torch.equal(b_buffer[:, :_RANK], expected_b)
+
+
 @pytest.mark.parametrize("stacked_a", [False, True], ids=["shared-A", "stacked-A"])
 def test_an_already_fused_qkv_adapter_matches_its_members(stacked_a):
     module_path, members, full_rows, wrapper, reference_slice = _qkv(tp_rank=3)
@@ -355,3 +373,4 @@ def test_the_adapter_keeps_dense_projections_per_member():
     assert sorted(adapter.layers[0].weights) == sorted(
         names[:3] + [f"{_PREFIX}mlp.experts.0.gate_up_proj.lora_A.weight"]
     )
+

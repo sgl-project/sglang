@@ -1136,6 +1136,9 @@ class LoRAMemoryPool:
                     )
                 fused_member = _fused_member_slot(name)
                 if fused_member is not None and fused_member[0] in fused_member_modules:
+                    # PEFT may ship an untrained member as a zero-element placeholder.
+                    if weights.numel() == 0:
+                        continue
                     fused_module, slot = fused_member
                     side = "A" if "lora_A" in name else "B"
                     temp_member_weights[fused_module][(side, slot)] = (
