@@ -16,7 +16,7 @@ The simulator supports:
 
 - synthetic request rates, ShareGPT workloads, and timestamped Autobench traces;
 - OFFLINE logical-time simulation and BLOCKING wall-clock replay;
-- AIConfigurator, ML, and replay latency predictors;
+- AISimulate, ML, and replay latency predictors;
 - SGLang prefix caching and [HiCache](/docs/advanced_features/hicache); and
 - serving-compatible TTFT, TPOT, ITL, throughput, and cache-hit metrics.
 
@@ -29,10 +29,10 @@ python3 -m pip install -e tools/sglang-simulator
 export PYTHONPATH="$PWD/tools/sglang-simulator/src:$PWD/python"
 ```
 
-AIConfigurator is optional. Install the validated extra only when you use an AIConfigurator predictor:
+Install the AISimulate extra for the simulator runtime. The current shared import and memory-estimation paths also load the SDK when using ML or replay predictors:
 
 ```bash
-python3 -m pip install -e "tools/sglang-simulator[aic]"
+python3 -m pip install -e "tools/sglang-simulator[aisimulate]"
 ```
 
 ## Start a simulator server

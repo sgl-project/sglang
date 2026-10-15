@@ -8,7 +8,7 @@
     "num_device_per_node": 8
   },
   "predictor": {
-    "name": "aiconfigurator",
+    "name": "aisimulate",
     "database_mode": "SOL"
   },
   "scheduler": {
@@ -16,6 +16,6 @@
     "ep_size": 1,
     "dp_size": 1,
     "backend_name": "sglang",
-    "backend_version": "0.5.9"
+    "backend_version": "0.5.10"
   }
 }

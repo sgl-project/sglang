@@ -1,19 +1,68 @@
+from importlib.metadata import (
+    PackageNotFoundError,
+    packages_distributions,
+    version,
+)
 from typing import Optional
 
 import numpy as np
-from aiconfigurator.sdk import models
-from aiconfigurator.sdk.backends.factory import get_backend
-from aiconfigurator.sdk.common import (
-    CommQuantMode,
-    DatabaseMode,
-    FMHAQuantMode,
-    GEMMQuantMode,
-    KVCacheQuantMode,
-    MoEQuantMode,
-)
-from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
-from aiconfigurator.sdk.inference_session import InferenceSession
-from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
+
+# AISimulate 0.12.1 ships the estimator SDK under the ``aiconfigurator.sdk``
+# compatibility namespace *inside* the ``aisimulate`` distribution; the
+# ``aisimulate.sdk`` namespace only exists in later prereleases. The imports
+# below therefore target ``aiconfigurator.sdk`` on purpose — removing them
+# would break the pinned release. The guard right after them rejects the
+# standalone legacy ``aiconfigurator`` distribution, which publishes the same
+# import namespace, so an old-only installation fails loudly instead of
+# silently running unvalidated estimator code.
+try:
+    from aiconfigurator.sdk import models
+    from aiconfigurator.sdk.backends.factory import get_backend
+    from aiconfigurator.sdk.common import (
+        CommQuantMode,
+        DatabaseMode,
+        FMHAQuantMode,
+        GEMMQuantMode,
+        KVCacheQuantMode,
+        MoEQuantMode,
+    )
+    from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
+    from aiconfigurator.sdk.inference_session import InferenceSession
+    from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
+except ModuleNotFoundError as exc:
+    # Only a genuinely missing target namespace may raise the install hint; a
+    # missing dependency inside an installed SDK must surface unchanged.
+    if exc.name not in {"aiconfigurator", "aiconfigurator.sdk"}:
+        raise
+    raise ModuleNotFoundError(
+        "SGLang Simulator's AISimulate predictor needs the AISimulate estimator "
+        "SDK, which provides the 'aiconfigurator.sdk' namespace in the pinned "
+        "aisimulate==0.12.1 release. Install it with: "
+        "pip install -e 'tools/sglang-simulator[aisimulate]'. The standalone "
+        "legacy 'aiconfigurator' distribution is not supported."
+    ) from exc
+
+try:
+    version("aiconfigurator")
+except PackageNotFoundError:
+    pass
+else:
+    raise ImportError(
+        "The legacy standalone 'aiconfigurator' distribution is installed, "
+        "which SGLang Simulator no longer supports. The AISimulate predictor "
+        "requires the estimator SDK shipped inside the 'aisimulate' "
+        "distribution. Create a fresh environment and install: "
+        "pip install -e 'tools/sglang-simulator[aisimulate]'"
+    )
+
+if "aisimulate" not in packages_distributions().get("aiconfigurator", ()):
+    raise ImportError(
+        "The 'aiconfigurator' import namespace is not provided by the "
+        "'aisimulate' distribution, so the AISimulate estimator SDK cannot be "
+        "trusted in this environment. Create a fresh environment and install: "
+        "pip install -e 'tools/sglang-simulator[aisimulate]'"
+    )
+
 from sglang_simulator.simulation.types import (
     SchedulerConfig,
 )
@@ -27,7 +76,7 @@ from sglang_simulator.time_predictor.base import (
 )
 from sglang_simulator.utils import get_logger
 
-# Map the common data types to AIConfigurator data types.
+# Map the common data types to AISimulate data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
     DataType.FP16: GEMMQuantMode.bfloat16,
     DataType.BF16: GEMMQuantMode.bfloat16,
@@ -87,7 +136,7 @@ def _resolve_comm_quant_mode(sched_config: SchedulerConfig) -> CommQuantMode:
         return MAP_DTYPE_TO_CommQuantMode[sched_config.data_type]
     except KeyError:
         raise ValueError(
-            "AIConfigurator has no communication quantization mapping for "
+            "AISimulate has no communication quantization mapping for "
             f"model data type {sched_config.data_type.value}. Set "
             "comm_quant_mode_override explicitly to half, int8, or fp8."
         ) from None
@@ -130,7 +179,7 @@ def get_perf_model(
         workload_distribution=workload_distribution,
     )
 
-    logger.info(f"Model config for AIConfigurator: {model_config}")
+    logger.info(f"Model config for AISimulate: {model_config}")
 
     return models.get_model(
         model_path=model.model_path,
@@ -139,7 +188,7 @@ def get_perf_model(
     )
 
 
-class AIConfiguratorTimePredictor(InferTimePredictor):
+class AISimulateTimePredictor(InferTimePredictor):
     def __init__(
         self,
         model: ModelInfo,
@@ -174,7 +223,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             raise ValueError("Failed to initialize the database.")
 
         database.set_default_database_mode(database_mode)
-        logger.info(f"AIC Database mode: {database_mode}")
+        logger.info(f"AISimulate database mode: {database_mode}")
 
         self._session = InferenceSession(
             model=get_perf_model(config, model, workload_distribution),
