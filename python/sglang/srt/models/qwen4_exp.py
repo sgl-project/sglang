@@ -791,10 +791,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     The source weight may be on the meta device; only its metadata is used.
     """
 
-    # The NPU backend keeps device graphs around the host lookup, rather than
-    # forcing the entire model to execute eagerly.
-    requires_npu_host_offload_graph = True
-
     _COPIED_ATTRIBUTES = (
         "quant_config",
         "enable_tp",
@@ -863,6 +859,25 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
+        self._npu_uva_table = None
+        self.npu_uva_enabled = False
+        self.npu_uva_fallback_reason = None
+        self.requires_npu_host_offload_graph = False
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.ple import try_create_ple_uva_table
+
+            self._npu_uva_table, self.npu_uva_fallback_reason = (
+                try_create_ple_uva_table(self.weight, backend=backend)
+            )
+            self.npu_uva_enabled = self._npu_uva_table is not None
+            self.requires_npu_host_offload_graph = not self.npu_uva_enabled
+            if self.npu_uva_enabled:
+                logger.info("NPU PLE lookup route: uva")
+            else:
+                logger.info(
+                    "NPU PLE lookup route: cpu_staging (%s)",
+                    self.npu_uva_fallback_reason,
+                )
         # The scale is tiny; keep it with the model instead of offloading it
         # with the table.
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
@@ -902,8 +917,19 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         flat_ids = input_ids.reshape(-1)
         if flat_ids.numel():
             if input_ids.device.type == "npu":
-                from sglang.srt.hardware_backend.npu.ple import gather_ple_host_rows
+                from sglang.srt.hardware_backend.npu.ple import (
+                    gather_ple_host_rows,
+                    gather_ple_uva_rows,
+                )
 
+                if self._npu_uva_table is not None:
+                    return gather_ple_uva_rows(
+                        self._npu_uva_table,
+                        flat_ids,
+                        output,
+                        vocab_start=self.shard_indices.org_vocab_start_index,
+                        vocab_end=self.shard_indices.org_vocab_end_index,
+                    )
                 return gather_ple_host_rows(
                     self.weight,
                     flat_ids,

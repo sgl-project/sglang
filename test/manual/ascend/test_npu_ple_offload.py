@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -71,7 +72,9 @@ class TestNpuPleOffload(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
 
-    def make_embedding(self, backend, dtype, dim, *, start=0, end=None, vocab=8):
+    def make_embedding(
+        self, backend, dtype, dim, *, start=0, end=None, vocab=8, force_fallback=False
+    ):
         """A host-table embedding holding rows [start, end) of a vocab-row table."""
         end = vocab if end is None else end
         log(
@@ -116,9 +119,18 @@ class TestNpuPleOffload(unittest.TestCase):
             num_added_embeddings_per_partition=0,
         )
         table_dir = Path(tempfile.mkdtemp(dir=self.directory))
-        embedding = Qwen4ExpPinnedHostEmbedding(
-            source, backend=backend, table_dir=str(table_dir)
+        mapping = (
+            patch(
+                "sglang.srt.hardware_backend.npu.ple.try_create_ple_uva_table",
+                return_value=(None, "forced test fallback"),
+            )
+            if force_fallback
+            else nullcontext()
         )
+        with mapping:
+            embedding = Qwen4ExpPinnedHostEmbedding(
+                source, backend=backend, table_dir=str(table_dir)
+            )
         # Keep the mapped storage alive until its background workers stop.
         self.addCleanup(self.close_embedding, embedding)
         log(f"  table allocated, files: {sorted(os.listdir(table_dir))}")
@@ -135,6 +147,20 @@ class TestNpuPleOffload(unittest.TestCase):
         self.assertEqual(embedding.weight.dtype, dtype)
         self.assertEqual(embedding.weight.is_pinned(), backend == "pinned")
         self.assertIs(embedding.weight_scale, source.weight_scale)
+        self.assertIs(
+            embedding.requires_npu_host_offload_graph, not embedding.npu_uva_enabled
+        )
+        if embedding.npu_uva_enabled:
+            self.assertEqual(backend, "pinned")
+            self.assertEqual(dtype, torch.bfloat16)
+            self.assertIsNone(embedding.npu_uva_fallback_reason)
+        else:
+            self.assertIsInstance(embedding.npu_uva_fallback_reason, str)
+            self.assertTrue(embedding.npu_uva_fallback_reason)
+        if backend == "file" or dtype != torch.bfloat16 or force_fallback:
+            self.assertFalse(embedding.npu_uva_enabled)
+        if force_fallback:
+            self.assertEqual(embedding.npu_uva_fallback_reason, "forced test fallback")
         return embedding, rows, table_dir
 
     @staticmethod
@@ -142,7 +168,10 @@ class TestNpuPleOffload(unittest.TestCase):
         for worker in (embedding._file_prefetcher, embedding._file_rss_trimmer):
             if worker is not None:
                 worker.close()
-        log("  embedding workers closed")
+        owner = getattr(embedding, "_npu_uva_table", None)
+        if owner is not None:
+            owner.close()
+        log("  embedding workers and UVA registration closed")
 
     @staticmethod
     def use_recorder(embedding):
@@ -249,9 +278,7 @@ class TestNpuPleOffload(unittest.TestCase):
         for id_dtype in (torch.int32, torch.int64):
             with self.subTest(ids=id_dtype):
                 recorder.calls.clear()
-                ids = torch.tensor(
-                    [[1, 5], [7, 5]], dtype=id_dtype, device=self.device
-                )
+                ids = torch.tensor([[1, 5], [7, 5]], dtype=id_dtype, device=self.device)
                 actual = self.lookup(embedding, ids)
                 self.assertEqual(len(recorder.calls), 1)
                 hinted_ids, vocab_start, vocab_end = recorder.calls[0]
@@ -319,9 +346,7 @@ class TestNpuPleOffload(unittest.TestCase):
         # As in Qwen4ExpPLELayer: a side stream refills one buffer, main waits.
         for backend in ("pinned", "file"):
             with self.subTest(backend=backend):
-                embedding, rows, _ = self.make_embedding(
-                    backend, torch.bfloat16, 257
-                )
+                embedding, rows, _ = self.make_embedding(backend, torch.bfloat16, 257)
                 stream = torch.npu.Stream(device=self.device)
                 out = torch.empty((128, 257), dtype=torch.bfloat16, device=self.device)
                 for offset in range(4):
@@ -346,10 +371,60 @@ class TestNpuPleOffload(unittest.TestCase):
                 actual = self.lookup(embedding, ids)
                 self.assertEqual(actual.shape, (0, 3, 7))
 
+    def test_uva_plain_graph_reads_updated_ids_and_host_rows(self):
+        for id_dtype in (torch.int32, torch.int64):
+            with self.subTest(ids=id_dtype):
+                start, end, dim = 4, 8, 13
+                embedding, rows, _ = self.make_embedding(
+                    "pinned", torch.bfloat16, dim, start=start, end=end
+                )
+                self.assertTrue(
+                    embedding.npu_uva_enabled, embedding.npu_uva_fallback_reason
+                )
+                self.assertFalse(embedding.requires_npu_host_offload_graph)
+                ids = torch.tensor(
+                    [4, 7, 5, -1, 8, 5], dtype=id_dtype, device=self.device
+                )
+                result = torch.empty((6, dim), dtype=torch.bfloat16, device=self.device)
+                # Pay any one-time kernel setup before an ordinary, unsplit graph.
+                embedding.gather(ids, out=result)
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    embedding.gather(ids, out=result)
+                for step, pattern in enumerate(
+                    ([4, 7, 5, -1, 8, 5], [6, 5, 7, 6, 0, 99])
+                ):
+                    ids_cpu = torch.tensor(pattern, dtype=id_dtype)
+                    updated = (rows.float() + (step + 1) * 32).to(rows.dtype)
+                    # This is a CPU store into the registered table, not H2D.
+                    embedding.weight.copy_(updated[start:end])
+                    ids.copy_(ids_cpu)
+                    graph.replay()
+                    torch.npu.synchronize()
+                    self.check(result, self.reference(updated, ids_cpu, start, end))
+                log("  ordinary NPU graph sees changed IDs and host table rows")
+
+    def test_mapping_failure_uses_cpu_staging(self):
+        embedding, rows, _ = self.make_embedding(
+            "pinned", torch.bfloat16, 13, force_fallback=True
+        )
+        self.assertFalse(embedding.npu_uva_enabled)
+        self.assertTrue(embedding.requires_npu_host_offload_graph)
+        recorder = self.use_recorder(embedding)
+        ids = torch.tensor([7, 2, 2, -1, 8], dtype=torch.int64, device=self.device)
+        actual = self.lookup(embedding, ids)
+        self.check(actual, self.reference(rows, ids, 0, 8))
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertEqual(recorder.calls[0][0].device.type, "cpu")
+
     def test_graph_replays_host_lookup_between_segments(self):
         for backend in ("pinned", "file"):
             with self.subTest(backend=backend):
-                embedding, rows, _ = self.make_embedding(backend, torch.bfloat16, 7)
+                embedding, rows, _ = self.make_embedding(
+                    backend, torch.bfloat16, 7, force_fallback=True
+                )
+                self.assertTrue(embedding.requires_npu_host_offload_graph)
                 recorder = self.use_recorder(embedding)
                 # Graph inputs and outputs are prepared on the CPU, as elsewhere
                 # in this file. Inside the graph only D2D copies run: segment 0
@@ -387,7 +462,9 @@ class TestNpuPleOffload(unittest.TestCase):
                 self.assertEqual(len(recorder.calls), 2)
 
     def test_raw_graph_capture_rejected_before_host_row_selection(self):
-        embedding, _, _ = self.make_embedding("file", torch.bfloat16, 7)
+        embedding, _, _ = self.make_embedding(
+            "file", torch.bfloat16, 7, force_fallback=True
+        )
         recorder = self.use_recorder(embedding)
         for id_dtype in (torch.int32, torch.int64):
             with self.subTest(ids=id_dtype):
