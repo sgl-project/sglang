@@ -1047,6 +1047,12 @@ def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
     return {}
 
 
+def _deterministic_aiter_decode_supported(view: Any) -> bool:
+    # AITER paged decode reduces fixed 256-token KV partitions per request, so it is
+    # batch-invariant (verified on gfx950); MLA decode sizes its KV splits by batch size.
+    return is_gfx95_supported() and not use_mla_backend(view)
+
+
 @register_post_process
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
@@ -1057,6 +1063,9 @@ def _deterministic_attention_backend(view: Any) -> dict:
     # so it has to be one of the deterministic backends too.
     for field in ("prefill_attention_backend", "decode_attention_backend"):
         backend = getattr(view, field, None)
+        if field == "decode_attention_backend" and backend == "aiter":
+            if _deterministic_aiter_decode_supported(view):
+                continue
         if (
             backend is not None
             and backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES

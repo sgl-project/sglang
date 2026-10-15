@@ -1744,7 +1744,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # A per-phase backend overrides --attention-backend for its phase, so a
         # non-deterministic one must be refused even when the main backend is fine.
         for field in ("prefill_attention_backend", "decode_attention_backend"):
-            with self.subTest(field=field):
+            with (
+                self.subTest(field=field),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=False,
+                ),
+            ):
                 view = ResolvedView(
                     SimpleNamespace(
                         enable_deterministic_inference=True,
@@ -1754,6 +1760,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
                 with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
                     _deterministic_attention_backend(view)
+
+    def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
+        """AITER decode attention is batch-invariant only for non-MLA models on gfx950;
+        AITER prefill attention never is."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        cases = [
+            # (gfx950, MLA model, prefill backend, accepted)
+            (True, False, "triton", True),
+            (False, False, "triton", False),
+            (True, True, "triton", False),
+            (True, False, "aiter", False),
+        ]
+        for gfx950, mla, prefill, accepted in cases:
+            with (
+                self.subTest(gfx950=gfx950, mla=mla, prefill=prefill),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=gfx950,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=mla
+                ),
+            ):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        prefill_attention_backend=prefill,
+                        decode_attention_backend="aiter",
+                    )
+                )
+                if accepted:
+                    self.assertEqual(_deterministic_attention_backend(view), {})
+                else:
+                    with self.assertRaises(ValueError):
+                        _deterministic_attention_backend(view)
 
     def test_deterministic_compatible_phase_backends_are_accepted(self):
         from sglang.srt.arg_groups.overrides import (
