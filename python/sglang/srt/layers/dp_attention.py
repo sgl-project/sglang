@@ -98,7 +98,7 @@ def dp_slot_in(per_rank) -> int:
         return 0
     width = dp_gather_width()
     ceiling_sized = (
-        get_exec().moe.elastic_ep_backend is not None and len(per_rank) > width
+        len(per_rank) > width and get_exec().moe.elastic_ep_backend is not None
     )
     if len(per_rank) != width and not ceiling_sized:
         raise ValueError(
@@ -607,10 +607,8 @@ def dp_capacity_for(dp_size: int) -> int:
     for a tp-2 joiner into a tp-4 pool. Over-sizing is inert (the tail fills with
     ranks contributing nothing); disagreeing across processes is not.
     """
-    if get_exec().moe.elastic_ep_backend is None:
-        return dp_size
     max_ep_size = get_parallel().max_ep_size
-    if not max_ep_size:
+    if not max_ep_size or get_exec().moe.elastic_ep_backend is None:
         return dp_size
     return max(dp_size, max_ep_size)
 
