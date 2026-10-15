@@ -519,7 +519,9 @@ class DllmManager:
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder, [], self.enable_priority_scheduling
         )
-        new_batch.sampling_info = self.step_builder.build_sampling_info(can_run_list)
+        new_batch.sampling_info = self.step_builder.build_sampling_info(
+            can_run_list, new_batch.req_pool_indices
+        )
 
         return new_batch
 

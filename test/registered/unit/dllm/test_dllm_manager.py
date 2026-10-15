@@ -107,6 +107,7 @@ class _Step:
     def __init__(self, reqs, kv_reuse_lens):
         self.reqs = list(reqs)
         self.kv_reuse_lens = kv_reuse_lens
+        self.req_pool_indices = None
         self.return_logprob = False
         self.prefill_stats = None
         self.dp_cooperation_info = None

@@ -105,7 +105,9 @@ def test_request_release_frees_slot_and_penalty_row(make_pool):
     every pool; the hybrid decode pool borrows the decode __init__ but
     inherits free."""
     pool = make_pool()
-    store = PenaltyStore(vocab_size=8, device="cpu")
+    store = PenaltyStore(
+        vocab_size=8, num_slots=pool.req_to_token.shape[0], device="cpu"
+    )
     req = SimpleNamespace(
         kv=ReqKvInfo(),
         output_ids=[3],

@@ -2528,12 +2528,10 @@ def req_pool_indices_of(
 class DecodeRows:
     """The inputs a decode step takes from its requests alone: their slots and
     their sampling params. Consecutive decode steps share them while the same
-    requests stay in the same order, each in the same slot and penalty row."""
+    requests stay in the same order, each in the same slot."""
 
     reqs: List[Req]
     slots: List[int]
-    # PenaltyStore row of each slot, None for a request without penalties.
-    penalty_rows: List[Optional[int]]
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     sampling_info: SamplingBatchInfo

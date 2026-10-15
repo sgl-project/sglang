@@ -1,8 +1,9 @@
 """Sampling metadata of one step, built from the step's requests.
 
 Invariants:
-- `build` reads only each request's params and `req.grammar` and has no side
-  effects, so building twice gives equal infos.
+- `build` reads only each request's params, `req.grammar`, and whether it
+  holds a penalty row, and has no side effects, so building twice gives equal
+  infos.
 - A different set of requests gets a new info, never a filtered or merged one.
 - A forward fills `grammar_mask`, `rids_int`, and `bootstrap_room_ids_int` on
   its own copy (`forward_sampling_info`); the step's info keeps its built
@@ -88,7 +89,7 @@ class SamplingBatchInfo:
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
     grammar_mask: Optional[GrammarMask] = None
 
-    # Penalized requests and their history rows; None when no request uses one.
+    # Penalized requests and their slots; None when no request uses one.
     penalties: Optional[StepPenalties] = None
 
     # Whether any request has custom logit processor
@@ -131,6 +132,7 @@ class SamplingBatchInfo:
         vocab_size: int,
         device: str,
         penalty_store: Optional[PenaltyStore] = None,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ) -> SamplingBatchInfo:
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
 
@@ -271,7 +273,9 @@ class SamplingBatchInfo:
             grammars=(
                 [r.grammar for r in reqs] if any(r.grammar for r in reqs) else None
             ),
-            penalties=StepPenalties.build(reqs, penalty_store, device),
+            penalties=StepPenalties.build(
+                reqs, req_pool_indices, penalty_store, device
+            ),
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,

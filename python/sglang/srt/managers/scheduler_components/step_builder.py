@@ -136,28 +136,19 @@ class StepBuilder:
 
     def build_decode_step(self, reqs: List[Req]) -> ScheduleBatch:
         """The decode step of reqs with its sampling info; the last decode
-        step's request inputs are reused while its requests keep their slots
-        and penalty rows."""
+        step's request inputs are reused while its requests keep their slots."""
         slots = [r.kv.req_pool_idx for r in reqs]
-        row_of_slot = self.penalty_store.row_of_slot
-        penalty_rows = [row_of_slot.get(s) for s in slots]
         rows = self.decode_rows
-        if (
-            rows is None
-            or rows.reqs != reqs
-            or rows.slots != slots
-            or rows.penalty_rows != penalty_rows
-        ):
+        if rows is None or rows.reqs != reqs or rows.slots != slots:
             req_pool_indices, req_pool_indices_cpu = req_pool_indices_of(
                 reqs, self.device
             )
             rows = self.decode_rows = DecodeRows(
                 reqs=list(reqs),
                 slots=slots,
-                penalty_rows=penalty_rows,
                 req_pool_indices=req_pool_indices,
                 req_pool_indices_cpu=req_pool_indices_cpu,
-                sampling_info=self.build_sampling_info(reqs),
+                sampling_info=self.build_sampling_info(reqs, req_pool_indices),
             )
         step = self.new_decode_step(
             reqs, (rows.req_pool_indices, rows.req_pool_indices_cpu)
@@ -165,12 +156,15 @@ class StepBuilder:
         step.sampling_info = rows.sampling_info
         return step
 
-    def build_sampling_info(self, reqs: List[Req]) -> SamplingBatchInfo:
+    def build_sampling_info(
+        self, reqs: List[Req], req_pool_indices: torch.Tensor
+    ) -> SamplingBatchInfo:
         return SamplingBatchInfo.build(
             reqs,
             self.model_config.vocab_size,
             self.device,
             self.penalty_store,
+            req_pool_indices,
         )
 
     def clear_decode_rows(self) -> None:

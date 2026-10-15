@@ -550,7 +550,9 @@ class StepPlanner:
                     self.step_builder.new_decode_step(decode_reqs)
                 )
 
-        new_batch.sampling_info = self.step_builder.build_sampling_info(new_batch.reqs)
+        new_batch.sampling_info = self.step_builder.build_sampling_info(
+            new_batch.reqs, new_batch.req_pool_indices
+        )
         return new_batch
 
     def _select_decode_reqs(self, slot: ScheduleSlot) -> List[Req]:

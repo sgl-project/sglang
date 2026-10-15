@@ -845,7 +845,9 @@ class Scheduler:
 
     def init_penalty_store(self) -> None:
         self.penalty_store = PenaltyStore(
-            self.model_config.vocab_size, self.req_to_token_pool.device
+            self.model_config.vocab_size,
+            self.req_to_token_pool.req_to_token.shape[0],
+            self.req_to_token_pool.device,
         )
 
     def init_kv_canary(self) -> None:
