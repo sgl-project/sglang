@@ -491,6 +491,10 @@ mod tests {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
+            metadata: Some(crate::message::response::SchedulerMetadata {
+                cached_tokens: 128,
+                ..Default::default()
+            }),
             ..Default::default()
         })
     }
@@ -499,6 +503,10 @@ mod tests {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
+            metadata: Some(crate::message::response::SchedulerMetadata {
+                cached_tokens: 128,
+                ..Default::default()
+            }),
             // Parsed from the wire map Python emits, not a hand-built enum.
             finish_reason: Some(
                 serde_json::from_value(serde_json::json!({"type": "length", "length": 1}))
@@ -855,6 +863,7 @@ mod tests {
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "!");
         assert_eq!(v["meta_info"]["completion_tokens"], 3);
+        assert_eq!(v["meta_info"]["cached_tokens"], 128);
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
         assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 

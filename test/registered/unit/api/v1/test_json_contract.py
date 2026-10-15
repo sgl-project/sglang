@@ -281,7 +281,7 @@ class TestFrames(CustomTestCase):
 
     def test_generate_response_matches_frame_value_shape(self):
         """Key order (text, meta_info, output_ids), conditional keys, and
-        finish_reason always present (null pre-terminal)."""
+        finish_reason, cached_tokens_details, and dp_rank always present."""
         frame = GenerateResponse(
             text="ok",
             output_ids=[7, 8],
@@ -295,7 +295,7 @@ class TestFrames(CustomTestCase):
         )
         self.assertEqual(
             compact(frame.to_json_value()),
-            '{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null},"output_ids":[7,8]}',
+            '{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens_details":null,"dp_rank":null},"output_ids":[7,8]}',
         )
 
     def test_frame_round_trip_with_logprobs(self):
@@ -310,6 +310,8 @@ class TestFrames(CustomTestCase):
                 "output_top_logprobs": [None, [[-0.2, 6, None]]],
                 "hidden_states": [[0.5, 0.25]],
                 "e2e_latency": 0.01,
+                "cached_tokens_details": None,
+                "dp_rank": None,
             },
             "output_ids": [5],
             "index": 0,
