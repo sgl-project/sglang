@@ -159,6 +159,54 @@ def supported_rt(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -
     )
 
 
+def _static_supported_shared(block: "Qwen2MoeSparseMoeBlock") -> bool:
+    """The shared expert's gate/up is a static per-tensor FP8 projection the front-end kernel can compute."""
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+    from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
+
+    mlp = block.shared_expert
+    if not isinstance(mlp, Qwen2MoeMLP):
+        return False
+    gu = mlp.gate_up_proj
+    return (
+        isinstance(gu.quant_method, ModelOptFp8LinearMethod)
+        and gu.use_flashinfer_bmm
+        and gu.bias is None
+        and gu.weight.dtype == torch.float8_e4m3fn
+        and gu.weight.shape[0] == _HIDDEN
+        and gu.weight.shape[1] % 8 == 0
+        and gu.weight.shape[1] <= 512
+        and gu.weight.t().is_contiguous()
+        and gu.weight_scale.numel() == 1
+        and gu.input_scale.numel() == 1
+        and isinstance(mlp.act_fn, SiluAndMul)
+    )
+
+
+def _use_shared(block: "Qwen2MoeSparseMoeBlock", m: int, defer_finalize: bool) -> bool:
+    """Whether this launch also computes the shared gate/up: only where the routed path is issued
+    before the shared expert (dual-stream deferred finalize), so the side stream can consume it."""
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    if not (defer_finalize and m <= 8 and block.alt_stream is not None and get_is_capture_mode()):
+        return False
+    ok = block._route_sh_static_ok
+    if ok is None:
+        ok = block._route_sh_static_ok = _static_supported_shared(block)
+    return ok
+
+
+def shared_expert_tail(mlp, gate_up: torch.Tensor) -> torch.Tensor:
+    """Qwen2MoeMLP.forward after its gate_up projection."""
+    if mlp._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
+        x, _ = mlp.down_proj(mlp._silu_fp4_quant_fused(gate_up))
+        return x
+    x = mlp.act_fn(gate_up)
+    x, _ = mlp.down_proj(x)
+    return x
+
+
 def forward_routed_rt(
     block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor, *, defer_finalize: bool
 ):
@@ -167,7 +215,10 @@ def forward_routed_rt(
     Same runner call as FusedMoE.forward_impl / forward_deferred_finalize, with the
     activation pre-quantized (the runner's hidden_states_scale passthrough).
     """
-    from sglang.kernels.ops.moe.qwen_router_front import router_gemm_quant
+    from sglang.kernels.ops.moe.qwen_router_front import (
+        router_gemm_quant,
+        router_gemm_quant_shared,
+    )
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
@@ -180,9 +231,23 @@ def forward_routed_rt(
 
     experts = block.experts
     # The runner keeps the input scale as a 0-d tensor; the kernel takes shape [1].
-    logits, x_fp4, x_sf = router_gemm_quant(
-        hidden_states, block.gate.weight, experts.w13_input_scale_quant.reshape(1)
-    )
+    in_scale = experts.w13_input_scale_quant.reshape(1)
+    if _use_shared(block, hidden_states.shape[0], defer_finalize):
+        gu = block.shared_expert.gate_up_proj
+        logits, x_fp4, x_sf, gate_up = router_gemm_quant_shared(
+            hidden_states,
+            block.gate.weight,
+            in_scale,
+            gu.weight.t(),
+            gu.input_scale.reshape(1),
+            gu.weight_scale.reshape(1),
+        )
+        block._route_sh_gate_up = gate_up
+        block._route_sh_event.record()
+    else:
+        logits, x_fp4, x_sf = router_gemm_quant(
+            hidden_states, block.gate.weight, in_scale
+        )
     topk_output = block.topk(hidden_states, logits)
     if not TopKOutputChecker.format_is_bypassed(topk_output):
         raise RuntimeError("router_gemm_quant path requires logits-based bypassed TopK")

@@ -117,6 +117,37 @@ def _assert_matches_stock_chain(out, logits, x, gs, m: int, tile: int) -> None:
 
 
 @requires_blackwell
+@pytest.mark.parametrize("m", [1, 7, 8])
+@pytest.mark.parametrize("n_shared", [256, 512])
+def test_router_gemm_quant_shared(m: int, n_shared: int) -> None:
+    """The shared gate/up stage: no worse than the served cuBLASLt path against an fp64 reference,
+    and it must leave the router logits and the NVFP4 input bitwise unchanged."""
+    from flashinfer import bmm_fp8
+
+    from sglang.kernels.ops.moe.qwen_router_front import router_gemm_quant, router_gemm_quant_shared
+    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+    x, weight, gs = _inputs(m, seed=5000 + m, clustered=False)
+    g = torch.Generator(device="cuda")
+    g.manual_seed(6000 + n_shared)
+    w_sh = (torch.randn(n_shared, HIDDEN, device="cuda", generator=g) * 64).to(torch.float8_e4m3fn)
+    in_scale = torch.tensor([0.05], device="cuda")
+    w_scale = torch.tensor([3.7e-4], device="cuda")
+    logits, x_fp4, x_sf, gate_up = router_gemm_quant_shared(x, weight, gs, w_sh, in_scale, w_scale)
+    logits_ref, x_fp4_ref, x_sf_ref = router_gemm_quant(x, weight, gs)
+    torch.cuda.synchronize()
+    assert torch.equal(logits, logits_ref)
+    assert torch.equal(x_fp4, x_fp4_ref) and torch.equal(x_sf, x_sf_ref)
+
+    qx, qs = static_quant_fp8(x, in_scale)
+    stock = bmm_fp8(qx.unsqueeze(0), w_sh.t().unsqueeze(0), qs.reshape(1), w_scale, torch.bfloat16,
+                    backend="cublas").view(m, n_shared)
+    ref = (qx.double() @ w_sh.double().t()) * (float(in_scale) * float(w_scale))
+    err = lambda y: float((y.double() - ref).norm() / ref.norm())
+    assert err(gate_up) <= 1.05 * err(stock)
+
+
+@requires_blackwell
 @pytest.mark.parametrize("m", [1, 7, 16])
 def test_router_topk_only_matches_full(m: int) -> None:
     """The top-k-only launch must produce the same ids / weights as the full launch."""

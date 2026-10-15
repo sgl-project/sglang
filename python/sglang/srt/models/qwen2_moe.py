@@ -421,6 +421,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         # Same switch on the trtllm runner: router GEMM + input quant as one kernel.
         self._route_rt_static_ok = self._route_front_static_ok
+        # The shared expert's gate/up output when that kernel also computed it this forward,
+        # with the event the side stream waits on before running the rest of the shared expert.
+        self._route_sh_static_ok = self._route_front_static_ok
+        self._route_sh_gate_up: Optional[torch.Tensor] = None
+        self._route_sh_event = (
+            torch.cuda.Event() if self._route_front_static_ok is None else None
+        )
 
     def get_moe_weights(self):
         return [
@@ -532,7 +539,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         shared_output = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+            if self._route_sh_gate_up is not None:
+                # gate/up already came out of the router front-end launch on the main stream.
+                gate_up, self._route_sh_gate_up = self._route_sh_gate_up, None
+                torch.cuda.current_stream().wait_event(self._route_sh_event)
+                shared_output = qwen_router_front.shared_expert_tail(
+                    self.shared_expert, gate_up
+                )
+            else:
+                shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(

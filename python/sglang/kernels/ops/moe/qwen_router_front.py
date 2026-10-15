@@ -42,6 +42,7 @@ def _jit_module(max_m: int, trace: bool = False) -> Module:
         cuda_wrappers=[
             ("run", f"RouterFrontKernel<{args}>::run"),
             ("run_gemm", f"RouterFrontKernel<{args}>::run_gemm"),
+            ("run_gemm_shared", f"RouterFrontKernel<{args}>::run_gemm_shared"),
             ("run_tail", f"RouterFrontKernel<{args}>::run_tail"),
             ("run_topk", f"RouterFrontKernel<{args}>::run_topk"),
         ],
@@ -146,6 +147,31 @@ def router_gemm_quant(
     x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
     _jit_module(_max_m_bucket(m)).run_gemm(x, weight, global_scale, logits, x_fp4, x_sf)
     return logits, x_fp4, x_sf
+
+
+def router_gemm_quant_shared(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    sh_weight: torch.Tensor,
+    sh_in_scale: torch.Tensor,
+    sh_w_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """router_gemm_quant plus the shared expert's gate/up projection in the same launch (M <= 8).
+
+    sh_weight [N, 4096] e4m3 (row-major, N % 8 == 0), static per-tensor scales sh_in_scale / sh_w_scale [1] fp32.
+    Returns (logits, x_fp4, x_sf, gate_up bf16 [M, N]); gate_up = (q(x) @ sh_weight.T) * sh_in_scale * sh_w_scale with
+    q the static e4m3 quantization of x, accumulated in fp32 (order differs from cuBLASLt).
+    """
+    m = x.shape[0]
+    logits = torch.empty((m, NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
+    x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
+    x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
+    gate_up = torch.empty((m, sh_weight.shape[0]), dtype=torch.bfloat16, device=x.device)
+    _jit_module(_max_m_bucket(m)).run_gemm_shared(
+        x, weight, global_scale, logits, x_fp4, x_sf, sh_weight.view(torch.uint8), sh_in_scale, sh_w_scale, gate_up
+    )
+    return logits, x_fp4, x_sf, gate_up
 
 
 def router_tail(

@@ -68,6 +68,12 @@ struct Params {
   uint32_t num_tokens;
   uint32_t tile_log2;
   uint32_t mode;  // kMode* bits: input quantization, top-k, routing tables
+  // Shared-expert gate/up projection (static per-tensor FP8), computed alongside the router GEMV.
+  const uint8_t* sh_weight;  // [sh_n, kHidden] e4m3
+  const float* sh_in_scale;  // [1] activation scale
+  const float* sh_w_scale;   // [1] weight scale
+  bf16_t* sh_out;            // [M, sh_n]
+  uint32_t sh_n;
 };
 
 inline constexpr uint32_t kModeQuant = 1u;
@@ -652,12 +658,21 @@ inline constexpr uint32_t kChainSteps = kSplitK / 16;
 // Shared-memory rows are padded by 16 B so the 8 rows of an ldmatrix hit distinct banks.
 inline constexpr uint32_t kRowBytes = kHidden * 2 + 16;
 
-template <uint32_t kMaxM>
+// Shared gate/up stage: FP8 rows padded by 16 B like the bf16 ones; K split in kShSplits
+// chains of m16n8k32 MMAs, one per warp 2 .. 2 + kShSplits - 1.
+inline constexpr uint32_t kShRowBytes = kHidden + 16;
+inline constexpr uint32_t kShSplits = 4;
+inline constexpr uint32_t kShSteps = kHidden / kShSplits / 32;
+
+template <uint32_t kMaxM, bool kShared = false>
 struct GemvSmem {
   static constexpr uint32_t kW = 0;
   static constexpr uint32_t kX = kW + kExpertsPerCta * kRowBytes;
   static constexpr uint32_t kPart = kX + kMaxM * kRowBytes;  // fp32 [2][16][kExpertsPerCta]
-  static constexpr uint32_t kBarW = kPart + 2 * 16 * kExpertsPerCta * 4;
+  static constexpr uint32_t kShW = kPart + 2 * 16 * kExpertsPerCta * 4;
+  static constexpr uint32_t kXq = kShW + (kShared ? 8 * kShRowBytes : 0);
+  static constexpr uint32_t kShPart = kXq + (kShared ? kMaxM * kShRowBytes : 0);  // fp32 [kShSplits][16][8]
+  static constexpr uint32_t kBarW = kShPart + (kShared ? kShSplits * 16 * 8 * 4 : 0);
   static constexpr uint32_t kBarX = kBarW + 8;
   static constexpr uint32_t kBytes = kBarX + 8;
 };
@@ -720,6 +735,66 @@ SGL_DEVICE void gemv_chain(uint32_t half, uint32_t M, const uint8_t* smem, float
   }
 }
 
+SGL_DEVICE void mma_e4m3_16832(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+      "{%0, %1, %2, %3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Two values -> two e4m3 bytes (low byte = first), saturating, round to nearest even.
+SGL_DEVICE uint32_t cvt_e4m3x2(float lo, float hi) {
+  uint32_t out;
+  asm("{\n"
+      ".reg .b16 pair;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 pair, %2, %1;\n"
+      "cvt.u32.u16 %0, pair;\n"
+      "}"
+      : "=r"(out)
+      : "f"(lo), "f"(hi));
+  return out;
+}
+
+// One K split of the shared gate/up projection for this CTA's 8 rows; fp32 partials to s_part.
+template <uint32_t kMaxM>
+SGL_DEVICE void shared_chain(uint32_t split, uint32_t M, const uint8_t* smem, float* s_part) {
+  using L = GemvSmem<kMaxM, true>;
+  const uint32_t lane = threadIdx.x % 32;
+  const uint32_t j = lane >> 3, r = lane & 7;
+  const uint32_t tok = (j & 1) * 8 + r;
+  const uint32_t a_row = tok < M ? tok : 0;
+  const uint32_t kbase = split * (kHidden / kShSplits);
+  // ldmatrix on byte pairs: a 16 B row segment holds 16 e4m3 values (one m16n8k32 half-K).
+  const uint32_t a_addr = smem_addr(smem + L::kXq + a_row * kShRowBytes + kbase + (j >> 1) * 16);
+  const uint32_t b_addr = smem_addr(smem + L::kShW + r * kShRowBytes + kbase + (j & 1) * 16);
+  constexpr uint32_t kDepth = 4;
+  uint32_t a[kDepth][4], b[kDepth][2];
+#pragma unroll
+  for (uint32_t i = 0; i < kDepth; ++i) {
+    ldmatrix_x4(a[i], a_addr + i * 32);
+    ldmatrix_x2(b[i], b_addr + i * 32);
+  }
+  float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (uint32_t step = 0; step < kShSteps; ++step) {
+    const uint32_t slot = step % kDepth;
+    mma_e4m3_16832(d, a[slot], b[slot]);
+    if (step + kDepth < kShSteps) {
+      ldmatrix_x4(a[slot], a_addr + (step + kDepth) * 32);
+      ldmatrix_x2(b[slot], b_addr + (step + kDepth) * 32);
+    }
+  }
+  const uint32_t g = lane >> 2, c = lane & 3;
+  float* part = s_part + split * 16 * 8;
+  part[g * 8 + 2 * c] = d[0];
+  part[g * 8 + 2 * c + 1] = d[1];
+  if constexpr (kMaxM > 8) {
+    part[(g + 8) * 8 + 2 * c] = d[2];
+    part[(g + 8) * 8 + 2 * c + 1] = d[3];
+  }
+}
+
 SGL_DEVICE void mbar_init(uint32_t bar, uint32_t count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(count) : "memory");
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -750,9 +825,53 @@ SGL_DEVICE void bulk_load(uint32_t dst, const void* src, uint32_t bytes, uint32_
       : "memory");
 }
 
-template <uint32_t kMaxM, bool kUsePDL, bool kTrace>
+// Warps 2..7 of a CTA with shared rows: quantize the token rows to e4m3 the way
+// static_quant_fp8 does (x * (1 / scale), saturate, round to nearest even), then
+// warps 2..5 run the gate/up K splits while warps 6..7 quantize row b < M to NVFP4.
+template <uint32_t kMaxM>
+SGL_DEVICE void shared_gate_up(const Params& p, uint32_t M, uint8_t* smem, uint32_t bar_w, uint32_t bar_x) {
+  using L = GemvSmem<kMaxM, true>;
+  const uint32_t t = threadIdx.x - 64;  // 0 .. 191
+  const uint32_t warp = threadIdx.x / 32;
+  mbar_wait(bar_x, 0);
+  const float inv = div_full(1.0f, p.sh_in_scale[0]);
+  for (uint32_t i = t; i < M * (kHidden / 16); i += kThreads - 64) {
+    const uint32_t row = i / (kHidden / 16), blk = i % (kHidden / 16);
+    const uint4* src = reinterpret_cast<const uint4*>(smem + L::kX + row * kRowBytes + blk * 32);
+    const uint4 lo = src[0], hi = src[1];
+    const uint32_t w[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    uint32_t q[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float a0 = fminf(fmaxf(__fmul_rn(bf16_lo(w[2 * k]), inv), -448.0f), 448.0f);
+      const float a1 = fminf(fmaxf(__fmul_rn(bf16_hi(w[2 * k]), inv), -448.0f), 448.0f);
+      const float a2 = fminf(fmaxf(__fmul_rn(bf16_lo(w[2 * k + 1]), inv), -448.0f), 448.0f);
+      const float a3 = fminf(fmaxf(__fmul_rn(bf16_hi(w[2 * k + 1]), inv), -448.0f), 448.0f);
+      q[k] = cvt_e4m3x2(a0, a1) | (cvt_e4m3x2(a2, a3) << 16);
+    }
+    *reinterpret_cast<uint4*>(smem + L::kXq + row * kShRowBytes + blk * 16) = make_uint4(q[0], q[1], q[2], q[3]);
+  }
+  asm volatile("bar.sync 1, %0;" ::"r"(kThreads - 64) : "memory");
+  if (warp < 2 + kShSplits) {
+    mbar_wait(bar_w, 0);
+    shared_chain<kMaxM>(warp - 2, M, smem, reinterpret_cast<float*>(smem + L::kShPart));
+  } else if ((p.mode & kModeQuant) && blockIdx.x < M) {
+    const uint8_t* row = smem + L::kX + blockIdx.x * kRowBytes;
+    for (uint32_t blk = threadIdx.x - 64 - 32 * kShSplits; blk < kBlocksPerRow; blk += kThreads - 64 - 32 * kShSplits) {
+      const uint4* src = reinterpret_cast<const uint4*>(row + blk * kSfVec * 2);
+      uint32_t sf;
+      uint2 packed;
+      quantize_block(src[0], src[1], p.global_scale[0], sf, packed);
+      *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(blockIdx.x) * (kHidden / 2) + blk * 8) = packed;
+      p.x_sf[static_cast<size_t>(blockIdx.x) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
+    }
+  }
+}
+
+template <uint32_t kMaxM, bool kUsePDL, bool kTrace, bool kShared = false>
 __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_constant__ Params p) {
-  using L = GemvSmem<kMaxM>;
+  using L = GemvSmem<kMaxM, kShared>;
+  static_assert(!kShared || kMaxM <= 8, "the shared gate/up stage fits shared memory only for M <= 8");
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ uint32_t s_mask[kExperts];
   __shared__ int16_t s_tile[kExperts];
@@ -769,15 +888,26 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
   const uint32_t bar_x = smem_addr(smem + L::kBarX);
   trace_stamp<kTrace>(p, tb + 0);
 
-  // Router weights are static: their bulk copies are issued before waiting on the producer grid.
+  // This CTA's 8 rows of the shared gate/up projection, when it has any.
+  const uint32_t sh_row0 = blockIdx.x * 8;
+  const bool has_sh = kShared && sh_row0 < p.sh_n;
+
+  // Router (and shared) weights are static: their bulk copies are issued before waiting on the producer grid.
   if (threadIdx.x == 0) {
     mbar_init(bar_w, 1);
     mbar_init(bar_x, 1);
-    mbar_expect_tx(bar_w, kExpertsPerCta * kHidden * 2);
+    mbar_expect_tx(bar_w, kExpertsPerCta * kHidden * 2 + (has_sh ? 8 * kHidden : 0));
 #pragma unroll
     for (uint32_t e = 0; e < kExpertsPerCta; ++e) {
       bulk_load(smem_addr(smem + L::kW + e * kRowBytes), p.weight + static_cast<size_t>(expert0 + e) * kHidden,
                 kHidden * 2, bar_w);
+    }
+    if (has_sh) {
+#pragma unroll
+      for (uint32_t r = 0; r < 8; ++r) {
+        bulk_load(smem_addr(smem + L::kShW + r * kShRowBytes), p.sh_weight + static_cast<size_t>(sh_row0 + r) * kHidden,
+                  kHidden, bar_w);
+      }
     }
   }
   __syncthreads();
@@ -804,6 +934,8 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
     mbar_wait(bar_x, 0);
     trace_stamp<kTrace>(p, tb + 2);
     gemv_chain<kMaxM>(warp, M, smem, s_part);
+  } else if (has_sh) {
+    shared_gate_up<kMaxM>(p, M, smem, bar_w, bar_x);
   } else if ((p.mode & kModeQuant) && blockIdx.x < M) {
     // CTA b < M quantizes token row b while warps 0 and 1 run the GEMV chains.
     mbar_wait(bar_x, 0);
@@ -825,6 +957,16 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
     const float lo = s_part[m * kExpertsPerCta + e];
     const float hi = s_part[(16 + m) * kExpertsPerCta + e];
     p.logits[m * kExperts + expert0 + e] = __float2bfloat16_rn(__fadd_rn(lo, hi));
+  }
+  if (has_sh && threadIdx.x < M * 8) {
+    const uint32_t m = threadIdx.x / 8;
+    const uint32_t n = threadIdx.x % 8;
+    const float* sp = reinterpret_cast<const float*>(smem + L::kShPart);
+    float acc = sp[m * 8 + n];
+#pragma unroll
+    for (uint32_t k = 1; k < kShSplits; ++k) acc = __fadd_rn(acc, sp[(k * 16 + m) * 8 + n]);
+    const float alpha = __fmul_rn(p.sh_in_scale[0], p.sh_w_scale[0]);
+    p.sh_out[static_cast<size_t>(m) * p.sh_n + sh_row0 + n] = __float2bfloat16_rn(__fmul_rn(acc, alpha));
   }
   if (!(p.mode & kModeTopk)) return;
 
@@ -1078,18 +1220,68 @@ struct RouterFrontKernel {
     launch_front<false>(params, device.unwrap());
   }
 
+  /// \brief run_gemm plus the shared-expert gate/up projection (static per-tensor FP8) in the same launch.
+  static void run_gemm_shared(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView global_scale,
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView x_fp4,
+      const tvm::ffi::TensorView x_sf,
+      const tvm::ffi::TensorView sh_weight,
+      const tvm::ffi::TensorView sh_in_scale,
+      const tvm::ffi::TensorView sh_w_scale,
+      const tvm::ffi::TensorView sh_out) {
+    using namespace host;
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto N_ = SymbolicSize{"shared_rows"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
+    TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(weight);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
+    TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).verify(logits);
+    TensorMatcher({M_, kHidden / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(8).verify(x_fp4);
+    TensorMatcher({M_, kBlocksPerRow}).with_dtype<uint8_t>().with_device(device).verify(x_sf);
+    TensorMatcher({N_, kHidden}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(sh_weight);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(sh_in_scale);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(sh_w_scale);
+    TensorMatcher({M_, N_}).with_dtype<bf16_t>().with_device(device).verify(sh_out);
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    const auto N = static_cast<uint32_t>(N_.unwrap());
+    CHECK_HOST(M <= kMaxM && kMaxM <= 8) << "router_gemm_shared: num_tokens " << M << " needs the M <= 8 build";
+    CHECK_HOST(N % 8 == 0 && N <= kNumCtas * 8) << "router_gemm_shared: shared rows " << N;
+    if (M == 0) return;
+    Params params{};
+    params.x = static_cast<const bf16_t*>(x.data_ptr());
+    params.weight = static_cast<const bf16_t*>(weight.data_ptr());
+    params.global_scale = static_cast<const float*>(global_scale.data_ptr());
+    params.logits = static_cast<bf16_t*>(logits.data_ptr());
+    params.x_fp4 = static_cast<uint8_t*>(x_fp4.data_ptr());
+    params.x_sf = static_cast<uint8_t*>(x_sf.data_ptr());
+    params.sh_weight = static_cast<const uint8_t*>(sh_weight.data_ptr());
+    params.sh_in_scale = static_cast<const float*>(sh_in_scale.data_ptr());
+    params.sh_w_scale = static_cast<const float*>(sh_w_scale.data_ptr());
+    params.sh_out = static_cast<bf16_t*>(sh_out.data_ptr());
+    params.sh_n = N;
+    params.num_tokens = M;
+    params.mode = kModeQuant;
+    if constexpr (kMaxM <= 8) launch_front<false, true>(params, device.unwrap());
+  }
+
  private:
-  template <bool kT>
+  template <bool kT, bool kSh = false>
   static void launch_front(const Params& params, DLDevice device) {
     using namespace host;
-    constexpr uint32_t kSmem = GemvSmem<kMaxM>::kBytes;
+    constexpr uint32_t kSmem = GemvSmem<kMaxM, kSh>::kBytes;
     static const bool smem_attr_set = [] {
       CHECK_CUDA(cudaFuncSetAttribute(
-          router_front_kernel<kMaxM, kUsePDL, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+          router_front_kernel<kMaxM, kUsePDL, kT, kSh>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
       return true;
     }();
     (void)smem_attr_set;
-    LaunchKernel(kNumCtas, kThreads, device, kSmem).enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, kT>, params);
+    LaunchKernel(kNumCtas, kThreads, device, kSmem)
+        .enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, kT, kSh>, params);
   }
 };
 
