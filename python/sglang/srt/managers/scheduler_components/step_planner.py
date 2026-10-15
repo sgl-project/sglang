@@ -442,11 +442,8 @@ class StepPlanner:
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     is_full = True
 
-            if is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
-                ):
-                    break
+            if is_full and not self.enable_priority_preemption:
+                break
 
             if hicache_storage_enabled() or get_memory().enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
@@ -468,6 +465,11 @@ class StepPlanner:
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            # Preemption sizes the request by this match: its fill ids and
+            # cached prefix are stale or empty before it.
+            if is_full and not adder.preempt_to_schedule(req):
+                self._revert_match(req)
+                break
             if hicache_storage_enabled() and (
                 self.request_intake.prefetch_after_device_hit_loss(req)
             ):
@@ -489,21 +491,9 @@ class StepPlanner:
 
             if res != AddReqResult.CONTINUE:
                 no_kv_room = res == AddReqResult.NO_TOKEN
-                # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.kv.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.kv.mamba_pool_idx = None
+                    self._revert_match(req)
                 break
 
         if mamba_allocator is not None:
@@ -626,6 +616,18 @@ class StepPlanner:
             new_batch.reqs, new_batch.req_pool_indices
         )
         return new_batch
+
+    def _revert_match(self, req: Req) -> None:
+        """Undo the mamba state init_next_round_input staged for a request the
+        pass does not admit, so its freshly allocated slot does not leak. A
+        session holds its slot across requests and frees it itself."""
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        if req.kv.holds_mamba and not getattr(req, "session", None):
+            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                req.kv.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.kv.mamba_pool_idx = None
 
     def _select_decode_reqs(self, slot: ScheduleSlot) -> List[Req]:
         """The decoding requests one decode step (or a mixed step's decode
