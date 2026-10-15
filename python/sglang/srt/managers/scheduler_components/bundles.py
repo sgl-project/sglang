@@ -93,9 +93,11 @@ class RequestLimits:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class Streams:
-    """The device and the streams the scheduler loop runs on."""
+    """The device, its torch module and the streams the scheduler loop runs
+    on."""
 
     device: str
+    device_module: Any
     schedule_stream: Any
     forward_stream: Any
     copy_stream: Any

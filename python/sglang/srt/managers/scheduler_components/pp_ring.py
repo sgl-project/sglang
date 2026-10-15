@@ -116,7 +116,6 @@ class PPRing:
         ops: DriverOps,
         counters: LaunchCounters,
         pp_spec_forward: Optional[PPSpecForward],
-        device_module,
         kv: KvResources,
         streams: Streams,
         workers: Workers,
@@ -124,6 +123,7 @@ class PPRing:
     ):
         pp_group = get_parallel().pp_group
         device = streams.device
+        device_module = streams.device_module
         schedule_stream = streams.schedule_stream
         copy_stream = streams.copy_stream
         copy_stream_ctx = device_module.stream(copy_stream)

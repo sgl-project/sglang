@@ -51,7 +51,7 @@ class _DeviceModule:
 def _scheduler(device_module, schedule_stream):
     scheduler = partial_scheduler()
     get_context().override("test", disable_overlap_schedule=False)
-    scheduler.parts.device_module = device_module
+    scheduler.parts.streams.device_module = device_module
     scheduler.parts.streams.schedule_stream = schedule_stream
     scheduler.parts.metrics_sink = SimpleNamespace(
         start_scheduler_time_accounting=lambda: None

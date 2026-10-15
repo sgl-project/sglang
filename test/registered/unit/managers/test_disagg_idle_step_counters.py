@@ -476,11 +476,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.parts.streams.forward_stream = Mock()
         scheduler.parts.streams.schedule_stream = Mock()
-        scheduler.parts.device_module = SimpleNamespace(
-            Event=Mock, current_stream=Mock(), stream=lambda stream: nullcontext()
-        )
         scheduler.parts.streams = Streams(
             device="cpu",
+            device_module=SimpleNamespace(
+                Event=Mock, current_stream=Mock(), stream=lambda stream: nullcontext()
+            ),
             schedule_stream=scheduler.parts.streams.schedule_stream,
             forward_stream=scheduler.parts.streams.forward_stream,
             copy_stream=None,

@@ -176,9 +176,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
             s.parts.future_map
         ) = None
         s.parts.streams = Streams(
-            device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
+            device="cpu",
+            device_module=SimpleNamespace(stream=lambda stream: None),
+            schedule_stream=None,
+            forward_stream=None,
+            copy_stream=None,
         )
-        s.parts.device_module = SimpleNamespace(stream=lambda stream: None)
         s.parts.pp_spec_forward = None
         s.mode.step_launcher = SimpleNamespace(run_batch=Mock())
         s.parts.recv_skipper = None

@@ -85,13 +85,13 @@ class StepLauncher:
         scripted_scheduler_hook: Optional[ScriptedSchedulerHook],
         workers: Workers,
         is_generation: bool,
-        device_module,
     ):
         spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
         self.token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         self.tree_cache = kv.tree_cache
+        device_module = streams.device_module
         self.schedule_stream = streams.schedule_stream
         self.forward_stream = streams.forward_stream
         self.copy_stream = streams.copy_stream

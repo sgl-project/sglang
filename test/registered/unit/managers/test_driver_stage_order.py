@@ -514,7 +514,15 @@ class _RingShell(_Shell):
             attn_tp_group=None,
         )
         s.parts.streams = Streams(
-            device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
+            device="cpu",
+            device_module=SimpleNamespace(
+                Event=lambda: SimpleNamespace(record=lambda stream: None),
+                current_stream=lambda: None,
+                stream=lambda stream: nullcontext(),
+            ),
+            schedule_stream=None,
+            forward_stream=None,
+            copy_stream=None,
         )
         s.parts.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
         s.parts.future_map = s.parts.workers.tp_worker = None
@@ -531,11 +539,6 @@ class _RingShell(_Shell):
             send_proxy=lambda result: self.log("send_proxy"),
             wait_forward_dependencies=lambda: None,
             launch_event=None,
-        )
-        s.parts.device_module = SimpleNamespace(
-            Event=lambda: SimpleNamespace(record=lambda stream: None),
-            current_stream=lambda: None,
-            stream=lambda stream: nullcontext(),
         )
 
     def send(self, data, async_send=False):

@@ -81,11 +81,14 @@ class TestPPRingCommit(CustomTestCase):
         s.parts.flags = EngineFlags()
         s.parts.lists = CoreLists()
         s.parts.spec_algorithm = SimpleNamespace(is_none=lambda: True)
-        s.parts.device_module = SimpleNamespace(
-            Event=Mock, current_stream=Mock(), stream=lambda stream: nullcontext()
-        )
         s.parts.streams = Streams(
-            device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
+            device="cpu",
+            device_module=SimpleNamespace(
+                Event=Mock, current_stream=Mock(), stream=lambda stream: nullcontext()
+            ),
+            schedule_stream=None,
+            forward_stream=None,
+            copy_stream=None,
         )
         s.parts.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
         s.parts.future_map = s.parts.workers.tp_worker = None

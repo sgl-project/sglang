@@ -251,7 +251,6 @@ class SchedulerParts:
     recv_skipper: Optional[SchedulerRecvSkipper]
     profiler_manager: SchedulerProfilerManager
     # Streams.
-    device_module: Any
     future_map: Any
     streams: Streams
     pp_spec_forward: Optional[PPSpecForward]
@@ -630,6 +629,7 @@ def assemble_scheduler(
     )
     streams = Streams(
         device=device,
+        device_module=device_module,
         schedule_stream=schedule_stream,
         forward_stream=forward_stream,
         copy_stream=copy_stream,
@@ -856,7 +856,6 @@ def assemble_scheduler(
         watchdog=watchdog,
         recv_skipper=recv_skipper,
         profiler_manager=profiler_manager,
-        device_module=device_module,
         future_map=future_map,
         streams=streams,
         pp_spec_forward=pp_spec_forward,
@@ -1063,10 +1062,7 @@ def rebuild_mode(
 
 def build_pp_ring(parts: SchedulerParts, stages: ModeStages, ops: DriverOps) -> PPRing:
     """Build the ring driver and its PP channel, once per ring loop."""
-    channel = PPChannel(
-        device_module=parts.device_module,
-        streams=parts.streams,
-    )
+    channel = PPChannel(streams=parts.streams)
     return PPRing(
         channel=channel,
         stages=stages,
@@ -1075,7 +1071,6 @@ def build_pp_ring(parts: SchedulerParts, stages: ModeStages, ops: DriverOps) -> 
         ops=ops,
         counters=parts.counters,
         pp_spec_forward=parts.pp_spec_forward,
-        device_module=parts.device_module,
         kv=parts.kv,
         streams=parts.streams,
         workers=parts.workers,
@@ -1399,5 +1394,4 @@ def init_step_launcher(parts: SchedulerParts, stages: ModeStages) -> StepLaunche
         scripted_scheduler_hook=parts.scripted_scheduler_hook,
         workers=parts.workers,
         is_generation=parts.is_generation,
-        device_module=parts.device_module,
     )
