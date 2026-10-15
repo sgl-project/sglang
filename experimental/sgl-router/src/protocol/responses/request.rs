@@ -263,10 +263,9 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
                     .filter(|v| !v.is_null())
                     .ok_or_else(|| format!("input[{i}] is missing `content`"))?;
                 match role.as_str() {
+                    // Calls without outputs yet keep the turn open: a stream
+                    // emits text that arrived during a call after the call.
                     "assistant" => {
-                        if !pending.tool_calls.is_empty() {
-                            pending.flush(messages);
-                        }
                         let text = content_text(&content, i)?;
                         match &mut pending.content {
                             Some(c) => {
@@ -339,8 +338,9 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
                 }));
             }
             "reasoning" => {
-                // Reasoning belongs to the following assistant turn.
-                if pending.content.is_some() || !pending.tool_calls.is_empty() {
+                // Reasoning starts the next turn, unless the open one still
+                // awaits call outputs.
+                if pending.content.is_some() && pending.tool_calls.is_empty() {
                     pending.flush(messages);
                 }
                 let text = reasoning_text(&obj);

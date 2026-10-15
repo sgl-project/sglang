@@ -8,8 +8,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderValue, Response};
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderMap, Response, StatusCode};
 use bytes::Bytes;
 
 use crate::protocol::responses::{
@@ -19,8 +18,7 @@ use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::routes::chat::chat_completions;
-
-const MAX_REPLY_BYTES: usize = crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
+use crate::server::routes::reply::{is_sse, rebuild, MAX_REPLY_BYTES};
 
 pub(crate) async fn responses(
     State(ctx): State<Arc<AppContext>>,
@@ -41,56 +39,38 @@ pub(crate) async fn responses(
 /// Keeps status, headers and extensions (access log); replaces the body.
 async fn adapt(resp: Response<Body>, echo: EchoContext, streaming: bool) -> Response<Body> {
     let (mut parts, body) = resp.into_parts();
-    let is_sse = parts
-        .headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("text/event-stream"));
-
-    if parts.status.is_success() && streaming && is_sse {
+    if parts.status.is_success() && streaming && is_sse(&parts) {
         parts.headers.remove(header::CONTENT_LENGTH);
         return Response::from_parts(parts, transduce_body(body, ResponsesStream::new(echo)));
     }
 
+    let status = parts.status.as_u16();
     let bytes = match axum::body::to_bytes(body, MAX_REPLY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "responses: failed to read upstream reply");
-            return ApiError::UpstreamStatus {
-                status: parts.status,
-            }
-            .into_response();
+            parts.status = StatusCode::BAD_GATEWAY;
+            return rebuild(
+                parts,
+                responses::error_body(502, "failed to read the upstream reply"),
+            );
         }
     };
-
     if !parts.status.is_success() {
-        return match responses::wrap_error_body(&bytes, parts.status.as_u16()) {
-            Some(wrapped) => rebuild(parts, wrapped),
-            None => Response::from_parts(parts, Body::from(bytes)),
-        };
+        return rebuild(parts, responses::wrap_error_body(&bytes, status));
     }
-
     match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(chat) => {
-            let converted = chat_to_response(&chat, &echo);
-            let body = serde_json::to_vec(&converted).expect("serialize response");
+            let body = serde_json::to_vec(&chat_to_response(&chat, &echo)).expect("serialize");
             rebuild(parts, body)
         }
         Err(e) => {
             tracing::warn!(error = %e, "responses: upstream reply is not JSON");
-            ApiError::UpstreamStatus {
-                status: parts.status,
-            }
-            .into_response()
+            parts.status = StatusCode::BAD_GATEWAY;
+            rebuild(
+                parts,
+                responses::error_body(502, "upstream reply is not a valid chat completion"),
+            )
         }
     }
-}
-
-fn rebuild(mut parts: axum::http::response::Parts, body: Vec<u8>) -> Response<Body> {
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    Response::from_parts(parts, Body::from(body))
 }

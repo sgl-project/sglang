@@ -11,6 +11,7 @@ use super::{
     reasoning_item, response_object, usage_from_chat, EchoContext, Finish,
 };
 use crate::protocol::sse::{data_payload, write_event, Data, LineBuffer, SseTransducer};
+use crate::protocol::upstream_error;
 
 /// The open reasoning or message item; at most one at a time.
 enum Open {
@@ -96,13 +97,8 @@ impl ResponsesStream {
             Some(Data::Json(chunk)) => chunk,
         };
         self.ensure_started(out);
-        if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
-            let message = err
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| err.as_str())
-                .unwrap_or("upstream error");
-            self.emit_failed(message, out);
+        if let Some((_, message)) = upstream_error(&chunk) {
+            self.emit_failed(&message, out);
             return;
         }
         if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
@@ -651,7 +647,7 @@ mod tests {
     fn inband_error_becomes_response_failed_and_stops() {
         let mut s = ResponsesStream::new(echo());
         let mut raw = s.feed(chunk(json!({"content": "par"}), None).as_bytes());
-        raw.extend(s.feed(b"data: {\"error\": {\"message\": \"boom\", \"code\": 500}}\n\n"));
+        raw.extend(s.feed(b"data: {\"error\": {\"message\": \"too long\", \"code\": 400}}\n\n"));
         assert!(s.is_terminal());
         raw.extend(s.feed(chunk(json!({"content": "more"}), None).as_bytes()));
         raw.extend(s.finish());
@@ -660,7 +656,7 @@ mod tests {
         let (last, data) = evs.last().unwrap();
         assert_eq!(last, "response.failed");
         assert_eq!(data["response"]["status"], "failed");
-        assert_eq!(data["response"]["error"]["message"], "boom");
+        assert_eq!(data["response"]["error"]["message"], "too long");
     }
 
     #[test]
@@ -783,12 +779,15 @@ mod tests {
     }
 
     #[test]
-    fn a_string_error_keeps_its_message() {
+    fn a_string_error_fails_without_leaking_it() {
         let mut s = ResponsesStream::new(echo());
-        let raw = s.feed(b"data: {\"error\": \"queue full\"}\n\n");
+        let raw = s.feed(b"data: {\"error\": \"queue full at /srv/x.py\"}\n\n");
         let (event, data) = events(&raw).pop().unwrap();
         assert_eq!(event, "response.failed");
-        assert_eq!(data["response"]["error"]["message"], "queue full");
+        assert_eq!(
+            data["response"]["error"]["message"],
+            "Internal server error"
+        );
     }
 
     fn indexed(index: u64, name: Option<&str>, args: &str) -> Value {
@@ -856,5 +855,40 @@ mod tests {
             data["response"]["error"]["message"],
             "Stream processing error"
         );
+    }
+
+    /// Streamed output sent back as the next request's input stays one turn,
+    /// though text that arrived during the call is emitted after it.
+    #[test]
+    fn streamed_output_round_trips_as_one_turn() {
+        let evs = run(&[
+            chunk(json!({"reasoning_content": "plan"}), None),
+            chunk(indexed(0, Some("f"), "{}"), None),
+            chunk(json!({"content": "Calling f now."}), Some("tool_calls")),
+        ]);
+        let output = evs.last().unwrap().1["response"]["output"].clone();
+        let types: Vec<&str> = output
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["reasoning", "function_call", "message"]);
+        let call_id = output[1]["call_id"].clone();
+        let mut input = vec![json!({"role": "user", "content": "go"})];
+        input.extend(output.as_array().unwrap().iter().cloned());
+        input.push(json!({"type": "function_call_output", "call_id": call_id, "output": "ok"}));
+        let chat = to_chat(json!({"model": "m", "input": input})).unwrap().chat;
+        let roles: Vec<&str> = chat["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool"]);
+        let turn = &chat["messages"][1];
+        assert_eq!(turn["content"], "Calling f now.");
+        assert_eq!(turn["reasoning_content"], "plan");
+        assert_eq!(turn["tool_calls"][0]["id"], call_id);
     }
 }

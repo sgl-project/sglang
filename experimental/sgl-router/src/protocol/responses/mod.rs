@@ -11,9 +11,8 @@ use serde_json::{json, Map, Value};
 
 pub(crate) use request::{to_chat, EchoContext, ToolMap};
 
-pub(crate) fn new_id(prefix: &str) -> String {
-    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
-}
+pub(crate) use crate::protocol::new_id;
+use crate::protocol::{openai_error_type, scrub_message};
 
 pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -197,23 +196,35 @@ pub(crate) fn custom_input(arguments: &str) -> String {
         .unwrap_or_else(|| arguments.to_owned())
 }
 
-/// Re-wrap sglang's flat error body into `{"error": {...}}`; `None` = keep.
-pub(crate) fn wrap_error_body(body: &[u8], status: u16) -> Option<Vec<u8>> {
-    let v: Value = serde_json::from_slice(body).ok()?;
-    if v.get("error").is_some_and(Value::is_object) {
-        return None;
+pub(crate) fn error_body(status: u16, message: &str) -> Vec<u8> {
+    let error = json!({"message": message, "type": openai_error_type(status),
+                       "param": null, "code": status});
+    serde_json::to_vec(&json!({ "error": error })).expect("serialize error")
+}
+
+/// Any non-2xx body in the `{"error": {...}}` envelope. The router's own
+/// envelope is kept; engine text is scrubbed.
+pub(crate) fn wrap_error_body(body: &[u8], status: u16) -> Vec<u8> {
+    let v: Option<Value> = serde_json::from_slice(body).ok();
+    if v.as_ref()
+        .is_some_and(|v| v.get("error").is_some_and(Value::is_object))
+    {
+        return body.to_vec();
     }
-    let message = v.get("message").and_then(Value::as_str)?;
-    let typ = v
-        .get("type")
+    let field = |k: &str| v.as_ref().and_then(|v| v.get(k)).filter(|f| !f.is_null());
+    let message = field("message")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| crate::server::error::openai_error_type(status));
-    let code = v.get("code").cloned().unwrap_or(Value::Null);
-    let param = v.get("param").cloned().unwrap_or(Value::Null);
-    serde_json::to_vec(&json!({
-        "error": {"message": message, "type": typ, "param": param, "code": code}
-    }))
-    .ok()
+        .map_or_else(|| String::from_utf8_lossy(body).into_owned(), str::to_owned);
+    let typ = field("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| openai_error_type(status));
+    let error = json!({
+        "message": scrub_message(&message, status),
+        "type": typ,
+        "param": field("param").cloned().unwrap_or(Value::Null),
+        "code": field("code").cloned().unwrap_or_else(|| status.into()),
+    });
+    serde_json::to_vec(&json!({ "error": error })).expect("serialize error")
 }
 
 #[cfg(test)]
@@ -242,10 +253,14 @@ mod tests {
     #[test]
     fn wraps_flat_sglang_errors_only() {
         let flat = br#"{"object":"error","message":"bad schema","type":"BadRequestError","param":null,"code":400}"#;
-        let w: Value = serde_json::from_slice(&wrap_error_body(flat, 400).unwrap()).unwrap();
+        let w: Value = serde_json::from_slice(&wrap_error_body(flat, 400)).unwrap();
         assert_eq!(w["error"]["message"], "bad schema");
         assert_eq!(w["error"]["code"], 400);
-        assert!(wrap_error_body(br#"{"error":{"message":"x"}}"#, 400).is_none());
-        assert!(wrap_error_body(b"not json", 500).is_none());
+        let own = br#"{"error":{"message":"x"}}"#;
+        assert_eq!(wrap_error_body(own, 503), own);
+        // Non-JSON bodies are wrapped too; 5xx text never reaches the client.
+        let w: Value = serde_json::from_slice(&wrap_error_body(b"Traceback: /srv", 500)).unwrap();
+        assert_eq!(w["error"]["message"], "Internal server error");
+        assert_eq!(w["error"]["type"], "server_error");
     }
 }
