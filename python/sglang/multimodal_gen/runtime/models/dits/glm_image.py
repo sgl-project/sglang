@@ -448,7 +448,7 @@ class GlmImageGELU(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
-        # extra-high/high fusion site: up-proj GEMM + tanh-GELU in cublasLt
+        # lossless/high fusion site: up-proj GEMM + tanh-GELU in cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 

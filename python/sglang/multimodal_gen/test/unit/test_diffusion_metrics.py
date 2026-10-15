@@ -65,6 +65,7 @@ def test_scheduler_counts_original_requests_and_cleans_up(
 ):
     collector, registry = metrics
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.worker = SimpleNamespace(release_cache_if_idle=Mock())
     scheduler._async_output_save = False
     scheduler._inflight_finalizes = deque()
     scheduler.metrics = collector if enabled else None
@@ -113,6 +114,8 @@ def test_scheduler_counts_original_requests_and_cleans_up(
 
     scheduler._dispatch_items = dispatch
     scheduler.event_loop()
+    assert scheduler.worker.defer_cache_release is True
+    scheduler.worker.release_cache_if_idle.assert_not_called()
     if not enabled:
         assert not collector._requests
         assert (

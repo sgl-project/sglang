@@ -111,9 +111,7 @@ def load_image(
         else:
             # in-memory loading path
             image = PIL.Image.open(BytesIO(srt_get_image_bytes(image)))
-    elif isinstance(image, PIL.Image.Image):
-        image = image
-    else:
+    elif not isinstance(image, PIL.Image.Image):
         raise ValueError(
             "Incorrect format used for the image. Should be bytes, a URL, a local path, base64/data URL, or a PIL image."
         )
