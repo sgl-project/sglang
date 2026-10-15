@@ -5,13 +5,25 @@ import triton
 import triton.language as tl
 
 
-def dequantize_k_cache(quant_k_cache):
-    return _dequantize_k_cache_fast_wrapped(quant_k_cache)
+def _infer_dsa_dims(dim_quant: int, tile_size: int = 128) -> tuple[int, int]:
+    """Recover the NoPE and RoPE widths from a packed DSA cache row."""
+    for dim_rope in (0, 64):
+        scaled_width = (dim_quant - 2 * dim_rope) * tile_size
+        if scaled_width % (tile_size + 4):
+            continue
+        dim_nope = scaled_width // (tile_size + 4)
+        if dim_nope > 0 and dim_nope % tile_size == 0:
+            return dim_nope, dim_rope
+    raise ValueError(f"Unsupported packed DSA KV row width: {dim_quant}")
+
+
+def dequantize_k_cache(quant_k_cache, dv: int | None = None):
+    return _dequantize_k_cache_fast_wrapped(quant_k_cache, dv=dv)
 
 
 def _dequantize_k_cache_fast_wrapped(
     quant_k_cache: torch.Tensor,
-    dv: int = 512,
+    dv: int | None = None,
     tile_size: int = 128,
 ) -> torch.Tensor:
     original_ndim = quant_k_cache.ndim
@@ -19,12 +31,15 @@ def _dequantize_k_cache_fast_wrapped(
         # set block_size = 1
         quant_k_cache = quant_k_cache.unsqueeze(1)
     num_blocks, block_size, _, dim_quant = quant_k_cache.shape
-    assert dv == 512
-    assert dim_quant == 656
     assert tile_size == 128
+    inferred_dv, dim_rope = _infer_dsa_dims(dim_quant)
+    if dv is None:
+        dv = inferred_dv
+    if dv != inferred_dv:
+        raise ValueError(f"dv={dv} does not match packed row width {dim_quant}")
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
-    output = _dequantize_k_cache_fast(quant_k_cache)
+    output = _dequantize_k_cache_fast(quant_k_cache, dim_nope=dv, dim_rope=dim_rope)
 
     if original_ndim == 3:
         return output.view(num_blocks, 1, -1)
@@ -32,14 +47,17 @@ def _dequantize_k_cache_fast_wrapped(
         return output.view(num_blocks, block_size, 1, -1)
 
 
-def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
+def _dequantize_k_cache_fast(
+    quant_k_cache,
+    dim_nope: int,
+    dim_rope: int,
+    group_size: int = 128,
+):
     num_tokens, dim_quant = quant_k_cache.shape
 
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
     num_tiles = dim_nope // group_size
-    assert dim_quant == 656
+    assert dim_quant == dim_nope + num_tiles * 4 + dim_rope * 2
 
     output = torch.empty(
         (num_tokens, dim_nope + dim_rope),
@@ -47,8 +65,7 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
         device=quant_k_cache.device,
     )
 
-    num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
     assert dim_nope % group_size == 0
 
@@ -138,18 +155,14 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == 656, (
-        f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
-    )
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
     # Index bounds validated in dsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
-    num_tiles = dim_nope // group_size  # 512 // 128 = 4
+    num_tiles = dim_nope // group_size
 
     output = torch.empty(
         (num_tokens, 1, dim_nope + dim_rope),
@@ -157,9 +170,7 @@ def dequantize_k_cache_paged(
         device=quant_k_cache.device,
     )
 
-    # cdiv(512 + 64, 128) = 5
-    num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
     assert dim_nope % group_size == 0
 
@@ -258,10 +269,11 @@ def gather_dequant_requant_fp8_paged(
     extra_rows: int = 0,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Gather paged fp8 KV tokens and re-pack into flat [576] fp8 layout.
+    """Gather paged FP8 KV tokens and re-pack into a flat raw FP8 layout.
 
-    The paged KV cache stores 656 bytes per token:
-        [512 nope_fp8 | 16 scales_f32 (4 groups) | 128 rope_bf16_bytes]
+    Each packed cache row stores:
+        [dim_nope FP8 bytes | 4 scale bytes per group | 2 bytes per RoPE element]
+    For example, 256+0 uses 264 bytes and 512+64 uses 656 bytes.
     This kernel gathers the requested tokens, de-quantises nope with the
     per-group scales, and re-quantises to per-tensor fp8 (scale=1.0).
     Rope is cast bf16->fp8.  The whole operation is fused into a single
@@ -275,7 +287,7 @@ def gather_dequant_requant_fp8_paged(
     persistent (dirty) buffer via ``out``.
 
     Args:
-        quant_k_cache: [total_num_tokens, 1, 656] fp8_e4m3fn
+        quant_k_cache: [total_num_tokens, 1, dim_quant] fp8_e4m3fn
         page_table_1_flattened: [num_tokens] int32
         group_size: per-group dequant tile size (default 128)
         extra_rows: number of zero-filled landing-pad rows to append at
@@ -283,21 +295,20 @@ def gather_dequant_requant_fp8_paged(
             kernel which over-reads past end-of-buffer for masked
             indices)
         out: optional pre-allocated destination of shape
-            [num_tokens + extra_rows, 1, 576] (or [.., 576]) fp8_e4m3fn,
-            contiguous.  Contents may be arbitrary (fully overwritten).
+            [num_tokens + extra_rows, 1, dim_nope + dim_rope] (or the
+            equivalent 2D shape) fp8_e4m3fn, contiguous. Contents may be
+            arbitrary (fully overwritten).
     Returns:
-        output: [num_tokens + extra_rows, 1, 576] fp8_e4m3fn
+        output: [num_tokens + extra_rows, 1, dim_nope + dim_rope] fp8_e4m3fn
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == 656
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
-    num_tiles = dim_nope // group_size  # 4
-    out_dim = dim_nope + dim_rope  # 576
+    num_tiles = dim_nope // group_size
+    out_dim = dim_nope + dim_rope
     assert num_tiles * group_size == dim_nope
 
     total_rows = num_tokens + extra_rows
@@ -417,13 +428,17 @@ def _gather_dequant_requant_fp8_paged_vec_kernel(
     tl.store(dst_q, y, mask=row_in_range[:, None, None])
 
     # b. rope: [T, R] bf16 -> fp8; pad rows: 0.0 -> byte 0x00
-    offs_r = tl.arange(0, DIM_ROPE)
-    src_r = input_rope_ptr + paged[:, None] * input_rope_stride_0 + offs_r[None, :]
-    data = tl.load(src_r, mask=is_real[:, None], other=0.0).to(tl.float8e4nv)
-    dst_r = (
-        output_ptr + offs_t64[:, None] * output_stride_0 + DIM_NOPE + offs_r[None, :]
-    )
-    tl.store(dst_r, data, mask=row_in_range[:, None])
+    if DIM_ROPE > 0:
+        offs_r = tl.arange(0, DIM_ROPE)
+        src_r = input_rope_ptr + paged[:, None] * input_rope_stride_0 + offs_r[None, :]
+        data = tl.load(src_r, mask=is_real[:, None], other=0.0).to(tl.float8e4nv)
+        dst_r = (
+            output_ptr
+            + offs_t64[:, None] * output_stride_0
+            + DIM_NOPE
+            + offs_r[None, :]
+        )
+        tl.store(dst_r, data, mask=row_in_range[:, None])
 
 
 def gather_dequant_requant_fp8_paged_legacy(
@@ -441,15 +456,13 @@ def gather_dequant_requant_fp8_paged_legacy(
     (token, 128-elem slice).
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == 656
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
-    num_tiles = dim_nope // group_size  # 4
-    out_dim = dim_nope + dim_rope  # 576
+    num_tiles = dim_nope // group_size
+    out_dim = dim_nope + dim_rope
     assert num_tiles * group_size == dim_nope
 
     total_rows = num_tokens + extra_rows
@@ -462,8 +475,7 @@ def gather_dequant_requant_fp8_paged_legacy(
         device=quant_k_cache.device,
     )
 
-    num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)  # 5
-    assert num_blocks_per_token == 5
+    num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
     input_nope_q = quant_k_cache[:, :dim_nope]
     input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
@@ -545,10 +557,6 @@ def _gather_dequant_requant_fp8_paged_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
-if __name__ == "__main__":
-    raise Exception("UT is in quant_k_cache.py")
-
-
 @triton.jit
 def _concat_cast_kv_fp8_pad_kernel(
     out_ptr,
@@ -564,18 +572,22 @@ def _concat_cast_kv_fp8_pad_kernel(
     write zeros (the -1-sentinel landing pad the kernel's clamp maps to)."""
     row = tl.program_id(0).to(tl.int64)
     offs_n = tl.arange(0, NOPE)
-    offs_r = tl.arange(0, ROPE)
     head = NOPE + ROPE
     if row < num_tokens:
         v_n = tl.load(k_ptr + row * k_stride + offs_n)
         tl.store(out_ptr + row * head + offs_n, v_n.to(tl.float8e4nv))
-        v_r = tl.load(kr_ptr + row * kr_stride + offs_r)
-        tl.store(out_ptr + row * head + NOPE + offs_r, v_r.to(tl.float8e4nv))
+        # NoPE models pass ROPE=0; tl.arange rejects empty ranges, so skip statically.
+        if ROPE > 0:
+            offs_r = tl.arange(0, ROPE)
+            v_r = tl.load(kr_ptr + row * kr_stride + offs_r)
+            tl.store(out_ptr + row * head + NOPE + offs_r, v_r.to(tl.float8e4nv))
     else:
         zero_n = tl.zeros([NOPE], dtype=tl.float32).to(tl.float8e4nv)
-        zero_r = tl.zeros([ROPE], dtype=tl.float32).to(tl.float8e4nv)
         tl.store(out_ptr + row * head + offs_n, zero_n)
-        tl.store(out_ptr + row * head + NOPE + offs_r, zero_r)
+        if ROPE > 0:
+            offs_r = tl.arange(0, ROPE)
+            zero_r = tl.zeros([ROPE], dtype=tl.float32).to(tl.float8e4nv)
+            tl.store(out_ptr + row * head + NOPE + offs_r, zero_r)
 
 
 def concat_cast_kv_fp8_pad(
@@ -590,7 +602,7 @@ def concat_cast_kv_fp8_pad(
     tail (3 kernels + one [tokens, 576] bf16 alloc).  Same bf16->fp8
     store-cast the gather kernel uses (bit-identical bytes).
 
-    ``out``: [total_rows, 576] fp8 slice (total_rows = num_tokens + pad band);
+    ``out``: [total_rows, NOPE+ROPE] fp8 slice (total_rows = num_tokens + pad band);
     ``k``: [num_tokens, NOPE] bf16 view; ``k_rope``: [num_tokens, ROPE] bf16.
     """
     total_rows, head = out.shape
@@ -599,7 +611,7 @@ def concat_cast_kv_fp8_pad(
     assert head == nope + rope and out.dtype == torch.float8_e4m3fn
     k2 = k.view(num_tokens, nope)
     kr2 = k_rope.view(num_tokens, rope)
-    assert k2.stride(-1) == 1 and kr2.stride(-1) == 1
+    assert k2.stride(-1) == 1 and (rope == 0 or kr2.stride(-1) == 1)
     _concat_cast_kv_fp8_pad_kernel[(total_rows,)](
         out,
         k2,
@@ -610,4 +622,96 @@ def concat_cast_kv_fp8_pad(
         NOPE=nope,
         ROPE=rope,
     )
+    return out
+
+
+@triton.jit
+def _gather_cast_kv_bf16_paged_vec_kernel(
+    kv_buffer_ptr,
+    out_ptr,
+    loc_ptr,
+    num_tokens,
+    total_rows,
+    buffer_stride: tl.constexpr,
+    out_stride: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TOKENS_PER_PROG: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * TOKENS_PER_PROG + tl.arange(0, TOKENS_PER_PROG)
+    gathered = rows < num_tokens
+    loc = tl.load(loc_ptr + rows, mask=gathered, other=0).to(tl.int64)
+    cols = tl.arange(0, HEAD_DIM)
+    src = tl.load(
+        kv_buffer_ptr + loc[:, None] * buffer_stride + cols[None, :],
+        mask=gathered[:, None],
+        other=0.0,
+    )
+    # Rows past num_tokens load nothing and store that zero: they are the
+    # -1-sentinel landing pad, so the trailing zero_ fuses into this kernel.
+    tl.store(
+        out_ptr + rows[:, None].to(tl.int64) * out_stride + cols[None, :],
+        src,
+        mask=(rows < total_rows)[:, None],
+    )
+
+
+def gather_cast_kv_fp8_pad_paged(
+    out: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    nope_dim: int,
+) -> torch.Tensor:
+    """Q8KV8 prefix KV prep for a bf16 MLA pool: gather rows [latent | rope] by
+    token slot, store-cast them into the fp8 buffer, and zero the trailing
+    -1-sentinel landing-pad rows.
+
+    ``out``: [num_tokens + pad_rows, head_dim] fp8, contents arbitrary;
+    ``kv_cache``: [slots, 1, head_dim] bf16;
+    ``page_table_1_flattened``: [num_tokens] int32 slot ids.
+    """
+    head_dim = out.shape[-1]
+    num_tokens = page_table_1_flattened.shape[0]
+    assert out.dtype == torch.float8_e4m3fn and out.is_contiguous()
+    assert kv_cache.dtype == torch.bfloat16 and kv_cache.shape[-1] == head_dim
+    # The gather addresses the source as loc * stride(0) + arange(0, nope_dim),
+    # so only stride(0) is passed; a non-unit last-dim stride would silently read
+    # the wrong elements. concat_cast_kv_fp8_pad asserts the same invariant.
+    assert kv_cache.stride(-1) == 1
+    if head_dim == nope_dim and head_dim & (head_dim - 1) == 0:
+        # NoPE: source and destination rows are both one contiguous HEAD_DIM run,
+        # so gather, cast and pad-zeroing fit in one kernel.  The shared get
+        # kernel below runs one program per token -- 131072 CTAs at a 128k
+        # context -- and CTA count, not access width, is what binds there.
+        total_rows = out.shape[0]
+        _gather_cast_kv_bf16_paged_vec_kernel[
+            (triton.cdiv(total_rows, _GATHER_TOKENS_PER_PROG),)
+        ](
+            kv_cache,
+            out,
+            page_table_1_flattened,
+            num_tokens,
+            total_rows,
+            kv_cache.stride(0),
+            out.stride(0),
+            HEAD_DIM=head_dim,
+            TOKENS_PER_PROG=_GATHER_TOKENS_PER_PROG,
+            num_warps=4,
+        )
+        return out
+
+    # Local import: mla_buffer reaches into sglang.srt.runtime_context, and this
+    # module lives under sglang.kernels; importing it at module scope would make
+    # every kernels-side consumer pull in srt at import time.
+    from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
+
+    if num_tokens > 0:
+        rows = out[:num_tokens]
+        get_mla_kv_buffer_triton(
+            kv_cache,
+            page_table_1_flattened,
+            rows[:, :nope_dim],
+            rows[:, nope_dim:] if head_dim > nope_dim else None,
+        )
+    out[num_tokens:].zero_()
     return out

@@ -282,6 +282,10 @@ _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES: tuple[str, ...] = (
     "model.language_model.layers.0",
 )
 
+# A NextN draft builds its block under ``model.decoder``; only the draft's own
+# weight-name mapper renames per-layer specs onto it, so the target never matches.
+_MOE_SHARED_EXPERT_QUANT_DRAFT_BASES: tuple[str, ...] = ("model.decoder",)
+
 _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
     "gate_proj",
     "up_proj",
@@ -381,9 +385,15 @@ class QuarkConfig(QuantizationConfig):
 
         layer_quant_config = self.quant_config.get("layer_quant_config")
         if layer_quant_config:
-            self.quant_config["layer_quant_config"] = hf_to_sglang_mapper.apply_dict(
-                layer_quant_config
-            )
+            layer_quant_config = hf_to_sglang_mapper.apply_dict(layer_quant_config)
+            # DeepSeek-V4 fuses wq_a + wkv into one wqkv_a module that has no spec
+            # of its own; both halves share one, so mirror it.
+            for name in list(layer_quant_config):
+                if name.endswith(".wq_a"):
+                    layer_quant_config.setdefault(
+                        name.removesuffix(".wq_a") + ".wqkv_a", layer_quant_config[name]
+                    )
+            self.quant_config["layer_quant_config"] = layer_quant_config
 
         if self.kv_cache_group:
             self.kv_cache_group = hf_to_sglang_mapper.apply_list(self.kv_cache_group)
@@ -417,6 +427,15 @@ class QuarkConfig(QuantizationConfig):
             activation_scheme="dynamic",
             weight_block_size=block_size,
             packed_modules_mapping=packed_modules_mapping,
+        )
+
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        # get_quant_method registers every non-excluded prefix as an
+        # online-quantized layer, so answer from the exclude list instead.
+        return self.excluded_fp8_config is None and should_ignore_layer(
+            prefix,
+            ignore=self.exclude_layers,
+            fused_mapping=self.packed_modules_mapping,
         )
 
     def get_quant_method(
@@ -869,6 +888,17 @@ class QuarkConfig(QuantizationConfig):
                 if fnmatch.fnmatch(layer_name, name_pattern):
                     return layer_quant_config[name_pattern]
 
+            # entries may name experts individually, so they resolve the fused module
+            if layer_name.endswith(".experts"):
+                expert_prefix = layer_name + "."
+                expert_entries = {
+                    name[len(expert_prefix) :]: cfg
+                    for name, cfg in layer_quant_config.items()
+                    if name.startswith(expert_prefix)
+                }
+                if expert_entries:
+                    return self._fused_expert_config(layer_name, expert_entries)
+
             layer_type = type(module).__name__
             layer_type_quant_config = cast(
                 dict[str, Any], self.quant_config.get("layer_type_quant_config")
@@ -880,6 +910,44 @@ class QuarkConfig(QuantizationConfig):
                 dict[str, Any], self.quant_config.get("global_quant_config")
             )
             return global_quant_config
+
+    @staticmethod
+    def _fused_expert_config(
+        layer_name: str, entries: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        projections_by_expert: dict[int, set[str]] = {}
+        for suffix in entries:
+            index, _, projection = suffix.partition(".")
+            if not index.isdigit() or not projection:
+                raise ValueError(
+                    f"Found a per-expert entry {suffix!r} in {layer_name} that is "
+                    "not <expert index>.<projection>."
+                )
+            projections_by_expert.setdefault(int(index), set()).add(projection)
+
+        # one fused module spans the bank, so a gap below the highest pinned index raises
+        pinned = projections_by_expert.keys()
+        missing = sorted(set(range(max(pinned) + 1)) - pinned)
+        if missing:
+            raise ValueError(
+                f"Found per-expert entries in {layer_name} that skip experts "
+                f"{missing[:4]}. SGLang requires all to use the same scheme."
+            )
+
+        projections = next(iter(projections_by_expert.values()))
+        if any(p != projections for p in projections_by_expert.values()):
+            raise ValueError(
+                f"Found different projections pinned per expert in {layer_name}. "
+                "SGLang requires all to use the same scheme."
+            )
+
+        configs = list(entries.values())
+        if not all(deep_compare(cfg, configs[0]) for cfg in configs):
+            raise ValueError(
+                f"Found different quantization configurations among the experts "
+                f"of {layer_name}. SGLang requires all to use the same scheme."
+            )
+        return configs[0]
 
     def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme":
         if config.get("output_tensors") or config.get("bias"):
@@ -996,15 +1064,26 @@ class QuarkConfig(QuantizationConfig):
         if not layer_quant_config:
             return True
 
-        # Compare routed vs shared specs at layer 0 (stub module needed by
-        # _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
+        # DeepSeek-family modules are "shared_experts"; a misspelled lookup would
+        # fall through to the global spec and hide a mismatch.
+        shared_module = (
+            "shared_experts"
+            if any(".shared_experts." in name for name in layer_quant_config)
+            else "shared_expert"
+        )
+
+        # Compare routed vs shared specs at layer 0 and the draft block (stub module
+        # needed by _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
         lookup_stub = torch.nn.Module()
         try:
-            for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES:
+            for base in (
+                _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES
+                + _MOE_SHARED_EXPERT_QUANT_DRAFT_BASES
+            ):
                 moe_name = f"{base}.mlp.experts"
                 moe_cfg = self._find_matched_config(moe_name, lookup_stub)
                 for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
-                    shared_name = f"{base}.mlp.shared_expert.{suffix}"
+                    shared_name = f"{base}.mlp.{shared_module}.{suffix}"
                     shared_cfg = self._find_matched_config(shared_name, lookup_stub)
                     if not deep_compare(moe_cfg, shared_cfg):
                         return False

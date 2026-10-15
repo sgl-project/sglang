@@ -39,11 +39,11 @@ from sglang.srt.distributed.device_communicators.torch_symm_mem import (
     TorchSymmMemCommunicator,
 )
 from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import publish_build_topology
 from sglang.utils import is_in_ci
 
@@ -191,10 +191,10 @@ if __name__ == "__main__":
     )
     publish_build_topology(world_rank=rank, tp_size=world_size)
     initialize_model_parallel()
-    group = get_tensor_model_parallel_group().device_group
-    cpu_group = get_tensor_model_parallel_group().cpu_group
-    pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
-    torch_symm_mem_comm = get_tensor_model_parallel_group().torch_symm_mem_comm
+    group = get_parallel().tp_group.device_group
+    cpu_group = get_parallel().tp_group.cpu_group
+    pynccl_comm = get_parallel().tp_group.pynccl_comm
+    torch_symm_mem_comm = get_parallel().tp_group.torch_symm_mem_comm
     dist.barrier()
     profile = False
     dtype = torch.bfloat16

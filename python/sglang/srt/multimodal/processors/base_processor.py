@@ -1,6 +1,7 @@
 import asyncio
 import concurrent
 import concurrent.futures
+import concurrent.futures.process
 import dataclasses
 import multiprocessing as mp
 import os
@@ -36,6 +37,7 @@ from sglang.srt.multimodal.cache import (
     build_processor_fingerprint,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -43,6 +45,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
+from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
 from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
@@ -210,6 +213,13 @@ def _tokenizer_of(processor):
     return processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
 
+def _forget_parent_executor_wakeups():
+    # A forked worker inherits the parent's executor wakeups, whose locks a parent
+    # thread may hold at fork time; since Python 3.12.8 / 3.13.1 the worker's exit
+    # hook takes those locks, so the worker would never exit.
+    concurrent.futures.process._threads_wakeups.clear()
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
@@ -331,6 +341,7 @@ class BaseMultimodalProcessor(ABC):
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
         )
+        self.hash_executor = MultimodalHashExecutor()
         if self.mm_io_worker_num > 4:
             logger.info(
                 "Multimodal data loading enabled with %d worker threads (%s).",
@@ -448,7 +459,7 @@ class BaseMultimodalProcessor(ABC):
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
                 self.server_args.base_gpu_id,
-                self.server_args.tp_size,
+                get_mm_feature_consumer_count(),
             )
 
     @property
@@ -494,6 +505,7 @@ class BaseMultimodalProcessor(ABC):
     def shutdown(self) -> None:
         """Drop cached artifacts and stop every processor-side executor."""
         self.clear_preprocess_cache()
+        self.hash_executor.shutdown()
         self.io_executor.shutdown(wait=False, cancel_futures=True)
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
@@ -504,6 +516,7 @@ class BaseMultimodalProcessor(ABC):
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            initializer=_forget_parent_executor_wakeups,
         )
 
     def _replace_broken_cpu_executor(

@@ -13,7 +13,7 @@ from sglang.srt.eplb.lplb_solver import (
 )
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -24,13 +24,8 @@ logger = logging.getLogger(__name__)
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
-def prepare_moe_topk(
-    *,
-    model,
-    model_config: ModelConfig,
-    moe_ep_size: int,
-    moe_ep_rank: int,
-) -> None:
+def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
+    parallel = get_parallel()
     balancer_cls = None
     num_prepared = 0
     num_routed_experts = None
@@ -61,8 +56,8 @@ def prepare_moe_topk(
             routed_scaling_factor = module.routed_scaling_factor
         module.waterfill_balancer = balancer_cls(
             num_routed_experts=num_physical_routed_experts,
-            world_size=moe_ep_size,
-            rank=moe_ep_rank,
+            world_size=parallel.moe_ep_size,
+            rank=parallel.moe_ep_rank,
             layer_id=module.layer_id,
             routed_scaling_factor=(
                 routed_scaling_factor if routed_scaling_factor is not None else 1.0
@@ -71,6 +66,32 @@ def prepare_moe_topk(
         num_prepared += 1
     if num_prepared:
         log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
+
+
+def prebuild_deepep_v2_buffer(*, model) -> None:
+    """Build the deepep_v2 ElasticBuffer at deployment time.
+
+    No-op unless the a2a backend is deepep_v2. The buffer is process-wide and
+    shared by every MoE layer, so the first deepep_v2 dispatcher builds it. The
+    per-rank cap is validated in validate_deepep_v2_dispatch_token_budget at
+    server-args time.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    for module in model.modules():
+        if isinstance(module, FusedMoE) and isinstance(
+            module.dispatcher, DeepEPv2Dispatcher
+        ):
+            module.dispatcher.prebuild()
+            log_info_on_rank0(
+                logger, "Prebuilt the DeepEP-V2 ElasticBuffer at startup."
+            )
+            return
 
 
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
