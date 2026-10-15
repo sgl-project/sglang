@@ -2000,6 +2000,13 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        self.quant_config is not None
+                        and getattr(self.quant_config, "get_name", lambda: "")()
+                        == "gptq"
+                    ):
+                        continue
+                    logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
@@ -2013,6 +2020,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        self.quant_config is not None
+                        and getattr(self.quant_config, "get_name", lambda: "")()
+                        == "gptq"
+                    ):
+                        continue
+                    logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 if name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
@@ -2477,6 +2491,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        self.quant_config is not None
+                        and getattr(self.quant_config, "get_name", lambda: "")()
+                        == "gptq"
+                    ):
+                        continue
+                    logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
@@ -2496,6 +2517,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # print(name, loaded_weight.shape)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        self.quant_config is not None
+                        and getattr(self.quant_config, "get_name", lambda: "")()
+                        == "gptq"
+                        and "visual" not in name
+                    ):
+                        continue
+                    logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 if name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
