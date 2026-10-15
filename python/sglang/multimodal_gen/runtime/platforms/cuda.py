@@ -855,6 +855,9 @@ class CudaPlatformBase(Platform):
             from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
                 maybe_optimize_minimax_h3_vae,
             )
+            from sglang.multimodal_gen.runtime.models.vaes.qwen_image21_vae_cuda_opt import (
+                maybe_optimize_qwen_image21_vae,
+            )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
                 maybe_optimize_qwen_image_vae,
                 maybe_optimize_wan_vae,
@@ -864,6 +867,7 @@ class CudaPlatformBase(Platform):
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
             vae = maybe_optimize_qwen_image_vae(vae)
+            vae = maybe_optimize_qwen_image21_vae(vae)
             vae = maybe_optimize_minimax_h3_vae(vae)
         except Exception:
             logger.warning(
