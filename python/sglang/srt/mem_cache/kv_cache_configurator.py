@@ -1438,16 +1438,13 @@ class KVCacheConfigurator:
         )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
-        mamba_layer_ids = [
+        # Target layers on this rank only; a draft holding linear state gets its own
+        # pool via clone_with_new_mamba.
+        return [
             i
             for i in self.mambaish_config.mamba2_cache_params.layers
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
-        if max_speculative_num_draft_tokens():
-            for layer_id in getattr(self.mambaish_config, "nextn_layer_ids", []):
-                if layer_id not in mamba_layer_ids:
-                    mamba_layer_ids.append(layer_id)
-        return mamba_layer_ids
 
     def _get_ple_req_pool_kwargs(self) -> dict[str, Any]:
         from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig

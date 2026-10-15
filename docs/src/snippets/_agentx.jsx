@@ -503,7 +503,7 @@ export const AgentX = ({ data }) => {
           {cellsFor(hw, ckpt).map(([c, i]) => (
             <button key={c.id} value={c.id} style={S.chip(cellIdx === i)} onClick={() => pickCell(i)}>
               {c.label}
-              <span style={S.sub}>{c.detail} · {c.gpus} GPUs · c{c.points.flatMap((p) => p.concs).join(", ")}</span>
+              <span style={S.sub}>{c.detail} · {c.gpus} GPU{c.gpus === 1 ? "" : "s"} · c{c.points.flatMap((p) => p.concs).join(", ")}</span>
             </button>
           ))}
           <span style={{ ...S.sub, paddingTop: "2px" }}>Ordered from low latency (top) to high throughput (bottom).</span>

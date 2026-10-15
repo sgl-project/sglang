@@ -68,7 +68,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
-from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
@@ -76,33 +75,19 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
-    _tbo_event,
-    attn_tp_all_gather,
-    attn_tp_all_gather_into_tensor,
     attn_tp_all_reduce,
-    dp_gather_partial,
     dp_gather_replicate,
-    dp_reduce_scatter_tensor,
-    dp_reduce_scatterv_async,
-    dp_scatter,
-    get_dp_global_num_tokens,
-    get_dp_tbo_comm_stream,
-    get_global_dp_buffer,
     get_global_dp_buffer_len,
-    get_local_dp_buffer,
-    get_local_dp_buffer_len,
-    get_tbo_persistent_buffer,
     is_allocation_symmetric,
     is_dp_attention_enabled,
-    is_dp_gatherv_active,
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
-from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
+from sglang.srt.layers.layer_boundary import append_stages, get_attn_tp_context
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
@@ -113,9 +98,6 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
-)
-from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
-    can_fuse_all_reduce,
 )
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -158,16 +140,20 @@ from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
     default_weight_loader,
 )
+from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-    apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
 )
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     enter_late_layer_dp,
     exit_late_layer_dp,
     late_layer_dp_counts,
+)
+from sglang.srt.models.deepseek_common.moe_transport import (
+    OverlappedMoeTransport,
+    _tbo_run_moe,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -180,6 +166,11 @@ from sglang.srt.models.deepseek_v2 import (
     _is_hip,
     _is_npu,
     _is_xpu,
+)
+from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
+from sglang.srt.models.deepseek_v4_platform_stage import (
+    NonCudaDecoderMixin,
+    forward_layer_fused_boundary,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.models.utils import WeightsMapper
@@ -284,7 +275,6 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
 
 
 _NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
-_MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
@@ -361,7 +351,7 @@ def _flashinfer_hc_pre(
         rms_eps=rms_eps,
         mhc_pre_eps=hc_eps,
         mhc_sinkhorn_eps=hc_eps,
-        mhc_post_mult_value=_MHC_POST_MULT_VALUE,
+        mhc_post_mult_value=MHC_POST_MULT_VALUE,
         sinkhorn_repeat=sinkhorn_iters,
         num_splits=n_splits,
     )
@@ -369,13 +359,10 @@ def _flashinfer_hc_pre(
 
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-# PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
-# gather instead of on the gathered global buffer. Requires
-# SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
-_SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+
 
 if _use_aiter:
     if _is_gfx95_supported or _is_gfx1250_supported:
@@ -2466,6 +2453,8 @@ class MQALayer(MqaAttentionBase):
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                    # TRT-LLM returns BF16 even with FP8 queries.
+                    dtype=x.dtype,
                 )
                 bcg_deepseek_v4_attention_with_output(
                     attn_q,
@@ -2653,9 +2642,14 @@ class MQALayer(MqaAttentionBase):
 
         defer_all_reduce = defer_all_reduce and (
             self.attn_tp_size > 1
-            and self.attn_tp_size == get_parallel().tp_size
-            and self.wo_b.reduce_results
-            and not self.wo_b.use_decode_attn_tp
+            and (
+                _is_cuda
+                or (
+                    self.attn_tp_size == get_parallel().tp_size
+                    and self.wo_b.reduce_results
+                    and not self.wo_b.use_decode_attn_tp
+                )
+            )
             and not should_skip_mlp_all_reduce()
         )
         o, _ = self.wo_b(
@@ -2681,51 +2675,11 @@ class MQALayer(MqaAttentionBase):
             positions=state.positions,
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
+            defer_all_reduce=_is_cuda,
         )
 
 
-@contextmanager
-def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
-    # Under CP the real rows are not a prefix, so every row must be routed.
-    saved = (
-        forward_batch.num_token_non_padded,
-        forward_batch.global_num_token_non_padded_cpu,
-    )
-    if saved[0] is not None:
-        forward_batch.num_token_non_padded = torch.full_like(saved[0], num_rows)
-    forward_batch.global_num_token_non_padded_cpu = num_rows
-    try:
-        yield
-    finally:
-        (
-            forward_batch.num_token_non_padded,
-            forward_batch.global_num_token_non_padded_cpu,
-        ) = saved
-
-
-def _attn_tp_all_gather_chunks(
-    local: torch.Tensor, chunk_rows: List[int]
-) -> torch.Tensor:
-    # Tensor all_gather stays on aiter AG / pynccl under graph capture; the list
-    # all_gather falls back to ProcessGroupNCCL, which invalidates HIP capture.
-    max_rows = max(chunk_rows)
-    padded = local
-    if local.shape[0] != max_rows:
-        padded = local.new_zeros((max_rows, *local.shape[1:]))
-        padded[: local.shape[0]].copy_(local)
-    gathered = local.new_empty((len(chunk_rows) * max_rows, *local.shape[1:]))
-    attn_tp_all_gather_into_tensor(gathered, padded.contiguous())
-    if all(rows == max_rows for rows in chunk_rows):
-        return gathered
-    return torch.cat(
-        [
-            gathered[i * max_rows : i * max_rows + rows]
-            for i, rows in enumerate(chunk_rows)
-        ]
-    )
-
-
-class DeepseekV4DecoderLayer(nn.Module):
+class DeepseekV4DecoderLayerBase(nn.Module):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -2739,12 +2693,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_layout: Optional[EngramLayout] = None,
         hc_stats_stream: Optional[torch.cuda.Stream] = None,
         moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
+        *,
+        boundary_pre_from_prev: Optional[bool] = None,
+        boundary_mhc_fusions: bool = True,
     ) -> None:
         super().__init__()
         self.hc_stats_stream = hc_stats_stream
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        self.boundary_pre_from_prev = (
+            config.hc_pre_from_prev_sublayer and not is_nextn
+            if boundary_pre_from_prev is None
+            else boundary_pre_from_prev
+        )
+        self.boundary_mhc_fusions = boundary_mhc_fusions
         self.self_attn = self._build_self_attn(
             config=config,
             layer_id=layer_id,
@@ -2820,9 +2783,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         self._init_hyper_connections()
-        self._next_layer: Optional[DeepseekV4DecoderLayer] = None
-        self.local_boundary: Optional[mhc.HcNextBoundary] = None
-        self.next_boundary: Optional[mhc.HcNextBoundary] = None
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
             self.engram = Engram(
@@ -2854,14 +2814,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             compress_ratio_override=compress_ratio_override,
         )
 
-    def bind_next(self, next_layer: Optional[nn.Module]) -> None:
-        """Save the next layer for mhc. Must be called before `_init_boundaries`"""
-        if not self.hc_pre_from_prev_sublayer:
-            return
-        self._next_layer = None
-        if isinstance(next_layer, DeepseekV4DecoderLayer) and next_layer.engram is None:
-            self._next_layer = next_layer
-
     def _init_hyper_connections(self) -> None:
         """(Re)bind the two hyper-connections to the current mixing weights."""
         if not self.hc_pre_from_prev_sublayer:
@@ -2884,25 +2836,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self._hc_ffn_tf32_parts,
             self._hc_ffn_bf16_parts,
         )
-
-    def _init_boundaries(self) -> None:
-        """Resolved on first forward: `accepts_mxfp8_swizzled_input` is not settled
-        until `process_weights_after_loading`."""
-        if self.local_boundary is not None:
-            return
-        # ATTN[i] -> MOE[i]
-        self.local_boundary = mhc.make_boundary(
-            self.post_attention_layernorm,
-            accepts_mxfp8=False,
-            hc=self.ffn_hc,
-        )
-        # MOE[i] -> ATTN[i+1]
-        if self._next_layer is not None:
-            self.next_boundary = mhc.make_boundary(
-                self._next_layer.input_layernorm,
-                accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
-                hc=self._next_layer.attn_hc,
-            )
 
     def refresh_mhc_norm_weight_cache(self):
         # Cache bf16 norm weights so the fused path does not allocate/cast per forward.
@@ -2960,8 +2893,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         # re-run this, so drop them and re-resolve on the next forward.
         self.__dict__.pop("_can_fuse_attn_mhc", None)
         self.__dict__.pop("_can_fuse_ffn_mhc", None)
-        self.local_boundary = None
-        self.next_boundary = None
 
     def _input_norm(
         self,
@@ -3040,7 +2971,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 rms_eps=self.rms_norm_eps,
                 hc_pre_eps=self.hc_eps,
                 hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                hc_post_mult_value=MHC_POST_MULT_VALUE,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
                 **norm_kwargs,
             )
@@ -3074,7 +3005,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 rms_eps=self.rms_norm_eps,
                 hc_pre_eps=self.hc_eps,
                 hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                hc_post_mult_value=MHC_POST_MULT_VALUE,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
                 **norm_kwargs,
             )
@@ -3091,7 +3022,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 rms_eps=self.rms_norm_eps,
                 hc_pre_eps=self.hc_eps,
                 hc_sinkhorn_eps=self.hc_eps,
-                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                hc_post_mult_value=MHC_POST_MULT_VALUE,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
             )
             return y, post.squeeze(-1), comb, False
@@ -3151,187 +3082,6 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         return mhc.post(self.hc_cfg, x, residual, post, comb)
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_ids_global: torch.Tensor,
-        prev_residual: Optional[torch.Tensor] = None,
-        prev_post: Optional[torch.Tensor] = None,
-        prev_comb: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
-        use_fused = self.use_fused_mhc_post_pre
-
-        if prev_residual is not None and use_fused:
-            # Dispatch cascade: aiter HIP (gfx95) -> Triton (gfx95 small-batch
-            # <=64 tokens, or gfx1250 all sizes) -> TileLang -> None.
-            input_norm_weight = (
-                self._input_layernorm_weight_bf16
-                if self._input_layernorm_weight_bf16 is not None
-                else self.input_layernorm.weight.data
-            )
-            fused = apply_mhc_post_pre_boundary(
-                hidden_states,
-                prev_residual,
-                prev_post,
-                prev_comb,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.hc_mult,
-                self.rms_norm_eps,
-                self.hc_eps,
-                _MHC_POST_MULT_VALUE,
-                self.hc_sinkhorn_iters,
-                input_norm_weight,
-                self.input_layernorm.variance_epsilon,
-                fn_transpose=False,
-            )
-            if fused is not None:
-                residual, hidden_states, post, comb, norm_fused = fused
-                if not norm_fused:
-                    # Triton fused post+pre (gfx95 small-batch or gfx1250) returns
-                    # norm_fused=False — the input layernorm is NOT folded.
-                    # gfx95 takes the fp8-quant path; gfx1250 takes plain layernorm.
-                    hidden_states, x_quant = self._input_norm(
-                        hidden_states, allow_aiter_quant=_is_gfx95_supported
-                    )
-                else:
-                    x_quant = None
-            else:
-                hidden_states = self.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
-                residual = hidden_states
-                hidden_states, post, comb, norm_fused = self.hc_pre(
-                    hidden_states,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    norm=self.input_layernorm,
-                    forward_batch=forward_batch,
-                )
-                if not norm_fused:
-                    # gfx1250 takes plain layernorm here
-                    hidden_states, x_quant = self._input_norm(
-                        hidden_states, allow_aiter_quant=_is_gfx95_supported
-                    )
-                else:
-                    x_quant = None
-        else:
-            residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                norm=self.input_layernorm,
-                forward_batch=forward_batch,
-            )
-            if not norm_fused:
-                # gfx1250 takes plain layernorm here
-                hidden_states, x_quant = self._input_norm(
-                    hidden_states, allow_aiter_quant=_is_gfx95_supported
-                )
-            else:
-                x_quant = None
-
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            hidden_states = self.self_attn(
-                x=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                x_quant=x_quant,
-            )
-
-        if use_fused:
-            post_attn_norm_weight = (
-                self._post_attention_layernorm_weight_bf16
-                if self._post_attention_layernorm_weight_bf16 is not None
-                else self.post_attention_layernorm.weight.data
-            )
-            fused = apply_mhc_post_pre_boundary(
-                hidden_states,
-                residual,
-                post,
-                comb,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.hc_mult,
-                self.rms_norm_eps,
-                self.hc_eps,
-                _MHC_POST_MULT_VALUE,
-                self.hc_sinkhorn_iters,
-                post_attn_norm_weight,
-                self.post_attention_layernorm.variance_epsilon,
-                fn_transpose=True,
-            )
-            if fused is not None:
-                residual, hidden_states, post, comb, norm_fused = fused
-                if not norm_fused:
-                    hidden_states = self.post_attention_layernorm(hidden_states)
-            else:
-                hidden_states = self.hc_post(hidden_states, residual, post, comb)
-                residual = hidden_states
-                hidden_states, post, comb, norm_fused = self.hc_pre(
-                    hidden_states,
-                    self.hc_ffn_fn,
-                    self.hc_ffn_scale,
-                    self.hc_ffn_base,
-                    norm=self.post_attention_layernorm,
-                    forward_batch=forward_batch,
-                )
-                if not norm_fused:
-                    hidden_states = self.post_attention_layernorm(hidden_states)
-        else:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
-            residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                norm=self.post_attention_layernorm,
-                forward_batch=forward_batch,
-            )
-            if not norm_fused:
-                hidden_states = self.post_attention_layernorm(hidden_states)
-
-        hidden_states = self._run_moe_ffn_dp_sync(
-            hidden_states,
-            forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-        )
-
-        if not use_fused:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
-            return hidden_states, None, None, None
-
-        # Return the deferred FFN hc_post state; the next layer consumes it with
-        # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
-        return hidden_states, residual, post, comb
-
-    @functools.cached_property
-    def _can_fuse_attn_mhc(self) -> bool:
-        """The static half of the attention fuse gate (dsv4.1 only); load-time
-        facts, dropped by `refresh_mhc_norm_weight_cache`. Row capacity is the
-        dynamic half, checked per forward via `can_fuse_all_reduce`."""
-        return (
-            get_parallel().tp_size == self.self_attn.attn_tp_size == 4
-            and self.self_attn.wo_b.reduce_results
-            and self.local_boundary.norm_fusable
-            and mhc.can_fuse_post(self.hc_cfg)
-        )
-
     @functools.cached_property
     def _can_fuse_ffn_mhc(self) -> bool:
         """The MoE counterpart of `_can_fuse_attn_mhc`."""
@@ -3342,541 +3092,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             and not should_skip_post_experts_all_reduce(is_tp_path=True)
             and mhc.can_fuse_post(self.hc_cfg)
         )
-
-    def forward_hc_pre_from_prev(
-        self,
-        positions: torch.Tensor,
-        state: mhc.HcState,
-        input_ids: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_ids_global: torch.Tensor,
-    ) -> mhc.HcState:
-        """The layer's two hyper-connections, each collapsing with the previous one's
-        pre-mix."""
-        self._init_boundaries()
-        stats_stream = None
-        if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
-            stats_stream = self.hc_stats_stream
-
-        def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
-            assert self.attn_hc is not None
-            residual = state.residual
-            quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
-            mhc.fork_stats_stream(stats_stream)
-            x = mhc.combine(self.attn_hc, state, quantized)
-            precomputed = state.stats
-            state.release()
-            del state
-            world_size = self.self_attn.attn_tp_size
-            fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
-                x.shape[0], self.hc_cfg.hidden
-            )
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-                y = self.self_attn(
-                    x=x,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    x_quant=quantized[0] if quantized else None,
-                    defer_all_reduce=fuse_all_reduce_mhc,
-                )
-            del x
-            return mhc.run_attn_post(
-                self.attn_hc,
-                y,
-                residual,
-                stats_stream=stats_stream,
-                next=self.local_boundary,
-                world_size=world_size,
-                precomputed=precomputed,
-            )
-
-        def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
-            assert self.ffn_hc is not None
-            residual = state.residual
-            mhc.fork_stats_stream(stats_stream)
-            x = mhc.combine(self.ffn_hc, state)
-            precomputed = state.stats
-            state.release()
-            del state
-            fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
-                x.shape[0], self.hc_cfg.hidden
-            )
-            y = self._run_moe_ffn_dp_sync(
-                x,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                return_moe_output=fuse_all_reduce_mhc,
-            )
-            del x
-            return mhc.run_moe_post(
-                self.ffn_hc,
-                y,
-                residual,
-                stats_stream=stats_stream,
-                next=self.next_boundary,
-                world_size=self.mlp.tp_size,
-                precomputed=precomputed,
-            )
-
-        return run_ffn_hc(run_attn_hc(state))
-
-    def _run_moe_ffn_dp_sync(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        *,
-        input_ids: Optional[torch.Tensor],
-        input_ids_global: Optional[torch.Tensor],
-        return_moe_output: bool = False,
-    ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
-        _use_cp = is_cp_active(forward_batch)
-        _use_tp_moe_gather = (
-            not _use_cp
-            and get_parallel().attn_dp_size > 1
-            and get_moe_a2a_backend().is_none()
-        )
-        _use_tp_attn_a2a_scatter = (
-            not _use_cp
-            and get_parallel().attn_tp_size > 1
-            and not get_moe_a2a_backend().is_none()
-        )
-        # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
-        # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
-        # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
-        # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
-        # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
-        # MUST tell the MoE to skip it (mlp_reduce_scatter=True) or it
-        # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
-        _use_reduce_scatterv = (
-            _use_tp_moe_gather
-            and is_dp_gatherv_active()
-            and forward_batch.dp_padding_mode is not None
-            and not forward_batch.dp_padding_mode.is_max_len()
-        )
-        # SGLANG_DP_USE_REDUCE_SCATTER: in the MAX_LEN decode path (equal per-rank
-        # padding, gatherv inactive, no EP), replace the MoE-internal post-experts
-        # all_reduce + dp_scatter with an equal-chunk reduce_scatter. On ROCm this
-        # uses the aiter custom kernel (so BOTH gather and combine are aiter custom),
-        # elsewhere RCCL reduce_scatter; either way it cuts combine traffic ~2x vs
-        # all_reduce. tp_size==attn_dp_size required so the global buffer splits
-        # evenly into per-rank chunks.
-        _use_reduce_scatter = (
-            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
-            and _use_tp_moe_gather
-            and not _use_reduce_scatterv
-            and not should_use_dp_reduce_scatterv()
-            and forward_batch.dp_padding_mode is not None
-            and forward_batch.dp_padding_mode.is_max_len()
-            and get_parallel().tp_size == get_parallel().attn_dp_size
-        )
-        mlp_reduce_scatter = (
-            _use_cp
-            or _use_reduce_scatterv
-            or _use_reduce_scatter
-            or (_use_tp_moe_gather and should_use_dp_reduce_scatterv())
-        )
-        # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
-        # on LOCAL hidden before the gather and add it back after the combine
-        # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
-        # Applies to BOTH prefill and decode: the shared expert is a per-token MLP,
-        # so computing it on this rank's local tokens (M_local rows) is identical to
-        # computing it on the gathered global buffer (M_global rows) and keeping the
-        # local slice -- but costs 1/attn_dp_size the rows. With a replicated (TP1) shared
-        # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
-        # M_global * dim/tp), so decode no longer pays the ~attn_dp_size x penalty.
-        _shared_local = None
-        _do_shared_local = (
-            _SHARED_EXPERT_LOCAL
-            and _use_tp_moe_gather
-            and getattr(self.mlp, "shared_experts", None) is not None
-            and getattr(self.mlp, "_shared_expert_tp1", False)
-        )
-        if _use_cp:
-            moe_a2a_backend = get_moe_a2a_backend()
-            if moe_a2a_backend.is_none():
-                hidden_states = attn_cp_interleave_gather(hidden_states)
-            else:
-                assert (
-                    moe_a2a_backend.is_deepep()
-                    or moe_a2a_backend.is_megamoe()
-                    or moe_a2a_backend.is_mori()
-                ), (
-                    "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
-                    f"got {moe_a2a_backend.value!r}."
-                )
-        elif _use_tp_moe_gather:
-            hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_parallel().tp_group),
-                hidden_states,
-            )
-            if _do_shared_local and local_hidden_states.shape[0] > 0:
-                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
-            # The gather ships the whole padded chunk and the MoE runs on it, but
-            # graph replay never refreshes pad rows, so they hold stale pool
-            # memory (bf16-max scale) that overflows the MoE and the combine.
-            if _is_hip:
-                _mask_dp_pad_rows(local_hidden_states, forward_batch)
-            # self_attn has already reduced across attention TP, so these hidden
-            # states are replicated and must not be summed by a partial gather.
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
-        _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
-        if _use_tp_attn_a2a_scatter:
-            s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
-            _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
-            hidden_states = _a2a_scatter_chunks[r].contiguous()
-            # DSpark next-token layers are not hash-routed and intentionally do not
-            # carry token IDs. Only split IDs for callers that actually provide them.
-            if input_ids is not None:
-                input_ids = input_ids.tensor_split(s)[r].contiguous()
-            if input_ids_global is not None:
-                input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
-        # Skip the MoE-internal post-experts all_reduce when we will do the
-        # reduce via reduce_scatterv/reduce_scatter at the combine below
-        # (else double-reduce).
-        gathered_rows = (
-            _every_row_routed(forward_batch, hidden_states.shape[0])
-            if _use_cp and get_moe_a2a_backend().is_none()
-            else nullcontext()
-        )
-        with (
-            get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
-            gathered_rows,
-        ):
-            return_moe_output = (
-                return_moe_output
-                and not _use_cp
-                and not _use_tp_moe_gather
-                and not _use_tp_attn_a2a_scatter
-            )
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                skip_shared_experts=_do_shared_local,
-                return_moe_output=return_moe_output,
-            )
-
-        if _use_cp and get_moe_a2a_backend().is_none():
-            if self.config.model_type == "deepseek_v41":
-                parallel = get_parallel()
-                hidden_states = parallel.tp_group.all_reduce(hidden_states)
-                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
-                    parallel.attn_cp_rank
-                ].contiguous()
-            else:
-                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
-        elif _use_tp_moe_gather:
-            hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_parallel().tp_group),
-                hidden_states,
-            )
-            if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
-                # SUM the TP-sharded per-rank partial expert outputs AND scatter
-                # each rank its own token slice, in one op. Correct because the
-                # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
-                # This is the symmetric inverse of the all_gatherv gather.
-                get_parallel().tp_group.reduce_scatterv(
-                    global_hidden_states,
-                    output=hidden_states,
-                    sizes=get_dp_global_num_tokens(),
-                )
-            elif _use_reduce_scatter:
-                # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial
-                # expert outputs AND scatter each rank its own (MAX_LEN-padded)
-                # token chunk in one op (symmetric inverse of the MAX_LEN
-                # all_gather). Correct because the MoE-internal all_reduce was
-                # skipped (mlp_reduce_scatter above). dp_reduce_scatter_tensor
-                # routes to the equal-chunk reduce_scatter_tensor here (its
-                # variable-length reduce_scatterv branch is gated by
-                # is_dp_gatherv_active(), which is False under MAX_LEN), which in
-                # turn uses the aiter custom kernel when it fits (else RCCL).
-                dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
-            else:
-                dp_scatter(hidden_states, global_hidden_states, forward_batch)
-            # PoC: add the locally-computed shared-expert output to this rank's
-            # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
-            # above). Covers both prefill (gatherv) and decode (dp_scatter).
-            if _shared_local is not None:
-                n = hidden_states.shape[0]
-                hidden_states = hidden_states + _shared_local[:n]
-        if _use_tp_attn_a2a_scatter:
-            assert _a2a_scatter_chunks is not None
-            if _is_hip:
-                hidden_states = _attn_tp_all_gather_chunks(
-                    hidden_states, chunk_rows=[t.shape[0] for t in _a2a_scatter_chunks]
-                )
-            else:
-                gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
-                attn_tp_all_gather(gathered, hidden_states.contiguous())
-                hidden_states = torch.cat(gathered)
-        return hidden_states
-
-    # ------------------------------------------------------------------
-    # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
-    #
-    # These mirror the NON-fused branch of ``forward`` (cross-layer mHC
-    # fusion is disabled under TBO, so every layer is self-contained), split
-    # into ops so the operations engine can overlap one ubatch's MoE a2a
-    # dispatch/combine with the other ubatch's attention + expert GEMM.
-    # The MoE ops themselves (op_gate / op_select_experts / op_dispatch_a/b /
-    # op_experts / op_combine_a/b / op_shared_experts / op_output) are reused
-    # as-is from ``self.mlp`` (DeepseekV2MoE) — they decompose ``forward_deepep``.
-    # ------------------------------------------------------------------
-    def op_mhc_prepare_attn(
-        self,
-        state,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor] = None,
-        tbo_subbatch_index: Optional[int] = None,
-        **kwargs,
-    ):
-        # Non-fused attention-side mHC pre + input layernorm.
-        attn_residual = hidden_states
-        hidden_states, post, comb, norm_fused = self.hc_pre(
-            hidden_states,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            norm=self.input_layernorm,
-            forward_batch=forward_batch,
-        )
-        if not norm_fused:
-            hidden_states, x_quant = self._input_norm(hidden_states)
-        else:
-            x_quant = None
-
-        state.attn_residual = attn_residual
-        state.attn_post = post
-        state.attn_comb = comb
-        state.hidden_states_after_input_norm = hidden_states
-        state.attn_x_quant = x_quant
-        # mori's op_output slices final_hidden_states[:num_tokens].
-        if get_moe_a2a_backend().is_mori():
-            state.num_tokens = attn_residual.shape[0]
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-        )
-
-    def op_mhc_post_attn_pre_mlp(self, state):
-        # Close the attention mHC (hc_post), then open the FFN-side mHC pre +
-        # post-attention layernorm. Produces the 2D MoE input.
-        #
-        # Pop each boundary tensor from the state EXACTLY ONCE, up front, and
-        # reuse the locals for both the fused attempt and the non-fused
-        # fallback. apply_mhc_post_pre_boundary() returns None when it declines
-        # to fuse -- most importantly for the 0-token DP two-batch-overlap idle
-        # ubatch -- in which case control must fall through to the unfused
-        # hc_post. Popping in the fused call's arguments and again in the
-        # fallback would double-pop -> KeyError: 'hidden_states_after_attn' on
-        # every idle DP rank. use_fused_mhc_post_pre is on whenever the aiter
-        # gfx95 mHC path is available (is_cross_layer_mhc_fusion_enabled), so
-        # this fallback is reached under DP regardless of the TileLang env.
-        hidden_states_after_attn = state.pop("hidden_states_after_attn")
-        attn_residual = state.pop("attn_residual")
-        attn_post = state.pop("attn_post")
-        attn_comb = state.pop("attn_comb")
-
-        if self.use_fused_mhc_post_pre:
-            post_attn_norm_weight = (
-                self._post_attention_layernorm_weight_bf16
-                if self._post_attention_layernorm_weight_bf16 is not None
-                else self.post_attention_layernorm.weight.data
-            )
-            fused = apply_mhc_post_pre_boundary(
-                hidden_states_after_attn,
-                attn_residual,
-                attn_post,
-                attn_comb,
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.hc_mult,
-                self.rms_norm_eps,
-                self.hc_eps,
-                _MHC_POST_MULT_VALUE,
-                self.hc_sinkhorn_iters,
-                post_attn_norm_weight,
-                self.post_attention_layernorm.variance_epsilon,
-                fn_transpose=True,
-            )
-            if fused is not None:
-                ffn_residual, hidden_states, post, comb, norm_fused = fused
-                if not norm_fused:
-                    # The Triton fused post+pre skips the post-attention
-                    # layernorm (norm_fused=False); apply it before the MoE,
-                    # matching the unfused hc_pre path below.
-                    hidden_states = self.post_attention_layernorm(hidden_states)
-                state.ffn_residual = ffn_residual
-                state.ffn_post = post
-                state.ffn_comb = comb
-                state.hidden_states_mlp_input = hidden_states
-                return
-
-        hidden_states = self.hc_post(
-            hidden_states_after_attn,
-            attn_residual,
-            attn_post,
-            attn_comb,
-        )
-        ffn_residual = hidden_states
-        hidden_states, post, comb, norm_fused = self.hc_pre(
-            hidden_states,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            norm=self.post_attention_layernorm,
-            forward_batch=state.forward_batch,
-        )
-        if not norm_fused:
-            hidden_states = self.post_attention_layernorm(hidden_states)
-        state.ffn_residual = ffn_residual
-        state.ffn_post = post
-        state.ffn_comb = comb
-        state.hidden_states_mlp_input = hidden_states
-
-    def op_mhc_postprocess(self, state):
-        # Close the FFN mHC (hc_post) and emit the next layer's input dict.
-        hidden_states = self.hc_post(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("ffn_residual"),
-            state.pop("ffn_post"),
-            state.pop("ffn_comb"),
-        )
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            # DSV4 non-fused layers carry no residual across layers; the key is
-            # required by the next layer's op_mhc_prepare_attn (ignored).
-            residual=None,
-            forward_batch=state.forward_batch,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-        state.clear(
-            expect_keys={
-                "positions",
-                "forward_batch",
-                "tbo_subbatch_index",
-            }
-        )
-        return output
-
-    # ------------------------------------------------------------------
-    # Non-EP (DP TP-MoE) TBO ops. Overlap the DP all_gatherv (pre-MoE gather)
-    # + reduce_scatterv (post-MoE combine) with the OTHER ubatch's attn+MoE
-    # compute. Used when moe_a2a_backend is "none" (DP-attention, TP-MoE) —
-    # the path ATOM uses for DSV4 (+~7.7% prefill). Replaces the EP mori
-    # op_dispatch/op_combine. op_mhc_* and op_attn are reused (local hidden).
-    # ------------------------------------------------------------------
-    def op_gather_a(self, state):
-        # Launch the all_gatherv (local hidden -> global buffer) + the input_ids
-        # replicate-gather on the shared comm stream; record an event.
-        fb = state.forward_batch
-        local = state.pop("hidden_states_mlp_input")  # LOCAL [M_local, hidden]
-        # Shared-expert-local: compute on LOCAL hidden before the gather; added
-        # back after the combine (same as the non-fused forward). Skipped in the
-        # global MoE via skip_shared_experts.
-        do_shared_local = (
-            _SHARED_EXPERT_LOCAL
-            and getattr(self.mlp, "shared_experts", None) is not None
-            and getattr(self.mlp, "_shared_expert_tp1", False)
-        )
-        state.do_shared_local = do_shared_local
-        state.shared_local = (
-            self.mlp._forward_shared_experts(local)
-            if (do_shared_local and local.shape[0] > 0)
-            else None
-        )
-        # Persistent grow-only scratch (keyed per ubatch) instead of a fresh
-        # torch.empty each layer -> stops the allocator's `reserved` from
-        # ballooning at large prefill chunks. input_ids_global is gathered ONCE
-        # per ubatch in _forward_layers_tbo (cached on fb), not here.
-        sub = state.tbo_subbatch_index
-        global_rows = get_global_dp_buffer_len()
-        global_hidden = get_tbo_persistent_buffer(
-            ("gh", sub), global_rows, local.shape[1], local.dtype, local.device
-        )
-        comm = get_dp_tbo_comm_stream()
-        compute = torch.cuda.current_stream()
-        with torch.cuda.stream(comm):
-            comm.wait_stream(compute)
-            dp_gather_partial(global_hidden, local, fb)
-            state.gather_event = _tbo_event(("gather", sub))
-            state.gather_event.record(comm)
-        state.gather_keepalive = local
-        state.global_hidden = global_hidden
-
-    def op_gather_b(self, state):
-        torch.cuda.current_stream().wait_event(state.pop("gather_event"))
-        # Compute now ordered after the gather -> the gather input is safe to
-        # release (freed on the compute stream, no record_stream deferral).
-        state.pop("gather_keepalive")
-
-    def op_moe(self, state):
-        # MoE (gate/topk/experts) on the GLOBAL gathered buffer. mlp_reduce_scatter
-        # skips the MoE-internal all_reduce (we reduce_scatterv in op_combine).
-        fb = state.forward_batch
-        global_hidden = state.pop("global_hidden")
-        global_ids = fb._tbo_global_input_ids
-        with get_forward().scoped(mlp_reduce_scatter=True):
-            state.global_expert_out = self.mlp(
-                global_hidden,
-                fb,
-                input_ids=global_ids,
-                input_ids_global=global_ids,
-                skip_shared_experts=state.do_shared_local,
-            )
-
-    def op_combine_a(self, state):
-        # Launch reduce_scatterv (global partial expert sums -> per-rank local) on
-        # the comm stream; record an event. Symmetric inverse of the all_gatherv.
-        global_out = state.pop("global_expert_out")
-        local_out = get_tbo_persistent_buffer(
-            ("lo", state.tbo_subbatch_index),
-            get_local_dp_buffer_len(),
-            global_out.shape[1],
-            global_out.dtype,
-            global_out.device,
-        )
-        state.combine_event = dp_reduce_scatterv_async(
-            local_out,
-            global_out,
-            get_dp_global_num_tokens(),
-            event_key=("combine", state.tbo_subbatch_index),
-        )
-        state.local_out = local_out
-        # Keep the (variable-size) MoE output alive until op_combine_b waits on
-        # the combine event (replaces record_stream; avoids reserved churn).
-        state.combine_keepalive = global_out
-
-    def op_combine_b(self, state):
-        torch.cuda.current_stream().wait_event(state.pop("combine_event"))
-        state.pop("combine_keepalive")
-        hidden = state.pop("local_out")
-        shared_local = state.pop("shared_local")
-        state.pop("do_shared_local")
-        if shared_local is not None:
-            n = hidden.shape[0]
-            hidden = hidden + shared_local[:n]
-        state.hidden_states_mlp_output = hidden
-
-
-def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
-    n_real = forward_batch.num_token_non_padded
-    num_rows = local_hidden_states.shape[0]
-    if n_real is None or num_rows == 0:
-        return
-    pad = torch.arange(num_rows, device=local_hidden_states.device) >= n_real
-    local_hidden_states.masked_fill_(
-        pad.view(-1, *([1] * (local_hidden_states.dim() - 1))), 0
-    )
 
 
 def _gather_late_layer_ids(
@@ -3904,6 +3119,201 @@ def _scatter_tail_rows(
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full
+
+
+class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
+    """CUDA execution with declared residual reads and writes."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.self_attn.wo_b.reduce_results = False
+        self.mlp.reduce_results = False
+        declarations = hc_boundary.stages(self.config, self.layer_id, layer=self)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declarations[0], self.input_layernorm),
+            (declarations[1], self.post_attention_layernorm),
+        )
+
+    def _run_boundary_attention(
+        self, hidden_states, positions, forward_batch, quantized
+    ):
+        return self.self_attn(
+            x=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            x_quant=quantized,
+            defer_all_reduce=True,
+        )
+
+    def _bind_attention_transport(
+        self, hidden_states, batch, call, rows, overlapped_rows
+    ):
+        return hc_boundary.AttentionTransport(self, hidden_states, batch, call, rows)
+
+    def _bind_moe_transport(self, hidden_states, batch, call, rows, overlapped_rows):
+        if call.tbo:
+            if overlapped_rows is None:
+                raise NotImplementedError(
+                    "this operand transport has no overlapped path"
+                )
+            return OverlappedMoeTransport(
+                self.mlp, hidden_states, batch, call.tbo_subbatch_index, overlapped_rows
+            )
+        return hc_boundary.MoeTransport(self, hidden_states, batch, call, rows)
+
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        input_ids,
+        forward_batch,
+        input_ids_global,
+        *,
+        allow_cross_layer_fusion=True,
+    ):
+        call = hc_boundary.LayerCall(
+            input_ids, input_ids_global, allow_cross_layer_fusion
+        )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, read_context=call
+        )
+        quantized = residual_batch.written_residual(forward_batch).quantized
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = self._run_boundary_attention(
+                hidden_states, positions, forward_batch, quantized
+            )
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states, forward_batch, read_context=call
+        )
+        transport = self.ffn_boundary.transport_context(forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as output:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                input_ids=transport.input_ids,
+                input_ids_global=transport.input_ids_global,
+                skip_shared_experts=transport.do_shared_local,
+                return_moe_output=transport.return_moe_output,
+                leave_output_sum=True,
+            )
+            return output.finish(hidden_states)
+
+    @functools.cached_property
+    def _can_fuse_attn_mhc(self) -> bool:
+        """The static half of the attention fuse gate (dsv4.1 only); load-time
+        facts, dropped by `refresh_mhc_norm_weight_cache`. Row capacity is the
+        dynamic half, checked per forward via `can_fuse_all_reduce`."""
+        boundary = mhc.make_boundary(
+            self.post_attention_layernorm, accepts_mxfp8=False, hc=self.ffn_hc
+        )
+        return (
+            get_parallel().tp_size == self.self_attn.attn_tp_size == 4
+            and boundary.norm_fusable
+            and mhc.can_fuse_post(self.hc_cfg)
+        )
+
+    def op_mhc_prepare_attn(
+        self,
+        state,
+        positions,
+        hidden_states,
+        forward_batch,
+        residual=None,
+        tbo_subbatch_index=None,
+        **kwargs,
+    ):
+        residual_batch.start(forward_batch)
+        call = hc_boundary.LayerCall(
+            forward_batch.input_ids,
+            getattr(forward_batch, "_tbo_global_input_ids", forward_batch.input_ids),
+            allow_cross_layer_fusion=False,
+            tbo=True,
+            tbo_subbatch_index=tbo_subbatch_index,
+        )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, read_context=call
+        )
+        state.hidden_states_after_input_norm = hidden_states
+        state.attn_x_quant = residual_batch.written_residual(forward_batch).quantized
+        if get_moe_a2a_backend().is_mori():
+            state.num_tokens = hidden_states.shape[0]
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_mhc_post_attn_pre_mlp(self, state):
+        batch = state.forward_batch
+        hidden_states = self.attn_boundary.finish(
+            state.pop("hidden_states_after_attn"), batch
+        )
+        call = hc_boundary.LayerCall(
+            batch.input_ids,
+            getattr(batch, "_tbo_global_input_ids", batch.input_ids),
+            allow_cross_layer_fusion=False,
+            tbo=True,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
+            hidden_states, batch, read_context=call
+        )
+
+    def op_mhc_postprocess(self, state):
+        batch = state.forward_batch
+        hidden_states = self.ffn_boundary.finish(
+            state.pop("hidden_states_mlp_output"), batch
+        )
+        hidden_states = residual_batch.read_output(
+            hidden_states, batch, hc_boundary.FinalRead(), None
+        )
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=None,
+            forward_batch=batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear(expect_keys={"positions", "forward_batch", "tbo_subbatch_index"})
+        return output
+
+    def op_gather_a(self, state):
+        state.pop("hidden_states_mlp_input")
+        self.ffn_boundary.transport_context(state.forward_batch).issue_gather()
+
+    def op_gather_b(self, state):
+        self.ffn_boundary.transport_context(state.forward_batch).wait_gather()
+
+    def op_moe(self, state):
+        transport = self.ffn_boundary.transport_context(state.forward_batch)
+        state.global_expert_out = _tbo_run_moe(
+            self,
+            transport.global_hidden,
+            state.forward_batch,
+            transport.do_shared_local,
+        )
+
+    def op_combine_a(self, state):
+        self.ffn_boundary.transport_context(state.forward_batch).issue_combine(
+            state.pop("global_expert_out")
+        )
+
+    def op_combine_b(self, state):
+        state.hidden_states_mlp_output = self.ffn_boundary.transport_context(
+            state.forward_batch
+        ).wait_combine()
+
+
+class DeepseekV4PlatformDecoderLayer(NonCudaDecoderMixin, DeepseekV4DecoderLayerBase):
+    """Non-CUDA execution with platform mHC state and fusion."""
+
+
+DeepseekV4DecoderLayer = (
+    DeepseekV4CudaDecoderLayer if _is_cuda else DeepseekV4PlatformDecoderLayer
+)
 
 
 class DeepseekV4Model(nn.Module):
@@ -3986,6 +3396,10 @@ class DeepseekV4Model(nn.Module):
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            final_read=hc_boundary.FinalRead() if _is_cuda else None,
+            stage_facts=functools.partial(hc_boundary.stages, config)
+            if _is_cuda
+            else None,
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4016,9 +3430,11 @@ class DeepseekV4Model(nn.Module):
                 ),
             )
 
-        self.use_fused_mhc_post_pre = (
-            is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
-        )
+        if not _is_cuda:
+            self.use_fused_mhc_post_pre = (
+                is_cross_layer_mhc_fusion_enabled()
+                or _is_fused_mhc_post_pre_enabled_xpu()
+            )
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
 
@@ -4153,6 +3569,11 @@ class DeepseekV4Model(nn.Module):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+        tail_in_graph = (
+            tail is not None
+            and tail.scatter_indices is not None
+            and is_in_breakable_cuda_graph()
+        )
         late_dp_counts = None
         saved_dp = None
         if (
@@ -4167,20 +3588,38 @@ class DeepseekV4Model(nn.Module):
                     if tail is not None
                     else hidden_states.shape[0]
                 ),
+                in_graph=tail_in_graph,
             )
-        tail_in_graph = (
-            tail is not None
-            and tail.scatter_indices is not None
-            and is_in_breakable_cuda_graph()
-        )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
-        # A pending post never meets a residual reader: the HIP boundary's defer_post
-        # gate excludes Engram/DSpark-capture layers and the model end.
+        # The HIP defer_post gate excludes residual readers. CUDA materializes
+        # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        if _is_cuda:
+            residual_batch.start(forward_batch)
+            hidden_states = residual_batch.set_written(state, forward_batch)
         for i in range(self.start_layer, self.end_layer):
+            if _is_cuda:
+                layer = self.layers[i]
+                if (
+                    (tail is not None and i == self.late_layer_start)
+                    or layer.engram is not None
+                    or (capture_dspark and i in self.dspark_layers_to_capture)
+                ):
+                    call = hc_boundary.LayerCall(
+                        input_ids,
+                        input_ids_global,
+                    )
+                    next_boundary = (
+                        hc_boundary.HcRead(layer, True)
+                        .bind(forward_batch, call)
+                        .next_boundary
+                    )
+                    hidden_states = state = hc_boundary.materialize(
+                        hidden_states, forward_batch, next=next_boundary
+                    )
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
@@ -4192,6 +3631,8 @@ class DeepseekV4Model(nn.Module):
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
+                if _is_cuda:
+                    hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
                 if not (
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
@@ -4231,6 +3672,8 @@ class DeepseekV4Model(nn.Module):
                         hidden_states,
                     )
                 state = state.with_residual(hidden_states)
+                if _is_cuda:
+                    hidden_states = residual_batch.set_written(state, forward_batch)
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
@@ -4243,25 +3686,39 @@ class DeepseekV4Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if _is_hip and self.layers[i].hc_boundary_fused:
-                    state = _hip.forward_layer_fused_boundary(
-                        self,
-                        i,
-                        state,
+                if _is_cuda:
+                    hidden_states = self.layers[i](
                         positions=positions,
+                        hidden_states=hidden_states,
                         input_ids=input_ids,
                         forward_batch=forward_batch,
                         input_ids_global=input_ids_global,
-                        capture_dspark=capture_dspark,
                     )
-                    continue
-                state = self.layers[i].forward_hc_pre_from_prev(
-                    positions=positions,
-                    state=state,
-                    input_ids=input_ids,
-                    forward_batch=forward_batch,
-                    input_ids_global=input_ids_global,
-                )
+                else:
+                    if _is_hip and self.layers[i].hc_boundary_fused:
+                        state = forward_layer_fused_boundary(
+                            self,
+                            i,
+                            state,
+                            positions=positions,
+                            input_ids=input_ids,
+                            forward_batch=forward_batch,
+                            input_ids_global=input_ids_global,
+                            capture_dspark=capture_dspark,
+                        )
+                        continue
+                    state = self.layers[i].forward_hc_pre_from_prev(
+                        positions=positions,
+                        state=state,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_ids_global=input_ids_global,
+                    )
+        if _is_cuda:
+            state = residual_batch.read_output(
+                hidden_states, forward_batch, hc_boundary.FinalRead(), None
+            )
+            residual_batch.clear(forward_batch)
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_dp is not None:
             exit_late_layer_dp(forward_batch, saved_dp)
@@ -4379,18 +3836,43 @@ class DeepseekV4Model(nn.Module):
                 tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
-        outputs_arr = execute_overlapped_operations(
-            inputs_arr=inputs_arr,
-            operations_arr=[operations_strategy.operations] * 2,
-            delta_stages=[0, operations_strategy.tbo_delta_stages],
-        )
+        try:
+            outputs_arr = execute_overlapped_operations(
+                inputs_arr=inputs_arr,
+                operations_arr=[operations_strategy.operations] * 2,
+                delta_stages=[0, operations_strategy.tbo_delta_stages],
+            )
 
-        return _model_forward_tbo_merge_key(
-            outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
-        )
+            return _model_forward_tbo_merge_key(
+                outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
+            )
+        finally:
+            if _is_cuda:
+                for child in forward_batch.tbo_children:
+                    residual_batch.clear(child)
 
     @torch.no_grad()
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if not _is_cuda:
+            return self._forward_impl(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+        try:
+            return self._forward_impl(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+        finally:
+            residual_batch.clear(forward_batch)
+
+    @torch.no_grad()
+    def _forward_impl(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -4486,7 +3968,9 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            use_fused = self.use_fused_mhc_post_pre
+            if _is_cuda:
+                residual_batch.start(forward_batch)
+            use_fused = not _is_cuda and self.use_fused_mhc_post_pre
             prev_residual, prev_post, prev_comb = None, None, None
             last_layer = None
             for i in range(self.start_layer, self.end_layer):
@@ -4498,25 +3982,42 @@ class DeepseekV4Model(nn.Module):
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        forward_batch=forward_batch,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
-                    )
+                    if _is_cuda:
+                        hidden_states = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                        )
+                    else:
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
+                        )
                 if capture_dspark and i in self.dspark_layers_to_capture:
-                    if use_fused:
+                    if _is_cuda:
+                        completed = hc_boundary.materialize(
+                            hidden_states, forward_batch, consume=False
+                        )
+                    elif use_fused:
                         completed = layer.hc_post(
                             hidden_states, prev_residual, prev_post, prev_comb
                         )
                     else:
                         completed = hidden_states
                     dspark_aux_hidden_states.append(completed.mean(dim=1))
-            if use_fused and last_layer is not None:
+            if _is_cuda:
+                hidden_states = residual_batch.read_output(
+                    hidden_states, forward_batch, hc_boundary.FinalRead(), None
+                )
+            elif use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
@@ -4994,7 +4495,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             layer.refresh_mhc_norm_weight_cache()
         layers = self.model.layers
         for i, layer in enumerate(layers):
-            if isinstance(layer, DeepseekV4DecoderLayer):
+            if isinstance(layer, DeepseekV4PlatformDecoderLayer):
                 layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
 
     def precompile_kernels_after_loading(self) -> None:
@@ -5127,7 +4628,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             rms_eps=layer.rms_norm_eps,
             hc_pre_eps=layer.hc_eps,
             hc_sinkhorn_eps=layer.hc_eps,
-            hc_post_mult_value=_MHC_POST_MULT_VALUE,
+            hc_post_mult_value=MHC_POST_MULT_VALUE,
             sinkhorn_repeat=layer.hc_sinkhorn_iters,
             n_splits=1,
             n_splits_pre=32,

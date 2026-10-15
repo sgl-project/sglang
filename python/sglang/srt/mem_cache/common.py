@@ -47,6 +47,22 @@ def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
     return (kv_indices[::page_size] // page_size).cpu().numpy()
 
 
+def suffix_page_indices(
+    req_to_token: torch.Tensor,
+    req_pool_idx: int,
+    prefix_len: int,
+    seq_len: int,
+    page_size: int,
+) -> np.ndarray:
+    """Pages of a request's tokens [prefix_len, seq_len).
+
+    PD prefill and decode both call this with the same page-aligned prefix
+    (decode_prefix_len), so their lists pair up page by page even though their
+    rows point at different physical pages.
+    """
+    return kv_to_page_indices(req_to_token[req_pool_idx, prefix_len:seq_len], page_size)
+
+
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
