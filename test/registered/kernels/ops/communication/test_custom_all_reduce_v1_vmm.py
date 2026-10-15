@@ -70,9 +70,9 @@ def _init_comm() -> CustomAllreduce:
 def test_allocator_is_vmm():
     device, _, _ = _init_groups()
     probe = torch.zeros(16, dtype=torch.bfloat16, device=device)
-    assert is_vmm_pointer(
-        probe.data_ptr()
-    ), "expandable_segments is not active; check PYTORCH_ALLOC_CONF"
+    assert is_vmm_pointer(probe.data_ptr()), (
+        "expandable_segments is not active; check PYTORCH_ALLOC_CONF"
+    )
 
 
 @pytest.mark.parametrize("from_graph_pool", [False, True])
@@ -87,20 +87,22 @@ def test_graph_all_reduce_matches_nccl(size: int, from_graph_pool: bool):
     assert comm.should_custom_ar(graph_inp[0])
 
     graph = torch.cuda.CUDAGraph()
-    outs = []
+    outs, ptrs = [], []
     with comm.capture():
         with torch.cuda.graph(graph):
             for i in range(TEST_LAYERS):
                 # In a server the input is an activation from the graph's own
                 # private pool, so cover that source as well.
                 x = graph_inp[i] + 0 if from_graph_pool else graph_inp[i]
+                ptrs.append(x.data_ptr())
                 outs.append(comm.custom_all_reduce(x))
     torch.cuda.synchronize()
+    # Checked after capture so the test makes no driver calls inside it; the
+    # graph keeps these blocks mapped.
+    assert all(is_vmm_pointer(p) for p in ptrs)
 
     # Small integers stay exact in bf16 after the sum, so compare exactly.
-    inp = torch.randint(
-        0, 16, (TEST_LAYERS, size), dtype=torch.bfloat16, device=device
-    )
+    inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=torch.bfloat16, device=device)
     ref = inp.clone()
     dist.all_reduce(ref, group=nccl_group)
     graph_inp.copy_(inp)
