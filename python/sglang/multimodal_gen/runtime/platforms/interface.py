@@ -210,6 +210,12 @@ class Platform:
         return torch.cuda.get_device_capability()[0] == 12
 
     @classmethod
+    def is_gfx1151(cls) -> bool:
+        """True on the gfx1151 (Strix Halo) ROCm arch. Overridden on
+        RocmPlatform; every other platform is False."""
+        return False
+
+    @classmethod
     def is_cuda_static(cls) -> bool:
         return cls._enum == PlatformEnum.CUDA
 
@@ -530,8 +536,3 @@ class Platform:
     def tensor_on_device(self, t: torch.Tensor) -> bool:
         """Check if a tensor is on the current platform's device."""
         return t.is_cuda
-
-
-class UnspecifiedPlatform(Platform):
-    _enum = PlatformEnum.UNSPECIFIED
-    device_type = ""

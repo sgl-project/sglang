@@ -3,11 +3,15 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.gemm.chunked_embedding_lora_a import (
+from sglang.kernels.ops.lora.dense.chunked_embedding_lora_a import (
     chunked_embedding_lora_a_forward,
 )
-from sglang.kernels.ops.gemm.chunked_sgmv_expand import chunked_sgmv_lora_expand_forward
-from sglang.kernels.ops.gemm.chunked_sgmv_shrink import chunked_sgmv_lora_shrink_forward
+from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
+    chunked_sgmv_lora_expand_forward,
+)
+from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
+    chunked_sgmv_lora_shrink_forward,
+)
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
@@ -104,6 +108,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             weights=weights,
             batch_info=batch_info,
             slice_offsets=output_offset,
+            slice_offsets_cpu=kwargs.get("output_offset_cpu"),
             max_slice_size=max_slice_size,
             base_output=base_output,
         )
@@ -120,7 +125,6 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-
         # x: (s, input_dim)
         # qkv_lora_a: (num_lora, n_slices * r, input_dim)
         # qkv_lora_b: (num_lora, total_output_dim, r)
@@ -137,6 +141,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             weights=qkv_lora_b,
             batch_info=self.batch_info,
             slice_offsets=output_offset,
+            slice_offsets_cpu=kwargs.get("output_offset_cpu"),
             max_slice_size=max_qkv_out_dim,
             base_output=base_output,
         )
@@ -152,7 +157,6 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-
         # x: (s, input_dim)
         # gate_up_lora_a: (num_lora, 2 * r, input_dim)
         # gate_up_lora_b: (num_lora, 2 * output_dim, r)
@@ -171,6 +175,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             weights=gate_up_lora_b,
             batch_info=self.batch_info,
             slice_offsets=output_offset,
+            slice_offsets_cpu=kwargs.get("output_offset_cpu"),
             max_slice_size=output_dim,
             base_output=base_output,
         )
@@ -389,7 +394,6 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         weight_indices: list[int],
         batch_info: LoRABatchInfo,
     ) -> Tuple[Optional[LoRABatchInfo], Optional[List[LoRABatchInfo]]]:
-
         # Precompute lm_head_batch_info for pruned lm_head LoRA
         pruned_lens = get_lm_head_pruned_lens(forward_batch)
         lm_head_batch_info = None

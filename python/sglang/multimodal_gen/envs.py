@@ -5,11 +5,20 @@
 
 import logging
 import os
+import warnings
 from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+if "SGLANG_DIFFUSION_TRACE_FUNCTION" in os.environ:
+    warnings.warn(
+        "SGLANG_DIFFUSION_TRACE_FUNCTION was unused and has been removed. "
+        "Use Python profiling tools for function-level tracing.",
+        FutureWarning,
+        stacklevel=2,
+    )
 
 if TYPE_CHECKING:
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
@@ -20,7 +29,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
-    SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
@@ -35,6 +43,7 @@ if TYPE_CHECKING:
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
+    SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
@@ -47,13 +56,24 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
+    SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
     SGLANG_DIFFUSION_IPC_A2A: bool = True
+    # copy-engine all-to-all for Ulysses groups of any size on one host; off by
+    # default while it is validated. Falls back to NCCL when unavailable.
+    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # head groups for pipelining the Ulysses exchange against dense attention
+    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path):
+    # -1 picks the most groups that divide the heads per rank while each group's
+    # call still fills the GPU, and steps aside when the buffers do not fit; 0 or
+    # 1 keeps the sequential exchange; N >= 2 forces N groups
+    SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
     # retires the transport on every rank and fails the request
@@ -86,6 +106,14 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
     SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
+    # HunyuanImage-3: batch all condition images of a request group into one
+    # VAE/ViT encode call (halve-on-OOM backoff). Opt-in, off by default.
+    SGLANG_HI3_COND_ENCODE_BATCHING: bool = False
+    # HunyuanImage-3: apply the post-decode output geometry (native crop/pad
+    # and exact-size resample) to hit the requested aspect ratio. On by
+    # default; set 0 to skip the plan and return the full decoded native
+    # bucket untouched.
+    SGLANG_HI3_OUTPUT_CROP: bool = True
     SGLANG_CACHE_DIT_SECONDARY_DMD: bool = False
     SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY: int = 6
     SGLANG_CACHE_DIT_SECONDARY_DMD_RANK: int = 0
@@ -226,10 +254,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # if set, SGLANG_DIFFUSION_LOGGING_PREFIX will be prepended to all log messages
     "SGLANG_DIFFUSION_LOGGING_PREFIX": _lazy_str("SGLANG_DIFFUSION_LOGGING_PREFIX", ""),
-    # Trace function calls
-    # If set to 1, sgl_diffusion will trace function calls
-    # Useful for debugging
-    "SGLANG_DIFFUSION_TRACE_FUNCTION": _lazy_int("SGLANG_DIFFUSION_TRACE_FUNCTION", 0),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
     "SGLANG_DIFFUSION_ATTENTION_CONFIG": _lazy_path(
@@ -252,6 +276,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # For image generation task depends on image quality and the model config
     "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
         "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
+    ),
+    # Drop the SP tail-pad attention mask and run dense (unmasked) attention on
+    # the padded layout, instead of the packed-varlen path. Applies only when
+    # sequence parallelism is active and the mask is derived purely from the
+    # shard pad span.
+    "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
     ),
     # Select a built-in platform or an installed platform entry point.
     # Empty means automatic plugin activation followed by built-in detection.
@@ -312,7 +343,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
     # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
-    # up to num_inference_steps - 1 slots; the default covers the 50-step
+    # up to num_inference_steps slots; the default covers the 50-step
     # serving schedule, so this is an escape hatch, not a deployment knob.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
@@ -328,11 +359,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
     ),
+    # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
+    # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build
+    # and run (CC 9.0, 10.0, 12.0, 12.1 with nvcc) and falls back to
+    # comfy_kitchen; "jit" or "comfy_kitchen" forces one backend.
+    "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
+    ),
     # Path to a Parallel Decoding Distillation head stack (one fused output head
     # per denoise step, produced by fuse_minimax_h3_pdd_heads.py). Set only when serving a
     # PDD-distilled checkpoint; an ordinary run leaves the projection alone.
     "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS": _lazy_str(
         "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS"
+    ),
+    # NATTEN backend of the FLUX 3 video VAE (blackwell-fna, hopper-fna,
+    # cutlass-fna or flex-fna); probed per GPU when unset.
+    "SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND"
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
@@ -379,6 +422,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable cache-dit acceleration for DiT inference
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
+        "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
+    ),
+    "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1
+    ),
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),
@@ -421,6 +470,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_SCM_CACHE_BINS": _lazy_str("SGLANG_CACHE_DIT_SCM_CACHE_BINS"),
     # SCM policy: dynamic or static
     "SGLANG_CACHE_DIT_SCM_POLICY": _lazy_str("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"),
+    # HunyuanImage-3: batch all condition images of a request group into one
+    # VAE/ViT encode call (halve-on-OOM backoff on OOM). Opt-in, off by
+    # default; the AR backbone resident on the same device makes full-batch
+    # encoding tight on memory, so it must be explicitly enabled.
+    "SGLANG_HI3_COND_ENCODE_BATCHING": _lazy_bool("SGLANG_HI3_COND_ENCODE_BATCHING"),
+    # HunyuanImage-3: post-decode output geometry (native crop/pad plus
+    # exact-size resample). On by default; 0 returns the raw native bucket.
+    "SGLANG_HI3_OUTPUT_CROP": _lazy_bool("SGLANG_HI3_OUTPUT_CROP", "true"),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
