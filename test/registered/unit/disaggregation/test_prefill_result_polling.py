@@ -307,6 +307,7 @@ class _Scheduler:
             beam_coordinator=None,
             hisparse_coordinator=None,
             decode_offload_manager=None,
+            pending=PendingSteps(),
             output_streamer=None,
             ipc_channels=None,
         )
@@ -1520,6 +1521,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     beam_coordinator=None,
                     hisparse_coordinator=None,
                     decode_offload_manager=None,
+                    pending=PendingSteps(),
                     output_streamer=None,
                     ipc_channels=None,
                 )

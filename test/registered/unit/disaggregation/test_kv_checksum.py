@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.prefill import DisaggPrefill
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.disagg_owner_shells import (
@@ -263,6 +264,7 @@ class TestChecksumMismatchRelease(unittest.TestCase):
                 beam_coordinator=None,
                 hisparse_coordinator=hisparse,
                 decode_offload_manager=None,
+                pending=PendingSteps(),
                 output_streamer=None,
                 ipc_channels=None,
             ),

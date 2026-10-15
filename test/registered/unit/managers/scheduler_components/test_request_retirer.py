@@ -22,8 +22,13 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+from sglang.srt.managers.scheduler_components.pending_steps import (
+    PendingStep,
+    PendingSteps,
+)
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
@@ -47,6 +52,7 @@ def _retirer(**deps) -> RequestRetirer:
         beam_coordinator=MagicMock(),
         hisparse_coordinator=None,
         decode_offload_manager=None,
+        pending=PendingSteps(),
         output_streamer=MagicMock(),
         ipc_channels=MagicMock(),
     )
@@ -377,6 +383,180 @@ class TestPreallocAbortLeavesThroughTheRetirer(CustomTestCase):
         )
         self.assertIsNone(item.feature)
         self.assertIsNone(req.multimodal_inputs)
+
+
+class _RecordingTree:
+    """A prefix cache that records the row ranges it frees, over a real slot
+    pool."""
+
+    def __init__(self, page_size: int = 1):
+        self.req_to_token_pool = ReqToTokenPool(
+            size=4, max_context_len=32, device="cpu", enable_memory_saver=False
+        )
+        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        self.frees = []
+        self.unlock = Mock()
+        self.on_release = Mock()
+        self.finish = Mock()
+
+    def free_kv_row(self, kv, ranges):
+        self.frees.append((kv.req_pool_idx, list(ranges)))
+
+    def claim_kv_row(self, req):
+        return False
+
+    def supports_mamba(self):
+        return False
+
+
+class TestDeferredFree(CustomTestCase):
+    """A released request's slot and the KV pages a pending step may still
+    write go back to their pools at that step's host commit, not before."""
+
+    def setUp(self):
+        enter_scope(self, published_topology())
+
+    def _setup(self, page_size=1):
+        self.tree = _RecordingTree(page_size)
+        self.pool = self.tree.req_to_token_pool
+        self.pending = PendingSteps()
+        self.retirer = _retirer(
+            kv=SimpleNamespace(
+                tree_cache=self.tree,
+                req_to_token_pool=self.pool,
+                token_to_kv_pool_allocator=self.tree.token_to_kv_pool_allocator,
+            ),
+            pending=self.pending,
+        )
+
+    def _req(self, rid="r", *, committed=5, allocated=6):
+        req = Req(rid, "", list(range(8)), SamplingParams())
+        self.pool.alloc([req])
+        req.kv.kv_committed_len = committed
+        req.kv.kv_allocated_len = allocated
+        return req
+
+    def _launch(self, *reqs):
+        step = SimpleNamespace(reqs=list(reqs))
+        self.pending.push(
+            PendingStep(step=step, result=None, launch_ts=0.0, after_idle_gap=False)
+        )
+        return step
+
+    def _commit(self, step):
+        record = self.pending.popleft()
+        self.assertIs(record.step, step)
+        self.retirer.release_held(step)
+
+    def test_no_pending_step_frees_at_once(self):
+        self._setup()
+        req = self._req()
+        slot = req.kv.req_pool_idx
+
+        self.retirer.retire_aborted(req)
+
+        self.assertEqual(self.tree.frees, [(slot, [(0, 5)]), (slot, [(5, 6)])])
+        self.assertIn(slot, self.pool.free_slots)
+        self.assertFalse(req.kv.holds_kv)
+
+    def test_the_last_pending_step_holds_the_slot_and_written_pages(self):
+        self._setup()
+        req = self._req()
+        slot = req.kv.req_pool_idx
+        other = self._launch(self._req("other"))
+        step = self._launch(req)
+
+        self.retirer.retire_aborted(req)
+
+        # The committed pages go now; the written token and the slot wait.
+        self.assertEqual(self.tree.frees, [(slot, [(0, 5)])])
+        self.assertNotIn(slot, self.pool.free_slots)
+        self.assertFalse(req.kv.holds_kv)
+        self.assertEqual(len(list(self.pending.held())), 1)
+
+        self._commit(other)
+        self.assertNotIn(slot, self.pool.free_slots)
+        self._commit(step)
+        self.assertEqual(self.tree.frees[1:], [(slot, [(5, 6)])])
+        self.assertIn(slot, self.pool.free_slots)
+        self.assertEqual(list(self.pending.held()), [])
+
+    def test_two_pending_steps_hold_until_the_newer_commits(self):
+        self._setup()
+        req = self._req()
+        slot = req.kv.req_pool_idx
+        older, newer = self._launch(req), self._launch(req)
+
+        self.retirer.retire_finished(req, checkpoint=False)
+
+        self._commit(older)
+        self.assertNotIn(slot, self.pool.free_slots)
+        self._commit(newer)
+        self.assertIn(slot, self.pool.free_slots)
+
+    def test_retract_while_held_takes_a_new_slot(self):
+        self._setup()
+        req = self._req()
+        slot = req.kv.req_pool_idx
+        step = self._launch(req)
+
+        with patch(f"{_RETIRER}.evict_from_tree_cache"):
+            self.retirer.retract(req, num_remaining_reqs=0)
+        # The requeued request is admitted again before the step commits.
+        self.pool.alloc([req])
+        new_slot = req.kv.req_pool_idx
+        self.assertNotEqual(new_slot, slot)
+        # An abort of the requeued request releases only what it holds now.
+        self.retirer.retire_aborted_waiting(req)
+
+        self._commit(step)
+        self.assertIn(slot, self.pool.free_slots)
+        self.assertNotIn(new_slot, self.pool.free_slots)
+        self.assertEqual(self.tree.frees, [(slot, [(0, 5)]), (slot, [(5, 6)])])
+
+    def test_abort_while_held_frees_once(self):
+        self._setup()
+        req = self._req()
+        slot = req.kv.req_pool_idx
+        step = self._launch(req)
+
+        self.retirer.retire_finished(req, checkpoint=False)
+        # An abort reaching the request after it left holds nothing more.
+        self.retirer.retire_aborted(req)
+
+        self._commit(step)
+        self.assertEqual(self.pool.free_slots.count(slot), 1)
+        self.assertEqual(self.tree.frees, [(slot, [(0, 5)]), (slot, [(5, 6)])])
+
+    def test_pp_slots_hold_by_the_step_that_carries_the_request(self):
+        self._setup()
+        req = self._req()
+        slot = req.kv.req_pool_idx
+        slot0 = self._launch(self._req("slot0"))
+        slot1 = self._launch(req)
+        slot0_next = self._launch(self._req("slot0-next"))
+
+        self.retirer.retire_aborted(req)
+
+        self._commit(slot0)
+        self.assertNotIn(slot, self.pool.free_slots)
+        self._commit(slot1)
+        self.assertIn(slot, self.pool.free_slots)
+        self._commit(slot0_next)
+
+    def test_paged_hold_starts_at_the_committed_page(self):
+        self._setup(page_size=4)
+        req = self._req(committed=6, allocated=7)
+        slot = req.kv.req_pool_idx
+        step = self._launch(req)
+
+        self.retirer.retire_aborted(req)
+
+        self.assertEqual(self.tree.frees, [(slot, [(0, 4)])])
+        self._commit(step)
+        # The page holding the committed tail and the written token; the
+        # over-allocated range starts on the next page, past the allocation.
+        self.assertEqual(self.tree.frees[1:], [(slot, [(4, 6)])])
 
 
 if __name__ == "__main__":

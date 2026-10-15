@@ -9,7 +9,9 @@ parts its outcome needs, in this order:
 2. beam group (an aborted outcome);
 3. retraction backup (a retraction; it reads the device KV);
 4. HiSparse rows;
-5. KV row and request slot.
+5. KV row and request slot; the slot and the pages a pending step may still
+   write go back at the host commit of the last pending step that carries
+   the request.
 
 One entry keeps a documented exception: a PD transfer that failed after its
 prefill checkpoints the KV before it ends the cache request.
@@ -21,6 +23,8 @@ calls and the media release); a CPU test enforces it.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import logging
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Iterable, Optional
@@ -30,8 +34,10 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    HeldKv,
     backup_kv_cache,
     evict_from_tree_cache,
+    free_held_kv,
     free_req_slot,
     release_kv_cache,
 )
@@ -44,7 +50,7 @@ if TYPE_CHECKING:
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler_components.bundles import KvResources
     from sglang.srt.managers.scheduler_components.ipc_channels import (
         SchedulerIpcChannels,
@@ -52,6 +58,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +71,7 @@ class RequestRetirer:
         beam_coordinator: BeamCoordinator,
         hisparse_coordinator: Optional[HiSparseCoordinator],
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
+        pending: PendingSteps,
         output_streamer: SchedulerOutputStreamer,
         ipc_channels: SchedulerIpcChannels,
     ):
@@ -72,6 +80,7 @@ class RequestRetirer:
         self.beam_coordinator = beam_coordinator
         self.hisparse_coordinator = hisparse_coordinator
         self.decode_offload_manager = decode_offload_manager
+        self.pending = pending
         self.output_streamer = output_streamer
         self.ipc_channels = ipc_channels
 
@@ -83,7 +92,7 @@ class RequestRetirer:
         HiSparse rows, then the KV row (with ``checkpoint``, the tree first
         keeps what it can key). A successful cache request needs no finish."""
         self._release_hisparse_rows(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+        self._release_kv(req, checkpoint=checkpoint)
 
     def retire_aborted_waiting(self, req: Req) -> None:
         """A request aborted in the waiting queue: media and session with the
@@ -93,7 +102,7 @@ class RequestRetirer:
         self.release_aborted_request(req)
         self.beam_coordinator.retire_group(req)
         if req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            self._release_kv(req, checkpoint=False)
 
     def retire_aborted(self, req: Req, *, checkpoint: bool = False) -> None:
         """A request aborted once it may hold KV (running, chunked, or in a PD
@@ -104,13 +113,13 @@ class RequestRetirer:
         self.beam_coordinator.retire_group(req)
         self._release_hisparse_rows(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+            self._release_kv(req, checkpoint=checkpoint)
 
     def retire_transfer_failed(self, req: Req) -> None:
         """A PD prefill request whose KV transfer failed after its prefill: the
         prefill KV is valid, so the tree keeps it first; then media and session
         with the cache request."""
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        self._release_kv(req, checkpoint=True)
         self.release_aborted_request(req)
 
     def retire_offloaded(self, req: Req) -> None:
@@ -128,12 +137,27 @@ class RequestRetirer:
         # Released only at request finish; a mid-decode free races with
         # concurrent admission over live slots. The prefix the prealloc match
         # took from the tree stays with the tree: not freed, only unlocked.
-        self.tree_cache.free_kv_row(
-            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
-        )
+        row = (req.kv.cache_protected_len, req.kv.kv_allocated_len)
+        step = self.pending.last_step_with(req)
+        if step is None:
+            self.tree_cache.free_kv_row(req.kv, [row])
         self.tree_cache.unlock(req.lock)
         req.lock = None
-        free_req_slot(self.kv.req_to_token_pool, req)
+        if step is None:
+            free_req_slot(self.kv.req_to_token_pool, req)
+        else:
+            # A pending step still writes the row: all of it waits.
+            held = HeldKv(
+                kv=dataclasses.replace(
+                    req.kv,
+                    component_evicted_seqlens=dict(req.kv.component_evicted_seqlens),
+                ),
+                held_from=row[0],
+                row_frees=(row,),
+            )
+            req.kv.req_pool_idx = None
+            req.kv.penalty_row = None
+            self.pending.hold_until_commit(step, held)
         req.kv.mark_kv_released()
         req.disagg.offload = None
 
@@ -186,7 +210,7 @@ class RequestRetirer:
         cache request ends and its KV goes back without an insert; its media
         and session stay for the retry."""
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self._release_kv(req, checkpoint=False)
 
     def retract(
         self, req: Req, *, num_remaining_reqs: int, offload_kv: bool = True
@@ -212,7 +236,7 @@ class RequestRetirer:
         if hisparse_coordinator is not None and not req.finished():
             hisparse_coordinator.retract_req(req)
         # TODO (csy): for preempted requests, we may want to insert into the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self._release_kv(req, checkpoint=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = num_remaining_reqs * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
@@ -248,6 +272,12 @@ class RequestRetirer:
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def release_held(self, step: ScheduleBatch) -> None:
+        """At step's host commit, free the KV pages and slots released
+        requests left to it."""
+        for held in self.pending.take_held(step):
+            free_held_kv(held, self.tree_cache)
+
     # ------------------------------------------------------------------
     # Outputs of a leaving request.
     # ------------------------------------------------------------------
@@ -275,6 +305,16 @@ class RequestRetirer:
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
+
+    def _release_kv(self, req: Req, *, checkpoint: bool) -> None:
+        """The KV part: the row and slot go back to their pools, after the
+        commit of the last pending step that may still write them."""
+        step = self.pending.last_step_with(req)
+        if step is None:
+            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+            return
+        hold = functools.partial(self.pending.hold_until_commit, step)
+        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint, hold=hold)
 
     def _release_hisparse_rows(self, req: Req) -> None:
         hisparse = self.hisparse_coordinator

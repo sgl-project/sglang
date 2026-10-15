@@ -29,6 +29,7 @@ def make_request_retirer(**deps) -> RequestRetirer:
         beam_coordinator=Mock(),
         hisparse_coordinator=None,
         decode_offload_manager=None,
+        pending=PendingSteps(),
         output_streamer=Mock(),
         ipc_channels=Mock(),
     )

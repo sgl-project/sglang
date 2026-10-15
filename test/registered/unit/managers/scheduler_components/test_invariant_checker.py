@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
     kv_private_swa_tokens,
@@ -61,6 +62,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             pool_stats_observer=MagicMock(),
             counters=LaunchCounters(),
             core_lists=CoreLists(),
+            pending=PendingSteps(),
             scheduler_stage_metrics=None,
         )
 
@@ -199,6 +201,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             pool_stats_observer=observer,
             counters=self.counters,
             core_lists=self.core_lists,
+            pending=PendingSteps(),
             scheduler_stage_metrics=None,
         )
 

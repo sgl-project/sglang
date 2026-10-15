@@ -1838,6 +1838,8 @@ class Scheduler:
     def commit_step(self, record: PendingStep) -> None:
         """The host commit of one launched step, popped from pending."""
         self.process_batch_result(record.step, record.result)
+        # Its forward has finished: what released requests left to it is free.
+        self.request_retirer.release_held(record.step)
         self.step_counters.record(record)
         if CHECK_REQUEST_LISTS:
             self.invariant_checker.check_no_finished_reqs(
@@ -2192,6 +2194,7 @@ class Scheduler:
             pool_stats_observer=self.pool_stats_observer,
             counters=self.counters,
             core_lists=self.lists,
+            pending=self.pending,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -2312,6 +2315,7 @@ class Scheduler:
             beam_coordinator=self.beam_coordinator,
             hisparse_coordinator=self.hisparse_coordinator,
             decode_offload_manager=self.decode_offload_manager,
+            pending=self.pending,
             output_streamer=self.output_streamer,
             ipc_channels=self.ipc_channels,
         )

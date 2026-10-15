@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.managers.scheduler_components import (
     request_retirer as request_retirer_mod,
 )
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
@@ -1047,6 +1048,7 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
             beam_coordinator=None,
             hisparse_coordinator=q.hisparse_coordinator,
             decode_offload_manager=None,
+            pending=PendingSteps(),
             output_streamer=None,
             ipc_channels=None,
         )

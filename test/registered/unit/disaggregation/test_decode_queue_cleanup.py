@@ -736,6 +736,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             beam_coordinator=MagicMock(),
             hisparse_coordinator=None,
             decode_offload_manager=None,
+            pending=PendingSteps(),
             output_streamer=MagicMock(),
             ipc_channels=scheduler.ipc_channels,
         )

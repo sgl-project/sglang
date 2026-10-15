@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import (
     CustomTestCase,
     maybe_stub_sgl_kernel,
@@ -205,6 +206,7 @@ class _Shell:
         s.lists.decoding = []
         s.lists.chunked_req = None
         s.pending = PendingSteps()
+        s.request_retirer = make_request_retirer(pending=s.pending)
         s.flat_slot = ScheduleSlot()
         s.flags.enable_skip_finishing_decode = False
         s._sched_idled = False

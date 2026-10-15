@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
     Req,
 )
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
@@ -104,6 +105,7 @@ def _intake(**deps):
             beam_coordinator=beam_coordinator,
             hisparse_coordinator=None,
             decode_offload_manager=None,
+            pending=PendingSteps(),
             output_streamer=MagicMock(),
             ipc_channels=ipc_channels,
         ),
@@ -125,6 +127,7 @@ def _queued_registry(req):
             beam_coordinator=beam_coordinator,
             hisparse_coordinator=None,
             decode_offload_manager=None,
+            pending=PendingSteps(),
             output_streamer=MagicMock(),
             ipc_channels=ipc_channels,
         ),

@@ -31,6 +31,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import (
     CustomTestCase,
     enter_scope,
@@ -426,6 +427,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         launcher.launch_batch_sample_if_needed = Mock()
         scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
+        scheduler.request_retirer = make_request_retirer(pending=scheduler.pending)
         scheduler.recv_skipper = None
         scheduler.lists.chunked_req = None
         scheduler.lists.waiting_queue = []

@@ -156,6 +156,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         scheduler.flags._engine_paused = False
         scheduler._sched_idled = False
         scheduler.pending = PendingSteps()
+        scheduler.request_retirer = make_request_retirer(pending=scheduler.pending)
         scheduler.recv_skipper = None
         scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE

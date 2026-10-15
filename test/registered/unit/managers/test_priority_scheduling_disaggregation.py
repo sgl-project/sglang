@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
 )
+from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_intake import RequestIntake
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
@@ -81,6 +82,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 beam_coordinator=MagicMock(),
                 hisparse_coordinator=None,
                 decode_offload_manager=None,
+                pending=PendingSteps(),
                 output_streamer=MagicMock(),
                 ipc_channels=ipc_channels,
             ),
@@ -478,6 +480,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 beam_coordinator=MagicMock(),
                 hisparse_coordinator=None,
                 decode_offload_manager=None,
+                pending=PendingSteps(),
                 output_streamer=MagicMock(),
                 ipc_channels=ipc_channels,
             ),
