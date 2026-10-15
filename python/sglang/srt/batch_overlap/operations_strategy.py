@@ -187,9 +187,18 @@ def _compute_moe_deepseek_v4_prefill(layer):
     if get_moe_a2a_backend().is_none():
         # Non-EP DP TP-MoE: overlap the DP all_gatherv (gather) + reduce_scatterv
         # (combine) with the other ubatch's attn+MoE compute (ATOM's DSV4 path).
+        attn_ops = (
+            [
+                layer.self_attn.op_attn_cp_prepare,
+                operations.YieldOperation(),
+                layer.self_attn.op_attn_cp_finish,
+            ]
+            if layer.self_attn._should_use_cp_tbo_attn_schedule()
+            else [layer.self_attn.op_attn]
+        )
         ops = [
             layer.op_mhc_prepare_attn,
-            layer.self_attn.op_attn,
+            *attn_ops,
             layer.op_mhc_post_attn_pre_mlp,
             layer.op_gather_a,
             operations.YieldOperation(),

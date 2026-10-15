@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -689,19 +690,28 @@ def validate_sampling_mask_max_tokens(server_args: Any):
 
 
 def check_two_batch_overlap(server_args: Any):
-    # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
-    # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
-    # the other ubatch's compute), which requires DP attention. Enabling it
-    # there needs no extra opt-in env flag.
     cfg = resolving_view(server_args)
+
+    is_dsv4_cp_tbo = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.attn_cp_size > 1
+        and cfg.dp_size == 1
+        and model_config_of(server_args).hf_config.model_type == "deepseek_v4"
+    )
+
+    # The non-EP DP-TBO path requires DP attention. Interleave
+    # interleave CP-TBO is the explicit exception: it uses the CP group for
+    # hidden all-gather/reduce-scatter and therefore runs with dp_size=1.
 
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
         and not attn_dp_enabled_of(cfg)
+        and not is_dsv4_cp_tbo
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "
             "(moe_a2a_backend='none'), attention DP (--attn-dp-size) is required "
-            "(DeepSeek-V4 non-EP DP TBO path)."
+            "unless DeepSeek-V4 interleave prefill CP-TBO is enabled."
         )

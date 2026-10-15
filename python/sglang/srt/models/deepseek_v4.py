@@ -67,12 +67,19 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.cp import is_cp_enabled, is_interleave
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
+from sglang.srt.layers.cp.tbo import (
+    cp_tbo_all_gather_rerange_output_async,
+    cp_tbo_all_gather_rerange_output_wait,
+)
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
+    cp_interleave_input_ids,
     cp_materialize_global_token_order,
     is_cp_active,
+    prepare_cp_forward,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
@@ -2416,6 +2423,40 @@ class MQALayer(MqaAttentionBase):
                 kv, k_rope, forward_batch, torch.cuda.current_stream()
             )
 
+        return self._forward_core_and_project(
+            q,
+            kv,
+            positions,
+            forward_batch,
+            unified=unified,
+            q_out=q_out,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_padded=q_padded,
+            tp_slice=tp_slice,
+            attn_sink=attn_sink,
+            defer_all_reduce=defer_all_reduce,
+        )
+
+    def _forward_core_and_project(
+        self,
+        q,
+        kv,
+        positions,
+        forward_batch,
+        *,
+        unified=True,
+        q_out=None,
+        q_rope=None,
+        k_rope=None,
+        q_padded=None,
+        tp_slice=slice(None),
+        attn_sink=None,
+        defer_all_reduce=False,
+    ):
+        attn_backend = get_attn_backend()
+        if attn_sink is None:
+            attn_sink = self._local_attn_sink(self.n_local_heads)
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
         # done inline, so the backend skips its own store_cache; pass `q` as a
@@ -2725,6 +2766,217 @@ def _attn_tp_all_gather_chunks(
             for i, rows in enumerate(chunk_rows)
         ]
     )
+
+    def _should_use_cp_tbo_attn_schedule(self) -> bool:
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
+            is_unified_kv_triton,
+        )
+
+        return (
+            _is_hip
+            and is_cp_enabled()
+            and self.attn_tp_size == 1
+            and not self.is_dsv41
+            and is_interleave()
+            and is_unified_kv_triton()
+            and not is_unified_kv_fp8()
+        )
+
+    def _launch_cp_tbo_attn_gathers(
+        self,
+        state,
+        forward_batch: ForwardBatch,
+        kv_local: torch.Tensor,
+        indexer_score_local: Optional[torch.Tensor],
+        core_score_local: Optional[torch.Tensor],
+    ) -> None:
+        """Launch one TBO subbatch's CP-attention gathers in fixed order."""
+        state.cp_attn_kv_handle = cp_tbo_all_gather_rerange_output_async(
+            kv_local,
+            get_parallel().attn_cp_size,
+            forward_batch,
+            kind="kv",
+        )
+
+        indexer_score_handle = None
+        if indexer_score_local is not None:
+            indexer_score_handle = cp_tbo_all_gather_rerange_output_async(
+                indexer_score_local,
+                get_parallel().attn_cp_size,
+                forward_batch,
+                kind="indexer_score_c4",
+            )
+        state.cp_attn_indexer_score_handle = indexer_score_handle
+
+        core_score_handle = None
+        if core_score_local is not None:
+            core_score_handle = cp_tbo_all_gather_rerange_output_async(
+                core_score_local,
+                get_parallel().attn_cp_size,
+                forward_batch,
+                kind=f"core_score_c{self.compress_ratio}",
+            )
+        state.cp_attn_core_score_handle = core_score_handle
+
+    def op_attn_cp_prepare(self, state):
+        """Prepare local CP attention inputs and start their ordered gathers."""
+        forward_batch = state.forward_batch
+        split_active = self._should_use_cp_tbo_attn_schedule() and is_cp_active(
+            forward_batch
+        )
+        state.cp_attn_split_active = split_active
+        if not split_active:
+            state.hidden_states_after_attn = self.forward(
+                x=state.pop("hidden_states_after_input_norm"),
+                positions=state.positions,
+                forward_batch=forward_batch,
+                x_quant=state.pop("attn_x_quant"),
+            )
+            return
+
+        subbatch_index = state.tbo_subbatch_index
+        if subbatch_index not in (0, 1):
+            raise RuntimeError(
+                "Deferred CP-attention gather requires TBO subbatch index 0 or 1, "
+                f"got {subbatch_index}."
+            )
+
+        defer_this_gather = subbatch_index == 0
+        if subbatch_index == 1:
+            pending = getattr(self, "_cp_tbo_pending_attn_a_gather", None)
+            if pending is None:
+                raise RuntimeError(
+                    "TBO subbatch B entered CP-attention prepare before subbatch A "
+                    "published its deferred gather inputs."
+                )
+            self._cp_tbo_pending_attn_a_gather = None
+            self._launch_cp_tbo_attn_gathers(*pending)
+
+        x = state.pop("hidden_states_after_input_norm")
+        x_quant = state.pop("attn_x_quant")
+        x_linear = x_quant if x_quant is not None else x
+        positions = state.positions
+        attn_backend = get_attn_backend()
+
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x_linear)
+        else:
+            qkv_a = None
+        q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        q = self._compute_q_b(q_lora, positions)
+        kv_local = self._compute_kv_bf16(
+            x_linear,
+            positions,
+            qkv_a=qkv_a,
+        )
+        del qkv_a
+
+        state.cp_attn_q = q
+        if not defer_this_gather:
+            state.cp_attn_kv_handle = cp_tbo_all_gather_rerange_output_async(
+                kv_local,
+                get_parallel().attn_cp_size,
+                forward_batch,
+                kind="kv",
+            )
+
+        indexer_prepared = None
+        indexer_score_local = None
+        indexer_score_handle = None
+        if self.indexer is not None:
+            indexer_prepared = attn_backend.prepare_c4_indexer(
+                x=x,
+                q_lora=q_lora,
+                c4_indexer=self.indexer,
+                forward_batch=forward_batch,
+            )
+            indexer_score_local = self.indexer.compressor.compute_kv_score_local(x)
+            if not defer_this_gather:
+                indexer_score_handle = cp_tbo_all_gather_rerange_output_async(
+                    indexer_score_local,
+                    get_parallel().attn_cp_size,
+                    forward_batch,
+                    kind="indexer_score_c4",
+                )
+        state.cp_attn_indexer_prepared = indexer_prepared
+        if not defer_this_gather:
+            state.cp_attn_indexer_score_handle = indexer_score_handle
+
+        core_score_local = None
+        core_score_handle = None
+        if self.compressor is not None:
+            core_score_local = self.compressor.compute_kv_score_local(x)
+            if not defer_this_gather:
+                core_score_handle = cp_tbo_all_gather_rerange_output_async(
+                    core_score_local,
+                    get_parallel().attn_cp_size,
+                    forward_batch,
+                    kind=f"core_score_c{self.compress_ratio}",
+                )
+        if not defer_this_gather:
+            state.cp_attn_core_score_handle = core_score_handle
+
+        if defer_this_gather:
+            if getattr(self, "_cp_tbo_pending_attn_a_gather", None) is not None:
+                raise RuntimeError(
+                    "A deferred CP-attention gather from an earlier TBO step was not "
+                    "consumed by subbatch B."
+                )
+            self._cp_tbo_pending_attn_a_gather = (
+                state,
+                forward_batch,
+                kv_local,
+                indexer_score_local,
+                core_score_local,
+            )
+
+    def op_attn_cp_finish(self, state):
+        """Consume CP gathers, store compressor results, and run attention."""
+        if not state.pop("cp_attn_split_active"):
+            return
+
+        forward_batch = state.forward_batch
+        positions = state.positions
+        attn_backend = get_attn_backend()
+        q = state.pop("cp_attn_q")
+        kv = cp_tbo_all_gather_rerange_output_wait(state.pop("cp_attn_kv_handle"))
+
+        indexer_prepared = state.pop("cp_attn_indexer_prepared")
+        indexer_score_handle = state.pop("cp_attn_indexer_score_handle")
+        if indexer_score_handle is not None:
+            indexer_score = cp_tbo_all_gather_rerange_output_wait(indexer_score_handle)
+            attn_backend.forward_indexer_compressor_from_kv_score(
+                indexer_score,
+                forward_batch,
+                self.indexer.layer_id,
+                self.indexer.compressor,
+            )
+            attn_backend.forward_c4_indexer(
+                x=q,
+                q_lora=q,
+                c4_indexer=self.indexer,
+                forward_batch=forward_batch,
+                skip_compressor=True,
+                prepared=indexer_prepared,
+            )
+
+        core_score_handle = state.pop("cp_attn_core_score_handle")
+        if core_score_handle is not None:
+            core_score = cp_tbo_all_gather_rerange_output_wait(core_score_handle)
+            attn_backend.forward_core_compressor_from_kv_score(
+                core_score,
+                forward_batch,
+                self.layer_id,
+                self.compressor,
+            )
+
+        state.hidden_states_after_attn = self._forward_core_and_project(
+            q,
+            kv,
+            positions,
+            forward_batch,
+        )
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -3782,6 +4034,41 @@ class DeepseekV4DecoderLayer(nn.Module):
         # replicate-gather on the shared comm stream; record an event.
         fb = state.forward_batch
         local = state.pop("hidden_states_mlp_input")  # LOCAL [M_local, hidden]
+        sub = state.tbo_subbatch_index
+        if is_cp_active(fb):
+            parallel = get_parallel()
+            assert parallel.attn_dp_size == 1
+            assert parallel.attn_tp_size == 1
+            assert local.shape[0] > 0
+
+            # The synchronous CP path computes the shared expert after the
+            # hidden all-gather. Keep the same semantics in CP-TBO.
+            state.do_shared_local = False
+            state.shared_local = None
+
+            global_rows = local.shape[0] * parallel.attn_cp_size
+            global_hidden = get_tbo_persistent_buffer(
+                ("cp_gh", sub),
+                global_rows,
+                local.shape[1],
+                local.dtype,
+                local.device,
+            )
+            comm = get_dp_tbo_comm_stream()
+            compute = torch.cuda.current_stream()
+            with torch.cuda.stream(comm):
+                comm.wait_stream(compute)
+                get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
+                    global_hidden,
+                    local,
+                    comm,
+                )
+                state.gather_event = _tbo_event(("cp_hidden_gather", sub))
+                state.gather_event.record(comm)
+            state.gather_keepalive = local
+            state.global_hidden = global_hidden
+            return
+
         # Shared-expert-local: compute on LOCAL hidden before the gather; added
         # back after the combine (same as the non-fused forward). Skipped in the
         # global MoE via skip_shared_experts.
@@ -3840,6 +4127,37 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Launch reduce_scatterv (global partial expert sums -> per-rank local) on
         # the comm stream; record an event. Symmetric inverse of the all_gatherv.
         global_out = state.pop("global_expert_out")
+        fb = state.forward_batch
+        if is_cp_active(fb):
+            parallel = get_parallel()
+            assert parallel.attn_dp_size == 1
+            assert parallel.attn_tp_size == 1
+            assert global_out.shape[0] % parallel.attn_cp_size == 0
+
+            local_rows = global_out.shape[0] // parallel.attn_cp_size
+            local_out = get_tbo_persistent_buffer(
+                ("cp_lo", state.tbo_subbatch_index),
+                local_rows,
+                global_out.shape[1],
+                global_out.dtype,
+                global_out.device,
+            )
+            comm = get_dp_tbo_comm_stream()
+            compute = torch.cuda.current_stream()
+            with torch.cuda.stream(comm):
+                comm.wait_stream(compute)
+                get_parallel().attn_cp_group.reduce_scatter_tensor(
+                    local_out,
+                    global_out,
+                )
+                state.combine_event = _tbo_event(
+                    ("cp_combine", state.tbo_subbatch_index)
+                )
+                state.combine_event.record(comm)
+            state.local_out = local_out
+            state.combine_keepalive = global_out
+            return
+
         local_out = get_tbo_persistent_buffer(
             ("lo", state.tbo_subbatch_index),
             get_local_dp_buffer_len(),
@@ -4287,10 +4605,14 @@ class DeepseekV4Model(nn.Module):
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
-        path_ok = not is_cp_active(forward_batch) and (
-            not _is_hip
-            or not get_moe_a2a_backend().is_none()
-            or get_parallel().attn_dp_size > 1
+        cp_active = is_cp_active(forward_batch)
+        path_ok = (cp_active and bool(forward_batch.tbo_cp_children_ready)) or (
+            not cp_active
+            and (
+                not _is_hip
+                or not get_moe_a2a_backend().is_none()
+                or get_parallel().attn_dp_size > 1
+            )
         )
         return (
             is_tbo_enabled()
@@ -4324,16 +4646,42 @@ class DeepseekV4Model(nn.Module):
 
         # Split the per-rank batch into the 2 ubatches (token-range slice + pad
         # to tbo_padded_len). residual is unused by the DSV4 non-fused layer ops.
-        inputs_arr = [
-            _model_forward_filter_inputs(
-                hidden_states=hidden_states,
-                residual=None,
-                positions=positions,
-                output_forward_batch=child,
-                tbo_subbatch_index=idx,
-            )
-            for idx, child in enumerate(forward_batch.tbo_children)
-        ]
+        use_cp_tbo = is_cp_active(forward_batch)
+        if use_cp_tbo:
+            assert forward_batch.tbo_cp_children_ready
+            inputs_arr = []
+            for idx, child in enumerate(forward_batch.tbo_children):
+                assert child.tbo_cp_subbatch_index == idx
+                local_range = child.tbo_cp_local_token_range
+                assert local_range is not None
+                local_start, local_end = local_range
+                assert 0 <= local_start < local_end <= hidden_states.shape[0]
+
+                child._tbo_global_input_ids = cp_interleave_input_ids(
+                    child.input_ids, child
+                )
+                inputs_arr.append(
+                    dict(
+                        hidden_states=hidden_states[local_start:local_end],
+                        residual=None,
+                        positions=positions[local_start:local_end],
+                        forward_batch=child,
+                        tbo_subbatch_index=idx,
+                    )
+                )
+        else:
+            # Existing DP-TBO path: children use parent-local token coordinates
+            # and preserve the existing padding behavior.
+            inputs_arr = [
+                _model_forward_filter_inputs(
+                    hidden_states=hidden_states,
+                    residual=None,
+                    positions=positions,
+                    output_forward_batch=child,
+                    tbo_subbatch_index=idx,
+                )
+                for idx, child in enumerate(forward_batch.tbo_children)
+            ]
 
         # Non-EP DP TP-MoE: the per-ubatch DP gather/combine (op_gather/op_combine)
         # needs each ubatch's per-rank token counts, but tbo_padded_len is computed
@@ -4389,7 +4737,13 @@ class DeepseekV4Model(nn.Module):
         )
 
         return _model_forward_tbo_merge_key(
-            outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
+            outputs_arr[0],
+            outputs_arr[1],
+            "hidden_states",
+            hidden_states.shape[0],
+            token_range_field=(
+                "tbo_cp_local_token_range" if use_cp_tbo else "tbo_parent_token_range"
+            ),
         )
 
     @torch.no_grad()
@@ -4857,6 +5211,58 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         return input_ids, input_embeds
+
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Attach child CP layouts before the attention backends plan their queries."""
+        forward_batch.tbo_cp_children_ready = False
+        if not is_cp_active(forward_batch) or not is_interleave():
+            return
+        parallel = get_parallel()
+        children = forward_batch.tbo_children
+        if (
+            not forward_batch.can_run_tbo
+            or children is None
+            or len(children) != 2
+            or self.model.pp_group.world_size != 1
+            or not self.model.layers[
+                self.model.start_layer
+            ].self_attn._should_use_cp_tbo_attn_schedule()
+            or not get_moe_a2a_backend().is_none()
+            or parallel.attn_dp_size != 1
+            or parallel.attn_tp_size != 1
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return
+        alignment = parallel.attn_cp_size**2
+        ranges = [c.tbo_parent_token_range for c in children]
+        if any(r is None for r in ranges):
+            return
+        if (
+            ranges[0][0] != 0
+            or ranges[0][1] != ranges[1][0]
+            or ranges[1][1] != len(forward_batch.input_ids)
+        ):
+            return
+        for child, (start, end) in zip(children, ranges):
+            if (
+                child.batch_size <= 0
+                or start >= end
+                or start % alignment
+                or end % alignment
+                or len(child.input_ids) != end - start
+                or sum(child.extend_seq_lens_cpu) != end - start
+            ):
+                return
+        for index, child in enumerate(children):
+            start, end = child.tbo_parent_token_range
+            child.attn_cp_metadata = None
+            prepare_cp_forward(child)
+            child.tbo_cp_local_token_range = (
+                start // parallel.attn_cp_size,
+                end // parallel.attn_cp_size,
+            )
+            child.tbo_cp_subbatch_index = index
+        forward_batch.tbo_cp_children_ready = True
 
     def forward(
         self,

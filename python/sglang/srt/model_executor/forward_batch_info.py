@@ -753,10 +753,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
-    # For two-batch overlap
-    tbo_parent_token_range: Optional[Tuple[int, int]] = None
-    tbo_padded_len: Optional[int] = None
-    tbo_children: Optional[List[ForwardBatch]] = None
+    # The TBO child's token range in the CP-local hidden states.
+    # tbo_parent_token_range remains in pre-CP logical coordinates.
+    tbo_cp_local_token_range: Optional[Tuple[int, int]] = None
+
+    # 0 identifies child A and 1 identifies child B. CP KV gathers use this
+    # index to select per-subbatch persistent buffers and events.
+    tbo_cp_subbatch_index: Optional[int] = None
+
+    # True on the parent after both children have valid CP metadata and their
+    # split point satisfies the interleave physical-row alignment.
+    tbo_cp_children_ready: Optional[bool] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
 

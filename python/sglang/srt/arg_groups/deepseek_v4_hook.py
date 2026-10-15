@@ -148,13 +148,40 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 "--enable-decoder-swa-bounded-replay",
                 cfg.enable_decoder_swa_bounded_replay,
             ),
-            ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
         )
         for feature, enabled in unsupported:
             if enabled:
                 raise ValueError(
                     f"DeepSeekV4 prefill CP on HIP does not support {feature} yet."
                 )
+
+    if cfg.enable_two_batch_overlap:
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        if not get_platform().is_hip or cfg.cp_strategy != "interleave":
+            raise ValueError("DeepSeek-V4 CP-TBO requires HIP interleave prefill CP.")
+        if (
+            cfg.moe_a2a_backend != "none"
+            or cfg.ep_size != 1
+            or cfg.pp_size != 1
+            or cfg.dcp_size != 1
+            or cfg.speculative_algorithm is not None
+            or cfg.enable_mixed_chunk
+            or cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "DeepSeek-V4 CP-TBO requires eager prefill, TP-MoE without EP, "
+                "PP1/DCP1, and no speculation or mixed prefill/decode."
+            )
+        if (
+            envs.SGLANG_HACK_FLASHMLA_BACKEND.get() != "unified_kv_triton"
+            or envs.SGLANG_DSV4_UNIFIED_KV_FP8.get()
+        ):
+            raise ValueError(
+                "DeepSeek-V4 CP-TBO requires the BF16 unified KV layout: "
+                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton and "
+                "SGLANG_DSV4_UNIFIED_KV_FP8=0."
+            )
 
     attn_dp_size = context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
     declare_resolution(

@@ -171,6 +171,37 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
+        self._store_core_compressor_output(
+            new_compressed_kv,
+            layer_id,
+            compressor,
+        )
+
+    def forward_core_compressor_from_kv_score(
+        self,
+        kv_score: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        compressor: Compressor,
+    ) -> None:
+        new_compressed_kv = compressor.forward_from_kv_score(
+            kv_score,
+            forward_batch,
+            attn_backend=self,
+        )
+        self._store_core_compressor_output(
+            new_compressed_kv,
+            layer_id,
+            compressor,
+        )
+
+    def _store_core_compressor_output(
+        self,
+        new_compressed_kv: torch.Tensor,
+        layer_id: int,
+        compressor: Compressor,
+    ) -> None:
+        token_to_kv_pool = self.token_to_kv_pool
         core_metadata = self.forward_metadata.core_metadata
         out_loc = (
             core_metadata.c4_out_loc
@@ -199,6 +230,29 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
+        self._store_indexer_compressor_output(new_compressed_kv, layer_id)
+
+    def forward_indexer_compressor_from_kv_score(
+        self,
+        kv_score: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        compressor: Compressor,
+    ) -> None:
+        assert is_overlap_compress(compressor.ratio)
+        new_compressed_kv = compressor.forward_from_kv_score(
+            kv_score,
+            forward_batch,
+            attn_backend=self,
+        )
+        self._store_indexer_compressor_output(new_compressed_kv, layer_id)
+
+    def _store_indexer_compressor_output(
+        self,
+        new_compressed_kv: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        token_to_kv_pool = self.token_to_kv_pool
         out_loc = self.forward_metadata.core_metadata.c4_out_loc
         if out_loc.shape[0] > new_compressed_kv.shape[0]:
             out_loc = out_loc[: new_compressed_kv.shape[0]]
@@ -442,8 +496,12 @@ class Compressor(BaseFusedOp):
         assert isinstance(ret, CompressStatePool)
         return ret
 
+    def compute_kv_score_local(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute this rank's compressor input without any CP communication."""
+        return self._compute_wkv_gate(x)
+
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = self._compute_wkv_gate(x)
+        kv_score = self.compute_kv_score_local(x)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -470,18 +528,12 @@ class Compressor(BaseFusedOp):
             self.wkv_gate.qweight_type.weight_type,
         )
 
-    def forward_native(
+    def forward_from_kv_score(
         self,
-        x: torch.Tensor,
+        kv_score: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: Optional[AttentionBackend] = None,
+        attn_backend: AttentionBackend,
     ) -> torch.Tensor:
-        if forward_batch.forward_mode.is_idle():
-            assert x.shape[0] == 0
-            return x.new_empty(0, self.head_dim)
-
-        kv_score = self.compute_kv_score(x, forward_batch)
-
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4AttnBackend)
         kv_score_buffer = self.get_state_pool(attn_backend).kv_score_buffer.kv_score
@@ -496,6 +548,22 @@ class Compressor(BaseFusedOp):
             compress_ratio=self.ratio,
             forward_batch=forward_batch,
             is_paged=True,
+        )
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: Optional[AttentionBackend] = None,
+    ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        return self.forward_from_kv_score(
+            self.compute_kv_score(x, forward_batch),
+            forward_batch,
+            attn_backend,
         )
 
     def forward_npu(

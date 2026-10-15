@@ -123,12 +123,17 @@ class _StageExecutor:
         # parent's primary.
         self._child_ctx = child_ctx
 
-        # handling DP attention
+        # DP-TBO uses the global DP buffer bookkeeping. CP-TBO owns separate
+        # equal-size CP buffers and must not overwrite the global DP state.
         forward_batch: ForwardBatch = inputs["forward_batch"]
-        self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
-        self._local_dp_buffer_len = forward_batch.tbo_padded_len
-        self._global_num_tokens = forward_batch.global_num_tokens_cpu
-        self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
+        self._is_cp_tbo = (
+            getattr(forward_batch, "tbo_cp_local_token_range", None) is not None
+        )
+        if not self._is_cp_tbo:
+            self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
+            self._local_dp_buffer_len = forward_batch.tbo_padded_len
+            self._global_num_tokens = forward_batch.global_num_tokens_cpu
+            self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
 
     def next(self):
         assert not self.done
@@ -138,12 +143,13 @@ class _StageExecutor:
         # TODO: We currently always call set_dp_buffer_len here because sub-batches
         # may have different padded lengths. It can likely be removed after TBO slice &
         # pad logic is refactored.
-        set_dp_buffer_len(
-            self._global_dp_buffer_len,
-            self._local_dp_buffer_len,
-            self._is_dp_max_padding,
-            self._global_num_tokens,
-        )
+        if not self._is_cp_tbo:
+            set_dp_buffer_len(
+                self._global_dp_buffer_len,
+                self._local_dp_buffer_len,
+                self._is_dp_max_padding,
+                self._global_num_tokens,
+            )
 
         ctx_mgr = (
             forward_context(self._child_ctx)
