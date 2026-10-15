@@ -88,12 +88,17 @@ class DSAIndexerHostPoolBuilder:
         allocator_type: str,
         packed_draft_device_pools: tuple[DSATokenToKVPool, ...],
     ) -> DSAIndexerPoolHost:
+        kwargs = {}
+        shared_memory_group = getattr(anchor_host, "shared_memory_group", None)
+        if shared_memory_group is not None:
+            kwargs["shared_memory_group"] = shared_memory_group
         return DSAIndexerPoolHost(
             decl=decl,
             anchor_host=anchor_host,
             packed_draft_device_pools=packed_draft_device_pools,
             allocator_type=allocator_type,
             is_dummy=getattr(anchor_host, "_is_dummy", False),
+            **kwargs,
         )
 
 
@@ -142,6 +147,7 @@ class DSAIndexerPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         is_dummy: bool = False,
+        shared_memory_group=None,
     ):
         self._is_dummy = is_dummy
         self._destroyed = False
@@ -153,7 +159,27 @@ class DSAIndexerPoolHost(HostKVCache):
         self.layout = anchor_host.layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        if shared_memory_group is None:
+            shared_memory_group = getattr(anchor_host, "shared_memory_group", None)
+        self.shared_memory_group = shared_memory_group
+        self.allocator = get_allocator_from_storage(
+            allocator_type, shared_memory_group=shared_memory_group
+        )
+        if shared_memory_group is not None:
+            error = None
+            if (
+                is_dummy
+                or packed_draft_device_pools
+                or self.layout != "page_first_direct"
+                or device != "cpu"
+                or device_pool.device != "cuda"
+                or not pin_memory
+            ):
+                error = ValueError(
+                    "Shared HiCache requires a pinned CUDA indexer with "
+                    "page_first_direct layout, without dummy or packed draft pools"
+                )
+            self.allocator.synchronize_error(error, operation="DSA pool configuration")
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
@@ -201,12 +227,19 @@ class DSAIndexerPoolHost(HostKVCache):
             page_num=self.page_num, layer_num=self.layer_num, page_size=self.page_size
         )
         available_bytes = host_memory_budget_bytes(requested_bytes)
+        error = None
         if requested_bytes > available_bytes:
-            raise ValueError(
+            error = ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "
                 f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
+        if shared_memory_group is not None:
+            self.allocator.synchronize_error(
+                error, operation="indexer memory admission"
+            )
+        elif error is not None:
+            raise error
         draft_layer_num = self.layer_num - self.target_layer_num
         if draft_layer_num > 0:
             logger.info(
@@ -226,18 +259,35 @@ class DSAIndexerPoolHost(HostKVCache):
                 self.layout,
             )
         self.init_kv_buffer()
-        self._init_write_back_staging_buffers()
-        self.lock = threading.RLock()
-        self.clear()
+        error = None
+        try:
+            self._init_write_back_staging_buffers()
+            self.lock = threading.RLock()
+            self.clear()
+        except Exception as exc:
+            error = exc
+        self._finish_shared_initialization(error, operation="DSA host metadata")
 
     def destroy(self):
         if self._destroyed:
             return
-        if not self._is_dummy and self.pin_memory and (_is_cuda or _is_hip):
-            _cuda_host_unregister(self.index_k_with_scale_buffer)
+        buffer = getattr(self, "index_k_with_scale_buffer", None)
+        if (
+            buffer is not None
+            and not self._is_dummy
+            and self.pin_memory
+            and (_is_cuda or _is_hip)
+        ):
+            _cuda_host_unregister(buffer)
+            if getattr(self.allocator, "is_shared", False):
+                self.allocator.release(buffer)
         self.index_k_with_scale_buffer = None
         self.index_k_data_refs = []
         super().destroy()
+
+    def _clear_shared_host_views(self) -> None:
+        self.index_k_data_refs = []
+        self.index_k_data_ptrs = None
 
     def get_size_per_token(self):
         return self.decl.storage_info.bytes_per_token_per_layer * self.layer_num
@@ -260,6 +310,15 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        error = None
+        try:
+            self._init_device_index_metadata()
+        except Exception as exc:
+            error = exc
+        self._finish_shared_initialization(error, operation="DSA transfer metadata")
+        self._allocate_index_buffer(alloc_func)
+
+    def _init_device_index_metadata(self) -> None:
         self.packed_device_index_buffers = [
             self.device_pool.index_k_with_scale_buffer[layer]
             for layer in self._live_target_layers
@@ -273,6 +332,8 @@ class DSAIndexerPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+
+    def _allocate_index_buffer(self, alloc_func) -> None:
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer = alloc_func(
                 (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size),

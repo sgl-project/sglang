@@ -1964,8 +1964,19 @@ class ModelRunner:
             layer_counter = getattr(
                 self.token_to_kv_pool, "layer_transfer_counter", None
             )
-            layerwise_restore = bool(
-                getattr(get_memory(), "enable_mla_hicache_layerwise_overlap", False)
+            memory = get_memory()
+            # Captured graphs cannot pick up this restore's per-layer waits.
+            # A shared-host reader must execute its getters outside the graph.
+            shared_restore = bool(
+                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                and getattr(memory, "enable_mla_hicache_host_dedup", False)
+                and getattr(memory, "mla_hicache_host_dedup_mode", "broadcast")
+                == "shared"
+                and layer_counter is not None
+                and layer_counter.consumer_index >= 0
+            )
+            layerwise_restore = shared_restore or bool(
+                getattr(memory, "enable_mla_hicache_layerwise_overlap", False)
                 and layer_counter is not None
                 and getattr(layer_counter, "needs_layerwise_restore", lambda: False)()
             )

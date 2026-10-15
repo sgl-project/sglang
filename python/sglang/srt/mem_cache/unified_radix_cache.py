@@ -410,6 +410,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if getattr(self.cache_controller, "mla_shared_enabled", False) is True:
+            self.cache_controller.drain_shared_transfers()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -594,6 +596,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
+            if getattr(self.cache_controller, "mla_shared_enabled", False) is True:
+                self.cache_controller.drain_shared_transfers(synchronize_peers=False)
             self.host_pool_group.destroy()
 
     @rank_consensus(

@@ -149,6 +149,19 @@ def auto_size_hicache(
     )
     if dedup:
         capacity_ratio, budget = _dedup_host_budget(device_bytes, budget)
+        if getattr(memory, "mla_hicache_host_dedup_mode", "broadcast") == "shared":
+            # Peers map the owner's physical allocation rather than becoming
+            # buffer-less dummy pools. Give each mapper the owner's admission
+            # allowance, while the node's physical-demand sum still counts the
+            # shared bytes only once.
+            group = params.tp_cache_group
+            allowance = torch.tensor([budget], dtype=torch.int64)
+            torch.distributed.broadcast(
+                allowance,
+                src=torch.distributed.get_global_rank(group, 0),
+                group=group,
+            )
+            budget = int(allowance.item())
     else:
         capacity_ratio = budget / device_bytes
     ratio = (

@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupContext
+    from sglang.srt.mem_cache.mla_host_shared import SharedCPUHostDedupContext
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -337,7 +338,9 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
-        mla_dedup_context: Optional[MLAHostDedupContext] = None,
+        mla_dedup_context: Optional[
+            MLAHostDedupContext | SharedCPUHostDedupContext
+        ] = None,
     ):
         self.mla_dedup = mla_dedup_context
         self.tp_group = tp_group
@@ -355,6 +358,18 @@ class HiCacheController:
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        if self.mla_shared_enabled:
+            pools = [
+                entry.host_pool for entry in getattr(mem_pool_host, "entries", ())
+            ] or [mem_pool_host]
+            if any(
+                not getattr(pool.allocator, "is_shared", False)
+                or pool.allocator.process_group is not mla_dedup_context.process_group
+                for pool in pools
+            ):
+                raise ValueError(
+                    "Shared MLA restore requires shared pools on the same TP group."
+                )
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
@@ -435,6 +450,10 @@ class HiCacheController:
     @property
     def mla_dedup_enabled(self) -> bool:
         return getattr(self, "mla_dedup", None) is not None
+
+    @property
+    def mla_shared_enabled(self) -> bool:
+        return getattr(getattr(self, "mla_dedup", None), "is_shared", False) is True
 
     def set_mla_producer_stream(self, stream) -> None:
         if self.mla_dedup_enabled:
@@ -596,6 +615,10 @@ class HiCacheController:
         Requirement: no in-flight requests. This call is expected to run on the scheduler
         thread (control path), not concurrently with prefetch/backup.
         """
+        if self.mla_shared_enabled:
+            raise ValueError(
+                "Shared MLA host restore currently supports L2 cache only."
+            )
         if self.mla_dedup_enabled:
             raise ValueError("MLA host dedup storage requires the file L3 integration.")
         if self.enable_storage:
@@ -819,6 +842,7 @@ class HiCacheController:
         )
 
     def reset(self):
+        self.drain_shared_transfers()
         if self.mla_dedup is not None and self.mla_dedup.layerwise_overlap:
             self.mla_dedup.reset_layerwise_loads()
         # Reuse detach's queue wakeups and bounded joins, and fail if any
@@ -869,6 +893,30 @@ class HiCacheController:
             or self.ack_load_queue
         )
 
+    def drain_shared_transfers(self, *, synchronize_peers: bool = True) -> None:
+        """Keep shared rows alive until every submitted reader is finished.
+
+        Normal completion is gated by the tree's TP-MIN acknowledgement. Reset
+        bypasses that path, so it must explicitly drain copies before dropping
+        acknowledgements or clearing the shared host allocator. Process teardown
+        only drains local users: other processes retain their own mappings.
+        """
+        if not self.mla_shared_enabled:
+            return
+        failure = None
+        try:
+            self.l2_transfer_engine.device_to_host_stream.synchronize()
+            self.l2_transfer_engine.host_to_device_stream.synchronize()
+            for ack in (*self.ack_write_queue, *self.ack_load_queue):
+                ack.finish_event.synchronize()
+        except Exception as error:
+            if not synchronize_peers:
+                raise
+            failure = f"{type(error).__name__}: {error}"
+        if synchronize_peers:
+            self.mla_dedup.synchronize_error(failure, operation="reset drain")
+            self.mla_dedup.synchronize_readers()
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -894,28 +942,51 @@ class HiCacheController:
         if len(self.write_queue) == 0:
             return
 
-        op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
-        self.write_queue.clear()
-
-        if wait_for_forward and self.write_fence_stream is not None:
-            # An evicted SWA page can belong to an unfinished checkpoint.
-            self.l2_transfer_engine.device_to_host_stream.wait_stream(
-                self.write_fence_stream
+        transfers = []
+        failure = None
+        try:
+            op = CacheOperation.merge_ops(self.write_queue)
+            host_indices, device_indices, pool_transfers = self._move_write_operation(
+                op
             )
+            self.write_queue.clear()
 
-        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
-        if self.mla_dedup_enabled is True:
-            transfers = [
-                transfer
-                for transfer in transfers
-                if not getattr(transfer.host_pool, "_is_dummy", False)
-            ]
-            if self.mla_dedup.producer_stream is not None:
+            if wait_for_forward and self.write_fence_stream is not None:
+                # An evicted SWA page can belong to an unfinished checkpoint.
                 self.l2_transfer_engine.device_to_host_stream.wait_stream(
-                    self.mla_dedup.producer_stream
+                    self.write_fence_stream
                 )
-        completion = self.l2_transfer_engine.submit_device_to_host(transfers)
+
+            transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+            if self.mla_dedup_enabled is True:
+                transfers = [
+                    transfer
+                    for transfer in transfers
+                    if not getattr(transfer.host_pool, "_is_dummy", False)
+                ]
+                if self.mla_dedup.producer_stream is not None:
+                    self.l2_transfer_engine.device_to_host_stream.wait_stream(
+                        self.mla_dedup.producer_stream
+                    )
+        except Exception as error:
+            if not self.mla_shared_enabled:
+                raise
+            failure = f"{type(error).__name__}: {error}"
+        if self.mla_shared_enabled:
+            # Compare host row order before the owner can overwrite any shared
+            # bytes. Only the owner copies KV; peers retain the same metadata.
+            self.mla_dedup.validate_host_rows(transfers, failure=failure)
+            transfers = [t for t in transfers if t.host_pool.allocator.is_owner]
+            failure = None
+            try:
+                completion = self.l2_transfer_engine.submit_device_to_host(transfers)
+                # Publish CPU-visible KV only after the owner's D2H finishes.
+                completion.finish_event.synchronize()
+            except Exception as error:
+                failure = f"{type(error).__name__}: {error}"
+            self.mla_dedup.synchronize_error(failure, operation="D2H publication")
+        else:
+            completion = self.l2_transfer_engine.submit_device_to_host(transfers)
         if self.mla_dedup_enabled is True:
             self.mla_dedup.last_write_finish_event = completion.finish_event
 
@@ -930,8 +1001,8 @@ class HiCacheController:
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,
-                num_tokens_by_pool=self._num_tokens_by_pool(op),
-                num_bytes=self._transfer_num_bytes(op),
+                num_tokens_by_pool=(self._num_tokens_by_pool(op) if transfers else {}),
+                num_bytes=self._transfer_num_bytes(op) if transfers else 0,
             )
         )
 
@@ -1047,44 +1118,62 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
-        producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
-        self.load_queue.clear()
-        producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
+        transfers = []
+        failure = None
+        try:
+            producer_id = self.layer_done_counter.update_producer()
+            op = CacheOperation.merge_ops(self.load_queue)
+            host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+            self.load_queue.clear()
+            producer_event = self.layer_done_counter.events[producer_id]
+            producer_event.start_event.record()
 
-        if self.load_fence_stream is not None:
-            # in overlap scheduling, reclaimed pages might still be written by the forward thread
-            # therefore a fence is needed for loading thread to prevent memory corruption
-            # todo: it's possible to use a finer-grained fence
-            self.l2_transfer_engine.host_to_device_stream.wait_stream(
-                self.load_fence_stream
+            if self.load_fence_stream is not None:
+                # A reclaimed GPU row may still be used by the forward thread.
+                self.l2_transfer_engine.host_to_device_stream.wait_stream(
+                    self.load_fence_stream
+                )
+            transfers = self._l2_load_transfers(
+                host_indices, device_indices, pool_transfers
             )
+        except Exception as error:
+            if not self.mla_shared_enabled:
+                raise
+            failure = f"{type(error).__name__}: {error}"
+
+        if self.mla_shared_enabled:
+            # Even a rank whose local index/event preparation failed must enter
+            # the common verdict, so peers do not wait forever for its metadata.
+            self.mla_dedup.validate_host_rows(transfers, failure=failure)
 
         layerwise = self.mla_dedup_enabled and (
             getattr(self.mla_dedup, "layerwise_overlap", False) is True
         )
         load_kwargs = {}
-        if self.mla_dedup_enabled and not layerwise:
+        if self.mla_dedup_enabled and not layerwise and not self.mla_shared_enabled:
             load_kwargs["load_layer"] = self._mla_layer_loader(op.device_indices)
-        transfers = self._l2_load_transfers(
-            host_indices, device_indices, pool_transfers
-        )
         if layerwise:
             transfers = [
                 transfer
                 for transfer in transfers
                 if not getattr(transfer.host_pool, "_is_dummy", False)
             ]
-        completion = self.l2_transfer_engine.submit_host_to_device(
-            transfers,
-            start_event=producer_event.start_event,
-            on_layer_done=producer_event.complete,
-            transfer_layer_id_max=self.transfer_layer_id_max,
-            **load_kwargs,
-        )
-        if self.mla_dedup_enabled and not layerwise:
+        failure = None
+        try:
+            completion = self.l2_transfer_engine.submit_host_to_device(
+                transfers,
+                start_event=producer_event.start_event,
+                on_layer_done=producer_event.complete,
+                transfer_layer_id_max=self.transfer_layer_id_max,
+                **load_kwargs,
+            )
+        except Exception as error:
+            if not self.mla_shared_enabled:
+                raise
+            failure = f"{type(error).__name__}: {error}"
+        if self.mla_shared_enabled:
+            self.mla_dedup.synchronize_error(failure, operation="H2D submission")
+        if self.mla_dedup_enabled and not layerwise and not self.mla_shared_enabled:
             # Match #26691: finish the dedicated communicator's work before
             # allowing the next forward to issue model-TP collectives.
             self.l2_transfer_engine.host_to_device_stream.synchronize()

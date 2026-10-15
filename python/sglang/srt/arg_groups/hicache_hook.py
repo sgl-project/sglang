@@ -23,6 +23,45 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    shared_restore = (
+        getattr(cfg, "mla_hicache_host_dedup_mode", "broadcast") == "shared"
+    )
+    if shared_restore:
+        if not cfg.enable_mla_hicache_host_dedup:
+            raise ValueError(
+                "--mla-hicache-host-dedup-mode shared requires "
+                "--enable-mla-hicache-host-dedup."
+            )
+        if (
+            cfg.nnodes != 1
+            or cfg.tp_size <= 1
+            or cfg.pp_size != 1
+            or cfg.dp_size != 1
+            or cfg.attn_dp_size != 1
+            or cfg.attn_cp_size != 1
+            or cfg.dcp_size != 1
+        ):
+            raise ValueError(
+                "Shared MLA host restore requires single-node TP > 1, PP=DP=1 "
+                "and no attention DP/CP or DCP."
+            )
+        if cfg.speculative_algorithm is not None or cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "Shared MLA host restore does not support speculative decoding "
+                "or disaggregated serving."
+            )
+        if (
+            cfg.hicache_storage_backend is not None
+            or cfg.hicache_host_memory_mode != "cache"
+        ):
+            raise ValueError(
+                "Shared MLA host restore currently supports L2 cache only."
+            )
+        if cfg.enable_mla_hicache_layerwise_overlap:
+            raise ValueError(
+                "Shared MLA host restore uses HiCache's native per-layer waits; "
+                "--enable-mla-hicache-layerwise-overlap is for GPU broadcast."
+            )
     if cfg.enable_mla_hicache_layerwise_overlap:
         if not cfg.enable_mla_hicache_host_dedup:
             raise ValueError(
@@ -96,6 +135,13 @@ def handle_hicache(server_args: Any):
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
     resolve_unified_memory_layout_io(server_args)
+    if shared_restore and (
+        cfg.hicache_io_backend != "direct"
+        or cfg.hicache_mem_layout != "page_first_direct"
+    ):
+        raise ValueError(
+            "Shared MLA host restore requires direct I/O and page_first_direct layout."
+        )
     if (
         cfg.disaggregation_decode_host_receive_threshold < 1
         and cfg.hicache_mem_layout != "layer_first"

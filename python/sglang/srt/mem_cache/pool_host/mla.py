@@ -103,10 +103,33 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         target_layer_num: int,
         layer_shard_enabled: bool = False,
         pool_label: str = "kv",
+        shared_memory_group=None,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
         self.dtype = buffer_info.dtype
+
+        if shared_memory_group is not None:
+            from sglang.srt.mem_cache.pool_host.shared import synchronize_shared_error
+
+            error = None
+            if (
+                self._is_dummy
+                or draft_buffer_infos
+                or dcp_size != 1
+                or layout != "page_first_direct"
+                or device != "cpu"
+                or buffer_info.device.type != "cuda"
+                or not pin_memory
+            ):
+                error = ValueError(
+                    "Shared HiCache requires pinned CUDA MLA/DSA pools with "
+                    "page_first_direct layout, without dummy, packed draft, or DCP pools"
+                )
+            synchronize_shared_error(
+                shared_memory_group, error, operation="MLA pool configuration"
+            )
+
         self.layout = layout
         self.kv_lora_rank = buffer_info.kv_lora_rank
         self.qk_rope_head_dim = buffer_info.qk_rope_head_dim
@@ -215,6 +238,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dcp_rank=dcp_rank,
             pool_label=pool_label,
             is_dummy=self._is_dummy,
+            shared_memory_group=shared_memory_group,
         )
         if self._is_dummy:
             self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
@@ -234,7 +258,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             return
 
-        self._initialize_transfer_views()
+        error = None
+        try:
+            self._initialize_transfer_views()
+        except Exception as exc:
+            error = exc
+        self._finish_shared_initialization(error, operation="MLA transfer metadata")
 
     def _initialize_transfer_views(self) -> None:
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
@@ -262,6 +291,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self._native_buffers is None:
             self._init_device_row_stride(self.device_kv_buffers)
         self._init_write_back_staging_buffers()
+
+    def _clear_shared_host_views(self) -> None:
+        self.data_refs = []
+        self.data_ptrs = None
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,

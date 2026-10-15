@@ -75,7 +75,18 @@ class ShmHostTensorAllocator(HostTensorAllocator):
         self.fds = []
 
 
-def get_allocator_from_storage(allocator_type):
+def get_allocator_from_storage(allocator_type, *, shared_memory_group=None):
+    if shared_memory_group is not None:
+        from sglang.srt.mem_cache.pool_host.shared import SharedHostTensorAllocator
+
+        allocator = SharedHostTensorAllocator(shared_memory_group)
+        allocator.synchronize_error(
+            "Shared HiCache requires the default host allocator"
+            if allocator_type != "default"
+            else None,
+            operation="allocator configuration",
+        )
+        return allocator
     if allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -141,7 +152,10 @@ def get_allocator_type() -> str:
 
 
 def _cuda_host_register(
-    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
+    buffer: torch.Tensor,
+    registration_granularity_bytes: int | None = None,
+    *,
+    flags: int = 0,
 ) -> None:
     # Avoid oversized cudaHostRegister calls on large host pools.
     cudart = torch.cuda.cudart()
@@ -176,7 +190,7 @@ def _cuda_host_register(
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
             # Keep cudaError_t for cudaGetErrorString; int is only for comparison/logging.
-            rc = cudart.cudaHostRegister(ptr, size, 0)
+            rc = cudart.cudaHostRegister(ptr, size, flags)
             if int(rc) != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={int(rc)}, "
@@ -347,8 +361,28 @@ def alloc_with_host_register(
         _log_hip_owned_host_pool()
         return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
-        _cuda_host_register(buffer, registration_granularity_bytes)
+    if not getattr(allocator, "is_shared", False):
+        if pin_memory:
+            _cuda_host_register(buffer, registration_granularity_bytes)
+        return buffer
+
+    error = None
+    try:
+        if pin_memory:
+            # Every CUDA context must recognize the same physical CPU pages.
+            # cudaHostRegisterPortable is 0x01 in the CUDA runtime API.
+            _cuda_host_register(buffer, registration_granularity_bytes, flags=1)
+    except Exception as exc:
+        error = exc
+    try:
+        allocator.synchronize_error(error, operation="CUDA host registration")
+    except Exception:
+        # A peer can fail after our registration succeeds. Roll back all local
+        # registrations before discarding this mapping on every rank.
+        if getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, None):
+            _cuda_host_unregister(buffer)
+        allocator.release(buffer)
+        raise
     return buffer
 
 

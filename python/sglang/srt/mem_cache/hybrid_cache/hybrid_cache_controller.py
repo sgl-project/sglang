@@ -308,6 +308,10 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if self.mla_shared_enabled:
+            raise ValueError(
+                "Shared MLA host restore currently supports L2 cache only."
+            )
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
         ) and not self.supports_page_envelope_host(storage_backend):
@@ -358,6 +362,10 @@ class HybridCacheController(BaseHiCacheController):
             self.pp_prefetch_decisions.clear()
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
+        if self.mla_shared_enabled:
+            raise ValueError(
+                "Shared MLA host restore does not support dynamic draft/state pools."
+            )
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         self.mem_pool_host.add_entry(entry)
