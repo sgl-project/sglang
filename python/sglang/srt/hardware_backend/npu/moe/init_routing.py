@@ -96,8 +96,15 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         topk_ids: torch.Tensor,
         num_experts: int,
         top_k: int,
+        input_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
+        quant_mode = self.quant_mode if input_scale is None else -1
+        scale_kwargs = {}
+        if input_scale is not None:
+            if self.quant_mode != MXFP8_QUANT_MODE:
+                raise ValueError("Prequantized routing requires an MXFP8 dispatcher")
+            scale_kwargs["scale"] = input_scale.view(torch.uint8)
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,
@@ -107,10 +114,13 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_tokens_num_type=1,
                 expert_tokens_num_flag=True,
                 active_expert_range=[0, num_experts],
-                quant_mode=self.quant_mode,
+                quant_mode=quant_mode,
+                **scale_kwargs,
             )
         )
-        if self.quant_mode == -1:
+        if input_scale is not None:
+            pertoken_scale = pertoken_scale.view(input_scale.dtype)
+        elif self.quant_mode == -1:
             pertoken_scale = None
         elif self.quant_mode == MXFP8_QUANT_MODE:
             pertoken_scale = _normalize_mxfp_scale(pertoken_scale)

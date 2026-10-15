@@ -42,6 +42,7 @@ class AscendTPDispatchOutput(NamedTuple):
 
 class AscendTPCombineInput(NamedTuple):
     hidden_states: torch.Tensor
+    shared_output: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> CombineInputFormat:
@@ -95,12 +96,24 @@ class AscendTPDispatcher(BaseDispatcher):
             )
 
     def dispatch(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        *,
+        pre_quant_input=None,
     ) -> AscendTPDispatchOutput:
         topk_weights, topk_ids, _ = topk_output
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int32)
         top_k = topk_weights.shape[-1]
+        input_scale = None
+        if pre_quant_input is not None:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                record_mxfp8_operand,
+            )
+
+            record_mxfp8_operand(pre_quant_input)
+            hidden_states, input_scale = pre_quant_input
 
         (
             permuted_hidden_states,
@@ -112,6 +125,7 @@ class AscendTPDispatcher(BaseDispatcher):
             topk_ids,
             self.num_experts,
             top_k,
+            input_scale=input_scale,
         )
 
         self._dispatch_output = AscendTPDispatchOutput(
@@ -131,12 +145,19 @@ class AscendTPDispatcher(BaseDispatcher):
 
         dispatch_out = self._dispatch_output
 
+        shared_kwargs = {}
+        if combine_input.shared_output is not None:
+            if not isinstance(self.finalize, NPUFinalizeRouting):
+                raise ValueError("Shared finalization requires native TP routing")
+            shared_kwargs["skip1"] = combine_input.shared_output
+
         # The finalizer (possibly wrapped with TP all‑gather) does all the work.
         final_hidden_states = self.finalize._finalize_routing(
             combine_input.hidden_states,
             topk_weights=dispatch_out.topk_weights,
             expanded_row_idx=dispatch_out.expanded_row_idx,
             topk_ids=dispatch_out.topk_ids,
+            **shared_kwargs,
         )
 
         self._dispatch_output = None
