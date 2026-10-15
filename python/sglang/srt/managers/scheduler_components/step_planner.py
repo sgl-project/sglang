@@ -536,6 +536,17 @@ class StepPlanner:
             if is_full and not adder.preempt_to_schedule(req):
                 self._revert_match(req)
                 break
+            if is_full and not self.beam_coordinator.has_room(
+                len(running_reqs)
+                - len(adder.preempt_list)
+                + len(adder.can_run_list)
+                + 1,
+                rows_with_req,
+            ):
+                # A preempted request's row is held until the pending step
+                # that carries it commits; the request waits for it there.
+                self._revert_match(req)
+                break
             if hicache_storage_enabled() and (
                 self.request_intake.prefetch_after_device_hit_loss(req)
             ):

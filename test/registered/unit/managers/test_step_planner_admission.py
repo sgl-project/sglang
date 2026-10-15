@@ -95,6 +95,7 @@ class _Adder(PrefillAdder):
         self.preempt_list = []
         self.new_chunked_req = None
         self.rem_chunk_tokens = None
+        self.request_retirer = kw["request_retirer"]
 
     def budget_state(self):
         return AddReqResult.OTHER if self.spent else AddReqResult.CONTINUE
@@ -224,6 +225,29 @@ class TestPreemptionSizesTheMatchedRequest(_PlannerCase):
                 preempted, admitted = self._verdict(matched_before)
                 self.assertEqual(preempted, [])
                 self.assertEqual(admitted, [])
+
+
+class TestPreemptionWaitsForHeldRows(_PlannerCase):
+    """A preempted request's row is held until the pending step that carries
+    it commits; the request it made room for waits for that row instead of
+    being admitted against a row that is not free yet."""
+
+    def test_preempted_row_still_held_admits_nothing(self):
+        self.free_rows = 0
+        self.planner.enable_priority_preemption = True
+        _Adder.free_tokens = 10_000
+        self.addCleanup(setattr, _Adder, "free_tokens", 0)
+        running = _req("run", priority=0, max_new_tokens=50)
+        self.planner.core_lists.decoding = [running]
+        new = _req("new", priority=1, max_new_tokens=40)
+        self.planner.core_lists.waiting_queue = [new]
+
+        adder = self._admit()
+
+        # The retirer held the preempted row: the free rows stay at zero.
+        self.assertEqual(adder.preempt_list, [running])
+        self.planner.request_retirer.retract.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
 
 
 class TestHeldRowAdmission(_PlannerCase):
