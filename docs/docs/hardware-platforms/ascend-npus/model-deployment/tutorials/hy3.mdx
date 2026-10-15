@@ -13,8 +13,8 @@ parameters, developed by the Tencent Hy Team. It features 192 experts with top-8
 outperforms similar-size models and rivals flagship open-source models with 2–5× the parameters, with notable
 improvements in agentic workflows, long-context tasks, and production reliability.
 
-This document demonstrates the deployment of Hy3 on Ascend NPUs using SGLang, including single-node (Ascend A3 Series) and
-multi-node PD mixed mode and speculative decoding.
+This document demonstrates the deployment of Hy3 on Ascend NPUs using SGLang, including single-node deployment and
+speculative decoding.
 
 ## Supported features
 
@@ -78,7 +78,9 @@ The dependencies required for the NPU runtime environment have been integrated i
 online platform. You can directly pull it.
 
 <Note>
-Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable image yet, so the following command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag.
+Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable image yet, so the following
+command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable
+release tag.
 For details, see
 [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 </Note>

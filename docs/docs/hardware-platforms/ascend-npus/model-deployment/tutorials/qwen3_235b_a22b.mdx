@@ -91,7 +91,9 @@ The Docker image requires at least **30GB** of free space. Ensure sufficient dis
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable image yet, so the following command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag.
+Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable image yet, so the following
+command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable
+release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 {/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
@@ -159,14 +161,15 @@ The following command is based on the **W8A8** quantized model.
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
 #   PREFILL_HOST_IP: prefill node IP address
-#   NETWORK_IFACE: network interface name (use ifconfig to find)
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL (use ifconfig to find)
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo (use ifconfig to find)
 #============================================================
 
 export ASCEND_USE_FIA=1
 export SGLANG_SET_CPU_AFFINITY=1
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:12345"
-export HCCL_SOCKET_IFNAME=<NETWORK_IFACE>
-export GLOO_SOCKET_IFNAME=<NETWORK_IFACE>
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
 
 MODEL_PATH=/path/to/model-weights
 ```
