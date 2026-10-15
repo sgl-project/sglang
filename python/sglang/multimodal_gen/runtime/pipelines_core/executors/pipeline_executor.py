@@ -315,6 +315,7 @@ class PipelineExecutor(ABC):
             full_profile=batch.profile_all_stages,
             num_steps=batch.num_profiled_timesteps,
             num_inference_steps=batch.num_inference_steps,
+            record_execution_trace=batch.record_execution_trace,
         )
         try:
             yield
