@@ -367,9 +367,14 @@ def _assert_tied_distributed_topk(test, full_logits, target_ids, result):
 
 class TestFastInputLogprobs(CustomTestCase):
     def test_native_shard_precision_and_sampled_contract(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                self._check_native_shard_precision_and_sampled_contract(dtype)
+
+    def _check_native_shard_precision_and_sampled_contract(self, dtype):
         from sglang.srt.layers.logits_processor import LogitsProcessor
 
-        source = torch.tensor([[0.3, -1.7, 3.1]], dtype=torch.bfloat16)
+        source = torch.tensor([[0.3, -1.7, 3.1]], dtype=dtype)
         for cap in (None, 2.0):
             fake = SimpleNamespace(
                 do_tensor_parallel_all_gather_dp_attn=False,
@@ -386,7 +391,7 @@ class TestFastInputLogprobs(CustomTestCase):
                 expected = cap * torch.tanh(expected / cap)
                 self.assertEqual(got.dtype, torch.float32)
             else:
-                self.assertEqual(got.dtype, torch.bfloat16)
+                self.assertEqual(got.dtype, dtype)
             torch.testing.assert_close(got.float(), expected, rtol=0, atol=0)
 
         def gather(value):

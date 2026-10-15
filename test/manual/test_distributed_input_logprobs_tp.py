@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     DistributedLogprobContext,
     InputLogprobProcessor,
@@ -85,6 +86,10 @@ def check(vocab, dtype, chunk, topk):
         metadata,
         distributed_context=context,
     )
+    assert result.input_copy_done is not None, "CUDA probes must use staged spans"
+    output = LogitsProcessorOutput(next_token_logits=sampled)
+    result.write_input_to(output)
+    output.finalize_input_logprobs()
     reference = full.log_softmax(-1)
     assert sampled.dtype == torch.float32
     torch.testing.assert_close(
@@ -120,7 +125,7 @@ def main():
     try:
         count = 0
         for vocab in (131, 154881):
-            for dtype in (torch.float32, torch.bfloat16):
+            for dtype in (torch.float32, torch.bfloat16, torch.float16):
                 for chunk in (1, 4, 32):
                     for topk in (0, 5, 20):
                         check(vocab, dtype, chunk, topk)
