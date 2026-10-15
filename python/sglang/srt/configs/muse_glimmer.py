@@ -145,6 +145,7 @@ class MuseGlimmerConfig(PretrainedConfig):
         self.out_hidden_size = out_hidden_size
         self.projector_hidden_act = projector_hidden_act
         self.projector_hidden_size = projector_hidden_size
+        self.padded_projector_hidden_size = projector_hidden_size
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             bos_token_id=bos_token_id,

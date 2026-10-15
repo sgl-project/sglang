@@ -59,7 +59,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cpu, is_cuda, round_up
+from sglang.srt.utils import add_prefix, is_cpu, is_cuda
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
@@ -773,11 +773,7 @@ class MuseGlimmerVisionAdapter(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        sharded_size = config.projector_hidden_size
-        tp_size = get_parallel().tp_size
-        # CPU TP zero-pads the sharded dim (gelu(0) == 0); 32 keeps each shard AMX-aligned.
-        if _is_cpu and sharded_size % tp_size != 0:
-            sharded_size = round_up(sharded_size, tp_size * 32)
+        sharded_size = config.padded_projector_hidden_size
         self.fc1 = ColumnParallelLinear(
             config.out_hidden_size,
             sharded_size,
