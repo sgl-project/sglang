@@ -1,3 +1,4 @@
+import enum
 import importlib.util
 import sys
 import types
@@ -370,6 +371,22 @@ def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     assert module._resolve_max_tokens_per_rank() == 1024
 
 
+class _FakeFinalizeMode(enum.Enum):
+    # Mirrors flashinfer.moe_ep.FinalizeMode.
+    AUTO = 0
+    DEFAULT = 1
+    PERSISTENT = 2
+    CAKE = 3
+    NONE = 4
+
+
+def _install_fake_finalize_mode(monkeypatch):
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.FinalizeMode = _FakeFinalizeMode
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+
+
 def _use_cpu_for_shared_tensor(monkeypatch):
     # The shared tensor is allocated on the current CUDA device; CPU CI has none.
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
@@ -380,11 +397,13 @@ def test_persistent_finalize_kwargs_share_one_tensor(monkeypatch):
     must hand out the same object or later layers update a tensor nobody reads."""
     module = _load_megamoe_module(monkeypatch)
     _use_cpu_for_shared_tensor(monkeypatch)
+    _install_fake_finalize_mode(monkeypatch)
 
     first = module._persistent_finalize_kwargs()
     second = module._persistent_finalize_kwargs()
 
-    assert first["use_persistent_finalize_kernel"] is True
+    # PERSISTENT, not AUTO: AUTO would pick FlashInfer's CAKE reducer where it can.
+    assert first["finalize_mode"] is _FakeFinalizeMode.PERSISTENT
     tensor = first["num_valid_tokens_tensor"]
     assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (1,)
     assert second["num_valid_tokens_tensor"] is tensor
@@ -502,7 +521,9 @@ def test_persistent_finalize_uses_runtime_sized_output(monkeypatch):
 
     class Mega:
         supports_output_view = True
-        _megakernel_config = types.SimpleNamespace(use_persistent_finalize_kernel=True)
+        _megakernel_config = types.SimpleNamespace(
+            finalize_mode=_FakeFinalizeMode.PERSISTENT
+        )
 
         def forward(self, tensors, *, return_workspace_view=False):
             self.return_workspace_view = return_workspace_view
@@ -541,7 +562,11 @@ def test_adapter_refreshes_the_tensor_the_layer_holds_on_every_call(monkeypatch)
 
         def __init__(self, persistent):
             self._megakernel_config = types.SimpleNamespace(
-                use_persistent_finalize_kernel=persistent,
+                finalize_mode=(
+                    _FakeFinalizeMode.PERSISTENT
+                    if persistent
+                    else _FakeFinalizeMode.AUTO
+                ),
                 num_valid_tokens_tensor=owned,
             )
 

@@ -138,13 +138,8 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
 
 
 def _megamoe_uses_persistent_finalize(mega: Any) -> bool:
-    return bool(
-        getattr(
-            getattr(mega, "_megakernel_config", None),
-            "use_persistent_finalize_kernel",
-            False,
-        )
-    )
+    mode = getattr(getattr(mega, "_megakernel_config", None), "finalize_mode", None)
+    return getattr(mode, "name", None) == "PERSISTENT"
 
 
 def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
@@ -230,8 +225,12 @@ def _num_valid_tokens_tensor() -> torch.Tensor:
 def _persistent_finalize_kwargs() -> dict[str, Any]:
     if not envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT.get():
         return {}
+    from flashinfer.moe_ep import FinalizeMode
+
+    # Explicit PERSISTENT: AUTO would prefer FlashInfer's CAKE reducer wherever it
+    # supports the problem.
     return {
-        "use_persistent_finalize_kernel": True,
+        "finalize_mode": FinalizeMode.PERSISTENT,
         "num_valid_tokens_tensor": _num_valid_tokens_tensor(),
     }
 
