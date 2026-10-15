@@ -1320,19 +1320,11 @@ sglang generate \
 
 The repacker accepts numeric FP8 containers or packed `uint8` weights and produces
 packed FP4 `[out, in/2]` with `weight_scale` `[out, in/32]`. Dual-scale layers also
-require `weight_dual_scale` `[out, in/512, 1]`. Single-level weights default to ND;
+require `weight_dual_scale` `[out, in/512, 1]`. Single-level weights use ND layout;
 dual-scale weights require NZ. Each TP input partition must be divisible by 64 or
 512, respectively. Both `div.mul_scale` and `mul_scale` descriptors are accepted:
 single-level layers apply smoothing once before quantization; dual-scale layers
 pass it as `smooth_scale` to the quantization operator.
-
-Set `SGLANG_NPU_ENABLE_MXFP4_NZ=1` to prepare NZ weights for offline single-level
-Wan linears. W4A4 and W4A8 use separate layouts, prepared once at load time and
-selected with the activation precision. The additional W4A8 buffer doubles packed
-weight storage for these layers. This option conflicts with
-`SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1`. Validate on the installed CANN/torch_npu
-with CPU offloading disabled; CPU checks do not establish NZ numerical accuracy
-or speed. An unexpected format after preparation raises an error.
 
 Single-level layers follow MindIE-SD's schedule: W4A8 for the first two and last two
 denoising steps, and W4A4 otherwise. A 40-step run uses W4A8 at zero-based indices
@@ -1349,8 +1341,8 @@ Wan's settings apply only to its kernel instances. Existing SRT LLM defaults rem
 | --- | --- | --- | --- |
 | SRT offline `W4A4_MXFP4` | ND | `round` | FP32, original shape |
 | SRT offline `W4A8_MXFP` | FP4-aware NZ | Operator default | FP32, original shape |
-| Wan offline single-level W4A4 | ND; optional NZ | `rint`, `scale_alg=2`, `dst_type_max=7.25` by default | FP32, original shape |
-| Wan offline single-level W4A8 | Shared ND; separate optional NZ | Operator default | BF16, 1D bias expanded to `[1, out]` |
+| Wan offline single-level W4A4 | ND | `rint`, `scale_alg=2`, `dst_type_max=7.25` by default | FP32, original shape |
+| Wan offline single-level W4A8 | Same ND weights | Operator default | BF16, 1D bias expanded to `[1, out]` |
 
 SRT online `--quantization mxfp4` and diffusion online `--quantization mxfp4_npu`
 retain their separate dual-level paths. CPU checks can verify dispatch and operator

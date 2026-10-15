@@ -1008,7 +1008,6 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
-    SGLANG_NPU_ENABLE_MXFP4_NZ = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.

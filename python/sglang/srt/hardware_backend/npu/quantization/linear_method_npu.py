@@ -621,8 +621,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     of loading them from a msmodelslim checkpoint. ``group_size`` is fixed at 32
     by the ``W4A8_MXFP`` export format.
 
-    Wan reuses apply with ND weights by default, or a separate weight_w4a8
-    buffer when NZ is enabled. Its kernel instance opts into BF16 [1, N] bias.
+    Wan reuses apply with ND weights. Its kernel instance opts into BF16 [1, N] bias.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -680,7 +679,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         # W4(weight)A8(activation) matmul.
         output = torch.ops.npu.npu_quant_matmul(
             quantized_x,
-            getattr(layer, "weight_w4a8", layer.weight),
+            layer.weight,
             layer.weight_scale,
             scale_dtype=e8m0_dtype,
             pertoken_scale=dynamic_scale,
@@ -835,9 +834,8 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
-    [out, in/32]). SRT weights remain ND and are transposed for matmul.
-    Wan can supply mode-specific NZ weights before this transpose and selects
-    MindIE's activation rounding on its kernel instance.
+    [out, in/32]). The weight remains ND and is transposed for matmul.
+    Wan selects MindIE's activation rounding on its kernel instance.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
