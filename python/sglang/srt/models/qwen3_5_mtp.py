@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -126,7 +127,19 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.fc_split_slice = self._fc_split_slice(config.hidden_size)
+        if self.fc_split_slice is not None:
+            self.fc = RowParallelLinear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                reduce_results=True,
+                quant_config=None,
+                prefix=add_prefix("fc", prefix),
+            )
+        else:
+            self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
@@ -156,6 +169,33 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # Input embedding handed over by the previous greedy draft step, if any.
         self.draft_input_embeds: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _fc_split_slice(hidden_size: int) -> Optional[Tuple[bool, int, int]]:
+        """(uses hidden half, start, width) of this rank's fc input columns, or None."""
+        if not envs.SGLANG_Q35MF_DRAFT_FC_SPLIT.get():
+            return None
+        rank, size = get_parallel().tp_rank, get_parallel().tp_size
+        width = 2 * hidden_size // size
+        if size == 1 or (2 * hidden_size) % size != 0 or hidden_size % width != 0:
+            logger.warning("MTP fc split disabled for tp_size=%d; using the replicated fc.", size)
+            return None
+        start = rank * width
+        return (start >= hidden_size, start % hidden_size, width)
+
+    def _split_fc(self, input_embeds, hidden_states, forward_batch):
+        use_hidden, start, width = self.fc_split_slice
+        x = hidden_states if use_hidden else input_embeds
+        if not forward_batch.forward_mode.is_idle():
+            norm = self.pre_fc_norm_hidden if use_hidden else self.pre_fc_norm_embedding
+            x = norm(x)
+        if use_hidden and x.shape[0] != input_embeds.shape[0]:
+            rows = min(x.shape[0], input_embeds.shape[0])
+            slot = x.new_zeros((input_embeds.shape[0], x.shape[1]))
+            slot[:rows] = x[:rows]
+            x = slot
+        out, _ = self.fc(x[:, start : start + width])
+        return out
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -233,22 +273,27 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = forward_batch.spec_info.hidden_states
 
-            if not forward_batch.forward_mode.is_idle():
-                input_embeds = self.pre_fc_norm_embedding(input_embeds)
-                hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            # Captured prefill gives padded embeddings but real-height target states;
-            # place the real rows in an equal-height slot whose padding stays unread.
-            if hidden_states.shape[0] != input_embeds.shape[0]:
-                rows = min(hidden_states.shape[0], input_embeds.shape[0])
-                slot = hidden_states.new_zeros(
-                    (input_embeds.shape[0], hidden_states.shape[1])
+            if self.fc_split_slice is not None:
+                hidden_states = self._split_fc(
+                    input_embeds, hidden_states, forward_batch
                 )
-                slot[:rows] = hidden_states[:rows]
-                hidden_states = slot
+            else:
+                if not forward_batch.forward_mode.is_idle():
+                    input_embeds = self.pre_fc_norm_embedding(input_embeds)
+                    hidden_states = self.pre_fc_norm_hidden(hidden_states)
+                # Captured prefill gives padded embeddings but real-height target states;
+                # place the real rows in an equal-height slot whose padding stays unread.
+                if hidden_states.shape[0] != input_embeds.shape[0]:
+                    rows = min(hidden_states.shape[0], input_embeds.shape[0])
+                    slot = hidden_states.new_zeros(
+                        (input_embeds.shape[0], hidden_states.shape[1])
+                    )
+                    slot[:rows] = hidden_states[:rows]
+                    hidden_states = slot
 
-            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+                hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
-            hidden_states = self.fc(hidden_states)
+                hidden_states = self.fc(hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states = self.model(
