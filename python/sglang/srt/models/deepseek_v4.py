@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
+from sglang.experimental import monokernels as mono
 from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
@@ -4003,6 +4004,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
+        self.mono_plan = None  # this step's monokernel plan (mono.route)
         self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
         if self.pp_group.is_last_rank and not self.hc_pre_from_prev_sublayer:
             (
@@ -4474,6 +4476,7 @@ class DeepseekV4Model(nn.Module):
             )
         last_pre = None
         tail = None
+        self.mono_plan = mono.route(self, forward_batch)
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
@@ -5006,6 +5009,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
 
     def precompile_kernels_after_loading(self) -> None:
+        mono.attach(self)
+
         from sglang.srt.layers.moe.mega_moe import (
             build_mega_moe_shared_weights,
             should_fuse_mega_moe_shared_experts,
@@ -5183,6 +5188,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
+        weights = ((n, mono.load_tensor(self, n, w)) for n, w in weights)
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
@@ -5287,8 +5293,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
                     ):
                         continue
-                    if _is_hip and not is_nextn:
-                        _hip.stash_shared_expert(self.model.layers, name, loaded_weight)
                     if (
                         self.num_fused_shared_experts > 0
                         and "mlp.shared_experts" in name
@@ -5557,10 +5561,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        mono.loaded(self)
 
         if not is_nextn:
-            if _is_hip:
-                _hip.stash_k1_weights(self.model.layers)
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")

@@ -1656,9 +1656,6 @@ class Envs:
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
-    # gfx950 DeepSeek-V4.1 decode (<= 48 rows): FFN in one launch; MONO_K1 adds the attention front
-    SGLANG_ROCM_MONO_DECODE = EnvBool(False)
-    SGLANG_ROCM_MONO_K1 = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

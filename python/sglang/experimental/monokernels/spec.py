@@ -204,7 +204,10 @@ class MonoSpec:
 
 # architecture -> the module whose SPEC serves it, imported only when that model starts with the switch on: the
 # HF architecture (read by the config hook) and the SGLang class that loads it (read by the load hooks)
-REGISTRY: dict = {}
+REGISTRY: dict = {
+    "DeepseekV41ForCausalLM": "sglang.experimental.monokernels.hip.deepseek_v41.spec",
+    "DeepseekV4ForCausalLM": "sglang.experimental.monokernels.hip.deepseek_v41.spec",
+}
 
 
 def load_spec(arch: str) -> Optional[MonoSpec]:

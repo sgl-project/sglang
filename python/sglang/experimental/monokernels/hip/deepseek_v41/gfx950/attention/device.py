@@ -9,8 +9,8 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import bf16_pair, rsrc
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.sync import _spin
+from sglang.experimental.monokernels.hip.common.ops import bf16_pair, rsrc
+from sglang.experimental.monokernels.hip.common.sync import _spin
 
 # The execution model: one CTA a CU of an MI355X, all resident.
 BLOCKS = 256
@@ -99,10 +99,11 @@ def mfma_scaled(a, b, c, sa, sb, a_fmt=FP8, b_fmt=FP8):
 
 
 class Mailbox:
-    """Poll tagged CTA hand-offs; the caller supplies the launch tag."""
+    """Poll tagged CTA hand-offs; the caller supplies the launch tag and the launch's wait guard."""
 
-    def __init__(self, tag):
+    def __init__(self, tag, guard):
         self.tag = tag
+        self.guard = guard
 
     def put(self, base, i, v):
         bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
@@ -137,12 +138,15 @@ class Mailbox:
             cache_modifier=CM_DEV,
         )
 
-    def poll(self, specs, batch=POLL_MAX):
-        """Poll the pairs in ``specs`` until every tag is current; return the value words."""
+    def poll(self, specs, site, batch=POLL_MAX):
+        """Poll the pairs in ``specs`` until every tag is current (a guarded wait named ``site``); return the
+        value words."""
         if const_expr(len(specs) == 0):
             return []
         if const_expr(len(specs) > batch):
-            return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
+            return self.poll(specs[:batch], site, batch) + self.poll(
+                specs[batch:], site, batch
+            )
         tag = self.tag
 
         def load_all():
@@ -168,7 +172,7 @@ class Mailbox:
                 bad = bad | (v[e] != tag)
             return bad
 
-        v = _spin(load_all, pending)
+        v = _spin(load_all, pending, self.guard, site)
         outs, e = [], 0
         for _, _, n in specs:
             outs.append([v[e + 2 * q] for q in range(n)])

@@ -7,6 +7,7 @@ import triton
 if TYPE_CHECKING:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import HcCoefficients
 
+from sglang.experimental import monokernels as mono
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -35,7 +36,6 @@ if _is_hip:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
     )
-    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 if _is_gfx95_supported:
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
         post_attention_norm,
@@ -573,6 +573,18 @@ def apply_moe_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
     )
 
 
+def _mono_ffn(layer, ffn, x, residual, post, comb, pre, defer_post: bool):
+    """The monokernel ffn span from wo_b's unreduced output; the layer's post stays pending under defer_post."""
+    if ffn is None:
+        raise RuntimeError("monokernel plan: a k1 layer without its ffn span")
+    if not isinstance(x, AttnOutput):
+        raise RuntimeError("monokernel ffn span: the attention reduced wo_b itself")
+    x, residual, post, comb, pre = ffn(x.partial, residual, post, comb, pre)
+    if defer_post:
+        return None, pre, (x, residual, post, comb)
+    return layer.hc_post(x, residual, post, comb), pre, None
+
+
 def forward_hc_pre_from_prev_fused_boundary(
     layer,
     positions: torch.Tensor,
@@ -583,17 +595,19 @@ def forward_hc_pre_from_prev_fused_boundary(
     prev_pre: Optional[torch.Tensor],
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     defer_post: bool,
+    mono_plan=None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
-    comb); with defer_post this layer's is returned the same way and hidden_states is None."""
-    k1 = dsv41_mono_decode.k1_launch(layer, forward_batch, pending_post, prev_pre)
+    comb); with defer_post this layer's is returned the same way and hidden_states is None.
+    mono_plan is this step's monokernel plan: a covered layer starts its spans at layer_in
+    and attn_partial."""
+    k1 = mono.kernel(mono_plan, layer.layer_id, "layer_in")
     if k1 is not None:
-        # K1 runs this boundary and the attention front; the attention starts from its q
+        # the span runs this boundary and the attention front; the attention core starts from its query
         q, residual, post, comb, pre = k1(
-            positions, forward_batch, *pending_post, prev_pre
+            positions, forward_batch, pending_post, prev_pre
         )
-        mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
         with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = layer.self_attn(
                 x=residual[:, 0],
@@ -602,12 +616,8 @@ def forward_hc_pre_from_prev_fused_boundary(
                 defer_all_reduce=True,
                 mono_q=q,
             )
-        if not isinstance(x, AttnOutput):
-            raise RuntimeError("mono K1: the attention reduced wo_b itself")
-        x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
-        if defer_post:
-            return None, pre, (x, residual, post, comb)
-        return layer.hc_post(x, residual, post, comb), pre, None
+        ffn = mono.kernel(mono_plan, layer.layer_id, "attn_partial")
+        return _mono_ffn(layer, ffn, x, residual, post, comb, pre, defer_post)
     if pending_post is None:
         pending_post = (None, hidden_states, None, None)
     residual, x, attn_coefficients = hc_boundary(
@@ -622,11 +632,11 @@ def forward_hc_pre_from_prev_fused_boundary(
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
-    mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
+    ffn = mono.kernel(mono_plan, layer.layer_id, "attn_partial")
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         mhc = (
             None
-            if mono is not None
+            if ffn is not None
             else attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
         )
         x = layer.self_attn(
@@ -634,16 +644,11 @@ def forward_hc_pre_from_prev_fused_boundary(
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
-            defer_all_reduce=mhc is not None or mono is not None,
+            defer_all_reduce=mhc is not None or ffn is not None,
         )
-    if mono is not None:
-        if not isinstance(x, AttnOutput):
-            raise RuntimeError("mono FFN launch: the attention reduced wo_b itself")
+    if ffn is not None:
         pre, post, comb = attn_coefficients.tensors()
-        x, residual, post, comb, pre = mono(x.partial, residual, post, comb, pre)
-        if defer_post:
-            return None, pre, (x, residual, post, comb)
-        return layer.hc_post(x, residual, post, comb), pre, None
+        return _mono_ffn(layer, ffn, x, residual, post, comb, pre, defer_post)
     if mhc is not None:
         # wo_b honors the deferred reduce under attention_mhc_fusion's gates;
         # fail loud rather than fall back to an unfused reduce.

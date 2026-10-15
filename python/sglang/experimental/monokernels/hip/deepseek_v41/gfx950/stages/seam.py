@@ -15,7 +15,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import (
+from sglang.experimental.monokernels.hip.common.ops import (
     batched_rounds,
     bf16_round,
     bf_hi,
@@ -29,13 +29,13 @@ from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import (
     sum_partials,
     traced,
 )
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.plan import (
+from sglang.experimental.monokernels.hip.common.plan import (
     THREADS,
     WAVES,
     pair_layout,
 )
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.sync import preg
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.stages.gemv import (
+from sglang.experimental.monokernels.hip.common.sync import preg
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.gemv import (
     ld_bf,
     ld_f32,
     plus,

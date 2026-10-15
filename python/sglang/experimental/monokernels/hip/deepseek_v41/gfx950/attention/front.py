@@ -9,9 +9,9 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.epoch import gstore
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.mx import clamp_fp8
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import (
+from sglang.experimental.monokernels.hip.common.epoch import gstore
+from sglang.experimental.monokernels.hip.common.mx import clamp_fp8
+from sglang.experimental.monokernels.hip.common.ops import (
     bf16_round,
     butterfly,
     fp8_pack4,
@@ -21,8 +21,8 @@ from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import (
     traced,
     xshfl,
 )
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.plan import first_task
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.stages.gemv import (
+from sglang.experimental.monokernels.hip.common.plan import first_task
+from sglang.experimental.monokernels.hip.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
     plus,
@@ -100,7 +100,7 @@ def await_flags(c, region, n, index):
     """Thread u < n polls flag ``index(u)``; then the CTA proceeds."""
     tid = c["tid"]
     if tid < n:
-        c["mb"].poll([(region, index(fx.min(tid, n - 1)), 1)])
+        c["mb"].poll([(region, index(fx.min(tid, n - 1)), 1)], "front_flags")
     gpu.barrier()
 
 
@@ -152,7 +152,7 @@ def stage_qkv(c, t):
     sn = is_rope.select(ld_f32(a["cos_sin"], pos * ROPE + HALF + jj), fx.Float32(0.0))
     specs = [(c["qkvp"], t * QKV_ROWS + qc[j], 1) for j in range(8)]
     specs += [(c["qkvp"], t * QKV_ROWS + Q_RANK + tt * 2 + j, 1) for j in range(2)]
-    got = c["mb"].poll(specs)
+    got = c["mb"].poll(specs, "front_qkvp")
     vals = [bf16_round(got[j][0].bitcast(fx.Float32)) for j in range(10)]
     xq = [((tt * 8 + j) < Q_RANK).select(vals[j], fx.Float32(0.0)) for j in range(8)]
     xk = vals[8:10]
@@ -321,8 +321,9 @@ def front_lds(s: int, d: Dims):
     return FrontLds
 
 
-def front_context(key, lds, args: dict, scratch, tag, layout=None) -> dict:
-    """Return the front stages' context: LDS views, mailbox, scratch regions and arguments."""
+def front_context(key, lds, args: dict, scratch, tag, layout, guard) -> dict:
+    """Return the front stages' context: LDS views, guarded mailbox, scratch regions (``layout``, or the front's
+    own when None) and arguments."""
     s, d = key.tokens, Dims(key.tp)
     tid = fx.thread_idx.x
     c = {
@@ -336,7 +337,7 @@ def front_context(key, lds, args: dict, scratch, tag, layout=None) -> dict:
         "xsl": lds.xsl.ptr,
         "qxl": lds.qxl.ptr,
         "qxsl": lds.qxsl.ptr,
-        "mb": Mailbox(tag),
+        "mb": Mailbox(tag, guard),
         "d": d,
         "ldbf": lambda ptr, i: fx.Float32(
             fx.BFloat16(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.bf16))

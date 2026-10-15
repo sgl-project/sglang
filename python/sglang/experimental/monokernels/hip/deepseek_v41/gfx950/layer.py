@@ -3,6 +3,7 @@
 """Build K1 (attention seam and front) and the FFN launch (seam, MoE and TP all-reduce)."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -10,13 +11,40 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
+from sglang.experimental.monokernels.hip.common.epoch import (
+    EPOCH_MARKS,
+    epoch_begin,
+    epoch_end,
+    gstore,
+    kernel_symbol,
+)
+from sglang.experimental.monokernels.hip.common.guard import register_sites
+from sglang.experimental.monokernels.hip.common.mx import clamp_fp8
+from sglang.experimental.monokernels.hip.common.ops import (
+    CM_DEV,
+    butterfly,
+    fp8_pack4,
+    peer_bases,
+    rsrc,
+    traced,
+)
+from sglang.experimental.monokernels.hip.common.plan import (
+    BLOCKS,
+    THREADS,
+    WAVES,
+    first_task,
+    key_tuple,
+)
+from sglang.experimental.monokernels.hip.common.sync import (
+    Mailbox,
+    WaitGuard,
+    publish,
+    sreg,
+)
+
 from .attention import front as mb_front
 from .attention.plan import Dims, front_scratch
-from .common.epoch import EPOCH_MARKS, epoch_begin, epoch_end, gstore, kernel_symbol
-from .common.mx import clamp_fp8
-from .common.ops import CM_DEV, butterfly, fp8_pack4, peer_bases, rsrc, traced
-from .common.plan import BLOCKS, THREADS, WAVES, first_task, key_tuple
-from .common.sync import Mailbox, publish, sreg
+from .sites import WAIT_SITES
 from .sources import SOURCES
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
@@ -35,12 +63,20 @@ COUNTERS = ("ugq", "dq")
 # epoch buffer words: the epoch, one mark per CTA, then the MoE counters on their own lines
 EPOCH_COUNTERS = -(-(EPOCH_MARKS + BLOCKS) // 64) * 64
 EPOCH_WORDS = EPOCH_COUNTERS + COUNTER_WORDS
+register_sites(WAIT_SITES)
 
 
 @dataclass(frozen=True)
 class MonoBuild:
     tokens: int
     tp: int
+    # a fault-injection build stalls wait site ``fault_site`` from launch ``fault_after`` on; "" in normal builds
+    fault_site: str = ""
+    fault_after: int = 0
+
+    @property
+    def fault(self) -> Optional[tuple]:
+        return (self.fault_site, self.fault_after) if self.fault_site else None
 
 
 def _moe_key(key: MonoBuild) -> MoeBuild:
@@ -61,7 +97,8 @@ def scratch_layout(s: int, tp: int) -> dict:
         nonlocal off
         base = off
         for name, (o, n) in regions.items():
-            assert name not in out or name in SHARED_REGIONS, name
+            if name in out and name not in SHARED_REGIONS:
+                raise ValueError(f"scratch region {name} placed twice")
             out[name] = (base + o, n)
         off = max(off, base + max(o + n for o, n in regions.values()))
         off = -(-off // 256) * 256
@@ -83,6 +120,11 @@ def scratch_bytes(s: int = MAX_TOKENS, tp: int = 2) -> int:
 def peer_half_bytes(tp: int) -> int:
     """One parity's peer regions: the attention's partials, then the MoE's."""
     return seam.attn_peer_bytes(MAX_TOKENS, tp) + moe.peer_bytes(MAX_TOKENS, tp)
+
+
+def _check_width(s: int) -> None:
+    if not 1 <= s <= MAX_TOKENS:
+        raise ValueError(f"{s} rows; the launches serve 1 to {MAX_TOKENS}")
 
 
 def _epoch(epoch):
@@ -127,13 +169,16 @@ def publish_x8(c, t):
 
 def build_mono_k1(key: MonoBuild):
     s, tp = key.tokens, key.tp
-    assert 1 <= s <= MAX_TOKENS
+    _check_width(s)
     layout = scratch_layout(s, tp)
     fkey = _front_key(key)
     FrontLds = mb_front.front_lds(s, Dims(tp))
     NORM0 = SLICES  # the norms on the CTAs past the slices: the wqkv waits on them
     GATE0 = SLICES + s
-    assert GATE0 + s <= BLOCKS
+    if GATE0 + s > BLOCKS:
+        raise ValueError(
+            f"K1 at {s} rows needs {GATE0 + s} CTAs; the launch has {BLOCKS}"
+        )
 
     @fx.struct
     class SeamLds:
@@ -186,6 +231,7 @@ def build_mono_k1(key: MonoBuild):
         sl = lds.seam.peek()
         ep = _epoch(epoch)
         tag = (ep << 1) + 1
+        guard = WaitGuard(epoch, ep, tp, key.fault)
         fargs = {
             "x": 0,
             "x_stride": 0,
@@ -204,8 +250,10 @@ def build_mono_k1(key: MonoBuild):
             "q": q,
         }
         flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
-        c = mb_front.front_context(fkey, lds.front.peek(), fargs, scratch, tag, flayout)
-        amb = Mailbox(tag)
+        c = mb_front.front_context(
+            fkey, lds.front.peek(), fargs, scratch, tag, flayout, guard
+        )
+        amb = Mailbox(tag, guard)
         tid = fx.thread_idx.x
         ca = {
             "S": s,
@@ -445,18 +493,22 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         for region in COUNTERS:
             gstore(cb[region].value + fx.Int64(slot * 4), fx.Int32(0), words=1)
 
-    epoch_end({"bid": bid, "tid": tid}, a["epoch"], ep, reset)
+    epoch_end({"bid": bid, "tid": tid}, a["epoch"], ep, reset, amb.guard)
 
 
 def build_mono_ffn(key: MonoBuild):
     """Build the FFN launch: push this rank's wo_b partial, then ``run_ffn``."""
     s, tp = key.tokens, key.tp
-    assert 1 <= s <= MAX_TOKENS
+    _check_width(s)
     rs = route_shape(_moe_key(key))
-    assert rs.experts // 64 in SORT_NETS
+    if rs.experts // 64 not in SORT_NETS:
+        raise ValueError(f"no sort network for {rs.experts} experts")
     MoeLds = moe.moe_smem(s, rs)
     half = peer_half_bytes(tp)
-    assert SLICES + 2 * s <= BLOCKS
+    if SLICES + 2 * s > BLOCKS:
+        raise ValueError(
+            f"the FFN launch at {s} rows needs {SLICES + 2 * s} CTAs; it has {BLOCKS}"
+        )
     SeamLds = _seam_lds(s)
 
     @fx.union
@@ -532,7 +584,7 @@ def build_mono_ffn(key: MonoBuild):
             scratch=scratch,
             epoch=epoch,
         )
-        amb = Mailbox((ep << 1) + 2)
+        amb = Mailbox((ep << 1) + 2, WaitGuard(epoch, ep, tp, key.fault))
         run_ffn(key, lds, a, amb, bases, sym + par, rank, ep, part=part)
 
     @flyc.jit
