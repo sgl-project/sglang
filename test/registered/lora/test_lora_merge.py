@@ -351,9 +351,11 @@ class TestLoRAMerge(CustomTestCase):
                     ],
                 )
                 try:
-                    reference = input_logprobs(post("/generate", request))
+                    reference_output = post("/generate", request)
                 finally:
                     kill_process_tree(reference_process.pid)
+                self.assertEqual(actual["output_ids"], reference_output["output_ids"])
+                reference = input_logprobs(reference_output)
                 difference = (input_logprobs(actual) - reference).abs()
                 metrics["peft_reference"][name] = {
                     "mean_logprob_delta": difference.mean().item(),
