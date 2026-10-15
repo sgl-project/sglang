@@ -1250,7 +1250,12 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 operation.hash_value = list(hashes)
                 operation.storage_hit_count = hit_tokens
                 operation.sidecar_hash_values = None
+                operation.prefetch_kv_page_offset = 0
                 cc.trim_prefetch_full_head(operation, hit_tokens - full_tokens)
+                self.assertEqual(
+                    operation.prefetch_kv_page_offset,
+                    (hit_tokens - full_tokens) // page_size,
+                )
                 self.assertTrue(
                     cc.can_fit_prefetch_host_buffers(operation, full_tokens)
                 )
