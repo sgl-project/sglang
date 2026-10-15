@@ -6166,7 +6166,12 @@ class Scheduler(
         if completed and get_exec().moe.moe_a2a_backend == "nixl":
             from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 
-            NixlEPBuffer.finish_recovery(operation_id)
+            if success:
+                NixlEPBuffer.finish_recovery(operation_id)
+            elif state is not None and state.recovery_rank_offset is not None:
+                NixlEPBuffer.abort_recovery(
+                    operation_id, state.recovery_rank_offset
+                )
         if state is None or not completed or get_parallel().tp_rank != 0:
             return
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq

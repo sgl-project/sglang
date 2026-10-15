@@ -809,6 +809,7 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
         )
         self.assertEqual(self.state.recovery_phase, "failed")
         self.assertFalse(self.state.recovery_succeeded)
+        self.assertEqual(self.state.runtime_health, "recovery_unsupported")
         self.state.recovery_phase = "slot_restored"
         self.state.recovery_succeeded = None
         self.assertTrue(ElasticEPStateManager.begin_recovery_warmup("recover-1"))
@@ -863,10 +864,13 @@ class TestElasticEPRecoveryLifecycle(CustomTestCase):
                 "sglang.srt.managers.scheduler.get_parallel",
                 return_value=MagicMock(tp_rank=0),
             ),
+            patch.object(NixlEPBuffer, "abort_recovery") as abort_recovery,
         ):
             scheduler._maybe_complete_recovery_warmup(MagicMock(reqs=[finished]))
 
         self.assertEqual(self.state.recovery_phase, "failed")
+        self.assertEqual(self.state.runtime_health, "recovery_unsupported")
+        abort_recovery.assert_called_once_with("recover-1", 2)
         update = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
         self.assertFalse(update.success)
         self.assertEqual(update.recovery_phase, "failed")
