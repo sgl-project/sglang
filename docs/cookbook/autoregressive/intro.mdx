@@ -124,13 +124,13 @@ metatags:
   <Card
     title="StepFun"
     mode="card"
-    href="/cookbook/autoregressive/StepFun/Step3.5"
+    href="/cookbook/autoregressive/StepFun/Step-5-Preview"
     img="/cards/logos/stepfun.png"
   />
   <Card
     title="InclusionAI"
     mode="card"
-    href="/cookbook/autoregressive/InclusionAI/Ling-3.0-flash-VL"
+    href="/cookbook/autoregressive/InclusionAI/Ling-3.1-flash"
     img="/cards/logos/inclusionai.png"
   />
   <Card

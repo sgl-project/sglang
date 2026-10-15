@@ -748,7 +748,9 @@ pub(super) fn chat_event_stream(
     };
 
     async_stream::stream! {
-        let mut tool_calls_seen = vec![false; count];
+        // Each choice's first tool call, whose deltas (a name and argument
+        // fragments, for some parsers) alone pass without parallel tool calls.
+        let mut first_tool_call: Vec<Option<u32>> = vec![None; count];
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
             if let Some(response) = item.data.as_mut() {
@@ -756,15 +758,13 @@ pub(super) fn chat_event_stream(
                     for choice in &mut response.choices {
                         let index = choice.index as usize;
                         if let Some(calls) = choice.delta.tool_calls.as_mut() {
-                            if tool_calls_seen.get(index).copied().unwrap_or(false) {
-                                calls.clear();
-                            } else {
-                                calls.truncate(1);
-                                if !calls.is_empty()
-                                    && let Some(seen) = tool_calls_seen.get_mut(index)
-                                {
-                                    *seen = true;
-                                }
+                            let seen = first_tool_call.get(index).copied().flatten();
+                            let first = seen.or(calls.first().map(|call| call.index));
+                            calls.retain(|call| Some(call.index) == first);
+                            if let (Some(first), Some(slot)) = (first, first_tool_call.get_mut(index))
+                                && !calls.is_empty()
+                            {
+                                *slot = Some(first);
                             }
                             if calls.is_empty() {
                                 choice.delta.tool_calls = None;
@@ -846,13 +846,13 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
-/// V4 and GLM-5.3 prefill `<think>` when thinking, so the generated stream has
-/// no opening marker.
+/// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
+/// thinking, so the generated stream has no opening marker.
 fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
     matches!(
         reasoning_parser,
-        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45")
-    ) && prompt.ends_with("<think>")
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+    ) && prompt.trim_end_matches('\n').ends_with("<think>")
 }
 
 #[cfg(test)]
@@ -884,11 +884,20 @@ mod tests {
             glm,
             "<|user|>hi<|assistant|><think></think>"
         ));
+        let qwen = Some("qwen3");
+        assert!(starts_in_reasoning(
+            qwen,
+            "<|im_start|>assistant\n<think>\n"
+        ));
+        assert!(!starts_in_reasoning(
+            qwen,
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
         assert!(starts_in_reasoning(
             Some("deepseek-v4"),
             "<｜Assistant｜><think>"
         ));
-        assert!(!starts_in_reasoning(None, "<think>"));
+        assert!(!starts_in_reasoning(None, "<think>\n"));
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
