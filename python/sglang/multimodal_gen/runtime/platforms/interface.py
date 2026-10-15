@@ -307,12 +307,12 @@ class Platform:
     @classmethod
     def synchronize(cls) -> None:
         """Synchronize pending device work for the current platform."""
-        pass
+        torch.get_device_module().synchronize()
 
     @classmethod
     def empty_cache(cls) -> None:
         """Release cached device memory for the current platform."""
-        pass
+        torch.get_device_module().empty_cache()
 
     @classmethod
     def get_attn_backend_cls_str(
