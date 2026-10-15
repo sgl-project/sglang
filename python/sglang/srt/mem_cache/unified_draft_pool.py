@@ -395,9 +395,12 @@ class UnifiedDraftMambaPool(MambaPool):
         plain EXTEND forward: ModelRunner skips it on decode, target-verify
         and draft-extend, the modes the draft needs it in.
         """
+        # index_fill_, not `[:, idx] = 0`: an indexed Python zero is a host tensor
+        # that index_put_ copies into the pool, a stream synchronize per view.
+        idx = indices.to(device=self.mamba_cache.temporal.device, dtype=torch.int64)
         for view in self.mamba_cache.conv:
-            view[:, indices] = 0
-        self.mamba_cache.temporal[:, indices] = 0
+            view.index_fill_(1, idx, 0)
+        self.mamba_cache.temporal.index_fill_(1, idx, 0)
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Copy-on-write THIS runner's state block, block only (see above)."""

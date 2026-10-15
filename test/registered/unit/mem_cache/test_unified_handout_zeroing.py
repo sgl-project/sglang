@@ -16,11 +16,18 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DraftStateGeometry,
+    DraftStateRegion,
+    FusedDraftPlacement,
+)
+from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftMambaPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
     MLASubPoolSpec,
     UnifiedKVPool,
+    UnifiedMambaPool,
     UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
     init_unified_swa_pools,
@@ -327,6 +334,84 @@ class TestPoisonSparesTheSlotZeroSink(unittest.TestCase):
         self.assertEqual(table[0, :2].tolist(), [0, 0])  # freed: the sink
         v = bundle.token_to_kv_pool.swa_kv_pool.v_buffer[0]
         self.assertFalse(torch.isnan(v[:ps].float()).any().item())
+
+
+def _build_fused_mamba(device):
+    """A full + mamba pool whose mamba entries carry a fused draft's state
+    block, with the host's and the draft's state pools over it."""
+    region = DraftStateRegion(
+        lane_num=1,
+        state=DraftStateGeometry(
+            conv_state_shapes=((2, 4), (2, 4)),
+            conv_dtype=torch.float32,
+            temporal_state_shape=(2,),
+            temporal_dtype=torch.float32,
+        ),
+    )
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=2,
+        head_num=2,
+        head_dim=4,
+        store_dtype=torch.bfloat16,
+        grow_direction="down",
+    )
+    mamba_spec = MambaSubPoolSpec(
+        name="mamba",
+        layer_num=2,
+        conv_state_shapes=((3, 8),),
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=(2,),
+        temporal_dtype=torch.float32,
+        grow_direction="up",
+        draft_region=region,
+    )
+    buf = UnifiedKVPool(
+        total_bytes=4 * full_spec.entry_bytes() + 8 * mamba_spec.entry_bytes(),
+        sub_pool_specs=[full_spec, mamba_spec],
+        device=device,
+        enable_memory_saver=False,
+        page_size=1,
+        fused_draft=FusedDraftPlacement.from_counts(
+            counts={"mamba": [1]}, regions={"mamba": region}
+        ),
+    )
+    host = UnifiedMambaPool(
+        unified_buffer=buf,
+        sub_pool_name="mamba",
+        spec_state_size=2,
+        mamba_layer_ids=[0, 1],
+    )
+    draft = UnifiedDraftMambaPool(
+        unified_buffer=buf, sub_pool_name="mamba", layer_lanes={4: 0}
+    )
+    return buf, host, draft
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required (sync debug mode)")
+class TestMambaSlotClearStaysOnDevice(unittest.TestCase):
+    """BUG REGRESSION. Clearing mamba slots runs on every admission and must not
+    synchronize the stream."""
+
+    def test_clear_slots_does_not_synchronize(self):
+        buf, host, draft = _build_fused_mamba("cuda")
+        buf._raw.fill_(0x3F)  # every bf16 / fp32 element a normal nonzero
+        idx = torch.tensor([2, 5], device="cuda")
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            draft.clear_slots(idx)
+            host.clear_slots(idx[:1].int())
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        draft_conv, draft_temporal = buf.build_draft_state_views("mamba")
+        for view in (*draft_conv, draft_temporal):
+            self.assertFalse(view[:, 2].any().item())
+            self.assertFalse(view[:, 5].any().item())
+        # The draft's clear spares the host's streams in the same slot.
+        for view in (*host.mamba_cache.conv, host.mamba_cache.temporal):
+            self.assertFalse(view[:, 2].any().item())
+            self.assertTrue(view[:, 5].all().item())
 
 
 if __name__ == "__main__":  # pragma: no cover
