@@ -709,6 +709,7 @@ class MambaComponent(TreeComponent):
 
         if not keys:
             return None
+
         transfer = PoolTransfer(
             name=PoolName.MAMBA,
             keys=[keys[-1]],

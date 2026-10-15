@@ -183,10 +183,11 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
-def test_cache_linker_rejects_unsupported_tree_components():
-    cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, ComponentType.C128))
+@pytest.mark.parametrize("component_type", [ComponentType.C128])
+def test_cache_linker_rejects_unsupported_tree_components(component_type):
+    cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
 
-    with pytest.raises(ValueError, match="C128"):
+    with pytest.raises(ValueError, match=component_type.name):
         UnifiedCacheLinkerWrapper(cache, _FakeLinker())
 
     assert not cache.tree_core.enable_external_cache_linker
