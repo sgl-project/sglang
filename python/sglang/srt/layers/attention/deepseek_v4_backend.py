@@ -3574,6 +3574,9 @@ class DeepseekV4AttnBackend(
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
+        # The negation of the sparse-prefill gate in forward(), which reads only
+        # raw_indices; num_qo_tokens=0 drops the query-count clause, so this errs
+        # to True. Paged attention under active CP needs the page indices.
         return (
             self.trtllm_attn
             or self.mega_attn
