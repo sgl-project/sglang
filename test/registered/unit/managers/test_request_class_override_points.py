@@ -141,8 +141,8 @@ class TestRequestClassOverridePoints(CustomTestCase):
             cancel_for_dispatch=lambda items: None,
         )
         manager.positional_embeds_transport = SimpleNamespace(
-            prepare_for_dispatch=lambda objs: [],
-            cancel_for_dispatch=lambda items: None,
+            prepare_for_dispatch=lambda tokenized_objs: [],
+            cancel_for_dispatch=lambda proxies: None,
         )
         manager._dispatch_to_scheduler = sent.append
         manager._mark_state_dispatched = lambda rid: None
