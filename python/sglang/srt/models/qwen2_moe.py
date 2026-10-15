@@ -423,7 +423,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._route_rt_static_ok = self._route_front_static_ok
         # The shared expert's gate/up output when that kernel also computed it this forward,
         # with the event the side stream waits on before running the rest of the shared expert.
-        self._route_sh_static_ok = self._route_front_static_ok
+        self._route_sh_static_ok = (
+            None
+            if self._route_front_static_ok is None
+            and envs.SGLANG_Q35MF_ROUTE_SHARED.get()
+            else False
+        )
         self._route_sh_gate_up: Optional[torch.Tensor] = None
         self._route_sh_event = (
             torch.cuda.Event() if self._route_front_static_ok is None else None

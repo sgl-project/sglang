@@ -1151,6 +1151,10 @@ class Envs:
     # With SGLANG_Q35MF_ROUTE_FUSED: compute the router GEMV in the same kernel
     # too, in the cuBLAS router GEMM's accumulation order.
     SGLANG_Q35MF_ROUTE_GEMV = EnvBool(False)
+    # With SGLANG_Q35MF_ROUTE_FUSED on the trtllm runner: also compute the shared
+    # expert's FP8 gate/up projection in the same launch (fp32 accumulation order
+    # differs from cuBLASLt).
+    SGLANG_Q35MF_ROUTE_SHARED = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

@@ -194,7 +194,7 @@ def _use_shared(block: "Qwen2MoeSparseMoeBlock", m: int, defer_finalize: bool) -
     ok = block._route_sh_static_ok
     if ok is None:
         ok = block._route_sh_static_ok = _static_supported_shared(block)
-    return ok
+    return ok  # False unless SGLANG_Q35MF_ROUTE_SHARED is set (Qwen2MoeSparseMoeBlock.__init__)
 
 
 def shared_expert_tail(mlp, gate_up: torch.Tensor) -> torch.Tensor:
@@ -242,6 +242,7 @@ def forward_routed_rt(
             gu.input_scale.reshape(1),
             gu.weight_scale.reshape(1),
         )
+        gate_up.record_stream(block.alt_stream)
         block._route_sh_gate_up = gate_up
         block._route_sh_event.record()
     else:
