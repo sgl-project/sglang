@@ -10,7 +10,12 @@ from unittest import mock
 import torch
 
 from sglang.multimodal_gen.configs.models.vaes.flux3_image import Flux3ImageVAEConfig
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    use_vae_fast_path,
+)
 from sglang.multimodal_gen.runtime.models.vaes.flux3_image_vae import (
+    AttnBlock,
     Encoder,
     Flux3ImageVAE,
     Upsample,
@@ -24,6 +29,21 @@ def _meta_vae() -> Flux3ImageVAE:
 
 
 class TestFlux3ImageVAE(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_memory_efficient_attention_keeps_fp32_full_context(self):
+        torch.manual_seed(0)
+        block = AttnBlock(512, strided=True).cuda().eval()
+        block.fast_path_gate = VaeFastPathGate()
+        x = torch.randn(1, 512, 129, 129, device="cuda")
+        with (
+            torch.inference_mode(),
+            mock.patch.object(torch.backends.cuda.matmul, "allow_tf32", False),
+        ):
+            expected = block(x)
+            block.fast_path_gate.enabled = True
+            actual = block(x)
+        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
+
     def test_encoder_releases_dead_activations(self):
         encoder = Encoder(32, 3, 32, [1, 1], 1, 4).eval()
         activations = []
@@ -42,6 +62,9 @@ class TestFlux3ImageVAE(unittest.TestCase):
         vae = _meta_vae()
         for module in (vae.encoder, vae.decoder, vae.encoder.mid.block_1):
             self.assertIsInstance(module.act, torch.nn.SiLU)
+        with use_vae_fast_path(vae, True):
+            self.assertTrue(vae.decoder.mid.attn_1.fast_path_gate.enabled)
+        self.assertFalse(vae.decoder.mid.attn_1.fast_path_gate.enabled)
 
     def test_enable_spatial_parallel_swaps_convs(self):
         vae = _meta_vae()

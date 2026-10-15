@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, Packed, pack
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
     Flux3ImagePackageConfig,
 )
@@ -590,10 +591,13 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
             tuple(self.package_config.sampler.size),
         )
         batch.width, batch.height = width, height
-        with self.use_declared_component(
-            component_name="vae",
-            module=self.vae,
-            phase="condition_encode",
+        with (
+            self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                phase="condition_encode",
+            ),
+            use_vae_fast_path(self.vae, batch.quality != "exact"),
         ):
             with torch.inference_mode():
                 batch.flux3_condition = encode_references(
@@ -781,6 +785,7 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                 not flow_map
                 and not server_args.enable_breakable_cuda_graph
                 and not server_args.enable_torch_compile
+                and not server_args.enable_attention_backend_autotune
                 and not server_args.dit_layerwise_offload
                 and not server_args.enable_cfg_parallel
                 and not sequential_cfg
@@ -858,10 +863,13 @@ class Flux3ImageDecodeStage(PipelineStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        with self.use_declared_component(
-            component_name="vae",
-            module=self.vae,
-            phase="decode",
+        with (
+            self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                phase="decode",
+            ),
+            use_vae_fast_path(self.vae, batch.quality != "exact"),
         ):
             with torch.inference_mode():
                 image = crop_output(
@@ -876,8 +884,11 @@ class Flux3ImageDecodeStage(PipelineStage):
         for index, batch in enumerate(batches):
             groups.setdefault((batch.width, batch.height), []).append((index, batch))
         outputs = [None] * len(batches)
-        with self.use_declared_component(
-            component_name="vae", module=self.vae, phase="decode"
+        with (
+            self.use_declared_component(
+                component_name="vae", module=self.vae, phase="decode"
+            ),
+            use_vae_fast_path(self.vae, batches[0].quality != "exact"),
         ):
             for group in groups.values():
                 decoded = vae_decode(

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 import torch
 from einops import rearrange
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.diffusion import apply_group_norm_silu
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -35,6 +36,10 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import has_decode_parallel_world
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    register_vae_fast_path_gate,
+)
 
 
 @dataclass
@@ -54,6 +59,7 @@ class AttnBlock(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.strided = strided
+        self.fast_path_gate: VaeFastPathGate | None = None
 
         self.norm = nn.GroupNorm(
             num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
@@ -83,7 +89,25 @@ class AttnBlock(nn.Module):
             v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
         # Reference numerics: PyTorch's default SDPA backend choice.
         with torch_default_sdpa_backends():
-            h_ = nn.functional.scaled_dot_product_attention(q, k, v)
+            if (
+                self.fast_path_gate is not None
+                and self.fast_path_gate.enabled
+                and q.is_cuda
+                and q.dtype == torch.float32
+                and q.shape[-2] >= 16384
+            ):
+                # NCHW views force quadratic math SDPA. Dense head channels
+                # allow the existing FP32 memory-efficient kernel, if supported.
+                dense = tuple(tensor.contiguous() for tensor in (q, k, v))
+                params = torch.backends.cuda.SDPAParams(*dense, None, 0.0, False, False)
+                if torch.backends.cuda.can_use_efficient_attention(params):
+                    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                        h_ = nn.functional.scaled_dot_product_attention(*dense)
+                else:
+                    del params, dense
+                    h_ = nn.functional.scaled_dot_product_attention(q, k, v)
+            else:
+                h_ = nn.functional.scaled_dot_product_attention(q, k, v)
 
         return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
 
@@ -351,6 +375,11 @@ class AutoEncoder(nn.Module):
             affine=False,
             track_running_stats=True,
         )
+        gate = VaeFastPathGate()
+        for module in self.modules():
+            if isinstance(module, AttnBlock):
+                module.fast_path_gate = gate
+        register_vae_fast_path_gate(self, gate)
 
     def normalize(self, z: Tensor) -> Tensor:
         self.bn.eval()
