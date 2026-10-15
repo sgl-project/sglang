@@ -3282,14 +3282,23 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
-        # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
-        # row would be written at K's width and bleed into the next slot. Only this
-        # path needs the gate; the non-CUDA branch above handles both widths.
+        # The tiled kernels take one row width, so asymmetric K/V (an MLA draft) goes
+        # through set_kv_buffer, which owns the dtype conversion. Rows past
+        # commit_lens land in padding slot 0 instead of being gathered (no host sync).
         if self.v_row_dim != self.row_dim:
-            raise NotImplementedError(
-                "prefix-valid commit requires equal-width K/V rows, got "
-                f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
+            row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+            valid_mask = row_offsets[None, :] < commit_lens[:, None]
+            loc = torch.where(valid_mask, loc_2d, 0).reshape(-1)
+            self.set_kv_buffer(
+                layer,
+                KVWriteLoc(loc, physical=True),
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+                layer_id_override=layer_id,
             )
+            return
 
         fused_k_scale = _resolve_fused_scale(
             k_scale,

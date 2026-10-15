@@ -1922,7 +1922,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                    v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+                    v = v.view(-1, attn.num_kv_heads, attn.v_head_dim)
 
                     self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,
@@ -1978,7 +1978,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_norm(k)
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            v = v.view(-1, attn.num_kv_heads, attn.v_head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 KVWriteLoc(ctx_cache_loc, physical=True),

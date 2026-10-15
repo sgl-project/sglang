@@ -1101,6 +1101,13 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and getattr(self.hf_config, "dflash_config", None):
+            from sglang.srt.speculative.dflash_utils import (
+                expand_dflash_mla_kv_shapes,
+            )
+
+            expand_dflash_mla_kv_shapes(self.hf_config)
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (

@@ -17,7 +17,10 @@ from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
+from sglang.srt.speculative.dflash_utils import (
+    can_dflash_slice_qkv_weight,
+    is_dflash_mla_draft_config,
+)
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
@@ -382,6 +385,9 @@ class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        # The DSpark context-KV writers slice a fused qkv_proj.
+        if is_dflash_mla_draft_config(config):
+            raise ValueError("DSpark drafts do not support mla draft attention.")
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
         self.logits_mup_width_multiplier = None

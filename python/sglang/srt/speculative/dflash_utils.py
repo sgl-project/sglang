@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 import triton
@@ -24,6 +25,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 from sglang.utils import LazyImport
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+_DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
 
 logger = logging.getLogger(__name__)
 
@@ -547,6 +549,130 @@ def _parse_optional_int(
         comparator = "positive" if int(min_value) == 1 else f">= {int(min_value)}"
         raise ValueError(f"{field_name} must be {comparator}, got {parsed}.")
     return parsed
+
+
+def get_dflash_attention_modes(draft_hf_config: Any) -> Tuple[str, ...]:
+    """One attention mode per draft layer.
+
+    SpecForge exports the scalar ``dflash_config.attention_mode``; per-layer
+    ``attention_modes`` lists come from forks that mix modes. Default is gqa.
+    """
+    dflash_cfg = _get_dflash_config(draft_hf_config)
+    num_hidden_layers = _parse_optional_int(
+        _cfg_get(_get_text_config(draft_hf_config), "num_hidden_layers", None),
+        field_name="DFLASH draft num_hidden_layers",
+        min_value=1,
+    )
+    if num_hidden_layers is None:
+        raise ValueError("DFLASH attention modes require config.num_hidden_layers.")
+    if "attention_mode" in dflash_cfg and "attention_modes" in dflash_cfg:
+        raise ValueError(
+            "DFLASH dflash_config sets both attention_mode and attention_modes; "
+            "set only one."
+        )
+
+    raw_modes = dflash_cfg.get("attention_modes")
+    if raw_modes is None:
+        raw_modes = [dflash_cfg.get("attention_mode", "gqa")] * num_hidden_layers
+    elif not isinstance(raw_modes, (list, tuple)) or len(raw_modes) != (
+        num_hidden_layers
+    ):
+        raise ValueError(
+            "DFLASH dflash_config.attention_modes must list one mode per draft "
+            f"layer (num_hidden_layers={num_hidden_layers}), got {raw_modes!r}."
+        )
+
+    modes = tuple(str(mode).lower() for mode in raw_modes)
+    unsupported = set(modes) - _DFLASH_ATTENTION_MODES
+    if unsupported:
+        raise ValueError(
+            f"DFLASH draft attention mode(s) {sorted(unsupported)} are not "
+            f"supported; expected one of {sorted(_DFLASH_ATTENTION_MODES)}."
+        )
+    return modes
+
+
+def is_dflash_mla_draft_config(draft_hf_config: Any) -> bool:
+    modes = get_dflash_attention_modes(draft_hf_config)
+    if "mla" not in modes:
+        return False
+    # The draft KV pool has a single per-layer row layout.
+    if any(mode != "mla" for mode in modes):
+        raise ValueError(
+            "DFLASH drafts that mix mla with gqa/mha layers are not supported, "
+            f"got attention modes {list(modes)}."
+        )
+    return True
+
+
+class DFlashMLAConfig(msgspec.Struct, frozen=True):
+    q_lora_rank: Optional[int]
+    kv_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    v_head_dim: int
+    # True: DeepSeek interleaved pairs; False: NeoX halves.
+    rope_interleave: bool
+
+    @property
+    def qk_head_dim(self) -> int:
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+
+def parse_dflash_mla_config(draft_hf_config: Any) -> DFlashMLAConfig:
+    """Validate the MLA dimension fields the way SpecForge's
+    ``validate_dflash_mla_config`` does at training time."""
+    text_config = _get_text_config(draft_hf_config)
+    required = ("kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
+    missing = [name for name in required if _cfg_get(text_config, name) is None]
+    if missing:
+        raise ValueError(f"DFLASH mla draft config is missing {missing}.")
+
+    def _dim(name: str, min_value: int) -> int:
+        return _parse_optional_int(
+            _cfg_get(text_config, name),
+            field_name=f"DFLASH mla {name}",
+            min_value=min_value,
+        )
+
+    q_lora_rank = _cfg_get(text_config, "q_lora_rank")
+    if q_lora_rank is not None:
+        q_lora_rank = _dim("q_lora_rank", 1)
+    qk_rope_head_dim = _dim("qk_rope_head_dim", 1)
+    if qk_rope_head_dim % 2:
+        raise ValueError(
+            f"DFLASH mla qk_rope_head_dim must be even, got {qk_rope_head_dim}."
+        )
+    rope_interleave = _cfg_get(text_config, "rope_interleave", True)
+    if not isinstance(rope_interleave, bool):
+        raise ValueError(
+            f"DFLASH mla rope_interleave must be a bool, got {rope_interleave!r}."
+        )
+    return DFlashMLAConfig(
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=_dim("kv_lora_rank", 1),
+        qk_nope_head_dim=_dim("qk_nope_head_dim", 0),
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=_dim("v_head_dim", 1),
+        rope_interleave=rope_interleave,
+    )
+
+
+def expand_dflash_mla_kv_shapes(draft_hf_config: Any) -> None:
+    """Size the draft KV pool for an MLA draft served as expanded MHA.
+
+    Every head stores K = [k_nope | k_pe] and its own V row, so the pool needs
+    head_dim = qk_nope + qk_rope and num_kv_heads = num_attention_heads. The
+    exported head_dim / num_key_value_heads are unused by the MLA layers.
+    """
+    if not _get_dflash_config(draft_hf_config) or not is_dflash_mla_draft_config(
+        draft_hf_config
+    ):
+        return
+    mla_config = parse_dflash_mla_config(draft_hf_config)
+    text_config = _get_text_config(draft_hf_config)
+    text_config.head_dim = mla_config.qk_head_dim
+    text_config.num_key_value_heads = text_config.num_attention_heads
 
 
 @dataclass(frozen=True)

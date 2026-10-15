@@ -209,6 +209,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             apply_k_rope=lambda pos, k: k,
             num_kv_heads=1,
             head_dim=4,
+            v_head_dim=4,
             attn=SimpleNamespace(k_scale=None, v_scale=None),
         )
         worker = SimpleNamespace(
