@@ -38,8 +38,9 @@ class SharedCPUHostDedupContext:
     def validate_host_rows(self, transfers, failure: Optional[str] = None) -> None:
         """Compare shared row order before accessing host memory on any rank.
 
-        GPU destination rows may differ by rank. Host rows must identify the
-        same ordered bytes, including each DSA side pool, on every reader.
+        GPU destination rows may differ by rank. Shared host rows must identify
+        the same ordered bytes on every reader. Private state rows stay local
+        and may have different indices without changing the shared-row digest.
         Catch local preparation errors so peers reach the same failure verdict.
         """
         digest = hashlib.blake2b(digest_size=8)
@@ -47,16 +48,15 @@ class SharedCPUHostDedupContext:
             for transfer in transfers:
                 pool = transfer.host_pool
                 if not getattr(pool.allocator, "is_shared", False):
-                    raise ValueError(
-                        "Shared MLA restore cannot include a private host pool."
-                    )
+                    continue
                 if pool.allocator.process_group is not self.process_group:
                     raise ValueError(
                         "Shared host allocation uses a different TP group."
                     )
                 label = (
-                    f"{type(pool).__name__}:{getattr(pool, 'pool_label', '')}".encode()
-                )
+                    f"{type(pool).__name__}:"
+                    f"{getattr(pool, 'pool_name', getattr(pool, 'pool_label', ''))}"
+                ).encode()
                 rows = transfer.host_indices.to(
                     device="cpu", dtype=torch.int64
                 ).contiguous()

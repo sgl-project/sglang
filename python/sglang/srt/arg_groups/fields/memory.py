@@ -116,7 +116,8 @@ class Memory(msgspec.Struct):
         Arg(
             help="Restore deduplicated host KV through rank-0 H2D plus GPU broadcast, "
             "or let each TP rank load the same shared CPU allocation. "
-            "The shared mode requires single-node CUDA MLA/DSA, direct I/O and L2 only.",
+            "The shared mode requires single-node CUDA MLA/DSA, V4 or MLA/KDA, "
+            "direct I/O and L2 only.",
             choices=["broadcast", "shared"],
         ),
     ] = "broadcast"

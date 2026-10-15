@@ -176,7 +176,9 @@ def _estimate_hicache_bytes(
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 
-def _dedup_host_budget(physical_bytes: int, rank_budget: int) -> tuple[float, int]:
+def _dedup_host_budget(
+    physical_bytes: int, rank_budget: int, *, mapped_bytes: int | None = None
+) -> tuple[float, int]:
     """Share a host's allowance by physical demand before constructing any pool.
 
     Use the smallest cgroup-bounded snapshot reported on a node. This stays
@@ -186,6 +188,7 @@ def _dedup_host_budget(physical_bytes: int, rank_budget: int) -> tuple[float, in
     # multiplies two byte counts, which can exceed int64 even when each fits.
     physical_bytes = int(physical_bytes)
     rank_budget = int(rank_budget)
+    mapped_bytes = physical_bytes if mapped_bytes is None else int(mapped_bytes)
     node_rank = get_parallel().node_rank
     local = torch.tensor(
         [node_rank, rank_budget * ranks_per_host(), physical_bytes], dtype=torch.int64
@@ -205,7 +208,7 @@ def _dedup_host_budget(physical_bytes: int, rank_budget: int) -> tuple[float, in
         # A node containing only dummy peers must not constrain an owner on a
         # different node. It still participates in the subsequent global MIN.
         return float("inf"), 0
-    return host_budget / host_bytes, host_budget * physical_bytes // host_bytes
+    return host_budget / host_bytes, host_budget * mapped_bytes // host_bytes
 
 
 @contextmanager
@@ -230,20 +233,17 @@ def auto_size_hicache(
         host_memory_budget_bytes(auto_size=automatic) * (fraction if automatic else 1.0)
     )
     if dedup:
-        capacity_ratio, budget = _dedup_host_budget(device_bytes, budget)
-        if getattr(memory, "mla_hicache_host_dedup_mode", "broadcast") == "shared":
-            # Peers map the owner's physical allocation rather than becoming
-            # buffer-less dummy pools. Give each mapper the owner's admission
-            # allowance, while the node's physical-demand sum still counts the
-            # shared bytes only once.
-            group = params.tp_cache_group
-            allowance = torch.tensor([budget], dtype=torch.int64)
-            torch.distributed.broadcast(
-                allowance,
-                src=torch.distributed.get_global_rank(group, 0),
-                group=group,
+        shared = getattr(memory, "mla_hicache_host_dedup_mode", "broadcast") == "shared"
+        # Physical demand counts one shared copy plus every rank's private
+        # state. Admission covers this rank's mapped KV and its own state;
+        # copying the owner's entire allowance would misbudget hybrid pools.
+        if shared:
+            mapped_bytes = _estimate_hicache_bytes(params, draft_plan, physical=False)
+            capacity_ratio, budget = _dedup_host_budget(
+                device_bytes, budget, mapped_bytes=mapped_bytes
             )
-            budget = int(allowance.item())
+        else:
+            capacity_ratio, budget = _dedup_host_budget(device_bytes, budget)
     else:
         capacity_ratio = budget / device_bytes
     ratio = (

@@ -223,6 +223,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         allocator_type: str = "default",
         page_aligned_only: bool = False,
         is_dummy: bool = False,
+        shared_memory_group=None,
     ):
         self.pool_name = pool_name
         self._is_dummy = is_dummy
@@ -238,7 +239,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.shared_memory_group = shared_memory_group
+        self.allocator = get_allocator_from_storage(
+            allocator_type, shared_memory_group=shared_memory_group
+        )
+        self.kv_buffer = []
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
         self.layout = layout
@@ -249,6 +254,16 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
         self.device_buffers = device_buffers
         self.gpu_device = device_buffers[0].device if device_buffers else device
+
+        self._finish_shared_initialization(
+            ValueError(
+                "Shared V4 host pools require non-dummy page_first_direct storage"
+            )
+            if shared_memory_group is not None
+            and (is_dummy or self.layout != "page_first_direct")
+            else None,
+            operation=f"{pool_name} configuration",
+        )
 
         if is_dummy:
             if layout not in ("layer_first", "page_first", "page_first_direct"):
@@ -263,87 +278,110 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             self.clear()
             return
 
-        requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 paged pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
-
-        # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
-        # not torch.device objects; a torch.device key silently falls back to
-        # cudaHostRegister, which fails on NPU. Resolve the alloc func by type str.
-        _alloc_key = (
-            self.gpu_device.type
-            if isinstance(self.gpu_device, torch.device)
-            else str(self.gpu_device)
+        error = None
+        try:
+            requested_bytes = self.layer_num * num_host_pages * self.item_bytes
+            available_bytes = host_memory_budget_bytes(requested_bytes)
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory for V4 paged pool {pool_name}. "
+                    f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free."
+                )
+        except Exception as exc:
+            error = exc
+        self._finish_shared_initialization(
+            error, operation=f"{pool_name} memory admission"
         )
-        alloc_func = ALLOC_MEMORY_FUNCS[_alloc_key]
-        self.data_refs = []
-        if self.layout == "layer_first":
-            self.kv_buffer = [
-                alloc_func(
-                    (num_host_pages, self.item_bytes),
+
+        error = None
+        try:
+            # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
+            # not torch.device objects; a torch.device key silently falls back to
+            # cudaHostRegister, which fails on NPU. Resolve the alloc func by type str.
+            _alloc_key = (
+                self.gpu_device.type
+                if isinstance(self.gpu_device, torch.device)
+                else str(self.gpu_device)
+            )
+            alloc_func = ALLOC_MEMORY_FUNCS[_alloc_key]
+            self.data_refs = []
+            if self.layout == "layer_first":
+                self.kv_buffer = [
+                    alloc_func(
+                        (num_host_pages, self.item_bytes),
+                        dtype=self.dtype,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                        allocator=self.allocator,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+            elif self.layout == "page_first":
+                self.kv_buffer = alloc_func(
+                    (num_host_pages, self.layer_num, self.item_bytes),
                     dtype=self.dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
+                    registration_granularity_bytes=self.layer_num * self.item_bytes,
                 )
-                for _ in range(self.layer_num)
-            ]
-            self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        elif self.layout == "page_first":
-            self.kv_buffer = alloc_func(
-                (num_host_pages, self.layer_num, self.item_bytes),
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-                registration_granularity_bytes=self.layer_num * self.item_bytes,
-            )
-        elif self.layout == "page_first_direct":
-            self.kv_buffer = alloc_func(
-                (num_host_pages, self.layer_num, 1, self.item_bytes),
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-                registration_granularity_bytes=self.layer_num * self.item_bytes,
-            )
-        else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
+            elif self.layout == "page_first_direct":
+                self.kv_buffer = alloc_func(
+                    (num_host_pages, self.layer_num, 1, self.item_bytes),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                    registration_granularity_bytes=self.layer_num * self.item_bytes,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
 
-        logger.info(
-            "Allocating %.2f GB host memory for V4 paged pool '%s' "
-            "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
-            requested_bytes / 1e9,
-            self.pool_name,
-            self.layer_num,
-            num_host_pages,
-            self.item_bytes,
-            self.layout,
+            logger.info(
+                "Allocating %.2f GB host memory for V4 paged pool '%s' "
+                "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
+                requested_bytes / 1e9,
+                self.pool_name,
+                self.layer_num,
+                num_host_pages,
+                self.item_bytes,
+                self.layout,
+            )
+
+            self.device_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.device_buffers],
+                dtype=torch.uint64,
+                device=self.gpu_device,
+            )
+            self.data_ptrs = (
+                make_kernel_ptr_table(
+                    self.data_refs,
+                    self.gpu_device,
+                    host_memory_registered=self.pin_memory,
+                )
+                if self.data_refs
+                else None
+            )
+            self.can_use_jit = False
+            self.can_use_write_back_jit = False
+            self._init_write_back_staging_buffers()
+            self.clear()
+        except Exception as exc:
+            if shared_memory_group is None:
+                self.destroy()
+                raise
+            error = exc
+        self._finish_shared_initialization(
+            error, operation=f"{pool_name} initialization"
         )
 
-        self.device_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.device_buffers],
-            dtype=torch.uint64,
-            device=self.gpu_device,
-        )
-        self.data_ptrs = (
-            make_kernel_ptr_table(
-                self.data_refs,
-                self.gpu_device,
-                host_memory_registered=self.pin_memory,
-            )
-            if self.data_refs
-            else None
-        )
-        self.can_use_jit = False
-        self.can_use_write_back_jit = False
-        self._init_write_back_staging_buffers()
-        self.clear()
+    def _clear_shared_host_views(self) -> None:
+        self.data_refs = []
+        self.data_ptrs = None
+        self.device_ptrs = None
+        self.staging_buffer = None
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
@@ -753,10 +791,8 @@ class DeepSeekV4StateHostPool(HostKVCache):
         pin_memory: bool = True,
         allocator_type: str = "default",
         is_dummy: bool = False,
+        shared_memory_group=None,
     ):
-        if any(pool is None for pool in state_pools):
-            raise ValueError(f"{pool_name} state_pools must not contain None")
-
         self.pool_name = pool_name
         self._is_dummy = is_dummy
         self.state_pools = state_pools
@@ -766,7 +802,11 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.shared_memory_group = shared_memory_group
+        self.allocator = get_allocator_from_storage(
+            allocator_type, shared_memory_group=shared_memory_group
+        )
+        self.kv_buffer = []
         self.page_size = swa_page_size
         self.size = num_host_pages * swa_page_size
         self.layout = layout
@@ -778,8 +818,27 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.state_page_bytes = 0
         self.device_page_views = []
         self.gpu_device = device
-        self._init_device_page_views()
+        error = None
+        try:
+            if any(pool is None for pool in state_pools):
+                raise ValueError(f"{pool_name} state_pools must not contain None")
+            self._init_device_page_views()
+        except Exception as exc:
+            error = exc
+        self._finish_shared_initialization(
+            error, operation=f"{pool_name} state metadata"
+        )
         self.size_per_token = self.state_page_bytes
+
+        self._finish_shared_initialization(
+            ValueError(
+                "Shared V4 host pools require non-dummy page_first_direct storage"
+            )
+            if shared_memory_group is not None
+            and (is_dummy or self.layout != "page_first_direct")
+            else None,
+            operation=f"{pool_name} configuration",
+        )
 
         if is_dummy:
             if layout not in ("layer_first", "page_first", "page_first_direct"):
@@ -794,83 +853,110 @@ class DeepSeekV4StateHostPool(HostKVCache):
             self.clear()
             return
 
-        requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 state pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
-
-        # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
-        # not torch.device objects; resolve the key the same way PagedHostPool does.
-        _state_alloc_key = (
-            self.gpu_device.type
-            if isinstance(self.gpu_device, torch.device)
-            else str(self.gpu_device)
+        error = None
+        try:
+            requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
+            available_bytes = host_memory_budget_bytes(requested_bytes)
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory for V4 state pool {pool_name}. "
+                    f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free."
+                )
+        except Exception as exc:
+            error = exc
+        self._finish_shared_initialization(
+            error, operation=f"{pool_name} memory admission"
         )
-        alloc_func = ALLOC_MEMORY_FUNCS[_state_alloc_key]
-        self.data_refs = []
-        if self.layout == "layer_first":
-            self.kv_buffer = [
-                alloc_func(
-                    (num_host_pages, self.state_page_bytes),
+
+        error = None
+        try:
+            # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
+            # not torch.device objects; resolve the key the same way PagedHostPool does.
+            _state_alloc_key = (
+                self.gpu_device.type
+                if isinstance(self.gpu_device, torch.device)
+                else str(self.gpu_device)
+            )
+            alloc_func = ALLOC_MEMORY_FUNCS[_state_alloc_key]
+            self.data_refs = []
+            if self.layout == "layer_first":
+                self.kv_buffer = [
+                    alloc_func(
+                        (num_host_pages, self.state_page_bytes),
+                        dtype=self.dtype,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                        allocator=self.allocator,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+            elif self.layout == "page_first":
+                self.kv_buffer = alloc_func(
+                    (num_host_pages, self.layer_num, self.state_page_bytes),
                     dtype=self.dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
+                    registration_granularity_bytes=(
+                        self.layer_num * self.state_page_bytes
+                    ),
                 )
-                for _ in range(self.layer_num)
-            ]
-            self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        elif self.layout == "page_first":
-            self.kv_buffer = alloc_func(
-                (num_host_pages, self.layer_num, self.state_page_bytes),
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-                registration_granularity_bytes=(self.layer_num * self.state_page_bytes),
+            elif self.layout == "page_first_direct":
+                self.kv_buffer = alloc_func(
+                    (num_host_pages, self.layer_num, 1, self.state_page_bytes),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                    registration_granularity_bytes=(
+                        self.layer_num * self.state_page_bytes
+                    ),
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            logger.info(
+                "Allocating %.2f GB host memory for V4 state pool '%s' "
+                "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s).",
+                requested_bytes / 1e9,
+                self.pool_name,
+                self.layer_num,
+                num_host_pages,
+                self.state_page_bytes,
+                self.layout,
             )
-        elif self.layout == "page_first_direct":
-            self.kv_buffer = alloc_func(
-                (num_host_pages, self.layer_num, 1, self.state_page_bytes),
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-                registration_granularity_bytes=(self.layer_num * self.state_page_bytes),
+            self.device_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.device_page_views],
+                dtype=torch.uint64,
+                device=self.gpu_device,
             )
-        else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
-        logger.info(
-            "Allocating %.2f GB host memory for V4 state pool '%s' "
-            "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s).",
-            requested_bytes / 1e9,
-            self.pool_name,
-            self.layer_num,
-            num_host_pages,
-            self.state_page_bytes,
-            self.layout,
-        )
-        self.device_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.device_page_views],
-            dtype=torch.uint64,
-            device=self.gpu_device,
-        )
-        self.data_ptrs = (
-            make_kernel_ptr_table(
-                self.data_refs,
-                self.gpu_device,
-                host_memory_registered=self.pin_memory,
+            self.data_ptrs = (
+                make_kernel_ptr_table(
+                    self.data_refs,
+                    self.gpu_device,
+                    host_memory_registered=self.pin_memory,
+                )
+                if self.data_refs
+                else None
             )
-            if self.data_refs
-            else None
+            self.can_use_jit = False
+            self.can_use_write_back_jit = False
+            self._init_write_back_staging_buffers()
+        except Exception as exc:
+            if shared_memory_group is None:
+                self.destroy()
+                raise
+            error = exc
+        self._finish_shared_initialization(
+            error, operation=f"{pool_name} initialization"
         )
-        self.can_use_jit = False
-        self.can_use_write_back_jit = False
-        self._init_write_back_staging_buffers()
+
+    def _clear_shared_host_views(self) -> None:
+        self.data_refs = []
+        self.data_ptrs = None
+        self.device_ptrs = None
+        self.staging_buffer = None
 
     def _init_device_page_views(self) -> None:
         expected_ring_size = None

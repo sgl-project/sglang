@@ -556,7 +556,7 @@ class TestHiCacheSharedCPUBudget(CustomTestCase):
             token_to_kv_pool_allocator=mock.Mock(get_kvcache=lambda: pool),
             mtp_draft_device_pools=(),
         )
-        with self.assertRaisesRegex(ValueError, "flat CUDA MLA/DSA"):
+        with self.assertRaisesRegex(ValueError, "supported CUDA MLA/DSA"):
             assembler._validate_shared_mla_pool(pool, params, None)
 
     def test_shared_allocation_is_charged_to_owner_once(self):
@@ -608,11 +608,6 @@ class TestHiCacheSharedCPUBudget(CustomTestCase):
                 context = mock.Mock()
                 params = SimpleNamespace(tp_cache_group=object())
 
-                def owner_allowance(value, *, src, group):
-                    self.assertIs(group, params.tp_cache_group)
-                    self.assertEqual(src, 4)
-                    value[0] = 500
-
                 with (
                     self.subTest(rank=rank, fraction=fraction),
                     mock.patch.object(sizing, "get_memory", return_value=memory),
@@ -620,7 +615,9 @@ class TestHiCacheSharedCPUBudget(CustomTestCase):
                     mock.patch.object(
                         sizing,
                         "_estimate_hicache_bytes",
-                        return_value=100 if rank == 0 else 0,
+                        side_effect=lambda *args, physical=False: (
+                            100 if not physical or rank == 0 else 0
+                        ),
                     ),
                     mock.patch.object(
                         sizing, "host_memory_budget_bytes", return_value=125
@@ -628,14 +625,8 @@ class TestHiCacheSharedCPUBudget(CustomTestCase):
                     mock.patch.object(
                         sizing,
                         "_dedup_host_budget",
-                        return_value=(5, 500 if rank == 0 else 0),
-                    ),
-                    mock.patch.object(
-                        torch.distributed, "get_global_rank", return_value=4
-                    ),
-                    mock.patch.object(
-                        torch.distributed, "broadcast", side_effect=owner_allowance
-                    ),
+                        return_value=(5, 500),
+                    ) as allowance,
                     mock.patch.object(
                         torch.distributed, "is_initialized", return_value=False
                     ),
@@ -643,6 +634,7 @@ class TestHiCacheSharedCPUBudget(CustomTestCase):
                     with sizing.auto_size_hicache(params, None, enabled=True):
                         self.assertEqual(base.host_memory_budget_bytes(400), 500)
                         self.assertEqual(base._host_memory_budget.get(), 100)
+                    self.assertEqual(allowance.call_args.kwargs, {"mapped_bytes": 100})
                     if fraction is None:
                         context.override.assert_not_called()
                         ratios.append(memory.hicache_ratio)

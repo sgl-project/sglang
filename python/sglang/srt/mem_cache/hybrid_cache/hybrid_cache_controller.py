@@ -946,29 +946,49 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return transfers
 
-    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+    def _num_tokens_by_pool(
+        self, op: CacheOperation, *, transfers: Optional[list[L2Transfer]] = None
+    ) -> dict[str, int]:
         """Per-pool token counts for a merged transfer op (anchor + extra
         pools), shared by D->H write and H->D load acks; sidecar transfers
         reusing another pool's indices are excluded."""
-        counts = {self.mem_pool_host.anchor_entry.name.value: len(op.device_indices)}
+        active_pools = (
+            {id(t.host_pool) for t in transfers} if transfers is not None else None
+        )
+        anchor = self.mem_pool_host.anchor_entry
+        counts = (
+            {anchor.name.value: len(op.device_indices)}
+            if active_pools is None or id(anchor.host_pool) in active_pools
+            else {}
+        )
         for transfer in op.pool_transfers or []:
             if transfer.indices_from_pool is not None or transfer.host_indices is None:
                 continue
+            if active_pools is not None:
+                entry = self.mem_pool_host.entry_map.get(transfer.name)
+                if entry is None or id(entry.host_pool) not in active_pools:
+                    continue
             name = transfer.name.value
             counts[name] = counts.get(name, 0) + len(transfer.host_indices)
         return counts
 
-    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+    def _transfer_num_bytes(
+        self, op: CacheOperation, *, transfers: Optional[list[L2Transfer]] = None
+    ) -> int:
         """Total bytes moved by a merged transfer op across all pools.
 
         Sidecar transfers riding another pool's indices are included here but
         excluded from the per-pool token counts.
         """
+        active_pools = (
+            {id(t.host_pool) for t in transfers} if transfers is not None else None
+        )
         kv_tokens = len(op.device_indices)
         anchor_pool = self.mem_pool_host.anchor_entry.host_pool
         num_bytes = (
             0
             if getattr(anchor_pool, "_is_dummy", False)
+            or (active_pools is not None and id(anchor_pool) not in active_pools)
             else kv_tokens * anchor_pool.size_per_token
         )
         # Slot counts of the pools sidecars can ride on.
@@ -978,7 +998,13 @@ class HybridCacheController(BaseHiCacheController):
                 source_len[t.name] = len(t.host_indices)
         for t in op.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
-            if entry is None or getattr(entry.host_pool, "_is_dummy", False):
+            if (
+                entry is None
+                or getattr(entry.host_pool, "_is_dummy", False)
+                or (
+                    active_pools is not None and id(entry.host_pool) not in active_pools
+                )
+            ):
                 continue
             if t.indices_from_pool is not None:
                 num_slots = source_len.get(t.indices_from_pool, 0)

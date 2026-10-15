@@ -362,13 +362,17 @@ class HiCacheController:
             pools = [
                 entry.host_pool for entry in getattr(mem_pool_host, "entries", ())
             ] or [mem_pool_host]
-            if any(
-                not getattr(pool.allocator, "is_shared", False)
-                or pool.allocator.process_group is not mla_dedup_context.process_group
+            shared_pools = [
+                pool
                 for pool in pools
+                if getattr(getattr(pool, "allocator", None), "is_shared", False)
+            ]
+            if not shared_pools or any(
+                pool.allocator.process_group is not mla_dedup_context.process_group
+                for pool in shared_pools
             ):
                 raise ValueError(
-                    "Shared MLA restore requires shared pools on the same TP group."
+                    "Shared MLA restore requires a shared pool on the same TP group."
                 )
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
@@ -995,10 +999,15 @@ class HiCacheController:
                 raise
             failure = f"{type(error).__name__}: {error}"
         if self.mla_shared_enabled:
-            # Compare host row order before the owner can overwrite any shared
-            # bytes. Only the owner copies KV; peers retain the same metadata.
+            # Only the owner writes shared KV. Every rank still backs up its
+            # private state; those rows do not need matching physical indices.
             self.mla_dedup.validate_host_rows(transfers, failure=failure)
-            transfers = [t for t in transfers if t.host_pool.allocator.is_owner]
+            transfers = [
+                transfer
+                for transfer in transfers
+                if not getattr(transfer.host_pool.allocator, "is_shared", False)
+                or transfer.host_pool.allocator.is_owner
+            ]
             failure = None
             try:
                 completion = self.l2_transfer_engine.submit_device_to_host(transfers)
@@ -1016,6 +1025,7 @@ class HiCacheController:
             (id(self), "write"), completion.finish_event
         )
 
+        stats_kwargs = {"transfers": transfers} if self.mla_shared_enabled else {}
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -1023,17 +1033,32 @@ class HiCacheController:
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,
-                num_tokens_by_pool=(self._num_tokens_by_pool(op) if transfers else {}),
-                num_bytes=self._transfer_num_bytes(op) if transfers else 0,
+                num_tokens_by_pool=(
+                    self._num_tokens_by_pool(op, **stats_kwargs) if transfers else {}
+                ),
+                num_bytes=(
+                    self._transfer_num_bytes(op, **stats_kwargs) if transfers else 0
+                ),
             )
         )
 
-    def _transfer_num_bytes(self, op: CacheOperation) -> int:
-        if getattr(self.mem_pool_host, "_is_dummy", False):
+    def _transfer_num_bytes(
+        self, op: CacheOperation, *, transfers: Optional[list[L2Transfer]] = None
+    ) -> int:
+        if getattr(self.mem_pool_host, "_is_dummy", False) or (
+            transfers is not None
+            and not any(t.host_pool is self.mem_pool_host for t in transfers)
+        ):
             return 0
         return len(op.device_indices) * self.mem_pool_host.size_per_token
 
-    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+    def _num_tokens_by_pool(
+        self, op: CacheOperation, *, transfers: Optional[list[L2Transfer]] = None
+    ) -> dict[str, int]:
+        if transfers is not None and not any(
+            t.host_pool is self.mem_pool_host for t in transfers
+        ):
+            return {}
         return {PoolName.KV.value: len(op.device_indices)}
 
     def load(
