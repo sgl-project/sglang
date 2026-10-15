@@ -1112,7 +1112,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            if self._split_conv_prefill:
+            # Below the fused split limit one split kernel beats two extra conv launches.
+            if self._split_conv_prefill and (
+                layer.q_dim + layer.k_dim + layer.v_dim > MAX_FUSED_QKV_SPLIT_DIM
+            ):
                 split_qkv = self._convolve_prefill_split(
                     layer,
                     forward_batch,
