@@ -10,13 +10,14 @@
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.plan import THREADS, WAVES
+from sglang.experimental.monokernels.hip.common.plan import THREADS, WAVES
 
 # gfx95x cache policy bits: SC1 = device scope, SC0 | SC1 = system scope (peers over XGMI)
 CM_DEV = 16
@@ -31,6 +32,40 @@ CM_NT = 2
 
 def rsrc(addr, nbytes=None):
     return bo.create_buffer_resource_from_addr(addr, num_records_bytes=nbytes)
+
+
+def _gptr(addr):
+    return llvm.IntToPtrOp(
+        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr))
+    ).result
+
+
+def claim_i32(buf, word, value):
+    """Device-scope (agent) compare-and-swap word ``word`` of global buffer address ``buf`` from 0 to ``value``;
+    the Boolean whether this call won the claim. Device scope is right here: only this GPU's workgroups write
+    this rank's stop reason, so the race for the word is among them, not across GPUs (peers only read the stop
+    flag). Orders the write before this launch's later stores."""
+    at = buf + fx.Int64(word * 4)
+    ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), at)
+    _, won = fx.llvm.atomic_cas(
+        ptr,
+        fx.Int32(0),
+        fx.Int32(value),
+        syncscope="agent",
+        success_ordering=fx.AtomicOrdering.AcqRel,
+    )
+    return won
+
+
+def gstore(addr, value, words=4):
+    """Store ``words`` i32 (an Int32 or a Vector) at a 64-bit global address."""
+    v = as_ir_value(fx.Int32(value) if words == 1 else value)
+    llvm.StoreOp(v, _gptr(addr), alignment=4 * words)
+
+
+def memrealtime():
+    """The 100 MHz device clock (s_memrealtime)."""
+    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
 
 
 def permlane_swap(off, x, y):

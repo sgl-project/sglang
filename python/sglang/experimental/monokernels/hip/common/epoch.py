@@ -5,18 +5,26 @@
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
-from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import T
 
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.ops import (
+from sglang.experimental.monokernels.hip.common.ops import (
     CM_DEV,
+    gstore,
     rsrc,
     traced,
 )
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.plan import BLOCKS
-from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.sync import _spin
+from sglang.experimental.monokernels.hip.common.plan import BLOCKS
+from sglang.experimental.monokernels.hip.common.sync import _spin
+
+__all__ = [
+    "EPOCH_MARKS",
+    "epoch_begin",
+    "epoch_end",
+    "gstore",
+    "kernel_symbol",
+    "spin_until",
+]
 
 
 def kernel_symbol(stem, **params):
@@ -25,21 +33,9 @@ def kernel_symbol(stem, **params):
     return f"_ZN5aiter{len(name)}{name}E"
 
 
-def _gptr(addr):
-    return llvm.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr))
-    ).result
-
-
-def gstore(addr, value, words=4):
-    """Store ``words`` i32 (an Int32 or a Vector) at a 64-bit global address."""
-    v = as_ir_value(fx.Int32(value) if words == 1 else value)
-    llvm.StoreOp(v, _gptr(addr), alignment=4 * words)
-
-
-def spin_until(load, pending):
-    """``load()`` again (s_sleep between) while ``pending(value)``; the value."""
-    return _spin(load, pending)
+def spin_until(load, pending, guard, site):
+    """``load()`` again (s_sleep between) while ``pending(value)``; the value. A guarded wait named ``site``."""
+    return _spin(load, pending, guard, site)
 
 
 EPOCH_MARKS = 4  # word offset of the per-CTA marks in the epoch buffer
@@ -55,8 +51,9 @@ def epoch_begin(c, epoch, ep):
 
 
 @traced
-def epoch_end(c, epoch, ep, reset=None):
-    """CTA 0: once every CTA marked the epoch, run ``reset()`` and move the epoch on."""
+def epoch_end(c, epoch, ep, reset, guard):
+    """CTA 0: once every CTA marked the epoch (a guarded wait), run ``reset()`` unless None and move the epoch
+    on."""
     if c["bid"] == 0:
         tid = c["tid"]
         if tid < BLOCKS:
@@ -73,7 +70,7 @@ def epoch_end(c, epoch, ep, reset=None):
                     )
                 )
 
-            _ = spin_until(load_mark, lambda v: v != ep + 1)
+            _ = spin_until(load_mark, lambda v: v != ep + 1, guard, "epoch")
         gpu.barrier()
         if tid == 0:
             if const_expr(reset is not None):
