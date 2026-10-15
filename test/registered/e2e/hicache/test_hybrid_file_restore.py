@@ -114,7 +114,7 @@ class TestHybridFileRestore(CustomTestCase):
         model_path = snapshot_download(
             self.model,
             revision=self.revision,
-            allow_patterns=["*.json", "*.py", "*.safetensors", "*.model"],
+            allow_patterns=["*.json", "*.py", "*.safetensors", "*.model", "*.jinja"],
         )
         tokenizer = get_tokenizer(model_path, trust_remote_code=True)
         tokens = tokenizer.apply_chat_template(
