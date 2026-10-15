@@ -141,6 +141,24 @@ class TestMinimaxM2DetectorStreaming(CustomTestCase):
             f'<parameter name="city">北京</parameter></invoke>{TOOL_CALL_END}'
         )
 
+    def test_closing_brace_inside_string_argument(self):
+        # Regression: the outer object was closed by counting raw braces, so a
+        # "}" inside a string value suppressed the final closing brace.
+        for value in ("a}b", "}}", "{a}}"):
+            with self.subTest(value=value):
+                self.assert_stream_matches_final(
+                    f'{TOOL_CALL_START}<invoke name="get_weather">'
+                    f'<parameter name="city">{value}</parameter>'
+                    f"</invoke>{TOOL_CALL_END}"
+                )
+
+    def test_brace_inside_later_argument(self):
+        self.assert_stream_matches_final(
+            f'{TOOL_CALL_START}<invoke name="get_weather">'
+            f'<parameter name="days">3</parameter>'
+            f'<parameter name="city">x}}y</parameter></invoke>{TOOL_CALL_END}'
+        )
+
     def test_two_calls_in_one_block(self):
         self.assert_stream_matches_final(
             f'{TOOL_CALL_START}<invoke name="get_weather"></invoke>'

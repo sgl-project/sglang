@@ -353,23 +353,21 @@ class MinimaxM2Detector(BaseFormatDetector):
                 if self.tool_call_function_end_token in self._buf:
                     end_pos = self._buf.find(self.tool_call_function_end_token)
 
-                    # Add closing brace to complete the JSON object
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
                     if current_streamed:
-                        # Count opening and closing braces to check if JSON is complete
-                        open_braces = current_streamed.count("{")
-                        close_braces = current_streamed.count("}")
-                        if open_braces > close_braces:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters="}",
-                                )
+                        # _parse_and_stream_parameters always leaves the outer
+                        # object open, so close it exactly once. Counting raw
+                        # braces would miscount braces inside serialized strings.
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters="}",
                             )
-                            self.streamed_args_for_tool[self.current_tool_id] = (
-                                current_streamed + "}"
-                            )
+                        )
+                        self.streamed_args_for_tool[self.current_tool_id] = (
+                            current_streamed + "}"
+                        )
                     else:
                         # A call with no parameters streams nothing at all, so emit
                         # the empty object explicitly. detect_and_parse returns
