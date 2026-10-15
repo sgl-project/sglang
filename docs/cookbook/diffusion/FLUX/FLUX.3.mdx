@@ -1,24 +1,25 @@
 ---
 title: FLUX.3
-description: Serve FLUX.3 text-to-image and image-to-image generation with SGLang Diffusion.
+description: Serve FLUX.3 Image Klein text-to-image generation and image editing with SGLang Diffusion.
 tag: NEW
 metatags:
-    description: "Serve FLUX.3 image generation with SGLang Diffusion."
+    description: "Serve FLUX.3 Image Klein, Black Forest Labs' 5.6B text-to-image and image editing model, with SGLang Diffusion."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/black-forest-labs/flux3.jsx";
 
-<DiffusionModelTags tags={["image", "text-to-image / image editing", "multi-reference", "Base / step-distilled"]} />
+<DiffusionModelTags tags={["image", "5.6B DiT", "text-to-image / image editing", "up to 10 references", "Base / step-distilled"]} />
 
 ## 1. Quick start
 
 Use a [SGLang Diffusion Docker environment](/docs/sglang-diffusion/installation).
-Until your image contains this integration, install the model-support PR inside it:
+Until a released image contains this integration, install SGLang from `main`
+inside it:
 
 ```bash
-pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@refs/pull/44418/head#subdirectory=python'
+pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 ```
 
 <Deployment config={config} />
@@ -34,7 +35,12 @@ measured recommendations.
 </Note>
 
 <Warning>
-Review the Black Forest Labs license before production or commercial use.
+FLUX.3 Image Klein is released under the
+[FLUX Kommunity License v1.0](https://huggingface.co/black-forest-labs/flux-3-image-klein/blob/main/LICENSE.md):
+non-commercial use, plus commercial output generation for Qualifying Users with
+less than US$5M in gross annualized revenue, subject to its terms. The
+Qwen3-VL-4B-Instruct text encoder is Apache-2.0. Review the license before
+production or commercial use.
 </Warning>
 
 For platform-specific installation, see the
@@ -42,14 +48,28 @@ For platform-specific installation, see the
 
 ## 2. Model capabilities
 
-FLUX.3 Image generates images from text and edits one to ten reference images.
-Its packed multimodal DiT attends to image, reference-image and Qwen3-VL text
-tokens; a single server selects text-to-image or image editing per request.
+[FLUX.3 Image Klein](https://huggingface.co/collections/black-forest-labs/flux-3-image-klein)
+is Black Forest Labs' 5.6B open-weights model for text-to-image generation and
+image editing. It takes a prompt and up to 10 reference images and returns one
+image; text-to-image, single-reference edits and multi-reference compositions
+run through the same DiT, with Qwen3-VL-4B-Instruct as the text encoder. The
+5.6B count covers the image transformer only.
 
-Choose Base for CFG-controlled generation, or the step-distilled flow map for
-fewer denoising steps. Quantization and caching are separate fidelity/latency
-tradeoffs, not lossless substitutes for the selected checkpoint. This image
+Prompts can place elements with bounding boxes on a 0 to 1000 grid, then
+recolor, move, replace or remove them; boxes guide placement and scale rather
+than masking pixels. The model also renders text inside images. One SGLang
+server serves text-to-image and editing, chosen per request. This image
 pipeline does not serve the separate FLUX.3 Action robot policy.
+
+| Checkpoint | Training | Steps | Guidance | Built for |
+| --- | --- | --- | --- | --- |
+| [Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein) | step-distilled flow map | 16 | none | generation and editing, self-hosting; the checkpoint behind the BFL API |
+| [Klein Base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) | undistilled | 50 | 3.5 | fine-tuning, LoRA training, research |
+
+Each repository ships its BF16 DiT with FP8 (`fp8r`) and NVFP4 variants,
+together with the text encoder and image autoencoder. Quantization and caching
+are separate fidelity/latency tradeoffs, not lossless substitutes for the
+selected checkpoint.
 
 | Task | Endpoint | Conditioning |
 | --- | --- | --- |
@@ -70,11 +90,32 @@ Sampling is set per request (`num_inference_steps`, `guidance_scale`, `size`,
 `config.json`. SGLang expands `n` into independently seeded requests and can
 pack compatible requests into one DiT forward.
 
-References are prepared as in the BFL reference pipeline. A single reference is
+References are prepared as in the
+[BFL reference pipeline](https://github.com/black-forest-labs/flux-3-image-klein).
+A single reference is
 fitted under 4 MP, reflect-padded to the 16-pixel grid and, when you set no
 output size, sets the output size; the padding is cropped from the result.
 With several references each is fitted under 1 MP and centre-cropped, and the
 output takes the first one's size.
+
+### Prompting
+
+The caption controls composition; reference images anchor content but do not
+lock structure.
+
+- Write full scene captions covering framing, subject, background and lighting.
+  A short prompt gives generic output, and a one-line edit instruction ("make it
+  blue") reframes the shot. The [prompt upsampler](#7-prompt-upsampler) expands
+  a short request into a full caption.
+- For edits, describe the target image as a complete caption of the reference
+  with the edit folded in.
+- For layout, append a JSON list of elements to the caption. Each box is
+  `[top, left, bottom, right]` on a 0 to 1000 grid, and the caption tags each
+  element as `<id>`. To edit by box, refer to the n-th reference as
+  `<ref_image_n>` and give each element `from`, `src_bbox` and `tgt_bbox`; a
+  `null` target removes it. See BFL's
+  [bounding box guide](https://docs.bfl.ai/flux_3/flux3_image_bounding_boxes)
+  for the full format.
 
 ## 3. Checkpoints and precision
 
