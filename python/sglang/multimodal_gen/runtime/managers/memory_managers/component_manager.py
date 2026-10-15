@@ -48,6 +48,8 @@ class ComponentUse:
     memory_intensive: bool = False
     target_dtype: torch.dtype | None = None
     keep_ready_after_warmup: bool = False
+    # Stay on GPU after a real request (preferred_* still offloads).
+    keep_ready_after_request: bool = False
     start_at_stage_entry: bool = True
     # Layerwise components release their resident set when the use ends, which
     # is right for a DiT (one use spans every denoise step) and buys nothing for
@@ -55,6 +57,12 @@ class ComponentUse:
     # pipeline's per-phase headroom has decided the room is better spent holding
     # the set until this component runs again.
     retain_resident_layers: bool = False
+    # If True, skip keep-single-DiT and run finish_use after this interval.
+    release_after_use: bool = False
+    # H2D / restore this use on the request tail. Default off.
+    prefetch_after_request: bool = False
+    # Skip empty_cache after this use D2H.
+    skip_empty_cache_on_release: bool = False
 
 
 @dataclass(slots=True)
@@ -607,6 +615,8 @@ class ComponentResidencyManager:
         """Prepare a future memory-intensive component without waiting."""
         if not use.allow_prefetch:
             return
+        if self._use_key(use) in self._prefetched_use_keys:
+            return
         module = self.get_module(use.component_name)
         if module is None:
             return
@@ -616,9 +626,10 @@ class ComponentResidencyManager:
             and self._active_use is not None
         ):
             return
-        if is_resident_layerwise_module(module):
+        # Resident layerwise already keeps a layer window on GPU. Only Flux3's
+        # request-tail prefetch opts back in.
+        if is_resident_layerwise_module(module) and not use.prefetch_after_request:
             return
-
         self._uses_seen[use.component_name] = use
         self._modules_seen[use.component_name] = module
         self._begin_warmup_prefetch(use)
@@ -652,6 +663,9 @@ class ComponentResidencyManager:
         strategy = self.strategy_for(use.component_name, module)
         was_on_supported_device = self._module_on_supported_device(module)
         strategy.finish_use(module, use, self.state)
+        self._prefetched_use_keys = {
+            key for key in self._prefetched_use_keys if key[1] != use.component_name
+        }
         self._empty_cache_after_large_release(
             use, strategy, module, was_on_supported_device
         )
@@ -673,6 +687,8 @@ class ComponentResidencyManager:
                 and use.keep_ready_after_warmup
                 and explicit_mode is None
             ):
+                continue
+            if use.keep_ready_after_request:
                 continue
             if is_resident_layerwise_module(module):
                 preferred = False
@@ -722,6 +738,21 @@ class ComponentResidencyManager:
                 log_host_memory_breakdown(
                     self.placement_modules(),
                     label=f"after request {self._debug_requests_seen}",
+                )
+        self._prefetch_next_request()
+
+    def _prefetch_next_request(self) -> None:
+        """H2D / restore uses that set prefetch_after_request."""
+        for uses in self._stage_uses_by_index:
+            for use in uses:
+                if not use.prefetch_after_request:
+                    continue
+                if use.keep_ready_after_request:
+                    continue
+                self._prefetch_use(use)
+                logger.info(
+                    "prefetch %s for the next request",
+                    use.component_name,
                 )
 
     def _begin_warmup_phase(
@@ -936,12 +967,19 @@ class ComponentResidencyManager:
                 self._finish_use(use, keep_on_warmup=False, force=True)
 
     def _should_keep_after_use(self, use: ComponentUse) -> bool:
+        if use.keep_ready_after_request:
+            return True
         if self.state.future_uses and self._same_use(use, self.state.future_uses[0]):
             return True
+        if use.release_after_use:
+            return False
         module = self.get_module(use.component_name)
         if module is not None and self._should_keep_single_dit(
             use.component_name, module
         ):
+            if is_resident_layerwise_module(module):
+                # Layerwise DiT with resident layers must not stay on GPU through decode.
+                return False
             return True
         return False
 
@@ -1010,6 +1048,18 @@ class ComponentResidencyManager:
             self._module_device(module)
         )
 
+    def _module_on_cuda(self, module: nn.Module | None) -> bool:
+        """True if any parameter or buffer still has CUDA storage."""
+        if module is None:
+            return False
+        for tensor in module.parameters():
+            if tensor.device.type == "cuda":
+                return True
+        for tensor in module.buffers():
+            if tensor.device.type == "cuda":
+                return True
+        return False
+
     def _empty_cache_after_large_release(
         self,
         use: ComponentUse,
@@ -1018,6 +1068,10 @@ class ComponentResidencyManager:
         was_on_supported_device: bool,
     ) -> None:
         if not use.memory_intensive:
+            return
+        if use.skip_empty_cache_on_release:
+            return
+        if self._keep_ready_component_on_cuda():
             return
         released_device_storage = (
             was_on_supported_device and not self._module_on_supported_device(module)
@@ -1031,6 +1085,18 @@ class ComponentResidencyManager:
         if not torch.get_device_module().is_available():
             return
         torch.get_device_module().empty_cache()
+
+    def _keep_ready_component_on_cuda(self) -> bool:
+        """True if a keep-ready component still owns CUDA storage."""
+        for component_name, seen_use in self._uses_seen.items():
+            if not seen_use.keep_ready_after_request:
+                continue
+            seen = self._modules_seen.get(component_name)
+            if seen is None:
+                seen = self.get_module(component_name)
+            if self._module_on_cuda(seen):
+                return True
+        return False
 
 
 _GLOBAL_COMPONENT_RESIDENCY_MANAGER: ComponentResidencyManager | None = None
