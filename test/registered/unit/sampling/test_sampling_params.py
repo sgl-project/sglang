@@ -315,6 +315,24 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
+    # --- stop_token_ids ---
+    def test_stop_token_ids_exceeds_vocab_raises(self):
+        """Test that stop_token_ids with token_id >= vocab_size are rejected."""
+        sp = self._make(stop_token_ids=[99999])
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_negative_raises(self):
+        """Test that stop_token_ids with negative token_id are rejected."""
+        sp = self._make(stop_token_ids=[-1])
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_valid_tokens(self):
+        """Test that stop_token_ids within [0, vocab_size) are accepted."""
+        sp = self._make(stop_token_ids=[0, 31999])
+        sp.verify(self.VOCAB_SIZE)
+
     # --- sampling_seed ---
     def test_sampling_seed_valid(self):
         """Test that None (the default) and the int64 min/max boundaries are accepted."""
