@@ -63,6 +63,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_size_to_dp_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
@@ -449,6 +453,9 @@ _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    tokenized_generate_req_type = TokenizedGenerateReqInput
+    batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
@@ -520,7 +527,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
-        self.elastic_worker_count = get_parallel().num_dp_ranks
+        parallel = get_parallel()
+        self.elastic_worker_count = parallel.num_dp_ranks
+        self.attn_replica_size = attn_replica_size()
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -1583,7 +1592,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
-            tokenized_obj = TokenizedGenerateReqInput(
+            tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
@@ -1602,6 +1611,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
+                lora_name=obj.lora_path,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
@@ -1649,6 +1659,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
+                lora_name=obj.lora_path,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
@@ -1835,7 +1846,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-                batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+                batch_req = self.batch_tokenized_generate_req_type(batch=tokenized_objs)
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
@@ -3650,16 +3661,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
 
         self._dispatch_to_scheduler(msg)
-        self.elastic_worker_count = msg.effective_ep_size
+        self.elastic_worker_count = physical_ep_size_to_dp_size(
+            msg.effective_ep_size, self.attn_replica_size
+        )
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "serving_expanded"
         self.elastic_last_error = None
-        self.update_control_communicator_fan_out(msg.effective_ep_size)
+        self.update_control_communicator_fan_out(self.elastic_worker_count)
 
     def get_elastic_ep_state(self):
         return {
             "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
-            "effective_ep_size": self.elastic_worker_count,
+            "effective_ep_size": self.elastic_worker_count * self.attn_replica_size,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
@@ -3676,7 +3689,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "A previous scale operation has not completed yet. Wait until "
                     "all pending ranks have joined before issuing another scale."
                 ),
-                old_ep_size=self.elastic_worker_count,
+                old_ep_size=self.elastic_worker_count * self.attn_replica_size,
                 new_ep_size=obj.new_ep_size,
                 pending_ep_size=self.elastic_pending_ep_size,
                 scale_phase=self.elastic_scale_phase,

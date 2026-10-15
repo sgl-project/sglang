@@ -1748,6 +1748,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             cached_tokens_device=0,
             cached_tokens_host=0,
             cached_tokens_storage=0,
+            get_mm_token_counts=lambda: (0, 0, 0),
             multimodal_inputs=None,
             return_logprob=False,
             return_sampling_mask=sampling_mask is not None,
