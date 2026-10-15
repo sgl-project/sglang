@@ -118,6 +118,7 @@ class DraftVocabExchange:
         draft_tokens: Optional[torch.Tensor],
         step: int,
         draft_column: int,
+        mrope_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = self.num_rows
         gathered = self._pack_and_gather(local_logits, m, NAN_KEY_SPLIT_ARGMAX)
@@ -132,6 +133,7 @@ class DraftVocabExchange:
             draft_column,
             PACK_BLOCKS,
             self.world,
+            mrope_positions,
         )
         return topk_p, topk_index
 

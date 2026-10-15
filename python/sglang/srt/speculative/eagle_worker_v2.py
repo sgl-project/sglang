@@ -866,6 +866,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         draft_tokens_topk1,
                         i,
                         i + 1,
+                        (
+                            forward_batch.mrope_positions
+                            if self.draft_runner.model_config.model_is_mrope
+                            else None
+                        ),
                     )
                 elif self.topk == 1:
                     if _is_cuda or _is_hip:
@@ -889,7 +894,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
-                if self.draft_runner.model_config.model_is_mrope:
+                if self.draft_runner.model_config.model_is_mrope and exchange is None:
                     forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,

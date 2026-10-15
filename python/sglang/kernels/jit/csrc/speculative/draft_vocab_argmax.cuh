@@ -111,9 +111,11 @@ struct VocabArgmaxSelectParams {
   float* topk_p;           // [M]
   int64_t* draft_tokens;   // [M, S] draft chain, or null
   int64_t* positions;      // [M], or null to leave positions unchanged
+  int64_t* mrope;          // [3, >= M] rows of a multi-section position buffer, or null
   bf16_t* next_embeds;     // [M, H]
   int32_t draft_column;
   int32_t draft_stride;
+  int32_t mrope_stride;
 };
 
 /**
@@ -225,6 +227,10 @@ __global__ void __launch_bounds__(kThreads)
     p.topk_p[m] = 1.0f;
     if (p.draft_tokens != nullptr) p.draft_tokens[m * p.draft_stride + p.draft_column] = bi;
     if (p.positions != nullptr) p.positions[m] = p.positions[m] + 1;
+    if (p.mrope != nullptr) {
+#pragma unroll
+      for (int d = 0; d < 3; ++d) p.mrope[d * p.mrope_stride + m] += 1;
+    }
   }
 }
 
@@ -518,6 +524,7 @@ struct DraftVocabArgmax {
       const tvm::ffi::TensorView topk_p,
       const tvm::ffi::TensorView draft_tokens,
       const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView mrope_positions,
       const tvm::ffi::TensorView next_embeds,
       int64_t draft_column) {
     using namespace host;
@@ -537,6 +544,16 @@ struct DraftVocabArgmax {
       TensorMatcher({M}).with_dtype<int64_t>().with_device(device).verify(positions);
       pos = static_cast<int64_t*>(positions.data_ptr());
     }
+    int64_t* mrope = nullptr;
+    int32_t mrope_stride = 0;
+    if (mrope_positions.numel() > 0) {
+      auto N = SymbolicSize{"mrope_tokens"};
+      auto R = SymbolicSize{"mrope_row_stride"};
+      TensorMatcher({3, N}).with_strides({R, 1}).with_dtype<int64_t>().with_device(device).verify(mrope_positions);
+      CHECK_HOST(N.unwrap() == M.unwrap()) << "mrope positions must have one column per row";
+      mrope = static_cast<int64_t*>(mrope_positions.data_ptr());
+      mrope_stride = static_cast<int32_t>(R.unwrap());
+    }
     int64_t* tokens = nullptr;
     int32_t stride = 0;
     if (draft_tokens.numel() > 0) {
@@ -552,9 +569,11 @@ struct DraftVocabArgmax {
         .topk_p = static_cast<float*>(topk_p.data_ptr()),
         .draft_tokens = tokens,
         .positions = pos,
+        .mrope = mrope,
         .next_embeds = static_cast<bf16_t*>(next_embeds.data_ptr()),
         .draft_column = static_cast<int32_t>(draft_column),
         .draft_stride = stride,
+        .mrope_stride = mrope_stride,
     };
     LaunchKernel(static_cast<uint32_t>(M.unwrap()), kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(vocab_argmax_select_kernel<kH, kWorld, kThreads, kUsePDL>, params);

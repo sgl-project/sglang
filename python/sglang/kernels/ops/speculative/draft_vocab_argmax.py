@@ -74,13 +74,23 @@ def vocab_argmax_select(
     draft_column: int,
     blocks: int,
     world: int,
+    mrope_positions: torch.Tensor | None = None,
 ) -> None:
     """Per row, pick the token over gathered packed rows [M, world * (H + META_ELEMS)];
     write it to ``topk_index`` / ``draft_tokens[:, draft_column]``, advance
-    ``positions`` (empty tensors skip either) and copy its embedding row to
-    ``next_embeds``."""
+    ``positions`` and the [3, M] ``mrope_positions`` (empty tensors / None skip them)
+    and copy its embedding row to ``next_embeds``."""
+    if mrope_positions is None:
+        mrope_positions = positions.new_empty(0)
     _module(next_embeds.shape[-1], blocks, world).select(
-        gathered, topk_index, topk_p, draft_tokens, positions, next_embeds, draft_column
+        gathered,
+        topk_index,
+        topk_p,
+        draft_tokens,
+        positions,
+        mrope_positions,
+        next_embeds,
+        draft_column,
     )
 
 
