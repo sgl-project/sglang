@@ -90,6 +90,54 @@ class TokenizerManagerScoreMixin:
 
         raise ValueError("Invalid prompts type for score_prompts.")
 
+    async def score_readouts(
+        self,
+        *,
+        input_ids: Optional[List[int]],
+        text: Optional[str],
+        image_data: Optional[List[str]],
+        readout_anchor: Tuple[int, int],
+        label_token_ids: List[List[int]],
+        temperature: float = 1.0,
+        request: Optional[Any] = None,
+    ) -> ScoreResult:
+        """Score label tokens at every anchor readout of one prompt, in one prefill."""
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and greater than zero")
+        batch_request = GenerateReqInput(
+            text=text,
+            input_ids=input_ids,
+            image_data=image_data,
+            sampling_params={"max_new_tokens": 0},
+            return_logprob=True,
+            logprob_start_len=0,
+            token_ids_logprob=list(
+                dict.fromkeys(t for ids in label_token_ids for t in ids)
+            ),
+            readout_anchor=readout_anchor,
+            stream=False,
+        )
+        result = await self.generate_request(batch_request, request).__anext__()
+        meta_info = result["meta_info"]
+        rows = meta_info.get("input_token_ids_logprobs") or []
+        if len(rows) != len(label_token_ids):
+            raise RuntimeError(
+                f"expected {len(label_token_ids)} readouts, got {len(rows)} "
+                f"for request {meta_info.get('id', '<unknown>')}"
+            )
+        scores, token_logprobs = [], []
+        for row, labels in zip(rows, label_token_ids):
+            logprobs = self._extract_logprobs_for_tokens(row, labels)
+            scores.append(
+                self._convert_logprobs_to_scores(logprobs, labels, True, temperature)
+            )
+            token_logprobs.append([logprobs[token] for token in labels])
+        return ScoreResult(
+            scores=scores,
+            prompt_tokens=meta_info.get("prompt_tokens", 0),
+            token_logprobs=token_logprobs,
+        )
+
     def _build_multi_item_token_sequence(
         self, query: List[int], items: List[List[int]], delimiter_token_id: int
     ) -> Tuple[List[int], List[int]]:
