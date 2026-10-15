@@ -63,6 +63,7 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+    from sglang.srt.hardware_backend.npu.qkv import npu_split_qkv_rmsnorm_rope
 
 
 class Qwen3Attention(nn.Module):
@@ -188,7 +189,12 @@ class Qwen3Attention(nn.Module):
 
         if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
-        q, k, v = split_qkv_rmsnorm_rope(
+        qkv_kernel = (
+            npu_split_qkv_rmsnorm_rope
+            if torch.compiler.is_compiling()
+            else split_qkv_rmsnorm_rope
+        )
+        q, k, v = qkv_kernel(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,
@@ -483,7 +489,9 @@ class Qwen3Model(Qwen2Model):
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
         return (
-            (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
+            (hidden_states, aux_hidden_states)
+            if len(aux_hidden_states) > 0
+            else hidden_states
         )
 
 

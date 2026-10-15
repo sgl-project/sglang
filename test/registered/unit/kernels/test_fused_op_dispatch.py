@@ -35,6 +35,29 @@ _HIP = PlatformInfo(device_type="hip")
 _CPU = PlatformInfo()
 
 
+def test_platform_detection_is_compile_time_constant(monkeypatch):
+    import sglang.srt.utils as utils
+
+    monkeypatch.setattr(utils, "is_cuda", lambda: False)
+    monkeypatch.setattr(utils, "is_hip", lambda: False)
+    monkeypatch.setattr(utils, "is_cpu", lambda: torch.cpu.is_available())
+    monkeypatch.setattr(utils, "cpu_has_amx_support", lambda: False)
+    monkeypatch.setattr(utils, "is_npu", lambda: True)
+    fo._platform_key.cache_clear()
+    torch._dynamo.reset()
+    try:
+
+        def forward(x):
+            return x + (1 if fo._platform_key() == "npu" else 2)
+
+        compiled = torch.compile(forward, backend="eager", fullgraph=True)
+        x = torch.ones(2)
+        torch.testing.assert_close(compiled(x), x + 1)
+    finally:
+        fo._platform_key.cache_clear()
+        torch._dynamo.reset()
+
+
 @pytest.fixture(autouse=True)
 def _reset_global_state():
     saved_oot = {k: dict(v) for k, v in BaseFusedOp._oot_forward_registry.items()}

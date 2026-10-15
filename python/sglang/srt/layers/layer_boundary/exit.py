@@ -15,10 +15,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Optional, Tuple
 
-import msgspec
 import torch
 
 from sglang.srt.distributed import GroupCoordinator
@@ -436,7 +436,8 @@ def _batch_allows_deferred_sum(
     return residual is not None and aiter_ar_fusion_applies(residual, forward_batch)
 
 
-class ExitDecision(msgspec.Struct, frozen=True):
+@dataclass(frozen=True, slots=True)
+class ExitDecision:
     """One decision for an FFN output, made before compute runs.
 
     Fields:
