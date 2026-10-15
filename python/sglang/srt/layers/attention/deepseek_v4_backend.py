@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import enum
 import functools
 import logging
@@ -974,6 +975,8 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # Eager steps: each token's request, computed by the step's first ratio 1/2 layer.
+    eager_req_rows: Optional[torch.Tensor] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -982,6 +985,9 @@ class DSV4Metadata:
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
     candidate_metadata: Optional[CandidateMetadata] = None
+    # Late layers run eagerly inside a prefill-graph step: the captured source layer
+    # published no candidates, and inside the graph's window the full top-k applies.
+    candidates_cover_window: bool = False
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
     # otherwise lazily by ``_forward_prefill_sparse``.
@@ -1941,6 +1947,32 @@ class DeepseekV4AttnBackend(
         forward_batch.global_num_token_non_padded_cpu = non_padded
         forward_batch.global_num_token_non_padded = non_padded_gpu
         forward_batch.num_token_non_padded = local_non_padded
+
+    def enter_live_late_layer_tail(
+        self, forward_batch: ForwardBatch, *, num_tokens: int
+    ) -> tuple[tuple, LateLayerTail]:
+        """Inside the prefill CUDA graph, switch the late layers onto the live tail
+        rows instead of the graph's fixed block (they run as one eager break).
+        The block's metadata stays published for the logits that read it."""
+        # The static batch's rows are padded to the captured shape.
+        live = copy.copy(forward_batch)
+        live.positions = forward_batch.positions[:num_tokens]
+        live.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
+        block_metadata = self.tail_forward_metadata
+        live_metadata = self._build_late_layer_tail_metadata(live)
+        live_metadata.candidates_cover_window = True
+        # The graph's full-width buffers are padded past the extend, so the tail's
+        # gathers from them (a contiguous tail is a slice) stop at its real rows.
+        live_tail = live_metadata.late_layer_tail
+        live_metadata.late_layer_tail = msgspec.structs.replace(
+            live_tail, real_rows_count=sum(live_tail.extend_seq_lens_cpu)
+        )
+        self.tail_forward_metadata = live_metadata
+        try:
+            tail = self.tail_forward_metadata.late_layer_tail
+            return self.enter_late_layer_tail(forward_batch), tail
+        finally:
+            self.tail_forward_metadata = block_metadata
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).
@@ -3035,7 +3067,20 @@ class DeepseekV4AttnBackend(
             # live rows only and falls through.
             req, pos = hoisted_req, hoisted_pos
         else:
-            req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+            cached = meta.eager_req_rows
+            if cached is not None and cached.shape[0] == positions.shape[0]:
+                req = cached
+            else:
+                from sglang.srt.models.deepseek_v4_replay_graphs import (
+                    step_caches_allowed,
+                )
+
+                req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+                if (
+                    envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get()
+                    and step_caches_allowed()
+                ):
+                    meta.eager_req_rows = req
             pos = positions
         if (
             forward_batch.forward_mode.is_extend()
@@ -3150,8 +3195,16 @@ class DeepseekV4AttnBackend(
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
             is_in_breakable_cuda_graph,
         )
+        from sglang.srt.models.deepseek_v4_replay_graphs import (
+            in_decoder_replay_graph,
+        )
 
-        return self.low_ratio_prefill_graph and is_in_breakable_cuda_graph()
+        # Decoder replay graphs run the low-ratio sources as an eager break.
+        return (
+            self.low_ratio_prefill_graph
+            and is_in_breakable_cuda_graph()
+            and not in_decoder_replay_graph()
+        )
 
     def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:
         # Projection layout and fused-write support are fixed together at load time.
@@ -3475,7 +3528,9 @@ class DeepseekV4AttnBackend(
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
                 self._publish_candidate_metadata(published)
-            elif is_consumer:
+            elif is_consumer and not (
+                published is None and self.forward_metadata.candidates_cover_window
+            ):
                 self.prefill_candidates.consume_prefill(inputs, published)
             else:
                 self.full_topk_indexer.topk_prefill(inputs)
