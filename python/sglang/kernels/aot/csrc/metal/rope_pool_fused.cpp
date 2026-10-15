@@ -22,7 +22,7 @@ using namespace mlx::core;
 
 namespace {
 
-constexpr const char* kLibraryName = "sgl_metal_kernels";
+constexpr const char* kLibraryName = MLX_METAL_LIBRARY_NAME;
 
 MTL::Library* g_library = nullptr;
 
