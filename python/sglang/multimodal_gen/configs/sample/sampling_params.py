@@ -76,6 +76,23 @@ X264_PRESETS: tuple[str, ...] = (
     "veryslow",
     "placebo",
 )
+# RIFE multiplies the frame count by 2**exp and recurses forever for exp < 1.
+# The upper bound (16x) is arbitrary; each step doubles RIFE calls and frames.
+MIN_FRAME_INTERPOLATION_EXP = 1
+MAX_FRAME_INTERPOLATION_EXP = 4
+
+
+def validate_frame_interpolation_exp(exp: int) -> None:
+    if (
+        isinstance(exp, bool)
+        or not isinstance(exp, int)
+        or not MIN_FRAME_INTERPOLATION_EXP <= exp <= MAX_FRAME_INTERPOLATION_EXP
+    ):
+        raise ValueError(
+            "frame_interpolation_exp must be an int in "
+            f"[{MIN_FRAME_INTERPOLATION_EXP}, {MAX_FRAME_INTERPOLATION_EXP}], "
+            f"got {exp!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -549,7 +566,11 @@ class SamplingParams:
             if self.true_cfg_scale is not None
             else self.guidance_scale
         )
-        return cfg_scale > 1.0 and self.negative_prompt is not None
+        return (
+            cfg_scale is not None
+            and cfg_scale > 1.0
+            and self.negative_prompt is not None
+        )
 
     @classmethod
     def default_image_output_format(cls) -> str | None:
@@ -693,6 +714,8 @@ class SamplingParams:
                 raise ValueError(
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
+
+        validate_frame_interpolation_exp(self.frame_interpolation_exp)
 
         if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
             raise ValueError(

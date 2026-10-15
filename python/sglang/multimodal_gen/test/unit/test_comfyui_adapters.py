@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pack / unpack contract for ComfyUI model adapters."""
 
+import importlib
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -232,6 +235,41 @@ def test_comfyui_weight_access_gets_a_clear_error() -> None:
     base.to("cpu")
     with pytest.raises(RuntimeError, match="SGLDLoraLoader"):
         base.state_dict()
+
+
+def _qwen_image_edit_adapter():
+    """Import the Qwen adapters with the one ComfyUI helper they use stubbed."""
+    common_dit = types.ModuleType("comfy.ldm.common_dit")
+    common_dit.pad_to_patch_size = lambda x, patch_size: x
+    comfy, comfy_ldm = types.ModuleType("comfy"), types.ModuleType("comfy.ldm")
+    comfy.ldm, comfy_ldm.common_dit = comfy_ldm, common_dit
+    stubs = {"comfy": comfy, "comfy.ldm": comfy_ldm, "comfy.ldm.common_dit": common_dit}
+    with patch.dict(sys.modules, stubs):
+        module = importlib.import_module(
+            "sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.qwen_image"
+        )
+    return module.QwenImageEditAdapter()
+
+
+def test_qwen_image_edit_pack_keeps_all_ref_latents() -> None:
+    """Qwen-Image-Edit packed only the first of several reference images."""
+    adapter = _qwen_image_edit_adapter()
+    x = torch.ones(1, 16, 1, 90, 160)
+    timestep = torch.tensor([1.0])
+    context = torch.ones(1, 19, 2560)
+    ref_a = torch.ones(1, 16, 1, 64, 64)
+    ref_b = torch.ones(1, 16, 1, 32, 96)
+    ref_c = torch.ones(1, 16, 1, 48, 48)
+
+    packed = adapter.pack(x, timestep, context, ref_latents=[ref_a, ref_b, ref_c])
+
+    sizes = packed.extra_req["vae_image_sizes"]
+    assert sizes == [(64, 64), (96, 32), (48, 48)]
+
+    expected_tokens = sum(
+        (h // 2) * (w // 2) for h, w in [(64, 64), (32, 96), (48, 48)]
+    )
+    assert packed.extra_req["image_latent"].shape[1] == expected_tokens
 
 
 class _RowRecordingExecutor(SGLDiffusionExecutor):
