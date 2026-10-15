@@ -17,6 +17,7 @@ Enabled by SGLANG_Q35MF_EDGE_POST_VERIFY_GRAPH=1 (default off).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from types import SimpleNamespace
@@ -51,6 +52,32 @@ def sparse_verify_max_top_k(batch) -> Optional[int]:
     if not top_ks or any(k <= 1 or k > _SPARSE_TOP_K_LIMIT for k in top_ks):
         return None
     return max(top_ks)
+
+
+@contextlib.contextmanager
+def _count_acceptance_calls():
+    # eagle_sample resolves both kernels through these module attributes at call time.
+    from sglang.kernels.ops.speculative import sampling as sampling_ops
+    from sglang.srt.speculative import eagle_utils
+
+    calls = [0]
+    greedy_fn = eagle_utils.verify_tree_greedy_func
+    tree_fn = sampling_ops.tree_speculative_sampling_target_only
+
+    def counted(fn):
+        def call(*args, **kwargs):
+            calls[0] += 1
+            return fn(*args, **kwargs)
+
+        return call
+
+    eagle_utils.verify_tree_greedy_func = counted(greedy_fn)
+    sampling_ops.tree_speculative_sampling_target_only = counted(tree_fn)
+    try:
+        yield calls
+    finally:
+        eagle_utils.verify_tree_greedy_func = greedy_fn
+        sampling_ops.tree_speculative_sampling_target_only = tree_fn
 
 
 class _Slot:
@@ -294,11 +321,15 @@ class PostVerifyGraph:
             self._pool = torch.cuda.graph_pool_handle()
         stream = torch.cuda.current_stream()
         graph = torch.cuda.CUDAGraph()
-        with graph_capture(stream=stream) as ctx:
-            with torch.cuda.graph(
-                graph, pool=self._pool, stream=ctx.stream, capture_error_mode="thread_local"
-            ):
-                outputs = self._body(slot.inputs, batch, verify_input, logits_output, num_draft_tokens)
+        with _count_acceptance_calls() as acceptance_calls:
+            with graph_capture(stream=stream) as ctx:
+                with torch.cuda.graph(
+                    graph, pool=self._pool, stream=ctx.stream, capture_error_mode="thread_local"
+                ):
+                    outputs = self._body(slot.inputs, batch, verify_input, logits_output, num_draft_tokens)
+        # Injected acceptance only overrides the result; the real acceptance kernel must be in the graph.
+        if acceptance_calls[0] == 0:
+            raise RuntimeError("post-verify graph captured without the acceptance kernel")
         slot.graph = graph
         slot.outputs = outputs
         logger.info("Captured post-verify graph for bs=%d", len(batch.seq_lens))
