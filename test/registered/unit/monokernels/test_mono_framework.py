@@ -1,4 +1,5 @@
-"""CPU contracts for monokernel registration, validation, routing, and weight copies."""
+"""CPU contracts for monokernel registration, validation, routing, capture coverage,
+and weight copies."""
 
 import inspect
 import unittest
@@ -9,7 +10,12 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.srt import monokernels as mono
+from sglang.srt.model_executor.cuda_graph_config import (
+    Phase,
+    default_cuda_graph_config,
+    with_phase,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.monokernels import guards, runtime
 from sglang.srt.monokernels import spec as registry
 from sglang.srt.monokernels.guards import (
@@ -26,7 +32,9 @@ from sglang.srt.monokernels.spec import (
     Numerics,
     NumericsKind,
     Requirements,
+    ShapeKey,
 )
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -99,14 +107,35 @@ def reasons_for(cfg, arch=ARCH, isa="gfx950"):
 
 
 def batch(mode, bs, rows):
-    forward_mode = SimpleNamespace(
-        is_decode=lambda: mode == "decode",
-        is_target_verify=lambda: mode == "target_verify",
-    )
     return SimpleNamespace(
-        forward_mode=forward_mode,
+        forward_mode=ForwardMode[mode.upper()],
         batch_size=bs,
         input_ids=torch.zeros(rows, dtype=torch.int64),
+    )
+
+
+def install(*, archs, lookups):
+    """``install_monokernel_forward`` on an ``Lm``, as rank 0 of two whose gathered
+    lookups are ``lookups``."""
+    lm = Lm()
+    with (
+        patch.object(runtime, "_backend", return_value=BACKEND),
+        patch.object(runtime, "device_isa", return_value="gfx950"),
+        patch.object(runtime, "_gather_tp", return_value=lookups),
+    ):
+        runtime.install_monokernel_forward(
+            model=lm,
+            hf_config=SimpleNamespace(architectures=archs),
+            capture_tail_hooks=[],
+        )
+    return lm
+
+
+def runner(*, capture_bs, attention="dsv4"):
+    """A decode CUDA graph runner, as the capture tail hook sees it."""
+    return SimpleNamespace(
+        capture_bs=capture_bs,
+        model_runner=SimpleNamespace(decode_attention_backend_str=attention),
     )
 
 
@@ -115,10 +144,10 @@ class Lm(torch.nn.Module):
         return "normal"
 
 
-def switched():
-    """Build a fake model with six-token verify requests and fixed routing keys."""
+def switched(tokens=1):
+    """Build a fake model at ``tokens`` per request with fixed routing keys."""
     lm, built = Lm(), FakeBuilt()
-    served = runtime._served_keys(built=built, widths=WIDTHS, tokens=6)
+    served = runtime._served_keys(built=built, widths=WIDTHS, tokens=tokens)
     runtime._install_forward(model=lm, built=built, served=served)
     return lm, built
 
@@ -227,9 +256,12 @@ class TestMonokernelFramework(CustomTestCase):
         asked = built.asked
         x = torch.zeros(1)
         self.assertEqual(lm(x, None, batch("decode", 2, 2)), "mono")
+        verify, _ = switched(tokens=6)
         self.assertEqual(
-            lm(x, None, forward_batch=batch("target_verify", 2, 12)), "mono"
+            verify(x, None, forward_batch=batch("target_verify", 2, 12)), "mono"
         )
+        # a speculative server's target runs verify steps only
+        self.assertEqual(verify(x, None, batch("decode", 6, 6)), "normal")
         for normal in (
             batch("decode", 3, 3),  # a width not built
             batch("decode", 4, 4),  # a key the spec does not serve
@@ -238,7 +270,7 @@ class TestMonokernelFramework(CustomTestCase):
             batch("extend", 2, 9),
         ):
             self.assertEqual(lm(x, None, normal), "normal")
-        # the served keys were fixed at attach: routing runs none of the spec's code
+        # the served keys were fixed at install: routing runs none of the spec's code
         self.assertEqual(built.asked, asked)
 
     def test_each_forward_has_its_own_plan_state(self):
@@ -248,7 +280,8 @@ class TestMonokernelFramework(CustomTestCase):
             lm(torch.zeros(1), None, batch("decode", 2, 2))
         self.assertEqual(built.steps, [(2, {"layers": 1}), (2, {"layers": 1})])
 
-    def test_watched_weights_pass_through_and_keep_copies(self):
+    def test_the_weights_iterator_passes_weights_through_and_keeps_copies(self):
+        iterator = runtime.monokernel_weights_iterator
         model, other = torch.nn.Module(), torch.nn.Module()
         model.config = SimpleNamespace(architectures=[ARCH])
         other.config = SimpleNamespace(architectures=["Other"])
@@ -260,8 +293,8 @@ class TestMonokernelFramework(CustomTestCase):
             patch.object(runtime, "_backend", return_value=BACKEND),
             patch.object(runtime, "device_isa", return_value="gfx950"),
         ):
-            watched = list(mono.watch_weights(model=model, weights=iter(weights)))
-            self.assertIs(mono.watch_weights(model=other, weights=weights), weights)
+            watched = list(iterator(model=model, weights=iter(weights)))
+            self.assertIs(iterator(model=other, weights=weights), weights)
         # Observing a weight must preserve its identity and checkpoint order.
         self.assertEqual(
             [(n, id(t)) for n, t in watched], [(n, id(t)) for n, t in weights]
@@ -271,7 +304,110 @@ class TestMonokernelFramework(CustomTestCase):
             [("shared expert", "layers.0.shared.weight")],
         )
         with patch.object(runtime, "_backend", return_value=None):
-            self.assertIs(mono.watch_weights(model=model, weights=weights), weights)
+            self.assertIs(iterator(model=model, weights=weights), weights)
+
+    def test_every_rank_takes_the_same_lookup_branch(self):
+        # a rank that failed to load the registered spec once returned alone while
+        # its peers entered the next collective; now every rank refuses together
+        ours = (True, True, "", (SPEC.name, SPEC.api))
+        with self.assertRaisesRegex(ValueError, "rank 1: broken"):
+            install(archs=[ARCH], lookups=[ours, (False, True, "broken", None)])
+        # ranks that load different specs (another plugin version) must not pair up
+        other = (True, True, "", ("fake_v2", SPEC.api))
+        with self.assertRaisesRegex(ValueError, "the ranks load different specs"):
+            install(archs=[ARCH], lookups=[ours, other])
+        # a model the backend registers no spec for keeps its forward on every rank
+        lm = install(archs=["Other"], lookups=[(False, False, "none", None)] * 2)
+        self.assertNotIn("forward", vars(lm))
+
+    def test_the_decode_attention_backend_is_checked(self):
+        # the steps a spec serves run on the decode backend, not the base one
+        dsv4 = replace(
+            SPEC,
+            requires=Requirements(
+                kv_cache_dtypes=frozenset({"fp8_e4m3"}),
+                attention_backends=frozenset({"dsv4"}),
+            ),
+        )
+        with patch.object(guards, "find_spec", return_value=(dsv4, "")):
+            _, refused = reasons_for(
+                server_args(attention_backend="dsv4", decode_attention_backend="triton")
+            )
+            _, accepted = reasons_for(
+                server_args(attention_backend="triton", decode_attention_backend="dsv4")
+            )
+        self.assertTrue(any("decode attention backend 'triton'" in r for r in refused))
+        self.assertEqual(accepted, [])
+        # a draft runner resolves its own backend: the capture hook checks the runner's
+        decode = ShapeKey(forward_mode="decode", batch_size=2, tokens_per_request=1)
+        check = runtime._CaptureCheck(
+            spec=dsv4, backend=BACKEND, isa="gfx950", served=frozenset({decode})
+        )
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            with self.assertRaisesRegex(ValueError, "this runner's is 'triton'"):
+                check(
+                    runner(capture_bs=[2], attention="triton"),
+                    None,
+                    batch("decode", 2, 2),
+                    2,
+                )
+
+    def test_the_captured_graphs_decide_coverage(self):
+        # the runner may capture fewer sizes than configured (alignment, the request
+        # pool): configured 4 and 8 became a captured 2, which the spec does not serve
+        served = frozenset(
+            ShapeKey(forward_mode="decode", batch_size=bs, tokens_per_request=1)
+            for bs in (4, 8)
+        )
+        check = runtime._CaptureCheck(
+            spec=SPEC, backend=BACKEND, isa="gfx950", served=served
+        )
+        capturing = patch.object(torch.cuda, "is_current_stream_capturing")
+        with capturing as is_capturing:
+            is_capturing.return_value = False  # a warmup run is not a capture
+            check(runner(capture_bs=[2]), None, batch("decode", 2, 2), 2)
+            is_capturing.return_value = True
+            with self.assertRaisesRegex(ValueError, "none of the 1 captured decode"):
+                check(runner(capture_bs=[2]), None, batch("decode", 2, 2), 2)
+        check = runtime._CaptureCheck(
+            spec=SPEC, backend=BACKEND, isa="gfx950", served=served
+        )
+        with capturing:
+            for bs in (2, 4):  # the check waits for every captured size
+                check(runner(capture_bs=[2, 4]), None, batch("decode", bs, bs), bs)
+        self.assertTrue(check.done)
+        # a step pads up to a captured graph that holds it: only a served key past
+        # the largest graph of its mode runs eagerly
+        eager = runtime._eager_keys(served=served, captured=check.captured.values())
+        self.assertEqual([k.batch_size for k in eager], [8])
+
+    def test_the_runtime_reads_the_published_config(self):
+        graphs = with_phase(default_cuda_graph_config(), Phase.DECODE, bs=[1, 2, 8])
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                monokernel_backend=BACKEND,
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                cuda_graph_config=graphs,
+            ),
+            role="test",
+        )
+        self.addCleanup(reset_context)
+        self.assertEqual(runtime._backend(), BACKEND)
+        tokens = runtime._tokens_per_request()
+        self.assertEqual(tokens, 6)
+        self.assertEqual(
+            [
+                (k.forward_mode, k.batch_size, k.rows)
+                for k in runtime._capture_keys(tokens)
+            ],
+            [
+                ("target_verify", 1, 6),
+                ("target_verify", 2, 12),
+                ("target_verify", 8, 48),
+            ],
+        )
 
     def test_deadlines_stay_below_the_watchdog(self):
         self.assertEqual(deadline_s(None), MAX_DEADLINE_S)

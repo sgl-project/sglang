@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import enum
 import importlib
-from typing import Any, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol
 
 import msgspec
+
+if TYPE_CHECKING:
+    import torch
 
 # Version the spec, build context, shape key, and built-forward contracts together.
 API_VERSION = 1
@@ -50,6 +53,7 @@ class Requirements(msgspec.Struct, frozen=True):
 
     dtypes: frozenset[str] = frozenset()
     kv_cache_dtypes: frozenset[str] = frozenset()
+    # Checked against the decode-phase backend, which runs served steps.
     attention_backends: frozenset[str] = frozenset()
     moe_runner_backends: frozenset[str] = frozenset()
     quantizations: frozenset[Optional[str]] = frozenset()
@@ -105,28 +109,43 @@ class BuildContext(msgspec.Struct, frozen=True):
     copies: dict  # (kind, ...) -> tensor: the load hook's copies; build adds its own
 
 
-class MonoSpec(msgspec.Struct, frozen=True):
-    """A model-specific plugin contract.
+class Plan(msgspec.Struct, frozen=True):
+    """A routed forward's graph key and state shared by its layers within that step."""
 
-    build(model, hf_config, ctx) returns an object with serves(key) and
-    forward(plan, *inputs). Its forward accepts and returns the model's own
-    forward arguments and outputs.
-    """
+    key: ShapeKey
+    state: dict = {}
+
+
+class BuiltMonokernels(Protocol):
+    """The object a spec's build returns."""
+
+    def serves(self, key: ShapeKey) -> bool:
+        """Return whether the forward runs this graph key; asked once per key."""
+
+    def forward(self, plan: Plan, *args: Any, **kwargs: Any) -> Any:
+        """Run a routed step with the model forward's arguments and outputs."""
+
+
+class MonoSpec(msgspec.Struct, frozen=True):
+    """A model-specific plugin contract; build returns its BuiltMonokernels."""
 
     name: str
     devices: Mapping[str, DeviceLimits]  # per ISA
     features: frozenset[Feature]  # the refused-by-default features it accepts
     requires: Requirements
     numerics: Numerics
-    config_disable_reasons: Callable[..., list[str]]  # (cfg, hf_config), before load
+    # (cfg, hf_config), before load
+    config_disable_reasons: Callable[[Any, Any], list[str]]
     # (model, hf_config, copies): after load, with the load hook's copies
-    model_disable_reasons: Callable[..., list[str]]
-    build: Callable[..., Any]
+    model_disable_reasons: Callable[[torch.nn.Module, Any, dict], list[str]]
+    build: Callable[[torch.nn.Module, Any, BuildContext], BuiltMonokernels]
     api: int  # the API_VERSION this spec is written against
     # (copies, model, name, tensor): retain weights before model-specific conversion
-    load_tensor: Optional[Callable[..., None]] = None
+    load_tensor: Optional[
+        Callable[[dict, torch.nn.Module, str, torch.Tensor], None]
+    ] = None
     # (model) -> tokens per request when different from the target, e.g. draft blocks
-    tokens_per_request: Optional[Callable[..., int]] = None
+    tokens_per_request: Optional[Callable[[torch.nn.Module], int]] = None
 
     def widths(self, isa: str) -> tuple[int, ...]:
         return self.devices[isa].widths
@@ -145,6 +164,12 @@ def register(*, backend: str, architecture: str, path: str) -> None:
             f"{specs[architecture]}"
         )
     specs[architecture] = path
+
+
+def spec_registered(*, backend: str, architectures) -> bool:
+    """Return whether the backend registers a spec for any architecture, usable or not."""
+    specs = _REGISTRY.get(backend, {})
+    return any(arch in specs for arch in architectures or ())
 
 
 def find_spec(*, backend: str, architectures, isa: Optional[str]):

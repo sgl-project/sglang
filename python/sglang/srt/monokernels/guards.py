@@ -21,7 +21,6 @@ SGLANG_READS = {
         "tp_size",
         "dtype",
         "kv_cache_dtype",
-        "attention_backend",
         "moe_runner_backend",
         # the probes of the refused-by-default features
         "pp_size",
@@ -54,6 +53,7 @@ SGLANG_READS = {
         "rl_on_policy_target",
     ),
     "srt/arg_groups/overrides.py": (
+        "attention_backends_of",
         "declare_resolution",
         "model_config_of",
         "resolving_view",
@@ -92,7 +92,7 @@ def _ragged_verify(cfg) -> bool:
     return cfg.speculative_algorithm is not None and mode != "static"
 
 
-# Partitioned GPUs are refused at attach, and weight updates by SGLang's weight updater.
+# Partitioned GPUs are refused at install, and weight updates by SGLang's weight updater.
 _PROBES = {
     Feature.PIPELINE_PARALLEL: lambda c: c.pp_size > 1,
     Feature.MULTI_NODE_TP: lambda c: c.nnodes > 1,
@@ -138,6 +138,8 @@ def features_in_use(cfg: Any) -> set[Feature]:
 
 def monokernel_disable_reasons(*, cfg, model_config, isa):
     """Return the matching spec and all configuration rejection reasons."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
     if isa is None:
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
@@ -148,6 +150,7 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
         return None, [why]
     req = spec.requires
     dtype = str(model_config.dtype).replace("torch.", "")  # resolved, e.g. bfloat16
+    _, decode_backend = attention_backends_of(cfg)
     reasons = [
         f"{f.value} is in use and the spec does not accept it"
         for f in sorted(features_in_use(cfg) - spec.features, key=lambda f: f.name)
@@ -156,7 +159,8 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
         ("tp_size", cfg.tp_size, spec.devices[isa].tp_sizes),
         ("dtype", dtype, req.dtypes),
         ("--kv-cache-dtype", str(cfg.kv_cache_dtype), req.kv_cache_dtypes),
-        ("attention backend", cfg.attention_backend, req.attention_backends),
+        # Served steps run on the decode-phase backend.
+        ("decode attention backend", decode_backend, req.attention_backends),
         ("MoE runner backend", cfg.moe_runner_backend, req.moe_runner_backends),
         ("quantization", model_config.quantization, req.quantizations),
     ):

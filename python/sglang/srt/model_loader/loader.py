@@ -40,7 +40,6 @@ import huggingface_hub
 import numpy as np
 import torch
 
-from sglang.srt import monokernels as mono
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -48,6 +47,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
+from sglang.srt.monokernels.runtime import monokernel_weights_iterator
 from sglang.srt.runtime_context import (
     get_exec,
     get_model,
@@ -1058,7 +1058,7 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
-        weights = mono.watch_weights(model=model, weights=weights)
+        weights = monokernel_weights_iterator(model=model, weights=weights)
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.

@@ -8,14 +8,16 @@ import logging
 import time
 from typing import Any, Optional
 
-import msgspec
-
 from sglang.srt.monokernels.guards import deadline_s, device_isa
 from sglang.srt.monokernels.spec import (
     BuildContext,
+    BuiltMonokernels,
     Feature,
+    MonoSpec,
+    Plan,
     ShapeKey,
     find_spec,
+    spec_registered,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,8 +41,16 @@ SGLANG_READS = {
         "is_decode",
         "is_target_verify",
     ),
+    "srt/model_executor/model_runner.py": (
+        "capture_tail_hooks",
+        "decode_attention_backend_str",
+    ),
     "srt/model_executor/model_runner_components/weight_updater.py": (
         '"_derived_weight_cache_error"',
+    ),
+    "srt/model_executor/runner/decode_cuda_graph_runner.py": (
+        "capture_bs",
+        "model_runner",
     ),
     "srt/runtime_context.py": (
         "get_context",
@@ -78,7 +88,7 @@ def _gather_tp(obj) -> list:
     return out
 
 
-def watch_weights(*, model, weights):
+def monokernel_weights_iterator(*, model, weights):
     """Let the spec observe checkpoint tensors before model-specific conversion."""
     backend = _backend()
     if backend is None:
@@ -113,14 +123,7 @@ def shape_key(forward_batch) -> Optional[ShapeKey]:
     return ShapeKey(forward_mode=name, batch_size=bs, tokens_per_request=rows // bs)
 
 
-class Plan(msgspec.Struct, frozen=True):
-    """A routed forward's graph key and state shared by its layers within that step."""
-
-    key: ShapeKey
-    state: dict = {}
-
-
-def attach(*, model, hf_config) -> None:
+def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) -> None:
     """Build the selected spec and install its forward after loading, before KV sizing."""
     backend = _backend()
     if backend is None:
@@ -130,14 +133,38 @@ def attach(*, model, hf_config) -> None:
     from sglang.srt.runtime_context import get_device
 
     isa = device_isa()
-    spec, why = find_spec(
-        backend=backend, architectures=hf_config.architectures, isa=isa
-    )
+    archs = hf_config.architectures
+    spec, why = find_spec(backend=backend, architectures=archs, isa=isa)
     copies = model.__dict__.pop("_mono_copies", {})
-    if spec is None:
+    # Ranks branch together; one that skipped the collectives below would hang its peers.
+    lookups = _gather_tp(
+        (
+            spec is not None,
+            spec_registered(backend=backend, architectures=archs),
+            why,
+            None if spec is None else (spec.name, spec.api),
+        )
+    )
+    if not any(registered for _, registered, _, _ in lookups):
         # A draft model may have no registered spec.
         logger.info("monokernel: %s: the normal forward", why)
         return
+    reasons = [
+        f"rank {rank}: {reason}"
+        for rank, (found, _, reason, _) in enumerate(lookups)
+        if not found
+    ]
+    if reasons:
+        raise ValueError(f"--monokernel-backend {backend}: " + "; ".join(reasons))
+    if len({identity for *_, identity in lookups}) > 1:
+        raise ValueError(
+            f"--monokernel-backend {backend}: the ranks load different specs: "
+            + "; ".join(
+                f"rank {rank}: {name} (API {api})"
+                for rank, (*_, (name, api)) in enumerate(lookups)
+            )
+        )
+
     reasons = list(spec.model_disable_reasons(model, hf_config, copies))
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     if props.multi_processor_count < spec.devices[isa].resident_blocks:
@@ -176,12 +203,10 @@ def attach(*, model, hf_config) -> None:
     # Different routes would leave ranks waiting in incompatible collectives.
     if any(other != served for other in _gather_tp(served)):
         raise RuntimeError("monokernel: the ranks' specs serve different graph keys")
-    routed = [k for k in keys if k in served] if keys else served
-    if not routed:
+    if not served:
         raise ValueError(
-            f"--monokernel-backend {backend}: {spec.name} serves none of this "
-            "server's steps "
-            f"(widths {list(widths)}, {tokens} tokens a request)"
+            f"--monokernel-backend {backend}: {spec.name} serves none of the widths "
+            f"it built ({list(widths)}, {tokens} tokens a request)"
         )
     _install_forward(model=model, built=built, served=served)
     # Captured kernels retain weight copies that online updates cannot refresh.
@@ -190,39 +215,113 @@ def attach(*, model, hf_config) -> None:
         f"({spec.name})"
     )
     logger.info(
-        "monokernel %s on %s runs %s%s; every other step runs the standard path. "
-        "Widths %s built in %.1f s, %.1f MiB; wait deadline %.0f s (a failed wait "
-        "stops every rank with a GPU fault at address 0x0); weight copies: %s",
+        "monokernel %s on %s: widths %s built in %.1f s, %.1f MiB; wait deadline "
+        "%.0f s (a failed wait stops every rank with a GPU fault at address 0x0); "
+        "weight copies: %s",
         spec.name,
         isa,
-        _format_steps(routed),
-        f" ({len(routed)} of {len(keys)} decode graphs)" if keys else "",
         list(widths),
         time.perf_counter() - build_start,
         (torch.cuda.memory_allocated() - memory_before) / 2**20,
         build_context.deadline_s,
         _format_weight_copies(copies),
     )
-
-
-def _served_keys(*, built, widths, tokens: int) -> frozenset[ShapeKey]:
-    """Resolve supported decode and verify keys once, before any forwards."""
-    keys = [
-        ShapeKey(forward_mode="decode", batch_size=w, tokens_per_request=1)
-        for w in widths
-    ] + [
-        ShapeKey(
-            forward_mode="target_verify",
-            batch_size=w // tokens,
-            tokens_per_request=tokens,
+    if keys:
+        capture_tail_hooks.append(
+            _CaptureCheck(spec=spec, backend=backend, isa=isa, served=served)
         )
-        for w in widths
-        if tokens > 1 and w % tokens == 0
+    else:
+        # Without CUDA graphs every step runs eagerly, routed by its own key.
+        logger.info(
+            "monokernel %s on %s runs %s; every other step runs the standard path",
+            spec.name,
+            isa,
+            _format_steps(served),
+        )
+
+
+class _CaptureCheck:
+    """Check the captured decode graphs, not the configured sizes, once all are in.
+
+    Logs the steps that run the monokernels, captured and eager, and refuses a
+    runner none of whose graphs run them or whose decode attention backend the
+    spec does not accept.
+    """
+
+    def __init__(self, *, spec: MonoSpec, backend: str, isa: str, served: frozenset):
+        self.spec, self.backend, self.isa, self.served = spec, backend, isa, served
+        self.captured: dict[int, Optional[ShapeKey]] = {}
+        self.done = False
+
+    def __call__(self, runner, out, forward_batch, num_tokens) -> None:
+        import torch
+
+        if self.done or not torch.cuda.is_current_stream_capturing():
+            return  # the runner's warmup runs, and any recapture
+        self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
+        if not set(runner.capture_bs) <= set(self.captured):
+            return
+        self.done = True
+        attention = runner.model_runner.decode_attention_backend_str
+        allowed = self.spec.requires.attention_backends
+        if allowed and attention not in allowed:
+            raise ValueError(
+                f"--monokernel-backend {self.backend}: {self.spec.name} needs a decode "
+                f"attention backend in {sorted(allowed)}, this runner's is "
+                f"{attention!r}"
+            )
+        routed = [k for k in self.captured.values() if k in self.served]
+        if not routed:
+            raise ValueError(
+                f"--monokernel-backend {self.backend}: none of the "
+                f"{len(self.captured)} captured decode graphs (batch sizes "
+                f"{sorted(self.captured)}) runs {self.spec.name}'s monokernels"
+            )
+        eager = _eager_keys(served=self.served, captured=self.captured.values())
+        logger.info(
+            "monokernel %s on %s runs %s (%d of %d captured decode graphs)%s; every "
+            "other step runs the standard path",
+            self.spec.name,
+            self.isa,
+            _format_steps(routed),
+            len(routed),
+            len(self.captured),
+            f", and eagerly {_format_steps(eager)}" if eager else "",
+        )
+
+
+def _eager_keys(*, served, captured) -> list[ShapeKey]:
+    """Return served keys larger than every captured graph of their mode."""
+    # A step pads up to the smallest captured graph of its mode that holds it.
+    largest: dict = {}
+    for k in captured:
+        if k is not None:
+            mode = (k.forward_mode, k.tokens_per_request)
+            largest[mode] = max(largest.get(mode, 0), k.batch_size)
+    return [
+        k
+        for k in served
+        if k.batch_size > largest.get((k.forward_mode, k.tokens_per_request), 0)
     ]
+
+
+def _served_keys(
+    *, built: BuiltMonokernels, widths, tokens: int
+) -> frozenset[ShapeKey]:
+    """Resolve the supported keys of the model's step once, before any forwards."""
+    # A speculative target runs verify steps only; a plain server runs decode.
+    mode = "decode" if tokens == 1 else "target_verify"
+    keys = (
+        ShapeKey(forward_mode=mode, batch_size=w // tokens, tokens_per_request=tokens)
+        for w in widths
+        if w % tokens == 0
+    )
     return frozenset(k for k in keys if built.serves(k))
 
 
-def _install_forward(*, model, built, served: frozenset[ShapeKey]) -> None:
+def _install_forward(
+    *, model, built: BuiltMonokernels, served: frozenset[ShapeKey]
+) -> None:
     """Install shape-based dispatch while preserving the original forward signature."""
     original = model.forward
 
