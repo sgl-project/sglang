@@ -1647,13 +1647,6 @@ class Scheduler(
             self._confidence_budget_prepare = (
                 self.draft_worker.get_confidence_budget_prepare()
             )
-        # On HIP the publish wait is a host sync: without a CPU seq_lens mirror, the
-        # seq_lens gather runs on the forward stream instead, ordered after the publish.
-        self._resolve_seq_lens_on_forward_stream = (
-            _is_hip
-            and not needs_cpu_seq_lens
-            and self._confidence_budget_prepare is None
-        )
 
         if use_mlx():
             # MLX uses its own overlap loop and does not create CUDA streams,
@@ -4565,15 +4558,12 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                if not self._resolve_seq_lens_on_forward_stream:
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
-                    if self._resolve_seq_lens_on_forward_stream:
-                        self.future_map.resolve_seq_lens_cpu(batch, stream_ordered=True)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
