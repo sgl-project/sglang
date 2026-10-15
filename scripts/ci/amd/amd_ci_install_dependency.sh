@@ -162,7 +162,15 @@ else
   docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
 
   docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+  # No in-place Rust build: in a source checkout the loader never imports
+  # in-package modules (SGLANG_RUST_BUILD_MODE=auto), only fingerprinted ones
+  # from its cache, so the _multimodal this would compile went unused.
+  install_with_retry docker exec -e SGLANG_BUILD_RUST_EXTS=none ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+
+  # Seed that cache with what stage-a built, when the workflow downloaded it.
+  if [[ -d rust-ext-amd ]]; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/amd_ci_rust_ext_cache.sh" import rust-ext-amd
+  fi
 fi
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
