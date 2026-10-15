@@ -397,8 +397,11 @@ class ReqToTokenPool:
         self.size = size
         # +1 padding row at index 0: cuda-graph padded batches default
         # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
-        self._alloc_size = size + 1
-        self.max_context_len = max_context_len
+        from sglang.srt.mem_cache.request_pool_budget import request_mapping_shape
+
+        self._alloc_size, self.max_context_len = request_mapping_shape(
+            size, max_context_len
+        )
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(

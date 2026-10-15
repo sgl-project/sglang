@@ -66,6 +66,10 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 
 
+class PoolBudgetExhaustedError(RuntimeError):
+    """The supplied byte budget cannot hold a positive KV token capacity."""
+
+
 @dataclass
 class MemoryPoolConfig:
     """Resolved memory pool config, shared between target and draft workers."""
@@ -93,7 +97,7 @@ class MemoryPoolConfig:
             msg = "Not enough memory. Please try to increase --mem-fraction-static."
             if self.mem_fraction_static is not None:
                 msg += f" Current value: mem_fraction_static={self.mem_fraction_static}"
-            raise RuntimeError(msg)
+            raise PoolBudgetExhaustedError(msg)
 
 
 if TYPE_CHECKING:

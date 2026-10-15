@@ -33,8 +33,7 @@ constexpr size_t kSmem = 48 * 1024;  // bytes
 #endif
 #else
 // Reduced from 128KB to 32KB to improve occupancy.
-// Each radix pass needs at most ~TopK candidates in the threshold bin,
-// so 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
+// Threshold bins that exceed this capacity use the exact rescan path below.
 constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
 #endif
 
@@ -172,18 +171,96 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
         /// NOTE: (dark) fuse the histogram computation here
         if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
           s_input_idx[0][pos] = idx;
-          const auto bin = convert_to_uint32(raw_input);
-          const auto sub_bin = (bin >> 24) & 0xFF;
-          ::atomicAdd(&s_histogram[sub_bin], 1);
         }
+        // Keep the complete first-byte histogram even when indices overflow.
+        const auto bin = convert_to_uint32(raw_input);
+        const auto sub_bin = (bin >> 24) & 0xFF;
+        ::atomicAdd(&s_histogram[sub_bin], 1);
       }
     }
     __syncthreads();
   }
 
+  // A coarse bin can contain arbitrarily more than TopK entries. The buffered
+  // index buffer above holds only its first SMEM_INPUT_SIZE entries. On overflow,
+  // reuse the complete first-byte histogram, then refine
+  // the full bin by rescanning the source with an increasingly precise FP32
+  // prefix. All threads take this branch together, and the shared memory budget
+  // and the buffered fast path stay unchanged.
+  int first_buffered_round = 0;
+  if (s_num_input[0] > int(SMEM_INPUT_SIZE)) {
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+      // The initial collection already counted the entire coarse bin.
+      if (shift != 24) {
+        if (tx < RADIX + 1) s_histogram[tx] = 0;
+        __syncthreads();
+
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+          const auto value = input[idx + row_start];
+          const auto key = convert_to_uint32(value);
+          if (convert_to_uint8(value) == threshold_bin && (key & prefix_mask) == prefix) {
+            ::atomicAdd(&s_histogram[(key >> shift) & 0xFF], 1);
+          }
+        }
+        __syncthreads();
+      }
+      run_cumsum();
+      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+        s_threshold_bin_id = tx;
+        // Reuse the idle second-buffer counter for the final equal-score bin.
+        s_num_input[1] = topk - s_histogram[tx + 1];
+      }
+      __syncthreads();
+
+      const auto refine_bin = static_cast<uint32_t>(s_threshold_bin_id);
+      const auto boundary_count = s_histogram[refine_bin] - s_histogram[refine_bin + 1];
+      topk -= s_histogram[refine_bin + 1];
+      const bool buffer_boundary = shift > 0 && topk > 0 && boundary_count <= int(SMEM_INPUT_SIZE);
+      const int next_buffer = (shift >> 3) & 1;
+      if (buffer_boundary) {
+        // Every thread has read the cumulative histogram before it is reused.
+        __syncthreads();
+        if (tx < RADIX + 1) s_histogram[tx] = 0;
+        if (tx == 0) s_num_input[next_buffer] = 0;
+        __syncthreads();
+      }
+      for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+        const auto value = input[idx + row_start];
+        const auto key = convert_to_uint32(value);
+        if (convert_to_uint8(value) == threshold_bin && (key & prefix_mask) == prefix) {
+          const auto bin = (key >> shift) & 0xFF;
+          if (bin > refine_bin) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            index[pos] = idx;
+          } else if (shift == 0 && bin == refine_bin) {
+            const auto pos = ::atomicAdd(&s_num_input[1], -1);
+            if (pos > 0) index[TopK - pos] = idx;
+          } else if (buffer_boundary && bin == refine_bin) {
+            const auto pos = ::atomicAdd(&s_num_input[next_buffer], 1);
+            if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+              s_input_idx[next_buffer][pos] = idx;
+              ::atomicAdd(&s_histogram[(key >> (shift - 8)) & 0xFF], 1);
+            }
+          }
+        }
+      }
+      __syncthreads();
+      if (topk == 0 || shift == 0) return;
+      prefix |= refine_bin << shift;
+      prefix_mask |= 0xFFu << shift;
+      if (buffer_boundary && s_num_input[next_buffer] <= int(SMEM_INPUT_SIZE)) {
+        first_buffered_round = (32 - shift) >> 3;
+        break;
+      }
+    }
+  }
+
   // stage 2: refine with 8bit radix passes
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
+    if (round < first_buffered_round) continue;
     __shared__ int s_last_remain;
     const auto r_idx = round % 2;
 
