@@ -302,6 +302,17 @@ def collect_model_override_declarations(
     return declarations
 
 
+def model_sampling_overrides_of(
+    architectures: Optional[List[str]],
+) -> Tuple[Callable[[dict], dict], ...]:
+    """The primary architecture's request-time sampling providers."""
+    if not architectures:
+        return ()
+    return tuple(
+        model_override_base._MODEL_SAMPLING_OVERRIDE_FNS.get(architectures[0], ())
+    )
+
+
 # Importing the package is what registers the per-model declarations.
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 

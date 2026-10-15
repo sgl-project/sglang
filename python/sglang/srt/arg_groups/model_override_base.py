@@ -26,6 +26,10 @@ MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
 _MODEL_OVERRIDE_FNS: Dict[str, List[Callable[..., dict]]] = {}
 
 
+# Request-time sampling providers, in registration order.
+_MODEL_SAMPLING_OVERRIDE_FNS: Dict[str, List[Callable[[dict], dict]]] = {}
+
+
 # Predicate-keyed providers, in registration order.
 _PREDICATE_OVERRIDE_FNS: List[Tuple[Callable[[str], bool], Callable[..., dict]]] = []
 
@@ -53,6 +57,21 @@ def register_model_override_predicate(predicate: Callable[[str], bool]):
 
     def decorator(fn: Callable[..., dict]) -> Callable[..., dict]:
         _PREDICATE_OVERRIDE_FNS.append((predicate, fn))
+        return fn
+
+    return decorator
+
+
+def register_model_sampling_override(*architectures: str):
+    """Register a request-time sampling provider for ``architectures``.
+
+    The decorated callable receives the merged request sampling kwargs, must
+    not mutate them, and returns a ``{field: value}`` dict (possibly empty).
+    """
+
+    def decorator(fn: Callable[[dict], dict]) -> Callable[[dict], dict]:
+        for architecture in architectures:
+            _MODEL_SAMPLING_OVERRIDE_FNS.setdefault(architecture, []).append(fn)
         return fn
 
     return decorator
