@@ -299,6 +299,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     _use_draft_input_embeds = False
     _fa4_prefill = False
+    _body_drops_deepstack = False
     _backend_can_run_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     dllm_attention = None
@@ -673,6 +674,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     if name in params
                 ),
                 None,
+            )
+            # The body graph binds only input_embeds, so replaying a media
+            # batch would drop the deepstack features its vision encoder adds.
+            self._body_drops_deepstack = (
+                "input_deepstack_embeds" in params
+                and getattr(self.model_runner.model, "num_deepstack_embeddings", 0) > 0
             )
 
         # --- aiter chip info pre-warming (AMD) -------------------------
@@ -1305,7 +1312,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         rank-uniform; forward-time-only checking cannot split the group).
         """
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
+            self._qwen_bcg_hc_sidechannel
+            or self._qwen_bcg_mtp_draft
+            or self._body_drops_deepstack
         ):
             return False
         # Full replay bypasses forward_extend's Python image-mask guard.
