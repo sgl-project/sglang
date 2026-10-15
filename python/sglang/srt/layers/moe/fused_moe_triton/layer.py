@@ -649,7 +649,7 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         # Use narrow_padded_param_and_loaded_weight for:
         # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
+        # 2. GPU with flashinfer_trtllm padding (intermediate_size padded to 128, or 64 for gated NVFP4)
         # 3. GPU with Aiter padding
         aiter_padded = (
             _use_aiter
