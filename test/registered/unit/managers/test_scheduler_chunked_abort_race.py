@@ -100,6 +100,33 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
         self.assertEqual(abort_req.finished_reason, req.discard_output_reason.to_json())
 
+    def test_pp_pd_prefill_slot_applies_the_abort(self):
+        # A PP ring slot on a PD prefill node drops the aborted chunked request
+        # before it sends or schedules another chunk, as the flat loop does.
+        req = _FakeReq("chunked_rid")
+        sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
+        sched.mode_owners.disagg_prefill = owner = Mock()
+        owner.process_prefill_chunk.side_effect = lambda chunked, waiting, pending: (
+            chunked,
+            waiting,
+        )
+        sched.pending = []
+        sched.request_retirer = Mock()
+        sched.tree_cache = None
+        sched.ipc_channels = Mock()
+        sched._process_hicache_events = Mock()
+        sched._start_fpm_clock = Mock()
+        sched.step_planner = Mock()
+        sched.finalize_step = lambda step, slot: step
+
+        sched.get_next_pp_disagg_prefill_batch_to_run(Mock())
+
+        owner.release_aborted_chunked_req.assert_called_once_with(req)
+        sched.request_retirer.retire_aborted.assert_called_once_with(req)
+        self.assertIsNone(owner.process_prefill_chunk.call_args.args[0])
+        self.assertIsNone(sched.lists.chunked_req)
+        self.assertIsNone(sched.lists._pending_chunked_abort_req)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
