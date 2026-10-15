@@ -35,3 +35,6 @@ class Flux3ImageVAEConfig(VAEConfig):
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
     use_parallel_decode: bool = False
+
+    def get_vae_scale_factor(self) -> int:
+        return self.arch_config.spatial_compression_ratio

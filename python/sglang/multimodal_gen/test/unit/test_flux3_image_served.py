@@ -119,6 +119,17 @@ def _write_variant(
 
 
 class TestFlux3ServedRegistration(unittest.TestCase):
+    def test_batch_admission_uses_the_packed_vae_token_grid(self):
+        config = Flux3ImagePipelineConfig()
+        request = SimpleNamespace(
+            n_tokens=None,
+            width=1024,
+            height=512,
+            num_frames=1,
+            num_outputs_per_prompt=1,
+        )
+        self.assertEqual(config.estimate_request_cost(request), 64 * 32)
+
     def test_release_ids_and_renamed_packages_select_flux3_image(self):
         """Hub ids and local packages of any name must reach the FLUX.3 image
         pipeline without the model_index.json probe, which downloads a whole

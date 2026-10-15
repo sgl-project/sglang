@@ -49,7 +49,7 @@ return {
       title: "Precision",
       scope: "serve",
       description:
-        "FP8R and NVFP4 load the quantized DiT from the repo's variants/; the text encoder and VAE stay BF16.",
+        "FP8R and NVFP4 load a quantized DiT from variants/. Text encoder and VAE precision follow the package configuration.",
       default: "bf16",
       options: [
         { id: "bf16", label: "BF16", subtitle: "Reference", flags: [] },
@@ -112,6 +112,16 @@ return {
         { id: "eager", label: "Eager", flags: [], recommended: true },
         { id: "bcg", label: "Breakable CUDA graphs", flags: ["--enable-breakable-cuda-graph"], soft: true, softReason: "Not verified for every hardware and topology." },
       ],
+    },
+    {
+      id: "batch_size", title: "Max batch size", scope: "serve", kind: "number",
+      min: 1, max: 8, default: 1, unit: "requests", options: [],
+      description: "Larger batches trade activation memory and request latency for throughput.",
+    },
+    {
+      id: "batch_delay", title: "Batch window", scope: "serve", kind: "number",
+      min: 0, max: 100, default: 5, unit: "ms", options: [],
+      showWhen: (s) => Number(s.batch_size) > 1,
     },
     {
       id: "quality", title: "Quality", scope: "request", default: "lossless",
@@ -212,6 +222,9 @@ return {
       if (topology.ulysses_degree > 1) parallel.push(`--ulysses-degree ${topology.ulysses_degree}`);
       const variant = [s.model === "distilled" ? "sd" : "", s.precision === "bf16" ? "" : s.precision].filter(Boolean).join("-");
       if (variant) parallel.push(`--model-variant ${variant}`);
+      if (Number(s.batch_size) > 1) {
+        parallel.push(`--batching-max-size ${Number(s.batch_size)}`, `--batching-delay-ms ${Number(s.batch_delay) || 0}`);
+      }
       return {
         match: { hw: s.hw },
         nnodes: 1,

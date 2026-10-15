@@ -32,6 +32,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/FLUX/FLUX",
     },
     {
+      name: "FLUX.3 Image",
+      modelIds: ["herzogenhorn/f3-image-small", "black-forest-labs/flux-3-image-klein", "black-forest-labs/flux-3-image-klein-base"],
+      cookbook: "/cookbook/diffusion/FLUX/FLUX.3",
+    },
+    {
       name: "Qwen-Image",
       modelIds: [
         "Qwen/Qwen-Image",
