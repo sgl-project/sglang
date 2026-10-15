@@ -1392,21 +1392,6 @@ at::Tensor fp8_per_tensor_scaled_mm_cpu(
 #if defined(CPU_CAPABILITY_AVX512)
 constexpr int64_t kFP8QuantVecSize = 16;
 
-template <typename scalar_t>
-inline __m512 load_fp8_quant_input_avx512(const scalar_t* ptr) {
-  if constexpr (std::is_same_v<scalar_t, float>) {
-    return _mm512_loadu_ps(ptr);
-  } else if constexpr (std::is_same_v<scalar_t, double>) {
-    alignas(64) float values[kFP8QuantVecSize];
-    for (int64_t i = 0; i < kFP8QuantVecSize; ++i) {
-      values[i] = static_cast<float>(ptr[i]);
-    }
-    return _mm512_load_ps(values);
-  } else {
-    return __m512(load_float_vec(ptr));
-  }
-}
-
 inline __m512 abs_ordered_fp8_quant_avx512(__m512 value) {
   const __m512 sign_mask = _mm512_set1_ps(-0.0f);
   const __m512 zero = _mm512_setzero_ps();
@@ -1427,9 +1412,8 @@ inline void store_fp8_quantized_avx512(
 }
 #endif
 
-template <typename scalar_t>
 void quantize_groups_to_fp8_kernel(
-    const scalar_t* __restrict__ input,
+    const at::BFloat16* __restrict__ input,
     at::Float8_e4m3fn* __restrict__ output,
     float* __restrict__ scales,
     int64_t num_groups,
@@ -1446,7 +1430,7 @@ void quantize_groups_to_fp8_kernel(
       __m512 absmax_vec = _mm512_set1_ps(eps);
       int64_t i = 0;
       for (; i <= group_size - kFP8QuantVecSize; i += kFP8QuantVecSize) {
-        __m512 abs_vec = abs_ordered_fp8_quant_avx512(load_fp8_quant_input_avx512(input + offset + i));
+        __m512 abs_vec = abs_ordered_fp8_quant_avx512(__m512(load_float_vec(input + offset + i)));
         absmax_vec = _mm512_max_ps(absmax_vec, abs_vec);
       }
       float absmax = std::max(eps, _mm512_reduce_max_ps(absmax_vec));
@@ -1462,7 +1446,7 @@ void quantize_groups_to_fp8_kernel(
         store_fp8_quantized_avx512(
             output,
             offset + i,
-            _mm512_mul_ps(load_fp8_quant_input_avx512(input + offset + i), inv_scale_vec),
+            _mm512_mul_ps(__m512(load_float_vec(input + offset + i)), inv_scale_vec),
             quant_min_vec,
             quant_max_vec);
       }
@@ -1496,25 +1480,30 @@ void static_quant_to_fp8_kernel(
     const scalar_t* __restrict__ input, at::Float8_e4m3fn* __restrict__ output, int64_t numel, float scale) {
   constexpr float quant_max = 448.0f;
 #if defined(CPU_CAPABILITY_AVX512)
-  const __m512 quant_min_vec = _mm512_set1_ps(-quant_max);
-  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
-  const __m512 inv_scale_vec = _mm512_set1_ps(1.0f / scale);
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    const __m512 quant_min_vec = _mm512_set1_ps(-quant_max);
+    const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+    const __m512 inv_scale_vec = _mm512_set1_ps(1.0f / scale);
 
-  at::parallel_for(0, numel, 0, [&](int64_t begin, int64_t end) {
-    int64_t i = begin;
-    for (; i <= end - kFP8QuantVecSize; i += kFP8QuantVecSize) {
-      store_fp8_quantized_avx512(
-          output,
-          i,
-          _mm512_mul_ps(load_fp8_quant_input_avx512(input + i), inv_scale_vec),
-          quant_min_vec,
-          quant_max_vec);
-    }
-    for (; i < end; ++i) {
-      const float value = std::clamp(static_cast<float>(input[i]) / scale, -quant_max, quant_max);
-      output[i] = static_cast<at::Float8_e4m3fn>(value);
-    }
-  });
+    at::parallel_for(0, numel, 0, [&](int64_t begin, int64_t end) {
+      int64_t i = begin;
+      for (; i <= end - kFP8QuantVecSize; i += kFP8QuantVecSize) {
+        store_fp8_quantized_avx512(
+            output, i, _mm512_mul_ps(__m512(load_float_vec(input + i)), inv_scale_vec), quant_min_vec, quant_max_vec);
+      }
+      for (; i < end; ++i) {
+        const float value = std::clamp(static_cast<float>(input[i]) / scale, -quant_max, quant_max);
+        output[i] = static_cast<at::Float8_e4m3fn>(value);
+      }
+    });
+  } else {
+    at::parallel_for(0, numel, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; ++i) {
+        const float value = std::clamp(static_cast<float>(input[i]) / scale, -quant_max, quant_max);
+        output[i] = static_cast<at::Float8_e4m3fn>(value);
+      }
+    });
+  }
 #else
   at::parallel_for(0, numel, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
@@ -1533,18 +1522,27 @@ void dynamic_tensor_quant_to_fp8_kernel(
     int64_t numel) {
   constexpr float quant_max = 448.0f;
 #if defined(CPU_CAPABILITY_AVX512)
-  __m512 absmax_vec = _mm512_set1_ps(1.0e-12f);
-  int64_t i = 0;
-  for (; i <= numel - kFP8QuantVecSize; i += kFP8QuantVecSize) {
-    __m512 abs_vec = abs_ordered_fp8_quant_avx512(load_fp8_quant_input_avx512(input + i));
-    absmax_vec = _mm512_max_ps(absmax_vec, abs_vec);
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    __m512 absmax_vec = _mm512_set1_ps(1.0e-12f);
+    int64_t i = 0;
+    for (; i <= numel - kFP8QuantVecSize; i += kFP8QuantVecSize) {
+      __m512 abs_vec = abs_ordered_fp8_quant_avx512(__m512(load_float_vec(input + i)));
+      absmax_vec = _mm512_max_ps(absmax_vec, abs_vec);
+    }
+    float absmax = std::max(1.0e-12f, _mm512_reduce_max_ps(absmax_vec));
+    for (; i < numel; ++i) {
+      absmax = std::max(absmax, std::abs(static_cast<float>(input[i])));
+    }
+    scale[0] = absmax / quant_max;
+    static_quant_to_fp8_kernel(input, output, numel, scale[0]);
+  } else {
+    float absmax = 1.0e-12f;
+    for (int64_t i = 0; i < numel; ++i) {
+      absmax = std::max(absmax, std::abs(static_cast<float>(input[i])));
+    }
+    scale[0] = absmax / quant_max;
+    static_quant_to_fp8_kernel(input, output, numel, scale[0]);
   }
-  float absmax = std::max(1.0e-12f, _mm512_reduce_max_ps(absmax_vec));
-  for (; i < numel; ++i) {
-    absmax = std::max(absmax, std::abs(static_cast<float>(input[i])));
-  }
-  scale[0] = absmax / quant_max;
-  static_quant_to_fp8_kernel(input, output, numel, scale[0]);
 #else
   float absmax = 1.0e-12f;
   for (int64_t i = 0; i < numel; ++i) {
@@ -1567,9 +1565,7 @@ per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, doubl
   TORCH_CHECK(eps > 0.0, "per_token_group_quant_fp8_cpu: eps must be positive");
 
   const auto input_dtype = input.scalar_type();
-  TORCH_CHECK(
-      input_dtype == at::kBFloat16 || input_dtype == at::kHalf || input_dtype == at::kFloat,
-      "per_token_group_quant_fp8_cpu: input must be bfloat16, float16, or float32");
+  TORCH_CHECK(input_dtype == at::kBFloat16, "per_token_group_quant_fp8_cpu: input must be bfloat16");
 
   const int64_t num_groups = input.numel() / group_size;
   auto quantized = at::empty(input.sizes(), input.options().dtype(at::kFloat8_e4m3fn));
@@ -1577,15 +1573,13 @@ per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, doubl
   scale_sizes.back() = input.size(-1) / group_size;
   auto scales = at::empty(scale_sizes, input.options().dtype(at::kFloat));
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, input_dtype, "per_token_group_quant_fp8_cpu", [&] {
-    quantize_groups_to_fp8_kernel<scalar_t>(
-        input.data_ptr<scalar_t>(),
-        quantized.data_ptr<at::Float8_e4m3fn>(),
-        scales.data_ptr<float>(),
-        num_groups,
-        group_size,
-        static_cast<float>(eps));
-  });
+  quantize_groups_to_fp8_kernel(
+      input.data_ptr<at::BFloat16>(),
+      quantized.data_ptr<at::Float8_e4m3fn>(),
+      scales.data_ptr<float>(),
+      num_groups,
+      group_size,
+      static_cast<float>(eps));
 
   return std::make_tuple(quantized, scales);
 }
@@ -1680,33 +1674,52 @@ void mxfp8_quantize_groups_kernel(
   constexpr int64_t group_size = 32;
   constexpr float quant_max = 448.0f;
 #if defined(CPU_CAPABILITY_AVX512)
-  const __m512 zero = _mm512_setzero_ps();
-  const __m512 quant_min_vec = _mm512_set1_ps(-quant_max);
-  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 quant_min_vec = _mm512_set1_ps(-quant_max);
+    const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
 
-  at::parallel_for(0, num_groups, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t group = begin; group < end; ++group) {
-      const int64_t offset = group * group_size;
-      __m512 absmax_vec = zero;
-      for (int64_t i = 0; i < group_size; i += kFP8QuantVecSize) {
-        __m512 abs_vec = abs_ordered_fp8_quant_avx512(load_fp8_quant_input_avx512(input + offset + i));
-        absmax_vec = _mm512_max_ps(absmax_vec, abs_vec);
+    at::parallel_for(0, num_groups, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t group = begin; group < end; ++group) {
+        const int64_t offset = group * group_size;
+        __m512 absmax_vec = zero;
+        for (int64_t i = 0; i < group_size; i += kFP8QuantVecSize) {
+          __m512 abs_vec = abs_ordered_fp8_quant_avx512(__m512(load_float_vec(input + offset + i)));
+          absmax_vec = _mm512_max_ps(absmax_vec, abs_vec);
+        }
+        const float absmax = _mm512_reduce_max_ps(absmax_vec);
+        const uint8_t scale_byte = ceil_to_ue8m0_byte(absmax / quant_max);
+        const float scale_float = ue8m0_byte_to_float(scale_byte);
+        scale[group] = scale_byte;
+        const __m512 inv_scale_vec = _mm512_set1_ps(1.0f / scale_float);
+        for (int64_t i = 0; i < group_size; i += kFP8QuantVecSize) {
+          store_fp8_quantized_avx512(
+              output,
+              offset + i,
+              _mm512_mul_ps(__m512(load_float_vec(input + offset + i)), inv_scale_vec),
+              quant_min_vec,
+              quant_max_vec);
+        }
       }
-      const float absmax = _mm512_reduce_max_ps(absmax_vec);
-      const uint8_t scale_byte = ceil_to_ue8m0_byte(absmax / quant_max);
-      const float scale_float = ue8m0_byte_to_float(scale_byte);
-      scale[group] = scale_byte;
-      const __m512 inv_scale_vec = _mm512_set1_ps(1.0f / scale_float);
-      for (int64_t i = 0; i < group_size; i += kFP8QuantVecSize) {
-        store_fp8_quantized_avx512(
-            output,
-            offset + i,
-            _mm512_mul_ps(load_fp8_quant_input_avx512(input + offset + i), inv_scale_vec),
-            quant_min_vec,
-            quant_max_vec);
+    });
+  } else {
+    at::parallel_for(0, num_groups, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t group = begin; group < end; ++group) {
+        const int64_t offset = group * group_size;
+        float absmax = 0.0f;
+        for (int64_t i = 0; i < group_size; ++i) {
+          absmax = std::max(absmax, std::abs(static_cast<float>(input[offset + i])));
+        }
+        const uint8_t scale_byte = ceil_to_ue8m0_byte(absmax / quant_max);
+        const float scale_float = ue8m0_byte_to_float(scale_byte);
+        scale[group] = scale_byte;
+        for (int64_t i = 0; i < group_size; ++i) {
+          const float value = std::clamp(static_cast<float>(input[offset + i]) / scale_float, -quant_max, quant_max);
+          output[offset + i] = static_cast<at::Float8_e4m3fn>(value);
+        }
       }
-    }
-  });
+    });
+  }
 #else
   at::parallel_for(0, num_groups, 0, [&](int64_t begin, int64_t end) {
     for (int64_t group = begin; group < end; ++group) {
