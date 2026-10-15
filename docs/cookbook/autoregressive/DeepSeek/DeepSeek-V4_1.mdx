@@ -42,7 +42,7 @@ docker run --gpus all \
 **AMD GPUs (ROCm)** — AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261012
+docker pull lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261013
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -52,7 +52,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261012 \
+    lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261013 \
     sglang serve <use args below>
 ```
 
@@ -222,20 +222,20 @@ Only the L2 tier is exposed here. For the storage (L3) tier and the canonical fl
 
 Agentic replay is a different workload: long-context prompts, multi-turn sessions that reuse their own prefix across turns, and subagent branches that fan out within one session. Concurrency below counts live sessions, not requests. Every command keeps the engram tables on the host, and none adds a HiCache tier. The sessions fit the device pool.
 
-Two commands follow, one per concurrency range. TP2 and TP4 cover concurrency 1 to 16; at 32 and 64 the same two GPUs switch to DP attention with TP MoE.
+Two commands follow, one per concurrency range. TP2 covers concurrency 1 to 32 and TP4 covers 1 to 16; at 32 and 64 the same two GPUs also run DP attention with TP MoE.
 
-**TP2 or TP4, concurrency 1–16:** TP2 raises `--mem-fraction-static` at concurrency 16; TP4 holds 0.70, with a quarter of the checkpoint per rank leaving room to spare. A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency. Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
+**TP2 or TP4, concurrency 1–32:** TP2 raises `--mem-fraction-static` from concurrency 16 and continues through 32; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare. A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency. Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
 
 The braced values in the command follow concurrency:
 
-| Concurrency | 1 | 2 | 4 | 8 | 16 |
-|---|---|---|---|---|---|
-| `--max-running-requests` | 2 | 4 | 8 | 16 | 32 |
-| `--swa-prefix-tails` | 128 | 128 | 256 | 512 | 1024 |
-| `--prefill-decode-interval` | 192 | 192 | 192 | 192 | 96 |
-| `--schedule-policy` | lpm | lpm | lpm | lpm | fcfs |
-| `--mem-fraction-static`, TP2 | 0.70 | 0.70 | 0.70 | 0.70 | 0.80 |
-| `--mem-fraction-static`, TP4 | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 |
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| `--max-running-requests` | 2 | 4 | 8 | 16 | 32 | 64 |
+| `--swa-prefix-tails` | 128 | 128 | 256 | 512 | 1024 | 2048 |
+| `--prefill-decode-interval` | 192 | 192 | 192 | 192 | 96 | 32 |
+| `--schedule-policy` | lpm | lpm | lpm | lpm | fcfs | fcfs |
+| `--mem-fraction-static`, TP2 | 0.70 | 0.70 | 0.70 | 0.70 | 0.80 | 0.80 |
+| `--mem-fraction-static`, TP4 | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 | — |
 
 ```bash Command
 SGLANG_DEFAULT_THINKING=1 \
@@ -249,6 +249,7 @@ AITER_BF16_FP8_MOE_BOUND=0 \
 TRITON_HIP_USE_ASYNC_COPY=0 \
 ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \
 SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true \
+SGLANG_OPT_HIP_FLYDSL_MXFP8=1 \
 HSA_NO_SCRATCH_RECLAIM=0 \
 GPU_MAX_HW_QUEUES=2 \
 sglang serve \
@@ -279,7 +280,6 @@ sglang serve \
 | Concurrency | 32 | 64 |
 |---|---|---|
 | `--mem-fraction-static` | 0.80 | 0.85 |
-| `--chunked-prefill-size` | 32768 | 8192 |
 | `--prefill-decode-interval` | 32 | 16 |
 | `--swa-prefix-tails` | 2048 | 4096 |
 
@@ -295,6 +295,7 @@ AITER_BF16_FP8_MOE_BOUND=0 \
 TRITON_HIP_USE_ASYNC_COPY=0 \
 ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \
 SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true \
+SGLANG_OPT_HIP_FLYDSL_MXFP8=1 \
 HSA_NO_SCRATCH_RECLAIM=0 \
 GPU_MAX_HW_QUEUES=5 \
 SGLANG_SHARED_EXPERT_TP1=1 \
@@ -320,7 +321,7 @@ sglang serve \
   --enable-decoder-swa-bounded-replay \
   --cuda-graph-backend-prefill disabled \
   --mem-fraction-static {mem-fraction-static} \
-  --chunked-prefill-size {chunked-prefill-size} \
+  --chunked-prefill-size 32768 \
   --prefill-decode-interval {prefill-decode-interval} \
   --swa-prefix-tails {swa-prefix-tails} \
   --max-running-requests 64 \
