@@ -416,6 +416,18 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         # model_index.json records absent optional components as [null, null].
         return bool(entry) and entry[0] is not None
 
+    def create_comfyui_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.comfyui_step import (
+            LTX2ComfyUIStepStage,
+        )
+
+        self.add_stage(
+            LTX2ComfyUIStepStage(
+                transformer=self.get_module("transformer"),
+                model_path=server_args.model_path,
+            )
+        )
+
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")
         scheduler_overrides: dict = {}
