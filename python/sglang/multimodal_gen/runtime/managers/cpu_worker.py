@@ -30,6 +30,7 @@ class CPUWorker(GPUWorker):
         master_port: int,
         server_args: ServerArgs,
     ):
+        os.environ["LOCAL_SIZE"] = str(server_args.num_gpus // server_args.nnodes)
         super().__init__(local_rank, rank, master_port, server_args)
         if _is_cpu_amx_available:
             self.init_cpu_threads_binding()
