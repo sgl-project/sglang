@@ -1,0 +1,91 @@
+name: Release Pypi
+
+# Call the standalone template repository flytiger-release-action; uses and template_ref must reference the same version.
+# Configure RELEASE_USERNAME, RELEASE_TOKEN, and DATA_TOKEN in the calling repository's Actions secrets or in organization-level Actions secrets accessible to it.
+# Save release wheel artifacts when triggered by a tag.
+on:
+  # Trigger automatically only on tag pushes, or manually with supplied inputs.
+  push:
+    tags:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Name of the package to build and publish'
+        required: true
+        type: string
+        default: sglang
+      framework:
+        description: 'Name of the required framework, e.g. torch'
+        required: true
+        type: string
+        default: torch
+      python_versions:
+        description: 'JSON array; supported values: 38, 310, 312'
+        required: true
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'JSON array; supported values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
+        required: true
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'JSON array; supported values: 13.0.0, 13.2.0'
+        required: true
+        type: string
+        default: '["13.0.0"]'
+      torch_versions:
+        description: 'JSON array; supported values: 2.8.0, 2.10.0, 2.13.0; [""] means no Torch version is included'
+        required: true
+        type: string
+        default: '["2.10.0"]'
+      sdk_versions:
+        description: 'JSON array; supported values: 2.1.0, 2.2.0'
+        required: true
+        type: string
+        default: '["2.2.0"]'
+      tag_version:
+        description: 'Source code version; manually specify a tag when building and publishing multiple wheel packages'
+        required: false
+        type: string
+      build_command:
+        description: 'Build command'
+        required: false
+        type: string
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: flytiger-eco/shared-workflows/.github/workflows/matrix-release.yml@main
+    permissions:
+      contents: write
+    secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      data_token: ${{ secrets.DATA_TOKEN }}
+    with:
+      # Manual runs use the supplied inputs; tag pushes have no inputs and use the same defaults as manual runs.
+      package_name: ${{ inputs.package_name || 'sglang' }}
+      framework: ${{ inputs.framework || 'torch' }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.10.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      tag_version: ${{ inputs.tag_version || ''}}
+      build_command: |
+        ${{ inputs.build_command || 'unset PIP_INDEX_URL
+        export HOME=$(eval echo ~$(id -un))
+        source /usr/local/PPU_SDK/envsetup.sh || true
+        source scripts/ci/utils/install_protoc.sh
+        source scripts/ci/utils/install_rustup.sh
+        cd python
+        cp ../README.md ../LICENSE .
+        pip install build wheel setuptools setuptools-scm setuptools-rust
+        git config --global --add safe.directory ''*''
+        python3 -m build --wheel' }}
