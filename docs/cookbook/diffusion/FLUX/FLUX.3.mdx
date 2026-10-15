@@ -10,9 +10,9 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/black-forest-labs/flux3.jsx";
 
-<DiffusionModelTags tags={["image", "T2I / I2I", "50-step", "1024×1024"]} />
+<DiffusionModelTags tags={["image", "T2I / I2I", "16 / 50 steps", "1024×1024"]} />
 
-## Quick start
+## 1. Quick start
 
 Install SGLang Diffusion:
 
@@ -38,11 +38,16 @@ Review the Black Forest Labs license before production or commercial use.
 For platform-specific installation, see the
 [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
 
-## Model capabilities
+## 2. Model capabilities
 
 FLUX.3 image generates from a text prompt (text to image) or edits 1 to 10
 reference images (image to image). One server serves both: a request that
 carries reference images is an edit, any other request is text to image.
+
+Choose the distilled model for interactive latency: it samples 16 steps
+without classifier-free guidance, about 0.75 s per 1024×1024 image on one B200.
+Choose the base model when you need a custom guidance scale or a negative
+prompt; it samples 50 steps with CFG, about 4 s per image on the same GPU.
 
 | Task | Endpoint | Conditioning |
 | --- | --- | --- |
@@ -69,7 +74,7 @@ output size, sets the output size; the padding is cropped from the result.
 With several references each is fitted under 1 MP and centre-cropped, and the
 output takes the first one's size.
 
-## Checkpoints
+## 3. Checkpoints
 
 | Model | `--model-path` | Default sampling |
 | --- | --- | --- |
@@ -89,7 +94,7 @@ The base model samples with CFG against an empty negative prompt; a request's
 may point at the base repo's text encoder and VAE with `hf://` paths; SGLang
 fetches them from there.
 
-## Quantized checkpoints
+## 4. Quantized checkpoints
 
 Each repo ships quantized DiTs under `variants/`: select one with
 `--model-variant fp8r` or `--model-variant nvfp4` and keep `--model-path`
@@ -127,7 +132,7 @@ Denoise throughput of the base model on one B200 (1024×1024, 50 steps):
 
 Both combine with the multi-GPU, offload and CUDA-graph flags below.
 
-## Multi-GPU and acceleration
+## 5. Multi-GPU and acceleration
 
 FLUX.3 shares its DiT with FLUX.3 Action, so the image pipeline supports
 tensor parallelism, Ulysses sequence parallelism, CFG parallelism, layerwise
@@ -150,7 +155,7 @@ layerwise offload streams the whole model to each GPU every step (2.2 it/s on
 2× H200). Prefer tensor parallelism when offloading on several GPUs.
 </Note>
 
-## Cache-DiT
+## 6. Cache-DiT
 
 [Cache-DiT](/docs/sglang-diffusion/cache_dit) skips the 28 single-stream blocks
 on steps where their input barely changes and reuses the cached residual. Turn
@@ -176,7 +181,7 @@ layerwise offload. It is skipped, with a warning, under Ulysses sequence
 parallelism and breakable CUDA graphs, and for a request whose CFG pair has to
 run as two forwards to fit in device memory.
 
-## Request examples
+## 7. Request examples
 
 <Tabs>
 <Tab title="Text to image">
@@ -217,7 +222,7 @@ Pass `--image-path` (one or more images) to edit references instead.
 </Tab>
 </Tabs>
 
-## Validation
+## 8. Validation
 
 The FLUX.3 image path is parity-tested against the BFL reference for BF16,
 rowwise FP8, and NVFP4 checkpoints. Native image-VAE and native DiT tests cover
