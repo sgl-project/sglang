@@ -190,12 +190,14 @@ class SDPAImpl(AttentionImpl):
         lengths = {stop - start for start, stop in zip(bounds[:-1], bounds[1:])}
         covers_query = bounds[0] == 0 and bounds[-1] == query.shape[0]
         if (
-            query.device.type != "mps"
+            type(self) is not SDPAImpl
+            and query.device.type != "mps"
             and covers_query
             and len(lengths) == 1
             and 0 not in lengths
         ):
-            # Equal segments (e.g. packed CFG pairs) are independent batch rows.
+            # Subclasses (cuDNN SDPA) never take the native varlen op above, so
+            # equal segments (e.g. packed CFG pairs) run as one batch instead.
             segments = len(bounds) - 1
             output = self.forward(
                 query.reshape(segments, -1, *query.shape[1:]),
