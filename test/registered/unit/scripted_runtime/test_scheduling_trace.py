@@ -41,10 +41,18 @@ class TestSchedulingTraceWriter(CustomTestCase):
         # plan after resume already re-admits the retracted req into the batch.
         req = _Req(rid="a", retraction_count=0)
         scheduler = SimpleNamespace(
-            lists=SimpleNamespace(chunked_req=None, waiting_queue=[req], decoding=[]),
-            token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 8),
-            tree_cache=SimpleNamespace(evictable_size=lambda: 0),
-            new_token_ratio_tracker=SimpleNamespace(current=0.5),
+            parts=SimpleNamespace(
+                lists=SimpleNamespace(
+                    chunked_req=None, waiting_queue=[req], decoding=[]
+                ),
+                kv=SimpleNamespace(
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        available_size=lambda: 8
+                    ),
+                    tree_cache=SimpleNamespace(evictable_size=lambda: 0),
+                ),
+                new_token_ratio_tracker=SimpleNamespace(current=0.5),
+            )
         )
         step = SimpleNamespace(
             reqs=[req],
@@ -69,16 +77,18 @@ class TestSchedulingTraceWriter(CustomTestCase):
     def test_paused_iterations_record_reader_values(self):
         inflight = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b")]
         scheduler = SimpleNamespace(
-            flags=EngineFlags(),
-            load_inquirer=SimpleNamespace(
-                get_loads=lambda: SimpleNamespace(
-                    num_running_reqs=0, num_waiting_reqs=1
-                )
-            ),
-            request_registry=SimpleNamespace(
-                is_fully_idle=lambda ignore_waiting=False: ignore_waiting,
-                # The record sorts the labels.
-                collect_inflight_reqs=lambda: [inflight[1], inflight[0]],
+            parts=SimpleNamespace(flags=EngineFlags()),
+            hub=SimpleNamespace(
+                load_inquirer=SimpleNamespace(
+                    get_loads=lambda: SimpleNamespace(
+                        num_running_reqs=0, num_waiting_reqs=1
+                    )
+                ),
+                request_registry=SimpleNamespace(
+                    is_fully_idle=lambda ignore_waiting=False: ignore_waiting,
+                    # The record sorts the labels.
+                    collect_inflight_reqs=lambda: [inflight[1], inflight[0]],
+                ),
             ),
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,7 +96,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
             writer = SchedulingTraceWriter(path, {})
             writer._labels(inflight)
             writer.observe_readers(scheduler)
-            scheduler.flags._engine_paused = True
+            scheduler.parts.flags._engine_paused = True
             writer.observe_readers(scheduler)
             writer.close()
             records = load_trace(path)

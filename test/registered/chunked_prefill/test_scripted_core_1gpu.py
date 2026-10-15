@@ -86,7 +86,7 @@ class TestScriptedCore(ScriptedTestCase):
         # engine must not advance it.
         if not r.finished:
             req = r.req
-            assert req is not None and req in t.scheduler.lists.waiting_queue, (
+            assert req is not None and req in t.scheduler.parts.lists.waiting_queue, (
                 f"stage={stage}: pause(retract) should park the req back in "
                 f"waiting_queue; found={req!r}"
             )
@@ -160,7 +160,7 @@ class TestScriptedCore(ScriptedTestCase):
 
 
 def _assert_every_node_hit_once(t: ScriptedContext, prompt_len: int) -> None:
-    core = t.scheduler.tree_cache.tree_core
+    core = t.scheduler.parts.kv.tree_cache.tree_core
     prefill_hits: list[int] = []
     decode_hits: list[int] = []
     stack = [

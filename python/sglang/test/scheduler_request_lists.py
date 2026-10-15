@@ -1,5 +1,5 @@
-"""Checks on the scheduler's request lists, and its registry and step planner
-over a partial scheduler, for tests."""
+"""Checks on the scheduler's request lists, and a partial scheduler with its
+registry and step planner over what a test gave it, for tests."""
 
 from __future__ import annotations
 
@@ -55,7 +55,25 @@ def make_request_registry(**deps) -> RequestRegistry:
     return RequestRegistry(**args)
 
 
-# The registry's constructor arguments a partial scheduler may carry.
+def partial_scheduler() -> Scheduler:
+    """A scheduler built with __new__ over empty parts, mode and hub (and an
+    empty KV, workers, streams and capacity bundle in the parts), for a test
+    to fill."""
+    from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.parts = SimpleNamespace(
+        kv=SimpleNamespace(),
+        workers=SimpleNamespace(),
+        streams=SimpleNamespace(),
+        capacity=SimpleNamespace(),
+    )
+    scheduler.mode = SimpleNamespace()
+    scheduler.hub = SimpleNamespace()
+    return scheduler
+
+
+# The registry's constructor arguments a partial scheduler's parts may carry.
 _SCHEDULER_FIELDS = {
     "core_lists": "lists",
     "grammar_manager": "grammar_manager",
@@ -69,56 +87,61 @@ _SCHEDULER_FIELDS = {
 
 
 def request_registry_of(scheduler: Scheduler, **deps) -> RequestRegistry:
-    """The registry `init_request_registry` would build over the fields a
-    test's partial scheduler carries now."""
+    """The registry the assembly would build over the parts a test's partial
+    scheduler carries now."""
+    parts = scheduler.parts
     args = {
-        name: getattr(scheduler, field)
+        name: getattr(parts, field)
         for name, field in _SCHEDULER_FIELDS.items()
-        if hasattr(scheduler, field)
+        if hasattr(parts, field)
     }
-    if hasattr(scheduler, "tree_cache"):
-        args["kv"] = SimpleNamespace(tree_cache=scheduler.tree_cache)
+    if hasattr(parts.kv, "tree_cache"):
+        args["kv"] = SimpleNamespace(tree_cache=parts.kv.tree_cache)
     args.update(deps)
     return make_request_registry(**args)
 
 
-# The step planner's fields a partial scheduler may carry, by the scheduler's
-# name for each.
+# The step planner's fields a partial scheduler may carry, by where the
+# scheduler holds each.
 _PLANNER_FIELDS = {
-    "core_lists": "lists",
+    "core_lists": ("parts", "lists"),
     **{
-        name: name
+        name: ("parts", name)
         for name in (
             "pending",
             "flags",
             "counters",
-            "req_to_token_pool",
-            "token_to_kv_pool_allocator",
-            "tree_cache",
             "new_token_ratio_tracker",
             "beam_coordinator",
             "step_builder",
-            "hisparse_coordinator",
             "request_retirer",
             "metrics_sink",
             "ipc_channels",
             "decode_offload_manager",
             "mode_owners",
-            "request_intake",
             "spec_algorithm",
         )
     },
+    **{
+        name: ("parts", "kv", name)
+        for name in ("req_to_token_pool", "token_to_kv_pool_allocator", "tree_cache")
+    },
+    "hisparse_coordinator": ("parts", "mode_owners", "hisparse_coordinator"),
+    "request_intake": ("hub", "request_intake"),
 }
 
 
 def step_planner_of(scheduler: Scheduler, **fields) -> StepPlanner:
-    """A step planner over the fields a test's partial scheduler carries now
+    """A step planner over the parts a test's partial scheduler carries now
     and its registry; `fields` replaces any planner field."""
     planner = StepPlanner.__new__(StepPlanner)
-    for name, field in _PLANNER_FIELDS.items():
-        if hasattr(scheduler, field):
-            setattr(planner, name, getattr(scheduler, field))
-    planner.request_registry = scheduler.request_registry
+    for name, path in _PLANNER_FIELDS.items():
+        holder = scheduler
+        for attr in path[:-1]:
+            holder = getattr(holder, attr, None)
+        if hasattr(holder, path[-1]):
+            setattr(planner, name, getattr(holder, path[-1]))
+    planner.request_registry = scheduler.hub.request_registry
     planner.__dict__.update(fields)
     return planner
 
@@ -127,7 +150,7 @@ def request_lists(scheduler: Scheduler) -> Dict[str, List[Req]]:
     """The lists that own the scheduler's live requests."""
     return {
         name: entry.reqs
-        for name, entry in scheduler.request_registry.request_lists().items()
+        for name, entry in scheduler.hub.request_registry.request_lists().items()
     }
 
 
@@ -141,11 +164,11 @@ def assert_one_list_per_request(scheduler: Scheduler) -> None:
                 f"request {req.rid} is in both {owners[id(req)]} and {name}"
             )
             owners[id(req)] = name
-    for req in scheduler.lists.decoding:
+    for req in scheduler.parts.lists.decoding:
         assert not req.finished(), f"finished request {req.rid} is still decoding"
     for req in request_lists(scheduler).get("releasing", []):
         assert req.finished(), f"releasing request {req.rid} is not finished"
-    for record in scheduler.pending:
+    for record in scheduler.parts.pending:
         for req in record.step.reqs:
             assert req.finished() or id(req) in owners, (
                 f"request {req.rid} of a pending step is in no list"

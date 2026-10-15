@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers import scheduler_assembly
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
@@ -35,6 +36,7 @@ from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_assembly import init_mode_stages
 from sglang.srt.managers.scheduler_components.engine_state import (
     EngineFlags,
     LaunchCounters,
@@ -204,16 +206,17 @@ class _Scheduler:
         Scheduler.get_next_disagg_prefill_batch_to_run
     )
     finalize_step = Scheduler.finalize_step
-    init_mode_stages = Scheduler.init_mode_stages
+    loop_schedules = Scheduler.loop_schedules
+    # The other modes' schedules, which the loop's stage table names.
+    get_next_batch_to_run = Scheduler.get_next_batch_to_run
+    _admit_dllm_step = Scheduler._admit_dllm_step
+    get_next_disagg_decode_batch_to_run = Scheduler.get_next_disagg_decode_batch_to_run
     process_bootstrapped_queue = Scheduler.process_bootstrapped_queue
     process_prefill_transfer_queue = Scheduler.process_prefill_transfer_queue
     get_next_pp_disagg_prefill_batch_to_run = (
         Scheduler.get_next_pp_disagg_prefill_batch_to_run
     )
     _start_fpm_clock = Scheduler._start_fpm_clock
-    _is_continuous_input_polling_enabled = (
-        Scheduler._is_continuous_input_polling_enabled
-    )
     _yield_gil_if_needed = Scheduler._yield_gil_if_needed
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
@@ -229,6 +232,17 @@ class _Scheduler:
     disagg_decode = Scheduler.disagg_decode
     dllm = Scheduler.dllm
     hisparse_coordinator = Scheduler.hisparse_coordinator
+    # The double plays the scheduler and the parts, mode and hub it holds.
+    parts = mode = hub = property(lambda self: self)
+
+    @property
+    def kv(self):
+        return SimpleNamespace(
+            tree_cache=self.tree_cache, token_to_kv_pool_allocator=None
+        )
+
+    def init_mode_stages(self):
+        self.stages = init_mode_stages(self, self.loop_schedules())
 
     def __init__(
         self,
@@ -296,11 +310,11 @@ class _Scheduler:
             ]
         )
         self.metrics_sink.current_scheduler_metrics_enabled = False
+        self.metrics_sink.enable_fpm = False
         self.kv_events_publisher = Mock(spec=["publish_kv_events"])
         self.publish_load_snapshot = Mock()
         self.load_publisher = Mock(spec=["publish_load_stat"])
         self.load_inquirer = SimpleNamespace(get_loads=Mock())
-        self.enable_fpm = False
         self.step_counters = Mock()
         self.request_retirer = RequestRetirer(
             kv=SimpleNamespace(tree_cache=self.tree_cache),
@@ -580,11 +594,15 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
                     scheduler = SimpleNamespace(
                         _deferred_input_requests=[],
-                        request_registry=SimpleNamespace(
-                            poll_timeout_aborts=Mock(return_value=[])
+                        hub=SimpleNamespace(
+                            request_registry=SimpleNamespace(
+                                poll_timeout_aborts=Mock(return_value=[])
+                            )
                         ),
-                        request_receiver=SimpleNamespace(recv_requests=receiver),
-                        metrics_sink=Mock(),
+                        parts=SimpleNamespace(
+                            request_receiver=SimpleNamespace(recv_requests=receiver),
+                            metrics_sink=Mock(),
+                        ),
                         process_input_requests=Mock(),
                     )
                     with published_topology():
@@ -601,7 +619,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     self.assertEqual(receiver.call_count, 5)
                     # A held pause must not accumulate repeated timeout aborts.
                     self.assertEqual(
-                        scheduler.request_registry.poll_timeout_aborts.call_count,
+                        scheduler.hub.request_registry.poll_timeout_aborts.call_count,
                         2 if stop_at_pause else 5,
                     )
                     self.assertFalse(scheduler._deferred_input_requests)
@@ -1377,8 +1395,8 @@ class TestPrefillResultPolling(CustomTestCase):
                     published_topology(pp_size=pp_size),
                     patch.object(scheduler, loop, create=True) as run_loop,
                     patch.object(
-                        scheduler,
-                        "_is_continuous_input_polling_enabled",
+                        scheduler_assembly,
+                        "continuous_input_polling_enabled",
                         return_value=True,
                     ) as check_support,
                 ):

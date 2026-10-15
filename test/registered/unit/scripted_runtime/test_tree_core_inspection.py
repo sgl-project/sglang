@@ -63,7 +63,11 @@ def _insert(core, token_count):
 def test_scripted_inspection_tracks_hits_locks_and_stale_handles(backend):
     cache = _cache(backend)
     assert cache._tree_core_backend == backend
-    context = SimpleNamespace(scheduler=SimpleNamespace(tree_cache=cache))
+    context = SimpleNamespace(
+        scheduler=SimpleNamespace(
+            parts=SimpleNamespace(kv=SimpleNamespace(tree_cache=cache))
+        )
+    )
     prefix = _insert(cache.tree_core, 44)
     decode = _insert(cache.tree_core, 45)
 

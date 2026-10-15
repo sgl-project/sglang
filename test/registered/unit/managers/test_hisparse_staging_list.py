@@ -11,8 +11,10 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_assembly import init_mode_stages  # noqa: E402
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.scheduler_request_lists import request_registry_of
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -34,32 +36,34 @@ class TestHiSparseStagingList(unittest.TestCase):
         """A launched last chunk stages instead of decoding; a request its
         prefill commit finished leaves staging at that commit."""
         live, done = _Req("live", 0), _Req("done", 1)
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.mode_owners = ModeOwners()
-        scheduler.lists = CoreLists()
-        scheduler.lists.waiting_queue = [live, done]
-        scheduler.lists.decoding = []
-        scheduler.lists.chunked_req = None
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.mode_owners.disagg_prefill = None
-        scheduler.mode_owners.disagg_decode = None
-        scheduler.grammar_manager = SimpleNamespace(
+        scheduler = partial_scheduler()
+        scheduler.parts.mode_owners = ModeOwners()
+        scheduler.parts.lists = CoreLists()
+        scheduler.parts.lists.waiting_queue = [live, done]
+        scheduler.parts.lists.decoding = []
+        scheduler.parts.lists.chunked_req = None
+        scheduler.mode.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.parts.mode_owners.disagg_prefill = None
+        scheduler.parts.mode_owners.disagg_decode = None
+        scheduler.parts.grammar_manager = SimpleNamespace(
             grammar_queue=[], abort_requests=None
         )
-        scheduler.mode_owners.dllm = None
-        scheduler.mode_owners.hisparse_coordinator = HiSparseCoordinator.__new__(
+        scheduler.parts.mode_owners.dllm = None
+        scheduler.parts.mode_owners.hisparse_coordinator = HiSparseCoordinator.__new__(
             HiSparseCoordinator
         )
         scheduler.hisparse_coordinator.staging = []
-        scheduler.init_mode_stages()
+        scheduler.mode.stages = init_mode_stages(
+            scheduler.parts, scheduler.loop_schedules()
+        )
         step = SimpleNamespace(
             prefill_reqs=lambda: [live, done],
             chunked_req=None,
         )
 
         Scheduler.join_launched_step(scheduler, step, ScheduleSlot())
-        self.assertEqual(scheduler.lists.waiting_queue, [])
-        self.assertEqual(scheduler.lists.decoding, [])
+        self.assertEqual(scheduler.parts.lists.waiting_queue, [])
+        self.assertEqual(scheduler.parts.lists.decoding, [])
         self.assertEqual(scheduler.hisparse_coordinator.staging, [live, done])
 
         done.finished_reason = object()

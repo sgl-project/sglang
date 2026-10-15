@@ -19,7 +19,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
-from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_assembly import init_mode_stages  # noqa: E402
 from sglang.srt.managers.scheduler_components.bundles import Streams  # noqa: E402
 from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
     EngineFlags,
@@ -40,6 +40,7 @@ from sglang.srt.managers.scheduler_components.step_planner import (  # noqa: E40
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
+from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -65,30 +66,35 @@ class TestPPRingCommit(CustomTestCase):
         the relayed result it received, and what it committed."""
         enter_scope(self, published_topology(role="scheduler", pp_size=2))
         enter_scope(
-            self, get_parallel().override(pp_size=2, pp_async_batch_depth=depth)
+            self,
+            get_parallel().override(
+                pp_size=2,
+                pp_async_batch_depth=depth,
+                pp_group=SimpleNamespace(is_last_rank=True),
+                world_group=None,
+                attn_tp_group=None,
+            ),
         )
-        s = object.__new__(Scheduler)
-        s.mode_owners = ModeOwners()
-        s.counters = LaunchCounters()
-        s.flags = EngineFlags()
-        s.lists = CoreLists()
-        s.spec_algorithm = SimpleNamespace(is_none=lambda: True)
-        s.pp_group = SimpleNamespace(is_last_rank=True)
-        s.device_module = SimpleNamespace(
+        s = partial_scheduler()
+        s.parts.mode_owners = ModeOwners()
+        s.parts.counters = LaunchCounters()
+        s.parts.flags = EngineFlags()
+        s.parts.lists = CoreLists()
+        s.parts.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        s.parts.device_module = SimpleNamespace(
             Event=Mock, current_stream=Mock(), stream=lambda stream: nullcontext()
         )
-        s.world_group = s.attn_tp_group = None
-        s.streams = Streams(
+        s.parts.streams = Streams(
             device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
         )
-        s.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
-        s.future_map = s.tp_worker = None
-        s.pending = PendingSteps()
-        s.recv_skipper = None
-        s.pp_spec_forward = None
+        s.parts.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
+        s.parts.future_map = s.parts.workers.tp_worker = None
+        s.parts.pending = PendingSteps()
+        s.parts.recv_skipper = None
+        s.parts.pp_spec_forward = None
         s._sched_idled = False
         s.ingest_requests = Mock(return_value=[])
-        s.step_launcher = SimpleNamespace(
+        s.mode.step_launcher = SimpleNamespace(
             run_batch=lambda step, pp_proxy_tensors: SimpleNamespace(launched=step.name)
         )
         s.join_launched_step = Mock()
@@ -115,7 +121,7 @@ class TestPPRingCommit(CustomTestCase):
             trace[-1]["committed"] = record.step.name
             assert record.result is trace[-1]["relayed"]
 
-        s.stages = ModeStages(schedule=schedule_slot)
+        s.mode.stages = ModeStages(schedule=schedule_slot)
         s.commit_step = commit_step
         s.init_pp_ring()
         ring = s.pp_ring
@@ -155,7 +161,7 @@ class TestPPRingCommit(CustomTestCase):
                     committed_at,
                     {name: i + loop_size - 1 for name, i in launched_at.items()},
                 )
-                self.assertEqual(len(s.pending), 0)
+                self.assertEqual(len(s.parts.pending), 0)
                 s.on_idle.assert_called()
 
 
@@ -170,21 +176,21 @@ class TestPPSlotTag(CustomTestCase):
         """A request joins decoding tagged with the slot that launched its last
         prefill chunk; another slot's step never decodes it while that slot's
         step may still be in flight."""
-        s = object.__new__(Scheduler)
-        s.mode_owners = ModeOwners()
-        s.counters = LaunchCounters()
-        s.flags = EngineFlags()
-        s.lists = CoreLists()
-        s.disaggregation_mode = DisaggregationMode.NULL
-        s.mode_owners.disagg_prefill = None
-        s.mode_owners.disagg_decode = None
-        s.mode_owners.dllm = None
-        s.mode_owners.hisparse_coordinator = None
-        s.lists.decoding = []
-        s.lists.waiting_queue = []
-        s.pending = PendingSteps()
-        s.flags.enable_skip_finishing_decode = False
-        s.init_mode_stages()
+        s = partial_scheduler()
+        s.parts.mode_owners = ModeOwners()
+        s.parts.counters = LaunchCounters()
+        s.parts.flags = EngineFlags()
+        s.parts.lists = CoreLists()
+        s.mode.disaggregation_mode = DisaggregationMode.NULL
+        s.parts.mode_owners.disagg_prefill = None
+        s.parts.mode_owners.disagg_decode = None
+        s.parts.mode_owners.dllm = None
+        s.parts.mode_owners.hisparse_coordinator = None
+        s.parts.lists.decoding = []
+        s.parts.lists.waiting_queue = []
+        s.parts.pending = PendingSteps()
+        s.parts.flags.enable_skip_finishing_decode = False
+        s.mode.stages = init_mode_stages(s.parts, s.loop_schedules())
         reqs = [_Req() for _ in range(3)]
         slots = [ScheduleSlot(index=0), ScheduleSlot(index=1)]
         for slot, launched in ((slots[0], reqs[:2]), (slots[1], reqs[2:])):
@@ -196,7 +202,11 @@ class TestPPSlotTag(CustomTestCase):
             )
 
         planner = StepPlanner.__new__(StepPlanner)
-        planner.core_lists, planner.pending, planner.flags = s.lists, s.pending, s.flags
+        planner.core_lists, planner.pending, planner.flags = (
+            s.parts.lists,
+            s.parts.pending,
+            s.parts.flags,
+        )
         self.assertEqual(planner._select_decode_reqs(slots[0]), reqs[:2])
         self.assertEqual(planner._select_decode_reqs(slots[1]), reqs[2:])
         # Outside PP every decoding request runs.
@@ -206,17 +216,17 @@ class TestPPSlotTag(CustomTestCase):
         """PD decode admission fills the scheduled slot up to the per-slot cap,
         counting only that slot's decoding requests."""
         enter_scope(self, published_topology(role="scheduler", pp_size=2))
-        s = object.__new__(Scheduler)
-        s.mode_owners = ModeOwners()
-        s.counters = LaunchCounters()
-        s.flags = EngineFlags()
-        s.lists = CoreLists()
-        s.lists.decoding = []
+        s = partial_scheduler()
+        s.parts.mode_owners = ModeOwners()
+        s.parts.counters = LaunchCounters()
+        s.parts.flags = EngineFlags()
+        s.parts.lists = CoreLists()
+        s.parts.lists.decoding = []
         for slot, num_reqs in ((0, 2), (1, 1)):
             for _ in range(num_reqs):
                 req = _Req()
                 req.ring_slot = slot
-                s.lists.decoding.append(req)
+                s.parts.lists.decoding.append(req)
         ready = [Mock() for _ in range(3)]
         owner = decode_owner_shell(
             ready=list(ready),
@@ -224,7 +234,7 @@ class TestPPSlotTag(CustomTestCase):
             req_to_token_pool=SimpleNamespace(size=16),
             max_running_requests=3,
             tree_cache=Mock(),
-            core_lists=s.lists,
+            core_lists=s.parts.lists,
         )
 
         self.assertEqual(owner.pop_reqs_to_admit(ScheduleSlot(index=1)), ready[:2])

@@ -14,9 +14,9 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     DetachHiCacheStorageReqInput,
 )
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -30,11 +30,11 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         self.server_args = override.install()
         self.addCleanup(override.restore)
 
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.server_args = self.server_args
+        scheduler = partial_scheduler()
+        scheduler.parts.server_args = self.server_args
         scheduler.enable_hierarchical_cache = True
-        scheduler.request_registry = SimpleNamespace(is_fully_idle=lambda: True)
-        scheduler.tree_cache = SimpleNamespace(
+        scheduler.hub.request_registry = SimpleNamespace(is_fully_idle=lambda: True)
+        scheduler.parts.kv.tree_cache = SimpleNamespace(
             attach_storage_backend=lambda **kwargs: (True, "attached"),
             detach_storage_backend=lambda: (True, "detached"),
         )

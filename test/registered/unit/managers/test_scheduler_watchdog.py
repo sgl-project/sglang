@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_assembly import assemble_scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components import (  # noqa: E402
     invariant_checker as checker_mod,
 )
@@ -51,12 +51,16 @@ class TestSchedulerWatchdog(CustomTestCase):
         )
 
     def test_checker_is_attached_before_initialization_ends(self):
-        source = textwrap.dedent(inspect.getsource(Scheduler.__init__))
+        source = textwrap.dedent(inspect.getsource(assemble_scheduler))
         statements = ast.parse(source).body[0].body
         lines = [ast.unparse(statement) for statement in statements]
-        checker = lines.index("self.init_invariant_checker()")
-        attach = lines.index("self.init_watchdog_diagnostics()")
-        done = lines.index("self.flags.is_initializing = False")
+        checker = next(
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("invariant_checker = SchedulerInvariantChecker(")
+        )
+        attach = lines.index("watchdog.invariant_checker = invariant_checker")
+        done = lines.index("flags.is_initializing = False")
         self.assertLess(checker, attach)
         self.assertLess(attach, done)
 

@@ -16,6 +16,7 @@ from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
 )
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -35,31 +36,40 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         rc.reset_context()
 
     def _scheduler(self, mode, *, enable=True, idle=True):
-        s = Scheduler.__new__(Scheduler)
-        s.mode_owners = ModeOwners()
-        s.disaggregation_mode = mode
+        s = partial_scheduler()
+        s.parts.mode_owners = ModeOwners()
+        s.mode.disaggregation_mode = mode
         sa = ServerArgs(
             model_path="dummy",
             disaggregation_mode=mode.value,
             enable_pd_role_switch=enable,
         )
         rc.get_context().set_server_args(sa)
-        s.server_args = sa
-        s.request_registry = MagicMock(**{"is_fully_idle.return_value": idle})
+        s.parts.server_args = sa
+        s.hub.request_registry = MagicMock(**{"is_fully_idle.return_value": idle})
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
-        s.init_disaggregation = MagicMock()
-        s.maybe_init_disagg_prefill = MagicMock()
-        s.maybe_init_disagg_decode = MagicMock()
-        s.init_mode_stages = MagicMock()
-        s.init_step_launcher = MagicMock()
-        s.mode_owners.disagg_prefill = None
-        s.mode_owners.disagg_decode = None
+        # The rebuild steps, patched where the role switch calls them; each
+        # mock is kept on the scheduler double for the assertions.
+        for step in (
+            "init_disaggregation",
+            "maybe_init_disagg_prefill",
+            "maybe_init_disagg_decode",
+            "maybe_init_disagg_move_gate",
+            "init_mode_stages",
+            "init_step_launcher",
+        ):
+            patcher = patch.object(role_switch, step)
+            setattr(s, step, patcher.start())
+            self.addCleanup(patcher.stop)
+        s.init_disaggregation.return_value = (mode, None)
+        s.parts.mode_owners.disagg_prefill = None
+        s.parts.mode_owners.disagg_decode = None
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False
         s._pd_role_switch_unhealthy = False
-        s.tp_worker = MagicMock()
+        s.parts.workers.tp_worker = MagicMock()
         return s
 
     def test_rejected_when_flag_disabled(self):
@@ -114,7 +124,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
 
     def test_rejected_when_decode_graph_headroom_is_missing(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
-        s.tp_worker.get_decode_cuda_graph_bs.return_value = []
+        s.parts.workers.tp_worker.get_decode_cuda_graph_bs.return_value = []
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
         )
@@ -126,8 +136,8 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
 
     def test_rejected_when_decode_graph_headroom_is_insufficient(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
-        s.device = "cuda"
-        s.tp_worker.get_decode_cuda_graph_bs.return_value = []
+        s.parts.streams.device = "cuda"
+        s.parts.workers.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=0.5):
             out = Scheduler.handle_pd_role_switch(
                 s,
@@ -145,8 +155,8 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
 
     def test_decode_graph_headroom_allows_flip(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
-        s.device = "cuda"
-        s.tp_worker.get_decode_cuda_graph_bs.return_value = []
+        s.parts.streams.device = "cuda"
+        s.parts.workers.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=1.0):
             out = Scheduler.handle_pd_role_switch(
                 s,
@@ -172,7 +182,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.teardown_disaggregation.assert_called_once_with(s)
         self.assertEqual(rc.get_disagg().disaggregation_mode, "decode")
         # The pristine startup record is never mutated.
-        self.assertEqual(s.server_args.disaggregation_mode, "prefill")
+        self.assertEqual(s.parts.server_args.disaggregation_mode, "prefill")
         s.init_disaggregation.assert_called_once()
         s.maybe_init_disagg_decode.assert_called_once()
         # The new owner's stages and launcher replace the old one's.
@@ -180,7 +190,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.init_step_launcher.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
-        s.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
+        s.parts.workers.tp_worker.ensure_decode_cuda_graphs.assert_called_once()
         # The in-progress guard is released after a successful flip.
         self.assertFalse(s._pd_role_switch_in_progress)
 
@@ -193,7 +203,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertEqual(out.new_role, "prefill")
         s.init_disaggregation.assert_called_once()
         # Flipping to prefill must not capture decode graphs.
-        s.tp_worker.ensure_decode_cuda_graphs.assert_not_called()
+        s.parts.workers.tp_worker.ensure_decode_cuda_graphs.assert_not_called()
         self.assertTrue(s._event_loop_should_restart)
 
     def test_rejected_when_switch_in_progress(self):
@@ -221,7 +231,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_rebuild_failure_marks_unhealthy_and_notifies(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         # Rebuild of the new role fails after the old role was torn down.
-        s.init_disaggregation = MagicMock(side_effect=RuntimeError("boom"))
+        s.init_disaggregation.side_effect = RuntimeError("boom")
 
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="decode")
@@ -573,12 +583,12 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
 
 def _radix_scheduler(disable_radix_cache):
     s = MagicMock()
-    s.disable_radix_cache = disable_radix_cache
+    s.parts.disable_radix_cache = disable_radix_cache
     tree = MagicMock()
     del tree.clear_storage_backend  # plain RadixCache has none
-    s.tree_cache = tree
-    s.req_to_token_pool = MagicMock()
-    s.token_to_kv_pool_allocator = MagicMock()
+    s.parts.kv.tree_cache = tree
+    s.parts.kv.req_to_token_pool = MagicMock()
+    s.parts.kv.token_to_kv_pool_allocator = MagicMock()
     return s
 
 
@@ -590,24 +600,24 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
     def test_noop_when_radix_disabled(self):
         s = _radix_scheduler(disable_radix_cache=True)
         _release_prefix_cache_for_role_switch(s)
-        s.tree_cache.reset.assert_not_called()
-        s.token_to_kv_pool_allocator.clear.assert_not_called()
+        s.parts.kv.tree_cache.reset.assert_not_called()
+        s.parts.kv.token_to_kv_pool_allocator.clear.assert_not_called()
 
     def test_releases_when_radix_enabled(self):
         s = _radix_scheduler(disable_radix_cache=False)
         _release_prefix_cache_for_role_switch(s)
-        s.tree_cache.reset.assert_called_once_with()
-        s.req_to_token_pool.clear.assert_called_once_with()
-        s.token_to_kv_pool_allocator.clear.assert_called_once_with()
+        s.parts.kv.tree_cache.reset.assert_called_once_with()
+        s.parts.kv.req_to_token_pool.clear.assert_called_once_with()
+        s.parts.kv.token_to_kv_pool_allocator.clear.assert_called_once_with()
 
     def test_teardown_invokes_release(self):
         s = _radix_scheduler(disable_radix_cache=False)
         kv_manager = MagicMock()
-        s.mode_owners.disagg_prefill = SimpleNamespace(kv_manager=kv_manager)
+        s.parts.mode_owners.disagg_prefill = SimpleNamespace(kv_manager=kv_manager)
         teardown_disaggregation(s)
         kv_manager.teardown.assert_called_once_with()
-        self.assertIsNone(s.mode_owners.disagg_prefill)
-        s.tree_cache.reset.assert_called_once_with()
+        self.assertIsNone(s.parts.mode_owners.disagg_prefill)
+        s.parts.kv.tree_cache.reset.assert_called_once_with()
 
 
 if __name__ == "__main__":

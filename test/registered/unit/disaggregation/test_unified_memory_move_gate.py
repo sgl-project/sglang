@@ -22,7 +22,9 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_assembly import (  # noqa: E402
+    maybe_init_disagg_move_gate,
+)
 from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
     ModeOwners,
 )
@@ -84,21 +86,24 @@ def _installed_gate(test: CustomTestCase, scheduler: _FakeScheduler):
     """The gate a scheduler of this mode installs on its allocator."""
     enter_scope(test, published_topology())
     get_context().override("test.unified_memory", enable_unified_memory=True)
-    s = Scheduler.__new__(Scheduler)
-    s.mode_owners = ModeOwners()
-    s.mode_owners.disagg_prefill = (
+    owners = ModeOwners()
+    owners.disagg_prefill = (
         scheduler.disagg_prefill
         if scheduler.disaggregation_mode == DisaggregationMode.PREFILL
         else None
     )
-    s.mode_owners.disagg_decode = (
+    owners.disagg_decode = (
         scheduler.disagg_decode
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE
         else None
     )
-    s.token_to_kv_pool_allocator = Mock()
-    s.maybe_init_disagg_move_gate()
-    calls = s.token_to_kv_pool_allocator.set_disagg_move_gate.call_args_list
+    allocator = Mock()
+    maybe_init_disagg_move_gate(
+        SimpleNamespace(
+            mode_owners=owners, kv=SimpleNamespace(token_to_kv_pool_allocator=allocator)
+        )
+    )
+    calls = allocator.set_disagg_move_gate.call_args_list
     return calls[0].args[0] if calls else None
 
 

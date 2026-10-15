@@ -81,6 +81,24 @@ class ModeStages:
 
 
 @dataclass(frozen=True, slots=True)
+class LoopSchedules:
+    """The scheduler's own schedule stages, filled once by the scheduler; each
+    mode's stages take theirs from here."""
+
+    # The normal schedule; dLLM's too, which admits through admit_dllm.
+    schedule: Callable[..., Optional[ScheduleBatch]]
+    admit_dllm: Callable[[ScheduleSlot], Optional[ScheduleBatch]]
+    # PD prefill: the flat schedule, and the ring's intake, schedule and
+    # release around each slot.
+    schedule_disagg_prefill: Callable[..., Optional[ScheduleBatch]]
+    ring_intake_disagg_prefill: Callable[[], None]
+    ring_schedule_disagg_prefill: Callable[..., Optional[ScheduleBatch]]
+    ring_release_disagg_prefill: Callable[..., None]
+    # PD decode, flat and ring.
+    schedule_disagg_decode: Callable[..., Optional[ScheduleBatch]]
+
+
+@dataclass(frozen=True, slots=True)
 class DriverOps:
     """The core stages the PP ring runs for each slot, filled once by the
     scheduler; the ring holds them instead of reaching into the scheduler."""

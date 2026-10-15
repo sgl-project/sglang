@@ -19,7 +19,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
 )
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.pending_steps import (
@@ -35,6 +34,7 @@ from sglang.srt.session.session_controller import Session
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import prefill_owner_shell
 from sglang.test.scheduler_request_intake import make_request_intake
+from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -191,17 +191,17 @@ class TestBeamGroupLeavesWithItsLeader(CustomTestCase):
         self.assertEqual(beam._num_live_groups, 0)
 
     def test_mid_chunk_abort(self):
-        sched = Scheduler.__new__(Scheduler)
-        sched.mode_owners = ModeOwners()
-        sched.lists = CoreLists()
-        beam = _beam_coordinator(sched.lists)
+        sched = partial_scheduler()
+        sched.parts.mode_owners = ModeOwners()
+        sched.parts.lists = CoreLists()
+        beam = _beam_coordinator(sched.parts.lists)
         leader = _beam_leader(beam, "beam")
         leader.kv.req_pool_idx = 1
-        sched.lists.chunked_req = leader
-        sched.lists._pending_chunked_abort_req = leader
-        sched.request_retirer = _retirer(beam_coordinator=beam)
-        sched.tree_cache = sched.request_retirer.tree_cache
-        sched.ipc_channels = Mock()
+        sched.parts.lists.chunked_req = leader
+        sched.parts.lists._pending_chunked_abort_req = leader
+        sched.parts.request_retirer = _retirer(beam_coordinator=beam)
+        sched.parts.kv.tree_cache = sched.parts.request_retirer.tree_cache
+        sched.parts.ipc_channels = Mock()
 
         with (
             patch(f"{_RETIRER}.release_kv_cache") as release,
@@ -211,9 +211,9 @@ class TestBeamGroupLeavesWithItsLeader(CustomTestCase):
             sched.process_pending_chunked_abort()
 
         release.assert_called_once_with(
-            leader, sched.request_retirer.tree_cache, checkpoint=False
+            leader, sched.parts.request_retirer.tree_cache, checkpoint=False
         )
-        self.assertIsNone(sched.lists.chunked_req)
+        self.assertIsNone(sched.parts.lists.chunked_req)
         self.assertEqual(beam._num_live_groups, 0)
 
 

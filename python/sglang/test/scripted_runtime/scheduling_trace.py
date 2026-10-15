@@ -71,7 +71,7 @@ class SchedulingTraceWriter:
             "format": TRACE_FORMAT,
             "extra_engine_kwargs": json.loads(extra_kwargs) if extra_kwargs else {},
             "server_args": {
-                name: getattr(scheduler.server_args, name)
+                name: getattr(scheduler.parts.server_args, name)
                 for name in HEADER_SERVER_ARGS
             },
             "envs": {name: getattr(envs, name).get() for name in HEADER_ENVS},
@@ -87,22 +87,22 @@ class SchedulingTraceWriter:
         Not taken in record_schedule: mid-iteration, the requests a step
         admits are in the waiting queue until its launch, a state no reader sees.
         """
-        load = scheduler.load_inquirer.get_loads()
+        load = scheduler.hub.load_inquirer.get_loads()
         self._readers = {
-            "idle": scheduler.request_registry.is_fully_idle(),
-            "idle_ignore_waiting": scheduler.request_registry.is_fully_idle(
+            "idle": scheduler.hub.request_registry.is_fully_idle(),
+            "idle_ignore_waiting": scheduler.hub.request_registry.is_fully_idle(
                 ignore_waiting=True
             ),
             # A set, so sorted; each req was labeled by an earlier schedule record.
             "inflight": sorted(
-                self._labels(scheduler.request_registry.collect_inflight_reqs())
+                self._labels(scheduler.hub.request_registry.collect_inflight_reqs())
             ),
             "load": {
                 "running": load.num_running_reqs,
                 "waiting": load.num_waiting_reqs,
             },
         }
-        if scheduler.flags._engine_paused:
+        if scheduler.parts.flags._engine_paused:
             self._write({"kind": "paused", "step": self._step, **self._readers})
 
     def record_schedule(
@@ -114,8 +114,8 @@ class SchedulingTraceWriter:
         # queue, and its chunked request into the chunked holder.
         prefilled = batch.prefill_reqs() if batch is not None else []
         admitted = set(prefilled)
-        waiting = [r for r in scheduler.lists.waiting_queue if r not in admitted]
-        chunked = batch.chunked_req if prefilled else scheduler.lists.chunked_req
+        waiting = [r for r in scheduler.parts.lists.waiting_queue if r not in admitted]
+        chunked = batch.chunked_req if prefilled else scheduler.parts.lists.chunked_req
         record: Dict[str, Any] = {
             "kind": "schedule",
             "step": self._step,
@@ -127,21 +127,21 @@ class SchedulingTraceWriter:
             record["prefix_lens"] = list(batch.prefix_lens)
         record.update(
             chunked=self._label(chunked.rid) if chunked is not None else None,
-            running=self._labels(scheduler.lists.decoding),
+            running=self._labels(scheduler.parts.lists.decoding),
             waiting=self._labels(waiting),
             retracted=self._labels(
                 self._newly_retracted(
                     [
                         *batch_reqs,
-                        *scheduler.lists.decoding,
+                        *scheduler.parts.lists.decoding,
                         *waiting,
                         *([chunked] if chunked is not None else []),
                     ]
                 )
             ),
-            kv_available=scheduler.token_to_kv_pool_allocator.available_size(),
-            kv_evictable=scheduler.tree_cache.evictable_size(),
-            new_token_ratio=scheduler.new_token_ratio_tracker.current,
+            kv_available=scheduler.parts.kv.token_to_kv_pool_allocator.available_size(),
+            kv_evictable=scheduler.parts.kv.tree_cache.evictable_size(),
+            new_token_ratio=scheduler.parts.new_token_ratio_tracker.current,
             **self._readers,
         )
         self._write(record)

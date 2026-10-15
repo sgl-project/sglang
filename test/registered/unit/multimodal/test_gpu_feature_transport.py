@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -727,14 +728,14 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
     def _prepare_scheduler(scheduler):
         from sglang.test.scheduler_request_intake import make_request_intake
 
-        scheduler.request_intake = make_request_intake(
+        scheduler.hub.request_intake = make_request_intake(
             model_config=SimpleNamespace(requires_mm_token_modalities=False)
         )
         scheduler.scheduler_stage_metrics = None
-        scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
+        scheduler.parts.session_controller = SimpleNamespace(maybe_reap=MagicMock())
         scheduler._request_dispatcher = MagicMock(return_value=None)
-        scheduler.flush_wrapper = SimpleNamespace(check_pending=MagicMock())
-        scheduler.external_corpus_manager = None
+        scheduler.hub.flush_wrapper = SimpleNamespace(check_pending=MagicMock())
+        scheduler.parts.external_corpus_manager = None
 
     @staticmethod
     def _materialize_with_rank_errors(local_exception=None, remote_error=None):
@@ -795,7 +796,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             request_intake as intake_module,
         )
 
-        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler = partial_scheduler()
         # The transport gate reads the published bags, so the case publishes
         # the configuration under test.
         self._publish(
@@ -815,7 +816,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
                 return_value=materialized,
             ) as build_inputs,
             patch.object(
-                scheduler.request_intake, "_process_and_broadcast_mm_inputs"
+                scheduler.hub.request_intake, "_process_and_broadcast_mm_inputs"
             ) as cpu_broadcast,
             patch.object(
                 scheduler_module, "is_health_check_generate_req", return_value=False
@@ -847,7 +848,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             def __iter__(self):
                 return iter(self.batch)
 
-        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler = partial_scheduler()
         self._publish(mm_feature_transport="cuda_vmm")
         self._prepare_scheduler(scheduler)
         raw_inputs = [object(), object()]
@@ -1061,12 +1062,14 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             def __iter__(self):
                 return iter(self.requests)
 
-        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler = partial_scheduler()
         self._publish(mm_feature_transport="cuda_vmm")
         self._prepare_scheduler(scheduler)
-        scheduler.request_registry = MagicMock(**{"is_fully_idle.return_value": True})
-        scheduler.output_streamer = MagicMock()
-        intake = scheduler.request_intake
+        scheduler.hub.request_registry = MagicMock(
+            **{"is_fully_idle.return_value": True}
+        )
+        scheduler.parts.output_streamer = MagicMock()
+        intake = scheduler.hub.request_intake
         intake.handle_generate_request = MagicMock()
         intake.handle_embedding_request = MagicMock()
         intake.materialize_cuda_vmm_inputs = MagicMock(

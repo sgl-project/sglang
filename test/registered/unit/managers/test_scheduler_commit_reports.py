@@ -17,34 +17,35 @@ from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
     ModeOwners,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _scheduler(order: Mock, *, mode: str) -> Scheduler:
-    s = Scheduler.__new__(Scheduler)
-    s.mode_owners = ModeOwners()
-    s.lists = CoreLists()
+    s = partial_scheduler()
+    s.parts.mode_owners = ModeOwners()
+    s.parts.lists = CoreLists()
     s.scheduler_stage_metrics = None
     s.publish_load_snapshot = Mock(return_value=None)
-    s.load_publisher = Mock()
-    s.load_inquirer = Mock()
-    s.mode_owners.hisparse_coordinator = None
-    s.mode_owners.dllm = order.dllm if mode == "dllm" else None
-    s.mode_owners.disagg_prefill = (
+    s.parts.load_publisher = Mock()
+    s.hub.load_inquirer = Mock()
+    s.parts.mode_owners.hisparse_coordinator = None
+    s.parts.mode_owners.dllm = order.dllm if mode == "dllm" else None
+    s.parts.mode_owners.disagg_prefill = (
         order.disagg_prefill if mode == "pd_prefill" else None
     )
     order.disagg_prefill.commit_extend.return_value = ["waiting"]
-    s.batch_result_processor = order.processor
-    s.batch_result_processor.process_batch_result_decode.return_value = 7
-    s.metrics_reporter = order.reporter
-    s.metrics_sink = Mock()
+    s.parts.batch_result_processor = order.processor
+    s.parts.batch_result_processor.process_batch_result_decode.return_value = 7
+    s.hub.metrics_reporter = order.reporter
+    s.parts.metrics_sink = Mock()
     s.leave_finished_reqs = order.leave_finished_reqs
-    s.tree_cache = Mock()
-    s.enable_fpm = False
-    s.request_retirer = Mock()
-    s.output_streamer = Mock()
-    s.scripted_scheduler_hook = None
+    s.parts.kv.tree_cache = Mock()
+    s.parts.metrics_sink.enable_fpm = False
+    s.parts.request_retirer = Mock()
+    s.parts.output_streamer = Mock()
+    s.parts.scripted_scheduler_hook = None
     return s
 
 
@@ -109,7 +110,7 @@ class TestCommitReports(CustomTestCase):
                     dp_cooperation_info="dp",
                 )
                 if mode == "pd_prefill":
-                    self.assertEqual(s.lists.waiting_queue, ["waiting"])
+                    self.assertEqual(s.parts.lists.waiting_queue, ["waiting"])
 
     def test_a_step_without_prefill_stats_reports_nothing(self):
         _, _, order, names = self._commit(

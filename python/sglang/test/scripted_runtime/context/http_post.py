@@ -43,7 +43,7 @@ def _submit_post(
     path: str,
     json: Optional[Dict[str, Any]],
 ) -> None:
-    server_args = ctx.scheduler.server_args
+    server_args = ctx.scheduler.parts.server_args
     url = f"http://{server_args.host}:{server_args.port}{path}"
 
     async def _post() -> None:
