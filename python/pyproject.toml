@@ -13,7 +13,7 @@ name = "sglang"
 dynamic = ["version"]
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -86,7 +86,6 @@ dependencies = [
   "timm==1.0.16",
   "tokenizers==0.23.2",
   "tokenspeed_mla==0.1.8",
-  "tomli ; python_version < '3.11'",
   "torch==2.14.1",
   "torch_memory_saver>=0.0.9.post1",
   "torchaudio==2.11.0",
