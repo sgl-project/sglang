@@ -1314,7 +1314,7 @@ class ModelRunner:
             get_offloader().post_init()
 
         self.maybe_precompile_model_kernels_after_loading()
-        mono.attach(self.model, self.model_config.hf_config)
+        mono.attach(model=self.model, hf_config=self.model_config.hf_config)
 
         # Register model for layerwise NVTX profiling if enabled
         if get_exec().comm.enable_layerwise_nvtx_marker:

@@ -1058,7 +1058,7 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
-        weights = mono.watch_weights(model, weights)
+        weights = mono.watch_weights(model=model, weights=weights)
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.

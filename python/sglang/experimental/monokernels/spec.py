@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""What a model declares to the monokernel plugin (RFC #43949), and the registry
-that finds it. A spec module imports without its model, so the config hook can
+"""What a model declares to the monokernel framework, and the registry that
+finds it. A spec module imports without its model, so the config hook can
 refuse a setup before any process starts.
 
 Specs live in vendor packages (e.g. sgl-amd-mono), which SGLang loads as general
@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import enum
 import importlib
-from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
+
+import msgspec
 
 # The plugin API a spec is written against: MonoSpec, BuildContext, ShapeKey, and
 # the built model's ``serves(key)`` and ``forward(plan, *inputs)``
@@ -45,8 +46,7 @@ class Feature(enum.Enum):
     PARTITIONED_GPU = "partitioned GPUs"
 
 
-@dataclass(frozen=True)
-class DeviceLimits:
+class DeviceLimits(msgspec.Struct, frozen=True):
     """What a spec's kernels support on one ISA (e.g. ``gfx950``)."""
 
     widths: tuple[int, ...]  # step rows, ascending
@@ -54,8 +54,7 @@ class DeviceLimits:
     resident_blocks: int  # the launch grid: one workgroup a CU
 
 
-@dataclass(frozen=True)
-class Requirements:
+class Requirements(msgspec.Struct, frozen=True):
     """Configuration a spec needs; an empty set accepts any value."""
 
     dtypes: frozenset[str] = frozenset()
@@ -70,14 +69,13 @@ class NumericsKind(enum.Enum):
     TOLERANCE = "tolerance"
 
 
-@dataclass(frozen=True)
-class Numerics:
+class Numerics(msgspec.Struct, frozen=True):
     """Against the normal path on the same GPU. TOLERANCE bounds are per launch
     output: ``<launch>.<output>.<metric>``, with a metric in ``max_abs`` (0 is
     bit-exact), ``rel`` or ``cosine``; the kernel tests read them from here."""
 
     kind: NumericsKind
-    bounds: Mapping[str, float] = field(default_factory=dict)
+    bounds: Mapping[str, float] = {}
 
     def __post_init__(self):
         metrics = ("max_abs", "rel", "cosine")
@@ -95,26 +93,26 @@ class Numerics:
         return self.bounds[name]
 
 
-@dataclass(frozen=True)
-class ShapeKey:
-    """The graph key a plan is made from; every rank holds it alike."""
+class ShapeKey(msgspec.Struct, frozen=True):
+    """The graph key a step is routed by; every rank holds it alike."""
 
     forward_mode: str  # "decode" or "target_verify"
     batch_size: int  # requests, padded to the graph's batch size
     tokens_per_request: int
-    rows: int  # batch_size * tokens_per_request
+
+    @property
+    def rows(self) -> int:
+        return self.batch_size * self.tokens_per_request
 
 
-@dataclass(frozen=True)
-class BuildContext:
+class BuildContext(msgspec.Struct, frozen=True):
     isa: str
     widths: tuple[int, ...]  # the rows the capture plan routes
     deadline_s: float  # every wait's deadline, below --watchdog-timeout
     copies: dict  # (kind, ...) -> tensor: the load hook's copies; build adds its own
 
 
-@dataclass(frozen=True)
-class MonoSpec:
+class MonoSpec(msgspec.Struct, frozen=True):
     """One model's monokernels for one vendor. ``build(model, hf_config, ctx)``
     returns the built model: ``serves(key)`` says which graph keys its forward
     runs (it reads only the key), and ``forward(plan, *inputs)`` runs a routed
@@ -152,13 +150,7 @@ def register(architecture: str, path: str) -> None:
         _REGISTRY[architecture] = _REGISTRY.get(architecture, ()) + (path,)
 
 
-def unregister(architecture: str, path: str) -> None:
-    _REGISTRY[architecture] = tuple(
-        p for p in _REGISTRY.get(architecture, ()) if p != path
-    )
-
-
-def find_spec(architectures, isa: Optional[str]):
+def find_spec(*, architectures, isa: Optional[str]):
     """(the spec for ``architectures`` on ``isa``, "") or (None, why there is none).
     A spec that fails to import or states another API version is a reason too."""
     why = []
@@ -170,10 +162,12 @@ def find_spec(architectures, isa: Optional[str]):
             except Exception as e:
                 why.append(f"{path} does not import: {type(e).__name__}: {e}")
                 continue
-            if getattr(spec, "api", None) != API_VERSION:
+            if not isinstance(spec, MonoSpec):
+                why.append(f"{path} is not a MonoSpec")
+            elif spec.api != API_VERSION:
                 why.append(
-                    f"{path} is written for monokernel API {getattr(spec, 'api', None)}"
-                    f", this SGLang has {API_VERSION}"
+                    f"{path} is written for monokernel API {spec.api}, this SGLang "
+                    f"has {API_VERSION}"
                 )
             elif isa in spec.devices:
                 return spec, ""

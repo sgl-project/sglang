@@ -57,10 +57,10 @@ its tuning data) in `gemm`, and attention index selection in `attention`.
 Keep a fused operation intact; an attention kernel that fuses RoPE with a
 projection may stay in `attention`. A model name inside a logical group is fine.
 
-Monokernels (RFC #43949), persistent kernels that run most of a decoder layer
-in one or two launches, are not a group here: SGLang holds their framework in
-`sglang.experimental.monokernels`, and vendor packages (AMD's: sgl-amd-mono)
-hold each model's spec, glue and kernels.
+Monokernels, persistent kernels that run most of a decoder layer in one or two
+launches, are not a group here: SGLang holds their framework in
+`sglang.experimental.monokernels`, and vendor plugins (AMD's: sgl-amd-mono) hold
+each model's spec, forward and kernels.
 
 Runtime integration that owns process groups, symmetric buffers, or model
 dispatch stays in `srt`; the K3 communication adapters live in

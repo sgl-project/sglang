@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The monokernel plugin's refusals (RFC #43949), before any process starts.
+"""The monokernel framework's refusals, before any process starts.
 
 ``handle_monokernel(server_args)``, the config hook, finds the spec, refuses an
 unsupported setup with every reason, and sets the decode capture sizes; it is a
@@ -90,16 +90,9 @@ def device_isa() -> Optional[str]:
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    arch = getattr(props, "gcnArchName", None)
-    return arch.split(":")[0] if arch else f"sm_{props.major}{props.minor}"
-
-
-def _on(cfg, *names) -> bool:
-    return any(bool(getattr(cfg, name, False)) for name in names)
-
-
-def _over(cfg, name, n) -> bool:
-    return (getattr(cfg, name, None) or 0) > n
+    if torch.version.hip:
+        return props.gcnArchName.split(":")[0]
+    return f"sm_{props.major}{props.minor}"
 
 
 def _ragged_verify(cfg) -> bool:
@@ -109,72 +102,61 @@ def _ragged_verify(cfg) -> bool:
     return cfg.speculative_algorithm is not None and mode != "static"
 
 
-# A probe that fails counts as in use, so an unreadable setting refuses. Partitioned
-# GPUs are refused at attach, and weight updates by SGLang's weight updater.
+# Partitioned GPUs are refused at attach, and weight updates by SGLang's weight updater.
 _PROBES = {
     Feature.PIPELINE_PARALLEL: lambda c: c.pp_size > 1,
     Feature.MULTI_NODE_TP: lambda c: c.nnodes > 1,
     Feature.DP_ATTENTION: lambda c: (
-        _on(c, "enable_dp_attention") or _over(c, "attn_dp_size", 1)
+        bool(c.enable_dp_attention) or (c.attn_dp_size or 1) > 1
     ),
     Feature.EXPERT_PARALLEL: lambda c: (c.ep_size or 1) > 1,
     Feature.EPLB: lambda c: bool(c.enable_eplb),
     Feature.CONTEXT_PARALLEL: lambda c: (
-        _over(c, "attn_cp_size", 1)
-        or _over(c, "dcp_size", 1)
-        or _on(c, "enable_prefill_cp")
+        (c.attn_cp_size or 1) > 1 or (c.dcp_size or 1) > 1 or bool(c.enable_prefill_cp)
     ),
     Feature.SPECULATIVE_DECODING: lambda c: c.speculative_algorithm is not None,
     Feature.RAGGED_VERIFY: _ragged_verify,
-    Feature.TWO_BATCH_OVERLAP: lambda c: _on(
-        c, "enable_two_batch_overlap", "enable_single_batch_overlap"
+    Feature.TWO_BATCH_OVERLAP: lambda c: bool(
+        c.enable_two_batch_overlap or c.enable_single_batch_overlap
     ),
-    Feature.LORA: lambda c: _on(c, "enable_lora", "lora_paths"),
+    Feature.LORA: lambda c: bool(c.enable_lora or c.lora_paths),
     Feature.PD_DISAGGREGATION: lambda c: (c.disaggregation_mode or "null") != "null",
     Feature.RETURN_ROUTED_EXPERTS: lambda c: bool(c.enable_return_routed_experts),
-    Feature.RETURN_INDEXER_TOPK: lambda c: _on(c, "enable_return_indexer_topk"),
+    Feature.RETURN_INDEXER_TOPK: lambda c: bool(c.enable_return_indexer_topk),
     Feature.EAGLE3_HIDDEN_STATES: lambda c: (
         (c.speculative_algorithm or "").upper() == "EAGLE3"
     ),
-    Feature.KV_OFFLOAD: lambda c: _on(
-        c,
-        "enable_hierarchical_cache",
-        "disaggregation_decode_enable_offload_kvcache",
-        "enable_lmcache",
-        "enable_flexkv",
+    Feature.KV_OFFLOAD: lambda c: bool(
+        c.enable_hierarchical_cache
+        or c.disaggregation_decode_enable_offload_kvcache
+        or c.enable_lmcache
+        or c.enable_flexkv
     ),
-    Feature.MEMORY_RELEASE: lambda c: _on(
-        c, "enable_memory_saver", "enable_weights_cpu_backup"
+    Feature.MEMORY_RELEASE: lambda c: bool(
+        c.enable_memory_saver or c.enable_weights_cpu_backup
     ),
     Feature.CPU_OFFLOAD: lambda c: (
-        _over(c, "cpu_offload_gb", 0) or _over(c, "offload_group_size", 0)
+        (c.cpu_offload_gb or 0) > 0 or (c.offload_group_size or 0) > 0
     ),
     Feature.TORCH_COMPILE: lambda c: bool(c.enable_torch_compile),
 }
 
 
 def features_in_use(cfg: Any) -> set[Feature]:
-    used = set()
-    for feature, probe in _PROBES.items():
-        try:
-            if probe(cfg):
-                used.add(feature)
-        except Exception:
-            used.add(feature)
-    return used
+    return {feature for feature, probe in _PROBES.items() if probe(cfg)}
 
 
-def monokernel_disable_reasons(cfg, model_config, isa):
+def monokernel_disable_reasons(*, cfg, model_config, isa):
     """(spec, every reason the setup is refused); spec is None when none fits."""
     if isa is None:
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
-    spec, why = find_spec(getattr(hf_config, "architectures", None) or (), isa)
+    spec, why = find_spec(architectures=hf_config.architectures, isa=isa)
     if spec is None:
         return None, [why]
     req = spec.requires
     # the model dtype as resolved from the checkpoint ("auto" otherwise)
-    dtype = str(getattr(model_config, "dtype", None) or cfg.dtype).replace("torch.", "")
+    dtype = str(model_config.dtype).replace("torch.", "")
     reasons = [
         f"{f.value} is in use and the spec does not accept it"
         for f in sorted(features_in_use(cfg) - spec.features, key=lambda f: f.name)
@@ -185,34 +167,30 @@ def monokernel_disable_reasons(cfg, model_config, isa):
         ("--kv-cache-dtype", str(cfg.kv_cache_dtype), req.kv_cache_dtypes),
         ("attention backend", cfg.attention_backend, req.attention_backends),
         ("MoE runner backend", cfg.moe_runner_backend, req.moe_runner_backends),
-        (
-            "quantization",
-            getattr(model_config, "quantization", None),
-            req.quantizations,
-        ),
+        ("quantization", model_config.quantization, req.quantizations),
     ):
         if allowed and value not in allowed:
             reasons.append(
                 f"{what} {value!r} is not one of {sorted(map(str, allowed))}"
             )
-    watchdog = getattr(cfg, "watchdog_timeout", None)
+    watchdog = cfg.watchdog_timeout
     if watchdog and deadline_s(watchdog) < MIN_DEADLINE_S:
         reasons.append(
             f"--watchdog-timeout {watchdog:g} s leaves the waits a deadline under "
             f"{MIN_DEADLINE_S:g} s"
         )
     if spec.numerics.kind is not NumericsKind.BITWISE:
-        for flag, name in (
-            ("--enable-deterministic-inference", "enable_deterministic_inference"),
-            ("--rl-on-policy-target", "rl_on_policy_target"),
+        for flag, value in (
+            ("--enable-deterministic-inference", cfg.enable_deterministic_inference),
+            ("--rl-on-policy-target", cfg.rl_on_policy_target),
         ):
-            if _on(cfg, name):
+            if value:
                 reasons.append(f"{flag} needs a BITWISE spec, and this one is not")
     return spec, reasons + list(spec.config_disable_reasons(cfg, hf_config))
 
 
 def covered_capture_sizes(
-    widths, tokens_per_request: int, sizes: list[int]
+    *, widths, tokens_per_request: int, sizes: list[int]
 ) -> list[int]:
     """Up to the largest covered size, the decode capture sizes are the widths (rows)
     divided by the tokens a request; larger sizes stay as configured."""
@@ -238,7 +216,9 @@ def handle_monokernel(server_args) -> None:
     from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 
     isa = device_isa()
-    spec, reasons = monokernel_disable_reasons(cfg, model_config_of(server_args), isa)
+    spec, reasons = monokernel_disable_reasons(
+        cfg=cfg, model_config=model_config_of(server_args), isa=isa
+    )
     if reasons:
         raise ValueError(
             "--enable-monokernel cannot run this setup:\n  - " + "\n  - ".join(reasons)
@@ -247,8 +227,10 @@ def handle_monokernel(server_args) -> None:
         int(cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
     )
     graph = cfg.cuda_graph_config
-    sizes = list(getattr(getattr(graph, "decode", None), "bs", None) or [])
-    new = covered_capture_sizes(spec.widths(isa), tokens, sizes)
+    sizes = list(graph.decode.bs or [])
+    new = covered_capture_sizes(
+        widths=spec.widths(isa), tokens_per_request=tokens, sizes=sizes
+    )
     if sizes and new != sorted(set(sizes)):
         declare_resolution(
             server_args,
