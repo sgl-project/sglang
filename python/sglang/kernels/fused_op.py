@@ -163,6 +163,7 @@ def _platform() -> PlatformInfo:
 
 
 @functools.lru_cache(maxsize=1)
+@torch.compiler.assume_constant_result
 def _platform_key() -> str:
     """In-tree platform dispatch key, or ``""`` for plain-native platforms.
 

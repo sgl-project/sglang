@@ -15,6 +15,9 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
+from sglang.srt.hardware_backend.npu.attention.compiled_mha import (
+    npu_graph_mha_attention,
+)
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
 )
@@ -2834,6 +2837,20 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_len_kv = seq_lens_cpu_int.cpu().int().tolist()
 
             num_tokens = query.shape[0]
+            if self.enable_torch_compile:
+                output = npu_graph_mha_attention(
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_table=block_tables,
+                    block_size=self.page_size,
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    scale=layer.scaling,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
+                    v_head_dim=layer.v_head_dim,
+                )
+                return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
                 k_cache,
@@ -3010,7 +3027,21 @@ class AscendAttnBackend(AttentionBackend):
                 topk_indices,
             )
 
-        if self.graph_mode and (not self.enable_torch_compile):
+        compiled_mha = (
+            self.graph_mode
+            and self.enable_torch_compile
+            and not self.use_mla
+            and not self.is_hybrid_swa
+            and not self.use_sliding_window_kv_pool
+            and not self.use_fa
+            and not self.use_alibi
+            and not layer.is_cross_attention
+            and layer.sliding_window_size in (None, -1)
+            and sinks is None
+            and forward_batch.encoder_lens is None
+            and layer.logit_cap == 0
+        )
+        if self.graph_mode and (not self.enable_torch_compile or compiled_mha):
             return self.forward_decode_graph(
                 q,
                 k,

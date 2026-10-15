@@ -13,6 +13,7 @@
 # ==============================================================================
 """One forward's residual and its producer's outstanding contribution."""
 
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import msgspec
@@ -32,7 +33,8 @@ class DeclaredSum(msgspec.Struct, frozen=True):
         return _sum_group(self.group).all_reduce(value)
 
 
-class Contribution(msgspec.Struct):
+@dataclass(slots=True)
+class Contribution:
     """Own a producer's output, residual update and outstanding completion.
 
     Fields:

@@ -203,6 +203,8 @@ class StagePlan:
             self.paths[variant] = msgspec.structs.replace(
                 path, exit=exit_facts(kind, self, variant, path)
             )
+        # Build static exit policy before a forward can be traced by Dynamo.
+        self.output = ExitPolicy(self)
 
     @property
     def incoming_residual_rows(self):
