@@ -301,6 +301,7 @@ class SchedulerInvariantChecker:
         swa_uncached = self.tree_cache.swa_transient_size()
         for req in self._requests_owning_rows():
             assert req.kv.cache_protected_len % self.page_size == 0
+            req.kv.check_lengths()
             full_uncached += kv_private_tokens(req.kv, self.page_size)
             if self.is_hybrid_swa:
                 swa_uncached += kv_private_swa_tokens(req.kv, self.page_size)
@@ -368,7 +369,7 @@ class SchedulerInvariantChecker:
             )
 
     def _check_kv_page_invariants(self):
-        """committed<=allocated for every req/slot, and no double free:
+        """The length order of every req/slot row, and no double free:
           A. no owner references a page that is in the free pool (use-after-free).
           B. the free pool has no duplicate pages (two owners freed the same page).
         All heavy work runs on GPU to avoid per-token device->host sync."""
@@ -376,7 +377,8 @@ class SchedulerInvariantChecker:
         row_width = rtt.shape[1]
 
         def _add_owner(label, kv):
-            assert 0 <= kv.kv_committed_len <= kv.kv_allocated_len <= row_width
+            kv.check_lengths()
+            assert kv.kv_allocated_len <= row_width
             owners.append((label, kv.req_pool_idx, kv.kv_allocated_len))
 
         owners: list[tuple[str, Optional[int], int]] = []

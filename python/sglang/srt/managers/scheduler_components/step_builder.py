@@ -98,7 +98,7 @@ class StepBuilder:
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_end
+                req.kv.shield_swa_prefill(req.extend_end)
 
         return new_batch
 

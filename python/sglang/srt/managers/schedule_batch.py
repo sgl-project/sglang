@@ -920,7 +920,8 @@ class ReqKvInfo:
     # Match observations and scheduling state stay on the Req itself.
     req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
 
-    # The request's own KV is [cache_protected_len, kv_allocated_len).
+    # The request's own KV is [cache_protected_len, kv_allocated_len). Only the
+    # methods below write the lengths; check_lengths states their order.
     cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
     # This request already inserted [0, here) into the tree; later inserts count
     # a hit only on the nodes past it, so a request counts each node once.
@@ -993,6 +994,95 @@ class ReqKvInfo:
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
+
+    def allocate_extend(self, seq_len: int) -> None:
+        """The row holds [0, seq_len), all of it committed: an extend's tokens
+        are known when it is scheduled, so its KV counts as committed at
+        allocation."""
+        self.kv_allocated_len = seq_len
+        self.kv_committed_len = seq_len
+
+    def allocate_decode(self, num_tokens: int) -> None:
+        """The row holds num_tokens more slots, not committed: a decode step's
+        token is known only at its host commit (commit_decode)."""
+        self.kv_allocated_len += num_tokens
+
+    def allocate_spec_decode(self, end: int) -> None:
+        """The row holds at least [0, end), not committed past the verified
+        tokens; a reservation an earlier step left above end stays."""
+        self.kv_allocated_len = max(self.kv_allocated_len, end)
+
+    def commit_decode(self, num_tokens: int) -> None:
+        """num_tokens more decode tokens (a verify's accepted run) are
+        committed, at the host commit of the step that produced them."""
+        self.kv_committed_len += num_tokens
+
+    def receive(self, fill_len: int) -> None:
+        """PD decode: the row holds [0, fill_len), all of it committed, since the
+        prefill node computed those tokens and the transfer writes their KV."""
+        self.kv_allocated_len = fill_len
+        self.kv_committed_len = fill_len
+
+    def commit_finished(self, end: int) -> None:
+        """A finished turn a streaming session keeps: its tokens are final, so
+        committed reaches end, capped at what the row holds."""
+        self.kv_committed_len = min(end, self.kv_allocated_len)
+
+    def truncate(self, end: int) -> None:
+        """The row keeps at most [0, end): every length above end drops to it."""
+        self.kv_allocated_len = min(self.kv_allocated_len, end)
+        self.kv_committed_len = min(self.kv_committed_len, end)
+        self.clamp_evicted_seqlens(end)
+
+    def protect_prefix(self, length: int) -> None:
+        """The tree owns [0, length) of the row (matched, loaded back, or
+        inserted); the request frees only what lies past it."""
+        self.cache_protected_len = length
+
+    def record_insert(self, length: int) -> None:
+        """The request has inserted [0, length) into the tree; a later insert
+        counts a hit only past the longest one."""
+        self.cache_inserted_len = max(self.cache_inserted_len, length)
+
+    def clear_tree_prefix(self) -> None:
+        """The tree owns none of the row and the request inserted none of it (a
+        decode-radix request bound at the root)."""
+        self.cache_protected_len = 0
+        self.cache_inserted_len = 0
+
+    def shield_swa_prefill(self, extend_end: int) -> None:
+        """Prefill-aware SWA: the window never evicts [0, extend_end), the
+        prefill so far."""
+        self.swa_evict_floor = extend_end
+
+    def reset_for_retract(self) -> None:
+        """A retracted request holds no row: every field goes back to a fresh
+        record's, except the host backup its resume restores from."""
+        assert not self.holds_kv, "expect it is already released"
+        retraction_backup = self.retraction_backup
+        for f in dataclasses.fields(self):
+            if f.default_factory is not dataclasses.MISSING:
+                setattr(self, f.name, f.default_factory())
+            else:
+                setattr(self, f.name, f.default)
+        self.retraction_backup = retraction_backup
+
+    def check_lengths(self) -> None:
+        """The order of a held row's lengths: the tree's prefix, the inserted
+        prefix and the window-evicted prefix lie in the committed KV, which lies
+        in the allocated KV."""
+        if not self.holds_kv:
+            return
+        committed, allocated = self.kv_committed_len, self.kv_allocated_len
+        assert (
+            self.cache_protected_len <= committed
+            and self.cache_inserted_len <= committed
+            and self.max_evicted_seqlen <= committed
+            and 0 <= committed <= allocated
+        ), (
+            f"{self.cache_protected_len=}, {self.cache_inserted_len=}, "
+            f"{self.max_evicted_seqlen=}, {committed=}, {allocated=}"
+        )
 
 
 class Req:
@@ -1644,7 +1734,7 @@ class Req:
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if match_result.cache_protected_len is None:
-                self.kv.cache_protected_len = self.prefix_len
+                self.kv.protect_prefix(self.prefix_len)
 
         if (
             self.is_retracted
@@ -1926,8 +2016,7 @@ class Req:
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
-        self.kv.cache_protected_len = 0
-        self.kv.cache_inserted_len = 0
+        self.kv.reset_for_retract()
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock = None
@@ -1940,18 +2029,8 @@ class Req:
         self.temp_input_top_logprobs_idx = None
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
-        self.kv.mamba_pool_idx = None
-        self.kv.mamba_ping_pong_track_buffer = None
-        self.kv.mamba_next_track_idx = None
-        self.kv.mamba_last_track_idx = None
-        self.kv.mamba_last_track_seqlen = None
-        self.kv.mamba_prev_track_seqlen = None
         self.mamba_branching_seqlen = None
-        self.kv.mamba_cow_src_index = None
-        self.kv.mamba_needs_clear = False
         self.already_computed = 0
-        assert not self.kv.holds_kv, "expect it is already released"
-        self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -2228,7 +2307,7 @@ def commit_step_counters(step: ScheduleBatch) -> None:
             continue
         req.decode_batch_idx += 1
         if commit_kv:
-            req.kv.kv_committed_len += 1
+            req.kv.commit_decode(1)
 
 
 def new_tokens_required_next_decode(

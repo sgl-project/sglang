@@ -15,7 +15,10 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.test.scheduler_request_lists import assert_one_list_per_request
+from sglang.test.scheduler_request_lists import (
+    assert_one_list_per_request,
+    assert_progress_lengths,
+)
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.io_struct import (
@@ -244,6 +247,7 @@ class ScriptedSchedulerHook:
     def step(self) -> None:
         # An iteration boundary: the scheduler loop calls this at intake.
         assert_one_list_per_request(self.scheduler)
+        assert_progress_lengths(self.scheduler)
         if not self._is_driver:
             return
 

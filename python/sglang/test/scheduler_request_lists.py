@@ -1,5 +1,6 @@
-"""Checks on the scheduler's request lists, and a partial scheduler with its
-registry and step planner over what a test gave it, for tests."""
+"""Checks on the scheduler's request lists and their requests' KV lengths, and
+a partial scheduler with its registry and step planner over what a test gave
+it, for tests."""
 
 from __future__ import annotations
 
@@ -173,3 +174,44 @@ def assert_one_list_per_request(scheduler: Scheduler) -> None:
             assert req.finished() or id(req) in owners, (
                 f"request {req.rid} of a pending step is in no list"
             )
+
+
+def assert_progress_lengths(scheduler: Scheduler) -> None:
+    """At an iteration boundary: every held row's lengths are in order (a
+    request's, a session's, or one released and held for a pending step), and a
+    live request's KV allocated past its committed length belongs to its pending
+    decode steps: one token per step without speculation; with it, at least the
+    bonus token per step, and the rest is the verify reservation."""
+    reqs: Dict[int, Req] = {}
+    for entries in request_lists(scheduler).values():
+        for entry in entries:
+            req = getattr(entry, "req", entry)
+            reqs[id(req)] = req
+    num_inflight: Dict[int, int] = {}
+    for record in scheduler.parts.pending:
+        for req in record.step.decode_reqs():
+            num_inflight[id(req)] = num_inflight.get(id(req), 0) + 1
+    spec = not scheduler.parts.spec_algorithm.is_none()
+    for req in reqs.values():
+        kv = req.kv
+        if not kv.holds_kv:
+            continue
+        kv.check_lengths()
+        if req.finished():
+            # Its commit skips a pending step's token, which the release frees.
+            continue
+        n = num_inflight.get(id(req), 0)
+        committed, allocated = kv.kv_committed_len, kv.kv_allocated_len
+        if spec:
+            ok = committed + n <= allocated
+        else:
+            ok = committed + n == allocated
+        assert ok, (
+            f"request {req.rid}: {committed=}, {allocated=}, {n} pending decode steps"
+        )
+    for kv in scheduler.parts.kv.tree_cache.session_records().values():
+        kv.check_lengths()
+    # A record held for a pending step is its row as the request released it:
+    # in order, but no live request's, so the pending-step relation skips it.
+    for held in scheduler.parts.pending.held():
+        held.kv.check_lengths()

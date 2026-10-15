@@ -346,9 +346,8 @@ class DllmManager:
             ]
             self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
 
-        req.kv.kv_committed_len = context_len
-        req.kv.kv_allocated_len = context_len
         assert req.kv.max_evicted_seqlen <= context_len
+        req.kv.truncate(context_len)
         req.extend_end = context_len
         checkpoint_kv_cache(req, self.tree_cache)
 
