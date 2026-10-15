@@ -1,12 +1,14 @@
 """K3 GPU preprocess: shared batched pipeline hook contract (CPU parts)."""
 
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
+from sglang.srt.multimodal.processors import kimi_k3, kimi_k25
 from sglang.srt.multimodal.processors.kimi_k3 import _fill_transparent_bg
 from sglang.srt.multimodal.processors.kimi_k25 import _resize_bicubic_if_needed
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -54,6 +56,25 @@ def test_resize_matches_pil_bicubic_golden():
         # Integer pixel domain: everything within 1 level, most pixels exact.
         assert diff.max() <= 1.0, f"max |diff|={diff.max()} at {target_w}x{target_h}"
         assert (diff == 0).mean() > 0.7, f"bitwise ratio={(diff == 0).mean():.3f}"
+
+
+def test_large_resize_runs_on_cpu_and_matches(monkeypatch):
+    """Sources above the GPU pixel cap resize on the CPU with the same kernel
+    and come back on the caller's device."""
+    x = torch.from_numpy(_natural_image(600, 800)).permute(2, 0, 1).unsqueeze(0)
+    expected = _resize_bicubic_if_needed(x, 300, 400)
+
+    monkeypatch.setattr(kimi_k25, "_MAX_GPU_RESIZE_PIXELS", 0)
+    moved = []
+    real_cpu = torch.Tensor.cpu
+    monkeypatch.setattr(
+        torch.Tensor, "cpu", lambda t: moved.append(t.shape) or real_cpu(t)
+    )
+    ours = _resize_bicubic_if_needed(x, 300, 400)
+
+    assert moved == [x.shape]
+    assert ours.device == x.device
+    torch.testing.assert_close(ours, expected)
 
 
 def test_fill_transparent_bg_matches_checkpoint_composite():

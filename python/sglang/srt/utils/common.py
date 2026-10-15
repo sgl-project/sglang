@@ -2125,7 +2125,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except (OSError, SyntaxError) as e:
+    except (OSError, SyntaxError, Image.DecompressionBombError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 

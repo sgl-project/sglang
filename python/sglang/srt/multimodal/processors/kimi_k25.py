@@ -148,6 +148,9 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     return image[:3]
 
 
+_MAX_GPU_RESIZE_PIXELS = 4096 * 4096
+
+
 def _resize_bicubic_if_needed(
     image: torch.Tensor, target_height: int, target_width: int
 ) -> torch.Tensor:
@@ -162,12 +165,16 @@ def _resize_bicubic_if_needed(
     8-bit levels of residual remain -- against PIL's float path we agree to 5e-3,
     i.e. the kernel matches and only the arithmetic differs.
     """
-    image = image.float()
     if image.shape[-2:] == (target_height, target_width):
-        return image
+        return image.float()
+    # The fp32 copy of a very large source can exhaust a GPU that also holds
+    # the weights and KV cache, so resize those on the CPU.
+    device = image.device
+    if image.shape[0] * image.shape[-2] * image.shape[-1] > _MAX_GPU_RESIZE_PIXELS:
+        image = image.cpu()
     return (
         F.interpolate(
-            image,
+            image.float(),
             size=(target_height, target_width),
             mode="bicubic",
             align_corners=False,
@@ -175,6 +182,7 @@ def _resize_bicubic_if_needed(
         )
         .round_()
         .clamp_(0.0, 255.0)
+        .to(device)
     )
 
 
