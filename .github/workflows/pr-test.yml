@@ -100,6 +100,8 @@ jobs:
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
+    # job+step timeouts must exceed max-wait-minutes, else the 360-min default kills the wait first
+    timeout-minutes: 250
     outputs:
       base_a_result: ${{ steps.wait.outputs.result }}
     steps:
@@ -109,6 +111,7 @@ jobs:
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
+        timeout-minutes: 245
         with:
           stage-name: base-a
           jobs: |
@@ -130,6 +133,8 @@ jobs:
       (needs.wait-for-base-a.result == 'success' || needs.wait-for-base-a.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
+    # job+step timeouts must exceed max-wait-minutes, else the 360-min default kills the wait first
+    timeout-minutes: 490
     outputs:
       base_b_result: ${{ steps.wait.outputs.result }}
     steps:
@@ -139,6 +144,7 @@ jobs:
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
+        timeout-minutes: 485
         with:
           stage-name: base-b
           jobs: |
