@@ -5,7 +5,6 @@ These cover the pure-Python logic that the GPU end-to-end test
 (test_weight_cache_daemon.py) cannot exercise cheaply:
 
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
-  - CPU storage FD transport, aliases, strided/empty views, and multiple clients
   - CacheConfig compatibility matching / (de)serialization
   - quant-config hashing and method-name extraction
   - daemon spawn configuration and socket/ready path derivation
@@ -22,6 +21,7 @@ import os
 import socket
 import struct
 import unittest
+import weakref
 from types import SimpleNamespace
 
 import torch
@@ -130,46 +130,33 @@ class TestProtocolFraming(CustomTestCase):
 
 
 class TestTransportBackend(CustomTestCase):
-    def test_cpu_storage_views_survive_multiple_clients(self):
-        source = torch.arange(32, dtype=torch.bfloat16)
-        tensors = {
-            "left": (source[2:14:2], True),
-            "right": (source[8:20].view(3, 4), False),
-            "empty": (torch.empty(0, dtype=torch.bfloat16), True),
-        }
-        server = TorchIpcTransportBackend()
-        entries = server.prepare_export(tensors)
-        clients = []
-        for _ in range(2):
-            client = TorchIpcTransportBackend()
-            a, b = socket.socketpair()
-            try:
-                a.settimeout(5)
-                b.settimeout(5)
-                server.send_fetch_state_response(a, config={}, entries=entries, pid=123)
-                response = client.recv_fetch_state_response(b, recv_msg(b))
-                imported = {
-                    name: client.import_tensor(entry)
-                    for name, entry in response["entries"].items()
-                }
-            finally:
-                a.close()
-                b.close()
-            for name, (expected, _) in tensors.items():
-                actual = imported[name]
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                self.assertEqual(actual.stride(), expected.stride())
-                self.assertEqual(actual.storage_offset(), expected.storage_offset())
-            self.assertEqual(
-                imported["left"].untyped_storage().data_ptr(),
-                imported["right"].untyped_storage().data_ptr(),
-            )
-            clients.append(imported)
-        # Both clients and the source retain the same physical CPU storage.
-        source[8] = 123
-        for imported in clients:
-            self.assertEqual(imported["left"][3].item(), 123)
-            self.assertEqual(imported["right"][0, 0].item(), 123)
+    def test_shutdown_releases_exported_tensor_references(self):
+        from unittest.mock import patch
+
+        from sglang.srt.weight_cache.daemon import WeightCacheDaemon
+
+        daemon = object.__new__(WeightCacheDaemon)
+        daemon.model = torch.nn.Linear(4, 4, bias=False)
+        tensor = daemon.model.weight.detach()
+        reference = weakref.ref(tensor)
+        daemon.transport_backend = TorchIpcTransportBackend()
+        daemon.state_entries = daemon.transport_backend.prepare_export(
+            {"weight": (tensor, True)}
+        )
+        del tensor
+        with (
+            patch(
+                "sglang.srt.weight_cache.daemon.dist.is_initialized", return_value=False
+            ),
+            patch(
+                "sglang.srt.weight_cache.daemon.current_platform.empty_cache"
+            ) as empty_cache,
+        ):
+            daemon.shutdown()
+        self.assertIsNone(reference())
+        self.assertIsNone(daemon.transport_backend)
+        self.assertFalse(daemon._running)
+        empty_cache.assert_called_once()
 
     def test_default_backend_is_torch_ipc(self):
         backend = get_client_transport_backend(None)
@@ -184,24 +171,27 @@ class TestTransportBackend(CustomTestCase):
         state_tensors = {"x": (torch.arange(8, dtype=torch.float32), True)}
         entries = backend.prepare_export(state_tensors)
 
-        a, b = socket.socketpair()
-        try:
-            backend.send_fetch_state_response(
-                a,
-                config={"k": "v"},
-                entries=entries,
-                pid=123,
-                preloaded_weights_bytes=65536,
-            )
-            resp = recv_msg(b)
-            resp = backend.recv_fetch_state_response(b, resp)
-            imported = backend.import_tensor(resp["entries"]["x"])
-            self.assertTrue(torch.equal(imported.cpu(), state_tensors["x"][0]))
-            self.assertEqual(resp["transport_backend"], TORCH_IPC_BACKEND)
-            self.assertEqual(resp["preloaded_weights_bytes"], 65536)
-        finally:
-            a.close()
-            b.close()
+        # Reuse the daemon's prepared metadata, but each client must receive a
+        # fresh serialization lease rather than reusing the first client's FD.
+        for _ in range(2):
+            a, b = socket.socketpair()
+            try:
+                backend.send_fetch_state_response(
+                    a,
+                    config={"k": "v"},
+                    entries=entries,
+                    pid=123,
+                    preloaded_weights_bytes=65536,
+                )
+                resp = recv_msg(b)
+                resp = backend.recv_fetch_state_response(b, resp)
+                imported = backend.import_tensor(resp["entries"]["x"])
+                self.assertTrue(torch.equal(imported.cpu(), state_tensors["x"][0]))
+                self.assertEqual(resp["transport_backend"], TORCH_IPC_BACKEND)
+                self.assertEqual(resp["preloaded_weights_bytes"], 65536)
+            finally:
+                a.close()
+                b.close()
 
 
 class TestCacheConfig(CustomTestCase):

@@ -81,7 +81,7 @@ class SmallTSumHCShell:
             self.weights = prepare_raw_hc_weights_from_batched(
                 down_weights,
                 source.input_mix_weight_up.weight,
-                source.hc_norm.weight,
+                source.hc_norm.weight.flatten(),
                 norm_weight_permuted=norm_weight_permuted,
             )
 

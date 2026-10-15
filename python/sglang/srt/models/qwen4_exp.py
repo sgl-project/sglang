@@ -1573,17 +1573,17 @@ class Qwen4ExpLayerExtensionMixin:
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.attn_hyper_connection = GatedResidual(
+        from sglang.srt.layers.hyperconnection_packed import create_gated_residual
+
+        self.attn_hyper_connection = create_gated_residual(
             hc_config,
             use_mix=True,
             use_combine=True,
-            packed_weights=True,
         )
-        self.mlp_hyper_connection = GatedResidual(
+        self.mlp_hyper_connection = create_gated_residual(
             hc_config,
             use_mix=True,
             use_combine=True,
-            packed_weights=True,
         )
         self.attn_boundary, self.ffn_boundary = _build_qwen4_exp_stages(
             config,
@@ -2476,6 +2476,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace("model.language_model.", "model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if name.endswith(".block_inject_weight.weight"):
+                merged_name = (
+                    name[: -len("block_inject_weight.weight")]
+                    + "input_mix_weight_down.weight"
+                )
+                if getattr(
+                    params_dict.get(merged_name), "hc_merged_down_inject", False
+                ):
+                    name = merged_name
             if name.endswith(".k_proj.k_scale"):
                 name = name.replace(".k_proj.k_scale", ".attn.k_scale")
             elif name.endswith(".v_proj.v_scale"):

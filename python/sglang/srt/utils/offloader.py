@@ -99,6 +99,9 @@ def _get_resident_parameter_ids(module: torch.nn.Module):
     # tensors held as ordinary attributes need their backing weights to stay put.
     resident = set()
     for owner in module.modules():
+        get_resident = getattr(owner, "offload_resident_parameters", None)
+        if get_resident is not None:
+            resident.update(id(parameter) for parameter in get_resident())
         # MLA post_load_weights derives w_kc/w_vc from kv_b_proj weights on
         # their current device. These attributes already exist before loading.
         projection = getattr(owner, "kv_b_proj", None)

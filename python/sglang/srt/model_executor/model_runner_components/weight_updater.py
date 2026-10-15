@@ -312,6 +312,10 @@ class WeightUpdater:
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
+        for module in self.get_model().modules():
+            begin = getattr(module, "begin_sum_state_update", None)
+            if begin is not None:
+                begin()
 
     def validate_weight_update(self: WeightUpdater) -> None:
         _validate_hc_weights_after_loading(self.get_model())
@@ -320,6 +324,10 @@ class WeightUpdater:
         if run_post_load:
             post_load_weights(self.get_model())
         self.validate_weight_update()
+        for module in self.get_model().modules():
+            finish = getattr(module, "finish_sum_state_update", None)
+            if finish is not None:
+                finish(force=run_post_load)
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
         )
@@ -377,7 +385,7 @@ class WeightUpdater:
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.get_model(), named_tensors)
-            _model_refresh_hc_weights(self.get_model())
+            _model_refresh_hc_weights(self.get_model(), force=True)
         elif load_format is None:
             self.get_model().load_weights(named_tensors)
         else:
@@ -423,6 +431,7 @@ class WeightUpdater:
         if error is not None:
             return False, error
 
+        owned_hc_updates = []
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
                 SGLangCheckpointEngineWorkerExtensionImpl,
@@ -430,26 +439,53 @@ class WeightUpdater:
 
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
+            # Checkpoint-engine may invoke model.load_weights for several IPC
+            # buckets. Finalize the merged parameters only after the whole call.
+            for module in self.get_model().modules():
+                begin = getattr(module, "begin_sum_state_update", None)
+                if begin is not None and begin(reuse=True):
+                    owned_hc_updates.append(module)
             worker.update_weights_from_ipc(recv_req.zmq_handles)
+            for module in owned_hc_updates:
+                module.validate_sum_state_weights()
+            for module in owned_hc_updates:
+                module.finish_sum_state_update()
             return True, "IPC weight update completed successfully"
         except ImportError as e:
+            for module in owned_hc_updates:
+                module.abort_sum_state_update()
             return False, f"IPC weight update failed: ImportError {e}"
         except Exception as e:
+            for module in owned_hc_updates:
+                module.abort_sum_state_update()
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
 
 
-def _model_refresh_hc_weights(model):
+def _model_refresh_hc_weights(model, *, force=False):
     # Opt-in per-module hook. Other models/platforms must not import the
     # optional HC/Triton backend just because they update their weights.
     for module in model.modules():
         prepare = getattr(module, "prepare_sum_state_weights", None)
         if prepare is not None:
-            prepare(force=True)
+            prepare(force=force)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
+    # Merged parameters can explicitly expose checkpoint aliases to the loader
+    # without registering overlapping parameters or duplicating their storage.
+    for name, parameter in tuple(params_dict.items()):
+        aliases = getattr(parameter, "weight_loader_aliases", ())
+        if aliases:
+            if not name.endswith(aliases[0]):
+                raise ValueError("Weight-loader alias does not match its parameter")
+            prefix = name[: -len(aliases[0])]
+            for alias in aliases[1:]:
+                key = prefix + alias
+                if key in params_dict and params_dict[key] is not parameter:
+                    raise ValueError(f"Conflicting weight-loader alias: {key}")
+                params_dict[key] = parameter
     for name, tensor in named_tensors:
         param = params_dict[name]
         # Only HC opts in: arbitrary weight_loaders may reshard an already
