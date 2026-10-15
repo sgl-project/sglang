@@ -1248,7 +1248,6 @@ class AutoencoderKLLegacy(AutoencoderKL):
         self.use_3d_conv = use_3d_conv
         self.causal_encoder = causal_encoder
         self.causal_decoder = causal_decoder
-        self.slidedec = self.causal_encoder and not self.causal_decoder
 
         # some registered parameters for simplicity
         self.vae_ratio = int(np.cumprod(space_down)[-1])

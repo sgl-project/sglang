@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+_MAX_INT32 = 2**31 - 1
+
 
 @triton.jit(do_not_specialize=["rows"])
 def _pack_qkv_destination_major_kernel(
@@ -21,9 +23,15 @@ def _pack_qkv_destination_major_kernel(
     stride_k_head,
     stride_v_row,
     stride_v_head,
+    IDX64: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if IDX64:
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(
+            0, BLOCK_SIZE
+        ).to(tl.int64)
+    else:
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < total_elements
 
     dim = offsets % head_size
@@ -96,6 +104,15 @@ def pack_qkv_destination_major(
     if total_elements == 0:
         return output
 
+    # Input views may be strided (e.g. slices of a fused qkv projection), so
+    # bound each tensor by one past the largest element offset it is addressed at.
+    max_offset = max(
+        output.numel(),
+        *(
+            (rows - 1) * t.stride(0) + (global_heads - 1) * t.stride(1) + head_size
+            for t in (q, k, v)
+        ),
+    )
     block_size = 1024
     with torch.get_device_module().device(q.device):
         _pack_qkv_destination_major_kernel[(triton.cdiv(total_elements, block_size),)](
@@ -113,6 +130,7 @@ def pack_qkv_destination_major(
             k.stride(1),
             v.stride(0),
             v.stride(1),
+            IDX64=max_offset > _MAX_INT32,
             BLOCK_SIZE=block_size,
             num_warps=8,
         )

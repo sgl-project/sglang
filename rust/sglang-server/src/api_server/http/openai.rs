@@ -11,7 +11,7 @@ use std::sync::Arc;
 mod chat;
 mod completions;
 mod models;
-mod reasoning;
+mod pd_routing;
 mod template;
 mod template_builtins;
 mod template_legacy;
@@ -190,6 +190,25 @@ fn contains_media(value: &serde_json::Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Why a chat or completions request's `model` cannot be served, if it
+/// cannot. Any name is served, as Python's handlers serve it, except the
+/// `base-model:adapter` form: there it asks for that LoRA adapter, which
+/// this server does not support, so serving the base model instead would
+/// silently change the answer. (Python refuses it the same way when LoRA is
+/// off.) The served name itself is always accepted, colon or not.
+fn model_error(model: &str, served_model_name: &str) -> Option<String> {
+    if model == served_model_name {
+        return None;
+    }
+    let (_, adapter) = model.split_once(':')?;
+    let adapter = adapter.trim();
+    (!adapter.is_empty()).then(|| {
+        format!(
+            "model `{model}` asks for LoRA adapter `{adapter}`; LoRA is not supported by the Rust server"
+        )
+    })
 }
 
 #[cfg(test)]

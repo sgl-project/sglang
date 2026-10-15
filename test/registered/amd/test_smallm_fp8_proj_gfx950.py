@@ -184,8 +184,6 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                 reduce_results=False,
                 params_dtype=torch.bfloat16,
                 quant_config=_QuarkPerToken(),
-                tp_rank=0,
-                tp_size=1,
             ).cuda()
             proj.weight.data.copy_(
                 (torch.randn(4096, 2048, device="cuda") * 0.05).to(torch.float8_e4m3fn)

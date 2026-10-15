@@ -218,8 +218,7 @@ class DecLockRefParams:
 
     A segment release requires its component's boundary entry; a missing
     entry must not be treated as a lock reaching the root. ``node_id`` is
-    ``None`` only for receipts that never came from a unified-tree acquire
-    (legacy caches, session sentinels).
+    ``None`` only for legacy caches; the unified tree rejects such a receipt.
     """
 
     node_id: Optional[int] = None
@@ -322,7 +321,7 @@ def zero_match_result(
     tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
 ) -> MatchResult:
     if not tree_cache.supports_prefix_sharing():
-        # match_prefix already returns a miss; no root_node to walk back to.
+        # A non-sharing cache's match is already a miss; pass it through.
         return match_result
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
@@ -440,6 +439,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def touch_prefix(self, key: RadixKey) -> None:
+        """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
+        never allocates, loads, or queries external tiers."""
+
     def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
         """Return request indices in depth-first, subtree-weight order."""
         return _dfs_weight_order(self.root_node, node_handles, self.resolve_node_handle)
@@ -463,7 +466,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Logical-page KV sharding: the rotation base stamped on ``node``.
 
         ``node`` is whatever this cache stores in ``req.last_node`` (a NodeId
-        for the unified tree, None for caches without tree nodes). None means
+        for the unified tree). None means
         "no base available here", which sends the alloc path to the base the
         request recorded at its previous alloc. Tree caches that keep the
         per-chain base override this. See UnifiedTreeNode.rotation_base.
@@ -591,6 +594,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         node). None means retry admission; zero can be a successful
         auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
+
+    def load_back_is_cache_owned(self) -> bool:
+        """Whether the slots loaded by ``init_load_back`` belong to this cache.
+
+        False means they belong to the request, which inserts them like any
+        computed KV once its forward confirms the load.
+        """
+        return True
 
     def finish_storage_prefetch_admission(
         self,

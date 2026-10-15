@@ -1,26 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Warmup-calibrated automatic component residency placement.
+"""Warmup memory, timing and layer-use estimates for the default workload.
 
-Under ``--performance-mode auto`` with server warmup, each rank measures the
-peak GPU memory of bounded synthetic warmup requests and a low-step probe at
-the complete default serving shape, then selects a complete serving placement
-for every eligible component under the measured memory constraints.
-
-When no full-shape measurement is available, the fallback estimate splits the
-measured peak into persistent weights and workload-scaled activations. Scaling
-the whole peak would multiply resident weights by the video frame/area cap
-ratio (~16x for Wan-class defaults) and residency adjustment would never trigger.
-
-The planner targets the model default workload only (default resolution,
-default frames, batch=1). Larger shapes, batches, or multi-image inputs need
-explicit ``--component-residency``.
-
-Loading and serving are deliberately separate placement states. The existing
-auto policy provides the initial state. This module then optimizes the
-long-lived serving state and validates the transition with a post-placement
-warmup. A failed default-workload probe can demote that initial state and retry;
-successful probes may promote or rebalance it. It does not force a single
-placement to serve two different lifecycle objectives.
+Peak-memory extrapolation separates persistent weights from workload-scaled
+activations. Phase and layer-use estimates account for stage-specific iteration
+counts rather than scaling every stage by the request's denoising steps.
 """
 
 from __future__ import annotations

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
+    SamplingParams,
     _sanitize_filename,
 )
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
@@ -65,15 +66,7 @@ class ActionSamplingParams:
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
 
-    def build_request_extra(self) -> dict[str, Any]:
-        extra = {}
-        diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
-        if diffusers_kwargs:
-            extra["diffusers_kwargs"] = diffusers_kwargs
-        explicit_fields = getattr(self, "_explicit_fields", None)
-        if explicit_fields is not None:
-            extra["explicit_fields"] = sorted(explicit_fields)
-        return extra
+    build_request_extra = SamplingParams.build_request_extra
 
     def apply_request_extra(self, req: Any) -> None:
         req.extra.update(self.build_request_extra())

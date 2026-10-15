@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
+use sglang_processor::openai::OpenAiSettings;
 use tracing::warn;
 use url::Url;
 
@@ -69,6 +70,8 @@ pub struct ServerInfo {
     /// DP ranks behind the endpoint, mirroring the engine's `num_dp_ranks_of`;
     /// an absent field counts as 1.
     pub dp_ranks: u32,
+    /// The engine's OpenAI-layer server args; `None` when `/server_info` did not report them.
+    pub openai: Option<OpenAiSettings>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -132,12 +135,26 @@ impl WorkerIntrospector {
         let server_info_url = format!("{base}/server_info");
         let model_info_url = format!("{base}/model_info");
         let (parsed, model_info) = tokio::join!(
-            Self::fetch_with_retry::<ServerInfoBody>(&self.client, &server_info_url, worker_url),
+            Self::fetch_with_retry::<serde_json::Value>(&self.client, &server_info_url, worker_url),
             Self::fetch_with_retry::<ModelInfoBody>(&self.client, &model_info_url, worker_url),
         );
         // A worker that answers one endpoint and not the other still gets
         // registered with whatever did answer.
-        let parsed = parsed.unwrap_or_default();
+        // Parsed apart, so an engine that reports them oddly loses only OpenAI lowering.
+        let openai = parsed
+            .as_ref()
+            .filter(|info| info.get("incremental_streaming_output").is_some())
+            .and_then(|info| OpenAiSettings::deserialize(info).ok());
+        let parsed: ServerInfoBody = parsed
+            .and_then(|info| {
+                serde_json::from_value(info)
+                    .map_err(|e| {
+                        warn!(worker_url = %worker_url, error = %e,
+                        "introspect: /server_info fields did not parse; treating it as absent")
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
 
         // `/model_info` is the effective identity; `/server_info` is the launch
         // record, kept as the fallback for workers that predate the field
@@ -155,11 +172,11 @@ impl WorkerIntrospector {
         }
 
         // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
-        // token bigrams; the router must mirror that on the selection side.
+        // token bigrams, except on hybrid (Mamba/linear-attention) models.
         let is_bigram = crate::state::kv_events::classify_bigram(
             parsed.speculative_algorithm.as_deref(),
             worker_url,
-        );
+        ) && !parsed.uses_mamba_radix_cache;
         let event_config = parsed
             .kv_events
             .map(|block| resolve_event_config(block, worker_url, is_bigram));
@@ -179,6 +196,7 @@ impl WorkerIntrospector {
                 .dp_size
                 .unwrap_or(1)
                 .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
+            openai,
         }
     }
 
@@ -368,6 +386,10 @@ struct ServerInfoBody {
     /// token bigrams. Absent on workers without speculative decoding.
     #[serde(default)]
     speculative_algorithm: Option<String>,
+    /// Hybrid (Mamba/linear-attention) models keep unigram KV keys even
+    /// under EAGLE.
+    #[serde(default)]
+    uses_mamba_radix_cache: bool,
     /// Carries the value of `ServerArgs.disaggregation_mode`
     /// (`"null"` | `"prefill"` | `"decode"`). Absent on older SGLang
     /// versions that predate the field.
@@ -527,6 +549,28 @@ mod tests {
             cfg.is_bigram,
             "EAGLE worker via the introspector must set is_bigram"
         );
+    }
+
+    /// A hybrid (Mamba/KDA) EAGLE worker keeps unigram KV keys, so it must
+    /// NOT be bigram.
+    #[tokio::test]
+    async fn fetch_no_bigram_for_hybrid_eagle_worker() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "speculative_algorithm": "EAGLE",
+            "uses_mamba_radix_cache": true,
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector().fetch(&url).await.event_config.unwrap();
+        assert!(!cfg.is_bigram);
     }
 
     /// A non-speculative worker (no `speculative_algorithm`) must NOT be bigram.
