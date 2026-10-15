@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -395,6 +396,32 @@ class PerImageRequestInfo:
     overlapping: List[Tuple[int, MultimodalDataItem, int]] = field(default_factory=list)
 
 
+def _chunk_misses_by_token_budget(
+    miss_items: List[MultimodalDataItem],
+    token_counts: List[int],
+    budget: int,
+) -> List[Tuple[List[MultimodalDataItem], List[int]]]:
+    """Split cache-miss items into groups whose total ViT token count stays
+    within the per-call budget, bounding the batched ViT workspace. An item
+    larger than the budget forms its own group. budget <= 0 means no limit."""
+    if budget <= 0:
+        return [(miss_items, token_counts)]
+    groups: List[Tuple[List[MultimodalDataItem], List[int]]] = []
+    cur_items: List[MultimodalDataItem] = []
+    cur_counts: List[int] = []
+    cur_tokens = 0
+    for item, count in zip(miss_items, token_counts):
+        if cur_items and cur_tokens + count > budget:
+            groups.append((cur_items, cur_counts))
+            cur_items, cur_counts, cur_tokens = [], [], 0
+        cur_items.append(item)
+        cur_counts.append(count)
+        cur_tokens += count
+    if cur_items:
+        groups.append((cur_items, cur_counts))
+    return groups
+
+
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
@@ -449,32 +476,39 @@ def _batch_encode_per_image_misses(
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
 
-    # Phase 1b: single ViT call for all unique cache misses
+    # Phase 1b: encode all unique cache misses, chunked by per-call ViT token budget
     if unique_misses:
         ordered_cache_keys = list(unique_misses.keys())
         miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
         token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
 
         _move_items_to_device(miss_items, device, data_embedding_func)
-        all_miss_embedding = data_embedding_func(miss_items)
+        budget = envs.SGLANG_MM_CROSS_REQUEST_BATCH_TOKEN_BUDGET.get()
+        split_embeddings: List[torch.Tensor] = []
+        for group_items, group_counts in _chunk_misses_by_token_budget(
+            miss_items, token_counts, budget
+        ):
+            group_embedding = data_embedding_func(group_items)
 
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached). Mirrors
-            # _get_chunked_embedding_by_item.
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
-        else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
-            )
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+            if isinstance(group_embedding, list):
+                # Per-item embeddings: no split needed, and each cache entry owns
+                # its storage (a torch.split view would pin the whole concatenated
+                # buffer for as long as any single item stays cached). Mirrors
+                # _get_chunked_embedding_by_item.
+                assert len(group_embedding) == len(group_items), (
+                    f"per-item embedding count {len(group_embedding)} != "
+                    f"cache-miss item count {len(group_items)}"
+                )
+                split_embeddings.extend(
+                    emb.reshape(-1, emb.shape[-1]) for emb in group_embedding
+                )
+            else:
+                group_embedding = group_embedding.reshape(
+                    -1, group_embedding.shape[-1]
+                )
+                split_embeddings.extend(
+                    torch.split(group_embedding, group_counts, dim=0)
+                )
         for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
             if embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb)):
                 cached = embedding_cache.get_single(cache_key[0])
