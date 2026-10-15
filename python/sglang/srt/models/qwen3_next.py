@@ -30,6 +30,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    NORM_READOUT,
     Fp8Input,
     NormQuantReadout,
 )
@@ -68,6 +69,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -80,6 +82,7 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -226,6 +229,20 @@ def _moe_accepts_fp8_tuple(mlp) -> bool:
     if shared is not None:
         return _linear_accepts_fp8_tuple(getattr(shared, "gate_up_proj", None))
     return _routed_experts_accept_pre_quant(mlp)
+
+
+def _ffn_read(mlp, is_layer_sparse: bool):
+    """The FFN stage's read declaration.
+
+    ``declare_ffn`` defaults to ``NORM_READOUT``, and ``NormQuantReadout`` is
+    not a drop-in substitute for it: on an empty batch the former keeps the
+    previous residual while the latter returns ``hidden_states`` as the
+    residual. Install the quantized read only when the fp8 will actually be
+    consumed, so every other backend and model keeps the stock behaviour.
+    """
+    if not (_use_aiter and is_layer_sparse and _moe_accepts_fp8_tuple(mlp)):
+        return NORM_READOUT
+    return NormQuantReadout(fp8_input=Fp8Input.TUPLE_AND_BF16)
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -711,13 +728,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 declare_ffn(
                     sparse=self.is_layer_sparse,
                     next_layer_sparse=is_next_layer_sparse,
-                    # Only the Qwen3Next MoE subclass unpacks the tuple; a dense
-                    # Qwen2MoeMLP layer keeps the plain AR+RMSNorm read.
-                    read=NormQuantReadout(
-                        fp8_input=Fp8Input.TUPLE_AND_BF16
-                        if self.is_layer_sparse and _moe_accepts_fp8_tuple(self.mlp)
-                        else None
-                    ),
+                    read=_ffn_read(self.mlp, self.is_layer_sparse),
                 ),
                 self.post_attention_layernorm,
             ),
@@ -890,13 +901,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 declare_ffn(
                     sparse=self.is_layer_sparse,
                     next_layer_sparse=is_next_layer_sparse,
-                    # Only the Qwen3Next MoE subclass unpacks the tuple; a dense
-                    # Qwen2MoeMLP layer keeps the plain AR+RMSNorm read.
-                    read=NormQuantReadout(
-                        fp8_input=Fp8Input.TUPLE_AND_BF16
-                        if self.is_layer_sparse and _moe_accepts_fp8_tuple(self.mlp)
-                        else None
-                    ),
+                    read=_ffn_read(self.mlp, self.is_layer_sparse),
                 ),
                 self.post_attention_layernorm,
             ),
