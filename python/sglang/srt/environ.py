@@ -1544,6 +1544,12 @@ class Envs:
     SGLANG_Q35MF_ARRIVE_PREWARM = EnvBool(False)
     # Chat requests forwarded as token ids skip the full-prompt decode.
     SGLANG_Q35MF_ARRIVE_SKIP_DECODE = EnvBool(False)
+    # Draft and draft-extend graph inputs are staged with one fused copy launch.
+    SGLANG_Q35MF_ARRIVE_DRAFT_COPY = EnvBool(False)
+    # Per-round result ids are copied to reused pinned host slots.
+    SGLANG_Q35MF_ARRIVE_D2H_RING = EnvBool(False)
+    # A decode batch unchanged since its stash reuses the relayed draft inputs.
+    SGLANG_Q35MF_ARRIVE_SKIP_REGATHER = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

@@ -201,6 +201,7 @@ from sglang.srt.managers.overlap_utils import (
     RelayPayload,
     decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
+    note_relayed_draft_input,
     resolve_forward_inputs,
 )
 from sglang.srt.managers.prefill_delayer import (
@@ -4878,6 +4879,7 @@ class Scheduler(
             # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
         self.future_map.stash(future_indices, payload)
+        note_relayed_draft_input(future_indices, batch_result.next_draft_input)
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )

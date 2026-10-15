@@ -10,6 +10,7 @@ import msgspec
 import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -18,10 +19,15 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
@@ -45,6 +51,56 @@ def allocate_distinct_stream(device_module, avoid_streams):
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
+
+
+# Results are consumed by the scheduler within two iterations; slots recycle after eight.
+_RESULT_HOST_RING_DEPTH = 8
+_RESULT_HOST_RING_ENABLED = envs.SGLANG_Q35MF_ARRIVE_D2H_RING.get()
+
+
+class _PinnedHostRing:
+    """Round-robin pinned host slots per (dtype, shape) for small device-to-host copies."""
+
+    def __init__(self, depth: int):
+        self._depth = depth
+        self._slots = {}
+
+    def copy(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == "cpu":
+            return tensor
+        key = (tensor.dtype, tensor.shape)
+        entry = self._slots.get(key)
+        if entry is None:
+            entry = self._slots[key] = [
+                [
+                    torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+                    for _ in range(self._depth)
+                ],
+                0,
+            ]
+        slots, cursor = entry
+        entry[1] = (cursor + 1) % self._depth
+        host = slots[cursor]
+        host.copy_(tensor, non_blocking=True)
+        tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
+        return host
+
+
+_result_host_ring_instance: Optional[_PinnedHostRing] = None
+
+
+def _result_host_ring() -> Optional[_PinnedHostRing]:
+    """The process ring, or None where results can stay in flight longer (pipeline
+    parallel) or pinned memory is unavailable."""
+    global _result_host_ring_instance, _RESULT_HOST_RING_ENABLED
+    if _result_host_ring_instance is None:
+        if get_parallel().pp_size > 1 or not is_pin_memory_available(
+            torch.device("cuda")
+        ):
+            _RESULT_HOST_RING_ENABLED = False
+            return None
+        _result_host_ring_instance = _PinnedHostRing(_RESULT_HOST_RING_DEPTH)
+    return _result_host_ring_instance
 
 
 @dataclasses.dataclass
@@ -159,12 +215,48 @@ class GenerationBatchResult:
     def get_num_generated_tokens(self, batch_size: int) -> int:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
+    def _copy_ids_to_pinned_ring(self) -> bool:
+        """Copy the per-round id tensors into reused pinned slots; False when this
+        result carries anything else that needs a host copy."""
+        logits_output = self.logits_output
+        if (
+            logits_output is not None
+            and (
+                logits_output.sampling_mask_output is not None
+                or logits_output.auxiliary_device_output is not None
+            )
+        ) or (
+            self.routed_experts_output is not None
+            or self.indexer_topk_output is not None
+            or self.expert_distribution_metrics is not None
+        ):
+            return False
+        ring = _result_host_ring()
+        if ring is None:
+            return False
+        self.next_token_ids = ring.copy(self.next_token_ids)
+        if self.accept_lens is not None:
+            self.accept_lens = ring.copy(self.accept_lens)
+        if self.block_accept_lens is not None:
+            self.block_accept_lens = ring.copy(self.block_accept_lens)
+        if self.cap_lens is not None:
+            self.cap_lens = ring.copy(self.cap_lens)
+        self.copy_done.record()
+        return True
+
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if (
+            _RESULT_HOST_RING_ENABLED
+            and not return_logprob
+            and not (return_hidden_states and self.logits_output.hidden_states is not None)
+            and self._copy_ids_to_pinned_ring()
+        ):
+            return
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(

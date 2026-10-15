@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -20,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.kernels.ops.memory.small_field_copy import small_field_copy
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
@@ -133,6 +135,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             draft_extend_attn_backend or eagle_worker.draft_extend_attn_backend
         )
         self.attn_backend = self.draft_extend_attn_backend
+        self._fused_input_copy = envs.SGLANG_Q35MF_ARRIVE_DRAFT_COPY.get()
+        self._input_views_cache = {}
 
         # Disable parent paths that don't apply.
         self.compile_bs = []
@@ -512,6 +516,109 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
+    def _input_views(self, raw_bs: int, num_tokens: int, bs: int) -> tuple:
+        # Static-buffer slices are rebuilt per call in the stock path; slicing costs
+        # several microseconds of host time each, so reuse them per shape.
+        buffers = self.buffers
+        key = (raw_bs, num_tokens, bs)
+        entry = self._input_views_cache.get(key)
+        if entry is not None and entry[0] is buffers:
+            return entry[1]
+        views = (
+            buffers.input_ids[:num_tokens],
+            buffers.seq_lens[:raw_bs],
+            buffers.out_cache_loc[:num_tokens],
+            buffers.positions[:num_tokens],
+            buffers.req_pool_indices[:raw_bs],
+            (
+                buffers.mrope_positions[:, :num_tokens]
+                if self.model_runner.model_config.model_is_mrope
+                else None
+            ),
+            buffers.extend_seq_lens[:raw_bs],
+            buffers.num_correct_drafts[:raw_bs],
+            buffers.num_accept_tokens[:raw_bs],
+            buffers.select_index[:raw_bs],
+            track_indices(buffers.mamba_track_indices, raw_bs),
+            (
+                buffers.hidden_states[:num_tokens]
+                if buffers.hidden_states is not None
+                else None
+            ),
+            buffers.extend_seq_lens[:bs],
+            track_indices(buffers.mamba_track_indices, bs),
+        )
+        self._input_views_cache[key] = (buffers, views)
+        return views
+
+    def _stage_inputs_fused(
+        self,
+        forward_batch: ForwardBatch,
+        select_index: torch.Tensor,
+        *,
+        raw_bs: int,
+        num_tokens: int,
+        bs: int,
+    ) -> bool:
+        """Stage the per-round inputs (hidden states included) with one copy launch;
+        False leaves every input to the stock copies."""
+        buffers = self.buffers
+        spec_info = forward_batch.spec_info
+        views = self._input_views(raw_bs, num_tokens, bs)
+        dsts = list(views[:5])
+        srcs = [
+            forward_batch.input_ids,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+            forward_batch.req_pool_indices,
+        ]
+        if views[5] is not None:
+            if (
+                bs * self.captured_req_width != num_tokens
+                or forward_batch.mrope_positions is None
+            ):
+                buffers.mrope_positions.zero_()
+            if forward_batch.mrope_positions is not None:
+                dsts.append(views[5])
+                srcs.append(forward_batch.mrope_positions)
+        if forward_batch.extend_seq_lens is not None:
+            dsts.append(views[6])
+            srcs.append(forward_batch.extend_seq_lens)
+        else:
+            views[6].fill_(self.captured_req_width)
+        if spec_info.num_correct_drafts is not None:
+            dsts.append(views[7])
+            srcs.append(spec_info.num_correct_drafts)
+            dsts.append(views[8])
+            srcs.append(spec_info.num_accept_tokens)
+        dsts.append(views[9])
+        srcs.append(select_index)
+        if (
+            buffers.mamba_track_indices is not None
+            and forward_batch.mamba_track_indices is not None
+            and raw_bs == bs
+        ):
+            dsts.append(views[10])
+            srcs.append(forward_batch.mamba_track_indices)
+        else:
+            refresh_track_indices(
+                buffers.mamba_track_indices,
+                forward_batch.mamba_track_indices,
+                raw_bs=raw_bs,
+                bs=bs,
+                copy_dsts=dsts,
+                copy_srcs=srcs,
+            )
+        if (
+            views[11] is not None
+            and spec_info.hidden_states is not None
+            and spec_info.hidden_states.shape[1] == buffers.hidden_states.shape[1]
+        ):
+            dsts.append(views[11])
+            srcs.append(spec_info.hidden_states)
+        return small_field_copy(dsts, srcs)
+
     def execute(self, forward_batch: ForwardBatch, select_index: torch.Tensor):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
@@ -541,59 +648,64 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
-        # Batch the small per-field device copies into a grouped foreach copy
-        # (one foreach call per dtype pair) to cut launch overhead. hidden_states
-        # is handled separately below (see note), and seq_lens_cpu is handled
-        # further down since it lives on host.
-        copy_dsts = [
-            buffers.input_ids[:num_tokens],
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[:num_tokens],
-            buffers.positions[:num_tokens],
-            buffers.req_pool_indices[:raw_bs],
-        ]
-        copy_srcs = [
-            forward_batch.input_ids,
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-            forward_batch.req_pool_indices,
-        ]
-        if self.model_runner.model_config.model_is_mrope:
-            if (
-                bs * self.captured_req_width != num_tokens
-                or forward_batch.mrope_positions is None
-            ):
-                buffers.mrope_positions.zero_()
-            if forward_batch.mrope_positions is not None:
-                copy_dsts.append(buffers.mrope_positions[:, :num_tokens])
-                copy_srcs.append(forward_batch.mrope_positions)
-        if forward_batch.extend_seq_lens is not None:
-            copy_dsts.append(buffers.extend_seq_lens[:raw_bs])
-            copy_srcs.append(forward_batch.extend_seq_lens)
-        else:
-            buffers.extend_seq_lens[:raw_bs].fill_(self.captured_req_width)
-        if forward_batch.spec_info.num_correct_drafts is not None:
-            copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
-            copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
-            copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
-            copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
-        copy_dsts.append(buffers.select_index[:raw_bs])
-        copy_srcs.append(select_index)
-        refresh_track_indices(
-            buffers.mamba_track_indices,
-            forward_batch.mamba_track_indices,
-            raw_bs=raw_bs,
-            bs=bs,
-            copy_dsts=copy_dsts,
-            copy_srcs=copy_srcs,
+        staged = self._fused_input_copy and self._stage_inputs_fused(
+            forward_batch, select_index, raw_bs=raw_bs, num_tokens=num_tokens, bs=bs
         )
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        if not staged:
+            # Batch the small per-field device copies into a grouped foreach copy
+            # (one foreach call per dtype pair) to cut launch overhead. hidden_states
+            # is handled separately below (see note), and seq_lens_cpu is handled
+            # further down since it lives on host.
+            copy_dsts = [
+                buffers.input_ids[:num_tokens],
+                buffers.seq_lens[:raw_bs],
+                buffers.out_cache_loc[:num_tokens],
+                buffers.positions[:num_tokens],
+                buffers.req_pool_indices[:raw_bs],
+            ]
+            copy_srcs = [
+                forward_batch.input_ids,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+                forward_batch.req_pool_indices,
+            ]
+            if self.model_runner.model_config.model_is_mrope:
+                if (
+                    bs * self.captured_req_width != num_tokens
+                    or forward_batch.mrope_positions is None
+                ):
+                    buffers.mrope_positions.zero_()
+                if forward_batch.mrope_positions is not None:
+                    copy_dsts.append(buffers.mrope_positions[:, :num_tokens])
+                    copy_srcs.append(forward_batch.mrope_positions)
+            if forward_batch.extend_seq_lens is not None:
+                copy_dsts.append(buffers.extend_seq_lens[:raw_bs])
+                copy_srcs.append(forward_batch.extend_seq_lens)
+            else:
+                buffers.extend_seq_lens[:raw_bs].fill_(self.captured_req_width)
+            if forward_batch.spec_info.num_correct_drafts is not None:
+                copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
+                copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
+                copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
+                copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
+            copy_dsts.append(buffers.select_index[:raw_bs])
+            copy_srcs.append(select_index)
+            refresh_track_indices(
+                buffers.mamba_track_indices,
+                forward_batch.mamba_track_indices,
+                raw_bs=raw_bs,
+                bs=bs,
+                copy_dsts=copy_dsts,
+                copy_srcs=copy_srcs,
+            )
+            _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
         if (
-            buffers.hidden_states is not None
+            not staged
+            and buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
             and forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
@@ -623,7 +735,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]
         )
-        forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
+        forward_batch.spec_info.extend_seq_lens_tensor = (
+            self._input_views(raw_bs, num_tokens, bs)[-2]
+            if staged
+            else buffers.extend_seq_lens[:bs]
+        )
 
         if bs != raw_bs:
             forward_batch.spec_info.positions = buffers.positions[:num_tokens]
@@ -647,13 +763,21 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
             ),
             encoder_lens=None,
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc=(
+                self._input_views(raw_bs, num_tokens, bs)[2]
+                if staged
+                else buffers.out_cache_loc[:num_tokens]
+            ),
             out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
             kv_loc_plan=forward_batch.kv_loc_plan,
             kv_loc_cols=forward_batch.kv_loc_cols,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             # Virtual input stays separate from the backend's physical buffer.
-            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
+            mamba_track_indices=(
+                self._input_views(raw_bs, num_tokens, bs)[-1]
+                if staged
+                else track_indices(buffers.mamba_track_indices, bs)
+            ),
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)

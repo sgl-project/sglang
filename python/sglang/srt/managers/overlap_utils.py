@@ -84,6 +84,33 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
+# Decode relay recorded by the scheduler: (future_indices, draft_input) of the last stash.
+_SKIP_SAME_BATCH_REGATHER = envs.SGLANG_Q35MF_ARRIVE_SKIP_REGATHER.get()
+_last_relay: Optional[tuple] = None
+
+
+def note_relayed_draft_input(future_indices, draft_input) -> None:
+    """Record the draft input the scheduler just stashed under ``future_indices``."""
+    global _last_relay
+    if _SKIP_SAME_BATCH_REGATHER:
+        _last_relay = None if draft_input is None else (future_indices, draft_input)
+
+
+def _draft_input_is_last_relay(batch: ScheduleBatch, future_map: FutureMap) -> bool:
+    # Same draft input object and same index tensor object as the stash: the batch was
+    # neither filtered nor merged since, so the gather would return these very rows.
+    record = _last_relay
+    draft_input = batch.spec_info
+    return (
+        record is not None
+        and draft_input is record[1]
+        and draft_input.future_indices is record[0]
+        and future_map.need_topk
+        and future_map.draft_probs_buf is None
+        and not draft_input.future_dsa_topk_indices_available
+    )
+
+
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
@@ -124,7 +151,14 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     # Only the overlap path relays spec extras through the future_map; the
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
     if batch.enable_overlap and not batch.spec_algorithm.is_none():
-        future_map._resolve_spec_extras(batch)
+        if _SKIP_SAME_BATCH_REGATHER and _draft_input_is_last_relay(batch, future_map):
+            draft_input = batch.spec_info
+            draft_input.bonus_tokens = draft_input.bonus_tokens.to(
+                future_map.output_tokens_buf.dtype
+            )
+            draft_input.dsa_topk_indices = None
+        else:
+            future_map._resolve_spec_extras(batch)
 
 
 CONFIDENCE_RELAY_RING_LAG: int = 2
