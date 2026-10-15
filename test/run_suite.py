@@ -1,6 +1,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 from typing import Dict, List, Optional
@@ -23,6 +24,8 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "mps": HWBackend.MPS,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -124,6 +127,19 @@ PER_COMMIT_SUITES = {
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
     ],
+    HWBackend.MPS: [
+        "stage-a-unit-test-mps",
+        # stage-b needs a self-hosted Apple Silicon runner; dispatched manually.
+        "stage-b-e2e-mps",
+    ],
+    # PPU has no suite in any of the three dicts yet: pr-test-ppu.yml only runs
+    # the runner preflight until the PPU SRT platform and AOT kernels land.
+    # Declaring a name here before a workflow dispatches it would let a test
+    # register, validate, and count as covered while never running, so each PPU
+    # suite name arrives with the job that runs it. Until then PPU is in
+    # _SUITE_CHECKED_BACKENDS with no valid suite, so validate_all_suites()
+    # rejects any register_ppu_ci() outright.
+    HWBackend.PPU: [],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -152,11 +168,14 @@ NIGHTLY_SUITES = {
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
         "nightly-amd-8-gpu-mi35x-glm53-flash",
+        "nightly-amd-accuracy-8-gpu-glm53",
+        "nightly-amd-8-gpu-mi35x-glm53",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         "nightly-amd-accuracy-8-gpu-deepseek-v4-flash",
         "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
+        "nightly-amd-4-gpu-mi35x-deepseek-v41-flash",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
     ],
@@ -194,10 +213,11 @@ NIGHTLY_SUITES = {
         "full-perf-16-npu-a3",
     ],
     HWBackend.XPU: [
-        "nightly-xpu-1-gpu",
-        "nightly-xpu-2-gpu",
-        "nightly-xpu-4-gpu",
-        "nightly-xpu-8-gpu",
+        "nightly-xpu-kernel-main-1-gpu",
+        "nightly-xpu-kernel-main-2-gpu",
+        "nightly-xpu-kernel-main-4-gpu",
+        "nightly-xpu-kernel-main-8-gpu",
+        "nightly-xpu-kernel-wheel-1-gpu",
     ],
 }
 
@@ -229,6 +249,8 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.MPS,
+    HWBackend.PPU,
 }
 
 
@@ -421,7 +443,19 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        timeout_overrides=dict(args.timeout_override),
     )
+
+
+def _parse_timeout_override(value: str) -> tuple[str, float]:
+    path, sep, seconds = value.rpartition("=")
+    try:
+        timeout = float(seconds)
+    except ValueError:
+        timeout = 0
+    if not sep or not path or not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError(f"expected PATH=SECONDS, got {value!r}")
+    return path, timeout
 
 
 def main():
@@ -458,6 +492,14 @@ def main():
         type=int,
         default=1200,
         help="The time limit for running one file in seconds (default: 1200).",
+    )
+    parser.add_argument(
+        "--timeout-override",
+        type=_parse_timeout_override,
+        action="append",
+        default=[],
+        metavar="PATH=SECONDS",
+        help="First-attempt timeout matched by path suffix; retries use --timeout-per-file. Repeatable.",
     )
     parser.add_argument(
         "--timeout-from-est-time",

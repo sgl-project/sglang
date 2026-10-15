@@ -94,14 +94,14 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         self.assertEqual(
             resolve_decode_precision(
                 self._server_args(vae_decode_precision_high="bf16"),
-                quality="extra-high",
+                quality="lossless",
             ),
             torch.float16,
         )
         self.assertEqual(
             resolve_decode_precision(
                 self._server_args(vae_decode_precision_high="bf16"),
-                quality="lossless",
+                quality="exact",
             ),
             torch.float16,
         )

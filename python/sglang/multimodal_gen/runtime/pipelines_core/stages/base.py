@@ -157,18 +157,9 @@ class PipelineStage(StageDedupMixin, ABC):
         # Default implementation - no verification
         return VerificationResult()
 
-    def maybe_free_model_hooks(self):
-        pass
-
     def load_model(self):
         """
         Load the model for the stage.
-        """
-        pass
-
-    def offload_model(self):
-        """
-        Offload the model for the stage.
         """
         pass
 
@@ -287,6 +278,12 @@ class PipelineStage(StageDedupMixin, ABC):
         )
         self._component_residency_manager.begin_use(use, module=module)
 
+    def finish_unused_declared_component(self, *, component_name: str, module=None):
+        if self._component_residency_manager is None:
+            return
+        use = self._declared_component_use(component_name=component_name)
+        self._component_residency_manager.finish_unused_component(use, module=module)
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
@@ -377,15 +374,6 @@ class PipelineStage(StageDedupMixin, ABC):
         return torch.device(
             current_platform.device_type,
         )
-
-    def set_logging(self, enable: bool):
-        """
-        Enable or disable logging for this stage.
-
-        Args:
-            enable: Whether to enable logging.
-        """
-        self._enable_logging = enable
 
     def __call__(
         self,

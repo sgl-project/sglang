@@ -13,6 +13,9 @@ from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    invalidate_conditioning_caches,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
@@ -53,6 +56,26 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = init_logger(__name__)
+
+# merge_mode "auto" keeps an adapter unmerged when merging it into the base
+# weights would round away more than this share of its update (by norm), i.e.
+# when the merge would destroy most of it. Distilled LoRAs sit below a BF16 ulp
+# of the weights (MiniMax-H3 Turbo loses 75%); style LoRAs keep most of theirs
+# (Wan Arcane-Jinx loses 14%, a Z-Image anime LoRA 31%) and would pay the
+# dynamic path's cost, up to +50% per step on small models, for little
+AUTO_MERGE_MAX_ROUNDING_LOSS = 0.5
+
+
+def merge_rounding_loss(lora_layers: dict) -> float | None:
+    """Share of the attached LoRA update (by norm) that merging it into the
+    layers' weight dtype would round away; None when nothing can be measured."""
+    lost = total = 0.0
+    for layer in lora_layers.values():
+        norms = layer.merge_rounding_norms()
+        if norms is not None:
+            lost += norms[0]
+            total += norms[1]
+    return (lost / total) ** 0.5 if total > 0 else None
 
 
 def _swap_peft_swiglu_fc1_lora_b(
@@ -184,6 +207,8 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_layers_critic = {}
         self.lora_layers_transformer_2 = {}
         self.is_lora_merged = {}
+        # merge_mode "auto": rounding loss per (module, paths, strengths, alphas)
+        self.auto_merge_rounding_loss = {}
         self.lora_initialized = False
         self.lora_rank = None
         self.lora_alpha = None
@@ -1036,6 +1061,14 @@ class LoRAPipeline(ComposedPipelineBase):
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
+    def _invalidate_lora_conditioning(self):
+        # LoRA targets DiTs; unrelated text and VAE weights remain unchanged
+        invalidate_conditioning_caches(
+            module
+            for name in ("transformer", "transformer_2", "fake_score_transformer")
+            if (module := self.modules.get(name)) is not None
+        )
+
     def set_lora(
         self,
         lora_nickname: str | list[str],
@@ -1055,6 +1088,7 @@ class LoRAPipeline(ComposedPipelineBase):
         stop costing anonymous host memory; pass it only for the startup
         (static) adapter, where the merged combination is stable.
         """
+        self._invalidate_lora_conditioning()
         merge_mode = self._resolve_lora_merge_mode(merge_weights, merge_mode)
 
         # Normalize inputs to lists for multi-LoRA support
@@ -1177,6 +1211,20 @@ class LoRAPipeline(ComposedPipelineBase):
                 # Apply LoRA to modules for this target
                 for module_name, lora_layers_dict in target_modules:
                     effective_merge_weights = merge_weights_by_module[module_name]
+                    if (
+                        effective_merge_weights
+                        and merge_mode == "auto"
+                        and len(tgt_nicknames) == 1
+                        and self._auto_merge_rounds_away(
+                            module_name,
+                            lora_layers_dict,
+                            tgt_nicknames,
+                            tgt_paths,
+                            rank,
+                            tgt_strengths,
+                        )
+                    ):
+                        effective_merge_weights = False
                     count = None
                     if not effective_merge_weights and not adapter_updated:
                         count = self._reactivate_cached_dynamic_lora_layers(
@@ -1241,6 +1289,48 @@ class LoRAPipeline(ComposedPipelineBase):
             merge_mode,
         )
 
+    def _auto_merge_rounds_away(
+        self,
+        module_name: str,
+        lora_layers: dict[str, BaseLayerWithLoRA],
+        nicknames: list[str],
+        paths: list[str | None],
+        rank: int,
+        strengths: list[float],
+    ) -> bool:
+        """Whether merge_mode "auto" should keep this adapter unmerged on the
+        module. It is attached unmerged to measure, which is where it stays."""
+        key = (
+            module_name,
+            tuple(paths),
+            tuple(strengths),
+            tuple(self.loaded_adapter_alphas.get(n) for n in nicknames),
+        )
+        if key not in self.auto_merge_rounding_loss:
+            self._apply_lora_to_layers(
+                lora_layers,
+                nicknames,
+                paths,
+                rank,
+                strengths,
+                clear_existing=True,
+                merge_weights=False,
+            )
+            self.auto_merge_rounding_loss[key] = merge_rounding_loss(lora_layers)
+        loss = self.auto_merge_rounding_loss[key]
+        if loss is None or loss <= AUTO_MERGE_MAX_ROUNDING_LOSS:
+            return False
+        if rank == 0:
+            logger.info(
+                "LoRA %s stays unmerged on %s: merging it into the base weights "
+                "would round away %.0f%% of its update. Pass "
+                "--lora-merge-mode merge to merge anyway.",
+                ",".join(str(p) for p in paths),
+                module_name,
+                100 * loss,
+            )
+        return True
+
     def _merge_via_cache(self, name, layer, merge_cache) -> None:
         """Merge one layer through the cache instead of in place.
 
@@ -1303,6 +1393,7 @@ class LoRAPipeline(ComposedPipelineBase):
         Disable LoRA for the specified target, regardless of whether weights were
         merged into the base model or are still active in the wrapped LoRA path.
         """
+        self._invalidate_lora_conditioning()
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("deactivate_lora_weights: %s", error)
@@ -1340,6 +1431,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     "transformer_2", "critic".
             strength: LoRA strength for merge, default 1.0.
         """
+        self._invalidate_lora_conditioning()
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("merge_lora_weights: %s", error)
@@ -1412,6 +1504,7 @@ class LoRAPipeline(ComposedPipelineBase):
             target: Which transformer(s) to unmerge. One of "all", "transformer",
                     "transformer_2", "critic".
         """
+        self._invalidate_lora_conditioning()
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("unmerge_lora_weights: %s", error)

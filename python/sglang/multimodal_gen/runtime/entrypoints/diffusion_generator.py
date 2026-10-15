@@ -398,7 +398,11 @@ class DiffGenerator:
                         save_outputs(
                             output_batch.output,
                             requests[0].data_type,
-                            requests[0].fps,
+                            (
+                                output_batch.fps
+                                if output_batch.fps is not None
+                                else requests[0].fps
+                            ),
                             requests[0].save_output,
                             lambda idx: output_requests[idx].output_file_path(),
                             audio=output_batch.audio,
@@ -407,6 +411,7 @@ class DiffGenerator:
                             audios_out=audios_out,
                             frames_out=frames_out,
                             output_compression=requests[0].output_compression,
+                            x264_preset=requests[0].x264_preset,
                             enable_frame_interpolation=requests[
                                 0
                             ].enable_frame_interpolation,
@@ -530,10 +535,17 @@ class DiffGenerator:
             return
         if self.server_args.warmup_mode != "off":
             total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
-            logger.info(
-                f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
-                total_duration_ms / 1000.0,
-            )
+            if results[0].metrics.get("warmup_failed"):
+                logger.warning(
+                    "Warmup failed, so this request ran cold: %.2f seconds "
+                    "includes first-use cost and is not a warmed-up timing",
+                    total_duration_ms / 1000.0,
+                )
+            else:
+                logger.info(
+                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                    total_duration_ms / 1000.0,
+                )
 
         peak_memories = [r.peak_memory_mb for r in results if r.peak_memory_mb]
         if peak_memories:
