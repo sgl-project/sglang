@@ -12,7 +12,7 @@
 `sglang-kernel` provides optimized compute primitives for LLM inference engines, enabling efficient inference for large language models and vision-language models through custom kernel operations. The source tree lives under the `python/sglang/kernels/aot/` directory and the Python import path remains `sgl_kernel`.
 
 ## Installation
-Requires torch == 2.14.1
+Requires torch == 2.15.0
 
 ```bash
 # Latest version
