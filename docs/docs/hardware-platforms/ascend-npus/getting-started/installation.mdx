@@ -415,13 +415,12 @@ cat /proc/sys/vm/swappiness # shows 10
 
 ## Running SGLang Service
 
-<Note>
-On the 950PR/DT Series, make sure `ASCEND_USE_FIA=1` is set before launching the server.
-</Note>
-
 ### Running Service For Large Language Models
 
 #### PD Mixed Scene
+
+<Tabs>
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 # Enabling CPU Affinity
@@ -433,9 +432,30 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+export ASCEND_USE_FIA=1
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --attention-backend ascend \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+  </Tab>
+</Tabs>
+
 #### PD Disaggregation Scene
 
 1. Launch Prefill Server
+
+<Tabs>
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 # Enabling CPU Affinity
@@ -458,7 +478,41 @@ python3 -m sglang.launch_server \
     --port 30001
 ```
 
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+export ASCEND_USE_FIA=1
+# PD disaggregation transfer protocol on the 950PR/DT Series
+export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
+
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 30001
+```
+
+  </Tab>
+</Tabs>
+
 2. Launch Decode Server
+
+<Tabs>
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 # PREFILL_IP: IP address of the first Prefill Server
@@ -476,6 +530,34 @@ python3 -m sglang.launch_server \
     --host 127.0.0.1 \
     --port 30002
 ```
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+export ASCEND_USE_FIA=1
+# PD disaggregation transfer protocol on the 950PR/DT Series
+export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
+
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 30002
+```
+
+  </Tab>
+</Tabs>
 
 3. Launch Router
 
@@ -498,6 +580,9 @@ The `8995` in command script is the disaggregation bootstrap port. It must match
 
 #### PD Mixed Scene
 
+<Tabs>
+  <Tab title="Ascend A3 Series">
+
 ```bash Command
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
@@ -512,6 +597,29 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --sampling-backend ascend
 ```
+
+  </Tab>
+  <Tab title="Ascend 950PR/DT Series">
+
+```bash Command
+# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+export ASCEND_USE_FIA=1
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --tp 4 \
+    --device npu \
+    --attention-backend ascend \
+    --mm-attention-backend ascend_attn \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --enable-multimodal \
+    --sampling-backend ascend
+```
+
+  </Tab>
+</Tabs>
 
 ## Testing the Service
 
