@@ -1516,7 +1516,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
-            block_tables = metadata.get_cache_page_table_64()
+            block_tables = metadata.get_logical_page_table()
 
         assert (
             forward_batch.seq_lens_cpu is not None
