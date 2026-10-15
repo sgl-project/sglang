@@ -121,6 +121,9 @@ class PostVerifyGraph:
         self._commit_done = torch.cuda.Event() if _SIDE_STREAM_COMMIT else None
         self._commit_pending = False
         self._max_top_k: Optional[int] = None
+        # Engagement counters: replayed rounds per key and rounds left to the stock path.
+        self._graph_rounds: Dict[tuple, int] = {}
+        self._stock_rounds = 0
         self._checked = 0
         self._mismatch = 0
 
@@ -161,9 +164,11 @@ class PostVerifyGraph:
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
         if key is None:
+            self._count_round(None)
             return None
         key = key + (uno_target_max_top_k,)
         self._max_top_k = uno_target_max_top_k
+        self._count_round(key)
         try:
             return self._run(key, batch, verify_input, logits_output, num_draft_tokens)
         except Exception:
@@ -172,6 +177,19 @@ class PostVerifyGraph:
             )
             self.disabled = True
             raise
+
+    def _count_round(self, key) -> None:
+        if key is None:
+            self._stock_rounds += 1
+        else:
+            self._graph_rounds[key] = self._graph_rounds.get(key, 0) + 1
+        total = self._stock_rounds + sum(self._graph_rounds.values())
+        if total % 2000 == 0:
+            logger.info(
+                "post-verify graph rounds: stock %d, graph %s",
+                self._stock_rounds,
+                self._graph_rounds,
+            )
 
     def join(self) -> None:
         """Makes the current stream wait for the last side-stream mamba state commit."""
@@ -310,7 +328,9 @@ class PostVerifyGraph:
                 return self._body(
                     slot.inputs, batch, verify_input, logits_output, num_draft_tokens
                 )[:6]
-            self._capture(slot, batch, verify_input, logits_output, num_draft_tokens)
+            self._capture(
+                slot, batch, verify_input, logits_output, num_draft_tokens, key=key
+            )
         else:
             self._load(slot, inputs, sim_len)
         slot.graph.replay()
@@ -382,7 +402,13 @@ class PostVerifyGraph:
             done.record()
 
     def _capture(
-        self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens
+        self,
+        slot: _Slot,
+        batch,
+        verify_input,
+        logits_output,
+        num_draft_tokens,
+        key=None,
     ):
         from sglang.srt.distributed.parallel_state import graph_capture
 
@@ -428,7 +454,12 @@ class PostVerifyGraph:
             slot.commit_graph = commit_graph
         slot.graph = graph
         slot.outputs = outputs
-        logger.info("Captured post-verify graph for bs=%d", len(batch.seq_lens))
+        logger.info(
+            "Captured post-verify graph for bs=%d key=%s side_commit=%s",
+            len(batch.seq_lens),
+            key,
+            slot.commit_graph is not None,
+        )
 
     def _body(
         self, x, batch, verify_input, logits_output, num_draft_tokens, commit=True
