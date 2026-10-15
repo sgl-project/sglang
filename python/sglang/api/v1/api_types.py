@@ -258,12 +258,13 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     mm_hashes: Optional[StringListOrList] = None
     video_data: Optional[MediaInput] = None
     audio_data: Optional[MediaInput] = None
-    lora_path: Optional[OptionalStringOrList] = None
+    extra_key: Optional[StringOrList] = None
     routing_key: Optional[str] = None
     priority: Optional[int] = None
     require_reasoning: Optional[bool] = None
     max_thinking_tokens: Optional[int] = None
     kv_hints: Optional[KvHintsEnvelopeOrList] = None
+    lora_path: Optional[OptionalStringOrList] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -1315,8 +1316,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["video_data"] = None if x is None else decode_MediaInput(x)
         elif key == "audio_data":
             kw["audio_data"] = None if x is None else decode_MediaInput(x)
-        elif key == "lora_path":
-            kw["lora_path"] = None if x is None else decode_OptionalStringOrList(x)
+        elif key == "extra_key":
+            kw["extra_key"] = None if x is None else decode_StringOrList(x)
         elif key == "routing_key":
             kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "priority":
@@ -1327,6 +1328,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
         elif key == "kv_hints":
             kw["kv_hints"] = None if x is None else decode_KvHintsEnvelopeOrList(x)
+        elif key == "lora_path":
+            kw["lora_path"] = None if x is None else decode_OptionalStringOrList(x)
     return GenerateRequest(**kw)
 
 
@@ -1376,8 +1379,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["video_data"] = encode_MediaInput(v.video_data)
     if v.audio_data is not None:
         d["audio_data"] = encode_MediaInput(v.audio_data)
-    if v.lora_path is not None:
-        d["lora_path"] = encode_OptionalStringOrList(v.lora_path)
+    if v.extra_key is not None:
+        d["extra_key"] = encode_StringOrList(v.extra_key)
     if v.routing_key is not None:
         d["routing_key"] = v.routing_key
     if v.priority is not None:
@@ -1388,6 +1391,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["max_thinking_tokens"] = v.max_thinking_tokens
     if v.kv_hints is not None:
         d["kv_hints"] = encode_KvHintsEnvelopeOrList(v.kv_hints)
+    if v.lora_path is not None:
+        d["lora_path"] = encode_OptionalStringOrList(v.lora_path)
     return d
 
 

@@ -1,6 +1,7 @@
 //! The shared handle: submission with admission and cancellation ownership,
 //! runtime-to-semantic event translation, and the typed control operations
-//! (model info, model list, server info, detokenize, health probe).
+//! (model info, model list, server info, weights check, detokenize, health
+//! probe).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
@@ -14,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
-use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
+use crate::message::io_struct::{CheckWeightsReqInput, ControlRequest, GetInternalStateReq};
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
@@ -305,6 +306,31 @@ impl CoreHandle {
             .map_err(|error| {
                 CoreError::InvalidResponse(format!("invalid internal-state response: {error}"))
             })
+    }
+
+    /// Ask every scheduler rank to run the weight checker's `action` on the
+    /// runners `selector` names, and relay each rank's checksum record.
+    pub(crate) async fn check_weights(
+        &self,
+        action: String,
+        allow_quant_error: bool,
+        skip_tensor_list: Option<Vec<String>>,
+        selector: String,
+    ) -> Result<CheckWeightsOutcome, CoreError> {
+        let bytes = self
+            .control(ControlRequest::CheckWeightsReqInput(
+                CheckWeightsReqInput::new(
+                    Rid::new().to_string(),
+                    action,
+                    allow_quant_error,
+                    skip_tensor_list,
+                    selector,
+                ),
+            ))
+            .await?;
+        rmp_serde::from_slice::<CheckWeightsOutcome>(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid weights-check response: {error}"))
+        })
     }
 
     async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
@@ -629,6 +655,17 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
             CoreError::InvalidResponse("unexpected non-generation response".into()),
         ),
     }
+}
+
+/// The scheduler's `CheckWeightsReqOutput`: whether every rank succeeded, why
+/// not, and one checksum record per rank (`None` when no rank produced one).
+#[derive(Debug, serde::Deserialize, PartialEq)]
+pub(crate) struct CheckWeightsOutcome {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) payload: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
 }
 
 /// Private scheduler response envelope. This MessagePack shape is decoded at

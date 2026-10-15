@@ -2,7 +2,7 @@
 // rust/sglang-server/src/message/request.rs's GenerateBody (request) and
 // api_core/frame.rs's frame shape (response). Unknown JSON keys on the
 // request are IGNORED: `deny_unknown_fields` broke real clients that send
-// Python-only `GenerateReqInput` fields (priority, extra_key, session_id,
+// Python-only `GenerateReqInput` fields (session_id,
 // ...), pinned by request.rs's unported-fields test.
 
 syntax = "proto3";
@@ -53,11 +53,15 @@ message GenerateRequest {
   optional StringListOrList mm_hashes = 20;
   optional MediaInput video_data = 21;
   optional MediaInput audio_data = 22;
+  // Prefix-cache namespace: requests share cached prefixes only under the same
+  // key. One key for every batch item, or one per item; an empty key means
+  // none.
+  StringOrList extra_key = 23;
 
   // Orchestrator controls used by native gRPC clients such as Dynamo.
   // `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
   // applies to every prompt, a list carries one (nullable) value per prompt.
-  OptionalStringOrList lora_path = 23;
+  OptionalStringOrList lora_path = 30;
   optional string routing_key = 24;
   reserved 25; // Trace-parent extraction is not implemented by the Rust frontend yet.
   optional int64 priority = 26;

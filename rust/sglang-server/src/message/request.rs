@@ -108,6 +108,7 @@ pub fn into_requests(
         require_reasoning,
         max_thinking_tokens,
         kv_hints,
+        extra_key,
     } = req;
     let rid = rid.and_then(wire::string_or_list);
     let text = text.and_then(wire::string_or_list);
@@ -132,6 +133,7 @@ pub fn into_requests(
     let video_data = video_data.map(wire::media_input).transpose()?;
     let audio_data = audio_data.map(wire::media_input).transpose()?;
     let mm_hashes = mm_hashes.and_then(wire::string_list_or_list);
+    let extra_key = extra_key.and_then(wire::string_or_list);
     let lora_path = lora_path.and_then(wire::optional_string_or_list);
 
     if max_thinking_tokens.is_some() && !policy.enable_strict_thinking {
@@ -313,6 +315,17 @@ pub fn into_requests(
     } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n)?;
     let bootstrap_pair_keys = flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
     let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
+    // Python `_normalize_extra_key`: one key broadcasts, a list is per item
+    // (batch requests only), and an empty key means none.
+    if !is_batch && matches!(extra_key, Some(OneOrMany::Many(_))) {
+        return Err(Error::Validation(
+            "extra_key should be a string for a single request.".into(),
+        ));
+    }
+    let extra_keys: Vec<Option<String>> = fan_out(extra_key, n, "extra_key")?
+        .into_iter()
+        .map(|key| key.filter(|key| !key.is_empty()))
+        .collect();
     // `mm_hashes` has no batch form: honoring it only here would give the two
     // servers different prefix-cache keys for the same body. Reject instead of
     // dropping it silently as Python does — the field exists to align a
@@ -362,6 +375,7 @@ pub fn into_requests(
         bootstrap_rooms,
         bootstrap_pair_keys,
         decode_tp_sizes,
+        extra_keys,
         images,
         videos,
         audios,
@@ -384,6 +398,7 @@ pub fn into_requests(
             bootstrap_room,
             bootstrap_pair_key,
             decode_tp_size,
+            extra_key,
             image_data,
             video_data,
             audio_data,
@@ -426,6 +441,7 @@ pub fn into_requests(
                 decode_tp_size,
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
+                extra_key,
                 lora_id,
                 routing_key: routing_key.clone(),
                 priority,
@@ -574,6 +590,9 @@ pub struct GenerateRequest {
     /// so these are pure passthrough for the scheduler/LB protocol.
     pub routed_dp_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
+    /// Prefix-cache namespace: requests share cached prefixes only under the
+    /// same key.
+    pub extra_key: Option<String>,
     /// Scheduler/orchestrator controls forwarded by the native API. `lora_id`
     /// accepts the preloaded adapter identifier; dynamic LoRA loading remains
     /// owned by the Python registry and is intentionally not implied here.
@@ -1087,7 +1106,6 @@ mod tests {
     #[test]
     fn unported_generate_req_input_fields_are_ignored() {
         for field in [
-            r#""extra_key": "k""#,
             r#""session_id": "s""#,
             r#""session_params": {"a": 1}"#,
             r#""return_sampling_mask": true"#,
@@ -1465,6 +1483,26 @@ mod tests {
 
         let err = requests(r#"{"text": ["a", "b"], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
         assert!(err.to_string().contains("bootstrap_room"), "{err}");
+    }
+
+    /// `extra_key` fans out like Python `_normalize_extra_key`: one key
+    /// broadcasts, a list is per item and must match the batch (and needs a
+    /// batch), and an empty key means none.
+    #[test]
+    fn extra_key_fans_out() {
+        let (ps, _) = requests(r#"{"text": "a", "extra_key": "salt"}"#).unwrap();
+        assert_eq!(ps[0].extra_key.as_deref(), Some("salt"));
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "extra_key": "salt"}"#).unwrap();
+        assert!(ps.iter().all(|p| p.extra_key.as_deref() == Some("salt")));
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "extra_key": ["k", ""]}"#).unwrap();
+        assert_eq!(ps[0].extra_key.as_deref(), Some("k"));
+        assert_eq!(ps[1].extra_key, None);
+        let (ps, _) = requests(r#"{"text": "a", "extra_key": ""}"#).unwrap();
+        assert_eq!(ps[0].extra_key, None);
+        assert!(requests(r#"{"text": "a", "extra_key": ["k"]}"#).is_err());
+
+        let err = requests(r#"{"text": ["a", "b"], "extra_key": ["k"]}"#).unwrap_err();
+        assert!(err.to_string().contains("extra_key"), "{err}");
     }
 
     /// The PD router (mini_lb) and PD-warmup payload shapes must parse. The

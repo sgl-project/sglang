@@ -1605,8 +1605,8 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.audio_data {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "audio_data", v)?;
         }
-        if let Some(v) = &self.lora_path {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "lora_path", v)?;
+        if let Some(v) = &self.extra_key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
         }
         if let Some(v) = &self.routing_key {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "routing_key", v)?;
@@ -1622,6 +1622,9 @@ impl ::serde::Serialize for GenerateRequest {
         }
         if let Some(v) = &self.kv_hints {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "kv_hints", v)?;
+        }
+        if let Some(v) = &self.lora_path {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "lora_path", v)?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
@@ -1661,12 +1664,13 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_mm_hashes = None;
                 let mut f_video_data = None;
                 let mut f_audio_data = None;
-                let mut f_lora_path = None;
+                let mut f_extra_key = None;
                 let mut f_routing_key = None;
                 let mut f_priority = None;
                 let mut f_require_reasoning = None;
                 let mut f_max_thinking_tokens = None;
                 let mut f_kv_hints = None;
+                let mut f_lora_path = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -1823,11 +1827,11 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_audio_data = Some(map.next_value::<Option<MediaInput>>()?);
                         }
-                        "lora_path" => {
-                            if f_lora_path.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("lora_path"));
+                        "extra_key" => {
+                            if f_extra_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("extra_key"));
                             }
-                            f_lora_path = Some(map.next_value::<Option<OptionalStringOrList>>()?);
+                            f_extra_key = Some(map.next_value::<Option<StringOrList>>()?);
                         }
                         "routing_key" => {
                             if f_routing_key.is_some() {
@@ -1864,6 +1868,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_kv_hints = Some(map.next_value::<Option<KvHintsEnvelopeOrList>>()?);
                         }
+                        "lora_path" => {
+                            if f_lora_path.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("lora_path"));
+                            }
+                            f_lora_path = Some(map.next_value::<Option<OptionalStringOrList>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -1892,12 +1902,13 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     mm_hashes: f_mm_hashes.flatten(),
                     video_data: f_video_data.flatten(),
                     audio_data: f_audio_data.flatten(),
-                    lora_path: f_lora_path.flatten(),
+                    extra_key: f_extra_key.flatten(),
                     routing_key: f_routing_key.flatten(),
                     priority: f_priority.flatten(),
                     require_reasoning: f_require_reasoning.flatten(),
                     max_thinking_tokens: f_max_thinking_tokens.flatten(),
                     kv_hints: f_kv_hints.flatten(),
+                    lora_path: f_lora_path.flatten(),
                 })
             }
         }

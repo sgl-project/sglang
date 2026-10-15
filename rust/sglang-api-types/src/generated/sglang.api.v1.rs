@@ -378,10 +378,15 @@ pub struct GenerateRequest {
     pub video_data: ::core::option::Option<MediaInput>,
     #[prost(message, optional, tag = "22")]
     pub audio_data: ::core::option::Option<MediaInput>,
+    /// Prefix-cache namespace: requests share cached prefixes only under the same
+    /// key. One key for every batch item, or one per item; an empty key means
+    /// none.
+    #[prost(message, optional, tag = "23")]
+    pub extra_key: ::core::option::Option<StringOrList>,
     /// Orchestrator controls used by native gRPC clients such as Dynamo.
     /// `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
     /// applies to every prompt, a list carries one (nullable) value per prompt.
-    #[prost(message, optional, tag = "23")]
+    #[prost(message, optional, tag = "30")]
     pub lora_path: ::core::option::Option<OptionalStringOrList>,
     #[prost(string, optional, tag = "24")]
     pub routing_key: ::core::option::Option<::prost::alloc::string::String>,

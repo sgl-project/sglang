@@ -54,7 +54,7 @@ wire_struct! {
         routing_key: Option<&'a str>,
         require_reasoning: bool,
         priority: Option<i64>,
-        extra_key: (),
+        extra_key: Option<&'a str>,
         no_logs: bool,
         return_bytes: bool,
         return_entropy: bool,
@@ -84,6 +84,15 @@ control_messages! {
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    /// `/weights_checker`'s control request: every scheduler rank runs the
+    /// weight checker's `action` on the runners `selector` names.
+    CheckWeightsReqInput {
+        action: String,
+        allow_quant_error: bool,
+        skip_tensor_list: Option<Vec<String>>,
+        selector: String,
+    }
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -130,7 +139,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             routing_key: req.routing_key.as_deref(),
             require_reasoning: req.require_reasoning,
             priority: req.priority,
-            extra_key: (),
+            extra_key: req.extra_key.as_deref(),
             no_logs: false,
             return_bytes: false,
             return_entropy: false,
@@ -149,6 +158,24 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl GetInternalStateReq {
     pub fn new(rid: String) -> Self {
         Self { rid }
+    }
+}
+
+impl CheckWeightsReqInput {
+    pub fn new(
+        rid: String,
+        action: String,
+        allow_quant_error: bool,
+        skip_tensor_list: Option<Vec<String>>,
+        selector: String,
+    ) -> Self {
+        Self {
+            rid,
+            action,
+            allow_quant_error,
+            skip_tensor_list,
+            selector,
+        }
     }
 }
 
@@ -183,6 +210,34 @@ mod tests {
         assert_eq!(arr[3].as_bool(), Some(false));
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
+    }
+
+    #[test]
+    fn check_weights_req_msgpack_shape() {
+        let b = CheckWeightsReqInput::new(
+            "7".into(),
+            "fingerprint".into(),
+            true,
+            Some(vec!["lm_head".into()]),
+            "target".into(),
+        )
+        .encode()
+        .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            7,
+            "CheckWeightsReqInput = [tag, rid, http_ipc, action, \
+             allow_quant_error, skip_tensor_list, selector]"
+        );
+        assert_eq!(arr[0].as_str(), Some("CheckWeightsReqInput"));
+        assert_eq!(arr[1].as_str(), Some("7"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_str(), Some("fingerprint"));
+        assert_eq!(arr[4].as_bool(), Some(true));
+        assert_eq!(arr[5][0].as_str(), Some("lm_head"));
+        assert_eq!(arr[6].as_str(), Some("target"));
     }
 
     /// The header must be positionally aligned: `input_embeds` (idx 5) /
@@ -286,7 +341,7 @@ mod tests {
     /// block (17–24) holding its defaults — a shift here silently routes KV
     /// transfers to the wrong host/room.
     #[test]
-    fn header_bootstrap_block_is_positionally_aligned() {
+    fn header_bootstrap_block_and_extra_key_are_positionally_aligned() {
         let req = GenerateRequest {
             rid: "r1".into(),
             text: Some("hi".into()),
@@ -297,6 +352,7 @@ mod tests {
             decode_tp_size: Some(2),
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
+            extra_key: Some("salt".into()),
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -315,5 +371,9 @@ mod tests {
         assert_eq!(arr[29].as_i64(), Some(2), "decode_tp_size at 29");
         assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
+        assert!(arr[32].is_nil(), "routing_key at 32");
+        assert_eq!(arr[33].as_bool(), Some(false), "require_reasoning at 33");
+        assert!(arr[34].is_nil(), "priority at 34");
+        assert_eq!(arr[35].as_str(), Some("salt"), "extra_key at 35");
     }
 }
