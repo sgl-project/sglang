@@ -329,11 +329,11 @@ def get_thread_caller_info() -> Optional[Tuple[str, str]]:
     registered via ``trace_set_thread_info``; otherwise ``None``.
 
     ``caller_role`` is the thread's ``thread_label`` (e.g. ``"Prefetch"`` /
-    ``"Backup"``). ``caller_id`` mirrors the rank+host segment of the scheduler
-    thread-span name (without the leading label, so it does not duplicate
-    ``caller_role``) and is forwarded to Mooncake so per-RPC spans attribute to
-    a specific dummy-client / TP rank. Returns ``None`` on threads that never
-    registered, so callers can omit the fields cleanly.
+    ``"Backup"``). ``caller_id`` is the thread's ranks, host and pid (without
+    the label, so it does not duplicate ``caller_role``) and is forwarded to
+    Mooncake so per-RPC spans attribute to a specific dummy-client / TP rank.
+    Returns ``None`` on threads that never registered, so callers can omit the
+    fields cleanly.
     """
     info = threads_info.get(threading.get_native_id())
     if info is None:
@@ -362,14 +362,11 @@ def start_root_span(
         external_trace_header or {}
     )
 
-    # Drop the worker_id added by MultiTokenizer
-    orig_rid = rid.split("_")[-1]
-    role = "" if role == "unified" else role
-    attrs = {"rid": orig_rid, "module": f"sglang::{module_name}"}
+    attrs = {"rid": rid, "module": f"sglang::{module_name}"}
     if bootstrap_room:
         attrs["bootstrap_room"] = str(hex(bootstrap_room))
     return tracer.start_span(
-        name=f"{role} Req {orig_rid[:8]}",
+        name="Req" if role == "unified" else f"{role} Req",
         start_time=ts,
         context=external_trace_context,
         attributes=attrs,
@@ -438,12 +435,11 @@ class TraceReqContext:
 
         thread_name = f"{thread_info.thread_label}"
         if thread_info.tp_rank is not None:
-            thread_name += f" [TP {thread_info.tp_rank}] "
+            thread_name += f" [TP {thread_info.tp_rank}]"
         if thread_info.pp_rank is not None:
-            thread_name += f" [PP {thread_info.pp_rank}] "
+            thread_name += f" [PP {thread_info.pp_rank}]"
         if thread_info.dp_rank is not None:
-            thread_name += f" [DP {thread_info.dp_rank}] "
-        thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
+            thread_name += f" [DP {thread_info.dp_rank}]"
         thread_context.thread_span = tracer.start_span(
             name=thread_name,
             start_time=ts,
