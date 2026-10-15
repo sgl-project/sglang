@@ -1,4 +1,6 @@
-"""Inference options for offline ModelSlim MXFP checkpoints."""
+"""Checkpoint conversion and inference options for offline ModelSlim MXFP."""
+
+import torch
 
 # msmodelslim names the exported rotations after the to_q/to_k projections
 # (`to_q_rot`/`to_k_rot`); earlier exports used `q_rot`/`k_rot`. The Wan weight
@@ -53,3 +55,22 @@ def mxfp4_quant_kwargs(description: dict) -> dict:
         "scale_alg": description.get("mxfp4_scale_alg", 2),
         "dst_type_max": description.get("mxfp4_dst_type_max", 7.25),
     }
+
+
+def pack_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
+    if weight.dtype == torch.uint8:
+        return weight
+    if weight.dtype != torch.float8_e4m3fn or weight.shape[-1] % 2:
+        raise ValueError(
+            "MXFP4 weights must be packed uint8 or even-width FP8 containers"
+        )
+    # Convert numeric E2M1 values before the loader casts to the target dtype.
+    values = weight.float()
+    magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=weight.device)
+    codes = torch.searchsorted(magnitudes, values.abs()).clamp(max=7)
+    if not torch.equal(magnitudes[codes], values.abs()):
+        raise ValueError(
+            "FP8 container contains values that are not representable as FP4 E2M1"
+        )
+    codes = (codes | (torch.signbit(values).long() << 3)).to(torch.uint8)
+    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()

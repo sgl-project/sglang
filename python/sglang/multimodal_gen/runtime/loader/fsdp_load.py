@@ -680,6 +680,15 @@ def load_model_from_full_model_state_dict(
         is_rank_local_shard = is_rank_local_fsdp_shard or is_rank_local_tp_shard
         full_tensor = loaded_tensor.tensor if is_rank_local_shard else loaded_tensor
 
+        actual_param = rank_local_checkpoint.get_param_for_weight_loading(
+            model, param_dict, target_param_name
+        )
+        checkpoint_transform = getattr(
+            actual_param, "checkpoint_weight_transform", None
+        )
+        if checkpoint_transform is not None:
+            full_tensor = checkpoint_transform(full_tensor)
+
         if not is_rank_local_shard:
             full_tensor = _maybe_dequantize_fp8(
                 full_tensor,
@@ -746,9 +755,6 @@ def load_model_from_full_model_state_dict(
             full_tensor = full_tensor.to(
                 device=checkpoint_load_device,
                 dtype=target_dtype,
-            )
-            actual_param = rank_local_checkpoint.get_param_for_weight_loading(
-                model, param_dict, target_param_name
             )
             weight_loader = (
                 getattr(actual_param, "weight_loader", None)
@@ -831,9 +837,6 @@ def load_model_from_full_model_state_dict(
         else:
             full_tensor = full_tensor.to(
                 device=checkpoint_load_device, dtype=target_dtype
-            )
-            actual_param = rank_local_checkpoint.get_param_for_weight_loading(
-                model, param_dict, target_param_name
             )
             weight_loader = (
                 getattr(actual_param, "weight_loader", None)

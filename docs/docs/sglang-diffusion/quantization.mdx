@@ -1326,6 +1326,11 @@ dual-scale weights require NZ. Each TP input partition must be divisible by 64 o
 single-level layers apply smoothing once before quantization; dual-scale layers
 pass it as `smooth_scale` to the quantization operator.
 
+Existing ModelSlim diffusion checkpoints with numeric FP8 containers `[out, in]`
+also load directly: the loader packs their FP4 values before dtype conversion and
+tensor-parallel slicing. Already-packed FP4 bytes and genuine MXFP8 weights retain
+their existing loading paths.
+
 Single-level layers follow MindIE-SD's schedule: W4A8 for the first two and last two
 denoising steps, and W4A4 otherwise. A 40-step run uses W4A8 at zero-based indices
 0, 1, 38, and 39 to retain higher activation precision at the ends of denoising.

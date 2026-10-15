@@ -7,9 +7,11 @@ import re
 import shutil
 from typing import Any, Dict, List
 
-import torch
 from safetensors.torch import load_file, save_file
 
+from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
+    pack_fp4_weight,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -113,25 +115,6 @@ def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
     for f in candidates:
         state_dict.update(load_file(f))
     return state_dict
-
-
-def pack_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
-    if weight.dtype == torch.uint8:
-        return weight
-    if weight.dtype != torch.float8_e4m3fn or weight.shape[-1] % 2:
-        raise ValueError(
-            "MXFP4 weights must be packed uint8 or even-width FP8 containers"
-        )
-    # Convert numeric E2M1 values before the loader casts to the target dtype.
-    values = weight.float()
-    magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=weight.device)
-    codes = torch.searchsorted(magnitudes, values.abs()).clamp(max=7)
-    if not torch.equal(magnitudes[codes], values.abs()):
-        raise ValueError(
-            "FP8 container contains values that are not representable as FP4 E2M1"
-        )
-    codes = (codes | (torch.signbit(values).long() << 3)).to(torch.uint8)
-    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
 
 
 def load_quant_description(model_path: pathlib.Path) -> Dict[str, Any]:

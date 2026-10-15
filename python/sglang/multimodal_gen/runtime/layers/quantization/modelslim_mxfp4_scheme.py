@@ -16,6 +16,7 @@ import torch
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
     default_mxfp4_policy,
     mxfp4_quant_kwargs,
+    pack_fp4_weight,
     resolve_precision,
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
@@ -92,7 +93,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
                 f"{self.prefix}: MXFP4 input partition must be divisible by {alignment}"
             )
 
-        # wan_repack converts numeric FP8 containers to packed FP4 bytes.
+        # Legacy FP8 containers must be packed before generic loader casts.
         weight = ModelWeightParameter(
             data=torch.empty(
                 (
@@ -106,6 +107,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             weight_loader=weight_loader,
         )
         weight.missing_param_init = "error"
+        weight.checkpoint_weight_transform = pack_fp4_weight
         layer.register_parameter("weight", weight)
 
         # L1 block scale: uint8 [out, in/32], e8m0 scale with +127 offset.
