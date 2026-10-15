@@ -1043,7 +1043,7 @@ class MqaAttentionBase(nn.Module):
                 else 0
             )
         )
-        freqs_cis = precompute_freqs_cis(
+        self.rope_kwargs = dict(
             dim=self.qk_rope_head_dim,
             seqlen=config.max_position_embeddings,
             original_seq_len=original_seq_len,
@@ -1052,6 +1052,7 @@ class MqaAttentionBase(nn.Module):
             beta_fast=scaling.get("beta_fast", 32),
             beta_slow=scaling.get("beta_slow", 1),
         )
+        freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
@@ -1292,7 +1293,14 @@ class MQALayer(MqaAttentionBase):
             and _is_cuda
             and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
         )
-        self.mega_cos_sin_cache = self.mega_wo_a = None
+        self.mega_cos_sin_cache = None
+        if self.use_mega_attention:
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                precompute_cos_sin_table,
+            )
+
+            self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
+        self.mega_wo_a = None
         self.mega_wq_b_permuted = False
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
@@ -1322,14 +1330,15 @@ class MQALayer(MqaAttentionBase):
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
 
-    def setup_mega_attention(self, cos_sin_cache: torch.Tensor) -> None:
+    def setup_mega_attention(self) -> None:
+        if not self.use_mega_attention:
+            return
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
             interleave_output_columns,
             interleave_query_rows,
             quantize_wo_a,
         )
 
-        self.mega_cos_sin_cache = cos_sin_cache
         self.mega_wq_b_permuted = (
             self.n_local_heads in (64, 128) and self._wq_b_uses_flashinfer_mxfp8()
         )
@@ -5097,15 +5106,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
 
-        from sglang.srt.layers.attention.deepseek_v4_mega_backend import cos_sin_table
-
-        cos_sin_tables: dict[int, torch.Tensor] = {}
         for module in self.modules():
-            if isinstance(module, MQALayer) and module.use_mega_attention:
-                key = id(module.freqs_cis)
-                if key not in cos_sin_tables:
-                    cos_sin_tables[key] = cos_sin_table(module.freqs_cis)
-                module.setup_mega_attention(cos_sin_tables[key])
+            if isinstance(module, MQALayer):
+                module.setup_mega_attention()
 
         if is_nextn:
             return
