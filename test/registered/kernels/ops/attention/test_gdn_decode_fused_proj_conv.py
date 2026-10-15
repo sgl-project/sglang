@@ -12,9 +12,10 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 # CUDA; the presence of the optional sgl_kernel AOT extension does not reroute
 # GDN decode through srt.layers.attention.mamba.causal_conv1d.
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=7, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=7, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _reference(
@@ -187,6 +188,39 @@ class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
         torch.testing.assert_close(state_test, ref[4], rtol=0, atol=0)
         self.assertEqual(b.data_ptr() % 32, 0)
         self.assertEqual(a.data_ptr() % 32, 0)
+
+    def test_empty_batch_returns_without_launching(self):
+        """An idle DP rank must not reach the zero-grid launch (HIP)."""
+        device = "cuda"
+        dtype = torch.float16
+        qkv_dim, v_dim, num_v_heads, head_v_dim, width, state_len = 32, 64, 4, 16, 4, 3
+        qkvz = torch.randn(0, qkv_dim + v_dim, device=device, dtype=dtype)
+        ba = torch.randn(0, 2 * num_v_heads, device=device, dtype=dtype)
+        weight = torch.randn(qkv_dim, width, device=device, dtype=dtype) * 0.1
+        state = torch.randn(3, qkv_dim, state_len, device=device, dtype=dtype)
+        state_before = state.clone()
+        indices = torch.empty(0, device=device, dtype=torch.int32)
+
+        out, z, b, a = fused_qkvzba_causal_conv1d_update_contiguous(
+            qkvz,
+            ba,
+            state,
+            weight,
+            None,
+            indices,
+            qkv_dim=qkv_dim,
+            v_dim=v_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            activation="silu",
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(out.shape[0], 0)
+        self.assertEqual(z.shape[0], 0)
+        self.assertEqual(b.shape, (0, num_v_heads))
+        self.assertEqual(a.shape, (0, num_v_heads))
+        torch.testing.assert_close(state, state_before, rtol=0, atol=0)
 
     def test_random_shapes_widths_dtypes_and_state_updates(self):
         cases = (
