@@ -547,6 +547,13 @@ def _cco_lsa_size(comm) -> int:
 
 def _epv2_arena_bytes(cfg) -> int:
     """Upper bound of the MORI EPv2 intranode symmetric arena for `cfg`."""
+    if getattr(cfg, "async_ll", False):
+        # AsyncLL lays its arena out like the internode kernels plus send-side
+        # staging; take MORI's region table instead of re-deriving it.
+        from mori.ops.dispatch_combine_v2.internode_regions import asyncll_regions
+
+        regions = asyncll_regions(cfg)
+        return sum(nbytes for _, nbytes in regions) + len(regions) * 256
     cap = cfg.effective_max_recv
     topk = cfg.num_experts_per_token
     # The hip backend pads scale rows to 128 B; flydsl uses the unpadded row.
@@ -612,11 +619,13 @@ def init_mori_epv2_op(
     num_local_experts: int,
     hidden_size: int,
     params_dtype: torch.dtype,
-    max_tokens_per_rank: int,
+    num_max_dispatch_tokens_per_rank: int,
+    deepep_mode: DeepEPMode,
     instance_id: int = 0,
-    max_total_recv_tokens: int = 0,
     dispatch_dtype: DispatchDtype = DispatchDtype.bf16,
     combine_dtype: CombineDtype = CombineDtype.bf16,
+    enable_sdma: bool = False,
+    max_total_recv_tokens: int = 0,
     launch_config: _MoriEPv2LaunchConfig = _MoriEPv2LaunchConfig(
         None, None, None, None
     ),
@@ -650,7 +659,7 @@ def init_mori_epv2_op(
         rank=rank,
         world_size=world_size,
         hidden_dim=hidden_size,
-        max_num_inp_token_per_rank=max_tokens_per_rank,
+        max_num_inp_token_per_rank=num_max_dispatch_tokens_per_rank,
         num_experts_per_rank=num_local_experts,
         num_experts_per_token=router_topk,
         data_type=torch.bfloat16,
@@ -662,6 +671,17 @@ def init_mori_epv2_op(
         quant_type=_EPV2_COMBINE_QUANT[combine_dtype],
         max_total_recv_tokens=max_total_recv_tokens,
     )
+    # As in init_mori_op: low_latency or SDMA selects the AsyncLL kernels. MORI's
+    # "sdma" transport needs MORI_ENABLE_SDMA for cco's SDMA queues; "lsa" needs none.
+    async_ll = deepep_mode.enable_low_latency() or enable_sdma
+    async_ll_transport = "sdma" if enable_sdma else "lsa"
+    if async_ll:
+        if "async_ll" not in EpDispatchCombineConfig.__dataclass_fields__:
+            raise ValueError(
+                "MORI EPv2 with deepep_mode=low_latency or MORI_ENABLE_SDMA=1 needs "
+                "a MORI build with EPv2 AsyncLL (EpDispatchCombineConfig.async_ll)"
+            )
+        cfg_kwargs.update(async_ll=True, async_ll_transport=async_ll_transport)
     cfg = EpDispatchCombineConfig(
         **cfg_kwargs,
         dispatch_block_num=launch_config.dispatch_block_num,
@@ -700,11 +720,12 @@ def init_mori_epv2_op(
     logger.info(
         f"[MORI EPv2 init] world={world_size} rank={rank} lsa_size={lsa_size} "
         f"hidden={hidden_size} experts={num_experts} local_experts={num_local_experts} "
-        f"topk={router_topk} max_tokens={max_tokens_per_rank} "
+        f"topk={router_topk} max_tokens={num_max_dispatch_tokens_per_rank} "
         f"recv_cap={cfg.effective_max_recv} "
         f"dispatch_dtype={dispatch_dtype} combine_dtype={combine_dtype} "
         f"combine_mode={cfg.combine_mode} launch_config={launch_config} "
-        f"schedule={cfg.schedule}"
+        f"schedule={cfg.schedule} async_ll={async_ll}"
+        + (f" async_ll_transport={async_ll_transport}" if async_ll else "")
     )
     return op
 
@@ -1352,16 +1373,11 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPv1DispatcherImplBase):
         return combined_hidden_states
 
 
-class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
+class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
     _is_epv2 = True
 
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
-        if (
-            not self.deepep_mode.enable_normal()
-            or self.deepep_mode.enable_low_latency()
-        ):
-            raise ValueError("MORI EPv2 currently supports normal mode only")
         try:
             from mori.cco import Communicator  # noqa: F401
             from mori.ops.dispatch_combine_v2 import EpDispatchCombineOp  # noqa: F401
@@ -1373,11 +1389,12 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         # EPv2 forwards exactly top-k routed experts and has no fake expert slot.
         os.environ.setdefault("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "1")
         self.async_finish = async_finish
-        # Same dual-stream setup as EPv1 normal; dispatch_b/combine_b order the
-        # comm stream with the events async_finish records.
-        if self._tbo_enabled and async_finish:
-            self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
-        self._launch_config = _get_epv2_launch_config(self._tbo_enabled)
+        self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
+        # Under SDMA or low_latency MORI derives its grids from the CU count, so
+        # keep its geometry.
+        self._launch_config = _get_epv2_launch_config(
+            self._tbo_enabled and not self._uses_async_ll
+        )
         self._mori_op = None
         self.fp8_quant_func = None
         self.fp4_quant_func = None
@@ -1387,8 +1404,15 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
             self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
 
+    @property
+    def _uses_async_ll(self) -> bool:
+        # Whether init_mori_epv2_op builds an AsyncLL op (SDMA or low_latency).
+        raise NotImplementedError
+
     def set_quant_config(self, quant_config: dict) -> None:
         super().set_quant_config(quant_config)
+        if self._uses_async_ll:
+            self._restrict_transport_dtypes()
         # All EPv2 quant funcs are bound together, only when Aiter is available.
         if self.dispatch_dtype != DispatchDtype.bf16 and self.fp4_quant_func is None:
             raise RuntimeError(
@@ -1400,6 +1424,22 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
 
     def _default_combine_dtype(self, weight_dtype) -> CombineDtype:
         return CombineDtype.bf16
+
+    def _restrict_transport_dtypes(self) -> None:
+        # The SDMA / low_latency kernels move bf16 or fp8 tokens and combine
+        # unquantized.
+        if self.dispatch_dtype == DispatchDtype.fp4:
+            logger.warning_once(
+                "MORI EPv2 SDMA / low_latency transport has no fp4 dispatch; "
+                "falling back to bf16 dispatch."
+            )
+            self.dispatch_dtype = DispatchDtype.bf16
+        if self.combine_dtype != CombineDtype.bf16:
+            logger.warning_once(
+                f"MORI EPv2 SDMA / low_latency transport has no {self.combine_dtype} "
+                "combine; falling back to bf16 combine."
+            )
+            self.combine_dtype = CombineDtype.bf16
 
     def _apply_combine_dtype_override(self):
         if envs.SGLANG_MORI_COMBINE_DTYPE.is_set():
@@ -1451,10 +1491,12 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self.hidden_size,
             self.params_dtype,
             self.num_max_dispatch_tokens_per_rank,
+            self.deepep_mode,
             self.instance_id,
-            envs.SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS.get(),
             self.dispatch_dtype,
             self.combine_dtype,
+            self.enable_sdma,
+            envs.SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS.get(),
             self._launch_config,
         )
         # Keep logical caps on the power-of-two ladder init_mori_epv2_op pre-compiled.
@@ -1475,10 +1517,14 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         return self.mori_op.cfg.effective_max_recv
 
     def _is_recv_layout_verified(self) -> bool:
-        # Older MORI builds lack these fields; keep their full receive view.
-        return not getattr(self.mori_op.cfg, "is_internode", True) and getattr(
-            self.mori_op, "backend_name", "unknown"
-        ) in ("flydsl", "hip")
+        # Older MORI builds lack these fields; keep their full receive view. The
+        # SDMA / low_latency receive layout has not been checked against
+        # mori_recv_bound.
+        return (
+            not self._uses_async_ll
+            and not getattr(self.mori_op.cfg, "is_internode", True)
+            and getattr(self.mori_op, "backend_name", "unknown") in ("flydsl", "hip")
+        )
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if hidden_states.dtype != torch.bfloat16:
@@ -1494,37 +1540,17 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             topk_output.topk_ids.to(torch.int32),
         )
 
+    def _dispatch_transport(
+        self, hidden_states, topk_weights, topk_ids, scale, ready_event
+    ):
+        raise NotImplementedError
+
     def dispatch_b(
         self, hidden_states, topk_weights, topk_ids, scale, output_dtype, ready_event
     ) -> DispatchOutput:
-        kwargs = {"return_routing": True}
-        if _supports_dynamic_recv_cap(self.mori_op):
-            # A manual cap is an exact MoE input limit, not a MORI graph tier.
-            # Keep the full transport view so arbitrary caps need no new JIT
-            # specialization during capture; AITER applies the logical slice.
-            dispatch_cap = (
-                self.mori_op.cfg.effective_max_recv
-                if self._manual_recv_cap > 0 or self._recv_cap == 0
-                else self._recv_cap
-            )
-            kwargs.update(recv_cap=dispatch_cap, clone_routing=False)
-        if self._comm_stream is None:
-            result = self.mori_op.dispatch(
-                hidden_states, topk_weights, scale, topk_ids, **kwargs
-            )
-        else:
-            compute_stream = torch.cuda.current_stream()
-            keepalive = (hidden_states, topk_weights, topk_ids, scale)
-            with torch.cuda.stream(self._comm_stream):
-                assert ready_event is not None
-                self._comm_stream.wait_event(ready_event)
-                result = self.mori_op.dispatch(
-                    hidden_states, topk_weights, scale, topk_ids, **kwargs
-                )
-                done_event = torch.cuda.Event(blocking=False, interprocess=False)
-                done_event.record(self._comm_stream)
-            compute_stream.wait_event(done_event)
-            del keepalive
+        result = self._dispatch_transport(
+            hidden_states, topk_weights, topk_ids, scale, ready_event
+        )
         (
             recv_hidden,
             recv_weights,
@@ -1569,8 +1595,81 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             recv_cap=self._recv_cap,
         )
 
+    def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
+        raise NotImplementedError
+
     def combine_b(self, hidden_states, topk_ids, topk_weights, ready_event):
-        if self._comm_stream is None:
+        out = self._combine_transport(
+            hidden_states, topk_ids, topk_weights, ready_event
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            del self._routing
+        return out
+
+
+class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
+    def __init__(self, async_finish: bool, **kwargs):
+        super().__init__(async_finish=async_finish, **kwargs)
+        # Same dual-stream setup as EPv1 normal; dispatch_b/combine_b order the
+        # comm stream with the events async_finish records. SDMA needs none (see
+        # _uses_async_ll): the send half returns at once and the recv half waits.
+        if self._tbo_enabled and async_finish and not self._uses_async_ll:
+            self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+
+    @property
+    def _uses_async_ll(self) -> bool:
+        # MORI EPv2 reaches SDMA only through its AsyncLL send/recv kernels, so
+        # init_mori_epv2_op builds an AsyncLL op under SDMA; normal runs the two
+        # halves back to back.
+        return self.enable_sdma
+
+    def _dispatch_transport(
+        self, hidden_states, topk_weights, topk_ids, scale, ready_event
+    ):
+        kwargs = {"return_routing": True}
+        if not self._uses_async_ll and _supports_dynamic_recv_cap(self.mori_op):
+            # A manual cap is an exact MoE input limit, not a MORI graph tier.
+            # Keep the full transport view so arbitrary caps need no new JIT
+            # specialization during capture; AITER applies the logical slice.
+            dispatch_cap = (
+                self.mori_op.cfg.effective_max_recv
+                if self._manual_recv_cap > 0 or self._recv_cap == 0
+                else self._recv_cap
+            )
+            kwargs.update(recv_cap=dispatch_cap, clone_routing=False)
+        if self.enable_sdma:
+            # SDMA: send and receive back to back (see _uses_async_ll).
+            result = self.mori_op.dispatch_send(
+                hidden_states, topk_weights, scale, topk_ids, return_routing=True
+            )
+            self.mori_op.dispatch_recv()
+        elif self._comm_stream is None:
+            result = self.mori_op.dispatch(
+                hidden_states, topk_weights, scale, topk_ids, **kwargs
+            )
+        else:
+            compute_stream = torch.cuda.current_stream()
+            keepalive = (hidden_states, topk_weights, topk_ids, scale)
+            with torch.cuda.stream(self._comm_stream):
+                assert ready_event is not None
+                self._comm_stream.wait_event(ready_event)
+                result = self.mori_op.dispatch(
+                    hidden_states, topk_weights, scale, topk_ids, **kwargs
+                )
+                done_event = torch.cuda.Event(blocking=False, interprocess=False)
+                done_event.record(self._comm_stream)
+            compute_stream.wait_event(done_event)
+            del keepalive
+        return result
+
+    def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
+        if self.enable_sdma:
+            # SDMA: send and receive back to back (see _uses_async_ll).
+            out, _ = self.mori_op.combine_send(
+                hidden_states, None, self._recv_topk_ids, routing=self._routing
+            )
+            self.mori_op.combine_recv()
+        elif self._comm_stream is None:
             out, _ = self.mori_op.combine(
                 hidden_states, None, self._recv_topk_ids, routing=self._routing
             )
@@ -1593,8 +1692,60 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
                 done_event.record(self._comm_stream)
             compute_stream.wait_event(done_event)
             del keepalive
-        if not torch.cuda.is_current_stream_capturing():
-            del self._routing
+        return out
+
+
+class _MoriEPv2DispatcherImplLowLatency(_MoriEPv2DispatcherImplBase):
+    """MORI EPv2 on AsyncLL kernels with send in *_a and receive in *_b, so a TBO
+    sibling batch computes while the transfer drains."""
+
+    def __init__(self, async_finish: bool, **kwargs):
+        super().__init__(async_finish=async_finish, **kwargs)
+        # Send halves in flight, completed by dispatch_b / combine_b.
+        self._pending_dispatch = None
+        self._pending_combine = None
+
+    @property
+    def _uses_async_ll(self) -> bool:
+        return True
+
+    def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        state = super().dispatch_a(hidden_states, topk_output)
+        # The returned views are valid only after dispatch_recv; the inputs stay
+        # alive in `state` until then.
+        hidden_states, topk_weights, topk_ids, scale = state[:4]
+        self._pending_dispatch = self.mori_op.dispatch_send(
+            hidden_states, topk_weights, scale, topk_ids, return_routing=True
+        )
+        return state
+
+    def _dispatch_transport(
+        self, hidden_states, topk_weights, topk_ids, scale, ready_event
+    ):
+        result = self._pending_dispatch
+        self._pending_dispatch = None
+        assert result is not None, "MORI EPv2 AsyncLL dispatch_b without dispatch_a"
+        self.mori_op.dispatch_recv()
+        return result
+
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        state = super().combine_a(hidden_states, topk_ids, topk_weights)
+        # The output is valid only after combine_recv.
+        self._pending_combine, _ = self.mori_op.combine_send(
+            hidden_states, None, self._recv_topk_ids, routing=self._routing
+        )
+        return state
+
+    def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
+        out = self._pending_combine
+        self._pending_combine = None
+        assert out is not None, "MORI EPv2 AsyncLL combine_b without combine_a"
+        self.mori_op.combine_recv()
         return out
 
 
@@ -1656,9 +1807,15 @@ class MoriEPDispatcher(BaseDispatcher):
         )
 
         if self._is_epv2:
-            self._normal_dispatcher = _MoriEPv2DispatcherImplNormal(
-                async_finish=async_finish, **common_kwargs
-            )
+            # deepep_mode is normal or low_latency here; auto became normal above.
+            if self.deepep_mode.enable_low_latency():
+                self._low_latency_dispatcher = _MoriEPv2DispatcherImplLowLatency(
+                    async_finish=async_finish, **common_kwargs
+                )
+            else:
+                self._normal_dispatcher = _MoriEPv2DispatcherImplNormal(
+                    async_finish=async_finish, **common_kwargs
+                )
         else:
             if self.deepep_mode.enable_low_latency():
                 self._low_latency_dispatcher = _MoriEPDispatcherImplLowLatency(
@@ -1749,8 +1906,6 @@ class MoriEPDispatcher(BaseDispatcher):
         return self._get_impl().combine_b(*inner_state)
 
     def _get_impl(self) -> _MoriEPDispatcherImplBase:
-        if self._is_epv2:
-            return self._normal_dispatcher
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:

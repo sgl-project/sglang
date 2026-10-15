@@ -403,6 +403,7 @@ class TboDPAttentionPreparer:
 
         deepep_mode = get_deepep_mode()
         enable_a2a_moe = not get_moe_a2a_backend().is_none()
+        ll_supports_extend = get_moe_a2a_backend().low_latency_supports_extend()
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
@@ -442,6 +443,7 @@ class TboDPAttentionPreparer:
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_a2a_moe
+                and not ll_supports_extend
                 and (resolved_deepep_mode.is_low_latency())
             )
         else:
