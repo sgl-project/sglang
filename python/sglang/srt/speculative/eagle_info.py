@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
@@ -9,6 +9,9 @@ from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.eagle_adaptive_verify import RaggedVerifyForward
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ class EagleVerifyInput(SpecInput):
     # The iteration's plan when the draft planned the verify window
     # (`prepared_out_cache_loc`); verify and draft extend take it.
     kv_loc_plan: Optional[KVLocPlan] = None
+    ragged_forward: Optional["RaggedVerifyForward"] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.

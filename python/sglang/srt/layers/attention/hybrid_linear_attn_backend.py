@@ -16,6 +16,9 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
+from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+    build_ragged_dense_row_maps,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -113,6 +116,8 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self.ragged_dense_rows_buf: Optional[torch.Tensor] = None
+        self.ragged_packed_rows_buf: Optional[torch.Tensor] = None
         self.conv_states_shape: tuple[int, int] = None
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
@@ -181,6 +186,8 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_recompute_dst = None
         logical_num_tokens = None
         track_mask_indices = None
+        ragged_dense_rows = None
+        ragged_packed_rows = None
 
         # Padded rows carry req-pool row 0, which maps to the reserved mamba
         # padding slot 0 in both the static and the unified pool.
@@ -284,6 +291,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 if ragged_layout is not None:
                     # Compact ragged verify: variable per-request verify lens.
                     query_start_loc = ragged_layout.qo_indptr_device
+                    ragged_dense_rows, ragged_packed_rows = build_ragged_dense_row_maps(
+                        query_start_loc=query_start_loc,
+                        num_packed_rows=forward_batch.input_ids.shape[0],
+                        draft_token_num=forward_batch.spec_info.draft_token_num,
+                    )
                 else:
                     query_start_loc = torch.arange(
                         0,
@@ -361,6 +373,8 @@ class MambaAttnBackendBase(AttentionBackend):
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
+            ragged_dense_rows=ragged_dense_rows,
+            ragged_packed_rows=ragged_packed_rows,
         )
 
     def init_forward_metadata_out_graph(
@@ -661,6 +675,12 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        self.ragged_dense_rows_buf = torch.full(
+            (max_num_tokens,), -1, dtype=torch.int64, device=self.device
+        )
+        self.ragged_packed_rows_buf = torch.full(
+            (max_num_tokens,), -1, dtype=torch.int64, device=self.device
+        )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         assert max_num_tokens % max_bs == 0, (
@@ -679,6 +699,22 @@ class MambaAttnBackendBase(AttentionBackend):
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
 
+    def _stage_ragged_row_maps(
+        self, *, bs: int, spec_info
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_packed_rows = spec_info.ragged_verify_layout.graph_num_tokens
+        draft_token_num = spec_info.draft_token_num
+        dense_rows, packed_rows = build_ragged_dense_row_maps(
+            query_start_loc=self.query_start_loc_list[bs - 1],
+            num_packed_rows=num_packed_rows,
+            draft_token_num=draft_token_num,
+        )
+        dense_buf = self.ragged_dense_rows_buf[:num_packed_rows]
+        packed_buf = self.ragged_packed_rows_buf[: bs * draft_token_num]
+        dense_buf.copy_(dense_rows)
+        packed_buf.copy_(packed_rows)
+        return dense_buf, packed_buf
+
     def _capture_metadata(
         self,
         bs: int,
@@ -686,6 +722,8 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        ragged_dense_rows = None
+        ragged_packed_rows = None
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
@@ -697,6 +735,9 @@ class MambaAttnBackendBase(AttentionBackend):
             if ragged_layout is not None:
                 # Ragged capture: qsl from the runner's synthetic layout.
                 self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                ragged_dense_rows, ragged_packed_rows = self._stage_ragged_row_maps(
+                    bs=bs, spec_info=spec_info
+                )
             else:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -739,6 +780,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                ragged_dense_rows=ragged_dense_rows,
+                ragged_packed_rows=ragged_packed_rows,
             )
 
     def _replay_metadata(
@@ -752,6 +795,8 @@ class MambaAttnBackendBase(AttentionBackend):
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
     ):
+        ragged_dense_rows = None
+        ragged_packed_rows = None
         if num_padding is None:
             if seq_lens_cpu is None:
                 num_padding = 0
@@ -893,6 +938,9 @@ class MambaAttnBackendBase(AttentionBackend):
                         padded_bs=bs, cap=spec_info.draft_token_num
                     )
                 self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                ragged_dense_rows, ragged_packed_rows = self._stage_ragged_row_maps(
+                    bs=bs, spec_info=spec_info
+                )
             elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -937,6 +985,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                ragged_dense_rows=ragged_dense_rows,
+                ragged_packed_rows=ragged_packed_rows,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):

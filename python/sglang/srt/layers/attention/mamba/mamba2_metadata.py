@@ -84,6 +84,9 @@ class ForwardMetadata:
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
 
+    ragged_dense_rows: Optional[torch.Tensor] = None
+    ragged_packed_rows: Optional[torch.Tensor] = None
+
 
 @dataclass(kw_only=True)
 class Mamba2Metadata(ForwardMetadata):

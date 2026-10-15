@@ -163,6 +163,10 @@ class TRTLLMMHAMetadata:
     mixed_prefill_tokens: int = 0
 
 
+def _verify_metadata_key(bs: int, is_ragged_verify: bool):
+    return (bs, "ragged") if is_ragged_verify else bs
+
+
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
@@ -702,15 +706,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     max_bs, dtype=torch.int32, device=self.device
                 ),
                 # Static uniform preset (Q_MODE_NONE: the fused kernel never
-                # rewrites it). Ragged verify overwrites the [:bs+1] slice
-                # eagerly on every capture/replay-prep, and the ragged-verify
-                # mode is fixed for the whole server run, so the two never mix.
+                # rewrites it).
                 "cu_seqlens_q": torch.arange(
                     0,
                     max_bs * self.speculative_num_draft_tokens + 1,
                     step=self.speculative_num_draft_tokens,
                     dtype=torch.int32,
                     device=self.device,
+                ),
+                "ragged_cu_seqlens_q": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
                 ),
                 "cu_seqlens_k": torch.zeros(
                     max_bs + 1, dtype=torch.int32, device=self.device
@@ -815,15 +820,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
             ]
-            metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
-                : bs + 1
-            ]
+            is_ragged_verify = (
+                spec_info is not None and spec_info.ragged_verify_layout is not None
+            )
+            metadata.cu_seqlens_q = self.target_verify_metadata[
+                "ragged_cu_seqlens_q" if is_ragged_verify else "cu_seqlens_q"
+            ][: bs + 1]
             metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
                 : bs + 1
             ]
-            metadata.is_ragged_verify = (
-                spec_info is not None and spec_info.ragged_verify_layout is not None
-            )
+            metadata.is_ragged_verify = is_ragged_verify
             metadata.max_seq_len_q = (
                 self.speculative_num_draft_tokens
                 if metadata.is_ragged_verify
@@ -850,7 +856,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.encoder_page_table = self.target_verify_metadata[
                     "encoder_page_table"
                 ][:verify_rows, :]
-            self.target_verify_metadata[bs] = metadata
+            self.target_verify_metadata[_verify_metadata_key(bs, is_ragged_verify)] = (
+                metadata
+            )
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = spec_info.num_tokens_per_req
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
@@ -928,8 +936,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
         elif forward_mode.is_target_verify():
-            # Here we only support topk = 1 for now.
-            metadata = self.target_verify_metadata[bs]
             if spec_info is not None and spec_info.ragged_verify_layout is not None:
                 # Ragged verify: the per-request k-extension is not a
                 # uniform scalar seqlen_offset, so the fused kernel cannot
@@ -937,6 +943,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # capture/replay-prep in init_forward_metadata_out_graph;
                 # record nothing here.
                 return
+            # Here we only support topk = 1 for now.
+            metadata = self.target_verify_metadata[bs]
             seqlen_offset = metadata.max_seq_len_q
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
@@ -1069,8 +1077,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if forward_mode.is_decode_or_idle():
             self.forward_metadata = self.decode_cuda_graph_metadata[bs]
         elif forward_mode.is_target_verify():
-            self.forward_metadata = self.target_verify_metadata[bs]
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            self.forward_metadata = self.target_verify_metadata[
+                _verify_metadata_key(bs, ragged_layout is not None)
+            ]
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
                     self.forward_metadata,

@@ -206,6 +206,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
+    supports_ragged_verify_graph: bool = True
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
@@ -281,6 +282,21 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
 
     @staticmethod
+    def _ragged_verify_layout(forward_mode, spec_info):
+        if forward_mode is None or not forward_mode.is_target_verify():
+            return None
+        if spec_info is None:
+            return None
+        return spec_info.ragged_verify_layout
+
+    @classmethod
+    def _graph_metadata_key(cls, forward_mode, bs, spec_info):
+        layout = cls._ragged_verify_layout(forward_mode, spec_info)
+        if layout is None:
+            return (forward_mode, bs)
+        return (forward_mode, bs, layout.graph_num_tokens)
+
+    @staticmethod
     def _speculative_max_row_length(forward_batch, sequence_lengths) -> int:
         """Sync-free host-side over-bound for the token-slot gather width:
         request length plus the draft window covers every speculative row."""
@@ -319,6 +335,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 f"rows={num_rows}"
             )
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+        ragged_layout = QwenSparseAttnBackend._ragged_verify_layout(
+            forward_batch.forward_mode, forward_batch.spec_info
+        )
+        if ragged_layout is not None:
+            extend_seq_lens = ragged_layout.verify_lens
         if extend_seq_lens is not None:
             # DP token padding rows belong to no request; alias them to request row 0,
             # as the CUDA-graph layout does, so gathers stay in bounds.
@@ -375,7 +396,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         num_padding: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         base_lengths = cls._as_cpu_int_tensor(seq_lens_cpu, bs)
-        if forward_mode.is_target_verify():
+        ragged_layout = cls._ragged_verify_layout(forward_mode, spec_info)
+        if ragged_layout is not None:
+            verify_lens = (
+                ragged_layout.verify_lens_cpu
+                if ragged_layout.verify_lens_cpu is not None
+                else ragged_layout.verify_lens
+            )
+            extend_lengths = cls._as_cpu_int_tensor(verify_lens, bs)
+            if extend_lengths.numel() < bs:
+                extend_lengths = F.pad(extend_lengths, (0, bs - extend_lengths.numel()))
+        elif forward_mode.is_target_verify():
             extend_len = int(spec_info.draft_token_num)
             extend_lengths = torch.full((bs,), extend_len, dtype=torch.int32)
         else:
@@ -966,7 +997,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             fa2_cu_seqlens_k=self._graph_fa2_cu_seqlens_k[: metadata_rows + 1],
             fa2_cu_seqlens_q=self._graph_cu_seqlens_q[: metadata_rows + 1],
         )
-        self._cuda_graph_metadata[(forward_mode, bs)] = metadata
+        self._cuda_graph_metadata[
+            self._graph_metadata_key(forward_mode, bs, spec_info)
+        ] = metadata
         self.forward_metadata = metadata
 
     def _replay_cuda_graph_metadata(
@@ -981,7 +1014,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         num_padding: int = 0,
     ) -> None:
         self._require_chain_speculation(forward_mode, spec_info)
-        metadata = self._cuda_graph_metadata[(forward_mode, bs)]
+        metadata = self._cuda_graph_metadata[
+            self._graph_metadata_key(forward_mode, bs, spec_info)
+        ]
         # Compressed addressing is arithmetic over req_to_token; pure reads below.
         if self._can_replay_with_gpu_kernels(metadata, seq_lens):
             self._replay_cuda_graph_metadata_gpu(
@@ -1087,7 +1122,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         if bs <= 0 or num_rows <= 0:
             return
 
-        if speculative:
+        ragged_layout = self._ragged_verify_layout(forward_mode, spec_info)
+        if ragged_layout is not None:
+            mode = 2
+            extend_len = 0
+            extend_lens = F.pad(
+                ragged_layout.verify_lens[:bs].to(torch.int32),
+                (0, bs - min(ragged_layout.bs, bs)),
+            )
+            seq_lens = seq_lens[:bs] + extend_lens
+        elif speculative:
             if forward_mode.is_target_verify():
                 mode = 1
                 extend_lens = None
@@ -1364,10 +1408,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
+        ragged = False
         if mode.is_decode():
             width = 1
         elif mode.is_target_verify():
             width = int(forward_batch.spec_info.draft_token_num)
+            ragged = forward_batch.spec_info.ragged_verify_layout is not None
         else:
             return None
         trtllm_decode = _resolve_trtllm_sparse_decode()
@@ -1380,8 +1426,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             width <= 0
             or width > 4
             or rows == 0
-            or rows % width
-            or rows != forward_batch.req_pool_indices.numel() * width
+            or (
+                not ragged
+                and (
+                    rows % width
+                    or rows != forward_batch.req_pool_indices.numel() * width
+                )
+            )
             or not isinstance(loc, torch.Tensor)
             or loc.ndim != 1
             or loc.numel() != rows
@@ -1415,6 +1466,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata = self._resolve_metadata(forward_batch)
         if metadata.sequence_lengths.numel() != rows:
             return None
+        prefix_lengths = None
+        if ragged:
+            prefix_lengths = metadata.indexer_metadata.graph_prefix_lengths
+            if (
+                not metadata.is_cuda_graph
+                or prefix_lengths is None
+                or not self._uses_block_indices(indices)
+            ):
+                return None
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
             kc,
@@ -1424,7 +1484,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata,
             indices.to(torch.int32).contiguous(),
             trtllm_decode,
-            new_kv=(k, v, loc, width),
+            new_kv=(k, v, loc, width, prefix_lengths),
         )
 
     def forward_extend(
@@ -1723,7 +1783,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer.device,
         )
         if new_kv is not None:
-            k, v, loc, width = new_kv
+            k, v, loc, width, prefix_lengths = new_kv
             row_requests = metadata.row_req_pool_indices
             if row_requests is None:
                 row_requests = forward_batch.req_pool_indices
@@ -1750,6 +1810,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 ),
                 # trtllm_decode reads each row only up to valid_counts.
                 visible_page_size=page,
+                prefix_lengths=prefix_lengths,
             )
         else:
             qwen_sparse_valid_counts_triton(

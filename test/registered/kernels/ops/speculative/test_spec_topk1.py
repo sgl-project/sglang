@@ -157,6 +157,39 @@ class TestSpecTopk1Triton(CustomTestCase):
             positions, torch.ones_like(positions), rtol=0, atol=0
         )
 
+    def test_compute_prob_matches_softmax_max_across_splits(self):
+        """The split reduction must rescale each block's sum-exp to the global max."""
+        batch_size = 6
+        vocab_size = 248320
+        g = torch.Generator(device=self.device).manual_seed(3)
+        logits = (
+            torch.randn((batch_size, vocab_size), device=self.device, generator=g)
+            * torch.tensor([0.5, 2.0, 4.0, 8.0, 16.0, 32.0], device=self.device)[
+                :, None
+            ]
+        ).to(torch.bfloat16)
+        # A fully masked split must not turn the probability into NaN.
+        logits[0, :8192] = -float("inf")
+        positions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        backing = torch.full((batch_size, 4), -1.0, device=self.device)
+
+        topk_p, topk_index = draft_topk1_postprocess(
+            logits,
+            positions,
+            compute_prob=True,
+            draft_probs=backing,
+            draft_prob_column=2,
+        )
+
+        expected = torch.softmax(logits.float(), dim=-1).max(dim=-1, keepdim=True)
+        torch.testing.assert_close(topk_index, expected.indices, rtol=0, atol=0)
+        torch.testing.assert_close(topk_p, expected.values, rtol=1e-4, atol=1e-6)
+        torch.testing.assert_close(backing[:, 2:3], topk_p, rtol=0, atol=0)
+        self.assertTrue(torch.all(backing[:, [0, 1, 3]] == -1.0).item())
+        torch.testing.assert_close(
+            positions, torch.ones_like(positions), rtol=0, atol=0
+        )
+
     def test_row_strided_logits_view_matches_argmax(self):
         batch_size = 5
         vocab_size = 8193

@@ -676,6 +676,8 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+    if verify_input.ragged_forward is not None:
+        verify_input.ragged_forward.unpack_output(logits_output)
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None

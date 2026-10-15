@@ -1204,6 +1204,33 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
 
+    if cfg.speculative_adaptive_verification:
+        _validate_adaptive_verification(server_args)
+
+
+def _validate_adaptive_verification(server_args: ServerArgs) -> None:
+    view = resolved_view(server_args)
+    unsupported = {
+        "speculative_algorithm EAGLE/EAGLE3/NEXTN": view.speculative_algorithm
+        in ("EAGLE", "EAGLE3"),
+        "--speculative-eagle-topk 1": view.speculative_eagle_topk == 1,
+        "CUDA": not get_platform().is_hip and view.device == "cuda",
+        "no --speculative-adaptive": not view.speculative_adaptive,
+        "no --enable-multi-layer-eagle": not view.enable_multi_layer_eagle,
+        "no --speculative-use-rejection-sampling": (
+            not view.speculative_use_rejection_sampling
+        ),
+        "pp_size == 1": view.pp_size == 1,
+        "no DP attention": not attn_dp_enabled_of(view),
+        "no --enable-two-batch-overlap": not view.enable_two_batch_overlap,
+        "no SGLANG_SIMULATE_ACC_LEN": float(envs.SGLANG_SIMULATE_ACC_LEN.get()) <= 0,
+    }
+    missing = [name for name, ok in unsupported.items() if not ok]
+    if missing:
+        raise ValueError(
+            "--speculative-adaptive-verification requires " + ", ".join(missing)
+        )
+
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)

@@ -245,6 +245,18 @@ class Spec(msgspec.Struct):
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
+    speculative_adaptive_verification: A[
+        bool,
+        "EAGLE/NEXTN with topk=1 only. Adaptive verification: each step, trim the "
+        "draft chains the target verifies, per request, to the drafts most likely "
+        "to be accepted, choosing the total verify-token count that maximizes "
+        "expected accepted tokens per second. Acceptance is predicted by a logistic "
+        "estimator on the draft top-1 log-odds fitted online from verify outcomes "
+        "(no confidence head needed); costs come from profiling the target verify "
+        "graphs at startup plus the measured rest of the step. Lossless: the "
+        "estimator reads the draft distribution only, never the sampled token. "
+        "Requires CUDA graphs and attention backends with ragged verify support.",
+    ] = False
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
     ] = None

@@ -1425,6 +1425,10 @@ class Envs:
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Every N planned steps on rank 0 (syncs the device); 0 disables.
+    SGLANG_ADAPTIVE_VERIFY_LOG_INTERVAL = EnvInt(0)
+    # Test knob: always verify through the k-th smallest ragged tier; 0 disables.
+    SGLANG_TEST_ADAPTIVE_VERIFY_FORCE_TIER = EnvInt(0)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

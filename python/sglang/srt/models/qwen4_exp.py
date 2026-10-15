@@ -15,6 +15,10 @@ import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+    build_ragged_dense_row_maps,
+    gather_rows_masked,
+)
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -182,6 +186,8 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+    ragged_dense_rows: Optional[torch.Tensor] = None
+    ragged_packed_rows: Optional[torch.Tensor] = None
 
 
 class _BreakablePLEBatch:
@@ -266,6 +272,25 @@ def _prepare_ple_batch(
     physical_tokens = input_ids.shape[0]
     processed_tokens = _get_processed_token_count(forward_batch, physical_tokens)
     tokens = input_ids[:processed_tokens]
+    out_cache_loc = forward_batch.out_cache_loc
+    ragged_layout = (
+        forward_batch.spec_info.ragged_verify_layout
+        if mode.is_target_verify()
+        else None
+    )
+    ragged_dense_rows = ragged_packed_rows = None
+    if ragged_layout is not None:
+        ragged_dense_rows, ragged_packed_rows = build_ragged_dense_row_maps(
+            query_start_loc=ragged_layout.qo_indptr_device,
+            num_packed_rows=processed_tokens,
+            draft_token_num=int(forward_batch.spec_info.draft_token_num),
+        )
+        tokens = gather_rows_masked(tokens.unsqueeze(1), ragged_packed_rows)[:, 0]
+        if out_cache_loc is not None:
+            out_cache_loc = gather_rows_masked(
+                out_cache_loc[:processed_tokens].unsqueeze(1), ragged_packed_rows
+            )[:, 0]
+        physical_tokens = processed_tokens = ragged_packed_rows.shape[0]
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
     if mode.is_target_verify():
@@ -280,7 +305,9 @@ def _prepare_ple_batch(
         # Eager verify rows can be shorter than the row stride;
         # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
         lengths = (
-            forward_batch.extend_seq_lens[:sequence_count].long()
+            ragged_layout.verify_lens.long()
+            if ragged_layout is not None
+            else forward_batch.extend_seq_lens[:sequence_count].long()
             if forward_batch.forward_mode.is_target_verify()
             and forward_batch.extend_seq_lens is not None
             else torch.full(
@@ -338,7 +365,6 @@ def _prepare_ple_batch(
 
     # CUDA graph padding uses request slot 0, which may belong to a real request.
     # Map padded sequences to the state pools' reserved dummy slot instead.
-    out_cache_loc = forward_batch.out_cache_loc
     if use_decode_fast_path:
         if out_cache_loc is not None:
             state_indices = torch.where(
@@ -394,6 +420,8 @@ def _prepare_ple_batch(
         state_indices=state_indices,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
+        ragged_dense_rows=ragged_dense_rows,
+        ragged_packed_rows=ragged_packed_rows,
     )
 
 
@@ -1332,6 +1360,21 @@ class Qwen4ExpPLELayer(nn.Module):
         return embeddings
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+    ) -> torch.Tensor:
+        if batch.ragged_dense_rows is None:
+            return self._forward_rows(hidden_states, forward_batch, batch)
+        dense = gather_rows_masked(hidden_states, batch.ragged_packed_rows)
+        output = self._forward_rows(dense, forward_batch, batch)
+        return _pad_token_rows(
+            gather_rows_masked(output, batch.ragged_dense_rows),
+            hidden_states.shape[0],
+        )
+
+    def _forward_rows(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,

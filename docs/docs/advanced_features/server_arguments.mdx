@@ -1753,6 +1753,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-adaptive-verification`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>EAGLE/NEXTN with topk=1 only. Each step, trim the draft chains the target verifies, per request, to the drafts most likely to be accepted, choosing the total verify-token count that maximizes expected accepted tokens per second. Acceptance is predicted by a logistic estimator on the draft top-1 log-odds fitted online from verify outcomes (no confidence head needed); costs come from profiling the target verify graphs at startup plus the measured rest of the step. Lossless. Requires CUDA graphs and attention backends with ragged verify support.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-skip-dp-mlp-sync`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
