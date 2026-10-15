@@ -79,7 +79,6 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     # Gate only on SGLANG_OPT_FUSE_MHC_POST_PRE; TileLang switches don't apply.
     if _is_gfx1250_supported:
         return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
-    # gfx942: TileLang's HIP codegen cannot lower the fused kernel (tl.get_lane_idx).
     if _is_gfx942_supported:
         return False
     # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
@@ -93,7 +92,6 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 
 
 def _is_aiter_gfx95_mhc_available() -> bool:
-    # aiter's mHC kernels, including mhc_fused_post_pre, also run on gfx942.
     return _is_hip and get_bool_env_var("SGLANG_USE_AITER") and (
         is_gfx95_supported() or is_gfx942_supported()
     )

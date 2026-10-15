@@ -34,8 +34,6 @@ _AITER_MHC_ACTIVE_LOGGED = False
 
 
 def _use_aiter_mhc() -> bool:
-    # aiter's mHC kernels also run on gfx942 (MI300X), using their default
-    # config for its CU count.
     return (
         not _AITER_MHC_RUNTIME_DISABLED
         and (is_gfx95_supported() or is_gfx942_supported())
