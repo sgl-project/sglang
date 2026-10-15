@@ -405,3 +405,78 @@ sglang-router launch \
 </Accordion>
 
 The language workers use distinct encoder-bootstrap ports (`8997` / `8999`) on this shared host; the router's `8998` matches the prefill KV bootstrap port. Send client requests to `http://localhost:8000/v1`. See the [EPD guide](/docs/advanced_features/epd_disaggregation) for the architecture and additional deployment options.
+
+### 3.4 Sequence Parallel for Prefill
+
+Sequence parallelism (SP) splits activations along the token dimension across TP ranks. Each rank processes its own token shard for normalization, pooling, and unpooling, reducing duplicated computation and activation storage during long-prompt prefill. NVFP4 MegaMoE connects these shards to expert parallelism through integrated all-to-all dispatch and combine: tokens reach their selected experts, and weighted expert outputs return to the original token ranks.
+
+For a Blackwell NVFP4 configuration (B300, B200, or GB300), use the [Playground](#playground) to enable **Prefill Sequence Parallel** and **Prefill MegaMoE** together. This adds `--enable-layernorm-sp --enable-megamoe-for-layernorm-sp` to the launch command. Keep **Attention TP** and **MoE EP** equal; MegaMoE requires SP to remain on. These prefill options are unavailable on H200 and are omitted for a PD decode worker.
+
+### 3.5 Speculative Decoding with DFlash v2 and Block Verification
+
+DFlash V2 uses the target model's hidden states to propose a block of future tokens in one draft-model forward pass; Muse Spark Open then verifies the block in a single pass, advancing by multiple tokens when proposals are accepted. V2 mixes information across neighboring draft positions and selects candidates with their dependencies in mind. Optional [block verification](https://arxiv.org/abs/2403.10444) evaluates draft prefixes jointly instead of token by token, potentially accepting longer prefixes while preserving the target sampling distribution.
+
+In the [Playground](#playground), select **DFlash V2** under **Speculative Decoding** to add `--speculative-algorithm DFLASH` and `--speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2`. Then adjust:
+
+- **Draft attention backend:** `fa4` for NVIDIA or `triton` for MI355X, inherited from Deployment and set with `--speculative-draft-attention-backend`.
+- **Num draft tokens:** 1–8, default **8**, set with `--speculative-num-draft-tokens`.
+- **Block Verification:** turn it on to add `--speculative-use-block-verification`; it is off by default.
+
+The Deployment **Low Latency** strategy enables DFlash V2 on supported GPUs; **High Throughput** leaves speculative decoding off. The Playground inherits that choice and lets you override it.
+
+### 3.6 MegaKernel with Helion (Experimental)
+
+We support persistent Helion megakernels for DFlash V2 target verification. They fuse attention, projection and normalization boundaries, routing, MoE, and the layer tail, with a separate fused LM head, reducing kernel launches and communication overhead. TP4/EP1 shards each expert across four GPUs, avoiding the expert-load imbalance of EP4 at batch size 1. With **BS=1 + DFlash V2**, the reported decode performance is roughly **10% faster** than the TP4/EP4 baseline without megakernels on 4×GB300; gains depend on the workload.
+
+Use this experimental recipe **only on a PD-disaggregated decode worker**, with four **GB300 (SM 10.3)** GPUs, NVFP4 weights, FP8 E4M3 KV cache, and `helion==1.5.0`. Keep prefill on the regular path: EP1 prefill is slower than the TP4/EP4 baseline. This specialized TP4/EP1 command is separate from the Playground's equal-TP/EP configuration.
+
+<Accordion title="Helion decode worker (4×GB300)">
+
+Install the dependency in the serving environment, then launch the decode worker:
+
+```bash Command
+python -m pip install helion==1.5.0
+
+export NCCL_NVLS_ENABLE=1
+export NCCL_MNNVL_ENABLE=1
+export NCCL_CUMEM_ENABLE=1
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
+export MC_FORCE_MNNVL=1
+
+SGLANG_FORCE_FUSED_OP_BACKEND=helion \
+SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR=1 \
+SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1 \
+python -m sglang.launch_server \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --tokenizer-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name external \
+  --json-model-override-args '{"eos_token_id":[200001,200008]}' \
+  --tp-size 4 \
+  --ep-size 1 \
+  --context-length 131072 \
+  --max-running-requests 1 \
+  --quantization modelopt_fp4 \
+  --moe-runner-backend flashinfer_trtllm \
+  --attention-backend trtllm_mha \
+  --kv-cache-dtype fp8_e4m3 \
+  --page-size 128 \
+  --disable-flashinfer-autotune \
+  --disable-prefill-cuda-graph \
+  --cuda-graph-max-bs-decode 1 \
+  --reasoning-parser muse \
+  --tool-call-parser muse \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-num-draft-tokens 8 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998 \
+  --mem-fraction-static 0.80 \
+  --host 0.0.0.0 \
+  --port 30002
+```
+
+</Accordion>
+
+Pair this worker with a compatible prefill worker using the same target checkpoint, TP4, `--kv-cache-dtype fp8_e4m3`, `--page-size 128`, and `--served-model-name external`, with bootstrap port `8998`. Use the [Playground](#playground) PD router command with the decode URL pointing to this worker on port `30002`; send client requests to the router on port `8000`.
