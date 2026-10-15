@@ -1222,6 +1222,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
             return_value=[]
         )
+        tm.positional_embeds_transport = Mock()
         tm._dispatch_to_scheduler = Mock()
         rid = "disconnect_zombie"
         obj = _make_generate_obj(rid, is_single=True)

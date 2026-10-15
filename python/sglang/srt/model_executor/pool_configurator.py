@@ -265,6 +265,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
+                draft_loc_space_scale = 1
+                if get_memory().enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    # The draft pool is direct-indexed by the target allocator's
+                    # host-expanded logical IDs.  Account for the entire dense
+                    # address space that KVCacheConfigurator allocates below.
+                    draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
@@ -279,9 +287,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = int(
-                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    draft_kv_size = (
+                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
+                        * draft_loc_space_scale
                     )
+                    # _compute_dsa_indexer_cell_size already applies the
+                    # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
@@ -291,9 +302,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
+                    draft_kv_size = int(
+                        self._cell_size * draft_num_layers / int(num_layers)
                     )
+                    self._cell_size += draft_kv_size * draft_loc_space_scale
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
@@ -1161,8 +1173,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         self.paged_draft_layers = 0
         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
+            aux = kvc.spec_aux_config
             self.paged_draft_layers = int(
-                kvc.spec_aux_config.dflash_draft_num_layers or 0
+                aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
             )
             assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
         self.request_window_bytes = 0
@@ -1265,7 +1278,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # Nothing is kept for reuse, so the request cap alone bounds the pool.
             return 0
         max_running_requests = self.requested_max_running_requests_per_worker
-        return 4 * max_running_requests if max_running_requests is not None else 0
+        if max_running_requests is None:
+            return 0
+        tails = 4 * max_running_requests
+        if self.encoder_replay and self.paged_draft_layers:
+            # A replay tail pays for draft layers only; spend the non-replay
+            # default's bytes on proportionally more tails.
+            tails *= max(1, self.num_layers_total // self.paged_draft_layers)
+        return tails
 
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
         """SWA slots to reserve in cap mode, None to keep ratio sizing. Cap mode
