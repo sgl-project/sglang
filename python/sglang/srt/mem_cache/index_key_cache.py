@@ -58,12 +58,24 @@ class IndexKeyCache:
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
+        assert self.pool.index_kpool == 1, (
+            "Moving pooled index keys requires regrouping tokens"
+        )
+        page_size = self.pool.index_page_size
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        tgt_page, tgt_offset = tgt_loc_flat // page_size, tgt_loc_flat % page_size
+        src_page, src_offset = src_loc_flat // page_size, src_loc_flat % page_size
+        key_bytes = page_size * self.pool.index_head_dim
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            index_k = self._kernel_view(index_k)
+            # Each physical page stores all key bytes followed by all scale bytes.
+            # Locations identify tokens; copying whole pages overwrites neighbors.
+            for part in (index_k[:, :key_bytes], index_k[:, key_bytes:]):
+                tokens = part.view(index_k.shape[0], page_size, -1)
+                tokens[tgt_page, tgt_offset] = tokens[src_page, src_offset]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:
