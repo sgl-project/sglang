@@ -155,8 +155,7 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
     if spec is None:
         return None, [why]
     req = spec.requires
-    # the model dtype as resolved from the checkpoint ("auto" otherwise)
-    dtype = str(model_config.dtype).replace("torch.", "")
+    dtype = str(model_config.dtype).replace("torch.", "")  # resolved, e.g. bfloat16
     reasons = [
         f"{f.value} is in use and the spec does not accept it"
         for f in sorted(features_in_use(cfg) - spec.features, key=lambda f: f.name)

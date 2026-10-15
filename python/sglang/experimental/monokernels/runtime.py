@@ -60,18 +60,23 @@ SGLANG_READS = {
         '"_derived_weight_cache_error"',
     ),
     "srt/runtime_context.py": (
+        "get_context",
         "get_device",
         "get_exec",
         "get_parallel",
         "get_spec",
+        "is_config_namespace_published",
         '"tp_group"',
     ),
 }
 
 
 def enabled() -> bool:
-    from sglang.srt.runtime_context import get_exec
+    from sglang.srt.runtime_context import get_context, get_exec
 
+    # the model loader also runs without a server's config (tools, unit tests)
+    if not get_context().is_config_namespace_published("exec"):
+        return False
     return get_exec().kernel.enable_monokernel
 
 
@@ -159,7 +164,10 @@ def attach(*, model, hf_config) -> None:
     if reasons:
         raise ValueError("--enable-monokernel: " + "; ".join(reasons))
 
-    tokens = (spec.tokens_per_request or (lambda _: _tokens_per_request()))(model)
+    if spec.tokens_per_request is not None:
+        tokens = spec.tokens_per_request(model)
+    else:
+        tokens = _tokens_per_request()
     keys = _capture_keys(tokens)
     rows = {k.rows for k in keys}
     # the widths the capture plan routes (every width a step can have without graphs)
@@ -191,7 +199,7 @@ def attach(*, model, hf_config) -> None:
         f"({spec.name})"
     )
     logger.info(
-        "monokernel %s on %s runs %s%s; every other step runs the normal path. "
+        "monokernel %s on %s runs %s%s; every other step runs the standard path. "
         "Widths %s built in %.1f s, %.1f MiB; wait deadline %.0f s (a failed wait "
         "stops every rank with a GPU fault at address 0x0); weight copies: %s",
         spec.name,

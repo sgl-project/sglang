@@ -406,8 +406,6 @@ class Envs:
     # Fault injection and regression tests
     # ===================================================================
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
-    # "rank:site[:after]": the monokernel wait one rank stalls at, after `after` launches
-    SGLANG_TEST_MONO_FAULT_INJECT = EnvStr("")
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)

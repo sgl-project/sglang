@@ -36,7 +36,7 @@ If no installed plugin covers the model on this GPU, or the setup uses a feature
 Routing depends only on a step's CUDA graph key and is fixed when the model loads, so the startup log states exactly which steps run the plugin's kernels. Each model logs one line, for example:
 
 ```text
-monokernel deepseek_v41_hip on gfx950 runs target_verify steps of batch size [1, 2, 3, 4, 5, 6, 7, 8] x 6 tokens (8 of 20 decode graphs); every other step runs the normal path. ...
+monokernel deepseek_v41_hip on gfx950 runs target_verify steps of batch size [1, 2, 3, 4, 5, 6, 7, 8] x 6 tokens (8 of 20 decode graphs); every other step runs the standard path. ...
 ```
 
 A server whose spec serves none of its steps refuses to start rather than running the standard path only.
