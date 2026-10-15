@@ -1987,6 +1987,7 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    SGLANG_REQUIRED_PLUGINS = EnvTuple(())
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)
