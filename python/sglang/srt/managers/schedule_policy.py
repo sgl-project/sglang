@@ -597,7 +597,11 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         hisparse_coordinator: Optional[HiSparseCoordinator] = None,
+        mixed_decode_kv_tokens: int = 0,
     ):
+        """num_mixed_decode_tokens and mixed_decode_kv_tokens reserve the decode
+        rows of a mixed step ahead of admission: their forward tokens from the
+        input and chunk budgets, the KV they allocate from the KV budget."""
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
@@ -619,7 +623,7 @@ class PrefillAdder:
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
         self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
-            tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+            tree_cache, num_mixed_decode_tokens=mixed_decode_kv_tokens
         )
 
         self.req_states = None
@@ -948,6 +952,10 @@ class PrefillAdder:
         return True
 
     def add_chunked_req(self, req: Req):
+        if self.rem_chunk_tokens <= 0:
+            # The decode rows of a mixed step spent the chunk budget: the chunk
+            # waits instead of running a non-positive extend.
+            return req
         _rem_tokens = self.memory_budget.available_chunk_tokens(self.rem_chunk_tokens)
         if _rem_tokens is None:
             return req

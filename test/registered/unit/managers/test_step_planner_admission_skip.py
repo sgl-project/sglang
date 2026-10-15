@@ -24,7 +24,11 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     LaunchCounters,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
-from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
+from sglang.srt.managers.scheduler_components.step_planner import (
+    DecodeFirst,
+    StepPlanner,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -41,13 +45,14 @@ def _req(rid, ring_slot=None):
         rid=rid,
         ring_slot=ring_slot,
         is_prefill_only=False,
+        return_logprob=False,
         beam_group=None,
         token_indices_to_pool=None,
         lora_id=None,
         output_ids=[],
         seqlen=8,
         sampling_params=SimpleNamespace(max_new_tokens=8),
-        kv=SimpleNamespace(holds_mamba=False, holds_kv=False),
+        kv=SimpleNamespace(holds_mamba=False, holds_kv=False, kv_allocated_len=8),
         init_next_round_input=Mock(),
     )
 
@@ -369,6 +374,36 @@ class TestNoKvRoom(_AdmissionCase):
 
         self.assertTrue(self.planner.should_defer_prefill())
         self.assertFalse(self.planner.should_defer_prefill())
+        self.assertEqual(self._admit(), ["w0"])
+
+
+class TestNoKvRoomMixed(_AdmissionCase):
+    """Under mixed chunked prefill the pass reserves the decode part's KV; a
+    remembered pass reruns once that reservation shrinks."""
+
+    def setUp(self):
+        super().setUp()
+        s = self.planner
+        s.is_mixed_chunk = True
+        s.composition_policy = DecodeFirst()
+        s.pending = []
+        s.spec_algorithm = SpeculativeAlgorithm.NONE
+        s.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
+        # Both decode rows sit at a page boundary: each needs a new page.
+        self.running = [_req("r0"), _req("r1")]
+        s.core_lists.decoding = list(self.running)
+        s.core_lists.waiting_queue = [_req("w0")]
+        self.assertEqual(self._admit(), ["w0"])
+        self.assertEqual(s._no_kv_room[None].decode_kv_tokens, 8)
+
+    def test_skipped_while_the_reservation_holds(self):
+        self.assertIsNone(self._admit())
+
+    def test_a_smaller_reservation_reopens(self):
+        # A commit moves r1 off the page boundary: its next token needs no
+        # new page, so the decode part reserves less.
+        self.running[1].kv.kv_allocated_len = 9
+
         self.assertEqual(self._admit(), ["w0"])
 
 

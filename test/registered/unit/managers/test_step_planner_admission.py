@@ -1,7 +1,8 @@
 """What one StepPlanner admission pass admits: preemption sizes a request by
 its current prefix match, the row budget counts the new request rows the
-admitted requests take, not the requests, and a spent pass budget stops the
-pass before its first candidate."""
+admitted requests take, not the requests, a spent pass budget stops the pass
+before its first candidate, and a mixed step reserves its decode part before
+admission."""
 
 import unittest
 from array import array
@@ -26,7 +27,11 @@ from sglang.srt.managers.scheduler_components.engine_state import (
     LaunchCounters,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
-from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
+from sglang.srt.managers.scheduler_components.step_planner import (
+    DecodeFirst,
+    StepPlanner,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -47,6 +52,8 @@ def _req(rid, *, priority=0, max_new_tokens=8, holds_row=False):
         ring_slot=None,
         priority=priority,
         is_prefill_only=False,
+        return_logprob=False,
+        input_embeds=None,
         beam_group=None,
         token_indices_to_pool=None,
         lora_id=None,
@@ -58,7 +65,7 @@ def _req(rid, *, priority=0, max_new_tokens=8, holds_row=False):
             max_new_tokens=max_new_tokens, ignore_eos=False
         ),
         time_stats=SimpleNamespace(wait_queue_entry_time=0),
-        kv=SimpleNamespace(holds_mamba=False, holds_kv=holds_row),
+        kv=SimpleNamespace(holds_mamba=False, holds_kv=holds_row, kv_allocated_len=8),
         init_next_round_input=Mock(),
     )
 
@@ -72,6 +79,8 @@ class _Adder(PrefillAdder):
     spent = False
 
     def __init__(self, page_size, tree_cache, allocator, running_reqs, *a, **kw):
+        # The decode part's forward tokens and KV, reserved ahead of admission.
+        self.reserved = (a[3], kw["mixed_decode_kv_tokens"])
         self.running_reqs = running_reqs
         self.new_token_ratio = 1.0
         self.priority_scheduling_preemption_threshold = 0
@@ -286,6 +295,57 @@ class TestSpentBudget(_PlannerCase):
         self.assertEqual([r.rid for r in adder.can_run_list], ["chunk"])
         head.init_next_round_input.assert_not_called()
         self.assertEqual(self.planner._no_kv_room, {})
+
+
+class TestMixedStep(_PlannerCase):
+    def setUp(self):
+        super().setUp()
+        s = self.planner
+        s.is_mixed_chunk = True
+        s.composition_policy = DecodeFirst()
+        s.pending = []
+        s.spec_algorithm = SpeculativeAlgorithm.NONE
+        s.token_to_kv_pool_allocator = SimpleNamespace(page_size=1)
+        p = patch(f"{_PLANNER}.check_decode_mem", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+        prefill_only = _req("prefill-only", holds_row=True)
+        prefill_only.is_prefill_only = True
+        self.decode = [_req("d0", holds_row=True), _req("d1", holds_row=True)]
+        s.core_lists.decoding = [*self.decode, prefill_only]
+        self.waiting = _req("w")
+        s.core_lists.waiting_queue = [self.waiting]
+
+    def _mixed_rows(self):
+        """The requests of the decode step mixed into the built step."""
+        built = self.planner.step_builder
+        if not built.build_extend_step.return_value.mix_decode_rows.called:
+            return None
+        return built.new_decode_step.call_args.args[0]
+
+    def test_the_decode_part_is_reserved_before_admission(self):
+        # Its forward tokens are its rows and its KV the tokens they
+        # allocate; a prefill-only request decodes no token.
+        adder = self._admit()
+
+        self.assertEqual(adder.reserved, (2, 2))
+        self.assertEqual(self._mixed_rows(), self.decode)
+
+    def test_a_decode_row_with_logprobs_is_not_reserved(self):
+        self.decode[0].return_logprob = True
+
+        adder = self._admit()
+
+        self.assertEqual(adder.reserved, (0, 0))
+        self.assertIsNone(self._mixed_rows())
+
+    def test_a_prefill_with_input_embeds_keeps_the_decode_part_out(self):
+        self.waiting.input_embeds = [[0.0]]
+
+        adder = self._admit()
+
+        self.assertEqual(adder.reserved, (2, 2))
+        self.assertIsNone(self._mixed_rows())
 
 
 if __name__ == "__main__":
