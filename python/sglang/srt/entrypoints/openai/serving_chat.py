@@ -944,7 +944,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 remaining_logprobs = None
 
         # Handle tool calls
-        if self._tool_call_parsing_active(request):
+        if self._should_parse_tool_calls(request):
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -991,13 +991,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 remaining_logprobs = None
 
-        # Flush logprobs still unattached this step — only when a parser is
-        # active, since _process_tool_call_stream may consume the delta and emit
-        # no content chunk. On the plain path an empty-delta step has no chunk
-        # to attach to either way, and a standalone empty-delta logprobs chunk
-        # is not a shape clients expect.
+        # Flush logprobs still unattached this step — only when a parser or the
+        # constrained JSON fallback is active, since _process_tool_call_stream
+        # may consume the delta and emit no content chunk. On the plain path an
+        # empty-delta step has no chunk to attach to either way, and a
+        # standalone empty-delta logprobs chunk is not a shape clients expect.
         if remaining_logprobs is not None and (
-            self.reasoning_parser or self.tool_call_parser
+            self.reasoning_parser
+            or self.tool_call_parser
+            or self._should_parse_tool_calls(request)
         ):
             usage = None
             if continuous_usage_stats:
@@ -1018,7 +1020,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
     def _tool_call_parsing_active(self, request: ChatCompletionRequest) -> bool:
-        """Whether this request's output runs through the tool-call parser.
+        """Whether this request uses the configured tool-call parser.
 
         The reasoning parser is told the same thing, so channel-framed formats
         keep their framing intact exactly when a tool-call parser consumes it.
@@ -1027,6 +1029,16 @@ class OpenAIServingChat(OpenAIServingBase):
             request.tool_choice != "none"
             and self._effective_tools(request)
             and self.tool_call_parser
+        )
+
+    def _should_parse_tool_calls(self, request: ChatCompletionRequest) -> bool:
+        """Whether the response should parse native or constrained JSON tool calls."""
+        return self._tool_call_parsing_active(request) or bool(
+            self._effective_tools(request)
+            and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+            )
         )
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
@@ -2438,7 +2450,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle tool calls
             tool_calls = None
             effective_tools = self._effective_tools(request)
-            if self._tool_call_parsing_active(request):
+            if self._should_parse_tool_calls(request):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
