@@ -33,7 +33,7 @@ def _ue8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
 
 class TestCPUQuantOps(CustomTestCase):
     def test_per_token_group_quant_fp8_cpu(self):
-        x = torch.linspace(-2.0, 2.0, steps=128, dtype=torch.float32).reshape(2, 64)
+        x = torch.linspace(-2.0, 2.0, steps=128, dtype=torch.bfloat16).reshape(2, 64)
 
         q, scale = torch.ops.sgl_kernel.per_token_group_quant_fp8_cpu(x, 32, 1e-10)
         ref_q, ref_scale = per_token_group_quant_fp8(x, 32)
@@ -44,7 +44,7 @@ class TestCPUQuantOps(CustomTestCase):
         torch.testing.assert_close(q.float(), ref_q.float())
         torch.testing.assert_close(
             _dequant_fp8(q, scale.repeat_interleave(32, dim=-1)),
-            x,
+            x.float(),
             atol=0.08,
             rtol=0.08,
         )
@@ -70,14 +70,14 @@ class TestCPUQuantOps(CustomTestCase):
         )
 
     def test_scaled_fp8_quant_cpu_padding(self):
-        x = torch.randn(2, 32, dtype=torch.float32) / 3
+        x = torch.randn(2, 32, dtype=torch.bfloat16) / 3
 
         q, scale = torch.ops.sgl_kernel.scaled_fp8_quant_cpu(x, None, 4, True)
 
         self.assertEqual(q.shape, (4, 32))
         self.assertEqual(scale.shape, (4, 1))
         torch.testing.assert_close(
-            _dequant_fp8(q[:2], scale[:2]), x, atol=0.02, rtol=0.02
+            _dequant_fp8(q[:2], scale[:2]), x.float(), atol=0.02, rtol=0.02
         )
         torch.testing.assert_close(q[2:].float(), torch.zeros(2, 32))
         torch.testing.assert_close(scale[2:], torch.zeros(2, 1))
