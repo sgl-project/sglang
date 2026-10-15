@@ -2828,6 +2828,12 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _create_generation_req(
+        self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
+    ) -> Req:
+        """Extension point for request-local state, including session requests."""
+        return Req(*args, **kwargs)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2870,7 +2876,8 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = Req(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -2963,6 +2970,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
+                req_factory=partial(self._create_generation_req, recv_req),
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -2984,7 +2992,8 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = Req(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -4822,13 +4831,19 @@ class Scheduler(
         if not (self.attn_dp_enabled and get_exec().moe.elastic_ep_backend is not None):
             return
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        from sglang.srt.elastic_ep.topology import (
+            attn_replica_size,
+            collapse_physical_rank_status,
+        )
 
         inst = ElasticEPStateManager.instance()
         if inst is not None and inst.active_ranks_cpu is not None:
+            dp_status = collapse_physical_rank_status(
+                inst.active_ranks_cpu.tolist(),
+                attn_replica_size(),
+            )
             self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(
-                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()]
-                )
+                ActiveRanksOutput(status=dp_status)
             )
         else:
             logger.debug("[Elastic EP] active rank state is unavailable")
@@ -5782,6 +5797,19 @@ class Scheduler(
                 message=(
                     f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
                     f"({max_ep_size}). Restart with a larger --max-ep-size."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        from sglang.srt.elastic_ep.topology import attn_replica_size
+
+        replica_size = attn_replica_size()
+        if new_ep_size % replica_size != 0:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) would admit an incomplete "
+                    f"attention replica with size {replica_size}."
                 ),
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
