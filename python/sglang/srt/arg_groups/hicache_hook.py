@@ -162,6 +162,14 @@ def resolve_hicache_key_scheme(server_args: Any):
         or cfg.hicache_storage_layer_partition is not None
     )
     if not unified:
+        if (
+            cfg.hicache_mem_layout == "page_unified"
+            and cfg.hicache_storage_backend is not None
+        ):
+            raise ValueError(
+                "--hicache-mem-layout page_unified with storage requires "
+                "--hicache-storage-key-scheme unified to distinguish its byte order."
+            )
         if partition_configs:
             raise ValueError(
                 "--hicache-storage-head-group / --hicache-storage-layer-partition "

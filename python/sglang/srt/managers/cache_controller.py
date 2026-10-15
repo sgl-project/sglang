@@ -548,10 +548,13 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
-        if (
-            get_memory().hicache_storage_key_scheme == "unified"
-            and storage_backend != "file"
-        ):
+        key_scheme = get_memory().hicache_storage_key_scheme
+        if key_scheme != "unified" and self.storage_host_pool.layout == "page_unified":
+            raise ValueError(
+                "The page_unified host layout requires unified storage keys "
+                "to distinguish its byte order."
+            )
+        if key_scheme == "unified" and storage_backend != "file":
             raise NotImplementedError(
                 "The unified key scheme supports only the file storage backend."
             )
