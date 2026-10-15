@@ -313,23 +313,14 @@ def test_native_batching_is_refused_for_unverified_models() -> None:
 
 
 def test_options_node_sets_native_batching_only_when_enabled() -> None:
-    folder_paths = types.ModuleType("folder_paths")
-    folder_paths.folder_names_and_paths = {}
-    folder_paths.get_full_path = lambda folder, name: f"/{folder}/{name}"
-    comfy_api = types.ModuleType("comfy_api")
-    comfy_api_input = types.ModuleType("comfy_api.input")
-    comfy_api_input.VideoInput = type("VideoInput", (), {})
-    comfy_api.input = comfy_api_input
-    stubs = {
-        "folder_paths": folder_paths,
-        "comfy_api": comfy_api,
-        "comfy_api.input": comfy_api_input,
-    }
-    with mock.patch.dict(sys.modules, stubs):
-        from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion import nodes
-    node = nodes.SGLDOptions()
-    spec = nodes.SGLDOptions.INPUT_TYPES()["optional"]["native_batching"]
-    assert spec == (list(NATIVE_BATCHING_MODES), {"default": "off"})
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion import options
+
+    node = options.SGLDOptions()
+    spec = options.SGLDOptions.INPUT_TYPES()["optional"]["native_batching"]
+    assert spec[0] == list(NATIVE_BATCHING_MODES)
+    assert spec[1]["default"] == "off"
     assert "native_batching" not in node.create_options()[0]
-    options = node.create_options(native_batching="cfg_only")[0]
-    assert options["native_batching"] == "cfg_only"
+    assert "native_batching" in options.PLUGIN_KEYS
+    assert node.create_options(native_batching="cfg_only")[0]["native_batching"] == (
+        "cfg_only"
+    )
