@@ -22,7 +22,7 @@ VOCAB_SIZE = 32
 def _req(**sampling_params):
     return SimpleNamespace(
         rid="r",
-        kv=SimpleNamespace(req_pool_idx=None),
+        kv=SimpleNamespace(req_pool_idx=None, penalty_row=None),
         output_ids=[],
         grammar=None,
         sampling_params=SamplingParams(**sampling_params),

@@ -847,7 +847,6 @@ class Scheduler:
         self.penalty_store = PenaltyStore(
             self.model_config.vocab_size, self.req_to_token_pool.device
         )
-        self.req_to_token_pool.register_on_free_slot(self.penalty_store.free)
 
     def init_kv_canary(self) -> None:
         if (c := self.tp_worker.model_runner.canary_manager) is not None:

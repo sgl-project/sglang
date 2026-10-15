@@ -1,8 +1,9 @@
 """Penalty history in per-request rows, keyed by req_pool_idx.
 
-`PenaltyStore` is one per scheduler: `alloc` (re)sets a request's row to the
-history of its `output_ids` each time it enters an extend step, and the
-pool's free-slot hook frees the row with the slot.
+`PenaltyStore` is one per scheduler: `alloc` gives a penalized request a row
+on `req.kv.penalty_row` and (re)sets it to the history of its `output_ids`
+each time the request enters an extend step; the request's release path
+(`free_req_slot`) frees the row with the request's slot.
 
 Invariants:
 - Only a request whose params use a penalty holds a row; a step without one
@@ -52,6 +53,15 @@ def _to_device(data, dtype: torch.dtype, device, pin: bool) -> torch.Tensor:
     return torch.tensor(data, dtype=dtype, pin_memory=pin).to(device, non_blocking=True)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class PenaltyRow:
+    """A request's row in its store; `req.kv` holds it from `alloc` until the
+    request's slot is freed."""
+
+    store: PenaltyStore
+    index: int
+
+
 class PenaltyStore:
     def __init__(self, vocab_size: int, device):
         self.vocab_size = vocab_size
@@ -67,17 +77,18 @@ class PenaltyStore:
     def alloc(self, req) -> None:
         if not uses_penalty(req.sampling_params):
             return
-        slot = req.kv.req_pool_idx
-        row = self.row_of_slot.get(slot)
-        if row is None:
-            row = self.free_rows.pop() if self.free_rows else len(self.row_of_slot)
-            self.row_of_slot[slot] = row
+        kv = req.kv
+        if kv.penalty_row is None:
+            index = self.free_rows.pop() if self.free_rows else len(self.row_of_slot)
+            kv.penalty_row = PenaltyRow(self, index)
+        row = kv.penalty_row.index
+        self.row_of_slot[kv.req_pool_idx] = row
         self.pending_init[row] = list(req.output_ids)
 
-    def free(self, req_pool_idx: int) -> None:
-        row = self.row_of_slot.pop(req_pool_idx, None)
-        if row is None:
-            return
+    def free(self, kv) -> None:
+        row = kv.penalty_row.index
+        kv.penalty_row = None
+        del self.row_of_slot[kv.req_pool_idx]
         self.pending_init.pop(row, None)
         self.free_rows.append(row)
 

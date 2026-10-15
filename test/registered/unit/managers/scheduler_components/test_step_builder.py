@@ -97,8 +97,8 @@ class TestDecodeRowsReuse(CustomTestCase):
 
         # Both are retracted, and req_a comes back to slot 1 but takes the row
         # req_b freed last.
-        store.free(1)
-        store.free(2)
+        store.free(req_a.kv)
+        store.free(req_b.kv)
         store.alloc(req_a)
         self.assertNotEqual(store.row_of_slot[1], 0)
         step = builder.build_decode_step([req_a])

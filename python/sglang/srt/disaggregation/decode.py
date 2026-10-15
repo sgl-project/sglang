@@ -216,9 +216,8 @@ class DecodeReqToTokenPool:
     #running <= 8, #pre-allocated + #transfer <= pre_alloc_size, so we can use the free memory to pre-allocate requests to unblock prefill.
     """
 
-    # Mirror ReqToTokenPool.register_on_alloc_rows and register_on_free_slot.
+    # Mirrors ReqToTokenPool.register_on_alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
-    _on_free_slot: Optional[Callable[[int], None]] = None
 
     def __init__(
         self,
@@ -297,8 +296,6 @@ class DecodeReqToTokenPool:
 
     def free(self, req: Req):
         assert req.kv.holds_kv, "request must have req_pool_idx"
-        if self._on_free_slot is not None:
-            self._on_free_slot(req.kv.req_pool_idx)
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
 
@@ -309,10 +306,6 @@ class DecodeReqToTokenPool:
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
         assert self._on_alloc_rows is None
         self._on_alloc_rows = hook
-
-    def register_on_free_slot(self, hook: Callable[[int], None]) -> None:
-        assert self._on_free_slot is None
-        self._on_free_slot = hook
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):

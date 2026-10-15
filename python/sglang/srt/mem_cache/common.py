@@ -420,8 +420,16 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
 
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
-    tree_cache.req_to_token_pool.free(req)
+    free_req_slot(tree_cache.req_to_token_pool, req)
     req.kv.mark_kv_released()
+
+
+def free_req_slot(req_to_token_pool: ReqToTokenPool, holder: Any) -> None:
+    """Free the slot of `holder` (a request or a session slot) and the
+    penalty row its kv record holds."""
+    if holder.kv.penalty_row is not None:
+        holder.kv.penalty_row.store.free(holder.kv)
+    req_to_token_pool.free(holder)
 
 
 def _release_overallocated_kv_indices(

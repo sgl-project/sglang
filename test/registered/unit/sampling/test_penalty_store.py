@@ -26,7 +26,7 @@ DEVICE = "cpu"
 def _req(slot, rid=None, output_ids=(), **sampling_params):
     return SimpleNamespace(
         rid=rid if rid is not None else f"r{slot}",
-        kv=SimpleNamespace(req_pool_idx=slot),
+        kv=SimpleNamespace(req_pool_idx=slot, penalty_row=None),
         output_ids=list(output_ids),
         sampling_params=SamplingParams(**sampling_params),
         eos_token_ids=None,
@@ -138,7 +138,7 @@ class TestHistory(_BuildTestCase):
             self._step(store, running, [r.output_ids for r in running], rng)
 
         # a is retracted: its slot is freed, d takes a new slot meanwhile.
-        store.free(a.kv.req_pool_idx)
+        store.free(a.kv)
         running.remove(a)
         store.alloc(d)
         running.append(d)
@@ -154,7 +154,7 @@ class TestHistory(_BuildTestCase):
             self._step(store, running, [r.output_ids for r in running], rng)
 
         # c finishes and leaves.
-        store.free(c.kv.req_pool_idx)
+        store.free(c.kv)
         running.remove(c)
         self._step(store, running, [r.output_ids for r in running], rng)
         self.assertEqual(len(store.row_of_slot), 2)
@@ -196,7 +196,7 @@ class TestHistory(_BuildTestCase):
         step = SamplingBatchInfo.build([a], VOCAB_SIZE, DEVICE, store)
 
         # a finishes before its last step samples; b then takes the freed row.
-        store.free(1)
+        store.free(a.kv)
         step.commit_sampled_tokens(torch.tensor([7]))
         b = _req(2, frequency_penalty=1.0, output_ids=[3])
         store.alloc(b)

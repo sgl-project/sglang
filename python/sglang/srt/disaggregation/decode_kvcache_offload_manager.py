@@ -14,6 +14,7 @@ from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import free_req_slot
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -363,7 +364,7 @@ class DecodeKVCacheOffloadManager:
         )
         self.tree_cache.unlock(req.lock)
         req.lock = None
-        self.req_to_token_pool.free(req)
+        free_req_slot(self.req_to_token_pool, req)
         req.kv.mark_kv_released()
         req.disagg.offload = None
 
