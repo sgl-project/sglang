@@ -27,10 +27,6 @@ if get_device_sm() >= 89:
         sglang_per_token_group_quant_fp8,
         sglang_per_token_quant_fp8,
     )
-    from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
-    from sglang.kernels.ops.elementwise.silu_mul_quant import (
-        silu_and_mul_post_quant_mxfp4,
-    )
 
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
@@ -722,6 +718,8 @@ def deep_moe_impl_fused(
             )
             act_scale_col_major = True
     elif use_mxfp4:
+        from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
+
         # hidden_states: torch.uint8, hidden_states_scale: torch.uint16
         hidden_states, hidden_states_scale = downcast_to_mxfp4(
             hidden_states, axis=1, enable_fused_moe=use_fused_path
@@ -867,6 +865,10 @@ def deep_moe_impl_fused(
         and gemm1_limit is None
         and use_mxfp4
     ):
+        from sglang.kernels.ops.elementwise.silu_mul_quant import (
+            silu_and_mul_post_quant_mxfp4,
+        )
+
         a, a_scale = silu_and_mul_post_quant_mxfp4(out1, swiglu_limit=swiglu_limit)
     else:
         if activation == "situ":

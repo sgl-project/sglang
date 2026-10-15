@@ -4,6 +4,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -63,7 +64,8 @@ def test_kda_dispatcher_honors_flashkda_prefill_backend_on_ppu():
     kernel_class.assert_called_once_with()
 
 
-def test_ppu_flashkda_dispatches_to_platform_operator():
+@pytest.mark.parametrize("extend_kwargs", [{}, {"return_intermediate_states": False}])
+def test_ppu_flashkda_dispatches_to_platform_operator(extend_kwargs):
     num_heads = 12
     head_dim = 128
     packed_tokens = 64
@@ -77,8 +79,8 @@ def test_ppu_flashkda_dispatches_to_platform_operator():
     query_start_loc = torch.tensor([0, packed_tokens], dtype=torch.int32)
     flashkda_fwd = Mock(
         side_effect=lambda **kwargs: (
-            kwargs["out"].zero_(),
-            kwargs["final_state"].copy_(kwargs["initial_state"]),
+            kwargs["out"].fill_(0.25),
+            kwargs["final_state"].copy_(kwargs["initial_state"] + 1),
         )
     )
     pla_module = ModuleType("pla")
@@ -112,9 +114,14 @@ def test_ppu_flashkda_dispatches_to_platform_operator():
             A_log=torch.zeros((1, 1, num_heads, 1), dtype=torch.float32),
             dt_bias=torch.zeros(num_heads * head_dim, dtype=torch.float32),
             lower_bound=-5.0,
+            **extend_kwargs,
         )
 
+    assert isinstance(output, torch.Tensor)
     assert output.shape == q.shape
+    assert torch.all(output == 0.25)
+    assert torch.all(ssm_states[1] == 1)
+    assert torch.count_nonzero(ssm_states[0]) == 0
     load_flash_kda.assert_not_called()
     flashkda_fwd.assert_called_once()
     kwargs = flashkda_fwd.call_args.kwargs
@@ -124,6 +131,67 @@ def test_ppu_flashkda_dispatches_to_platform_operator():
     assert kwargs["A_log"].shape == (num_heads,)
     assert kwargs["dt_bias"].shape == (num_heads, head_dim)
     assert kwargs["cu_seqlens"].dtype == torch.int64
+
+
+@pytest.mark.parametrize(
+    "track_ssm, lower_bound, is_spec_decode",
+    [(True, -5.0, False), (False, None, False), (False, -5.0, True)],
+)
+def test_ppu_flashkda_fallback_preserves_return_contract(
+    track_ssm, lower_bound, is_spec_decode
+):
+    kernel = kda_flashkda.FlashKDAKernel()
+    output = torch.zeros((1, 64, 12, 128), dtype=torch.bfloat16)
+    result = (output, sentinel.intermediate_states) if track_ssm else output
+    track_state = sentinel.track_state if track_ssm else None
+    track_chunk_idx = sentinel.track_chunk_idx if track_ssm else None
+
+    with (
+        patch.object(kda_flashkda, "is_ppu", return_value=True),
+        patch.object(kernel, "_flashkda_extend") as fused_extend,
+        patch(
+            "sglang.kernels.ops.attention.fla.kda.chunk_kda", return_value=result
+        ) as chunk_kda,
+    ):
+        actual = kernel.extend(
+            sentinel.q,
+            sentinel.k,
+            sentinel.v,
+            sentinel.g,
+            sentinel.beta,
+            ssm_states=sentinel.ssm_states,
+            cache_indices=sentinel.cache_indices,
+            query_start_loc=sentinel.query_start_loc,
+            A_log=sentinel.A_log,
+            dt_bias=sentinel.dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=True,
+            is_spec_decode=is_spec_decode,
+            return_intermediate_states=track_ssm,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+        )
+
+    assert actual is result
+    fused_extend.assert_not_called()
+    chunk_kda.assert_called_once_with(
+        q=sentinel.q,
+        k=sentinel.k,
+        v=sentinel.v,
+        g=sentinel.g,
+        beta=sentinel.beta,
+        initial_state=sentinel.ssm_states,
+        initial_state_indices=sentinel.cache_indices,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=sentinel.query_start_loc,
+        A_log=sentinel.A_log,
+        dt_bias=sentinel.dt_bias,
+        lower_bound=lower_bound,
+        beta_is_raw=True,
+        output_intermediate_states=track_ssm,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
+    )
 
 
 def test_ppu_flashkda_only_bypasses_cuda_sequence_length_fallback():
@@ -291,7 +359,7 @@ def test_ppu_disables_pdl_and_megamoe():
     with patch.object(jit_arch, "is_ppu_runtime", return_value=True):
         assert not jit_arch.is_arch_support_pdl.__wrapped__()
 
-    with patch.object(overrides_module, "is_ppu", return_value=True):
+    with patch("sglang.srt.utils.common.is_ppu", return_value=True):
         try:
             overrides_module._a2a_backend_overrides(
                 type("View", (), {"moe_a2a_backend": "megamoe"})()
