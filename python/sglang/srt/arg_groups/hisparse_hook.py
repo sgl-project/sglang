@@ -56,6 +56,20 @@ def validate_hisparse_dsa_backend(
     backend = getattr(view, attr)
     kv_cache_dtype = view.kv_cache_dtype
     allowed_backends = _hisparse_allowed_backends(kv_cache_dtype)
+    if not allowed_backends:
+        # No backend reads this KV layout here, so naming the (empty) allow-set
+        # or suggesting the user omit the option would both be dead ends: the
+        # dtype is the thing to change.
+        usable = " or ".join(
+            f"--kv-cache-dtype={dtype}"
+            for dtype in HISPARSE_KV_CACHE_DTYPES
+            if _hisparse_allowed_backends(dtype)
+        )
+        raise ValueError(
+            f"HiSparse does not support --kv-cache-dtype={kv_cache_dtype} on this "
+            f"platform: no DSA {label} backend reads that KV cache layout. "
+            f"Please use {usable}."
+        )
     if backend is not None and backend not in allowed_backends:
         raise ValueError(
             f"HiSparse supports DSA {label} backend(s) {sorted(allowed_backends)} "

@@ -1410,7 +1410,9 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             kv_cache_dtype="fp8_e4m3",
             dsa_decode_backend="intel_xpu",
         )
-        with self.assertRaisesRegex(ValueError, "fp8_e4m3"):
+        # The message must name the dtype to switch to: the allow-set is empty
+        # here, so "use one of []" and "omit the option" are both dead ends.
+        with self.assertRaisesRegex(ValueError, r"fp8_e4m3.*--kv-cache-dtype=bfloat16"):
             validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
 
     @override_platform(is_hip=False, is_xpu=True)
