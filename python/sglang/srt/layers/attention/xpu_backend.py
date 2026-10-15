@@ -1936,6 +1936,7 @@ class XPUAttentionBackend(AttentionBackend):
             self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
             m.swa_out_cache_loc = self.full_cg_prefill_swa_out_cache_loc[:num_out]
 
+        m.max_seq_len_k = max_seq_len_k
         if in_capture:
             # Baked into the captured kernel launches; upper bounds only.
             m.max_seq_len_q = forward_batch.positions.numel()
