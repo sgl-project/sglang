@@ -431,6 +431,26 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
 
+      # The AMD stand-in for rust-ext-build in pr-test.yml: the Rust extensions
+      # link this image's ROCm libtorch, so they are built here, in the test
+      # container, rather than on a hosted runner. This job's own tests then
+      # reuse them from the cache, and the later stages download them below.
+      - name: Build Rust extensions for later stages
+        continue-on-error: true
+        timeout-minutes: 15
+        run: bash scripts/ci/amd/amd_ci_rust_ext_cache.sh export rust-ext-amd
+
+      - name: Upload Rust extensions
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ format('rust-ext-amd-{0}-{1}', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+          path: rust-ext-amd/
+          if-no-files-found: ignore
+          retention-days: 1
+          # A re-run of this job replaces the modules a re-run of a later stage reads.
+          overwrite: true
+
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -579,6 +599,15 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      # Built by stage-a in this run ("Build Rust extensions for later stages").
+      - name: Download Rust extensions
+        if: needs.wait-for-stage-a-amd.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ format('rust-ext-amd-{0}-{1}', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+          path: rust-ext-amd
+
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
@@ -618,6 +647,15 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      # Built by stage-a in this run ("Build Rust extensions for later stages").
+      - name: Download Rust extensions
+        if: needs.wait-for-stage-a-amd.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ format('rust-ext-amd-{0}-{1}', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+          path: rust-ext-amd
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
@@ -702,6 +740,15 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      # Built by stage-a in this run ("Build Rust extensions for later stages").
+      - name: Download Rust extensions
+        if: needs.wait-for-stage-a-amd.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ format('rust-ext-amd-{0}-{1}', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+          path: rust-ext-amd
+
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
@@ -743,6 +790,15 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      # Built by stage-a in this run ("Build Rust extensions for later stages").
+      - name: Download Rust extensions
+        if: needs.wait-for-stage-a-amd.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ format('rust-ext-amd-{0}-{1}', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+          path: rust-ext-amd
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
@@ -1110,6 +1166,15 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      # Built by stage-a in this run ("Build Rust extensions for later stages").
+      - name: Download Rust extensions
+        if: needs.wait-for-stage-b-amd.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ format('rust-ext-amd-{0}-{1}', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+          path: rust-ext-amd
+
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
@@ -1170,6 +1235,15 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      # Built by stage-a in this run ("Build Rust extensions for later stages").
+      - name: Download Rust extensions
+        if: needs.wait-for-stage-b-amd.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ format('rust-ext-amd-{0}-{1}', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
+          path: rust-ext-amd
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
