@@ -5,15 +5,20 @@ import sys
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    PauseGenerationReqInput,
+    ReleaseMemoryOccupationReqInput,
     SessionParams,
     TokenizedGenerateReqInput,
 )
@@ -25,9 +30,12 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.srt.utils import cuda_vmm_transport_utils as vmm
@@ -384,6 +392,180 @@ def test_session_abort_preserves_shared_multimodal_features():
 
     mm_inputs.release_features.assert_not_called()
     assert req.multimodal_inputs is None
+
+
+@pytest.fixture
+def kept_rows():
+    """One kept entry of mm_schedule, as left by the chunk before."""
+    mm_schedule.release_prefill_rows()
+    mm_schedule._prefill_rows[("item", ((0, 9),))] = object()
+    yield mm_schedule._prefill_rows
+    mm_schedule.release_prefill_rows()
+
+
+def _admission_scheduler(chunked_req):
+    """A scheduler whose admission records how many kept entries it found."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.chunked_req = chunked_req
+    scheduler.prefill_delayer = None
+    scheduler.entries_at_admission = []
+
+    def admit(prefill_delayer_single_pass, running_batch):
+        scheduler.entries_at_admission.append(len(mm_schedule._prefill_rows))
+        return None, running_batch
+
+    scheduler._get_new_batch_prefill_raw = admit
+    return scheduler
+
+
+def test_kept_rows_stay_while_a_request_is_mid_prefill_and_go_after(kept_rows):
+    scheduler = _admission_scheduler(chunked_req=object())
+    scheduler.get_new_batch_prefill(running_batch=None)
+
+    # An abort or the last chunk leaves no chunked request for the next step.
+    scheduler.chunked_req = None
+    scheduler.get_new_batch_prefill(running_batch=None)
+
+    assert scheduler.entries_at_admission == [1, 0]
+
+
+def test_last_chunk_still_reads_its_kept_rows(kept_rows):
+    scheduler = _admission_scheduler(chunked_req=object())
+
+    def last_chunk(prefill_delayer_single_pass, running_batch):
+        # add_chunked_req returns None for a request's last chunk, whose
+        # forward in this step still reads the kept rows.
+        scheduler.chunked_req = None
+        return None, running_batch
+
+    scheduler._get_new_batch_prefill_raw = last_chunk
+    scheduler.get_new_batch_prefill(running_batch=None)
+
+    assert len(kept_rows) == 1
+
+
+def test_bootstrap_failure_releases_kept_rows_before_admission(kept_rows):
+    scheduler = _admission_scheduler(chunked_req=object())
+    scheduler.scheduler_stage_metrics = None
+    scheduler.process_pending_chunked_abort = Mock()
+    scheduler._process_hicache_events = Mock()
+    scheduler.resolve_waiting_queue_bootstrap = Mock()
+
+    def bootstrap_failed(last_batch, running_batch):
+        # process_prefill_chunk drops a chunked request whose bootstrap failed.
+        scheduler.chunked_req = None
+
+    scheduler.process_prefill_chunk = Mock(side_effect=bootstrap_failed)
+    scheduler.dp_attn_adapter = Mock()
+    scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
+
+    scheduler.get_next_disagg_prefill_batch_to_run(
+        running_batch=SimpleNamespace(batch_is_full=False), last_batch=None
+    )
+
+    assert scheduler.entries_at_admission == [0]
+
+
+def _pause_scheduler(disaggregation_mode):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._engine_paused = False
+    scheduler.enable_overlap = False
+    scheduler.enable_overlap_mlx = False
+    scheduler.last_batch = None
+    scheduler.cur_batch_for_debug = None
+    scheduler.running_batch = MagicMock()
+    scheduler.running_batch.reqs = []
+    scheduler.disaggregation_mode = disaggregation_mode
+    scheduler.decode_offload_manager = None
+    scheduler.hisparse_coordinator = None
+    scheduler.tree_cache = MagicMock()
+    scheduler.req_to_token_pool = MagicMock()
+    scheduler.token_to_kv_pool_allocator = MagicMock()
+    scheduler.waiting_queue = []
+    scheduler._add_request_to_queue = MagicMock()
+    scheduler.metrics_reporter = MagicMock()
+    scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+    scheduler.kv_events_publisher = MagicMock()
+    scheduler.chunked_req = MagicMock()
+    scheduler.chunked_req.finished.return_value = False
+    return scheduler
+
+
+@pytest.fixture
+def published_server_args():
+    from sglang.srt.server_args import ServerArgs
+
+    publish(ServerArgs(model_path="dummy"), role="test")
+    yield
+    reset_context()
+
+
+@pytest.mark.parametrize(
+    "mode, disaggregation_mode, kept",
+    [
+        ("retract", DisaggregationMode.NULL, 0),
+        # The live chunked request stays and resumes after the pause.
+        ("retract", DisaggregationMode.PREFILL, 1),
+        ("in_place", DisaggregationMode.NULL, 1),
+    ],
+)
+def test_pause_drops_kept_rows_only_with_the_chunked_request(
+    published_server_args, kept_rows, mode, disaggregation_mode, kept
+):
+    scheduler = _pause_scheduler(disaggregation_mode)
+
+    with patch("sglang.srt.managers.scheduler.retract_all"):
+        scheduler.pause_generation(PauseGenerationReqInput(mode=mode))
+
+    assert len(kept_rows) == kept
+
+
+def test_flush_cache_drops_kept_rows(kept_rows):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._engine_paused = False
+    scheduler.is_fully_idle = Mock(return_value=True)
+    scheduler.tree_cache = MagicMock()
+    scheduler.req_to_token_pool = MagicMock()
+    scheduler.token_to_kv_pool_allocator = MagicMock()
+    scheduler.grammar_manager = MagicMock()
+    scheduler.metrics_reporter = MagicMock()
+    scheduler.draft_worker = None
+
+    assert scheduler.flush_cache(empty_cache=False)
+    assert not kept_rows
+
+
+def test_weights_only_memory_release_drops_kept_rows(kept_rows):
+    with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
+        manager = SchedulerWeightUpdaterManager(
+            tp_worker=None,
+            draft_worker=None,
+            memory_saver_adapter=Mock(),
+            # This path never reaches flush_cache; a stub that keeps the rows
+            # shows the release comes from the manager itself.
+            flush_cache=Mock(return_value=True),
+            is_fully_idle=lambda **kwargs: True,
+            scheduler=SimpleNamespace(_engine_paused=False),
+        )
+
+    with patch("torch.get_device_module"):
+        manager.release_memory_occupation(
+            ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH])
+        )
+
+    manager.flush_cache.assert_not_called()
+    assert not kept_rows
+
+
+@pytest.mark.parametrize("prefix_len, in_progress", [(4, True), (0, False)])
+def test_dllm_context_is_in_progress_once_part_is_prefilled(prefix_len, in_progress):
+    # dLLM prefills its context over several steps without chunked_req.
+    manager = DllmManager(dllm_config=None)
+    manager.waiting_queue.append(
+        SimpleNamespace(dllm_phase=DllmReqPhase.STAGING_PREFILL, prefix_len=prefix_len)
+    )
+
+    assert manager.any_context_in_progress() is in_progress
 
 
 if __name__ == "__main__":

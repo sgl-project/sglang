@@ -488,9 +488,8 @@ VIDEO_RUNS = [(2, 5), (7, 10), (12, 15), (17, 20)]
 VIDEO_LEN = 24
 VIDEO_CHUNKS = [(0, 9), (9, 9), (18, 6)]
 VIDEO_TOKENS = sum(end - start + 1 for start, end in VIDEO_RUNS)
-# Kept-rows tests run each embedding path: the full path (a multi-run video),
-# the batched per-item path (a single-run item) and the per-request path of
-# HIP, NPU and XPU (a multi-run audio item).
+# The embedding paths: full (a multi-run video), batched (a single-run item),
+# and per-request on HIP, NPU and XPU (a multi-run audio item).
 PATHS = ["full", "batched", "per_request"]
 
 
@@ -796,7 +795,7 @@ def test_same_image_twice_in_a_request_reads_its_own_rows(monkeypatch, per_reque
 
 
 def test_kept_rows_are_not_served_to_a_request_with_another_layout():
-    # The same clip at another position: rows one dropped are unread for the other.
+    # The same clip at other positions must not read the first request's rows.
     mm_schedule.init_mm_embedding_cache(0)
     item = _video_item()
     shifted = [(start + 3, end + 3) for start, end in VIDEO_RUNS]

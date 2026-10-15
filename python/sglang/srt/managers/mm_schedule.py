@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -268,7 +269,6 @@ def _slice_item_chunk(
     chunk_len: int,
     first_row: int = 0,
 ) -> Tuple[torch.Tensor, int]:
-    """Return the item's rows for the chunk and the row index where the chunk ends."""
     if len(item.offsets) == 1:
         start, end = item.offsets[0]
         local_start = max(start, chunk_start) - start
@@ -287,38 +287,31 @@ def _slice_item_chunk(
     return chunk, end_row
 
 
-@dataclass(frozen=True, eq=False)
-class _PrefillRows:
-    """Encoder rows kept between two prefill chunks."""
-
+class _PrefillRows(msgspec.Struct, frozen=True):
     result: EmbeddingResult  # the rows from first_row on
     first_row: int = 0
     next_token: int = 0  # first prompt position these rows can still serve
     is_copy: bool = False  # a copy made here, not the encoder's or the cache's tensor
 
 
-# Kept rows by content and position. Requests with the same items at the same
-# positions (session requests, identical prompts) share an entry; the rows
-# depend only on the content, and the next_token check keeps a reader inside them.
+# Requests with the same items at the same positions share an entry;
+# the rows depend only on the content, and next_token keeps readers inside them.
 _prefill_rows: Dict[tuple, _PrefillRows] = {}
 
 
 def release_prefill_rows() -> None:
-    """Drop all kept rows; the scheduler calls this when no prefill is mid-way."""
     _prefill_rows.clear()
 
 
 def _rows_key(mm_hash: Optional[int], offsets) -> Optional[tuple]:
-    """Key kept rows by content and position; rows without a hash are not kept."""
     if mm_hash is None:
-        return None
+        return None  # unrelated items without a hash would share the key
     return mm_hash, tuple(tuple(run) for run in offsets)
 
 
 def _find_prefill_rows(
     key: Optional[tuple], chunk_start: int
 ) -> Optional[_PrefillRows]:
-    """Return the kept rows for `key` if they still cover `chunk_start`."""
     kept = _prefill_rows.get(key) if key is not None else None
     if kept is None or kept.next_token > chunk_start:
         return None
@@ -333,12 +326,6 @@ def _keep_prefill_rows(
     last_token: int,
     cache_hash: Optional[int],
 ) -> None:
-    """Keep the rows that later chunks still read.
-
-    The embedding cache may be disabled, too small, or evict the entry between
-    chunks, which would rerun the encoder for every chunk. `rows` served the
-    chunk ending at `chunk_end` and was read up to `end_row`.
-    """
     if key is None:
         return
     if last_token < chunk_end:
@@ -374,14 +361,15 @@ def _item_prefill_chunk(
     chunk_start: int,
     chunk_len: int,
 ) -> torch.Tensor:
-    """Slice an item's rows for a chunk from its kept rows, else from `emb`."""
     chunk_end = chunk_start + chunk_len
     last_token = item.offsets[-1][1]
-    key = _rows_key(item.hash, item.offsets)
+    key = _rows_key(mm_hash=item.hash, offsets=item.offsets)
     if kept is not None:
         rows = kept
     elif last_token < chunk_end or key is None:
-        return _slice_item_chunk(emb, item, chunk_start, chunk_len)[0]
+        return _slice_item_chunk(
+            emb=emb, item=item, chunk_start=chunk_start, chunk_len=chunk_len
+        )[0]
     else:
         rows = _PrefillRows(result=EmbeddingResult(embedding=emb))
     chunk, end_row = _slice_item_chunk(
@@ -417,13 +405,11 @@ def _get_chunked_embedding_full(
     """
     item_hashes = [item.hash for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-    # The key holds every item's hash and position, so one entry covers the
-    # request's whole layout.
     rows_key = _rows_key(
-        None if None in item_hashes else embedding_items_hash, items_offset
+        mm_hash=None if None in item_hashes else embedding_items_hash,
+        offsets=items_offset,
     )
     rows = _find_prefill_rows(key=rows_key, chunk_start=extend_prefix_len)
-    # The cache is asked only when no rows were kept.
     embedding_per_req = (
         rows.result if rows is not None else embedding_cache.get(item_hashes)
     )
@@ -539,7 +525,8 @@ def _batch_encode_per_image_misses(
 
         for idx, item, expected_token_count in overlapping:
             kept = _find_prefill_rows(
-                key=_rows_key(item.hash, item.offsets), chunk_start=chunk_start
+                key=_rows_key(mm_hash=item.hash, offsets=item.offsets),
+                chunk_start=chunk_start,
             )
             if kept is not None:
                 # Take it now; a later request in this batch may replace the entry.
@@ -636,7 +623,8 @@ def _get_chunked_embedding_by_item(
     miss_items = []
     for idx, item, expected_token_count in overlapping:
         kept = _find_prefill_rows(
-            key=_rows_key(item.hash, item.offsets), chunk_start=chunk_start
+            key=_rows_key(mm_hash=item.hash, offsets=item.offsets),
+            chunk_start=chunk_start,
         )
         if kept is not None:
             kept_rows[idx] = kept

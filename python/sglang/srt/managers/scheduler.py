@@ -106,7 +106,6 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
 )
-from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -3866,7 +3865,9 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
-            self._release_kept_mm_rows_dllm()
+            # dLLM prefills its context over several steps without chunked_req.
+            if not self.dllm_manager.any_context_in_progress():
+                mm_schedule.release_prefill_rows()
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
@@ -3951,21 +3952,9 @@ class Scheduler(
 
         return res
 
-    def _release_kept_mm_rows_dllm(self) -> None:
-        """Drop kept encoder rows unless a dLLM request is part-way through its
-        context; dLLM requests encode it over several steps without becoming
-        chunked_req."""
-        dllm = self.dllm_manager
-        if not any(
-            req.dllm_phase == DllmReqPhase.STAGING_PREFILL and req.prefix_len > 0
-            for req in (*dllm.waiting_queue, *dllm.staging_queue)
-        ):
-            mm_schedule.release_prefill_rows()
-
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
-        # Every prefill loop passes here after dropping chunked requests and
-        # before add_chunked_req ends the current one: drop kept encoder rows
-        # once no request is between two prefill chunks.
+        # Every prefill loop passes here after dropping chunked requests, and before
+        # add_chunked_req ends a last chunk whose forward still reads its kept rows.
         if self.chunked_req is None:
             mm_schedule.release_prefill_rows()
         prefill_delayer_single_pass = None
