@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     BlockAcceptEstimateRecorder,
 )
@@ -64,6 +65,7 @@ def _observe(
     seq_len: int,
     cap_trim: int = 0,
     temperature: float = 1.0,
+    draft_cutoffs: DraftSamplingParams | None = None,
 ) -> None:
     recorder.observe_verify_step(
         forward_ct=forward_ct,
@@ -71,6 +73,7 @@ def _observe(
         draft_tokens=torch.tensor([drafts], dtype=torch.int64),
         corrected_logits=corrected_logits.unsqueeze(0),
         draft_temperatures=torch.tensor([temperature], dtype=torch.float32),
+        draft_cutoffs=draft_cutoffs,
         greedy_mask=torch.tensor([False]),
         target_logits=target_logits,
         target_temperatures=torch.tensor([[temperature]], dtype=torch.float32),
@@ -89,6 +92,41 @@ def _read_records(path: Path) -> list[dict]:
 
 
 class TestBlockAcceptEstimateRecorder(CustomTestCase):
+    def test_censored_block_scores_q_under_the_draft_cutoffs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder, path = _make_recorder(tmp)
+            drafts = [1, 2, 3]
+            # Distinct logits, the draft highest and token 7 second: a draft
+            # top-k of 2 keeps just those two, so q(X) is e^10 / (e^10 + e^7)
+            # rather than the plain softmax's share of the whole row.
+            corrected = torch.arange(_VOCAB, dtype=torch.float32).repeat(_GAMMA, 1)
+            corrected[torch.arange(_GAMMA), torch.tensor(drafts)] = 10.0
+            expected_q_lp = 10.0 - math.log(math.exp(10.0) + math.exp(7.0))
+            cutoffs = DraftSamplingParams(
+                temperatures=torch.ones(1),
+                top_ks=torch.tensor([2], dtype=torch.int32),
+                top_ps=torch.ones(1),
+                apply_top_k=True,
+            )
+            _observe(
+                recorder,
+                forward_ct=1,
+                rid="r0",
+                drafts=drafts,
+                corrected_logits=corrected,
+                draft_cutoffs=cutoffs,
+                target_logits=torch.zeros(_GAMMA + 1, _VOCAB),
+                verify_len=2,
+                correct_len=1,
+                bonus=2,
+                seq_len=10,
+            )
+            recorder._file.flush()
+            record = _read_records(path)[0]
+            self.assertEqual(len(record["q_lp"]), 2)
+            for logprob in record["q_lp"]:
+                self.assertAlmostEqual(logprob, expected_q_lp, places=5)
+
     def test_exact_block_when_rejected_inside_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             recorder, path = _make_recorder(tmp)

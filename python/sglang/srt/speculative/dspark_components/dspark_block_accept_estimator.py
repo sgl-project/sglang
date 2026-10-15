@@ -12,6 +12,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
+from sglang.srt.speculative.dspark_components.dspark_draft import cutoff_draft_probs
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -294,6 +296,8 @@ class BlockAcceptEstimateRecorder:
         bonus: torch.Tensor,
         prefix_lens: torch.Tensor,
         layout: Optional[RaggedVerifyLayout],
+        draft_cutoffs: Optional[DraftSamplingParams] = None,
+        draft_probs: Optional[torch.Tensor] = None,
     ) -> None:
         if (
             self._delayed is not None
@@ -327,6 +331,8 @@ class BlockAcceptEstimateRecorder:
                 bonus=bonus,
                 prefix_lens=prefix_lens,
                 layout=layout,
+                draft_cutoffs=draft_cutoffs,
+                draft_probs=draft_probs,
             )
 
         if self._delayed is not None:
@@ -446,6 +452,8 @@ class BlockAcceptEstimateRecorder:
         bonus: torch.Tensor,
         prefix_lens: torch.Tensor,
         layout: Optional[RaggedVerifyLayout],
+        draft_cutoffs: Optional[DraftSamplingParams] = None,
+        draft_probs: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         gamma = self._gamma
         rows_per_request = gamma + 1
@@ -476,12 +484,18 @@ class BlockAcceptEstimateRecorder:
         )
         draft_flat = draft_tokens.reshape(-1)
 
-        q_all = self._gather_logprobs(
-            logits=corrected_logits.reshape(bs * gamma, -1),
-            row_indices=torch.arange(bs * gamma, device=device),
-            token_indices=draft_flat,
-            temps=draft_temps_full,
-        ).reshape(bs, gamma)
+        if draft_probs is None and draft_cutoffs is not None:
+            draft_probs = cutoff_draft_probs(corrected_logits, draft_cutoffs)
+        if draft_probs is not None:
+            # The draft sampled from the cut-off q, so score it with that q.
+            q_all = draft_probs.gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1).log()
+        else:
+            q_all = self._gather_logprobs(
+                logits=corrected_logits.reshape(bs * gamma, -1),
+                row_indices=torch.arange(bs * gamma, device=device),
+                token_indices=draft_flat,
+                temps=draft_temps_full,
+            ).reshape(bs, gamma)
         target_diag = self._gather_logprobs(
             logits=target_logits,
             row_indices=self._diag_rows(bs=bs, rows_per_request=rows_per_request),

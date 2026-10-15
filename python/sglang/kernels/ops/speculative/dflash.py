@@ -248,69 +248,45 @@ def _prepare_dflash_draft_block_unchecked(
 
 @triton.jit
 def _selector_walk_kernel(
-    scores_ptr,
+    probs_ptr,
     candidate_ptr,
     uniforms_ptr,
-    temperatures_ptr,
-    greedy_ptr,
     tokens_ptr,
     q_ptr,
     slots: tl.constexpr,
     top_k: tl.constexpr,
 ):
-    """One program per request: a slot's K scores stay in registers and the walk is a
-    loop, so the slot-to-slot dependency costs nothing instead of one kernel each."""
+    """One program per request: a slot's K probabilities stay in registers and the
+    walk is a loop, so the slot-to-slot dependency costs nothing instead of one
+    kernel each. Each slot draws by inverse CDF from the row its predecessor picked."""
     row = tl.program_id(0)
     offsets = tl.arange(0, top_k)
-    temperature = tl.load(temperatures_ptr + row)
-    greedy = tl.load(greedy_ptr + row) != 0
     previous = 0
     for slot in range(slots):
         base = (row * slots + slot) * top_k
-        scores = tl.load(scores_ptr + (base + previous) * top_k + offsets).to(
-            tl.float32
+        probabilities = tl.load(probs_ptr + (base + previous) * top_k + offsets)
+        uniform = tl.load(uniforms_ptr + row * slots + slot)
+        index = tl.sum(
+            tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
         )
-        if greedy:
-            # Same pick as torch.argmax: the first NaN if any, else the first max.
-            is_nan = scores != scores
-            best = tl.max(tl.where(is_nan, -float("inf"), scores), axis=0)
-            has_nan = tl.max(is_nan.to(tl.int32), axis=0) > 0
-            hit = tl.where(has_nan, is_nan, scores == best)
-            index = tl.min(tl.where(hit, offsets, top_k), axis=0)
-            probabilities = tl.where(offsets == index, 1.0, 0.0)
-        else:
-            scaled = scores / temperature
-            exponentials = tl.exp(scaled - tl.max(scaled, axis=0))
-            probabilities = exponentials / tl.sum(exponentials, axis=0)
-            uniform = tl.load(uniforms_ptr + row * slots + slot)
-            index = tl.sum(
-                tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
-            )
-            index = tl.minimum(index, top_k - 1)
+        # Roundoff can leave the CDF just below one; fall back inside q's support.
+        last_supported = tl.max(tl.where(probabilities > 0, offsets, 0), axis=0)
+        index = tl.minimum(index, last_supported)
         tl.store(q_ptr + base + offsets, probabilities)
         tl.store(tokens_ptr + row * slots + slot, tl.load(candidate_ptr + base + index))
         previous = index
 
 
-def selector_walk_triton(
-    *,
-    candidate_ids,
-    scores,
-    uniforms,
-    temperatures,
-    greedy_mask,
-):
+def selector_walk_triton(*, candidate_ids, probs, uniforms):
     batch, slots, top_k = candidate_ids.shape
-    tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
+    tokens = torch.empty((batch, slots), dtype=torch.int64, device=probs.device)
     q_rows = torch.empty(
-        (batch, slots, top_k), dtype=torch.float32, device=scores.device
+        (batch, slots, top_k), dtype=torch.float32, device=probs.device
     )
     _selector_walk_kernel[(batch,)](
-        scores.contiguous(),
+        probs.contiguous(),
         candidate_ids.contiguous(),
         uniforms.contiguous(),
-        temperatures.contiguous(),
-        greedy_mask.contiguous(),
         tokens,
         q_rows,
         slots=slots,

@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import LinearBase, ReplicatedLinear
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
@@ -17,6 +16,11 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.draft_sampling import (
+    DraftSamplingParams,
+    candidate_probs,
+    sample_candidate_path,
+)
 from sglang.srt.speculative.lilicorr_utils import (
     LiLiCorrConfig,
     parse_lilicorr_draft_config,
@@ -139,6 +143,29 @@ class LiLiCorrLayer(nn.Module):
             self.attn_norm(hidden_states), attention_bias
         )
         return hidden_states + self.mlp(self.mlp_norm(hidden_states))
+
+
+def _lattice_scores(log_start: torch.Tensor, log_pair: torch.Tensor) -> torch.Tensor:
+    # The walk reads only scores[:, 0, 0, :] at slot 0, so broadcasting is sound.
+    topk = int(log_start.shape[-1])
+    start = log_start.float()[:, None, None, :].expand(-1, 1, topk, topk)
+    return torch.cat([start, log_pair.float()], dim=1)
+
+
+def lilicorr_sample_path(
+    log_start: torch.Tensor,
+    log_pair: torch.Tensor,
+    candidate_tokens: torch.Tensor,
+    *,
+    uniforms: torch.Tensor,
+    params: Optional[DraftSamplingParams],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # No log-prob prior in the proposal: the head was trained without one. Greedy rows
+    # report a point mass so min(1, p/q) stays the right acceptance test.
+    probs = candidate_probs(_lattice_scores(log_start, log_pair), params)
+    return sample_candidate_path(
+        candidate_ids=candidate_tokens, probs=probs, uniforms=uniforms
+    )
 
 
 class LiLiCorrHead(nn.Module):
@@ -423,8 +450,7 @@ class LiLiCorrHead(nn.Module):
         anchor_hidden: torch.Tensor,
         anchor_valid: torch.Tensor,
         uniforms: torch.Tensor,
-        temperatures: torch.Tensor,
-        greedy_mask: torch.Tensor,
+        params: Optional[DraftSamplingParams],
         already_projected: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         start_scores, pair_scores = self.score(
@@ -441,8 +467,7 @@ class LiLiCorrHead(nn.Module):
             log_pair[:, 0],
             candidate_tokens,
             uniforms=uniforms,
-            temperatures=temperatures,
-            greedy_mask=greedy_mask,
+            params=params,
         )
 
     @torch.no_grad()

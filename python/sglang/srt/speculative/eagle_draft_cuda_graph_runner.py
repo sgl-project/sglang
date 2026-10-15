@@ -658,7 +658,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.dsa_seed_topk[:raw_bs].copy_(seed)
             else:
                 buffers.dsa_seed_topk[:raw_bs].zero_()
-        # Only rejection sampling reads temperatures (renorm_draft_probs); skip
+        # Only rejection sampling reads these (sample_draft_proposal); skip
         # the copy otherwise to keep the non-RS path free of extra work.
         if (
             get_spec().speculative_use_rejection_sampling

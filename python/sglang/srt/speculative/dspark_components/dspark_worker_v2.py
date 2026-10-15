@@ -49,6 +49,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    draft_tp_rng_sites,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -236,8 +237,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
+        # A draft temperature of 0 asks for the same argmax draft.
+        self._greedy_draft = (
+            envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+            or get_spec().speculative_draft_temperature == 0
+        )
         parallel = get_parallel()
-        self._tp_sync = SpecTpSync(get_dp_tp_group())
+        self._tp_sync = SpecTpSync(
+            get_dp_tp_group(),
+            rng_sites=draft_tp_rng_sites(greedy_draft=self._greedy_draft),
+        )
         self._draft_graph_group = (
             parallel.attn_tp_group
             if self._draft_dp_context_enabled
@@ -323,7 +332,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._simulate_acc_len > 0
             else None
         )
-        self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -1076,6 +1084,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            cutoff_draft_probs=accept.cutoff_draft_probs,
         )
 
         next_draft_input = make_next_draft_input(

@@ -20,6 +20,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
+from sglang.srt.sampling.draft_sampling import (
+    DraftOverrides,
+    DraftSamplingParams,
+    build_draft_probs,
+)
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -28,7 +34,7 @@ from sglang.srt.speculative.spec_info import (
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.spec_utils import draft_tp_context, fast_sample
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
@@ -61,6 +67,9 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     temperatures: torch.Tensor
     # Drafted by argmax: the sampling accept uses a one-hot draft distribution.
     greedy_draft: bool
+    # The draft top-k/top-p the tokens were sampled under, for the verify to
+    # rebuild q from corrected_logits; None without a draft cutoff override.
+    cutoffs: Optional[DraftSamplingParams] = None
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -124,6 +133,62 @@ class DraftParams(NamedTuple):
     greedy_mask: torch.Tensor
     # The temperature each step samples at: 0 on argmax rows.
     step_temperatures: torch.Tensor
+    # Draft top-k/top-p over ``temperatures`` (shared storage); set only under a
+    # draft cutoff override, when each step samples from q outside the kernel.
+    cutoffs: Optional[DraftSamplingParams] = None
+
+    @classmethod
+    def allocate(cls, bs: int, device) -> DraftParams:
+        """Greedy-initialized buffers for ``resolve_draft_params`` to fill."""
+        temperatures = torch.ones(bs, dtype=torch.float32, device=device)
+        overrides = DraftOverrides.from_spec()
+        cutoffs = None
+        if overrides.has_cutoff:
+            cutoffs = DraftSamplingParams(
+                temperatures=temperatures,
+                top_ks=torch.ones(bs, dtype=torch.int32, device=device),
+                top_ps=torch.ones(bs, dtype=torch.float32, device=device),
+                apply_top_k=overrides.top_k is not None,
+                apply_top_p=overrides.top_p is not None,
+            )
+        return cls(
+            temperatures=temperatures,
+            greedy_mask=torch.ones(bs, dtype=torch.bool, device=device),
+            step_temperatures=torch.zeros(bs, dtype=torch.float32, device=device),
+            cutoffs=cutoffs,
+        )
+
+    def slice(self, bs: int) -> DraftParams:
+        return DraftParams(
+            temperatures=self.temperatures[:bs],
+            greedy_mask=self.greedy_mask[:bs],
+            step_temperatures=self.step_temperatures[:bs],
+            cutoffs=None if self.cutoffs is None else self.cutoffs.slice(bs),
+        )
+
+
+def cutoff_draft_probs(
+    step_logits: torch.Tensor, cutoffs: DraftSamplingParams
+) -> torch.Tensor:
+    """The cut-off q of every kept step, [bs, gamma, vocab], built with the
+    same per-step [bs, vocab] calls ``_draft_step`` sampled from, so the verify
+    meets the kernels the draft ran and q matches bit for bit."""
+    return torch.stack(
+        [
+            build_draft_probs(step_logits[:, step], cutoffs)
+            for step in range(step_logits.shape[1])
+        ],
+        dim=1,
+    )
+
+
+def draft_tp_rng_sites(*, greedy_draft: bool) -> frozenset[SpecTpSyncSite]:
+    """The draft site draws from the torch RNG only when a cutoff override
+    redraws outside the fused kernel; the kernel's Philox noise matches across
+    ranks, so the ``rng`` sync preset leaves the site out otherwise."""
+    if greedy_draft or not DraftOverrides.from_spec().has_cutoff:
+        return frozenset()
+    return frozenset({SpecTpSyncSite.DSPARK_DRAFT})
 
 
 @functools.cache
@@ -138,30 +203,38 @@ def resolve_draft_params(
     device: Optional[torch.device] = None,
     out: Optional[DraftParams] = None,
 ) -> DraftParams:
-    """Written into the ``[:bs]`` rows of ``out`` when given (the graph's
-    static buffers), else into fresh tensors on ``device``."""
-    if out is not None:
-        device = out.temperatures.device
-    else:
-        out = DraftParams(
-            temperatures=torch.empty(bs, dtype=torch.float32, device=device),
-            greedy_mask=torch.empty(bs, dtype=torch.bool, device=device),
-            step_temperatures=torch.empty(bs, dtype=torch.float32, device=device),
-        )
-    temperatures, greedy_mask, step_temperatures = (buf[:bs] for buf in out)
+    """Fill the ``[:bs]`` rows of ``out`` (the graph's static buffers) or fresh
+    buffers on ``device``. A draft temperature override replaces every sampling
+    row's; greedy_mask stays the target's, which picks the accept rule. Draft
+    temperature 0 is an argmax draft, resolved by the worker as greedy_draft."""
+    params = (DraftParams.allocate(bs, device) if out is None else out).slice(bs)
+    temperatures, greedy_mask, step_temperatures, cutoffs = params
     if sampling_info is None:
         temperatures.fill_(1.0)
         greedy_mask.fill_(True)
         step_temperatures.zero_()
-    else:
+        if cutoffs is not None:
+            cutoffs.top_ks.fill_(1)
+            cutoffs.top_ps.fill_(1.0)
+        return params
+    overrides = DraftOverrides.from_spec()
+    if overrides.temperature is None:
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
             min=1e-5,
             out=temperatures,
         )
-        torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
-        torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
-    return DraftParams(temperatures, greedy_mask, step_temperatures)
+    else:
+        temperatures.fill_(max(float(overrides.temperature), 1e-5))
+    torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
+    torch.where(
+        greedy_mask, _zero(temperatures.device), temperatures, out=step_temperatures
+    )
+    if cutoffs is not None:
+        top_k = TOP_K_ALL if overrides.top_k is None else overrides.top_k
+        cutoffs.top_ks.fill_(top_k).masked_fill_(greedy_mask, 1)
+        cutoffs.top_ps.fill_(1.0 if overrides.top_p is None else overrides.top_p)
+    return params
 
 
 # XORed into the server seed so the draft noise differs from other samplers'.
@@ -191,7 +264,7 @@ def _draft_step(
     *,
     hidden_states: Optional[torch.Tensor],
     state: Optional[torch.Tensor],
-    temperatures: torch.Tensor,
+    params: DraftParams,
     noise: DraftNoise,
     step: int,
     logits_out: Optional[torch.Tensor],
@@ -220,19 +293,26 @@ def _draft_step(
             gather_logits=shard.gather,
         )
     )
+    # A draft cutoff needs the whole kept row: the kernel then only argmaxes
+    # (no Philox) and the sampling rows redraw below from the cut-off q.
+    cutoffs = None if logits_out is None else params.cutoffs
     tokens = MarkovSampleStep.execute(
         base_logits=base_logits,
         bias=bias,
-        temperatures=temperatures,
+        temperatures=params.step_temperatures,
         key=noise.key,
         offset=noise.offset,
         step=step,
         step_dtype=markov_head.step_logits_dtype(base_logits.dtype),
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
-        has_sampled_rows=None if logits_out is not None else False,
+        has_sampled_rows=None if logits_out is not None and cutoffs is None else False,
         **sharded,
     )
+    if cutoffs is not None:
+        # The verify rebuilds this same q from the kept step logits.
+        _, sampled = fast_sample(build_draft_probs(logits_out, cutoffs))
+        tokens = torch.where(params.greedy_mask, tokens, sampled.view(-1))
     return tokens, state
 
 
@@ -242,7 +322,7 @@ def draft_markov_block(
     base_logits: torch.Tensor,
     anchor_tokens: torch.Tensor,
     draft_hidden: Optional[torch.Tensor],
-    step_temperatures: torch.Tensor,
+    params: DraftParams,
     noise: DraftNoise,
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
@@ -267,7 +347,7 @@ def draft_markov_block(
             base_logits[:, step],
             hidden_states=None if draft_hidden is None else draft_hidden[:, step],
             state=state,
-            temperatures=step_temperatures,
+            params=params,
             noise=noise,
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
@@ -300,7 +380,7 @@ def sample_draft_block(
         base_logits=base_logits,
         anchor_tokens=anchor_tokens,
         draft_hidden=draft_hidden,
-        step_temperatures=params.step_temperatures,
+        params=params,
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
@@ -313,6 +393,7 @@ def sample_draft_block(
         greedy_mask=params.greedy_mask,
         temperatures=params.temperatures,
         greedy_draft=greedy_draft,
+        cutoffs=None if greedy_draft else params.cutoffs,
     )
 
 
@@ -403,14 +484,16 @@ class DraftBlockProposer:
             and fwd.can_run_graph
         ):
             folded = True
+            params = draft_sampler.params.slice(bs)
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
                 corrected_logits=(
                     None if self._greedy_draft else draft_sampler.step_logits[:bs]
                 ),
-                greedy_mask=draft_sampler.params.greedy_mask[:bs],
-                temperatures=draft_sampler.params.temperatures[:bs],
+                greedy_mask=params.greedy_mask,
+                temperatures=params.temperatures,
                 greedy_draft=self._greedy_draft,
+                cutoffs=None if self._greedy_draft else params.cutoffs,
             )
             if draft_sampler.confidence_out is not None:
                 confidence = draft_sampler.confidence_out[:bs]

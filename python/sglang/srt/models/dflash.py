@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -38,6 +37,11 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.sampling.draft_sampling import (
+    DraftSamplingParams,
+    candidate_probs,
+    sample_candidate_path,
+)
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -1070,16 +1074,6 @@ def _score_edges(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def _follow_maps(maps, initial_indices, edges: int):
-    index = initial_indices
-    path = [index]
-    for edge in range(edges):
-        index = maps[:, edge].gather(-1, index[:, None])[:, 0]
-        path.append(index)
-    return torch.stack(path, dim=1)
-
-
 class CandidateSelector(nn.Module):
     """Scores the K x K transitions between adjacent proposal slots, then walks them.
 
@@ -1146,60 +1140,16 @@ class CandidateSelector(nn.Module):
         candidate_ids: torch.Tensor,
         scores: torch.Tensor,
         uniforms: torch.Tensor,
-        temperatures: torch.Tensor,
-        greedy_mask: torch.Tensor,
+        params: Optional[DraftSamplingParams],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Walk one path, with q over the K candidates for the verify. greedy_mask
-        rows take the argmax, selected rather than branched, so one captured graph
+        """Walk one path, with q over the K candidates for the verify. Greedy rows
+        are point masses, selected rather than branched, so one captured graph
         serves greedy and sampling batches alike."""
-        if scores.is_cuda:
-            return selector_walk_triton(
-                candidate_ids=candidate_ids,
-                scores=scores,
-                uniforms=uniforms,
-                temperatures=temperatures,
-                greedy_mask=greedy_mask,
-            )
-        top_k = self.top_k
-        temps = temperatures.view(-1, 1)
-        initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
-        initial_indices = (
-            uniforms[:, :1]
-            .ge(initial_probs.cumsum(dim=-1))
-            .sum(dim=-1)
-            .clamp_max(top_k - 1)
+        return sample_candidate_path(
+            candidate_ids=candidate_ids,
+            probs=candidate_probs(scores, params),
+            uniforms=uniforms,
         )
-        transition_probs = torch.softmax(
-            scores[:, 1:].float() / temps[:, :, None, None], dim=-1
-        )
-        local_maps = (
-            uniforms[:, 1:, None, None]
-            .ge(transition_probs.cumsum(dim=-1))
-            .sum(dim=-1)
-            .clamp_max(top_k - 1)
-        )
-        initial_indices = torch.where(
-            greedy_mask, scores[:, 0, 0].argmax(dim=-1), initial_indices
-        )
-        local_maps = torch.where(
-            greedy_mask[:, None, None], scores[:, 1:].argmax(dim=-1), local_maps
-        )
-        torch._dynamo.mark_static(local_maps, 1)
-        torch._dynamo.mark_static(local_maps, 2)
-        path_indices = _follow_maps(
-            local_maps, initial_indices, int(scores.shape[1]) - 1
-        )
-        tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
-        realized_rows = transition_probs.gather(
-            2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
-        )[:, :, 0]
-        q_rows = torch.cat((initial_probs.unsqueeze(1), realized_rows), dim=1)
-        # Greedy rows walk the argmax, so their q is the point mass there, not
-        # the temperature-1 softmax above. The triton walk stores the same.
-        q_rows = torch.where(
-            greedy_mask[:, None, None], F.one_hot(path_indices, top_k).float(), q_rows
-        )
-        return tokens, q_rows
 
 
 class DFlash2DraftModel(DFlashDraftModel):
