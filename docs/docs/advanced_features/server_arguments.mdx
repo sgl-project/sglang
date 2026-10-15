@@ -1754,9 +1754,15 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-adaptive-verification`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>EAGLE/NEXTN with topk=1 only. Each step, trim the draft chains the target verifies, per request, to the drafts most likely to be accepted, choosing the total verify-token count that maximizes expected accepted tokens per second. Acceptance is predicted by a logistic estimator on the draft top-1 log-odds fitted online from verify outcomes (no confidence head needed); costs come from profiling the target verify graphs at startup plus the measured rest of the step. Lossless. Requires CUDA graphs and attention backends with ragged verify support.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>EAGLE/NEXTN (topk=1) and DSPARK (`SGLANG_RAGGED_VERIFY_MODE=compact`). Each step, trim the draft chains the target verifies, per request, to the drafts most likely to be accepted, choosing the total verify-token count that maximizes expected accepted tokens per second. Acceptance is predicted by a logistic estimator on the draft top-1 log-odds fitted online from verify outcomes (no confidence head needed); costs come from profiling the target verify graphs at startup plus the measured rest of the step. Lossless. Requires CUDA graphs and attention backends with ragged verify support.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-adaptive-verification-confidence`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Acceptance confidence for `--speculative-adaptive-verification`: the online estimator, or the draft's trained confidence head (DSPARK checkpoints that ship one).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`estimator`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`estimator`, `head`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-skip-dp-mlp-sync`</td>

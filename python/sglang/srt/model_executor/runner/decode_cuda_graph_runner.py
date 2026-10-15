@@ -359,9 +359,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self.model_runner.is_draft_worker
         )
         self.uniform_verify_graphs = (
-            self.ragged_verify_mode
-            and self.model_runner.spec_algorithm.is_eagle()
-            and get_spec().speculative_adaptive_verification
+            self.ragged_verify_mode and get_spec().speculative_adaptive_verification
         )
         self.ragged_tiers_by_slots: Optional[dict[int, list[int]]] = (
             self._build_adaptive_verify_tiers() if self.uniform_verify_graphs else None

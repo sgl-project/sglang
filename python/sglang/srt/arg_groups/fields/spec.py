@@ -247,8 +247,8 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_adaptive_verification: A[
         bool,
-        "EAGLE/NEXTN with topk=1 only. Adaptive verification: each step, trim the "
-        "draft chains the target verifies, per request, to the drafts most likely "
+        "EAGLE/NEXTN (topk=1) and DSPARK (SGLANG_RAGGED_VERIFY_MODE=compact). "
+        "Adaptive verification: each step, trim the draft chains the target verifies, per request, to the drafts most likely "
         "to be accepted, choosing the total verify-token count that maximizes "
         "expected accepted tokens per second. Acceptance is predicted by a logistic "
         "estimator on the draft top-1 log-odds fitted online from verify outcomes "
@@ -257,6 +257,12 @@ class Spec(msgspec.Struct):
         "estimator reads the draft distribution only, never the sampled token. "
         "Requires CUDA graphs and attention backends with ragged verify support.",
     ] = False
+    speculative_adaptive_verification_confidence: A[
+        Literal["estimator", "head"],
+        "Acceptance confidence for --speculative-adaptive-verification: the online "
+        "estimator, or the draft's trained confidence head (DSPARK checkpoints that "
+        "ship one).",
+    ] = "estimator"
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
     ] = None

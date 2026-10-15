@@ -31,6 +31,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_verify_scheduler import AdaptiveVerifyScheduler
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
@@ -528,6 +529,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        if get_spec().speculative_adaptive_verification:
+            self._verify_planner.attach_adaptive_scheduler(
+                AdaptiveVerifyScheduler(
+                    num_steps=self.gamma,
+                    target_model_runner=self.model_runner,
+                    device=self.device,
+                    overlap=not get_schedule().disable_overlap_schedule,
+                )
+            )
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
@@ -877,6 +887,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             simulate_bonus_sampling_info = sampling_info
             sampling_info = None
+        adaptive_step_start = self._verify_planner.begin_adaptive_step()
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -893,7 +904,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         if coordination_plan is not None:
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
-        confidence = proposal.confidence
+        confidence, acceptance_prediction = self._verify_planner.predict_confidence(
+            head_confidence=proposal.confidence,
+            draft_top_probs=proposal.draft_top_probs,
+        )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -998,6 +1012,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+        )
+        self._verify_planner.observe_accept(
+            prediction=acceptance_prediction,
+            num_correct_drafts=accept.correct_len,
+            layout=layout,
+        )
+        self._verify_planner.end_adaptive_step(
+            start=adaptive_step_start,
+            num_reqs=bs,
+            layout=layout if run_compact else None,
         )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,

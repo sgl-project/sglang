@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -59,6 +60,11 @@ class DsparkDraftSampler:
                 dtype=confidence_head.proj.weight.dtype,
                 device=device,
             )
+        self.top_probs_out = (
+            torch.empty((self.max_bs, self.gamma), dtype=torch.float32, device=device)
+            if get_spec().speculative_adaptive_verification
+            else None
+        )
         self.greedy_draft = greedy_draft
         self._noise = noise
         self._tp_sync = tp_sync
@@ -116,6 +122,9 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            top_probs_out=None
+            if self.top_probs_out is None
+            else self.top_probs_out[:bs],
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:

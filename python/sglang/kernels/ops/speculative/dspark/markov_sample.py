@@ -43,6 +43,7 @@ def _markov_sample_partial_kernel(
     OFFSET,
     L,
     P,
+    STATS,
     BS,
     XS,
     LS,
@@ -59,6 +60,7 @@ def _markov_sample_partial_kernel(
     SELECT: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    HAS_STATS: tl.constexpr,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
     i = part * BLOCK + tl.arange(0, BLOCK)
@@ -70,6 +72,12 @@ def _markov_sample_partial_kernel(
     value = _round_to_step_dtype(value, ROUND)
     if STORE:
         tl.store(L + row * LS + i, value.to(L.dtype.element_ty), in_shard)
+    if HAS_STATS:
+        block_max = tl.max(tl.where(valid, value, -float("inf")), 0)
+        safe_max = tl.where(block_max == -float("inf"), 0.0, block_max)
+        block_sum = tl.sum(tl.where(valid, tl.exp(value - safe_max), 0.0), 0)
+        tl.store(STATS + (row * PARTS + part) * 2, block_max)
+        tl.store(STATS + (row * PARTS + part) * 2 + 1, block_sum)
     if SELECT:
         _select_block(
             value,
@@ -203,8 +211,10 @@ def _launch_partial(
     has_sampled_rows,
     vocab_start=0,
     select=True,
+    stats=None,
 ):
-    # Returns the [rows, parts * 2] (value, index bits) candidates of each block.
+    # Returns the [rows, parts * 2] (value, index bits) candidates of each block;
+    # ``stats`` [rows, parts, 2] receives each block's (max, sum of exp(x - max)).
     rows, padded = base_logits.shape
     # The padded width fixes the transport shape on every rank; WIDTH masks padding.
     parts = triton.cdiv(padded, _BLOCK)
@@ -219,6 +229,7 @@ def _launch_partial(
         offset,
         base_logits if store is None else store,
         partial,
+        partial if stats is None else stats,
         0 if bias is None else bias.stride(0),
         base_logits.stride(0),
         0 if store is None else store.stride(0),
@@ -235,9 +246,31 @@ def _launch_partial(
         select,
         has_sampled_rows is not False,
         _PHILOX_ROUNDS,
+        stats is not None,
         num_warps=4,
     )
     return partial.view(rows, parts * 2)
+
+
+def _alloc_stats(base_logits: torch.Tensor, *, enabled: bool):
+    if not enabled:
+        return None
+    parts = triton.cdiv(base_logits.shape[1], _BLOCK)
+    return torch.empty(
+        (base_logits.shape[0], parts, 2), device=base_logits.device, dtype=torch.float32
+    )
+
+
+def _write_top_prob(*, stats, gather, rows: int, out: torch.Tensor) -> None:
+    parts = stats.shape[1]
+    flat = stats.reshape(rows, parts * 2)
+    gathered = flat if gather is None else gather(flat)
+    blocks = gathered.view(-1, rows, parts, 2).transpose(0, 1).reshape(rows, -1, 2)
+    block_max, block_sum = blocks[..., 0], blocks[..., 1]
+    row_max = block_max.amax(dim=1, keepdim=True)
+    safe_max = torch.where(torch.isfinite(row_max), row_max, 0.0)
+    total = (block_sum * torch.exp(block_max - safe_max)).sum(dim=1)
+    out.copy_(torch.where(total > 0, 1.0 / total, 0.0))
 
 
 class MarkovSampleStep:
@@ -298,6 +331,7 @@ class MarkovSampleStep:
         gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
+        top_prob_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         cls._check(
             base_logits,
@@ -326,16 +360,27 @@ class MarkovSampleStep:
             )
             launch(base_logits, bias, width=width, store=local, select=False)
             full = gather_logits(local)[:, : logits_out.shape[1]]
-            gathered = launch(full, None, width=full.shape[1], store=logits_out)
+            stats = _alloc_stats(full, enabled=top_prob_out is not None)
+            gathered = launch(
+                full, None, width=full.shape[1], store=logits_out, stats=stats
+            )
+            stats_gather = None
         else:
+            stats = _alloc_stats(base_logits, enabled=top_prob_out is not None)
             partial = launch(
                 base_logits,
                 bias,
                 width=width,
                 store=logits_out,
                 vocab_start=vocab_start,
+                stats=stats,
             )
             gathered = partial if gather is None else gather(partial)
+            stats_gather = gather
+        if top_prob_out is not None:
+            _write_top_prob(
+                stats=stats, gather=stats_gather, rows=rows, out=top_prob_out
+            )
         parts = gathered.shape[1] // 2
         world = gathered.shape[0] // rows
         result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
@@ -366,6 +411,7 @@ class MarkovSampleStep:
         gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
+        top_prob_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # None draws the noise for every row: reading the temperatures on the
         # host would break a graph capture.
@@ -396,11 +442,18 @@ class MarkovSampleStep:
                 step_dtype=step_dtype,
                 logits_out=logits_out,
                 has_sampled_rows=has_sampled_rows,
+                top_prob_out=top_prob_out,
             )
         padded = base_logits.shape[1]
         device = base_logits.device
         if logits_out is not None:
             logits_out.copy_(value)
+        if top_prob_out is not None:
+            masked = value[:, :width]
+            row_max = masked.amax(dim=1, keepdim=True)
+            row_sum = torch.exp(masked - row_max).sum(dim=1, keepdim=True)
+            stats = torch.cat([row_max, row_sum], dim=1).view(rows, 1, 2)
+            _write_top_prob(stats=stats, gather=gather, rows=rows, out=top_prob_out)
 
         keys = value
         if has_sampled_rows is not False:

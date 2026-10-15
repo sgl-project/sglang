@@ -1490,7 +1490,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     confidence=(
                         None
                         if adaptive_verify_step is None
-                        else adaptive_verify_step.predictions
+                        else adaptive_verify_step.prediction.predictions
                     ),
                 )
             if (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -141,6 +142,11 @@ def _refit_kernel(
     tl.store(grad_ptr + k * 2 + 0, 0.0, mask=mask)
     tl.store(grad_ptr + k * 2 + 1, 0.0, mask=mask)
     tl.store(counts_ptr + k, 0.0, mask=mask)
+
+
+class AcceptancePrediction(msgspec.Struct, frozen=True):
+    features: torch.Tensor
+    predictions: torch.Tensor
 
 
 class OnlineAcceptanceEstimator:

@@ -227,6 +227,57 @@ class TestMarkovSampleStep(CustomTestCase):
         for rank in range(3):
             self.assertTrue(torch.equal(run(rank, lambda _: stacked), full))
 
+    def test_top_prob_matches_full_vocab_softmax_across_shards(self):
+        # The per-block (max, sumexp) stats must combine across vocab shards
+        # into the full vocab's top-1 softmax probability, padding excluded.
+        g = torch.Generator(device=DEVICE).manual_seed(2)
+        rows, shard = 16, 5000
+        width = 2 * shard - 7
+        base = torch.randn(rows, 3 * shard, generator=g, device=DEVICE) * 3
+        bias = torch.randn(rows, width, generator=g, device=DEVICE)
+        temps = torch.rand(rows, generator=g, device=DEVICE)
+        expected = torch.softmax(base[:, :width] + bias, dim=1).amax(dim=1)
+        for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
+            top = torch.empty(rows, device=DEVICE)
+            _call(
+                impl,
+                base=base[:, :width].contiguous(),
+                bias=bias,
+                temps=temps,
+                step_dtype=torch.float32,
+                top_prob_out=top,
+            )
+            torch.testing.assert_close(top, expected, atol=1e-5, rtol=1e-4)
+
+        shards = [
+            (rank * shard, base[:, rank * shard : (rank + 1) * shard].contiguous())
+            for rank in range(3)
+        ]
+        calls = {rank: [] for rank in range(3)}
+
+        def run(rank, gather):
+            start, shard_base = shards[rank]
+            top = torch.empty(rows, device=DEVICE)
+            _call(
+                MarkovSampleStep.triton,
+                base=shard_base,
+                bias=bias[:, start : start + shard].contiguous(),
+                temps=temps,
+                step_dtype=torch.float32,
+                vocab_start=start,
+                gather=gather,
+                top_prob_out=top,
+            )
+            return top
+
+        for rank in range(3):
+            run(rank, lambda t, rank=rank: calls[rank].append(t) or t)
+        stacked = [torch.cat([calls[rank][i] for rank in range(3)]) for i in range(2)]
+        for rank in range(3):
+            replies = iter(stacked)
+            top = run(rank, lambda _: next(replies))
+            torch.testing.assert_close(top, expected, atol=1e-5, rtol=1e-4)
+
     def test_kept_sharded_logits_match_full_vocab(self):
         # Kept logits are gathered whole and every rank picks from them: the
         # same tokens and the same logits as the full vocab, both backends.
