@@ -183,7 +183,6 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
-
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
         0.0,
@@ -1049,6 +1048,40 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 scale_packed = scale_fp32
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
+        elif backend.is_gfx95_mxfp8_flydsl():
+            from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight
+
+            from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+                MXFP8_FLYDSL_M_VALUES,
+                MXFP8_FLYDSL_WEIGHT_SHAPES,
+                get_flydsl_mxfp8_config,
+            )
+
+            n, k = layer.weight.shape
+            if (n, k) not in MXFP8_FLYDSL_WEIGHT_SHAPES:
+                return
+
+            configs = {
+                m: get_flydsl_mxfp8_config(m, n, k) for m in MXFP8_FLYDSL_M_VALUES
+            }
+            if not any(configs.values()):
+                return
+            missing_m = [m for m, config in configs.items() if config is None]
+            if missing_m:
+                raise RuntimeError(
+                    "AITER/FlyDSL dense MXFP8 is missing required tunes "
+                    f"for weight shape {(n, k)} at M={missing_m}"
+                )
+            copy_or_rebind_param(
+                layer,
+                "weight_mxfp8_flydsl",
+                shuffle_weight(layer.weight.data, layout=(16, 16)),
+            )
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_mxfp8_flydsl",
+                shuffle_scale_a16w4(layer.weight_scale_inv.data, 1, False),
+            )
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
@@ -1067,6 +1100,84 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.format_ue8m0 = True
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
+
+    def _get_mxfp8_flydsl_runtime_buffers(
+        self,
+        layer: Module,
+        *,
+        m: int,
+        n: int,
+        k: int,
+        output_dtype: torch.dtype,
+        split_k: int,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Return pooled, pointer-stable buffers for a decode graph bucket."""
+        if m > 64:
+            return {
+                "activation_scale_padded": None,
+                "activation_scale_shuffled": None,
+                "output_buffer": None,
+                "splitk_workspace": None,
+            }
+
+        cache = getattr(layer, "_mxfp8_flydsl_runtime_buffers", None)
+        if cache is None:
+            cache = {}
+            layer._mxfp8_flydsl_runtime_buffers = cache
+        key = (n, k, output_dtype, layer.weight.device)
+        if key not in cache:
+            from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+                MXFP8_FLYDSL_M_VALUES,
+                get_flydsl_mxfp8_config,
+            )
+
+            max_workspace_elems = split_k * m * n
+            for candidate_m in MXFP8_FLYDSL_M_VALUES:
+                if candidate_m > 64:
+                    continue
+                candidate = get_flydsl_mxfp8_config(candidate_m, n, k)
+                if candidate is not None:
+                    max_workspace_elems = max(
+                        max_workspace_elems,
+                        int(candidate.get("splitK", 1)) * candidate_m * n,
+                    )
+            cache[key] = {
+                "activation_scale_padded": torch.empty(
+                    (64, k // 32),
+                    dtype=torch.uint8,
+                    device=layer.weight.device,
+                ),
+                "activation_scale_shuffled": torch.empty(
+                    (64, k // 32),
+                    dtype=torch.uint8,
+                    device=layer.weight.device,
+                ),
+                "output_buffer": torch.empty(
+                    (64, n), dtype=output_dtype, device=layer.weight.device
+                ),
+                "splitk_workspace": torch.empty(
+                    max_workspace_elems,
+                    dtype=torch.float32,
+                    device=layer.weight.device,
+                ),
+            }
+        pooled = cache[key]
+        padded_m = (m + 31) // 32 * 32
+        workspace_elems = split_k * m * n
+        workspace = pooled["splitk_workspace"]
+        if workspace_elems > workspace.numel():
+            raise RuntimeError(
+                "pooled FlyDSL split-K workspace is too small: "
+                f"need {workspace_elems}, have {workspace.numel()}"
+            )
+        return {
+            "activation_scale_padded": pooled["activation_scale_padded"][:padded_m],
+            "activation_scale_shuffled": pooled["activation_scale_shuffled"][:padded_m],
+            "output_buffer": pooled["output_buffer"][:m],
+            "splitk_workspace": (
+                workspace[:workspace_elems].view(split_k, m, n) if split_k > 1 else None
+            ),
+        }
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
@@ -1249,6 +1360,90 @@ class Fp8LinearMethod(LinearMethodBase):
             mxfp8_view = False
         if mxfp8_view:
             backend = self.mxfp8_dense_backend
+            if backend is not None and backend.is_gfx95_mxfp8_flydsl():
+                from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+                    dot_scaled_mxfp8_blockscaled_linear,
+                    get_flydsl_mxfp8_config,
+                )
+
+                input_value, input_scale = x if isinstance(x, tuple) else (x, None)
+                input_2d = input_value.view(-1, input_value.shape[-1])
+                m, k = input_2d.shape
+                n = layer.weight.shape[0]
+                config = get_flydsl_mxfp8_config(m, n, k)
+                if not isinstance(x, tuple) and input_value.dtype != torch.bfloat16:
+                    config = None
+
+                if config is not None and m <= 64:
+                    from sglang.srt.model_executor.cuda_graph_config import Backend
+                    from sglang.srt.runtime_context import get_server_args
+
+                    try:
+                        server_args = get_server_args()
+                    except ValueError:
+                        config = None
+                    else:
+                        decode_graph = (
+                            server_args.cuda_graph_config.decode
+                            if server_args.cuda_graph_config is not None
+                            else None
+                        )
+                        if (
+                            decode_graph is None
+                            or decode_graph.backend == Backend.DISABLED
+                            or (
+                                decode_graph.bs is not None and m not in decode_graph.bs
+                            )
+                            or (
+                                decode_graph.max_bs is not None
+                                and m > decode_graph.max_bs
+                            )
+                        ):
+                            config = None
+
+                if config is None:
+                    return dot_scaled_mxfp8_blockscaled_linear(
+                        input=input_value,
+                        weight=layer.weight,
+                        weight_scale=layer.weight_scale_inv,
+                        input_scale=input_scale,
+                        bias=bias,
+                    )
+
+                if not (
+                    hasattr(layer, "weight_mxfp8_flydsl")
+                    and hasattr(layer, "weight_scale_inv_mxfp8_flydsl")
+                ):
+                    raise RuntimeError(
+                        "selected AITER/FlyDSL MXFP8 signature has no derived "
+                        f"weight layout for {(m, n, k)}"
+                    )
+
+                output_dtype = (
+                    input_value.dtype
+                    if input_value.dtype in (torch.bfloat16, torch.float16)
+                    else torch.bfloat16
+                )
+                split_k = int(config.get("splitK", 1))
+                buffers = self._get_mxfp8_flydsl_runtime_buffers(
+                    layer,
+                    m=m,
+                    n=n,
+                    k=k,
+                    output_dtype=output_dtype,
+                    split_k=split_k,
+                )
+                return self.w8a8_mxfp8_linear(
+                    input=input_value,
+                    weight=layer.weight_mxfp8_flydsl,
+                    weight_scale=layer.weight_scale_inv_mxfp8_flydsl,
+                    input_scale=input_scale,
+                    bias=bias,
+                    output_dtype=output_dtype,
+                    config=config,
+                    **buffers,
+                )
+
             extra_kwargs = {}
             if self.mxfp8_prefill_autotune_min_tokens is not None:
                 input_tensor = x[0] if isinstance(x, tuple) else x
