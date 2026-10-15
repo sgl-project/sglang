@@ -380,6 +380,15 @@ class FlashInferAttnBackend(AttentionBackend):
             == KVCacheAttentionAccessKind.NATIVE_FP4
             and self.prefill_kv_access.scale_recipe == "nvfp4"
         )
+        # Native FP4 graph-stability is proven for plain prompt-prefill replays.
+        # Speculative forwards (target verify / draft extend) additionally need
+        # replay-stable plans at captured batch sizes; keep them on the
+        # dequant-workspace route (graph-safe with PR #43356) unless explicitly
+        # opted in, which is only safe with small decode-graph capture lists.
+        self.prefill_uses_native_fp4_for_spec = (
+            self.prefill_uses_native_fp4
+            and os.getenv("SGLANG_NVFP4_NATIVE_SPEC", "0") == "1"
+        )
         # Native FP4 prefill hands FlashInfer packed uint8 KV + block scales.
         # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
         self.flashinfer_kv_cache_dtype = (
@@ -1370,7 +1379,18 @@ class FlashInferAttnBackend(AttentionBackend):
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         native_kv_sf = None
-        if self.prefill_uses_native_fp4:
+        native_fp4_this_forward = self.prefill_uses_native_fp4
+        if (
+            native_fp4_this_forward
+            and not self.prefill_uses_native_fp4_for_spec
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+        ):
+            # Downgrade this speculative forward to the dequant workspace route.
+            native_fp4_this_forward = False
+        if native_fp4_this_forward:
             assert not layer.is_cross_attention, (
                 "NVFP4 native FP4 prefill does not support cross-attention"
             )
@@ -1381,7 +1401,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             kv_cache = (k_packed, v_packed)
             native_kv_sf = (k_block_sf, v_block_sf)
-        elif self.prefill_uses_dequant_workspace:
+        elif self.prefill_uses_dequant_workspace or (
+            self.prefill_uses_native_fp4 and not native_fp4_this_forward
+        ):
             kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
                 layer,
                 self.req_to_token_pool.req_to_token,
@@ -2431,7 +2453,15 @@ class FlashInferIndicesUpdaterPrefill:
             self.head_dim,
             1,
             q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
+            kv_data_type=(
+                torch.float8_e4m3fn
+                if (
+                    self.attn_backend.prefill_uses_native_fp4
+                    and not self.attn_backend.prefill_uses_native_fp4_for_spec
+                    and spec_info is not None
+                )
+                else self.data_type
+            ),
             custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
