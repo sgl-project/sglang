@@ -693,7 +693,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     # user typed, so warn and fall back rather than refuse to boot.
     _cg_cfg = cfg.cuda_graph_config
     if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.FULL:
-        full_cg_backends = {"fa3", "fa4"}
+        full_cg_backends = {"fa3", "fa4", "fa3_fa4"}
         backends = set(attention_backends_of(resolved_view(server_args)))
         backends.discard(None)
         if not backends <= full_cg_backends:
@@ -826,6 +826,7 @@ def handle_page_major_kv_layout(server_args: Any):
             "triton",
             "fa3",
             "fa4",
+            "fa3_fa4",
             "flashinfer",
             "trtllm_mha",
         }

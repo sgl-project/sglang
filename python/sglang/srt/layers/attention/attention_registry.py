@@ -279,6 +279,20 @@ def create_flashattention_v4_backend(runner):
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
 
+@register_attention_backend("fa3_fa4")
+def create_flashattention_v3_v4_hybrid_backend(runner):
+    major, _ = get_device_capability()
+    assert major == 9, (
+        "The fa3_fa4 attention backend (FA3 for head_dim <= 256, FA4 above) "
+        "requires SM90."
+    )
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
+
+    return FlashAttentionBackend(runner, fa_impl_ver=4, fa3_fa4_hybrid=True)
+
+
 @register_attention_backend("trtllm_mha")
 def create_trtllm_mha_backend(runner):
     if runner.use_mla_backend:

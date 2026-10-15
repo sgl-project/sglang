@@ -79,6 +79,7 @@ ATTENTION_BACKEND_CHOICES = [
     # NVIDIA specific
     "fa3",
     "fa4",
+    "fa3_fa4",  # Hopper only: FA3 for head_dim <= 256, FA4 above
     "flashinfer",
     "llada2_cfg_flashinfer",
     "flashmla",

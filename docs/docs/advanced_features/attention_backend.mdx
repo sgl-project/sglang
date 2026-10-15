@@ -689,6 +689,18 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
+- FlashAttention 3 + 4 per layer (`fa3_fa4`, SM90, MHA, BF16 KV cache only)
+```bash Command
+# Layers with head_dim <= 256 run FA3; wider layers (Gemma-4 full attention,
+# head_dim 512) run FA4. FA4 prefill keeps Gemma-4's bidirectional image masks;
+# --speculative-attention-mode decode puts MTP verify on the hybrid too.
+python3 -m sglang.launch_server \
+  --model-path google/gemma-4-31B-it \
+  --attention-backend fa4 \
+  --decode-attention-backend fa3_fa4 \
+  --speculative-attention-mode decode
+```
+
 - Ascend
 ```bash Command
 python3 -m sglang.launch_server \
