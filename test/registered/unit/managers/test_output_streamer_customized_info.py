@@ -169,6 +169,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(
                 stream_interval=1,
@@ -176,8 +177,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
         )
 
         streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
@@ -201,6 +200,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(
                 stream_interval=1,
@@ -208,8 +208,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
         )
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
@@ -238,6 +236,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(
                 stream_interval=1,
@@ -245,8 +244,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
         )
         terminal = _FakeReq("terminal", [20], finished=True)
         quiet = _FakeReq("quiet", [10, 11])
@@ -278,6 +275,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(
                 stream_interval=1,
@@ -285,8 +283,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
         )
         first = _FakeReq("duplicate", [10], finished=True)
         second = _FakeReq("duplicate", [20], finished=True)
@@ -305,12 +301,11 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
         )
 
         streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
@@ -330,12 +325,11 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         outputs = []
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            send_to_tokenizer=SimpleNamespace(),
             tree_cache=None,
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            get_disaggregation_mode=lambda: DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: False,
         )
 
         streamer._stream_output_generation([_FakeReq("r0", [], finished=True)], False)
@@ -351,12 +345,11 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Rust egress"):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
+                send_to_tokenizer=SimpleNamespace(),
                 tree_cache=None,
                 server_args=SimpleNamespace(),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
-                get_disaggregation_mode=lambda: DisaggregationMode.NULL,
-                enable_hicache_storage=lambda: False,
                 rust_server=object(),
             )
 

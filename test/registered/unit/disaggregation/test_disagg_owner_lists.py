@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
@@ -70,11 +71,8 @@ class TestDisaggPrefillLists(CustomTestCase):
             checkpoint=Mock(),
             send_kv_chunk=Mock(),
             output_streamer=Mock(),
-            metrics_reporter=SimpleNamespace(
-                report_prefill_stats=Mock(), enable_metrics=False
-            ),
-            maybe_send_health_check_signal=Mock(),
-            release_aborted_request=Mock(),
+            metrics_sink=SimpleNamespace(enable_metrics=False),
+            request_retirer=Mock(),
             attn_cp_cpu_group=None,
             attn_tp_cpu_group=None,
         )
@@ -155,7 +153,7 @@ class TestDisaggPrefillLists(CustomTestCase):
 
         bootstrap.abort(AbortReq(rid="r"))
 
-        owner.release_aborted_request.assert_called_once_with(req)
+        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
         owner.kv_senders["r"].abort.assert_called_once_with()
         owner.kv_senders["other"].abort.assert_not_called()
 
@@ -274,12 +272,11 @@ class TestDisaggDecodeLists(CustomTestCase):
             polling_interval=1,
             req_to_token_pool=SimpleNamespace(size=8),
             max_running_requests=8,
-            get_decoding=lambda: [],
+            core_lists=CoreLists(),
             tree_cache=Mock(),
-            release_aborted_request=Mock(),
-            send_abort_output=Mock(),
-            retire_beam_group=Mock(),
-            release_finished_req=Mock(),
+            request_retirer=Mock(),
+            beam_coordinator=Mock(),
+            batch_result_processor=SimpleNamespace(release_finished_req=Mock()),
         )
 
     def preallocating(self, rid):
@@ -317,7 +314,7 @@ class TestDisaggDecodeLists(CustomTestCase):
         owner = self.owner
         owner.ready = [_decode_req("a"), _decode_req("b")]
         owner.max_running_requests = 2
-        owner.get_decoding = lambda: [object()]
+        owner.core_lists.decoding = [object()]
 
         admitted = owner.pop_reqs_to_admit(ScheduleSlot())
         self.assertEqual([r.rid for r in admitted], ["a"])
@@ -359,7 +356,7 @@ class TestDisaggDecodeLists(CustomTestCase):
 
         self.assertEqual(_names(owner)["retracted"], ["x"])
         discard.assert_called_once()
-        owner.send_abort_output.assert_called_once()
+        owner.request_retirer.send_abort_output.assert_called_once()
 
     def test_abort_from_held(self):
         owner = self.owner
@@ -369,7 +366,7 @@ class TestDisaggDecodeLists(CustomTestCase):
         self.abort("held", "r")
 
         self.assertEqual(_names(owner)["held"], ["x"])
-        owner.release_aborted_request.assert_called_once_with(req)
+        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
 
     def test_abort_from_transfer_aborts_the_receiver(self):
         owner = self.owner
@@ -390,8 +387,10 @@ class TestDisaggDecodeLists(CustomTestCase):
         self.abort("ready", "r")
 
         self.assertEqual(_names(owner)["ready"], ["x"])
-        owner.release_aborted_request.assert_called_once_with(req)
-        owner.release_finished_req.assert_called_once_with(req, checkpoint=True)
+        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
+        owner.batch_result_processor.release_finished_req.assert_called_once_with(
+            req, checkpoint=True
+        )
         self.assertIsNotNone(req.finished_reason)
 
 

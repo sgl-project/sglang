@@ -18,6 +18,11 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
@@ -83,26 +88,29 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
 
 
 def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
-    metrics_reporter = MagicMock()
-    metrics_reporter.num_generated_tokens = 0
-    metrics_reporter.forward_ct_decode = 0
+    metrics_sink = MagicMock()
+    metrics_sink.num_generated_tokens = 0
+    metrics_sink.forward_ct_decode = 0
     return SchedulerBatchResultProcessor(
         is_generation=True,
         enable_overlap=True,
         model_config=SimpleNamespace(think_end_ids=None),
-        token_to_kv_pool_allocator=MagicMock(),
-        tree_cache=tree_cache or SimpleNamespace(page_size=TRACK_INTERVAL),
+        kv=SimpleNamespace(
+            token_to_kv_pool_allocator=MagicMock(),
+            tree_cache=tree_cache or SimpleNamespace(page_size=TRACK_INTERVAL),
+            req_to_token_pool=None,
+        ),
+        services=SimpleNamespace(
+            metrics_sink=metrics_sink,
+            output_streamer=MagicMock(),
+        ),
         hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
-        req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_reporter=metrics_reporter,
         draft_worker=None,
         model_worker=MagicMock(),
         logprob_result_processor=None,
-        output_streamer=MagicMock(),
-        abort_request=lambda *args, **kwargs: None,
         pending=PendingSteps(),
     )
 
@@ -131,23 +139,28 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         result = _make_result()
 
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.mode_owners = ModeOwners()
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.disagg_prefill = None
-        scheduler.disagg_decode = None
-        scheduler.dllm = None
-        scheduler.hisparse_coordinator = None
-        scheduler.gracefully_exit = False
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = None
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = None
+        scheduler.flags.gracefully_exit = False
         scheduler.flat_slot = ScheduleSlot()
         scheduler.ingest_requests = MagicMock(side_effect=[[], [], [], StopIteration])
-        scheduler._engine_paused = False
+        scheduler.flags._engine_paused = False
         scheduler._sched_idled = False
         scheduler.pending = PendingSteps()
         scheduler.recv_skipper = None
         scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.run_batch = MagicMock(return_value=result)
+        scheduler.step_launcher = SimpleNamespace(
+            run_batch=MagicMock(return_value=result)
+        )
         scheduler._apply_war_barrier = MagicMock()
-        scheduler._record_step_counters = MagicMock()
+        scheduler.step_counters = MagicMock()
         scheduler.is_generation = False
 
         pool = SimpleNamespace(
@@ -174,7 +187,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         scheduler.get_next_batch_to_run = get_next_batch_to_run
         state_at_commit = []
 
-        def process_batch_result(result_batch, batch_result, slot):
+        def process_batch_result(result_batch, batch_result):
             state_at_commit.append(
                 (req.kv.mamba_next_track_idx, req.kv.mamba_last_track_seqlen)
             )
@@ -263,7 +276,7 @@ class TestMambaSpecBoundaryCommit(unittest.TestCase):
             ),
             patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
         ):
-            # Scheduler._build_decode_step, then the verify on its forward view.
+            # StepBuilder.new_decode_step, then the verify on its forward view.
             step.prepare_for_decode()
             spec_prepare_for_decode(step)
             forward_batch = worker_forward_batch(step)
@@ -416,7 +429,6 @@ class TestMambaLazyFinishDonation(unittest.TestCase):
                 PendingStep(
                     step=pending_step,
                     result=None,
-                    slot=ScheduleSlot(),
                     launch_ts=0.0,
                     after_idle_gap=False,
                 )
@@ -516,7 +528,6 @@ class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
             PendingStep(
                 step=decode_step,
                 result=None,
-                slot=ScheduleSlot(),
                 launch_ts=0.0,
                 after_idle_gap=False,
             )
@@ -552,7 +563,7 @@ class TestMambaLazyPrefillCommitPublish(unittest.TestCase):
             ) as release,
         ):
             processor.process_batch_result_prefill(prefill_step, result)
-        return req, processor.tree_cache, release
+        return req, processor.kv.tree_cache, release
 
     def test_running_request_checkpoint(self):
         for pending_tracks in (True, False):

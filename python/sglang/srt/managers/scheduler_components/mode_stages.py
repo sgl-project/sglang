@@ -13,19 +13,18 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
+    from sglang.srt.managers.utils import GenerationBatchResult
 
 
 @dataclass(slots=True)
 class ScheduleSlot:
-    """What one step is scheduled for: the decoding requests it may run and
-    its admission flag. The flat driver has one slot, over every decoding
-    request; the PP ring has one per microbatch slot, over the requests that
-    slot launched."""
+    """What one step is scheduled for: the decoding requests it may run. The
+    flat driver has one slot, over every decoding request; the PP ring has
+    one per microbatch slot, over the requests that slot launched."""
 
     # The ring slot; None for the flat driver.
     index: Optional[int] = None
-    # Admission is shut until a request leaves decoding.
-    batch_is_full: bool = False
 
     def filter_decoding(self, decoding: List[Req]) -> List[Req]:
         """The decoding requests a step of this slot may run."""
@@ -79,3 +78,22 @@ class ModeStages:
     # channel and the ring size; under PP they replace the flat intake and
     # after_commit.
     ring_consensus: Optional[Callable[[Any, int], Any]] = None
+
+
+@dataclass(frozen=True, slots=True)
+class DriverOps:
+    """The core stages the PP ring runs for each slot, filled once by the
+    scheduler; the ring holds them instead of reaching into the scheduler."""
+
+    # Receive this pass's requests.
+    ingest_requests: Callable[[], List]
+    # Run a slot's step and keep it pending until the ring commits it.
+    launch_step: Callable[..., PendingStep]
+    # Commit a pending step, with the outputs the ring brought back.
+    commit_step: Callable[[PendingStep], None]
+    # Run a slot's forward, behind the ring's PP fences.
+    run_batch: Callable[..., GenerationBatchResult]
+    # Self-check and reset while the server is idle.
+    on_idle: Callable[[], None]
+    # Note a ring round that launched nothing.
+    mark_idle: Callable[[], None]

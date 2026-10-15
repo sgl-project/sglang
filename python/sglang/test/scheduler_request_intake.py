@@ -1,0 +1,47 @@
+"""A request intake with inert collaborators, for tests."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.managers.request_lists import CoreLists
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+from sglang.srt.managers.scheduler_components.request_intake import RequestIntake
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def make_request_intake(**deps) -> RequestIntake:
+    """An intake over empty core lists, with no mode owners and inert
+    collaborators; `deps` replaces any constructor argument."""
+    args = dict(
+        core_lists=CoreLists(),
+        counters=LaunchCounters(),
+        kv=SimpleNamespace(tree_cache=MagicMock(), token_to_kv_pool_allocator=None),
+        capacity=None,
+        ipc_channels=MagicMock(),
+        metrics_sink=SimpleNamespace(enable_metrics=False, metrics_collector=None),
+        output_streamer=MagicMock(),
+        beam_coordinator=MagicMock(),
+        session_controller=MagicMock(),
+        grammar_manager=MagicMock(),
+        request_retirer=MagicMock(),
+        mode_owners=ModeOwners(),
+        model_config=MagicMock(),
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        transfer_backend=TransferBackend.MOONCAKE,
+        tokenizer=None,
+        mm_processor=None,
+        pad_input_ids_func=None,
+        dp_tp_group=SimpleNamespace(cpu_group=None, rank_in_group=0, first_rank=0),
+        max_req_len=4096,
+        max_req_input_len=4095,
+        max_queued_requests=None,
+        sliding_window_size=None,
+        chunked_prefill_size=None,
+        sampling_mask_max_tokens=64,
+    )
+    args.update(deps)
+    return RequestIntake(**args)

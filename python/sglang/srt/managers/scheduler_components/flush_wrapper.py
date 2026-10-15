@@ -6,6 +6,9 @@ from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutpu
 from sglang.srt.managers.scheduler_components.ipc_channels import (
     SchedulerIpcChannels,
 )
+from sglang.srt.managers.scheduler_components.request_registry import (
+    RequestRegistry,
+)
 
 
 class SchedulerFlushWrapper:
@@ -13,11 +16,11 @@ class SchedulerFlushWrapper:
         self,
         *,
         flush_cache: Callable[[], bool],
-        is_fully_idle: Callable[[], bool],
+        request_registry: RequestRegistry,
         ipc_channels: SchedulerIpcChannels,
     ) -> None:
         self._flush_cache = flush_cache
-        self._is_fully_idle = is_fully_idle
+        self._request_registry = request_registry
         self._ipc_channels = ipc_channels
         self._pending: Optional[Tuple[FlushCacheReqInput, float]] = None
 
@@ -32,7 +35,7 @@ class SchedulerFlushWrapper:
         if timeout_s <= 0.0:
             return FlushCacheReqOutput(success=self._flush_cache())
 
-        if self._is_fully_idle():
+        if self._request_registry.is_fully_idle():
             return FlushCacheReqOutput(success=self._flush_cache())
 
         self._pending = (recv_req, time.monotonic() + timeout_s)
@@ -44,7 +47,7 @@ class SchedulerFlushWrapper:
 
         pending_req, deadline = self._pending
 
-        if self._is_fully_idle():
+        if self._request_registry.is_fully_idle():
             success = self._flush_cache()
             self._pending = None
             self._ipc_channels.send_to_tokenizer.send_output(

@@ -17,12 +17,20 @@ from enum import Enum, auto
 from typing import Any, Callable, List, Optional
 
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.poll_based_barrier import PollBasedBarrier
 
 logger = logging.getLogger(__name__)
 
 
 class SchedulerInputBlocker:
+    @classmethod
+    def maybe_create(cls) -> Optional["SchedulerInputBlocker"]:
+        if not get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN"):
+            return None
+        return cls(noop=get_parallel().attn_tp_rank != 0)
+
     def __init__(self, noop: bool):
         self._state = _State.UNBLOCKED
         self._pending_reqs = []

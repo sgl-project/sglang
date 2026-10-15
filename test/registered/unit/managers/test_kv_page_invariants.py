@@ -6,7 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,9 +36,8 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         req_to_token_pool = _rtp
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
-        get_launched_step = lambda self: None
-        get_decoding = lambda self: []
-        get_chunked_req = lambda self: None
+        counters = LaunchCounters()
+        core_lists = CoreLists()
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -67,7 +68,7 @@ class TestKVPageInvariants(CustomTestCase):
         )
         rtt[0, :256] = torch.arange(_PAGE_SIZE)  # req 0 owns page 0
         rtt[1, :256] = torch.arange(_PAGE_SIZE, 2 * _PAGE_SIZE)  # req 1 owns page 1
-        chk.get_decoding = lambda: [
+        chk.core_lists.decoding = [
             _FakeOwner(0, 256, 256, rid="a"),
             _FakeOwner(1, 200, 256, rid="b"),
         ]
@@ -76,13 +77,13 @@ class TestKVPageInvariants(CustomTestCase):
 
     def test_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_decoding = lambda: [_FakeOwner(0, 145, 144, rid="a")]
+        chk.core_lists.decoding = [_FakeOwner(0, 145, 144, rid="a")]
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
 
     def test_slot_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_decoding = lambda: []
+        chk.core_lists.decoding = []
         tc.session_records()["s1"] = _FakeOwner(0, 145, 144).kv
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
@@ -93,7 +94,7 @@ class TestKVPageInvariants(CustomTestCase):
         rtt[0, :3] = torch.tensor(
             [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
         )
-        chk.get_decoding = lambda: [_FakeOwner(0, 3, 3, rid="a")]
+        chk.core_lists.decoding = [_FakeOwner(0, 3, 3, rid="a")]
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 
@@ -107,9 +108,9 @@ class TestKVPageInvariants(CustomTestCase):
                 )
                 owner = _FakeOwner(0, 3, 3, rid="a")
                 if where == "decoding":
-                    chk.get_decoding = lambda: [owner]
+                    chk.core_lists.decoding = [owner]
                 else:
-                    chk.get_chunked_req = lambda: owner
+                    chk.core_lists.chunked_req = owner
                 with self.assertRaises(ValueError):
                     chk._check_kv_page_invariants()
 
@@ -120,7 +121,7 @@ class TestKVPageInvariants(CustomTestCase):
             return_value=torch.tensor([5, 6], dtype=torch.int64)
         )
         rtt[0, :1] = torch.tensor([5 * alloc.page_size])
-        chk.get_decoding = lambda: [_FakeOwner(0, 1, 1, rid="classed")]
+        chk.core_lists.decoding = [_FakeOwner(0, 1, 1, rid="classed")]
 
         with patch(
             "sglang.srt.managers.scheduler_components.invariant_checker.page_interleave_shard_size",
@@ -134,7 +135,7 @@ class TestKVPageInvariants(CustomTestCase):
     def test_free_pool_duplicate_raises(self):
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([3, 3, 4]))
         rtt[0, :1] = torch.tensor([10 * _PAGE_SIZE])  # owner page 10, not in free
-        chk.get_decoding = lambda: [_FakeOwner(0, 1, 1, rid="a")]
+        chk.core_lists.decoding = [_FakeOwner(0, 1, 1, rid="a")]
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 

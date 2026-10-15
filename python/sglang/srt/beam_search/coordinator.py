@@ -74,6 +74,7 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -107,6 +108,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     future_map: FutureMap
+    # The decoding requests, whose pending beam members hold rows.
+    core_lists: CoreLists
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
@@ -222,6 +225,35 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         self._num_live_groups += 1
         return None
 
+    @staticmethod
+    def num_rows(req: Req) -> int:
+        """The request rows req takes from the free pool once admitted: none
+        for a row it already holds (a continuing chunk, a session borrow),
+        plus one per member of its beam group not yet spawned."""
+        rows = 0 if req.kv.holds_kv else 1
+        group = req.beam_group
+        if group is not None and group.member_rows is None:
+            rows += group.beam_width - 1
+        return rows
+
+    def row_budget(self) -> int:
+        """The request rows admission may still hand out: the free rows minus
+        the rows promised to the members of decoding beam groups."""
+        return max(
+            self.req_to_token_pool.available_size()
+            - self.pending_member_rows(self.core_lists.decoding),
+            0,
+        )
+
+    def has_room(self, num_reqs: int, num_rows: int) -> bool:
+        """Whether num_reqs requests in a micro-batch, num_rows of them new
+        request rows (see num_rows), fit the micro-batch request cap and the
+        row budget."""
+        return (
+            num_reqs <= get_parallel().pp_max_micro_batch_size
+            and num_rows <= self.row_budget()
+        )
+
     def pending_member_rows(self, reqs: List[Req]) -> int:
         """Rows admitted-but-not-yet-spawned groups will claim; the admission
         gate subtracts this so it never over-commits the req slot pool."""
@@ -332,7 +364,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         assert rows is not None, (
             f"Beam member spawn needs {group.beam_width - 1} req-to-token slots "
             f"but only {self.req_to_token_pool.available_size()} are free; the "
-            f"admission gate (get_num_allocatable_reqs) must reserve them."
+            f"admission gate (row_budget) must reserve them."
         )
         device = self.req_to_token_pool.device
         member_rows = torch.tensor(rows, dtype=torch.int64, device=device)

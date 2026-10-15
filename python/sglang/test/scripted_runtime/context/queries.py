@@ -10,15 +10,15 @@ if TYPE_CHECKING:
 def _last_step(ctx: ScriptedContext) -> Optional[ScheduleBatch]:
     """The step the last scheduler iteration launched; None when it launched
     nothing."""
-    return ctx.scheduler.cur_batch_for_debug
+    return ctx.scheduler.counters.cur_batch_for_debug
 
 
 def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
     s = ctx.scheduler
-    if s.chunked_req is not None:
-        yield s.chunked_req
-    yield from s.waiting_queue
-    yield from s.decoding
+    if s.lists.chunked_req is not None:
+        yield s.lists.chunked_req
+    yield from s.lists.waiting_queue
+    yield from s.lists.decoding
     # A request the last step finished has left the lists already.
     last_step = _last_step(ctx)
     if last_step is not None:
@@ -31,9 +31,9 @@ def list_active_reqs(ctx: ScriptedContext) -> List[Req]:
 
 def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
     s = ctx.scheduler
-    chunked_rid = s.chunked_req.rid if s.chunked_req is not None else None
+    chunked_rid = s.lists.chunked_req.rid if s.lists.chunked_req is not None else None
     chunked = [chunked_rid] if chunked_rid is not None else []
-    running = [r.rid for r in s.decoding]
+    running = [r.rid for r in s.lists.decoding]
 
     prefill: List[str] = []
     decode: List[str] = []
@@ -52,7 +52,11 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
 
 def is_idle(ctx: ScriptedContext) -> bool:
     s = ctx.scheduler
-    return s.chunked_req is None and len(s.waiting_queue) == 0 and not s.decoding
+    return (
+        s.lists.chunked_req is None
+        and len(s.lists.waiting_queue) == 0
+        and not s.lists.decoding
+    )
 
 
 def is_fully_idle(ctx: ScriptedContext) -> bool:
@@ -93,12 +97,12 @@ def is_finished(ctx: ScriptedContext, rid: str) -> bool:
 
 def is_chunking(ctx: ScriptedContext, rid: str) -> bool:
     s = ctx.scheduler
-    return s.chunked_req is not None and s.chunked_req.rid == rid
+    return s.lists.chunked_req is not None and s.lists.chunked_req.rid == rid
 
 
 def status(ctx: ScriptedContext, rid: str) -> str:
     s = ctx.scheduler
-    if rid in {r.rid for r in s.waiting_queue}:
+    if rid in {r.rid for r in s.lists.waiting_queue}:
         return "waiting"
     req = find_req_by_rid(ctx, rid)
     if req is not None:

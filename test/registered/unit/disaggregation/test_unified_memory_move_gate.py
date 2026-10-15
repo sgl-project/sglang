@@ -13,17 +13,33 @@ corruption with no crash.
 import unittest
 from types import SimpleNamespace
 from typing import List, Optional, Set
+from unittest.mock import Mock
 
 import torch
 
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    unified_memory_disagg_move_gate,
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
 )
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.srt.mem_cache.allocator.unified_sub_pool import (  # noqa: E402
+    MultiEndedAllocator,
+)
+from sglang.srt.runtime_context import get_context, get_parallel  # noqa: E402
+from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from sglang.test.disagg_owner_shells import (  # noqa: E402
+    decode_owner_shell,
+    prefill_owner_shell,
+)
+from sglang.test.test_utils import (  # noqa: E402
+    CustomTestCase,
+    enter_scope,
+    published_topology,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -56,11 +72,34 @@ class _FakeScheduler:
     def __init__(self, mode: DisaggregationMode):
         self.disaggregation_mode = mode
         self.chunked_req: Optional[object] = None
-        self.disagg_prefill = SimpleNamespace(transfer=[], pending_chunk_rids=set())
-        self.disagg_decode = SimpleNamespace(
-            transfer_queue=_FakeTransferQueue(), prealloc_queue=_FakePreallocQueue()
+        self.disagg_prefill = prefill_owner_shell(transfer=[], pending_chunk_rids=set())
+        self.disagg_decode = decode_owner_shell(
+            transfer_queue=_FakeTransferQueue(),
+            prealloc_queue=_FakePreallocQueue(),
+            decode_offload_manager=None,
         )
-        self.decode_offload_manager = None
+
+
+def _installed_gate(test: CustomTestCase, scheduler: _FakeScheduler):
+    """The gate a scheduler of this mode installs on its allocator."""
+    enter_scope(test, published_topology())
+    get_context().override("test.unified_memory", enable_unified_memory=True)
+    s = Scheduler.__new__(Scheduler)
+    s.mode_owners = ModeOwners()
+    s.mode_owners.disagg_prefill = (
+        scheduler.disagg_prefill
+        if scheduler.disaggregation_mode == DisaggregationMode.PREFILL
+        else None
+    )
+    s.mode_owners.disagg_decode = (
+        scheduler.disagg_decode
+        if scheduler.disaggregation_mode == DisaggregationMode.DECODE
+        else None
+    )
+    s.token_to_kv_pool_allocator = Mock()
+    s.maybe_init_disagg_move_gate()
+    calls = s.token_to_kv_pool_allocator.set_disagg_move_gate.call_args_list
+    return calls[0].args[0] if calls else None
 
 
 class TestDecodeMoveGate(CustomTestCase):
@@ -72,7 +111,7 @@ class TestDecodeMoveGate(CustomTestCase):
         stay closed across that window even though the transfer queue is empty.
         """
         scheduler = _FakeScheduler(DisaggregationMode.DECODE)
-        gate = unified_memory_disagg_move_gate(scheduler)
+        gate = _installed_gate(self, scheduler)
         self.assertTrue(gate(), "idle decode node should allow compaction")
 
         # A's destination is now visible to prefill; transfer queue still empty.
@@ -97,7 +136,7 @@ class TestPrefillMoveGate(CustomTestCase):
         gate must not key off `chunked_req` alone.
         """
         scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
-        gate = unified_memory_disagg_move_gate(scheduler)
+        gate = _installed_gate(self, scheduler)
         self.assertTrue(gate(), "idle prefill node should allow compaction")
 
         # A middle chunk went out for rid "r0".
@@ -126,7 +165,7 @@ class TestPrefillMoveGate(CustomTestCase):
         in allocation failure despite reclaimable space.
         """
         scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
-        gate = unified_memory_disagg_move_gate(scheduler)
+        gate = _installed_gate(self, scheduler)
 
         scheduler.chunked_req = object()
         scheduler.disagg_prefill.pending_chunk_rids.add("r0")
@@ -192,12 +231,11 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
 
 
 class TestMoveGateRejectsNonPdNode(CustomTestCase):
-    def test_null_mode_is_rejected(self):
-        """The gate is only meaningful on a PD node; a NULL-mode scheduler is a
-        wiring bug and must not silently produce an always-open predicate."""
+    def test_null_mode_installs_no_gate(self):
+        """The gate is only meaningful on a PD node; a NULL-mode scheduler must
+        not install an always-open predicate."""
         scheduler = _FakeScheduler(DisaggregationMode.NULL)
-        with self.assertRaises(ValueError):
-            unified_memory_disagg_move_gate(scheduler)
+        self.assertIsNone(_installed_gate(self, scheduler))
 
 
 class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):

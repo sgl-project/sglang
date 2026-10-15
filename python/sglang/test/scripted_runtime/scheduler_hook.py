@@ -88,7 +88,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
                 f"idle_streak={idle_streak})"
             )
         yield
-        if proxy.work_reqs_seen > 0 and scheduler.is_fully_idle():
+        if proxy.work_reqs_seen > 0 and scheduler.request_registry.is_fully_idle():
             idle_streak += 1
         else:
             idle_streak = 0
@@ -103,14 +103,14 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
-    if scheduler._engine_paused:
+    if scheduler.flags._engine_paused:
         ctx.continue_generation()
 
     ctx._release_exhausted_pools()
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
         yield
-        if scheduler.is_fully_idle():
+        if scheduler.request_registry.is_fully_idle():
             break
     else:
         raise RuntimeError(
@@ -201,7 +201,9 @@ class ScriptedSchedulerHook:
             return
         # The chunked request once this step launches.
         chunked = (
-            batch.chunked_req if batch.prefill_reqs() else self.scheduler.chunked_req
+            batch.chunked_req
+            if batch.prefill_reqs()
+            else self.scheduler.lists.chunked_req
         )
         self._batch_log.append(
             ScriptedBatchRecord(

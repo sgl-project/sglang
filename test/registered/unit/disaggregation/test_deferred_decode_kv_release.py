@@ -673,10 +673,10 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.enable_staging = False
     q.staging_handler = None
     q.tree_cache = object()
-    q.release_finished_req = tree_release(q)
+    q.batch_result_processor = SimpleNamespace(release_finished_req=tree_release(q))
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
-    q.metrics_reporter = SimpleNamespace(enable_metrics=enable_metrics)
+    q.metrics_sink = SimpleNamespace(enable_metrics=enable_metrics)
     q.metrics_collector = SimpleNamespace(
         observe_decode_deferred_kv_release=MagicMock()
     )
@@ -915,7 +915,7 @@ def _make_pop_queue(mgr):
     q.enable_decode_hicache = False
     q.enable_hisparse = False
     q.output_streamer = SimpleNamespace(stream_output=lambda reqs, logprob: None)
-    q.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    q.metrics_sink = SimpleNamespace(enable_metrics=False)
     q._poll_with_metadata_gate = lambda: [KVPoll.Failed] * len(q.queue)
     q._clean_hicache_prefetch_resources = lambda decode_req: None
     return q
@@ -1042,11 +1042,14 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
         q = _make_pop_queue(mgr)
         q.enable_hisparse = True
         q.hisparse_coordinator = _FakeHiSparse({5: [100, 101]})
-        q.release_finished_req = MethodType(
-            SchedulerBatchResultProcessor.release_finished_req,
-            SimpleNamespace(
-                hisparse_coordinator=q.hisparse_coordinator, tree_cache=q.tree_cache
-            ),
+        q.batch_result_processor = SimpleNamespace(
+            release_finished_req=MethodType(
+                SchedulerBatchResultProcessor.release_finished_req,
+                SimpleNamespace(
+                    hisparse_coordinator=q.hisparse_coordinator,
+                    kv=SimpleNamespace(tree_cache=q.tree_cache),
+                ),
+            )
         )
         entry = _make_failed_req(mgr, room=11, idx=2, abort_notified=False)
         entry.req.kv = SimpleNamespace(req_pool_idx=5)

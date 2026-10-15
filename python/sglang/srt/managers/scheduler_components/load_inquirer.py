@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.load_snapshot import (
@@ -14,16 +14,21 @@ from sglang.srt.managers.load_snapshot import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.runtime_context import get_lora, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_lora, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_policy import SchedulePolicy
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+        MetricsSink,
     )
+    from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
+    from sglang.srt.managers.scheduler_components.request_registry import (
+        RequestRegistry,
+    )
+    from sglang.srt.managers.scheduler_components.step_counters import StepCounters
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -34,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
-    get_disaggregation_mode: Callable[[], DisaggregationMode]
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
@@ -42,22 +46,23 @@ class SchedulerLoadInquirer:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
     policy: SchedulePolicy
-    metrics_reporter: SchedulerMetricsReporter
-    get_request_lists: Callable
-    get_disagg_decode_prealloc_queue: Callable
-    get_total_prefill_uncached_tokens: Callable
-    get_total_prefill_busy_us: Callable
-    get_decode_moment_totals: Callable
+    metrics_sink: MetricsSink
+    request_registry: RequestRegistry
+    mode_owners: ModeOwners
+    step_counters: StepCounters
 
     def get_num_waiting_uncached_tokens(self) -> int:
         """Estimate input tokens waiting for prefill compute."""
-        if self.get_disaggregation_mode() == DisaggregationMode.DECODE:
+        if (
+            DisaggregationMode(get_disagg().disaggregation_mode)
+            == DisaggregationMode.DECODE
+        ):
             return 0
-        lists = self.get_request_lists()
+        lists = self.request_registry.request_lists()
         waiting_queue_prefix_matched = self.policy.waiting_queue_prefix_matched(
             lists["waiting"].reqs
         )
-        cache_miss_rate = 1.0 - self.metrics_reporter.recent_cache_hit_rate
+        cache_miss_rate = 1.0 - self.metrics_sink.recent_cache_hit_rate
         num_tokens = 0
         for req in lists["waiting"].reqs:
             if waiting_queue_prefix_matched:
@@ -70,9 +75,9 @@ class SchedulerLoadInquirer:
 
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
-        disaggregation_mode = self.get_disaggregation_mode()
-        stats = self.metrics_reporter.stats
-        lists = self.get_request_lists()
+        disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        stats = self.metrics_sink.stats
+        lists = self.request_registry.request_lists()
         num_running_reqs = len(lists["decoding"].reqs)
 
         queued = [req for entry in lists.values() if entry.queued for req in entry.reqs]
@@ -124,15 +129,15 @@ class SchedulerLoadInquirer:
             logger.debug(f"Memory metrics not available: {e}")
 
         speculative = None
-        metrics_reporter = self.metrics_reporter
+        metrics_sink = self.metrics_sink
         if (
             not self.spec_algorithm.is_none()
-            and metrics_reporter.spec_total_num_forward_ct > 0
+            and metrics_sink.spec_total_num_forward_ct > 0
         ):
             speculative = SpeculativeMetrics(
                 accept_length=(
-                    metrics_reporter.spec_total_num_accept_tokens
-                    / metrics_reporter.spec_total_num_forward_ct
+                    metrics_sink.spec_total_num_accept_tokens
+                    / metrics_sink.spec_total_num_forward_ct
                 ),
                 accept_rate=stats.spec_accept_rate,
             )
@@ -161,7 +166,7 @@ class SchedulerLoadInquirer:
             decode_retracted = len(lists["retracted"].reqs)
             ready_reqs = [
                 decode_req.req
-                for decode_req in self.get_disagg_decode_prealloc_queue().queue
+                for decode_req in self.mode_owners.disagg_decode.prealloc_queue.queue
                 if decode_req.waiting_for_input
             ]
             decode_prealloc_ready = len(ready_reqs)
@@ -185,7 +190,7 @@ class SchedulerLoadInquirer:
             prealloc_ready=decode_prealloc_ready,
         )
 
-        totals = self.get_decode_moment_totals()
+        totals = self.step_counters.decode_moment_totals
         decode_moments = list(totals) if totals[0] > 0 else None
 
         return LoadSnapshot(
@@ -211,7 +216,7 @@ class SchedulerLoadInquirer:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
-            total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
-            total_prefill_busy_us=self.get_total_prefill_busy_us(),
+            total_prefill_uncached_tokens=self.step_counters.total_prefill_uncached_tokens,
+            total_prefill_busy_us=self.step_counters.total_prefill_busy_us,
             decode_moments=decode_moments,
         )

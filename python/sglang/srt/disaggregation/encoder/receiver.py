@@ -10,9 +10,10 @@ from abc import ABC, abstractmethod
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -25,6 +26,7 @@ from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -62,7 +64,8 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_components.metrics_reporter import MetricsSink
 
 
 class _ReceiveRegistrationRunner:
@@ -1864,13 +1867,23 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
     }
 
 
+@dataclass(frozen=True, kw_only=True)
+class MMSchedulerSide:
+    """What a scheduler-side receiver reads to build its requests; the
+    tokenizer-side receiver has none."""
+
+    model_config: "ModelConfig"
+    tokenizer: Any
+    metrics_sink: "MetricsSink"
+
+
 class MMReceiverBase(ABC):
     def __init__(
         self,
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        scheduler: Optional["Scheduler"] = None,
+        scheduler_side: Optional["MMSchedulerSide"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
         self.context = zmq.asyncio.Context(20)
@@ -1892,10 +1905,10 @@ class MMReceiverBase(ABC):
         # A scheduler-side receiver works across its TP group; the tokenizer
         # side has no placement.
         parallel = get_parallel()
-        self.pp_rank = parallel.pp_rank if scheduler is not None else None
-        self.tp_rank = parallel.tp_rank if scheduler is not None else None
+        self.pp_rank = parallel.pp_rank if scheduler_side is not None else None
+        self.tp_rank = parallel.tp_rank if scheduler_side is not None else None
         self.tp_size = parallel.tp_size
-        self.tp_group = parallel.tp_group if scheduler is not None else None
+        self.tp_group = parallel.tp_group if scheduler_side is not None else None
         self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
@@ -1905,7 +1918,7 @@ class MMReceiverBase(ABC):
         self.scheduler_recv_socket = None
         if (
             self.encoder_transfer_backend == "zmq_to_scheduler"
-            and scheduler is not None
+            and scheduler_side is not None
         ):
             self.registration_runner = _ReceiveRegistrationRunner(
                 f"encoder-receive-registration-{self.tp_rank}"
@@ -1921,8 +1934,8 @@ class MMReceiverBase(ABC):
                 self.tp_rank,
                 self.scheduler_embedding_port,
             )
-        self.scheduler = scheduler
-        self.gpu_id = get_device().gpu_id if scheduler is not None else 0
+        self.scheduler_side = scheduler_side
+        self.gpu_id = get_device().gpu_id if scheduler_side is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.embedding_pool = None
 
@@ -1947,7 +1960,7 @@ class MMReceiverBase(ABC):
                     ),
                 )
             pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
-            if pool_mb and pool_mb > 0 and scheduler is not None:
+            if pool_mb and pool_mb > 0 and scheduler_side is not None:
                 try:
                     self.embedding_pool = EmbeddingPool(
                         self.gpu_id,
@@ -1966,7 +1979,10 @@ class MMReceiverBase(ABC):
             # Unlike mooncake, do NOT apply the default pool size: explicitly
             # set SGLANG_EMBEDDING_POOL_SIZE_MB=<MB> to bound received
             # embeddings on GPU; unset/0 keeps the unpooled CPU receive.
-            if envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set() and scheduler is not None:
+            if (
+                envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set()
+                and scheduler_side is not None
+            ):
                 pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
                 if pool_mb and pool_mb > 0:
                     try:
@@ -1984,8 +2000,8 @@ class MMReceiverBase(ABC):
                     server_args,
                     hf_config,
                     model_config=(
-                        getattr(self.scheduler, "model_config", None)
-                        if self.scheduler is not None
+                        self.scheduler_side.model_config
+                        if self.scheduler_side is not None
                         else None
                     ),
                 )
@@ -2529,25 +2545,25 @@ class MMReceiverBase(ABC):
             return_hidden_states=recv_req.return_hidden_states,
             return_routed_experts=recv_req.return_routed_experts,
             routed_experts_start_len=recv_req.routed_experts_start_len,
-            eos_token_ids=self.scheduler.model_config.hf_eos_token_id,
+            eos_token_ids=self.scheduler_side.model_config.hf_eos_token_id,
             bootstrap_host=recv_req.bootstrap_host,
             bootstrap_port=recv_req.bootstrap_port,
             bootstrap_room=recv_req.bootstrap_room,
-            disagg_mode=self.scheduler.disaggregation_mode,
+            disagg_mode=DisaggregationMode(get_disagg().disaggregation_mode),
             routed_dp_rank=recv_req.routed_dp_rank,
             disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
-            vocab_size=self.scheduler.model_config.vocab_size,
+            vocab_size=self.scheduler_side.model_config.vocab_size,
             priority=recv_req.priority,
             metrics_collector=(
-                self.scheduler.metrics_collector
-                if self.scheduler.metrics_reporter.enable_metrics
+                self.scheduler_side.metrics_sink.metrics_collector
+                if self.scheduler_side.metrics_sink.enable_metrics
                 else None
             ),
             extra_key=recv_req.extra_key,
             cache_salt=recv_req.cache_salt,
             http_worker_ipc=recv_req.http_worker_ipc,
         )
-        req.tokenizer = self.scheduler.tokenizer
+        req.tokenizer = self.scheduler_side.tokenizer
         return req
 
     def _assign_items_by_modality(
@@ -2673,14 +2689,14 @@ class MMReceiverHTTP(MMReceiverBase):
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        scheduler: Optional["Scheduler"] = None,
+        scheduler_side: Optional["MMSchedulerSide"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
         super().__init__(
             server_args,
             dtype=dtype,
             hf_config=hf_config,
-            scheduler=scheduler,
+            scheduler_side=scheduler_side,
             encode_urls=encode_urls,
         )
 
@@ -2806,7 +2822,7 @@ class MMReceiverGrpc(MMReceiverBase):
         server_args: ServerArgs,
         dtype: Optional[torch.dtype] = None,
         hf_config: Optional[PretrainedConfig] = None,
-        scheduler: Optional["Scheduler"] = None,
+        scheduler_side: Optional["MMSchedulerSide"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
         if get_disagg().encoder_transfer_backend == "mooncake":
@@ -2820,7 +2836,7 @@ class MMReceiverGrpc(MMReceiverBase):
             server_args,
             dtype=dtype,
             hf_config=hf_config,
-            scheduler=scheduler,
+            scheduler_side=scheduler_side,
             encode_urls=encode_urls,
         )
 
@@ -2933,7 +2949,7 @@ def create_mm_receiver(
     server_args: ServerArgs,
     dtype: Optional[torch.dtype] = None,
     hf_config: Optional[PretrainedConfig] = None,
-    scheduler: Optional["Scheduler"] = None,
+    scheduler_side: Optional["MMSchedulerSide"] = None,
     transport_mode: Optional[str] = None,
     encode_urls: Optional[List[str]] = None,
 ):
@@ -2951,6 +2967,6 @@ def create_mm_receiver(
         server_args,
         dtype=dtype,
         hf_config=hf_config,
-        scheduler=scheduler,
+        scheduler_side=scheduler_side,
         encode_urls=encode_urls,
     )

@@ -13,6 +13,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
+from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
+    EngineFlags,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
@@ -294,9 +297,9 @@ class TestDPBalanceStats(CustomTestCase):
     def _adapter(self):
         return dp_attn.SchedulerDPAttnAdapter(
             model_runner=object(),
-            offload_tags=set(),
+            flags=EngineFlags(),
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            new_step=lambda reqs: None,
+            step_builder=None,
             get_require_mlp_sync=lambda: True,
         )
 

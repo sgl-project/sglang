@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.prefill import should_force_retry
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -465,9 +466,9 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
 
         owner = prefill_owner_shell(
             tree_cache=tree,
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
-            get_processed_tokens_counter=lambda: 0,
-            release_aborted_request=lambda req: None,
+            metrics_sink=SimpleNamespace(enable_metrics=False),
+            counters=LaunchCounters(),
+            request_retirer=SimpleNamespace(release_aborted_request=lambda req: None),
             clear_pending_chunk_send=lambda req: None,
         )
         with patch(

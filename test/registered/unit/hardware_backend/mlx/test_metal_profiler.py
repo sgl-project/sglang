@@ -21,6 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_mlx_ci
 
@@ -168,7 +169,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         with get_parallel().override(
             tp_group=SimpleNamespace(cpu_group=None), attn_dp_enabled=False
         ):
-            mgr = SchedulerProfilerManager(get_forward_ct=lambda: 0)
+            mgr = SchedulerProfilerManager(counters=LaunchCounters())
         mgr._init_profile(output_dir, None, None, None, None, None, False, "test")
         return mgr
 

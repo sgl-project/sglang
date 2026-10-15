@@ -1,0 +1,83 @@
+"""Frozen bundles the scheduler hands to its components: each groups values
+that travel together and never change after the scheduler is built."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.metrics_reporter import MetricsSink
+    from sglang.srt.managers.scheduler_components.output_streamer import (
+        SchedulerOutputStreamer,
+    )
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.observability.scheduler_stage_metrics import (
+        SchedulerStageMetricsRecorder,
+    )
+    from sglang.srt.sampling.penalties import PenaltyStore
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class KvResources:
+    """The KV memory the components share."""
+
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    tree_cache: BasePrefixCache
+    penalty_store: PenaltyStore
+    # The draft model's KV pool under speculative decoding.
+    draft_token_to_kv_pool: Optional[KVCache]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class KvCapacity:
+    """The KV limits, known once the pools are built."""
+
+    # Request-token capacity as the worker reports it, in logical tokens.
+    max_total_num_tokens: int
+    # Logical-to-physical KV capacity ratio of the page-interleaved shards.
+    kv_shard_widening: int
+    # The request limit that keeps hybrid SWA's separate pool bounds.
+    effective_max_total_num_tokens: int
+    # The SWA pool's capacity; None without hybrid SWA.
+    swa_max_total_num_tokens: Optional[int]
+    max_token_pool_size: int
+    max_running_requests: int
+
+    @property
+    def widened_max_total_num_tokens(self) -> int:
+        """The capacity in the units the allocator and radix counters use."""
+        return self.max_total_num_tokens * self.kv_shard_widening
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Streams:
+    """The device and the streams the scheduler loop runs on."""
+
+    device: str
+    schedule_stream: Any
+    forward_stream: Any
+    copy_stream: Any
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class SchedulerServices:
+    """The leaf services every owner writes to."""
+
+    metrics_sink: MetricsSink
+    output_streamer: SchedulerOutputStreamer
+    scheduler_stage_metrics: SchedulerStageMetricsRecorder
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class ComponentClasses:
+    """The classes a `Scheduler` subclass swaps through its `get_*_class`
+    override points, resolved once at construction. Whoever builds one of these
+    objects, the scheduler or a component, takes its class from here; a
+    component takes it as a constructor argument (`prefill_adder_class=...`)."""
+
+    rust_server: type
+    output_streamer: type

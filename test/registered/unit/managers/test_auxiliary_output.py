@@ -15,11 +15,11 @@ from sglang.srt.managers.auxiliary_output import (
     CompositeDeviceAuxiliaryOutput,
     append_auxiliary_output,
 )
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.pp_ring import PPRing
+from sglang.srt.managers.scheduler_components.step_launcher import StepLauncher
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -466,10 +466,10 @@ def test_active_observer_uses_observer_logits_preprocessing():
     assert sampling_info.grammar_mask is None
 
 
-def test_scheduler_copies_auxiliary_output_for_non_overlap_results():
+def test_step_launcher_copies_auxiliary_output_for_non_overlap_results():
     event = object()
-    scheduler = object.__new__(Scheduler)
-    scheduler.device_module = SimpleNamespace(Event=Mock(return_value=event))
+    launcher = object.__new__(StepLauncher)
+    launcher.device_module = SimpleNamespace(Event=Mock(return_value=event))
     result = SimpleNamespace(
         logits_output=SimpleNamespace(auxiliary_device_output=object()),
         auxiliary_host_output=None,
@@ -479,7 +479,7 @@ def test_scheduler_copies_auxiliary_output_for_non_overlap_results():
     batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
 
     with published_topology():
-        Scheduler._copy_auxiliary_output_to_cpu(scheduler, batch, result)
+        StepLauncher._copy_auxiliary_output_to_cpu(launcher, batch, result)
 
     assert result.copy_done is event
     result.copy_to_cpu.assert_called_once_with(
@@ -488,9 +488,9 @@ def test_scheduler_copies_auxiliary_output_for_non_overlap_results():
     )
 
 
-def test_scheduler_preserves_pipeline_parallel_output_for_transport():
-    scheduler = object.__new__(Scheduler)
-    scheduler.device_module = SimpleNamespace(Event=Mock())
+def test_step_launcher_preserves_pipeline_parallel_output_for_transport():
+    launcher = object.__new__(StepLauncher)
+    launcher.device_module = SimpleNamespace(Event=Mock())
     result = SimpleNamespace(
         logits_output=SimpleNamespace(auxiliary_device_output=object()),
         auxiliary_host_output=None,
@@ -500,11 +500,11 @@ def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
 
     with published_topology(pp_size=2):
-        Scheduler._copy_auxiliary_output_to_cpu(scheduler, batch, result)
+        StepLauncher._copy_auxiliary_output_to_cpu(launcher, batch, result)
 
     assert result.copy_done is None
     result.copy_to_cpu.assert_not_called()
-    scheduler.device_module.Event.assert_not_called()
+    launcher.device_module.Event.assert_not_called()
 
 
 def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
@@ -554,8 +554,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         prefilling=[req],
         checkpoint=Mock(),
         send_kv_chunk=Mock(),
-        metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
-        maybe_send_health_check_signal=Mock(),
+        output_streamer=Mock(),
     )
 
     owner.commit_extend(batch, result, [], None)
@@ -569,7 +568,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         host_output,
         [0],
     )
-    owner.maybe_send_health_check_signal.assert_called_once_with()
+    owner.output_streamer.maybe_reply_health_check.assert_called_once_with()
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():

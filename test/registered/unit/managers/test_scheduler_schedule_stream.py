@@ -10,12 +10,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers import scheduler as scheduler_mod  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -44,17 +50,20 @@ class _DeviceModule:
 def _scheduler(device_module, schedule_stream, forward_stream):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.device = "cuda"
-    scheduler.enable_overlap = True
+    get_context().override("test", disable_overlap_schedule=False)
     scheduler.device_module = device_module
     scheduler.schedule_stream = schedule_stream
     scheduler.forward_stream = forward_stream
-    scheduler.metrics_reporter = SimpleNamespace(
+    scheduler.metrics_sink = SimpleNamespace(
         start_scheduler_time_accounting=lambda: None
     )
     return scheduler
 
 
 class TestScheduleStreamSettledAtInit(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
     def test_loop_runs_on_the_stream_settled_at_init(self):
         forward_stream = _Stream(1)
         device_module = _DeviceModule(handles=[1, 2])

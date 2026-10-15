@@ -98,7 +98,6 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.max_total_num_tokens = 64
         scheduler.max_req_input_len = 32
         scheduler.startup_time = {}
-        scheduler.page_size = 64
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
         publisher.describe_local_source.return_value = self._source(4, 256)
@@ -108,7 +107,9 @@ class TestLocalKvEventSources(CustomTestCase):
         ):
             with (
                 self.subTest(has_publisher=owned_publisher is not None),
-                get_context().override_server_args(grpc_port=50051, dcp_size=4),
+                get_context().override_server_args(
+                    grpc_port=50051, dcp_size=4, page_size=64
+                ),
             ):
                 component.kv_event_publisher = owned_publisher
                 self.assertEqual(

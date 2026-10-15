@@ -1,4 +1,9 @@
-from sglang.srt.runtime_context import get_context, get_observability, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_disagg,
+    get_observability,
+    get_parallel,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -12,13 +17,15 @@ from unittest.mock import patch
 import prometheus_client
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.request_lists import RequestList
+from sglang.srt.managers.request_lists import CoreLists, RequestList
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    MetricsSink,
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
     SchedulerMetricsCollector,
@@ -125,25 +132,49 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
         enable_kv_cache_events=False,
         collector=None,
     )
-    return SchedulerMetricsReporter(
-        scheduler=scheduler,
+    metrics_sink = MetricsSink(
         metrics_collector_context=context,
         metrics_collector=None,
+        device=getattr(scheduler, "device", ""),
     )
+    if hasattr(scheduler, "disaggregation_mode"):
+        _set_disaggregation_mode(test, scheduler.disaggregation_mode)
+    return SchedulerMetricsReporter(
+        metrics_sink=metrics_sink,
+        request_registry=getattr(scheduler, "request_registry", None),
+        core_lists=getattr(scheduler, "lists", None),
+        counters=None,
+        pool_stats_observer=getattr(scheduler, "pool_stats_observer", None),
+        grammar_manager=getattr(scheduler, "grammar_manager", None),
+        mm_receiver=None,
+        kv_events_publisher=scheduler.kv_events_publisher,
+        mode_owners=ModeOwners(),
+        kv=None,
+        capacity=None,
+        tp_worker=scheduler.tp_worker,
+        draft_worker=scheduler.draft_worker,
+        model_config=None,
+        spec_algorithm=None,
+        device=getattr(scheduler, "device", ""),
+    )
+
+
+def _set_disaggregation_mode(test, mode: DisaggregationMode) -> None:
+    """The reporter reads the live mode from config."""
+    enter_scope(test, get_disagg().override(disaggregation_mode=mode.value))
 
 
 class TestForwardPassMetrics(unittest.TestCase):
     def setUp(self):
-        self.scheduler = types.SimpleNamespace()
-        self.scheduler.waiting_queue = []
+        self.scheduler = types.SimpleNamespace(lists=CoreLists())
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
         self.reporter = _make_reporter(self, self.scheduler)
-        self.reporter._fpm_worker_id = "worker-7"
-        self.reporter._fpm_dp_rank = 0
-        self.reporter._fpm_publisher = _CollectingPublisher()
-        self.reporter._fpm_uses_device_timer = False
-        self.reporter._fpm_gpu_time_acc = 0.0
-        self.reporter.enable_fpm = True
+        self.reporter.metrics_sink._fpm_worker_id = "worker-7"
+        self.reporter.metrics_sink._fpm_dp_rank = 0
+        self.reporter.metrics_sink._fpm_publisher = _CollectingPublisher()
+        self.reporter.metrics_sink._fpm_uses_device_timer = False
+        self.reporter.metrics_sink._fpm_gpu_time_acc = 0.0
+        self.reporter.metrics_sink.enable_fpm = True
 
     def test_cache_hit_rate_window_keeps_last_15s_of_tokens(self):
         window = _CacheHitRateWindow()
@@ -167,8 +198,8 @@ class TestForwardPassMetrics(unittest.TestCase):
         return batch
 
     def test_emit_mixed_batch_separates_prefill_and_decode(self):
-        self.reporter._fpm_dp_rank = 3
-        self.scheduler.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]
+        self.reporter.metrics_sink._fpm_dp_rank = 3
+        self.scheduler.lists.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]
 
         prefill_a = _FakeReq(10)
         prefill_b = _FakeReq(14)
@@ -194,8 +225,8 @@ class TestForwardPassMetrics(unittest.TestCase):
         ):
             self.reporter._emit_forward_pass_metrics(batch)
 
-        self.assertEqual(len(self.reporter._fpm_publisher.metrics), 1)
-        metrics = self.reporter._fpm_publisher.metrics[0]
+        self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 1)
+        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
         self.assertEqual(metrics.worker_id, "worker-7")
         self.assertEqual(metrics.dp_rank, 3)
         self.assertEqual(metrics.wall_time, 4.5)
@@ -210,32 +241,34 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metrics.queued_requests.num_decode_requests, 1)
 
     def test_emit_uses_device_timer_gpu_time(self):
-        self.reporter._fpm_uses_device_timer = True
-        self.reporter._fpm_gpu_time_acc = 0.042
-        self.reporter.forward_pass_device_timer = types.SimpleNamespace(
+        self.reporter.metrics_sink._fpm_uses_device_timer = True
+        self.reporter.metrics_sink._fpm_gpu_time_acc = 0.042
+        self.reporter.metrics_sink.forward_pass_device_timer = types.SimpleNamespace(
             _report=lambda: None,
         )
         batch = self._make_batch()
 
         self.reporter._emit_forward_pass_metrics(batch)
 
-        self.assertEqual(len(self.reporter._fpm_publisher.metrics), 1)
+        self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 1)
         self.assertAlmostEqual(
-            self.reporter._fpm_publisher.metrics[0].wall_time, 0.042, places=4
+            self.reporter.metrics_sink._fpm_publisher.metrics[0].wall_time,
+            0.042,
+            places=4,
         )
-        self.assertAlmostEqual(self.reporter._fpm_gpu_time_acc, 0.0)
+        self.assertAlmostEqual(self.reporter.metrics_sink._fpm_gpu_time_acc, 0.0)
 
     def test_emit_skips_when_device_timer_zero(self):
-        self.reporter._fpm_uses_device_timer = True
-        self.reporter._fpm_gpu_time_acc = 0.0
-        self.reporter.forward_pass_device_timer = types.SimpleNamespace(
+        self.reporter.metrics_sink._fpm_uses_device_timer = True
+        self.reporter.metrics_sink._fpm_gpu_time_acc = 0.0
+        self.reporter.metrics_sink.forward_pass_device_timer = types.SimpleNamespace(
             _report=lambda: None,
         )
         batch = self._make_batch()
 
         self.reporter._emit_forward_pass_metrics(batch)
 
-        self.assertEqual(len(self.reporter._fpm_publisher.metrics), 0)
+        self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 0)
 
     def test_emit_uses_monotonic_without_device_timer(self):
         batch = self._make_batch()
@@ -246,17 +279,20 @@ class TestForwardPassMetrics(unittest.TestCase):
         ):
             self.reporter._emit_forward_pass_metrics(batch, result=None)
 
-        self.assertEqual(len(self.reporter._fpm_publisher.metrics), 1)
+        self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 1)
         self.assertAlmostEqual(
-            self.reporter._fpm_publisher.metrics[0].wall_time, 0.035, places=4
+            self.reporter.metrics_sink._fpm_publisher.metrics[0].wall_time,
+            0.035,
+            places=4,
         )
 
     def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
-        self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        self.scheduler.request_lists = lambda: {
+        _set_disaggregation_mode(self, DisaggregationMode.PREFILL)
+        self.reporter.request_registry = types.SimpleNamespace()
+        self.reporter.request_registry.request_lists = lambda: {
             "bootstrap": RequestList(name="bootstrap", reqs=[_FakeReq(100)])
         }
-        self.scheduler.waiting_queue = [_FakeReq(200), _FakeReq(50)]
+        self.scheduler.lists.waiting_queue = [_FakeReq(200), _FakeReq(50)]
         batch = self._make_batch()
 
         with patch(
@@ -265,14 +301,15 @@ class TestForwardPassMetrics(unittest.TestCase):
         ):
             self.reporter._emit_forward_pass_metrics(batch)
 
-        metrics = self.reporter._fpm_publisher.metrics[0]
+        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 3)
         self.assertEqual(metrics.queued_requests.sum_prefill_tokens, 350)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 0)
 
     def test_disagg_decode_queued_metrics(self):
-        self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        self.scheduler.request_lists = lambda: {
+        _set_disaggregation_mode(self, DisaggregationMode.DECODE)
+        self.reporter.request_registry = types.SimpleNamespace()
+        self.reporter.request_registry.request_lists = lambda: {
             "prealloc": RequestList(
                 name="prealloc",
                 reqs=[_FakeReq(10, output_len=5), _FakeReq(20, output_len=10)],
@@ -289,7 +326,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         ):
             self.reporter._emit_forward_pass_metrics(batch)
 
-        metrics = self.reporter._fpm_publisher.metrics[0]
+        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 0)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 3)
         self.assertEqual(metrics.queued_requests.sum_decode_kv_tokens, 15 + 30 + 45)
@@ -315,12 +352,14 @@ class TestForwardPassMetrics(unittest.TestCase):
         ):
             reporter = _make_reporter(self, scheduler)
 
-        self.assertTrue(reporter.enable_fpm)
-        self.assertEqual(reporter._fpm_worker_id, "endpoint-42")
-        self.assertEqual(reporter._fpm_dp_rank, 2)
-        self.assertEqual(reporter._fpm_publisher.worker_id, "endpoint-42")
-        self.assertEqual(reporter._fpm_publisher.dp_rank, 2)
-        self.assertTrue(reporter._fpm_publisher.endpoint.startswith("ipc://"))
+        self.assertTrue(reporter.metrics_sink.enable_fpm)
+        self.assertEqual(reporter.metrics_sink._fpm_worker_id, "endpoint-42")
+        self.assertEqual(reporter.metrics_sink._fpm_dp_rank, 2)
+        self.assertEqual(reporter.metrics_sink._fpm_publisher.worker_id, "endpoint-42")
+        self.assertEqual(reporter.metrics_sink._fpm_publisher.dp_rank, 2)
+        self.assertTrue(
+            reporter.metrics_sink._fpm_publisher.endpoint.startswith("ipc://")
+        )
         # The bag is what makes the write a bag write: an instance mutation
         # would still show up in the resolved dict through its ServerArgs base.
         endpoint = get_observability().forward_pass_metrics_ipc_name
@@ -352,7 +391,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         ):
             reporter = _make_reporter(self, scheduler)
 
-        self.assertFalse(reporter.enable_fpm)
+        self.assertFalse(reporter.metrics_sink.enable_fpm)
 
 
 def _dp_balance_stats(
@@ -382,8 +421,7 @@ def _dp_balance_stats(
 class TestDPBalanceMetrics(CustomTestCase):
     def _reporter_with_collector(self, attn_dp_rank: int):
         scheduler = types.SimpleNamespace(
-            decoding=[],
-            waiting_queue=[],
+            lists=CoreLists(),
             grammar_manager=[],
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
@@ -417,10 +455,10 @@ class TestDPBalanceMetrics(CustomTestCase):
                 for kind in ("Counter", "Gauge", "Histogram", "Summary")
             },
         ):
-            reporter.metrics_collector = SchedulerMetricsCollector(
+            reporter.metrics_sink.metrics_collector = SchedulerMetricsCollector(
                 labels=labels, server_args=scheduler.server_args
             )
-        reporter.current_scheduler_metrics_enabled = True
+        reporter.metrics_sink.current_scheduler_metrics_enabled = True
         return reporter, registry, {k: str(v) for k, v in labels.items()}
 
     def test_step_stats_exported_once_per_step(self):
@@ -440,13 +478,13 @@ class TestDPBalanceMetrics(CustomTestCase):
                 global_attention_pairs=[800, 4000],
             )
         )
-        reporter.log_batch_result_stats(batch, result=object())
+        reporter.metrics_sink.log_batch_result_stats(batch, result=object())
         batch.dp_balance_stats = _dp_balance_stats(
             local_tokens=0, global_num_tokens=[8, 0], sync_wait_seconds=0.004
         )
-        reporter.log_batch_result_stats(batch, result=object())
+        reporter.metrics_sink.log_batch_result_stats(batch, result=object())
         batch.dp_balance_stats = None
-        reporter.log_batch_result_stats(batch, result=object())
+        reporter.metrics_sink.log_batch_result_stats(batch, result=object())
 
         self.assertEqual(
             get("sglang:dp_attention_tokens_total", {**labels, "kind": "scheduled"}), 4
@@ -490,7 +528,7 @@ class TestDPBalanceMetrics(CustomTestCase):
                 local_tokens=4, global_num_tokens=[8, 4], sync_wait_seconds=0.002
             )
         )
-        reporter.log_batch_result_stats(batch, result=object())
+        reporter.metrics_sink.log_batch_result_stats(batch, result=object())
 
         get = registry.get_sample_value
         self.assertEqual(
@@ -505,9 +543,8 @@ class TestDPBalanceMetrics(CustomTestCase):
 class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
-            decoding=[],
-            waiting_queue=[],
-            queued_reqs=lambda: [],
+            lists=CoreLists(),
+            request_registry=types.SimpleNamespace(queued_reqs=lambda: []),
             grammar_manager=[],
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
@@ -521,7 +558,7 @@ class TestIdleMetrics(CustomTestCase):
         )
         self.reporter = _make_reporter(self, self.scheduler)
         self.published_occupancies = []
-        self.reporter.metrics_collector = types.SimpleNamespace(
+        self.reporter.metrics_sink.metrics_collector = types.SimpleNamespace(
             last_log_time=100.0,
             log_stats=lambda stats: self.published_occupancies.append(
                 stats.fwd_occupancy
@@ -542,10 +579,8 @@ class TestIdleMetrics(CustomTestCase):
             collector = SchedulerMetricsCollector(
                 labels=labels, server_args=self.scheduler.server_args
             )
-        self.reporter.metrics_collector = collector
-        self.reporter.current_scheduler_metrics_enabled = True
-        self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        self.scheduler.enable_priority_scheduling = True
+        self.reporter.metrics_sink.metrics_collector = collector
+        self.reporter.metrics_sink.current_scheduler_metrics_enabled = True
         host_reqs = [
             types.SimpleNamespace(host_staged=True, priority=priority)
             for priority in (1, 2)
@@ -554,10 +589,10 @@ class TestIdleMetrics(CustomTestCase):
             queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)],
             num_pending_deferred_releases=lambda: 0,
         )
-        self.scheduler.disagg_decode = types.SimpleNamespace(
+        self.reporter.mode_owners.disagg_decode = types.SimpleNamespace(
             transfer_queue=transfer_queue
         )
-        self.scheduler.request_lists = lambda: {
+        self.scheduler.request_registry.request_lists = lambda: {
             "prealloc": RequestList(name="prealloc", reqs=[]),
             "transfer": RequestList(name="transfer", reqs=transfer_queue.queue),
         }
@@ -565,7 +600,9 @@ class TestIdleMetrics(CustomTestCase):
             collector.increment_decode_host_receive_reqs()
 
         with get_context().override_server_args(
-            disaggregation_decode_host_receive_threshold=0.8
+            disaggregation_mode=DisaggregationMode.DECODE.value,
+            disaggregation_decode_host_receive_threshold=0.8,
+            enable_priority_scheduling=True,
         ):
             for waiting in (True, False):
                 for req in host_reqs:
@@ -591,10 +628,10 @@ class TestIdleMetrics(CustomTestCase):
                 )
 
     def test_idle_clears_cached_forward_occupancy_immediately(self):
-        self.reporter.current_scheduler_metrics_enabled = True
-        self.reporter.fwd_occupancy = 72.0
-        self.reporter.stats.fwd_occupancy = 72.0
-        self.reporter._device_timer_window_batch_count = 7
+        self.reporter.metrics_sink.current_scheduler_metrics_enabled = True
+        self.reporter.metrics_sink.fwd_occupancy = 72.0
+        self.reporter.metrics_sink.stats.fwd_occupancy = 72.0
+        self.reporter.metrics_sink._device_timer_window_batch_count = 7
 
         with (
             patch(
@@ -611,14 +648,14 @@ class TestIdleMetrics(CustomTestCase):
 
         self.assertEqual(len(self.published_occupancies), 1)
         self.assertTrue(math.isnan(self.published_occupancies[0]))
-        self.assertTrue(math.isnan(self.reporter.fwd_occupancy))
-        self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
-        self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
+        self.assertTrue(math.isnan(self.reporter.metrics_sink.fwd_occupancy))
+        self.assertTrue(math.isnan(self.reporter.metrics_sink.stats.fwd_occupancy))
+        self.assertEqual(self.reporter.metrics_sink._device_timer_window_batch_count, 0)
 
     def test_idle_resets_forward_timing_when_metrics_are_disabled(self):
-        self.reporter.fwd_occupancy = 72.0
-        self.reporter.stats.fwd_occupancy = 72.0
-        self.reporter._device_timer_window_batch_count = 7
+        self.reporter.metrics_sink.fwd_occupancy = 72.0
+        self.reporter.metrics_sink.stats.fwd_occupancy = 72.0
+        self.reporter.metrics_sink._device_timer_window_batch_count = 7
 
         with patch(
             "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
@@ -626,9 +663,9 @@ class TestIdleMetrics(CustomTestCase):
         ):
             self.reporter._maybe_log_idle_metrics()
 
-        self.assertTrue(math.isnan(self.reporter.fwd_occupancy))
-        self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
-        self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
+        self.assertTrue(math.isnan(self.reporter.metrics_sink.fwd_occupancy))
+        self.assertTrue(math.isnan(self.reporter.metrics_sink.stats.fwd_occupancy))
+        self.assertEqual(self.reporter.metrics_sink._device_timer_window_batch_count, 0)
         self.assertEqual(self.published_occupancies, [])
 
 
@@ -645,9 +682,9 @@ class TestSchedulerTimeAccounting(CustomTestCase):
         self.idle_seconds = []
         self.process_cpu_seconds = []
         self.stage_seconds = []
-        self.reporter.enable_metrics = True
-        self.reporter.scheduler_stage_metrics.enabled = True
-        self.reporter.metrics_collector = types.SimpleNamespace(
+        self.reporter.metrics_sink.enable_metrics = True
+        self.reporter.metrics_sink.scheduler_stage_metrics.enabled = True
+        self.reporter.metrics_sink.metrics_collector = types.SimpleNamespace(
             increment_scheduler_idle_seconds=self.idle_seconds.append,
             increment_scheduler_process_cpu_seconds=self.process_cpu_seconds.append,
             increment_scheduler_stage_seconds=lambda **kwargs: (
@@ -683,20 +720,22 @@ class TestSchedulerTimeAccounting(CustomTestCase):
                 side_effect=process_cpu_timestamps,
             ),
         ):
-            self.reporter.start_scheduler_time_accounting()
-            self.reporter.record_scheduler_idle()
-            self.reporter.record_scheduler_active(event_ns=1_300_000_000)
+            self.reporter.metrics_sink.start_scheduler_time_accounting()
+            self.reporter.metrics_sink.record_scheduler_idle()
+            self.reporter.metrics_sink.record_scheduler_active(event_ns=1_300_000_000)
             self.assertEqual(
-                self.reporter._forward_occupancy_log_window.idle_ns, 1_300_000_000
+                self.reporter.metrics_sink._forward_occupancy_log_window.idle_ns,
+                1_300_000_000,
             )
-            self.reporter.record_scheduler_active(event_ns=0)
+            self.reporter.metrics_sink.record_scheduler_active(event_ns=0)
             # Time between idle capture and accounting still counts as idle.
-            self.reporter.record_scheduler_idle()
-            self.reporter.record_scheduler_idle()
+            self.reporter.metrics_sink.record_scheduler_idle()
+            self.reporter.metrics_sink.record_scheduler_idle()
 
         self.assertAlmostEqual(sum(self.idle_seconds), 2.5)
         self.assertEqual(
-            self.reporter._forward_occupancy_log_window.idle_ns, 1_200_000_000
+            self.reporter.metrics_sink._forward_occupancy_log_window.idle_ns,
+            1_200_000_000,
         )
         self.assertAlmostEqual(sum(self.process_cpu_seconds), 1.9)
         self.assertAlmostEqual(
@@ -728,19 +767,19 @@ class TestSchedulerTimeAccounting(CustomTestCase):
                 side_effect=[0, 300_000_000],
             ) as process_time,
         ):
-            self.reporter.start_scheduler_time_accounting()
-            accounting = self.reporter._scheduler_time_accounting
-            self.reporter.record_scheduler_active(event_ns=200_000_000)
-            self.reporter.record_scheduler_idle()
+            self.reporter.metrics_sink.start_scheduler_time_accounting()
+            accounting = self.reporter.metrics_sink._scheduler_time_accounting
+            self.reporter.metrics_sink.record_scheduler_active(event_ns=200_000_000)
+            self.reporter.metrics_sink.record_scheduler_idle()
             self.assertEqual(self.idle_seconds, [])
             self.assertEqual(self.process_cpu_seconds, [])
-            with self.reporter.scheduler_stage_metrics.record(
+            with self.reporter.metrics_sink.scheduler_stage_metrics.record(
                 SCHEDULER_STAGE_RECV_REQUESTS
             ):
                 pass
             # Receive crossed the reporting deadline. Backdate only idle time,
             # not the stage drain (which has already sampled receive completion).
-            self.reporter.record_scheduler_active(event_ns=700_000_000)
+            self.reporter.metrics_sink.record_scheduler_active(event_ns=700_000_000)
             self.assertEqual(self.idle_seconds, [0.5])
             self.assertEqual(accounting.last_sample_ns, 1_200_000_000)
             self.assertAlmostEqual(
@@ -757,9 +796,9 @@ class TestSchedulerTimeAccounting(CustomTestCase):
                 ),
                 0.4,
             )
-            self.reporter.record_scheduler_active(event_ns=1_300_000_000)
+            self.reporter.metrics_sink.record_scheduler_active(event_ns=1_300_000_000)
 
-        self.assertIs(self.reporter._scheduler_time_accounting, accounting)
+        self.assertIs(self.reporter.metrics_sink._scheduler_time_accounting, accounting)
         self.assertEqual(process_time.call_count, 2)
         self.assertEqual(self.idle_seconds, [0.5])
         self.assertAlmostEqual(self.process_cpu_seconds[0], 0.3)
@@ -775,10 +814,12 @@ class TestSchedulerTimeAccounting(CustomTestCase):
                 side_effect=[0, 0],
             ),
         ):
-            self.reporter.start_scheduler_time_accounting()
-            self.reporter.record_scheduler_active(event_ns=-1)
-            self.assertEqual(self.reporter._forward_occupancy_log_window.idle_ns, 0)
-            self.reporter.record_scheduler_active(event_ns=1_000_000_000)
+            self.reporter.metrics_sink.start_scheduler_time_accounting()
+            self.reporter.metrics_sink.record_scheduler_active(event_ns=-1)
+            self.assertEqual(
+                self.reporter.metrics_sink._forward_occupancy_log_window.idle_ns, 0
+            )
+            self.reporter.metrics_sink.record_scheduler_active(event_ns=1_000_000_000)
 
         self.assertEqual(self.idle_seconds, [])
         self.assertEqual(self.process_cpu_seconds, [0.0])
@@ -788,8 +829,7 @@ class TestEstimatedPrefillPerf(CustomTestCase):
     """Causal pair count behind ``est. prefill TFLOPS/s`` and ``estimated_flops``."""
 
     def setUp(self):
-        self.scheduler = types.SimpleNamespace()
-        self.scheduler.waiting_queue = []
+        self.scheduler = types.SimpleNamespace(lists=CoreLists())
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
         self.reporter = _make_reporter(self, self.scheduler)
         # One unit per query-key pair and nothing else, so the returned FLOPs

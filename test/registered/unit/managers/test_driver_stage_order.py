@@ -22,10 +22,19 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.managers.request_lists import CoreLists  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler import (  # noqa: E402
     Scheduler,
     _dispatch_event_loop_once,
+)
+from sglang.srt.managers.scheduler_components.bundles import Streams  # noqa: E402
+from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
+    EngineFlags,
+    LaunchCounters,
+)
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
@@ -35,6 +44,7 @@ from sglang.srt.managers.scheduler_components.pending_steps import (  # noqa: E4
 )
 from sglang.srt.managers.scheduler_components.pp_ring import PPRing  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
@@ -183,62 +193,69 @@ class _Shell:
         self.ready_at = ready_at or {}
         self.results = {}
         s = self.s = Scheduler.__new__(Scheduler)
-        s.gracefully_exit = False
-        s._engine_paused = False
+        s.mode_owners = ModeOwners()
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
+        s.lists = CoreLists()
+        s.flags.gracefully_exit = False
+        s.flags._engine_paused = False
         s._deferred_input_requests = []
         s.scheduler_stage_metrics = None
-        s.waiting_queue = []
-        s.decoding = []
-        s.chunked_req = None
+        s.lists.waiting_queue = []
+        s.lists.decoding = []
+        s.lists.chunked_req = None
         s.pending = PendingSteps()
         s.flat_slot = ScheduleSlot()
-        s.enable_skip_finishing_decode = False
+        s.flags.enable_skip_finishing_decode = False
         s._sched_idled = False
-        s.cur_batch_for_debug = None
+        s.counters.cur_batch_for_debug = None
         s.recv_skipper = None
         s.enable_overlap = False
         s.enable_unified_memory = False
         s.enable_fpm = False
         s.enable_hisparse = False
-        s.hisparse_coordinator = None
+        s.mode_owners.hisparse_coordinator = None
         s.require_mlp_sync = False
         s.is_generation = True
         s.tp_size = 2
         s.spec_algorithm = SpeculativeAlgorithm.NONE
-        s._prefill_decode_interval_remaining = 0
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.scripted_scheduler_hook = _Hook(self)
-        s.dllm = None
-        s.disagg_prefill = None
-        s.disagg_decode = None
+        s.mode_owners.dllm = None
+        s.mode_owners.disagg_prefill = None
+        s.mode_owners.disagg_decode = None
         s.disaggregation_mode = DisaggregationMode.NULL
         if mode == "prefill":
-            s.disagg_prefill = _PrefillOwner(self)
+            s.mode_owners.disagg_prefill = _PrefillOwner(self)
             s.disaggregation_mode = DisaggregationMode.PREFILL
         elif mode == "decode":
-            s.disagg_decode = _DecodeOwner(self)
+            s.mode_owners.disagg_decode = _DecodeOwner(self)
             s.disaggregation_mode = DisaggregationMode.DECODE
             s.decode_offload_manager = None
         elif mode == "dllm":
-            s.dllm = _DllmOwner(self)
+            s.mode_owners.dllm = _DllmOwner(self)
 
         s.ingest_requests = self.ingest_requests
         s._record_scheduler_state_for_paused_engine = lambda: self.log("paused")
         s.process_pending_chunked_abort = lambda: self.log("chunked_abort")
         s._process_hicache_events = self.hicache_events
-        s.get_new_batch_prefill = lambda *slot: self.schedule_leaf("prefill")
-        s.get_decode_step = lambda *slot: self.schedule_leaf("decode")
+        s.step_planner = SimpleNamespace(
+            should_defer_prefill=lambda: False,
+            get_new_batch_prefill=lambda *slot: self.schedule_leaf("prefill"),
+            get_decode_step=lambda *slot: self.schedule_leaf("decode"),
+            arm_prefill_decode_interval=lambda step: self.log("arm_interval"),
+        )
         s.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=self.mlp_sync,
             maybe_set_extend_view=lambda step: self.log("extend_view"),
         )
-        s._arm_prefill_decode_interval = lambda step: self.log("arm_interval")
         s.ngram_embedding_manager = SimpleNamespace(prepare_for_forward=self.ngram)
-        s.run_batch = self.run_batch
+        s.step_launcher = SimpleNamespace(
+            run_batch=self.run_batch, launch_batch_sample_if_needed=self.sample
+        )
         s._apply_war_barrier = lambda: self.log("war_barrier")
-        s.launch_batch_sample_if_needed = self.sample
         s.process_batch_result = self.process_batch_result
-        s._record_step_counters = lambda record: None
+        s.step_counters = SimpleNamespace(record=lambda record: None)
         s.on_idle = lambda: self.log("idle")
 
     def log(self, *event):
@@ -254,7 +271,7 @@ class _Shell:
             raise _Stop
         self.log("ingest", stop_at_pause) if stop_at_pause else self.log("ingest")
         if self.iteration == self.shutdown_at:
-            self.s.gracefully_exit = True
+            self.s.flags.gracefully_exit = True
         return []
 
     def hicache_events(self, should_retry_storage_prefetch=True):
@@ -288,7 +305,7 @@ class _Shell:
         result.delay_sample_func = None
         self.log("sample", result.name)
 
-    def process_batch_result(self, step, result, *slot):
+    def process_batch_result(self, step, result):
         self.log("commit", step.name)
 
     def run(self, **topology):
@@ -299,6 +316,9 @@ class _Shell:
                 lambda step: self.log("schedule_time"),
             ),
         ):
+            get_context().override(
+                "test", disable_overlap_schedule=not self.s.enable_overlap
+            )
             self.s.init_mode_stages()
             try:
                 _dispatch_event_loop_once(self.s)
@@ -353,7 +373,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
             + _at(2, "ingest", ("commit", "d1"))
             + _at(3, "ingest", "idle"),
         )
-        self.assertTrue(shell.s.enable_skip_finishing_decode)
+        self.assertTrue(shell.s.flags.enable_skip_finishing_decode)
 
     def test_shutdown_stops_new_launches(self):
         """The pass that receives the shutdown commits what is pending and
@@ -468,7 +488,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
                     + _at(1, *schedule, ("decode", None), *_FINALIZE_NONE)
                     + _at(1, ("commit", "d0") if overlap else "idle", "dd.prefetch"),
                 )
-                self.assertFalse(shell.s.enable_skip_finishing_decode)
+                self.assertFalse(shell.s.flags.enable_skip_finishing_decode)
 
 
 class _RingShell(_Shell):
@@ -478,12 +498,14 @@ class _RingShell(_Shell):
     def __init__(self, mode, iterations, **script):
         super().__init__(mode, iterations, **script)
         s = self.s
-        s.device = "cpu"
         s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
         s.world_group = s.attn_tp_group = None
-        s.schedule_stream = s.forward_stream = s.copy_stream = None
-        s.copy_stream_ctx = s.future_map = s.req_to_token_pool = None
-        s.token_to_kv_pool_allocator = s.tp_worker = s.model_worker = None
+        s.streams = Streams(
+            device="cpu", schedule_stream=None, forward_stream=None, copy_stream=None
+        )
+        s.kv = SimpleNamespace(token_to_kv_pool_allocator=None)
+        s.future_map = s.tp_worker = None
+        s.pp_spec_forward = None
         self.channel = SimpleNamespace(
             is_first_rank=True,
             is_last_rank=False,
@@ -497,10 +519,10 @@ class _RingShell(_Shell):
             wait_forward_dependencies=lambda: None,
             launch_event=None,
         )
-        s.forward_stream_ctx = nullcontext()
         s.device_module = SimpleNamespace(
             Event=lambda: SimpleNamespace(record=lambda stream: None),
             current_stream=lambda: None,
+            stream=lambda stream: nullcontext(),
         )
 
     def send(self, data, async_send=False):

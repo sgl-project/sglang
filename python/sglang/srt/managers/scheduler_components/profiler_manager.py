@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     List,
     Optional,
 )
@@ -30,6 +29,7 @@ from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 
 _is_npu = is_npu()
 _is_mps = is_mps()
@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
-    get_forward_ct: Callable[[], int]
+    counters: LaunchCounters
     # Taken at construction: a batch can stop profiling while a scoped
     # override has moved the TP group.
     dp_tp_cpu_group: Any = field(init=False)
@@ -141,7 +141,9 @@ class SchedulerProfilerManager:
         self.detailed_annotations = detailed_annotations
 
         if start_step:
-            self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
+            self.profiler_start_forward_ct = max(
+                start_step, self.counters.forward_ct + 1
+            )
 
         if num_steps:
             if self.profile_by_stage:
@@ -154,7 +156,9 @@ class SchedulerProfilerManager:
                     self.profiler_start_forward_ct + num_steps
                 )
             else:
-                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps + 1
+                self.profiler_target_forward_ct = (
+                    self.counters.forward_ct + num_steps + 1
+                )
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
@@ -445,12 +449,12 @@ class SchedulerProfilerManager:
             # Check profiler
             if (
                 self.profiler_target_forward_ct
-                and self.profiler_target_forward_ct <= self.get_forward_ct()
+                and self.profiler_target_forward_ct <= self.counters.forward_ct
             ):
                 self._stop_profile()
             if (
                 self.profiler_start_forward_ct
-                and self.profiler_start_forward_ct == self.get_forward_ct()
+                and self.profiler_start_forward_ct == self.counters.forward_ct
             ):
                 self._start_profile()
 

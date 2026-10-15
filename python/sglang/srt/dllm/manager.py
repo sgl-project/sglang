@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import TYPE_CHECKING, Callable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.prefill_adder import DllmPrefillAdder
@@ -20,20 +20,20 @@ from sglang.srt.runtime_context import get_schedule
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.managers.io_struct import AbortReq
-    from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvResources,
+        SchedulerServices,
     )
     from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
         NewTokenRatioTracker,
     )
-    from sglang.srt.managers.scheduler_components.output_streamer import (
-        SchedulerOutputStreamer,
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
     )
+    from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
     from sglang.srt.managers.utils import GenerationBatchResult
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
 class DllmManager:
@@ -49,9 +49,8 @@ class DllmManager:
         self,
         *,
         dllm_config: DllmConfig,
-        tree_cache: BasePrefixCache,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        kv: KvResources,
+        services: SchedulerServices,
         policy: SchedulePolicy,
         new_token_ratio_tracker: NewTokenRatioTracker,
         page_size: int,
@@ -62,14 +61,15 @@ class DllmManager:
         enable_priority_scheduling: bool,
         truncation_align_size: Optional[int],
         context_len: int,
-        get_num_allocatable_reqs: Callable[[int], int],
-        build_extend_step: Callable[..., ScheduleBatch],
-        build_sampling_info: Callable,
-        metrics_reporter: SchedulerMetricsReporter,
-        output_streamer: SchedulerOutputStreamer,
-        release_aborted_request: Callable[[Req], None],
-        send_abort_output: Callable[[Req], None],
+        beam_coordinator: BeamCoordinator,
+        step_builder: StepBuilder,
+        request_retirer: RequestRetirer,
     ):
+        tree_cache = kv.tree_cache
+        req_to_token_pool = kv.req_to_token_pool
+        token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
+        metrics_sink = services.metrics_sink
+        output_streamer = services.output_streamer
         self.dllm_config = dllm_config
         self.tree_cache = tree_cache
         self.req_to_token_pool = req_to_token_pool
@@ -86,19 +86,15 @@ class DllmManager:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.truncation_align_size = truncation_align_size
         self.context_len = context_len
-        self.get_num_allocatable_reqs = get_num_allocatable_reqs
-        self.build_extend_step = build_extend_step
-        self.build_sampling_info = build_sampling_info
-        self.metrics_reporter = metrics_reporter
+        self.beam_coordinator = beam_coordinator
+        self.step_builder = step_builder
+        self.metrics_sink = metrics_sink
         self.output_streamer = output_streamer
-        self.release_aborted_request = release_aborted_request
-        self.send_abort_output = send_abort_output
+        self.request_retirer = request_retirer
 
         self.waiting: List[Req] = []
         self.staging: List[Req] = []
         self.between_blocks: List[Req] = []
-        # Set when admission finds no room; the next commit clears it.
-        self.batch_is_full = False
         self._next_intake_seq = 0
 
     def lists(self) -> List[RequestList]:
@@ -159,8 +155,8 @@ class DllmManager:
         if not aborted:
             return reqs
         for req in aborted:
-            self.release_aborted_request(req)
-            self.send_abort_output(req)
+            self.request_retirer.release_aborted_request(req)
+            self.request_retirer.send_abort_output(req)
             if req.kv.holds_kv or req.kv.holds_mamba:
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort dLLM queued request. {req.rid=}")
@@ -180,12 +176,6 @@ class DllmManager:
         # Requests taken already finished (a rejected multimodal input).
         self.waiting = [req for req in self.waiting if not req.finished()]
         self.between_blocks = [req for req in self.between_blocks if not req.finished()]
-
-        if self.enable_priority_preemption or self.is_empty():
-            # Only a commit clears the latch otherwise, and with nothing in
-            # flight none will come: a failure found with an empty manager
-            # must not close admission for good.
-            self.batch_is_full = False
 
         # Early exit if batch is full or no requests available
         if self._should_skip_prefill(waiting_queue):
@@ -238,8 +228,6 @@ class DllmManager:
             self.finish_dllm_forward(req)
             req.dllm.init_next_round_input(req)
         self._move_between_blocks(live_reqs)
-        # Admission reopens once the step's requests leave staging.
-        self.batch_is_full = False
 
     def _write_blocks(
         self,
@@ -253,12 +241,6 @@ class DllmManager:
             self.dllm_config.requires_separate_context_encoding
             and not batch.forward_mode.is_dllm_extend()
         ):
-            self.metrics_reporter.report_prefill_stats(
-                batch=batch,
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=result.can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
             return
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
@@ -284,7 +266,7 @@ class DllmManager:
                     req.full_untruncated_fill_ids[
                         req.extend_end - new_tokens : req.extend_end
                     ] = array("q", next_token_ids)
-                    self.metrics_reporter.num_generated_tokens += new_tokens
+                    self.metrics_sink.num_generated_tokens += new_tokens
 
                     req.output_ids.extend(next_token_ids)
                     req.update_finish_state(new_accepted_len=new_tokens)
@@ -323,20 +305,13 @@ class DllmManager:
                 if len_fill - len(next_token_ids) < len_input:
                     next_token_ids = next_token_ids[len_input - len_fill :]
 
-                self.metrics_reporter.num_generated_tokens += len(next_token_ids)
+                self.metrics_sink.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
                 self._finish_dllm_request_if_needed(req)
 
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
-
-        self.metrics_reporter.report_prefill_stats(
-            batch=batch,
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=result.can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
 
     def _finish_dllm_request_if_needed(self, req: Req) -> None:
         if (
@@ -426,17 +401,15 @@ class DllmManager:
 
     def _should_skip_prefill(self, waiting_queue: List[Req]) -> bool:
         """Check if DLLM prefill should be skipped."""
-        if (self.batch_is_full or not waiting_queue) and self.is_empty():
+        if not waiting_queue and self.is_empty():
             return True
 
         # No request decodes in dLLM mode.
-        running_bs = 0
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            not self.beam_coordinator.has_room(1, 1)
             and self.is_empty()
             and not self.enable_priority_preemption
         ):
-            self.batch_is_full = True
             return True
 
         return False
@@ -510,7 +483,7 @@ class DllmManager:
     ) -> ScheduleBatch:
         """Create and prepare a new DLLM batch."""
         # An FDFO block left unresolved rewrites the KV its request kept.
-        new_batch = self.build_extend_step(
+        new_batch = self.step_builder.build_extend_step(
             can_run_list,
             kv_reuse_lens=[
                 len(req.dllm.incomplete_ids) if req.kv.holds_kv else 0
@@ -534,7 +507,9 @@ class DllmManager:
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder, [], self.enable_priority_scheduling
         )
-        new_batch.sampling_info = self.build_sampling_info(can_run_list)
+        new_batch.sampling_info = self.step_builder.build_sampling_info(
+            can_run_list, new_batch.req_pool_indices
+        )
 
         return new_batch
 
@@ -543,14 +518,21 @@ class DllmManager:
     ) -> AddReqResult:
         """Process incoming DLLM requests with resource allocation and preemption."""
         res = AddReqResult.CONTINUE
+        # Once set, every later request must preempt to be admitted.
+        is_full = False
+        # The new request rows the admitted requests take; a staging request
+        # already holds its row.
+        num_admitted_rows = sum(map(self.beam_coordinator.num_rows, adder.can_run_list))
         for req in reqs:
-            # Check if batch is full
-            running_bs = 0
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.batch_is_full = True
+            # No request decodes in dLLM mode.
+            rows_with_req = num_admitted_rows + self.beam_coordinator.num_rows(req)
+            if not self.beam_coordinator.has_room(
+                len(adder.can_run_list) + 1, rows_with_req
+            ):
+                is_full = True
 
             # Try preemption if batch is full
-            if self.batch_is_full:
+            if is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
@@ -563,10 +545,10 @@ class DllmManager:
                 has_chunked_req=True,
                 truncation_align_size=self.truncation_align_size,
             )
+            if adder.can_run_list and req is adder.can_run_list[-1]:
+                num_admitted_rows = rows_with_req
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    self.batch_is_full = True
                 break
 
         return res

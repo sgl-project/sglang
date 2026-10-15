@@ -2,6 +2,7 @@
 step's host commit; that step's grammar commit runs inside the launch."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -18,6 +19,13 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (  #
     SchedulerBatchResultProcessor,
     advance_grammar_fsm,
     commit_pending_grammar,
+)
+from sglang.srt.managers.scheduler_components.engine_state import (  # noqa: E402
+    EngineFlags,
+    LaunchCounters,
+)
+from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
+    ModeOwners,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
     ScheduleSlot,
@@ -80,15 +88,18 @@ class TestGrammarCommitOverlap(CustomTestCase):
         processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
 
         s = Scheduler.__new__(Scheduler)
-        s.gracefully_exit = False
+        s.mode_owners = ModeOwners()
+        s.counters = LaunchCounters()
+        s.flags = EngineFlags()
+        s.flags.gracefully_exit = False
         s.flat_slot = ScheduleSlot()
         s.disaggregation_mode = DisaggregationMode.NULL
-        s.disagg_prefill = None
-        s.disagg_decode = None
-        s.dllm = None
-        s.hisparse_coordinator = None
+        s.mode_owners.disagg_prefill = None
+        s.mode_owners.disagg_decode = None
+        s.mode_owners.dllm = None
+        s.mode_owners.hisparse_coordinator = None
         s.ingest_requests = MagicMock(side_effect=[[], [], StopIteration])
-        s._engine_paused = False
+        s.flags._engine_paused = False
         s._sched_idled = False
         s.pending = PendingSteps()
         s.require_mlp_sync = False
@@ -98,7 +109,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
         s.batch_result_processor = processor
         s.get_next_batch_to_run = MagicMock(side_effect=steps)
         s._apply_war_barrier = MagicMock()
-        s._record_step_counters = MagicMock()
+        s.step_counters = MagicMock()
 
         def run_batch(step):
             events.append(("launch", step.forward_iter))
@@ -107,12 +118,12 @@ class TestGrammarCommitOverlap(CustomTestCase):
             commit_pending_grammar(s.pending)
             return results[step.forward_iter]
 
-        def process_batch_result(step, result, slot):
+        def process_batch_result(step, result):
             events.append(("commit", step.forward_iter))
             # The host commit runs the step's grammar commit if not done yet.
             advance_grammar_fsm(result, step)
 
-        s.run_batch = run_batch
+        s.step_launcher = SimpleNamespace(run_batch=run_batch)
         s.process_batch_result = process_batch_result
         s.init_mode_stages()
 

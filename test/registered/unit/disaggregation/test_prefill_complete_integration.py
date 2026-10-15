@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -449,12 +450,12 @@ class TestAllocationIntegration(CustomTestCase):
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             prealloc_fits_assumes_reclaim=Mock(return_value=False)
         )
-        queue._allocatable_token_budgets = Mock(return_value=100000)
+        queue._swa_aware_allocatable_token_budgets = Mock(return_value=(100000, None))
         queue._hicache_pending_restore_tokens = Mock(return_value=0)
         queue.enable_priority_scheduling = False
         queue.enable_hisparse = False
         queue.enable_lora = False
-        queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        queue.metrics_sink = SimpleNamespace(enable_metrics=False)
         queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
             available_size=Mock(return_value=1)
         )
@@ -499,11 +500,11 @@ class TestAllocationIntegration(CustomTestCase):
         )
         owner = prefill_owner_shell(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
-            release_aborted_request=Mock(),
+            request_retirer=Mock(),
             clear_pending_chunk_send=Mock(),
             req_to_metadata_buffer_idx_allocator=Mock(),
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
-            get_processed_tokens_counter=lambda: 0,
+            metrics_sink=SimpleNamespace(enable_metrics=False),
+            counters=LaunchCounters(),
         )
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),

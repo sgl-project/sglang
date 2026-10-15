@@ -77,6 +77,36 @@ def decide_needs_confidence_relay() -> bool:
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
 
 
+def create_future_map(
+    *,
+    spec_algorithm: SpeculativeAlgorithm,
+    device: str,
+    req_to_token_pool: ReqToTokenPool,
+    tp_worker,
+    draft_worker,
+) -> FutureMap:
+    # FutureMap is always-on: input_ids relay used in both modes.
+    # Workers without the spec_v2_attn_backends override fall back to
+    # target-only so the helper still produces a safe decision (no
+    # accidental opt-out for unaudited shapes).
+    if draft_worker is not None:
+        attn_backends = getattr(
+            draft_worker,
+            "spec_v2_attn_backends",
+            (tp_worker.model_runner.attn_backend,),
+        )
+    else:
+        attn_backends = (tp_worker.model_runner.attn_backend,)
+    needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
+    needs_confidence_relay = decide_needs_confidence_relay()
+    return spec_algorithm.create_future_map(
+        device,
+        req_to_token_pool,
+        needs_cpu_seq_lens=needs_cpu_seq_lens,
+        needs_confidence_relay=needs_confidence_relay,
+    )
+
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()

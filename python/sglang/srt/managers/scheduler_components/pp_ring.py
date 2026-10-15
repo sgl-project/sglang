@@ -3,16 +3,15 @@ from __future__ import annotations
 import dataclasses
 import logging
 from collections import deque
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
 
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
@@ -31,7 +30,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
 )
-from sglang.srt.speculative.forward_batch_view import derive_batch, worker_forward_batch
+from sglang.srt.speculative.forward_batch_view import derive_batch
 from sglang.srt.speculative.pp_spec_relay import PPSpecRelay
 from sglang.srt.utils.common import is_npu, is_xpu
 
@@ -39,9 +38,17 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler_components.mode_stages import ModeStages
+    from sglang.srt.managers.scheduler_components.bundles import KvResources, Streams
+    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
+    from sglang.srt.managers.scheduler_components.mode_stages import (
+        DriverOps,
+        ModeStages,
+    )
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.pp_channel import PPChannel
+    from sglang.srt.managers.scheduler_components.pp_spec_forward import (
+        PPSpecForward,
+    )
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -77,7 +84,7 @@ class RingSlot:
     """One microbatch slot of the ring: what it schedules for, and what it
     launched."""
 
-    # Its decoding requests and admission flag.
+    # Its decoding requests.
     schedule_slot: ScheduleSlot
     # The record of the step it launched last; None when it launched nothing.
     # A record is pending until the ring commits it.
@@ -102,48 +109,35 @@ class PPRing:
         stages: ModeStages,
         pending: PendingSteps,
         recv_skipper,
-        ingest_requests: Callable[[], List],
-        launch_step: Callable[..., PendingStep],
-        commit_step: Callable[[PendingStep], None],
-        run_batch: Callable[..., GenerationBatchResult],
-        on_idle: Callable[[], None],
-        set_cur_batch: Callable[[Optional[ScheduleBatch]], None],
-        mark_idle: Callable[[], None],
+        ops: DriverOps,
+        counters: LaunchCounters,
+        pp_spec_forward: Optional[PPSpecForward],
         pp_group,
-        device,
         device_module,
-        spec_algorithm,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
+        kv: KvResources,
+        streams: Streams,
         tp_worker,
-        model_worker,
         future_map,
-        schedule_stream,
-        copy_stream,
-        copy_stream_ctx,
-        forward_stream_ctx,
     ):
+        device = streams.device
+        schedule_stream = streams.schedule_stream
+        copy_stream = streams.copy_stream
+        copy_stream_ctx = device_module.stream(copy_stream)
+        forward_stream_ctx = device_module.stream(streams.forward_stream)
+        token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         self.channel = channel
-        # The driver's hooks into the scheduler.
+        # The driver's stages and the state it shares.
         self.stages = stages
         self.pending = pending
         self.recv_skipper = recv_skipper
-        self.ingest_requests = ingest_requests
-        self.launch_step = launch_step
-        self.commit_step = commit_step
-        self.run_batch = run_batch
-        self.on_idle = on_idle
-        self.set_cur_batch = set_cur_batch
-        self.mark_idle = mark_idle
+        self.ops = ops
+        self.counters = counters
         # What the forward and the output relay read.
         self.pp_group = pp_group
         self.device = device
         self.device_module = device_module
-        self.spec_algorithm = spec_algorithm
-        self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.tp_worker = tp_worker
-        self.model_worker = model_worker
         self.future_map = future_map
         self.schedule_stream = schedule_stream
         self.copy_stream = copy_stream
@@ -160,11 +154,7 @@ class PPRing:
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
         self.pp_spec_relay = (
-            PPSpecRelay(self.req_to_token_pool.req_to_token.shape[0], self.device)
-            if pp_spec_stable_rows_enabled()
-            and get_parallel().pp_size > 1
-            and not self.spec_algorithm.is_none()
-            else None
+            pp_spec_forward.pp_spec_relay if pp_spec_forward is not None else None
         )
 
         self.send_req_work = []
@@ -194,7 +184,7 @@ class PPRing:
                 # Receive requests; plain PP relays them on right away, PD
                 # after this slot's consensus messages.
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.ingest_requests()
+                    recv_reqs = self.ops.ingest_requests()
                 if not self.pp_group.is_last_rank:
                     self.channel.commit(self.send_req_work)
                     if pd is None:
@@ -207,14 +197,13 @@ class PPRing:
                     pd.take_ids(mb_id)
 
                 # Schedule the slot's step from the requests tagged with it;
-                # each slot admits up to its own batch size, under its own
-                # admission flag.
+                # each slot admits up to its own batch size.
                 slot = self.slots[mb_id].schedule_slot
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     step = (
                         pd.schedule(slot) if pd is not None else stages.schedule(slot)
                     )
-                self.set_cur_batch(step)
+                self.counters.cur_batch_for_debug = step
                 if step:
                     self.slots[mb_id].last_step = step
                 pp_proxy_tensors = None
@@ -239,7 +228,7 @@ class PPRing:
                     )
                 self.channel.commit_proxy_send()
                 self.slots[mb_id].record = (
-                    self.launch_step(step, slot, pp_proxy_tensors=pp_proxy_tensors)
+                    self.ops.launch_step(step, slot, pp_proxy_tensors=pp_proxy_tensors)
                     if step
                     else None
                 )
@@ -256,15 +245,14 @@ class PPRing:
                         self.slots[next_mb_id].schedule_slot, next_first_rank_mb_id
                     )
 
-                # Commit the next slot's step, launched one ring round ago; the
-                # requests it finishes reopen that slot's admission.
+                # Commit the next slot's step, launched one ring round ago.
                 due = self.slots[next_mb_id].record
                 if due is not None:
                     popped = self.pending.popleft()
                     assert popped is due, "the ring commits slots in launch order"
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
-                        self.commit_step(
+                        self.ops.commit_step(
                             dataclasses.replace(due, result=next_batch_result)
                         )
                 if pd is not None:
@@ -285,9 +273,9 @@ class PPRing:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.mark_idle()
+                self.ops.mark_idle()
                 if pd is None or pd.is_drained():
-                    self.on_idle()
+                    self.ops.on_idle()
 
     def _commit_send_output_work_and_preprocess_output_tensors(
         self,
@@ -401,8 +389,6 @@ class PPRing:
         launch_result: GenerationBatchResult,
         pp_outputs: PPProxyTensors,
     ):
-        from sglang.srt.managers.scheduler import GenerationBatchResult
-
         logits_output = None
 
         if (
@@ -569,144 +555,6 @@ class PPRing:
                 accept_lens - 1,
                 self.token_to_kv_pool_allocator,
             )
-
-    def spec_forward(
-        self,
-        step: ScheduleBatch,
-        *,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        pending_grammar: Optional[Iterable[PendingStep]] = None,
-    ) -> GenerationBatchResult:
-        """Run a speculative step on this stage, on a view of the step. A decode
-        step verifies the trees its rows' slots hold, the same tree on every
-        stage: a stage before the last runs only its part of the target on it
-        (sampling, accept and draft live on the last stage); the last stage
-        verifies and drafts the next round's trees for the relay."""
-        if step.forward_mode.is_extend() or step.is_extend_in_batch:
-            forward_batch = worker_forward_batch(step)
-            resolve_forward_inputs(forward_batch, self.future_map)
-            return self.model_worker.forward_batch_generation(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                pending_grammar=pending_grammar,
-            )
-
-        verify_input = self._spec_verify_input(step)
-        forward_batch = worker_forward_batch(step, spec_info=verify_input)
-        if self.pp_group.is_last_rank:
-            return self.model_worker.forward_batch_generation(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                pending_grammar=pending_grammar,
-            )
-
-        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_verify
-
-        verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
-            verify_input, self.req_to_token_pool, forward_batch, self.tp_worker
-        )
-        result = self.tp_worker.forward_model(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            pp_proxy_tensors=pp_proxy_tensors,
-            is_verify=True,
-        )
-        result.can_run_cuda_graph = can_run_cuda_graph
-        # This stage still has to compact its own accepted-path KV once the
-        # last stage relays which nodes it kept, so the verify slots have to
-        # outlive the forward.
-        result.spec_verify_out_cache_loc = verify_forward_batch.out_cache_loc
-        return result
-
-    def _spec_verify_input(self, step: ScheduleBatch):
-        """The verify input of a decode step, built from the trees the relay
-        keeps in its rows' slots, without a draft model.
-
-        Every stage, including the last one, builds it, so all stages verify
-        the exact same tree. A request that has not been drafted for yet (its
-        first decode after prefill) carries its sampled token over zero
-        drafts, which simply get rejected, costing acceptance rate, not
-        correctness."""
-        from sglang.srt.speculative.eagle_info import EagleVerifyInput
-        from sglang.srt.speculative.eagle_utils import (
-            TreeMaskMode,
-            build_tree_kernel_efficient,
-            default_tree_mask_mode,
-        )
-
-        spec = get_spec()
-        steps = spec.speculative_num_steps
-        num_draft_tokens = spec.speculative_num_draft_tokens
-        bs = step.batch_size()
-
-        if step.forward_mode.is_idle() or bs == 0:
-            return EagleVerifyInput.create_idle_input(
-                topk=spec.speculative_eagle_topk,
-                spec_steps=steps,
-                num_verify_tokens=num_draft_tokens,
-                device=self.device,
-            )
-
-        tree_rows, parent_list, top_scores_index = self.pp_spec_relay.gather(
-            step.req_pool_indices
-        )
-        bonus_tokens = tree_rows[:, 0].contiguous()
-        draft_tokens = tree_rows[:, 1:].contiguous()
-
-        # Mask selection mirrors the last stage's draft() tail
-        # (build_eagle_verify_input) so every stage builds the same mask.
-        verify_mask = self.tp_worker.model_runner.attn_backend.verify_mask
-        if verify_mask is None:
-            tree_mask_buf, mask_mode, fill_mask = None, default_tree_mask_mode(), True
-        else:
-            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
-            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
-
-        seq_lens_sum = step.seq_lens_sum
-        if seq_lens_sum is None:
-            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
-                seq_lens_sum = 0  # preallocated / bs-sized -> kernel ignores it
-            else:
-                # Conservative upper bound; backend-agnostic (not every
-                # attention backend exposes max_context_len).
-                seq_lens_sum = bs * self.tp_worker.model_runner.model_config.context_len
-
-        (
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            flat_draft_tokens,
-        ) = build_tree_kernel_efficient(
-            bonus_tokens,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            step.seq_lens,
-            seq_lens_sum,
-            spec.speculative_eagle_topk,
-            steps,
-            num_draft_tokens,
-            mask_mode,
-            tree_mask_buf,
-            fill_prefix_mask=fill_mask,
-        )
-        return EagleVerifyInput(
-            draft_token=flat_draft_tokens,
-            custom_mask=tree_mask,
-            positions=positions,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            retrieve_cum_len=None,
-            spec_steps=steps,
-            topk=spec.speculative_eagle_topk,
-            draft_token_num=num_draft_tokens,
-            capture_hidden_mode=None,
-            seq_lens_sum=step.seq_lens_sum,
-            seq_lens_cpu=step.seq_lens_cpu,
-        )
 
     def _send_output_to_next_stage(
         self,
@@ -964,7 +812,7 @@ class PPRing:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(step, pp_proxy_tensors)
+                result = self.ops.run_batch(step, pp_proxy_tensors)
                 set_time_batch(
                     step.reqs,
                     "set_run_batch_cpu_end_time",

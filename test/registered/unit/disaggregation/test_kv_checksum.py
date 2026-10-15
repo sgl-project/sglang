@@ -210,9 +210,11 @@ class _FakeOwner(DisaggDecode):
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
-        self.release_finished_req = tree_release(self)
+        self.batch_result_processor = SimpleNamespace(
+            release_finished_req=tree_release(self)
+        )
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
-        self.metrics_reporter = SimpleNamespace(enable_metrics=True)
+        self.metrics_sink = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
         self.streamed_aborts = []
 
@@ -257,15 +259,19 @@ class TestChecksumMismatchRelease(unittest.TestCase):
             holds_rows=lambda req: True,
             request_finished=lambda req: events.append(("hisparse", req.rid)),
         )
-        processor = SimpleNamespace(hisparse_coordinator=hisparse, tree_cache=None)
+        processor = SimpleNamespace(
+            hisparse_coordinator=hisparse, kv=SimpleNamespace(tree_cache=None)
+        )
         owner = decode_owner_shell(
             kv_checksum_computer=SimpleNamespace(compute=lambda pages, states: 1),
             tree_cache=None,
-            release_finished_req=MethodType(
-                SchedulerBatchResultProcessor.release_finished_req, processor
+            batch_result_processor=SimpleNamespace(
+                release_finished_req=MethodType(
+                    SchedulerBatchResultProcessor.release_finished_req, processor
+                )
             ),
             output_streamer=SimpleNamespace(stream_output=lambda reqs, *args: None),
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            metrics_sink=SimpleNamespace(enable_metrics=False),
         )
         req = _make_req(2, 4)
 

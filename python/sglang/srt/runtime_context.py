@@ -2040,6 +2040,12 @@ def exports_expert_balancedness_to_prometheus() -> bool:
     return get_exec().moe.expert_balancedness_report_mode in ("prometheus", "both")
 
 
+def hicache_storage_enabled() -> bool:
+    """Whether a HiCache storage backend is attached; the attach and detach
+    handlers override the leaf at runtime."""
+    return get_memory().hicache_storage_backend is not None
+
+
 def cutedsl_moe_max_num_tokens() -> int:
     """Largest token count one forward routes through a CuteDSL MoE layer on one
     DP rank; sizes the standard-allgather wrapper, MegaMoE, and AR fusion buffers.

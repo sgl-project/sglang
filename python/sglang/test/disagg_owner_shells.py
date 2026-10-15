@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.prefill import DisaggPrefill
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
 
 
 def prefill_owner_shell(**attrs) -> DisaggPrefill:
@@ -35,7 +36,7 @@ def decode_owner_shell(**attrs) -> DisaggDecode:
     owner.ready = []
     owner.releasing = []
     owner.decode_offload_manager = None
-    owner.is_engine_paused = lambda: False
+    owner.flags = EngineFlags()
     owner.__dict__.update(attrs)
     return owner
 

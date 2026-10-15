@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
+    Deque,
     List,
     Optional,
 )
@@ -24,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
+    HealthCheckOutput,
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -31,13 +34,21 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_observability,
+    get_parallel,
+    get_serving,
+    hicache_storage_enabled,
+)
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
     from sglang.srt.rust_server.server import RustServer
 
 
@@ -52,17 +63,35 @@ class SchedulerOutputStreamer:
     has_additional_customized_info: ClassVar[bool] = False
 
     send_to_detokenizer: zmq.Socket
+    # Health checks are answered to the tokenizer.
+    send_to_tokenizer: SenderWrapper
     tree_cache: BasePrefixCache
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
-    get_disaggregation_mode: Callable[[], DisaggregationMode]
-    enable_hicache_storage: Callable[[], bool]
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+    # Health checks deferred while requests run, oldest first.
+    return_health_check_ipcs: Deque[Optional[str]] = field(default_factory=deque)
+
+    def defer_health_check(self, http_worker_ipc: Optional[str]) -> None:
+        self.return_health_check_ipcs.append(http_worker_ipc)
+
+    def maybe_reply_health_check(self) -> None:
+        """Answer the oldest deferred health check; the requests running
+        meanwhile prove the scheduler alive."""
+        if self.return_health_check_ipcs:
+            # Return some signal for the health check.
+            # This is used to prevent the health check signal being blocked by long context prefill.
+            # However, one minor issue is that this code path does not check the status of detokenizer manager.
+            self.send_to_tokenizer.send_output(
+                HealthCheckOutput(
+                    http_worker_ipc=self.return_health_check_ipcs.popleft()
+                )
+            )
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:
@@ -102,9 +131,11 @@ class SchedulerOutputStreamer:
             }
             # In PD mode the L3 hit is produced on prefill and reported on
             # decode via metadata, while decode may not have a local storage backend.
-            if req.cached_tokens_storage > 0 or self.enable_hicache_storage():
+            if req.cached_tokens_storage > 0 or (
+                hicache_storage_enabled() or get_memory().enable_lmcache
+            ):
                 details["storage"] = req.cached_tokens_storage
-            if self.enable_hicache_storage():
+            if hicache_storage_enabled() or get_memory().enable_lmcache:
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
 
@@ -169,7 +200,7 @@ class SchedulerOutputStreamer:
             return_indexer_topk=return_indexer_topk,
             return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
-            disaggregation_mode=self.get_disaggregation_mode(),
+            disaggregation_mode=DisaggregationMode(get_disagg().disaggregation_mode),
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,

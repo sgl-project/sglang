@@ -31,21 +31,34 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.step_launcher import StepLauncher
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import result_processor_shell
-from sglang.test.scheduler_request_lists import assert_one_list_per_request
+from sglang.test.scheduler_request_intake import make_request_intake
+from sglang.test.scheduler_request_lists import (
+    assert_one_list_per_request,
+    request_registry_of,
+    step_planner_of,
+)
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -137,7 +150,7 @@ class _Owner(DisaggPrefill):
         self.result_completion_status = torch.empty(1, dtype=torch.int32)
         self.enable_staging = False
         self.kv_checksum_computer = None
-        self.get_processed_tokens_counter = lambda: scheduler.processed_tokens_counter
+        self.counters = scheduler.counters
 
     def after_commit(self, waiting, rids_to_check=None):
         self.scheduler.actions.append((self.scheduler.iteration, "inflight", None))
@@ -154,14 +167,32 @@ for _name, _source in (
     ("spec_algorithm", "spec_algorithm"),
     ("scheduler_stage_metrics", "scheduler_stage_metrics"),
     ("output_streamer", "output_streamer"),
-    ("metrics_reporter", "metrics_reporter"),
+    ("metrics_sink", "metrics_sink"),
     ("metrics_collector", "metrics_collector"),
     ("batch_result_processor", "batch_result_processor"),
     ("send_kv_chunk", "send_kv_chunk"),
-    ("release_aborted_request", "_release_aborted_request"),
-    ("maybe_send_health_check_signal", "maybe_send_health_check_signal"),
+    ("request_retirer", "request_retirer"),
 ):
     setattr(_Owner, _name, property(lambda self, n=_source: getattr(self.scheduler, n)))
+
+
+class _Launcher:
+    """The real delayed sample and its host copy start; the forward is the
+    scheduler double's run_batch."""
+
+    launch_batch_sample_if_needed = StepLauncher.launch_batch_sample_if_needed
+
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+        self.forward_stream_ctx = nullcontext()
+        self.copy_stream_ctx = nullcontext()
+        self.forward_stream = Mock(spec=["wait_stream"])
+        self.copy_stream = Mock(spec=["wait_stream"])
+        self.schedule_stream = object()
+        self._relay_beam_tokens = Mock()
+
+    def run_batch(self, batch):
+        return self.scheduler.run_batch(batch)
 
 
 class _Scheduler:
@@ -184,7 +215,6 @@ class _Scheduler:
         Scheduler._is_continuous_input_polling_enabled
     )
     _yield_gil_if_needed = Scheduler._yield_gil_if_needed
-    launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
     run_flat_loop = Scheduler.run_flat_loop
@@ -195,9 +225,10 @@ class _Scheduler:
     commit_step = Scheduler.commit_step
     commit_pending_steps = Scheduler.commit_pending_steps
     leave_finished_reqs = Scheduler.leave_finished_reqs
-    request_lists = Scheduler.request_lists
-    _abort_waiting_reqs = Scheduler._abort_waiting_reqs
-    _defer_chunked_abort = Scheduler._defer_chunked_abort
+    disagg_prefill = Scheduler.disagg_prefill
+    disagg_decode = Scheduler.disagg_decode
+    dllm = Scheduler.dllm
+    hisparse_coordinator = Scheduler.hisparse_coordinator
 
     def __init__(
         self,
@@ -231,70 +262,83 @@ class _Scheduler:
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.is_generation = True
-        self.dllm = None
+        self.mode_owners = ModeOwners()
         self.tp_cpu_group = None
         self.tp_size = 1
         self.attn_cp_cpu_group = None
         self.attn_tp_cpu_group = None
         self.pending = PendingSteps()
-        self.chunked_req = None
+        self.lists = CoreLists()
         self.decode_offload_manager = None
-        self.decoding = []
         self.flat_slot = ScheduleSlot()
-        self.waiting_queue = []
         self.recv_skipper = None
         self._sched_idled = False
-        self.cur_batch_for_debug = None
-        self._engine_paused = False
-        self.gracefully_exit = False
+        self.counters = LaunchCounters()
+        self.flags = EngineFlags()
+        # Config leaves, applied to the bags once a topology is published.
         self.enable_overlap = True
+        self.enable_hierarchical_cache = False
+        self.enable_unified_cache_external_linker = False
         self.require_mlp_sync = False
-        self.enable_unified_memory = False
         self.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=Mock())
-        self.hisparse_coordinator = None
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
         )
-        self.forward_stream_ctx = nullcontext()
-        self.copy_stream_ctx = nullcontext()
-        self.forward_stream = Mock(spec=["wait_stream"])
-        self.copy_stream = Mock(spec=["wait_stream"])
-        self.schedule_stream = object()
-        self._relay_beam_tokens = Mock()
+        self.step_launcher = _Launcher(self)
         self.tree_cache = Mock(spec=["flush_pending_backups", "finish"])
         self.batch_result_processor = result_processor_shell()
-        self.metrics_reporter = Mock(
+        self.metrics_reporter = Mock(spec=["report_prefill_stats"])
+        self.metrics_sink = Mock(
             spec=[
-                "report_prefill_stats",
                 "log_batch_result_stats",
                 "update_device_timer",
                 "record_scheduler_active",
             ]
         )
-        self.metrics_reporter.current_scheduler_metrics_enabled = False
+        self.metrics_sink.current_scheduler_metrics_enabled = False
         self.kv_events_publisher = Mock(spec=["publish_kv_events"])
         self.publish_load_snapshot = Mock()
         self.load_publisher = Mock(spec=["publish_load_stat"])
         self.load_inquirer = SimpleNamespace(get_loads=Mock())
         self.enable_fpm = False
-        self._record_step_counters = Mock()
+        self.step_counters = Mock()
         self._maybe_clear_mm_inputs = Mock()
-        self.maybe_send_health_check_signal = Mock()
+        self.output_streamer = Mock(spec=["maybe_reply_health_check"])
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch, need_sync=None: batch,
             maybe_set_extend_view=lambda batch: None,
         )
-        self._arm_prefill_decode_interval = Mock()
-        self.disagg_prefill = _Owner(self)
-        self.disagg_decode = None
+        self.mode_owners.disagg_prefill = _Owner(self)
+
+    def apply_config(self):
+        get_context().override(
+            "test",
+            disable_overlap_schedule=not self.enable_overlap,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            enable_unified_cache_external_linker=(
+                self.enable_unified_cache_external_linker
+            ),
+        )
 
     def _process_hicache_events(self, should_retry_storage_prefetch=True):
         pass
 
-    def _poll_timeout_aborts(self):
-        return []
+    @property
+    def request_registry(self):
+        # Over the collaborators as the tests last replaced them.
+        return request_registry_of(self)
+
+    @property
+    def step_planner(self):
+        # The real pause retraction over the same collaborators; admission is
+        # this fake's own.
+        return step_planner_of(
+            self,
+            get_new_batch_prefill=self.get_new_batch_prefill,
+            arm_prefill_decode_interval=lambda step: None,
+        )
 
     def ingest_requests(self, stop_at_pause=False):
         assert_one_list_per_request(self)
@@ -377,11 +421,11 @@ class _Scheduler:
     def _apply_war_barrier(self):
         pass
 
-    def process_batch_result(self, batch, result, slot):
+    def process_batch_result(self, batch, result):
         assert all(record.result is not result for record in self.pending)
         self.result_processes[batch.forward_iter] += 1
         self.actions.append((self.iteration, "process_result", batch.forward_iter))
-        Scheduler.process_batch_result(self, batch, result, slot)
+        Scheduler.process_batch_result(self, batch, result)
         event = self.copy_events[batch.forward_iter]
         assert event.ready and event.recorded
         assert result.delay_sample_func is None
@@ -401,12 +445,13 @@ def _run_loop(scheduler, enabled=True, **topology):
         ),
     ):
         scheduler.tp_size = get_parallel().tp_size
+        scheduler.apply_config()
         scheduler.init_mode_stages()
         try:
             _dispatch_event_loop_once(scheduler)
         except _StopLoop:
             return
-        if scheduler.gracefully_exit:
+        if scheduler.flags.gracefully_exit:
             return
     raise AssertionError("Scheduler exited before all arrivals were polled")
 
@@ -526,9 +571,11 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
                     scheduler = SimpleNamespace(
                         _deferred_input_requests=[],
-                        _poll_timeout_aborts=Mock(return_value=[]),
+                        request_registry=SimpleNamespace(
+                            poll_timeout_aborts=Mock(return_value=[])
+                        ),
                         request_receiver=SimpleNamespace(recv_requests=receiver),
-                        metrics_reporter=Mock(),
+                        metrics_sink=Mock(),
                         process_input_requests=Mock(),
                     )
                     with published_topology():
@@ -545,7 +592,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     self.assertEqual(receiver.call_count, 5)
                     # A held pause must not accumulate repeated timeout aborts.
                     self.assertEqual(
-                        scheduler._poll_timeout_aborts.call_count,
+                        scheduler.request_registry.poll_timeout_aborts.call_count,
                         2 if stop_at_pause else 5,
                     )
                     self.assertFalse(scheduler._deferred_input_requests)
@@ -588,19 +635,13 @@ class TestPrefillResultPolling(CustomTestCase):
     def test_empty_polls_and_arrival_bursts_preserve_storage_retry_pacing(self):
         class CapacityBlockedScheduler(_Scheduler):
             _process_hicache_events = Scheduler._process_hicache_events
-            _process_storage_prefetch_retries = (
-                Scheduler._process_storage_prefetch_retries
-            )
-            _retry_storage_prefetch = Scheduler._retry_storage_prefetch
-
-            def _prefetch_kvcache(self, req, storage_hit_end):
-                self.reissues.append(self.iteration)
-                self.tree_cache.storage_prefetch_retries.poll_miss(req.rid)
 
             def get_new_batch_prefill(self, slot):
                 if self.iteration > 0 and not self.result_processes[1]:
                     self.admission_attempts.append(self.iteration)
-                    self.policy.calc_priority(self.waiting_queue, self.decoding)
+                    self.policy.calc_priority(
+                        self.lists.waiting_queue, self.lists.decoding
+                    )
                     return None
                 return super().get_new_batch_prefill(slot)
 
@@ -611,7 +652,12 @@ class TestPrefillResultPolling(CustomTestCase):
                     arrivals[2:12] = [_batch(i) for i in range(2, 12)]
                 scheduler = CapacityBlockedScheduler(arrivals, {1: _result()}, {1: 13})
                 scheduler.enable_hierarchical_cache = True
-                scheduler.enable_hicache_storage = True
+                storage = patch(
+                    "sglang.srt.managers.scheduler.hicache_storage_enabled",
+                    return_value=True,
+                )
+                storage.start()
+                self.addCleanup(storage.stop)
                 scheduler.reissues = []
                 retries = StoragePrefetchRetries()
                 radix_cache = RadixCache.create_simulated()
@@ -629,6 +675,18 @@ class TestPrefillResultPolling(CustomTestCase):
                     swa_reprefill_tail_tokens=lambda: 0,
                     match_prefix=match_prefix,
                 )
+                scheduler.request_intake = make_request_intake(
+                    core_lists=scheduler.lists,
+                    kv=SimpleNamespace(
+                        tree_cache=scheduler.tree_cache, token_to_kv_pool_allocator=None
+                    ),
+                )
+
+                def reissue(req, storage_hit_end):
+                    scheduler.reissues.append(scheduler.iteration)
+                    retries.poll_miss(req.rid)
+
+                scheduler.request_intake._prefetch_kvcache = reissue
                 scheduler.policy = SchedulePolicy(
                     "fcfs", scheduler.tree_cache, False, False, False
                 )
@@ -642,7 +700,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     scheduler.disagg_prefill.kv_senders[req.rid] = SimpleNamespace(
                         poll=lambda: KVPoll.WaitingForInput
                     )
-                scheduler.waiting_queue = [head, paced]
+                scheduler.lists.waiting_queue = [head, paced]
                 retries.poll_miss(paced.rid)
 
                 with _single_rank_gloo_group():
@@ -699,7 +757,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 if self.readiness_source == "grammar":
                     if self.grammar_manager.has_waiting_grammars():
                         ready = self.grammar_manager.get_ready_grammar_requests()
-                        self.waiting_queue.extend(ready)
+                        self.lists.waiting_queue.extend(ready)
                         if ready:
                             self.ready_batches.append(self.batches[2])
                 elif (
@@ -734,8 +792,6 @@ class TestPrefillResultPolling(CustomTestCase):
                     scheduler.prefetch_ready = False
                     scheduler.enable_hierarchical_cache = readiness_source == "cache"
                     scheduler.enable_unified_cache_external_linker = False
-                    scheduler.enable_lmcache = False
-                    scheduler.enable_hicache_storage = False
 
                     def drain_cache_events():
                         # Readiness is visible only after the real cache-drain path.
@@ -754,14 +810,16 @@ class TestPrefillResultPolling(CustomTestCase):
                         )
                         with published_topology(skip_tokenizer_init=True):
                             scheduler.grammar_manager = GrammarManager(
-                                SimpleNamespace(
-                                    server_args=SimpleNamespace(),
-                                    dp_tp_cpu_group=None,
-                                    dp_tp_group=SimpleNamespace(
-                                        world_size=1, first_rank=0, is_first_rank=True
-                                    ),
-                                    pp_group=None,
-                                )
+                                server_args=SimpleNamespace(),
+                                tokenizer=None,
+                                model_config=None,
+                                dp_tp_group=SimpleNamespace(
+                                    cpu_group=None,
+                                    world_size=1,
+                                    first_rank=0,
+                                    is_first_rank=True,
+                                ),
+                                pp_group=None,
                             )
                         scheduler.grammar_manager.grammar_backend = Mock(
                             spec=["set_cache"]
@@ -834,7 +892,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 result = super().run_batch(batch)
                 if batch.forward_iter == 1:
                     self.ready_batches.append(second)
-                    self.waiting_queue.extend(second.reqs)
+                    self.lists.waiting_queue.extend(second.reqs)
                 return result
 
             def get_new_batch_prefill(self, slot):
@@ -859,7 +917,9 @@ class TestPrefillResultPolling(CustomTestCase):
         owner.after_commit = MethodType(DisaggPrefill.after_commit, owner)
         allocator = ReqToMetadataIdxAllocator(2)
         owner.req_to_metadata_buffer_idx_allocator = allocator
-        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.output_streamer = SimpleNamespace(
+            stream_output=Mock(), maybe_reply_health_check=Mock()
+        )
         prior = _batch(0).reqs[0]
         prior.disagg.metadata_buffer_index = allocator.alloc()
         prior.disagg.pending_bootstrap = False
@@ -919,7 +979,7 @@ class TestPrefillResultPolling(CustomTestCase):
         self.assertEqual(scheduler.result_processes, {1: 1, 2: 1, 3: 1})
         self.assertEqual(scheduler.load_publisher.publish_load_stat.call_count, 3)
         self.assertEqual(scheduler.tree_cache.flush_pending_backups.call_count, 3)
-        self.assertEqual(scheduler._record_step_counters.call_count, 3)
+        self.assertEqual(scheduler.step_counters.record.call_count, 3)
         for iteration in range(1, 8):
             self.assertIn((iteration, "receive", None), scheduler.actions)
             self.assertNotIn((iteration, "idle", None), scheduler.actions)
@@ -1155,7 +1215,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
                     _run_loop(scheduler, enabled=enabled)
 
-                    self.assertTrue(scheduler.gracefully_exit)
+                    self.assertTrue(scheduler.flags.gracefully_exit)
                     self.assertEqual(
                         scheduler.admission_attempts, list(range(shutdown_at))
                     )
@@ -1195,7 +1255,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 )
                 _run_loop(scheduler)
 
-                self.assertTrue(scheduler.gracefully_exit)
+                self.assertTrue(scheduler.flags.gracefully_exit)
                 self.assertEqual(
                     [a for a in scheduler.actions if a[1] == "launch"],
                     [
@@ -1239,7 +1299,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
                     _run_loop(scheduler)
 
-                    self.assertTrue(scheduler.gracefully_exit)
+                    self.assertTrue(scheduler.flags.gracefully_exit)
                     self.assertEqual(
                         [a for a in scheduler.actions if a[1] == "dispatch"][-3:],
                         [
@@ -1311,6 +1371,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         return_value=True,
                     ) as check_support,
                 ):
+                    scheduler.apply_config()
                     scheduler.init_mode_stages()
                     _dispatch_event_loop_once(scheduler)
                 run_loop.assert_called_once_with()
@@ -1417,8 +1478,6 @@ class TestPrefillResultPolling(CustomTestCase):
                 other = _batch(100)
 
                 class OptimisticScheduler(_Scheduler):
-                    _release_aborted_request = Scheduler._release_aborted_request
-
                     def run_batch(self, batch):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter
@@ -1432,7 +1491,7 @@ class TestPrefillResultPolling(CustomTestCase):
                             and item.rid == "100"
                             for item in inputs
                         ):
-                            self.waiting_queue.extend(other.reqs)
+                            self.lists.waiting_queue.extend(other.reqs)
 
                 pause_at = 2 if yield_before_pause else (1 if depth == 1 else 3)
                 ready_at = {**{batch.forward_iter: 20 for batch in chunks}, 100: 7}
@@ -1446,6 +1505,12 @@ class TestPrefillResultPolling(CustomTestCase):
                     resume_at=pause_at + 2,
                     pause_mode="retract",
                 )
+                scheduler.request_retirer = RequestRetirer(
+                    kv=SimpleNamespace(tree_cache=scheduler.tree_cache),
+                    beam_coordinator=None,
+                    output_streamer=None,
+                    ipc_channels=None,
+                )
                 scheduler.disagg_prefill.pending_chunk_rids = set()
                 scheduler.disagg_prefill.kv_senders.update(
                     {
@@ -1455,8 +1520,8 @@ class TestPrefillResultPolling(CustomTestCase):
                         ),
                     }
                 )
-                scheduler.processed_tokens_counter = 0
-                scheduler.metrics_reporter.enable_metrics = False
+                scheduler.counters.processed_tokens_counter = 0
+                scheduler.metrics_sink.enable_metrics = False
                 release_steps = []
 
                 def release(req, tree_cache, checkpoint):
@@ -1483,10 +1548,10 @@ class TestPrefillResultPolling(CustomTestCase):
                 self.assertEqual(
                     release_steps, [3 if depth == 1 or yield_before_pause else 5]
                 )
-                self.assertEqual(scheduler.waiting_queue, [req])
+                self.assertEqual(scheduler.lists.waiting_queue, [req])
                 self.assertEqual(req.disagg.prefill_attempt_count, 1)
                 self.assertEqual(list(req.output_ids), [])
-                self.assertIsNone(scheduler.chunked_req)
+                self.assertIsNone(scheduler.lists.chunked_req)
                 self.assertEqual(
                     scheduler.result_processes,
                     {b.forward_iter: 1 for b in [*chunks, other]},

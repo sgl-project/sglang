@@ -90,11 +90,20 @@ def _manager(*, fdfo, block_size=4, context_len=128):
             first_done_first_out_mode=fdfo,
             requires_separate_context_encoding=True,
         ),
-        tree_cache=object(),
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=SimpleNamespace(
-            free_group_begin=Mock(),
-            free_group_end=Mock(),
+        kv=SimpleNamespace(
+            tree_cache=object(),
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=Mock(),
+                free_group_end=Mock(),
+            ),
+        ),
+        services=SimpleNamespace(
+            metrics_sink=SimpleNamespace(
+                num_generated_tokens=0,
+                report_prefill_stats=Mock(),
+            ),
+            output_streamer=SimpleNamespace(stream_output=Mock()),
         ),
         policy=None,
         new_token_ratio_tracker=None,
@@ -106,16 +115,9 @@ def _manager(*, fdfo, block_size=4, context_len=128):
         enable_priority_scheduling=False,
         truncation_align_size=None,
         context_len=context_len,
-        get_num_allocatable_reqs=None,
-        build_extend_step=None,
-        build_sampling_info=None,
-        metrics_reporter=SimpleNamespace(
-            num_generated_tokens=0,
-            report_prefill_stats=Mock(),
-        ),
-        output_streamer=SimpleNamespace(stream_output=Mock()),
-        release_aborted_request=Mock(),
-        send_abort_output=Mock(),
+        beam_coordinator=None,
+        step_builder=None,
+        request_retirer=Mock(),
     )
 
 
@@ -160,7 +162,6 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
 
         manager.token_to_kv_pool_allocator.free_group_begin.assert_not_called()
         manager.output_streamer.stream_output.assert_not_called()
-        manager.metrics_reporter.report_prefill_stats.assert_called_once()
 
     def test_context_admission_obeys_live_swa_budget(self):
         allocator = SimpleNamespace(
@@ -369,24 +370,21 @@ class TestGemma4RequestValidation(unittest.TestCase):
         return manager.validate_request(req)
 
     def test_logprob_rejection_never_enters_the_generation_queue(self):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
         from sglang.srt.managers.io_struct import AbortReq
-        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
         from sglang.srt.runtime_context import get_context, get_parallel
+        from sglang.test.scheduler_request_intake import make_request_intake
 
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.enable_session_radix_cache = False
-        scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
-        scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
-        scheduler.tokenizer = None
-        scheduler.dllm = _manager(fdfo=False)
-        scheduler._maybe_namespace_elastic_radix_cache = Mock()
-        scheduler._add_request_to_queue = Mock()
-        scheduler.init_req_max_new_tokens = Mock()
-        scheduler.output_streamer = Mock()
         sender = Mock()
-        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
+        intake = make_request_intake(
+            model_config=SimpleNamespace(hf_eos_token_id={1}, vocab_size=128),
+            mode_owners=ModeOwners(dllm=_manager(fdfo=False)),
+            output_streamer=Mock(),
+            ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
+        )
+        intake._maybe_namespace_elastic_radix_cache = Mock()
+        intake.add_request_to_queue = Mock()
+        intake.init_req_max_new_tokens = Mock()
         recv_req = MagicMock(
             session_params=None,
             session_id=None,
@@ -404,21 +402,25 @@ class TestGemma4RequestValidation(unittest.TestCase):
         with (
             get_context().override_server_args(weight_version="test"),
             get_parallel().override(tp_rank=0),
-            patch("sglang.srt.managers.scheduler.Req", return_value=req),
             patch(
-                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                "sglang.srt.managers.scheduler_components.request_intake.Req",
+                return_value=req,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_intake."
+                "BeamCoordinator.request_beam_width",
                 return_value=1,
             ),
         ):
-            scheduler.handle_generate_request(recv_req)
+            intake.handle_generate_request(recv_req)
         sender.send_output.assert_called_once()
         abort, original = sender.send_output.call_args.args
         self.assertIsInstance(abort, AbortReq)
         self.assertIs(original, req)
         self.assertEqual(abort.finished_reason["status_code"], 400)
         self.assertIn("return_logprob", abort.finished_reason["message"])
-        scheduler._add_request_to_queue.assert_not_called()
-        scheduler.output_streamer.stream_output.assert_not_called()
+        intake.add_request_to_queue.assert_not_called()
+        intake.output_streamer.stream_output.assert_not_called()
 
     def test_core_and_posthoc_controls_are_supported(self):
         params = SamplingParams(

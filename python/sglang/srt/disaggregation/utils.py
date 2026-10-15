@@ -165,55 +165,6 @@ class DisaggregationMode(Enum):
         return "unified"
 
 
-def unified_memory_disagg_move_gate(scheduler):
-    """Compaction move gate for a PD node running the unified memory pool.
-
-    Returns a predicate that is True only when no transfer can be in flight, so
-    compaction never relocates a page the RDMA engine is reading or writing.
-    Safe to read this state from here: every mover runs on the scheduler thread.
-
-    A page is exposed from the moment its address reaches the peer until the
-    transfer concludes, and for part of that lifetime the request is in NEITHER
-    end's queue -- so queue emptiness alone is not enough:
-
-    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
-      chunks may still be draining, and the request only reaches the inflight
-      queue later, in the result path.
-    - DECODE: `pop_preallocated` publishes one request's destinations and keeps
-      allocating for the next, whose allocation can urgently flush the peer
-      sub-allocator; the batch reaches the transfer queue only after the loop.
-    """
-    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-
-        def prefill_gate() -> bool:
-            return not (
-                scheduler.disagg_prefill.transfer
-                or scheduler.disagg_prefill.pending_chunk_rids
-            )
-
-        return prefill_gate
-
-    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-
-        def decode_gate() -> bool:
-            decode_offload_manager = scheduler.decode_offload_manager
-            return not (
-                scheduler.disagg_decode.transfer_queue.queue
-                or scheduler.disagg_decode.prealloc_queue.has_published_destinations
-                or (
-                    decode_offload_manager is not None
-                    and decode_offload_manager.has_inflight_device_transfer()
-                )
-            )
-
-        return decode_gate
-
-    raise ValueError(
-        "unified_memory_disagg_move_gate: scheduler is not a PD node "
-        f"(mode={scheduler.disaggregation_mode})"
-    )
-
-
 #########################
 # Synchronization
 #########################
@@ -1891,7 +1842,7 @@ def is_unadmitted_reject(req: Req) -> bool:
 
     `req.is_retracted` catches the two re-entries that declare nothing:
     priority preemption and the pause/retract-all path both requeue through a
-    bare `_add_request_to_queue`. `release_req` always calls
+    bare `add_request_to_queue`. `release_req` always calls
     `reset_for_retract`, which sets it, and its clear sites all run downstream
     of these doors. The resource markers stay as a second line of defence --
     on their own they miss a `seqlen <= 1` preemption, whose KV is already

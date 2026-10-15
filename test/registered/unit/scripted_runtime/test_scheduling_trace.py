@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -40,9 +41,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
         # plan after resume already re-admits the retracted req into the batch.
         req = _Req(rid="a", retraction_count=0)
         scheduler = SimpleNamespace(
-            chunked_req=None,
-            waiting_queue=[req],
-            decoding=[],
+            lists=SimpleNamespace(chunked_req=None, waiting_queue=[req], decoding=[]),
             token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 8),
             tree_cache=SimpleNamespace(evictable_size=lambda: 0),
             new_token_ratio_tracker=SimpleNamespace(current=0.5),
@@ -70,22 +69,24 @@ class TestSchedulingTraceWriter(CustomTestCase):
     def test_paused_iterations_record_reader_values(self):
         inflight = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b")]
         scheduler = SimpleNamespace(
-            _engine_paused=False,
+            flags=EngineFlags(),
             load_inquirer=SimpleNamespace(
                 get_loads=lambda: SimpleNamespace(
                     num_running_reqs=0, num_waiting_reqs=1
                 )
             ),
-            is_fully_idle=lambda ignore_waiting=False: ignore_waiting,
-            # The record sorts the labels.
-            collect_inflight_reqs=lambda: [inflight[1], inflight[0]],
+            request_registry=SimpleNamespace(
+                is_fully_idle=lambda ignore_waiting=False: ignore_waiting,
+                # The record sorts the labels.
+                collect_inflight_reqs=lambda: [inflight[1], inflight[0]],
+            ),
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "t.jsonl")
             writer = SchedulingTraceWriter(path, {})
             writer._labels(inflight)
             writer.observe_readers(scheduler)
-            scheduler._engine_paused = True
+            scheduler.flags._engine_paused = True
             writer.observe_readers(scheduler)
             writer.close()
             records = load_trace(path)
@@ -120,11 +121,11 @@ class TestFirstDivergence(CustomTestCase):
         self.assertEqual(first_divergence(old[:1], old), 1)
 
     def test_ignored_fields_do_not_diverge(self):
-        old = [_schedule(1, batch_is_full=False)]
-        new = [_schedule(1, batch_is_full=True)]
+        old = [_schedule(1, kv_available=8)]
+        new = [_schedule(1, kv_available=0)]
 
         self.assertEqual(first_divergence(old, new), 0)
-        self.assertIsNone(first_divergence(old, new, ignore=["batch_is_full"]))
+        self.assertIsNone(first_divergence(old, new, ignore=["kv_available"]))
 
 
 class TestDiffTraceDirs(CustomTestCase):

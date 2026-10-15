@@ -5,8 +5,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
-    Callable,
     Deque,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -39,14 +39,20 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.request_lists import CoreLists, RequestList
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.engine_state import (
+        EngineFlags,
+        LaunchCounters,
+    )
 
 
 logger = logging.getLogger(__name__)
 
 # Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+# Read once: the check runs after every host commit.
+CHECK_REQUEST_LISTS = envs.SGLANG_CHECK_REQUEST_LIST_INVARIANTS.get()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -62,11 +68,10 @@ class SchedulerInvariantChecker:
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
     # The step this iteration launched; None when it launched nothing.
-    get_launched_step: Callable
-    get_decoding: Callable
+    counters: LaunchCounters
+    # The decoding and the chunked request own their KV rows.
+    core_lists: CoreLists
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The chunked-prefill request parked between chunks; it owns its KV row.
-    get_chunked_req: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -270,8 +275,8 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        reqs = list(self.get_decoding())
-        chunked_req = self.get_chunked_req()
+        reqs = list(self.core_lists.decoding)
+        chunked_req = self.core_lists.chunked_req
         if chunked_req is not None:
             reqs.append(chunked_req)
 
@@ -303,7 +308,7 @@ class SchedulerInvariantChecker:
 
     @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
     def self_check_during_busy(self):
-        if self.get_launched_step() is None:
+        if self.counters.cur_batch_for_debug is None:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
@@ -338,6 +343,19 @@ class SchedulerInvariantChecker:
 
         if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
             self._check_kv_page_invariants()
+
+    @staticmethod
+    def check_no_finished_reqs(lists: Dict[str, RequestList]) -> None:
+        """After a host commit no request list holds a finished request: the
+        commit moves each one out, except to a releasing list, which holds it
+        until its KV is released."""
+        for entry in lists.values():
+            if entry.releasing:
+                continue
+            finished = [req.rid for req in entry.reqs if req.finished()]
+            assert not finished, (
+                f"Finished requests left in the {entry.name!r} list: {finished}"
+            )
 
     def _check_kv_page_invariants(self):
         """committed<=allocated for every req/slot, and no double free:
@@ -483,27 +501,42 @@ class SchedulerInvariantChecker:
             self.tree_cache.sanity_check()
 
 
-def create_scheduler_watchdog(
-    scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
-) -> WatchdogRaw:
-    def dump_info() -> str:
-        if scheduler.is_initializing:
-            return ""
-        _, messages = scheduler.invariant_checker._check_all_pools(
-            scheduler.pool_stats_observer.get_pool_stats(),
-        )
-        return (
-            f"{scheduler.cur_batch_for_debug.batch_size()=}\n"
-            f"{scheduler.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
+class SchedulerWatchdog:
+    """Fires when the launch counter stalls while the scheduler initializes or
+    runs a step. Its stall dump reads the pools through the invariant checker,
+    which the scheduler attaches before initialization ends."""
+
+    def __init__(
+        self,
+        *,
+        counters: LaunchCounters,
+        flags: EngineFlags,
+        watchdog_timeout: float,
+        soft: bool = False,
+    ):
+        self.counters = counters
+        self.flags = flags
+        self.invariant_checker: Optional[SchedulerInvariantChecker] = None
+        self.raw = WatchdogRaw(
+            debug_name="Scheduler",
+            get_counter=lambda: counters.forward_ct,
+            is_active=lambda: (
+                flags.is_initializing or counters.cur_batch_for_debug is not None
+            ),
+            watchdog_timeout=watchdog_timeout,
+            soft=soft,
+            dump_info=self._dump_info,
         )
 
-    return WatchdogRaw(
-        debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
-        is_active=lambda: (
-            scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
-        ),
-        watchdog_timeout=watchdog_timeout,
-        soft=soft,
-        dump_info=dump_info,
-    )
+    def _dump_info(self) -> str:
+        if self.flags.is_initializing:
+            return ""
+        checker = self.invariant_checker
+        _, messages = checker._check_all_pools(
+            checker.pool_stats_observer.get_pool_stats(),
+        )
+        batch = self.counters.cur_batch_for_debug
+        return (
+            f"scheduler.cur_batch_for_debug.batch_size()={batch.batch_size()!r}\n"
+            f"scheduler.cur_batch_for_debug.reqs={batch.reqs!r}\n" + "\n".join(messages)
+        )

@@ -1,0 +1,279 @@
+"""Answer every reader about the live requests, and abort them."""
+
+from __future__ import annotations
+
+import logging
+import time
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.request_lists import RequestList
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.runtime_context import get_memory
+
+if TYPE_CHECKING:
+    from sglang.srt.beam_search.coordinator import BeamCoordinator
+    from sglang.srt.constrained.grammar_manager import GrammarManager
+    from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+        DecodeKVCacheOffloadManager,
+    )
+    from sglang.srt.disaggregation.encoder.receiver import MMReceiverBase
+    from sglang.srt.managers.request_lists import CoreLists
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler_components.bundles import KvResources
+    from sglang.srt.managers.scheduler_components.ipc_channels import (
+        SchedulerIpcChannels,
+    )
+    from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
+
+logger = logging.getLogger(__name__)
+
+
+class RequestRegistry:
+    def __init__(
+        self,
+        *,
+        core_lists: CoreLists,
+        grammar_manager: GrammarManager,
+        request_retirer: RequestRetirer,
+        beam_coordinator: BeamCoordinator,
+        ipc_channels: SchedulerIpcChannels,
+        kv: KvResources,
+        mm_receiver: Optional[MMReceiverBase],
+        pending: PendingSteps,
+        decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
+        mode_owners: ModeOwners,
+    ):
+        self.core_lists = core_lists
+        self.grammar_manager = grammar_manager
+        self.request_retirer = request_retirer
+        self.beam_coordinator = beam_coordinator
+        self.ipc_channels = ipc_channels
+        self.tree_cache = kv.tree_cache
+        self.mm_receiver = mm_receiver
+        self.pending = pending
+        self.decode_offload_manager = decode_offload_manager
+        # Read at call time: a PD role switch replaces the owners.
+        self.mode_owners = mode_owners
+
+    def queued_reqs(self) -> List[Req]:
+        """The requests waiting for admission, in list order."""
+        return [
+            req
+            for entry in self.request_lists().values()
+            if entry.queued
+            for req in entry.reqs
+        ]
+
+    def collect_inflight_reqs(self) -> List[Req]:
+        """The requests past prefill admission that a step may still run, in
+        list order (the same on every rank)."""
+        return [
+            req
+            for entry in self.request_lists().values()
+            if entry.inflight
+            for req in entry.reqs
+        ]
+
+    def request_lists(self) -> Dict[str, RequestList]:
+        """The lists that own the live requests, by name: the core lists, then
+        those of the PD mode and of the add-ons."""
+        lists = [
+            RequestList(
+                name="waiting",
+                reqs=self.core_lists.waiting_queue,
+                queued=True,
+                abort=self._abort_waiting_reqs,
+                health_check=True,
+                waiting=True,
+            ),
+            # Abort method 2: call `set_finish_with_abort`. The request still
+            # runs one prefill forward, with its input cut to one token.
+            RequestList(
+                name="grammar",
+                reqs=self.grammar_manager.grammar_queue,
+                abort=self.grammar_manager.abort_requests,
+            ),
+            RequestList(
+                name="decoding",
+                reqs=self.core_lists.decoding,
+                inflight=True,
+                health_check=True,
+                retract_on_pause=True,
+            ),
+            # A PD prefill node keeps a live mid-chunk request across a pause:
+            # its KV sender still reads the KV a retraction would free.
+            RequestList(
+                name="chunked",
+                reqs=[self.core_lists.chunked_req]
+                if self.core_lists.chunked_req is not None
+                else [],
+                inflight=True,
+                abort=self._defer_chunked_abort,
+                health_check=True,
+                retract_on_pause=self.mode_owners.disagg_prefill is None,
+            ),
+        ]
+        if self.mode_owners.disagg_prefill is not None:
+            lists += self.mode_owners.disagg_prefill.lists()
+        if self.mode_owners.disagg_decode is not None:
+            lists += self.mode_owners.disagg_decode.lists()
+        if self.mode_owners.dllm is not None:
+            lists += self.mode_owners.dllm.lists()
+        if self.mode_owners.hisparse_coordinator is not None:
+            lists += self.mode_owners.hisparse_coordinator.lists()
+        return {entry.name: entry for entry in lists}
+
+    def abort_request(self, recv_req: AbortReq):
+        # Abort requests still waiting for encoder embeddings (EPD language-only)
+        if self.mm_receiver is not None:
+            self.mm_receiver.abort_waiting_requests(recv_req)
+
+        for entry in self.request_lists().values():
+            if entry.abort is not None:
+                entry.abort(recv_req)
+            if entry.inflight:
+                self._abort_inflight_reqs(entry.reqs, recv_req)
+
+    def _abort_waiting_reqs(self, recv_req: AbortReq) -> None:
+        # Delete requests in the waiting queue
+        to_del = []
+        for i, req in enumerate(self.core_lists.waiting_queue):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                to_del.append(i)
+
+        # Sort in reverse order to avoid index issues when deleting
+        for i in reversed(to_del):
+            # Abort method 1: directly pop from the queue
+            # This only works for requests that have not started anything.
+            # We still need to send something back to TokenizerManager to clean up the state.
+            req = self.core_lists.waiting_queue.pop(i)
+            self.request_retirer.release_aborted_request(req)
+            self.beam_coordinator.retire_group(req)
+            # Without the initiator's reason the tokenizer falls back to a
+            # generic abort message.
+            self.ipc_channels.send_to_tokenizer.send_output(
+                make_abort_req(req, finished_reason=recv_req.finished_reason), req
+            )
+            if self.mode_owners.disagg_prefill is not None:
+                self.mode_owners.disagg_prefill.release_aborted_waiting_req(req)
+            # For mamba radix cache
+            elif req.kv.holds_mamba:
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
+            logger.debug(f"Abort queued request. {req.rid=}")
+
+    def _defer_chunked_abort(self, recv_req: AbortReq) -> None:
+        """Mark the chunked request for `process_pending_chunked_abort`."""
+        if (chunked_req := self.core_lists.chunked_req) is not None:
+            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                self.core_lists._pending_chunked_abort_req = chunked_req
+
+    def _abort_inflight_reqs(self, reqs: List[Req], recv_req: AbortReq) -> None:
+        # Abort the requests past admission
+        for req in reqs:
+            if not req.finished() and (
+                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            ):
+                # Abort method 3: set `to_finish`
+                # The request will still run one decode forward pass.
+                # Then we reuse all existing code to clean up the KV cache allocation.
+                logger.debug(f"Abort running request. {req.rid=}")
+                if recv_req.abort_message:
+                    # Timeout aborts carry an SLA message + 503 for the client.
+                    req.to_finish = FINISH_ABORT(
+                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+                else:
+                    req.to_finish = FINISH_ABORT()
+
+    def is_fully_idle(
+        self, for_health_check=False, ignore_waiting=False, ignore_releasing=False
+    ) -> bool:
+        # The request lists, and the steps not committed yet. The health check
+        # piggybacks on running requests in process_output, so it counts only
+        # the lists whose requests run soon (`RequestList.health_check`).
+        idle = len(self.pending) == 0 and not any(
+            entry.keeps_busy(
+                for_health_check=for_health_check,
+                ignore_waiting=ignore_waiting,
+                ignore_releasing=ignore_releasing,
+            )
+            for entry in self.request_lists().values()
+        )
+
+        if not for_health_check:
+            # PD decode KV offload: copies in flight still read device KV.
+            if self.decode_offload_manager is not None:
+                idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+
+            # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
+            # destructive operations like attach/detach/flush_cache.
+            if get_memory().enable_hierarchical_cache:
+                tc = self.tree_cache
+                idle &= len(tc.ongoing_write_through) == 0
+                idle &= len(tc.ongoing_load_back) == 0
+                if tc.enable_storage:
+                    idle &= len(tc.ongoing_prefetch) == 0
+                    idle &= len(tc.ongoing_backup) == 0
+                    if get_memory().hicache_host_memory_mode == "buffer_only":
+                        # Queued writes, staged prefetches, and in-flight
+                        # storage writes still hold host staging
+                        # (buffer-mode unified tree only).
+                        idle &= tc.buffer_pipeline.is_idle()
+            elif get_memory().enable_lmcache:
+                idle &= not self.tree_cache.has_pending_cache_operations()
+
+        return idle
+
+    def poll_timeout_aborts(self) -> List[AbortReq]:
+        """Emit aborts only; every rank must drop the same requests in the
+        same iteration, or the extend-vs-decode decision splits and the
+        collectives hang.
+        """
+        aborts: List[AbortReq] = []
+
+        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
+            deadline = time.perf_counter() - timeout_s
+            for req in self.queued_reqs():
+                entry_time = req.time_stats.wait_queue_entry_time
+                if 0 < entry_time < deadline:
+                    aborts.append(
+                        AbortReq(
+                            rid=req.rid,
+                            abort_message="Request waiting timeout reached.",
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Request waiting timeout reached.",
+                            },
+                        )
+                    )
+
+        if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
+            deadline = time.perf_counter() - timeout_s
+            for req in self.collect_inflight_reqs():
+                # Polling must not re-emit an abort awaiting result processing.
+                if req.finished() or req.to_finish is not None:
+                    continue
+                if 0 < req.time_stats.forward_entry_time < deadline:
+                    aborts.append(
+                        AbortReq(
+                            rid=req.rid,
+                            abort_message="Request running timeout reached.",
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "message": "Request running timeout reached.",
+                            },
+                        )
+                    )
+
+        return aborts

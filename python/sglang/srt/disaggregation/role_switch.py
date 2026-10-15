@@ -70,7 +70,7 @@ def handle_pd_role_switch(
             old_role=old_role,
             new_role=new_role,
         )
-    if not scheduler.is_fully_idle():
+    if not scheduler.request_registry.is_fully_idle():
         return _fail(
             "instance is not idle; drain all requests before switching",
             safe_to_restore=True,
@@ -122,7 +122,9 @@ def handle_pd_role_switch(
             scheduler.init_disaggregation()
             scheduler.maybe_init_disagg_prefill()
             scheduler.maybe_init_disagg_decode()
+            scheduler.maybe_init_disagg_move_gate()
             scheduler.init_mode_stages()
+            scheduler.init_step_launcher()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
             logger.critical(
@@ -219,19 +221,19 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
 
 def _current_kv_manager(scheduler: Scheduler):
     """The KV manager of the current role's owner, or None."""
-    owner = scheduler.disagg_prefill or scheduler.disagg_decode
+    owner = scheduler.mode_owners.disagg_prefill or scheduler.mode_owners.disagg_decode
     return owner.kv_manager if owner is not None else None
 
 
 def teardown_disaggregation(scheduler: Scheduler) -> None:
     """Release the current role's owner (its queues, metadata buffers and KV
     transfer manager) so the other role can be rebuilt."""
-    if scheduler.disagg_prefill is not None:
-        scheduler.disagg_prefill.kv_manager.teardown()
-        scheduler.disagg_prefill = None
-    elif scheduler.disagg_decode is not None:
-        scheduler.disagg_decode.kv_manager.teardown()
-        scheduler.disagg_decode = None
+    if scheduler.mode_owners.disagg_prefill is not None:
+        scheduler.mode_owners.disagg_prefill.kv_manager.teardown()
+        scheduler.mode_owners.disagg_prefill = None
+    elif scheduler.mode_owners.disagg_decode is not None:
+        scheduler.mode_owners.disagg_decode.kv_manager.teardown()
+        scheduler.mode_owners.disagg_decode = None
         # clear socket ctx in CommonKVReceiver
         CommonKVReceiver.close_all_sockets()
     _release_prefix_cache_for_role_switch(scheduler)
@@ -249,7 +251,7 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     their KV-pool slots *locked* even while idle. Carried across a role switch
     that means (a) the new role would match against stale prefixes whose KV no
     longer means what it did (corruption) and (b) those locked slots would leak
-    on every flip. Reset mirrors ``Scheduler.flush_cache``'s cache-release block
+    on every flip. Reset mirrors ``StepPlanner.flush_cache``'s cache-release block
     (the instance is already fully idle, checked before teardown) and, for
     hicache, best-effort clears the storage backend so it is released completely.
     """

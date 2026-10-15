@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from sglang.srt.runtime_context import get_schedule
 from sglang.test.scripted_runtime.context.radix import get_node_lock_ref
 
 if TYPE_CHECKING:
@@ -44,7 +45,7 @@ class ScriptedReqHandle:
         req = self.req
         if req is None or not req.kv.holds_kv:
             return 0
-        page_size = self.context.scheduler.page_size
+        page_size = get_schedule().page_size
         return (req.kv.kv_allocated_len + page_size - 1) // page_size
 
     @property

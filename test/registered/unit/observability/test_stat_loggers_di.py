@@ -29,8 +29,10 @@ from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    MetricsSink,
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -46,7 +48,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_context, reset_context
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 
 class _BoundRecordingMetric:
@@ -242,6 +244,7 @@ def _empty_decode_lists():
 
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
+        enter_scope(self, published_topology())
         self.labels = {
             "model_name": "test",
             "engine_type": "decode",
@@ -289,27 +292,26 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue.queue = []
         queue._deferred_releases = [object(), object(), object()]
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
-        reporter.scheduler = SimpleNamespace(
-            disaggregation_mode=DisaggregationMode.DECODE,
+        reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
+        reporter.mode_owners = ModeOwners(
             disagg_decode=SimpleNamespace(
                 transfer_queue=queue, prealloc_queue=SimpleNamespace(queue=[])
-            ),
-            request_lists=_empty_decode_lists,
-            decoding=[],
-            waiting_queue=[],
-            queued_reqs=lambda: [],
-            grammar_manager=[],
-            enable_priority_scheduling=False,
-            pool_stats_observer=SimpleNamespace(
-                get_pool_stats=lambda: SimpleNamespace(
-                    update_scheduler_stats=lambda stats: None,
-                ),
-                streaming_session_count=lambda: 0,
-                session_held_tokens=lambda: 0,
-            ),
+            )
         )
-        reporter.stats = SchedulerStats()
-        reporter.current_scheduler_metrics_enabled = True
+        reporter.core_lists = SimpleNamespace(decoding=[], waiting_queue=[])
+        reporter.request_registry = SimpleNamespace(
+            request_lists=_empty_decode_lists, queued_reqs=lambda: []
+        )
+        reporter.grammar_manager = []
+        reporter.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                update_scheduler_stats=lambda stats: None,
+            ),
+            streaming_session_count=lambda: 0,
+            session_held_tokens=lambda: 0,
+        )
+        reporter.metrics_sink.stats = SchedulerStats()
+        reporter.metrics_sink.current_scheduler_metrics_enabled = True
         collector = MagicMock()
         collector.last_log_time = 0
         collector.num_decode_deferred_kv_release_reqs = (
@@ -322,7 +324,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         collector._log_gauge.side_effect = lambda gauge, data: (
             SchedulerMetricsCollector._log_gauge(collector, gauge, data)
         )
-        reporter.metrics_collector = collector
+        reporter.metrics_sink.metrics_collector = collector
 
         with (
             patch(
@@ -332,7 +334,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_host_receive_threshold=1
+                    disaggregation_mode=DisaggregationMode.DECODE.value,
+                    disaggregation_decode_host_receive_threshold=1,
                 ),
             ),
             patch(
@@ -341,10 +344,14 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             ),
         ):
             reporter._maybe_log_idle_metrics()
-            self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 3)
+            self.assertEqual(
+                reporter.metrics_sink.stats.num_decode_deferred_kv_release_reqs, 3
+            )
             queue._deferred_releases.clear()
             reporter._maybe_log_idle_metrics()
-            self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 0)
+            self.assertEqual(
+                reporter.metrics_sink.stats.num_decode_deferred_kv_release_reqs, 0
+            )
 
         self.assertEqual(
             self.collector.num_decode_deferred_kv_release_reqs.sets,
@@ -365,46 +372,45 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             dp_cooperation_info=None,
         )
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
-        reporter.scheduler = SimpleNamespace(
-            disaggregation_mode=DisaggregationMode.DECODE,
+        reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
+        reporter.mode_owners = ModeOwners(
             disagg_decode=SimpleNamespace(
                 transfer_queue=queue,
                 prealloc_queue=SimpleNamespace(
                     queue=[], retracted_queue=[], num_tokens_pre_allocated=0
                 ),
-            ),
-            request_lists=_empty_decode_lists,
-            decoding=batch.reqs,
-            waiting_queue=[],
-            queued_reqs=lambda: [],
-            grammar_manager=[],
-            enable_priority_scheduling=False,
-            max_total_num_tokens=1,
-            spec_algorithm=SimpleNamespace(is_none=lambda: True),
-            pool_stats_observer=SimpleNamespace(
-                get_pool_stats=lambda: SimpleNamespace(
-                    get_decode_usage_msg_parts=lambda: [],
-                    update_scheduler_stats=lambda stats: None,
-                ),
-                streaming_session_count=lambda: 0,
-                session_held_tokens=lambda: 0,
-            ),
-            kv_events_publisher=SimpleNamespace(
-                emit_kv_metrics=lambda: None, publish_kv_events=lambda: None
-            ),
+            )
         )
-        reporter.stats = SchedulerStats()
-        reporter.current_scheduler_metrics_enabled = True
-        reporter.is_stats_logging_rank = False
+        reporter.core_lists = SimpleNamespace(decoding=batch.reqs, waiting_queue=[])
+        reporter.request_registry = SimpleNamespace(
+            request_lists=_empty_decode_lists, queued_reqs=lambda: []
+        )
+        reporter.grammar_manager = []
+        reporter.capacity = SimpleNamespace(max_total_num_tokens=1)
+        reporter.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        reporter.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                get_decode_usage_msg_parts=lambda: [],
+                update_scheduler_stats=lambda stats: None,
+            ),
+            streaming_session_count=lambda: 0,
+            session_held_tokens=lambda: 0,
+        )
+        reporter.kv_events_publisher = SimpleNamespace(
+            emit_kv_metrics=lambda: None, publish_kv_events=lambda: None
+        )
+        reporter.metrics_sink.stats = SchedulerStats()
+        reporter.metrics_sink.current_scheduler_metrics_enabled = True
+        reporter.metrics_sink.is_stats_logging_rank = False
         reporter.enable_mfu_metrics = False
-        reporter.scheduler_status_logger = None
-        reporter.forward_ct_decode = 0
-        reporter.decode_log_interval = 1
-        reporter.last_decode_stats_tic = 0.0
-        reporter.num_generated_tokens = 0
-        reporter.num_retracted_reqs = 0
-        reporter.num_paused_reqs = 0
-        reporter.fwd_occupancy = 0.0
+        reporter.metrics_sink.scheduler_status_logger = None
+        reporter.metrics_sink.forward_ct_decode = 0
+        reporter.metrics_sink.decode_log_interval = 1
+        reporter.metrics_sink.last_decode_stats_tic = 0.0
+        reporter.metrics_sink.num_generated_tokens = 0
+        reporter.metrics_sink.num_retracted_reqs = 0
+        reporter.metrics_sink.num_paused_reqs = 0
+        reporter.metrics_sink.fwd_occupancy = 0.0
         reporter._graph_backend_label = "cuda graph"
         reporter._calculate_utilization = lambda: None
         reporter._update_lora_metrics = lambda: None
@@ -420,7 +426,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         collector._log_gauge.side_effect = lambda gauge, data: (
             SchedulerMetricsCollector._log_gauge(collector, gauge, data)
         )
-        reporter.metrics_collector = collector
+        reporter.metrics_sink.metrics_collector = collector
 
         with (
             patch(
@@ -434,6 +440,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             patch(
                 "sglang.srt.managers.scheduler_components.metrics_reporter.get_disagg",
                 return_value=SimpleNamespace(
+                    disaggregation_mode=DisaggregationMode.DECODE.value,
                     disaggregation_decode_host_receive_threshold=1,
                     language_only=False,
                 ),
@@ -445,7 +452,9 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         ):
             reporter.report_decode_stats(can_run_cuda_graph=False, batch=batch)
 
-        self.assertEqual(reporter.stats.num_decode_deferred_kv_release_reqs, 2)
+        self.assertEqual(
+            reporter.metrics_sink.stats.num_decode_deferred_kv_release_reqs, 2
+        )
         self.assertEqual(
             self.collector.num_decode_deferred_kv_release_reqs.sets,
             [(self.labels, 2)],

@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+    maybe_update_reasoning_tokens,
 )
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -71,19 +72,22 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         is_generation=True,
         enable_overlap=False,
         model_config=SimpleNamespace(think_end_ids=None),
-        token_to_kv_pool_allocator=None,
-        tree_cache=None,
+        kv=SimpleNamespace(
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            req_to_token_pool=None,
+        ),
+        services=SimpleNamespace(
+            metrics_sink=SimpleNamespace(),
+            output_streamer=SimpleNamespace(),
+        ),
         hisparse_coordinator=None,
-        req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_reporter=SimpleNamespace(),
         draft_worker=None,
         model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,
-        output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
-        abort_request=lambda *a, **k: None,
         pending=PendingSteps(),
     )
 
@@ -118,7 +122,7 @@ def _commit_disagg_handoff(
     replayed_boundary: bool = False,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-    queue.update_reasoning_tokens = processor._maybe_update_reasoning_tokens
+    queue.model_config = processor.model_config
     queue.prealloc_queue = SimpleNamespace(kv_checksum_computer=None)
     queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
     queue.metadata_buffers = SimpleNamespace(
@@ -184,8 +188,8 @@ class TestReasoningTokenAccounting(CustomTestCase):
         processor = _make_processor()
         processor.model_config.think_end_ids = [7, 8]
 
-        processor._maybe_update_reasoning_tokens(req, [10, 7])
-        processor._maybe_update_reasoning_tokens(req, [8, 11])
+        maybe_update_reasoning_tokens(processor.model_config, req, [10, 7])
+        maybe_update_reasoning_tokens(processor.model_config, req, [8, 11])
 
         self.assertEqual(req.reasoning_tokens, 3)
         self.assertTrue(req._is_reasoning_over)
@@ -204,12 +208,12 @@ class TestReasoningTokenAccounting(CustomTestCase):
         ]
 
         # The global/default closer must not end a medium request.
-        processor._maybe_update_reasoning_tokens(req, [10, 7])
-        processor._maybe_update_reasoning_tokens(req, [8, 11])
+        maybe_update_reasoning_tokens(processor.model_config, req, [10, 7])
+        maybe_update_reasoning_tokens(processor.model_config, req, [8, 11])
         self.assertFalse(req._is_reasoning_over)
 
-        processor._maybe_update_reasoning_tokens(req, [10, 17])
-        processor._maybe_update_reasoning_tokens(req, [18, 11])
+        maybe_update_reasoning_tokens(processor.model_config, req, [10, 17])
+        maybe_update_reasoning_tokens(processor.model_config, req, [18, 11])
 
         self.assertEqual(req.reasoning_tokens, 7)
         self.assertTrue(req._is_reasoning_over)
@@ -230,7 +234,7 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertEqual(req.reasoning_tokens, 1)
         self.assertFalse(req._is_reasoning_over)
 
-        processor._maybe_update_reasoning_tokens(req, 18)
+        maybe_update_reasoning_tokens(processor.model_config, req, 18)
 
         self.assertEqual(req.reasoning_tokens, 2)
         self.assertTrue(req._is_reasoning_over)

@@ -33,8 +33,7 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.server_args = self.server_args
         scheduler.enable_hierarchical_cache = True
-        scheduler.enable_hicache_storage = False
-        scheduler.is_fully_idle = lambda: True
+        scheduler.request_registry = SimpleNamespace(is_fully_idle=lambda: True)
         scheduler.tree_cache = SimpleNamespace(
             attach_storage_backend=lambda **kwargs: (True, "attached"),
             detach_storage_backend=lambda: (True, "detached"),
@@ -61,7 +60,6 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
 
     def test_detach_clears_the_backend_for_the_same_readers(self):
         scheduler = self._scheduler(hicache_storage_backend="file")
-        scheduler.enable_hicache_storage = True
 
         out = scheduler.detach_hicache_storage_wrapped(DetachHiCacheStorageReqInput())
 

@@ -10,13 +10,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     AbortReq,
     SessionParams,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -24,7 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
     Req,
 )
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -32,6 +32,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_intake import make_request_intake
+from sglang.test.scheduler_request_lists import make_request_registry
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -89,20 +91,43 @@ def _rank(rank):
     )
 
 
-def _queued_scheduler(req):
-    scheduler = object.__new__(Scheduler)
-    scheduler.waiting_queue = [req]
-    scheduler.chunked_req = scheduler.mm_receiver = scheduler.dllm = None
-    scheduler.disaggregation_mode = DisaggregationMode.NULL
-    scheduler.disagg_prefill = None
-    scheduler.disagg_decode = None
-    scheduler.tree_cache = MagicMock()
-    scheduler.beam_coordinator = MagicMock()
-    scheduler.ipc_channels = MagicMock()
-    scheduler.grammar_manager = MagicMock()
-    scheduler.decoding = []
-    scheduler.hisparse_coordinator = None
-    return scheduler
+def _intake(**deps):
+    tree_cache = MagicMock()
+    beam_coordinator = MagicMock()
+    ipc_channels = MagicMock()
+    return make_request_intake(
+        kv=SimpleNamespace(tree_cache=tree_cache, token_to_kv_pool_allocator=None),
+        beam_coordinator=beam_coordinator,
+        ipc_channels=ipc_channels,
+        request_retirer=RequestRetirer(
+            kv=SimpleNamespace(tree_cache=tree_cache),
+            beam_coordinator=beam_coordinator,
+            output_streamer=MagicMock(),
+            ipc_channels=ipc_channels,
+        ),
+        **deps,
+    )
+
+
+def _queued_registry(req):
+    core_lists = CoreLists()
+    core_lists.waiting_queue = [req]
+    kv = SimpleNamespace(tree_cache=MagicMock())
+    beam_coordinator = MagicMock()
+    ipc_channels = MagicMock()
+    return make_request_registry(
+        core_lists=core_lists,
+        grammar_manager=MagicMock(),
+        request_retirer=RequestRetirer(
+            kv=kv,
+            beam_coordinator=beam_coordinator,
+            output_streamer=MagicMock(),
+            ipc_channels=ipc_channels,
+        ),
+        beam_coordinator=beam_coordinator,
+        ipc_channels=ipc_channels,
+        kv=kv,
+    )
 
 
 def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
@@ -111,10 +136,10 @@ def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
         for rank, item in enumerate(_publish(vmm_pool)):
             req = Req("queued-image", "", [1], SamplingParams())
             req.multimodal_inputs = MultimodalInputs(mm_items=[item])
-            scheduler = _queued_scheduler(req)
+            registry = _queued_registry(req)
             with _rank(rank):
-                scheduler.abort_request(AbortReq(rid=req.rid))
-            assert scheduler.waiting_queue == []
+                registry.abort_request(AbortReq(rid=req.rid))
+            assert registry.core_lists.waiting_queue == []
         vmm_pool._recycle_chunks()
         assert not vmm_pool.occupied_chunks
 
@@ -189,7 +214,7 @@ def test_aborted_session_turn_releases_new_media_not_history(vmm_pool):
         req.multimodal_inputs = MultimodalInputs(mm_items=[history])
         req.extend_image_inputs(MultimodalInputs(mm_items=[item]))
         with _rank(rank):
-            _queued_scheduler(req).abort_request(AbortReq(rid=req.rid))
+            _queued_registry(req).abort_request(AbortReq(rid=req.rid))
         assert torch.equal(history.feature, torch.ones(3))
         assert not session._inflight
     vmm_pool._recycle_chunks()
@@ -214,14 +239,13 @@ def test_rejected_session_releases_media_before_request_admission(vmm_pool):
             stream=False,
             session_params=SessionParams(id="missing"),
         )
-        scheduler = _queued_scheduler(None)
-        scheduler.session_controller = {}
-        scheduler.model_config = SimpleNamespace(vocab_size=10)
-        scheduler.tokenizer = None
-        scheduler.init_req_max_new_tokens = lambda req: None
-        scheduler._add_request_to_queue = lambda req: None
+        intake = _intake(
+            session_controller={}, model_config=SimpleNamespace(vocab_size=10)
+        )
+        intake.init_req_max_new_tokens = lambda req: None
+        intake.add_request_to_queue = lambda req: None
         with _rank(rank):
-            scheduler.handle_generate_request(recv)
+            intake.handle_generate_request(recv)
     vmm_pool._recycle_chunks()
     assert not vmm_pool.occupied_chunks
 
@@ -243,13 +267,13 @@ def test_other_rank_materialization_failure_releases_local_proxies(vmm_pool):
             token_ids_logprob=None,
             stream=False,
         )
-        scheduler = _queued_scheduler(None)
-        scheduler._gather_vmm_materialization_errors = lambda error: [
+        intake = _intake()
+        intake._gather_vmm_materialization_errors = lambda error: [
             None,
             "copy failed",
         ]
         with _rank(rank):
-            errors = scheduler._materialize_cuda_vmm_inputs(recv)
+            errors = intake.materialize_cuda_vmm_inputs(recv)
         assert "copy failed" in errors[0]
         assert recv.mm_inputs is None
     vmm_pool._recycle_chunks()

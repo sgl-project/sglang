@@ -17,12 +17,11 @@ from sglang.srt.disaggregation.encoder.receiver import (
     WaitingZmqRequestGrpc,
     _ReceiveRegistrationRunner,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import EncoderDispatchErrorReq
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -261,14 +260,16 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertEqual([req.rid for req, _, _ in abort_reqs], [owner.rid])
 
     def test_extra_key_and_cache_salt_are_forwarded(self):
-        scheduler = SimpleNamespace(
-            model_config=SimpleNamespace(hf_eos_token_id={2}, vocab_size=128),
-            disaggregation_mode=DisaggregationMode.NULL,
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
-            metrics_collector=None,
-            tokenizer=object(),
+        enter_scope(self, published_topology())
+        receiver = SimpleNamespace(
+            scheduler_side=SimpleNamespace(
+                model_config=SimpleNamespace(hf_eos_token_id={2}, vocab_size=128),
+                metrics_sink=SimpleNamespace(
+                    enable_metrics=False, metrics_collector=None
+                ),
+                tokenizer=object(),
+            )
         )
-        receiver = SimpleNamespace(scheduler=scheduler)
         recv_req = SimpleNamespace(
             rid="request-1",
             input_text="hello",

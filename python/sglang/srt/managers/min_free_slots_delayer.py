@@ -36,3 +36,20 @@ class MinFreeSlotsDelayer:
 
     def should_delay(self, *, running_bs: int, num_allocatable_reqs: int) -> bool:
         return running_bs > 0 and num_allocatable_reqs < self._min_free_slots
+
+
+def create_min_free_slots_delayer(
+    user_value: Optional[int],
+    max_running_requests: int,
+    *,
+    is_dflash_family: bool,
+) -> Optional[MinFreeSlotsDelayer]:
+    """The delayer for the resolved threshold, or None when it is disabled."""
+    min_free_slots = resolve_min_free_slots(
+        user_value,
+        max_running_requests,
+        is_dflash_family=is_dflash_family,
+    )
+    if min_free_slots is None:
+        return None
+    return MinFreeSlotsDelayer(min_free_slots=min_free_slots)

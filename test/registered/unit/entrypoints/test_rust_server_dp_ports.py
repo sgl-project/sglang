@@ -13,8 +13,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def _scheduler_for_typed_config():
-    return SimpleNamespace(
+def _launch_config():
+    return dict(
         server_args=SimpleNamespace(enable_return_hidden_states=False),
         model_config=SimpleNamespace(
             context_len=2048,
@@ -23,7 +23,7 @@ def _scheduler_for_typed_config():
             hf_config=SimpleNamespace(model_type=None),
             get_default_sampling_params=lambda: {},
         ),
-        rust_server_tokenizer_path=lambda: "tokenizer",
+        tokenizer_path="tokenizer",
         max_total_num_tokens=1024,
     )
 
@@ -47,10 +47,7 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
     ):
-        assert (
-            rust_config._build_server_args(_scheduler_for_typed_config())
-            == "server-args"
-        )
+        assert rust_config._build_server_args(**_launch_config()) == "server-args"
 
     assert extension.ServerArgs.call_args.kwargs["grpc_port"] == expected
 
@@ -83,17 +80,21 @@ def test_dp_leaders_reuse_node_local_ports(
         parallel = get_parallel()
         ports = []
         for dp_rank, tp_rank in enumerate(ranks):
-            scheduler = SimpleNamespace(
-                server_args=SimpleNamespace(),
-                model_config=SimpleNamespace(is_multimodal=False),
-            )
             with parallel.override(
                 tp_rank=tp_rank,
                 attn_dp_rank=dp_rank,
                 attn_tp_rank=tp_rank % parallel.attn_tp_size,
                 attn_cp_rank=0,
             ):
-                ports.append(rust_server.RustServer.launch(scheduler).http_port)
+                ports.append(
+                    rust_server.RustServer.launch(
+                        server_args=SimpleNamespace(),
+                        model_config=SimpleNamespace(is_multimodal=False),
+                        processor=None,
+                        tokenizer_path="tokenizer",
+                        max_total_num_tokens=1024,
+                    ).http_port
+                )
 
         calls = extension.return_value.Server.call_args_list
         assert [c.kwargs["port_offset"] for c in calls] == expected

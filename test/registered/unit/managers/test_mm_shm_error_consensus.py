@@ -33,14 +33,14 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.managers.scheduler import (  # noqa: E402
-    Scheduler,
+from sglang.srt.managers.scheduler_components.request_intake import (  # noqa: E402
     _MultimodalInputProcessingError,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.test.scheduler_request_intake import make_request_intake  # noqa: E402
 
 register_cpu_ci(est_time=33, suite="base-a-test-cpu")
 
@@ -101,7 +101,7 @@ def _receiver() -> SchedulerRequestReceiver:
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=True),
         max_recv_per_poll=-1,
-        stream_output=lambda *args, **kwargs: None,
+        output_streamer=SimpleNamespace(stream_output=lambda *args, **kwargs: None),
     )
 
 
@@ -391,7 +391,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
         self.assertIsInstance(req.mm_inputs, MMInputsProcessError)
         with self.assertRaises(_MultimodalInputProcessingError):
-            Scheduler._get_multimodal_inputs(object.__new__(Scheduler), req.mm_inputs)
+            make_request_intake()._get_multimodal_inputs(req.mm_inputs)
 
     def test_peer_failure_rejects_the_local_request(self):
         req = _request(torch.zeros(1))

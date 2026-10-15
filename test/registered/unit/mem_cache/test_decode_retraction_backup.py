@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVManager
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator, TransferBackend
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
@@ -377,7 +378,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             num_reserved_decode_tokens=0,
             server_args=env.server_args,
             model_config=SimpleNamespace(num_hidden_layers=env.target_pool.layer_num),
-            get_decoding=lambda: [],
+            core_lists=CoreLists(),
             get_ready=lambda: [],
             sliding_window_size=8 if hybrid_swa else None,
             enable_hisparse=False,

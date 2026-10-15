@@ -725,7 +725,11 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
 
     @staticmethod
     def _prepare_scheduler(scheduler):
-        scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
+        from sglang.test.scheduler_request_intake import make_request_intake
+
+        scheduler.request_intake = make_request_intake(
+            model_config=SimpleNamespace(requires_mm_token_modalities=False)
+        )
         scheduler.scheduler_stage_metrics = None
         scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
         scheduler._request_dispatcher = MagicMock(return_value=None)
@@ -734,15 +738,19 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
 
     @staticmethod
     def _materialize_with_rank_errors(local_exception=None, remote_error=None):
-        from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.scheduler_components import (
+            request_intake as intake_module,
+        )
+        from sglang.test.scheduler_request_intake import make_request_intake
 
         class TokenizedRequest:
             def __init__(self):
                 self.mm_inputs = object()
 
-        scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
-        scheduler.dp_tp_cpu_group = object()
+        intake = make_request_intake(
+            model_config=SimpleNamespace(requires_mm_token_modalities=False),
+            dp_tp_group=SimpleNamespace(cpu_group=object()),
+        )
         request = TokenizedRequest()
 
         def gather_errors(errors, local_error, **_kwargs):
@@ -753,40 +761,39 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             return_value=object(),
         )
         with (
+            patch.object(intake_module, "TokenizedGenerateReqInput", TokenizedRequest),
+            patch.object(intake_module, "TokenizedEmbeddingReqInput", TokenizedRequest),
             patch.object(
-                scheduler_module, "TokenizedGenerateReqInput", TokenizedRequest
-            ),
-            patch.object(
-                scheduler_module, "TokenizedEmbeddingReqInput", TokenizedRequest
-            ),
-            patch.object(
-                scheduler_module.MultimodalInputs,
+                intake_module.MultimodalInputs,
                 "from_processor_output",
                 materialize,
             ),
             patch.object(
-                scheduler_module.torch.distributed, "is_available", return_value=True
+                intake_module.torch.distributed, "is_available", return_value=True
             ),
             patch.object(
-                scheduler_module.torch.distributed,
+                intake_module.torch.distributed,
                 "is_initialized",
                 return_value=True,
             ),
             patch.object(
-                scheduler_module.torch.distributed, "get_world_size", return_value=2
+                intake_module.torch.distributed, "get_world_size", return_value=2
             ),
             patch.object(
-                scheduler_module.torch.distributed,
+                intake_module.torch.distributed,
                 "all_gather_object",
                 side_effect=gather_errors,
             ),
         ):
-            errors = scheduler._materialize_cuda_vmm_inputs(request)
+            errors = intake.materialize_cuda_vmm_inputs(request)
 
         return request, errors
 
     def test_materializes_inputs_directly_before_base_dispatch(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.scheduler_components import (
+            request_intake as intake_module,
+        )
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         # The transport gate reads the published bags, so the case publishes
@@ -801,16 +808,14 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         request = SimpleNamespace(mm_inputs=raw_inputs)
 
         with (
+            patch.object(intake_module, "TokenizedGenerateReqInput", SimpleNamespace),
             patch.object(
-                scheduler_module, "TokenizedGenerateReqInput", SimpleNamespace
-            ),
-            patch.object(
-                scheduler_module.MultimodalInputs,
+                intake_module.MultimodalInputs,
                 "from_processor_output",
                 return_value=materialized,
             ) as build_inputs,
             patch.object(
-                scheduler, "_process_and_broadcast_mm_inputs"
+                scheduler.request_intake, "_process_and_broadcast_mm_inputs"
             ) as cpu_broadcast,
             patch.object(
                 scheduler_module, "is_health_check_generate_req", return_value=False
@@ -827,6 +832,9 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
 
     def test_materializes_batched_inputs_before_dispatch(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.scheduler_components import (
+            request_intake as intake_module,
+        )
 
         class TokenizedRequest:
             def __init__(self, mm_inputs):
@@ -848,20 +856,14 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         request = BatchRequest(inner_requests)
 
         with (
+            patch.object(intake_module, "TokenizedGenerateReqInput", TokenizedRequest),
+            patch.object(intake_module, "TokenizedEmbeddingReqInput", TokenizedRequest),
+            patch.object(intake_module, "BatchTokenizedGenerateReqInput", BatchRequest),
             patch.object(
-                scheduler_module, "TokenizedGenerateReqInput", TokenizedRequest
+                intake_module, "BatchTokenizedEmbeddingReqInput", BatchRequest
             ),
             patch.object(
-                scheduler_module, "TokenizedEmbeddingReqInput", TokenizedRequest
-            ),
-            patch.object(
-                scheduler_module, "BatchTokenizedGenerateReqInput", BatchRequest
-            ),
-            patch.object(
-                scheduler_module, "BatchTokenizedEmbeddingReqInput", BatchRequest
-            ),
-            patch.object(
-                scheduler_module.MultimodalInputs,
+                intake_module.MultimodalInputs,
                 "from_processor_output",
                 side_effect=materialized,
             ) as build_inputs,
@@ -883,104 +885,115 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
 
     def test_already_materialized_inputs_are_reused(self):
         from sglang.srt.managers.schedule_batch import MultimodalInputs
-        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.test.scheduler_request_intake import make_request_intake
 
-        scheduler = object.__new__(Scheduler)
+        intake = make_request_intake()
         mm_inputs = MultimodalInputs(mm_items=[])
 
         with patch.object(
-            scheduler, "_process_and_broadcast_mm_inputs"
+            intake, "_process_and_broadcast_mm_inputs"
         ) as process_and_broadcast:
-            self.assertIs(scheduler._get_multimodal_inputs(mm_inputs), mm_inputs)
+            self.assertIs(intake._get_multimodal_inputs(mm_inputs), mm_inputs)
 
         process_and_broadcast.assert_not_called()
 
     def test_broadcast_mm_inputs_sends_entry_rank_processing_error(self):
-        from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.scheduler_components import (
+            request_intake as intake_module,
+        )
+        from sglang.test.scheduler_request_intake import make_request_intake
 
-        scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
-        scheduler.dp_tp_group = SimpleNamespace(rank_in_group=0, first_rank=0)
-        scheduler.dp_tp_cpu_group = object()
+        intake = make_request_intake(
+            model_config=SimpleNamespace(requires_mm_token_modalities=False),
+            dp_tp_group=SimpleNamespace(
+                rank_in_group=0, first_rank=0, cpu_group=object()
+            ),
+        )
 
         with (
             patch.object(
-                scheduler_module.MultimodalInputs,
+                intake_module.MultimodalInputs,
                 "from_processor_output",
                 side_effect=ValueError("bad image"),
             ),
             patch.object(
-                scheduler_module.torch.distributed, "is_available", return_value=True
+                intake_module.torch.distributed, "is_available", return_value=True
             ),
             patch.object(
-                scheduler_module.torch.distributed,
+                intake_module.torch.distributed,
                 "is_initialized",
                 return_value=True,
             ),
             patch.object(
-                scheduler_module.torch.distributed, "get_world_size", return_value=2
+                intake_module.torch.distributed, "get_world_size", return_value=2
             ),
             patch.object(
-                scheduler_module.torch.distributed, "broadcast_object_list"
+                intake_module.torch.distributed, "broadcast_object_list"
             ) as broadcast,
             self.assertRaisesRegex(
-                scheduler_module._MultimodalInputProcessingError,
+                intake_module._MultimodalInputProcessingError,
                 "ValueError: bad image",
             ),
         ):
-            scheduler._process_and_broadcast_mm_inputs(object())
+            intake._process_and_broadcast_mm_inputs(object())
 
         payload = broadcast.call_args.args[0][0]
         self.assertIn("ValueError: bad image", payload.error)
 
     def test_broadcast_mm_inputs_peer_rank_receives_processing_error(self):
-        from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.scheduler_components import (
+            request_intake as intake_module,
+        )
+        from sglang.test.scheduler_request_intake import make_request_intake
 
-        scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.dp_tp_group = SimpleNamespace(rank_in_group=1, first_rank=0)
-        scheduler.dp_tp_cpu_group = object()
+        intake = make_request_intake(
+            dp_tp_group=SimpleNamespace(
+                rank_in_group=1, first_rank=0, cpu_group=object()
+            ),
+        )
 
         def receive_error(obj_list, **_kwargs):
-            obj_list[0] = scheduler_module._MultimodalInputBroadcast(error="bad image")
+            obj_list[0] = intake_module._MultimodalInputBroadcast(error="bad image")
 
         with (
             patch.object(
-                scheduler_module.MultimodalInputs, "from_processor_output"
+                intake_module.MultimodalInputs, "from_processor_output"
             ) as materialize,
             patch.object(
-                scheduler_module.torch.distributed, "is_available", return_value=True
+                intake_module.torch.distributed, "is_available", return_value=True
             ),
             patch.object(
-                scheduler_module.torch.distributed,
+                intake_module.torch.distributed,
                 "is_initialized",
                 return_value=True,
             ),
             patch.object(
-                scheduler_module.torch.distributed, "get_world_size", return_value=2
+                intake_module.torch.distributed, "get_world_size", return_value=2
             ),
             patch.object(
-                scheduler_module.torch.distributed,
+                intake_module.torch.distributed,
                 "broadcast_object_list",
                 side_effect=receive_error,
             ),
             self.assertRaisesRegex(
-                scheduler_module._MultimodalInputProcessingError, "bad image"
+                intake_module._MultimodalInputProcessingError, "bad image"
             ),
         ):
-            scheduler._process_and_broadcast_mm_inputs(object())
+            intake._process_and_broadcast_mm_inputs(object())
 
         materialize.assert_not_called()
 
     def test_embedding_request_aborts_broadcast_processing_error(self):
-        from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.scheduler_components import (
+            request_intake as intake_module,
+        )
+        from sglang.test.scheduler_request_intake import make_request_intake
 
-        scheduler = object.__new__(scheduler_module.Scheduler)
-        scheduler.tokenizer = object()
-        scheduler.disable_radix_cache = False
-        scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
-        scheduler._add_request_to_queue = MagicMock()
-        scheduler._get_multimodal_inputs = MagicMock(
-            side_effect=scheduler_module._MultimodalInputProcessingError("bad image")
+        intake = make_request_intake(tokenizer=object())
+        intake._maybe_namespace_elastic_radix_cache = MagicMock()
+        intake.add_request_to_queue = MagicMock()
+        intake._get_multimodal_inputs = MagicMock(
+            side_effect=intake_module._MultimodalInputProcessingError("bad image")
         )
         req = MagicMock()
         recv_req = SimpleNamespace(
@@ -1003,15 +1016,15 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             mm_inputs=object(),
         )
 
-        with patch.object(scheduler_module, "Req", return_value=req):
-            scheduler.handle_embedding_request(recv_req)
+        with patch.object(intake_module, "Req", return_value=req):
+            intake.handle_embedding_request(recv_req)
 
         req.set_finish_with_abort.assert_called_once_with(
             "bad image",
             status_code=500,
             err_type="InternalServerError",
         )
-        scheduler._add_request_to_queue.assert_called_once_with(req)
+        intake.add_request_to_queue.assert_called_once_with(req)
 
     def test_vmm_materialization_consensus_rejects_any_rank_failure(self):
         cases = (
@@ -1028,6 +1041,9 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
 
     def test_vmm_batch_dispatches_good_and_failed_requests_individually(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.scheduler_components import (
+            request_intake as intake_module,
+        )
 
         class TokenizedRequest:
             pass
@@ -1045,27 +1061,22 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler = object.__new__(scheduler_module.Scheduler)
         self._publish(mm_feature_transport="cuda_vmm")
         self._prepare_scheduler(scheduler)
-        scheduler.is_fully_idle = MagicMock(return_value=True)
-        scheduler.return_health_check_ipcs = []
-        scheduler.handle_generate_request = MagicMock()
-        scheduler.handle_embedding_request = MagicMock()
-        scheduler._materialize_cuda_vmm_inputs = MagicMock(
+        scheduler.request_registry = MagicMock(**{"is_fully_idle.return_value": True})
+        scheduler.output_streamer = MagicMock()
+        intake = scheduler.request_intake
+        intake.handle_generate_request = MagicMock()
+        intake.handle_embedding_request = MagicMock()
+        intake.materialize_cuda_vmm_inputs = MagicMock(
             return_value=[None, "reconstruction failed"]
         )
         requests = [TokenizedRequest(), TokenizedRequest()]
         batch = BatchRequest(requests)
 
         with (
-            patch.object(
-                scheduler_module, "TokenizedGenerateReqInput", TokenizedRequest
-            ),
-            patch.object(
-                scheduler_module, "TokenizedEmbeddingReqInput", EmbeddingRequest
-            ),
-            patch.object(
-                scheduler_module, "BatchTokenizedGenerateReqInput", BatchRequest
-            ),
-            patch.object(scheduler_module, "BatchTokenizedEmbeddingReqInput", tuple),
+            patch.object(intake_module, "TokenizedGenerateReqInput", TokenizedRequest),
+            patch.object(intake_module, "TokenizedEmbeddingReqInput", EmbeddingRequest),
+            patch.object(intake_module, "BatchTokenizedGenerateReqInput", BatchRequest),
+            patch.object(intake_module, "BatchTokenizedEmbeddingReqInput", tuple),
             patch.object(
                 scheduler_module, "is_health_check_generate_req", return_value=False
             ),
@@ -1073,13 +1084,13 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             scheduler.process_input_requests([batch])
 
         self.assertEqual(
-            scheduler.handle_generate_request.call_args_list,
+            intake.handle_generate_request.call_args_list,
             [
                 call(requests[0], mm_input_error=None),
                 call(requests[1], mm_input_error="reconstruction failed"),
             ],
         )
-        scheduler.handle_embedding_request.assert_not_called()
+        intake.handle_embedding_request.assert_not_called()
         scheduler._request_dispatcher.assert_not_called()
 
     def test_vmm_materialization_abort_reports_internal_error(self):

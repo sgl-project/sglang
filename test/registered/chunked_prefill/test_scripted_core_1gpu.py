@@ -86,7 +86,7 @@ class TestScriptedCore(ScriptedTestCase):
         # engine must not advance it.
         if not r.finished:
             req = r.req
-            assert req is not None and req in t.scheduler.waiting_queue, (
+            assert req is not None and req in t.scheduler.lists.waiting_queue, (
                 f"stage={stage}: pause(retract) should park the req back in "
                 f"waiting_queue; found={req!r}"
             )

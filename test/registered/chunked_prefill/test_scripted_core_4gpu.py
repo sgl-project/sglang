@@ -72,7 +72,8 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             in_flight = len(scheduler.pending) > 0
             queues_clear = (
-                scheduler.chunked_req is None and len(scheduler.waiting_queue) == 0
+                scheduler.lists.chunked_req is None
+                and len(scheduler.lists.waiting_queue) == 0
             )
             if in_flight and queues_clear:
                 t.flush_cache()

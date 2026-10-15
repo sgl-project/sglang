@@ -147,7 +147,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield
 
         req = r.req
-        assert req is not None and req in t.scheduler.waiting_queue, (
+        assert req is not None and req in t.scheduler.lists.waiting_queue, (
             f"pause(retract) did not park the req in waiting_queue; found {req!r}"
         )
 
@@ -181,7 +181,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
         yield
 
         req = r.req
-        assert req is not None and req not in t.scheduler.waiting_queue, (
+        assert req is not None and req not in t.scheduler.lists.waiting_queue, (
             f"pause(in_place) should not retract the req to waiting_queue; found {req!r}"
         )
 
@@ -710,24 +710,24 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
     def _script_forward_ct_advances_once_per_yield(t: ScriptedContext):
         sched = t.scheduler
 
-        before_no_yield = sched.forward_ct
+        before_no_yield = sched.counters.forward_ct
         r = t.start_req(
             prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=128, ignore_eos=True
         )
-        assert sched.forward_ct == before_no_yield, (
-            f"forward_ct moved without a yield: {before_no_yield} -> {sched.forward_ct}"
+        assert sched.counters.forward_ct == before_no_yield, (
+            f"forward_ct moved without a yield: {before_no_yield} -> {sched.counters.forward_ct}"
         )
 
         yield from advance_to_decode_step(r, 1)
 
         for n in (1, 3, 5):
-            before = sched.forward_ct
+            before = sched.counters.forward_ct
             for _ in range(n):
                 yield
-            advanced = sched.forward_ct - before
+            advanced = sched.counters.forward_ct - before
             assert advanced == n, (
                 f"forward_ct advanced by {advanced} over {n} yields "
-                f"(before={before} after={sched.forward_ct})"
+                f"(before={before} after={sched.counters.forward_ct})"
             )
 
         t.abort_all()

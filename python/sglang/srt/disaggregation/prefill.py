@@ -102,19 +102,22 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
     )
-    from sglang.srt.managers.scheduler_components.metrics_reporter import (
-        SchedulerMetricsReporter,
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvCapacity,
+        KvResources,
+        SchedulerServices,
+        Streams,
     )
+    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-    from sglang.srt.observability.metrics_collector import (
-        SchedulerMetricsCollector,
-    )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -203,8 +206,8 @@ class PrefillBootstrapQueue:
         attn_tp_cpu_group: Any,
         pp_group: Any,
         output_streamer: SchedulerOutputStreamer,
-        get_processed_tokens_counter: Callable[[], int],
-        retire_unadmitted_request: Callable[[Req], None],
+        counters: LaunchCounters,
+        request_retirer: RequestRetirer,
         handle_bootstrap_failure: Callable[[Req], None],
     ):
         parallel = get_parallel()
@@ -236,8 +239,8 @@ class PrefillBootstrapQueue:
         self.attn_tp_cpu_group = attn_tp_cpu_group
         self.pp_group = pp_group
         self.output_streamer = output_streamer
-        self.get_processed_tokens_counter = get_processed_tokens_counter
-        self.retire_unadmitted_request = retire_unadmitted_request
+        self.counters = counters
+        self.request_retirer = request_retirer
         self.handle_bootstrap_failure = handle_bootstrap_failure
         self.pp_poll_sync_work_list: List = []
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
@@ -470,7 +473,7 @@ class PrefillBootstrapQueue:
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
         # buffer and a forward pass before anything unwinds it.
         if is_unadmitted_reject(req):
-            self.retire_unadmitted_request(req)
+            self.request_retirer.retire_unadmitted_request(req)
             return
         if not self.create_sender(req, num_kv_heads):
             return
@@ -548,7 +551,9 @@ class PrefillBootstrapQueue:
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
-                    req.arrival_processed_tokens = self.get_processed_tokens_counter()
+                    req.arrival_processed_tokens = (
+                        self.counters.processed_tokens_counter
+                    )
             elif poll == KVPoll.WaitingForInput:
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
@@ -559,7 +564,7 @@ class PrefillBootstrapQueue:
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
-                req.arrival_processed_tokens = self.get_processed_tokens_counter()
+                req.arrival_processed_tokens = self.counters.processed_tokens_counter
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
@@ -596,12 +601,10 @@ class DisaggPrefill:
         server_args: ServerArgs,
         model_config: ModelConfig,
         spec_algorithm: SpeculativeAlgorithm,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        draft_token_to_kv_pool: Optional[KVCache],
-        req_to_token_pool: ReqToTokenPool,
-        tree_cache: BasePrefixCache,
-        max_running_requests: int,
-        max_total_num_tokens: int,
+        kv: KvResources,
+        capacity: KvCapacity,
+        streams: Streams,
+        services: SchedulerServices,
         kv_cache_dtype_str: str,
         rust_http_port: Optional[int],
         transfer_backend: TransferBackend,
@@ -612,17 +615,21 @@ class DisaggPrefill:
         tp_cpu_group: Any,
         sliding_window_size: Optional[int],
         enable_overlap: bool,
-        forward_stream: Any,
-        scheduler_stage_metrics: SchedulerStageMetricsRecorder,
-        output_streamer: SchedulerOutputStreamer,
-        metrics_reporter: SchedulerMetricsReporter,
-        metrics_collector: Optional[SchedulerMetricsCollector],
         batch_result_processor: SchedulerBatchResultProcessor,
-        get_processed_tokens_counter: Callable[[], int],
-        retire_unadmitted_request: Callable[[Req], None],
-        release_aborted_request: Callable[[Req], None],
-        maybe_send_health_check_signal: Callable[[], None],
+        counters: LaunchCounters,
+        request_retirer: RequestRetirer,
     ):
+        token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
+        draft_token_to_kv_pool = kv.draft_token_to_kv_pool
+        req_to_token_pool = kv.req_to_token_pool
+        tree_cache = kv.tree_cache
+        max_running_requests = capacity.max_running_requests
+        max_total_num_tokens = capacity.effective_max_total_num_tokens
+        forward_stream = streams.forward_stream
+        scheduler_stage_metrics = services.scheduler_stage_metrics
+        output_streamer = services.output_streamer
+        metrics_sink = services.metrics_sink
+        metrics_collector = metrics_sink.metrics_collector
         self.num_kv_heads = model_config.num_key_value_heads
         self.spec_algorithm = spec_algorithm
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -637,12 +644,11 @@ class DisaggPrefill:
         self.forward_stream = forward_stream
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.output_streamer = output_streamer
-        self.metrics_reporter = metrics_reporter
+        self.metrics_sink = metrics_sink
         self.metrics_collector = metrics_collector
         self.batch_result_processor = batch_result_processor
-        self.get_processed_tokens_counter = get_processed_tokens_counter
-        self.release_aborted_request = release_aborted_request
-        self.maybe_send_health_check_signal = maybe_send_health_check_signal
+        self.counters = counters
+        self.request_retirer = request_retirer
 
         # *2 for the headroom.
         buffer_size = max_running_requests * 2
@@ -677,8 +683,8 @@ class DisaggPrefill:
             attn_tp_cpu_group=attn_tp_cpu_group,
             pp_group=pp_group,
             output_streamer=output_streamer,
-            get_processed_tokens_counter=get_processed_tokens_counter,
-            retire_unadmitted_request=retire_unadmitted_request,
+            counters=counters,
+            request_retirer=request_retirer,
             handle_bootstrap_failure=self.handle_bootstrap_failure,
         )
         self.kv_checksum_computer = self.bootstrap_queue.kv_checksum_computer
@@ -707,6 +713,15 @@ class DisaggPrefill:
         self.bootstrap_queue.add(req, self.num_kv_heads)
         req.time_stats.set_prefill_bootstrap_queue_entry_time()
 
+    def unified_memory_move_gate(self) -> bool:
+        """Whether unified-memory compaction may move pages: only when no KV
+        transfer can be in flight, so it never relocates a page the transfer
+        engine reads. A page is exposed from the moment its address reaches the
+        peer until the transfer concludes; scheduling the final chunk clears
+        `chunked_req` while earlier chunks may still be draining, and the
+        request reaches the transfer list only later, in the result path."""
+        return not (self.transfer or self.pending_chunk_rids)
+
     def lists(self) -> List[RequestList]:
         """The PD prefill lists: bootstrapping, prefilling, and sending the KV."""
         return [
@@ -733,7 +748,7 @@ class DisaggPrefill:
         for req in self.bootstrap_queue.queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.release_aborted_request(req)
+                self.request_retirer.release_aborted_request(req)
 
                 if hasattr(self.kv_senders[req.rid], "abort"):
                     self.kv_senders[req.rid].abort()
@@ -1098,14 +1113,7 @@ class DisaggPrefill:
                 any(req.return_logprob for req in aborted_reqs),
             )
 
-        can_run_cuda_graph = result.can_run_cuda_graph
-        self.metrics_reporter.report_prefill_stats(
-            batch=batch,
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
-        self.maybe_send_health_check_signal()
+        self.output_streamer.maybe_reply_health_check()
         return waiting
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -1234,9 +1242,9 @@ class DisaggPrefill:
             if metrics:
                 # Update last-value for REST API
                 if "latency_ms" in metrics:
-                    self.metrics_reporter.kv_transfer_latency_ms = metrics["latency_ms"]
+                    self.metrics_sink.kv_transfer_latency_ms = metrics["latency_ms"]
                 if "speed_gb_s" in metrics:
-                    self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
+                    self.metrics_sink.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
         self.output_streamer.stream_output(
@@ -1278,12 +1286,12 @@ class DisaggPrefill:
             req.finished_reason = FINISH_LENGTH(length=0)
         # unlock the tree
         release_kv_cache(req, self.tree_cache, checkpoint=True)
-        self.release_aborted_request(req)
+        self.request_retirer.release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_sink.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
@@ -1351,7 +1359,7 @@ class DisaggPrefill:
         req.disagg.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_sink.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         self.kv_senders.pop(req.rid, None)
@@ -1698,7 +1706,7 @@ class DisaggPrefill:
                 req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
             )
         )
-        self.release_aborted_request(req)
+        self.request_retirer.release_aborted_request(req)
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
         release_kv_cache(req, self.tree_cache, checkpoint=False)
@@ -1737,9 +1745,9 @@ class DisaggPrefill:
                 f"Req {req.rid} optimistic prefill yielded "
                 f"({req.disagg.prefill_attempt_count}/{max_attempts} attempts used)"
             )
-            if self.metrics_reporter.enable_metrics:
+            if self.metrics_sink.enable_metrics:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
-            req.arrival_processed_tokens = self.get_processed_tokens_counter()
+            req.arrival_processed_tokens = self.counters.processed_tokens_counter
             waiting = [req, *waiting]
         return waiting

@@ -83,12 +83,13 @@ def _run_scheduler_process_with_jitter(
     jitter_max_time_us: int,
     **scheduler_kwargs: Any,
 ) -> None:
-    from sglang.srt.managers.scheduler import Scheduler, run_scheduler_process
+    from sglang.srt.managers.scheduler import run_scheduler_process
+    from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
 
     original_record = torch.cuda.Event.record
     original_wait = torch.cuda.Event.wait
     original_capture_end = torch.cuda.CUDAGraph.capture_end
-    original_flush_cache = Scheduler.flush_cache
+    original_flush_cache = StepPlanner.flush_cache
     capture_streams: dict[tuple[torch.device, int], torch.cuda.Stream] = {}
     probability = jitter_probability / server_args.tp_size
     jitter_active = False
@@ -130,7 +131,7 @@ def _run_scheduler_process_with_jitter(
 
     torch.cuda.Event.record = wrap_event(original_record)
     torch.cuda.Event.wait = wrap_event(original_wait)
-    Scheduler.flush_cache = flush_cache
+    StepPlanner.flush_cache = flush_cache
 
     # A post-record delay can extend a captured side stream past the
     # event that originally joined it. Join those streams before ending

@@ -24,18 +24,25 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
 )
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.mode_stages import (
-    ModeStages,
-    ScheduleSlot,
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+from sglang.srt.managers.scheduler_components.mode_stages import ModeStages
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, tree_release
-from sglang.test.scheduler_request_lists import assert_one_list_per_request
+from sglang.test.scheduler_request_lists import (
+    assert_one_list_per_request,
+    request_registry_of,
+)
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -102,13 +109,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_overlap = False
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
-            return_value=(physical_available, physical_available)
-        )
-        queue._allocatable_token_budgets = MagicMock(
-            side_effect=lambda _decoding, **_: physical_available
-        )
-        queue._swa_tail_allocatable_token_budget = MagicMock(
-            side_effect=lambda _decoding, **_: physical_available
+            side_effect=lambda _decoding, **_: (physical_available, physical_available)
         )
 
         def pre_alloc(_req):
@@ -161,8 +162,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_overlap = True
         queue.schedule_stream = schedule_stream
         queue.forward_stream = forward_stream
-        queue._uses_swa_reservation = MagicMock(return_value=False)
-        queue._allocatable_token_budgets = MagicMock(return_value=4096)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(
+            return_value=(4096, None)
+        )
         queue._prealloc_required_tokens = MagicMock(return_value=(8, 0))
         queue._prealloc_reservation_fits = MagicMock(return_value=True)
         queue._pre_alloc = MagicMock()
@@ -198,13 +200,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # off, so this abort path needs one even though it never allocates.
         queue.token_to_kv_pool_allocator = MagicMock()
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(0, None))
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         queue.enable_priority_scheduling = False
         queue.enable_hisparse = False
         queue.enable_lora = False
-        queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        queue.metrics_sink = SimpleNamespace(enable_metrics=False)
         queue.output_streamer = MagicMock()
 
         with patch(
@@ -255,7 +257,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # off, so this abort path needs one even though it never allocates.
         queue.token_to_kv_pool_allocator = MagicMock()
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(0, None))
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         queue.enable_priority_scheduling = False
@@ -437,7 +439,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
-        queue.release_finished_req = tree_release(queue)
+        queue.batch_result_processor = SimpleNamespace(
+            release_finished_req=tree_release(queue)
+        )
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
@@ -446,7 +450,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_decode_hicache = False
         queue.enable_hisparse = False
         queue.output_streamer = MagicMock()
-        queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        queue.metrics_sink = SimpleNamespace(enable_metrics=False)
 
         mock_poll.return_value = [KVPoll.Failed]
 
@@ -553,7 +557,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
-        queue.release_finished_req = tree_release(queue)
+        queue.batch_result_processor = SimpleNamespace(
+            release_finished_req=tree_release(queue)
+        )
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
@@ -561,7 +567,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_decode_hicache = False
         queue.enable_hisparse = False
         queue.output_streamer = MagicMock()
-        queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        queue.metrics_sink = SimpleNamespace(enable_metrics=False)
         mock_poll.return_value = [KVPoll.Failed]
 
         self.assertEqual(queue.pop_transferred([]), [])
@@ -573,19 +579,23 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def _decode_scheduler(self, *, retracted=(), held=(), releasing=()):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.decoding = []
+        scheduler.mode_owners = ModeOwners()
+        scheduler.counters = LaunchCounters()
+        scheduler.flags = EngineFlags()
+        scheduler.lists = CoreLists()
+        scheduler.lists.decoding = []
         scheduler.pending = PendingSteps()
-        scheduler.chunked_req = None
-        scheduler.waiting_queue = []
+        scheduler.lists.chunked_req = None
+        scheduler.lists.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(
             grammar_queue=[], abort_requests=MagicMock()
         )
-        scheduler.dllm = None
-        scheduler.hisparse_coordinator = None
+        scheduler.mode_owners.dllm = None
+        scheduler.mode_owners.hisparse_coordinator = None
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler._engine_paused = False
-        scheduler.disagg_prefill = None
-        scheduler.disagg_decode = decode_owner_shell(
+        scheduler.flags._engine_paused = False
+        scheduler.mode_owners.disagg_prefill = None
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             prealloc_queue=SimpleNamespace(
                 queue=[],
                 retracted_queue=list(retracted),
@@ -595,22 +605,21 @@ class TestDecodeQueueCleanup(CustomTestCase):
             releasing=list(releasing),
         )
         scheduler.decode_offload_manager = None
-        scheduler.enable_hisparse = False
-        scheduler.enable_hierarchical_cache = False
-        scheduler.enable_lmcache = False
         return scheduler
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = self._decode_scheduler(retracted=[object()])
+        registry = request_registry_of(scheduler)
 
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(registry.is_fully_idle())
 
     def test_held_rebootstrap_requests_keep_scheduler_non_idle(self):
         scheduler = self._decode_scheduler(held=[MagicMock(**{"kv.holds_kv": False})])
+        registry = request_registry_of(scheduler)
 
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(registry.is_fully_idle())
         # The paused flush ignores waiting requests; held ones own no KV.
-        self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
+        self.assertTrue(registry.is_fully_idle(ignore_waiting=True))
 
     def _offloading(self, scheduler, *reqs):
         """Give the decode owner an offload manager with each request's copies
@@ -656,15 +665,16 @@ class TestDecodeQueueCleanup(CustomTestCase):
         manager, (done, live, plain) = self._offloading(
             scheduler, ("done", True, [1, 2]), ("live", False, [3]), ("plain", True, [])
         )
-        scheduler.decoding = [done, live, plain]
+        scheduler.lists.decoding = [done, live, plain]
+        registry = scheduler.request_registry = request_registry_of(scheduler)
 
         # The commit: finished requests leave decoding; the one whose release
         # waits on a copy moves into releasing, the live one keeps decoding.
-        scheduler.leave_finished_reqs(ScheduleSlot())
-        self.assertEqual(scheduler.decoding, [live])
+        scheduler.leave_finished_reqs()
+        self.assertEqual(scheduler.lists.decoding, [live])
         self.assertEqual(owner.releasing, [done])
         assert_one_list_per_request(scheduler)
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(registry.is_fully_idle())
 
         # Its first copy and the live request's land: it waits for the second.
         self._land(manager, 1, 3)
@@ -685,8 +695,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         owner.releasing = [done]
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
+        registry = request_registry_of(scheduler)
 
-        scheduler.abort_request(AbortReq(abort_all=True))
+        registry.abort_request(AbortReq(abort_all=True))
 
         self.assertEqual(owner.releasing, [done])
         manager._release_finished_req.assert_not_called()
@@ -697,27 +708,35 @@ class TestDecodeQueueCleanup(CustomTestCase):
     def test_releasing_requests_keep_scheduler_non_idle(self):
         # A failed transfer held until prefill stops writing its pages.
         scheduler = self._decode_scheduler(releasing=[object()])
+        registry = request_registry_of(scheduler)
 
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(registry.is_fully_idle())
         # The paused flush would clear pages a release frees later.
-        self.assertFalse(scheduler.is_fully_idle(ignore_waiting=True))
+        self.assertFalse(registry.is_fully_idle(ignore_waiting=True))
         # Releasing memory drops the held releases with the pool.
-        self.assertTrue(scheduler.is_fully_idle(ignore_releasing=True))
+        self.assertTrue(registry.is_fully_idle(ignore_releasing=True))
         # The health check reads running requests only.
-        self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
+        self.assertTrue(registry.is_fully_idle(for_health_check=True))
 
     def test_abort_reaches_held_rebootstrap_requests(self):
         held, kept = MagicMock(rid="held-1"), MagicMock(rid="other")
         scheduler = self._decode_scheduler(held=[held, kept])
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
-        scheduler.dllm = None
+        scheduler.mode_owners.dllm = None
         scheduler.ipc_channels = MagicMock()
         release_aborted_request = MagicMock()
-        scheduler.disagg_decode.release_aborted_request = release_aborted_request
-        scheduler.disagg_decode.send_abort_output = scheduler._send_abort_output
+        retirer = RequestRetirer(
+            kv=MagicMock(),
+            beam_coordinator=MagicMock(),
+            output_streamer=MagicMock(),
+            ipc_channels=scheduler.ipc_channels,
+        )
+        retirer.release_aborted_request = release_aborted_request
+        scheduler.disagg_decode.request_retirer = retirer
+        registry = request_registry_of(scheduler)
 
-        scheduler.abort_request(AbortReq(rid="held"))
+        registry.abort_request(AbortReq(rid="held"))
 
         self.assertEqual(
             scheduler.disagg_decode.prealloc_queue.held_rebootstrap_reqs, [kept]
@@ -821,7 +840,9 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.req_to_metadata_buffer_idx_allocator = MagicMock()
             queue.tp_rank = 0
             queue.tree_cache = MagicMock()
-            queue.release_finished_req = tree_release(queue)
+            queue.batch_result_processor = SimpleNamespace(
+                release_finished_req=tree_release(queue)
+            )
             queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()
@@ -829,7 +850,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.enable_decode_hicache = True
             queue.enable_hisparse = False
             queue.output_streamer = MagicMock()
-            queue.metrics_reporter = SimpleNamespace(enable_metrics=False)
+            queue.metrics_sink = SimpleNamespace(enable_metrics=False)
 
             def reduce_with_peer(
                 pollers, group, decode_reqs=None, metadata_buffers=None

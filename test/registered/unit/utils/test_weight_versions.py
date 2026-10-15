@@ -6,7 +6,15 @@ from unittest.mock import patch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.request_lists import CoreLists
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
+from sglang.srt.managers.scheduler_components.request_retirer import make_abort_req
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -18,6 +26,8 @@ from sglang.srt.utils.weight_versions import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell
+from sglang.test.scheduler_request_intake import make_request_intake
+from sglang.test.scheduler_request_lists import request_registry_of
 from sglang.test.test_utils import (
     CustomTestCase,
     enter_scope,
@@ -301,17 +311,28 @@ def _scheduler_stub(
     version, decoding, waiting, chunked=None, hisparse=None, mode=None
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.mode_owners = ModeOwners()
+    scheduler.lists = CoreLists()
     scheduler.serving = _ServingStub(version)
-    scheduler.decoding = decoding
-    scheduler.waiting_queue = waiting
-    scheduler.chunked_req = chunked
+    scheduler.lists.decoding = decoding
+    scheduler.lists.waiting_queue = waiting
+    scheduler.lists.chunked_req = chunked
     scheduler.grammar_manager = SimpleNamespace(grammar_queue=[], abort_requests=None)
-    scheduler.dllm = None
-    scheduler.hisparse_coordinator = hisparse
+    scheduler.mode_owners.dllm = None
+    scheduler.mode_owners.hisparse_coordinator = hisparse
     scheduler.disaggregation_mode = mode or DisaggregationMode.NULL
-    scheduler.disagg_prefill = None
-    scheduler.disagg_decode = None
+    scheduler.mode_owners.disagg_prefill = None
+    scheduler.mode_owners.disagg_decode = None
+    scheduler.request_registry = request_registry_of(scheduler)
     return scheduler
+
+
+def _record_weight_version_change(scheduler, new_version):
+    """Record through the weight updater, over the stub's request registry."""
+    updater = SimpleNamespace(request_registry=scheduler.request_registry)
+    SchedulerWeightUpdaterManager.record_weight_version_change(
+        updater, new_version=new_version
+    )
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
@@ -322,7 +343,10 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             ("get_serving", scheduler.serving),
             ("get_context", _ContextStub(scheduler.serving)),
         ):
-            patcher = patch(f"sglang.srt.managers.scheduler.{name}", return_value=value)
+            patcher = patch(
+                f"sglang.srt.managers.scheduler_components.weight_updater.{name}",
+                return_value=value,
+            )
             patcher.start()
             self.addCleanup(patcher.stop)
         return scheduler
@@ -336,7 +360,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             "v1", [running_req], [waiting_req], chunked=chunked_req
         )
 
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+        _record_weight_version_change(scheduler, new_version="v2")
 
         self.assertEqual(scheduler.serving.weight_version, "v2")
         for req, output_len in (
@@ -355,7 +379,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         coordinator.staging = [staging_req]
         scheduler = self._scheduler("v1", [], [], hisparse=coordinator)
 
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+        _record_weight_version_change(scheduler, new_version="v2")
 
         self.assertEqual(len(staging_req.weight_version_events), 1)
         self.assertEqual(staging_req.weight_version_events[0].old_version, "v1")
@@ -367,16 +391,17 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         retracted_req = _ReqStub(4)
         held_req = _ReqStub(6)
         scheduler = self._scheduler("v1", [], [], mode=DisaggregationMode.DECODE)
-        scheduler.disagg_decode = decode_owner_shell(
+        scheduler.mode_owners.disagg_decode = decode_owner_shell(
             prealloc_queue=SimpleNamespace(
                 queue=[],
                 retracted_queue=[retracted_req],
                 held_rebootstrap_reqs=[held_req],
             ),
-            is_engine_paused=lambda: True,
+            flags=EngineFlags(_engine_paused=True),
         )
+        scheduler.request_registry = request_registry_of(scheduler)
 
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
+        _record_weight_version_change(scheduler, new_version="v2")
 
         for req, output_len in ((retracted_req, 4), (held_req, 6)):
             self.assertEqual(len(req.weight_version_events), 1)
@@ -388,7 +413,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         req = _ReqStub(3)
         scheduler = self._scheduler("v1", [req], [])
 
-        Scheduler.record_weight_version_change(scheduler, new_version="v1")
+        _record_weight_version_change(scheduler, new_version="v1")
 
         self.assertEqual(scheduler.serving.weight_version, "v1")
         self.assertEqual(req.weight_version_events, [])
@@ -398,7 +423,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         req = _ReqStub(3)
         scheduler = self._scheduler("v1", [req], [])
 
-        Scheduler.record_weight_version_change(scheduler, new_version=None)
+        _record_weight_version_change(scheduler, new_version=None)
 
         self.assertEqual(scheduler.serving.weight_version, "v1")
         self.assertEqual(req.weight_version_events, [])
@@ -459,9 +484,9 @@ class TestSpanlessAbortPaths(CustomTestCase):
             trace_ctx=SimpleNamespace(abort=lambda abort_info: None)
         )
         sent = []
-        scheduler = SimpleNamespace(
-            enable_priority_scheduling=False,
-            abort_on_priority_when_disabled=True,
+        enter_scope(self, published_topology())
+        get_context().override("test", abort_on_priority_when_disabled=True)
+        intake = make_request_intake(
             ipc_channels=SimpleNamespace(
                 send_to_tokenizer=SimpleNamespace(
                     send_output=lambda obj, req_arg: sent.append(obj)
@@ -470,10 +495,10 @@ class TestSpanlessAbortPaths(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
             return_value=SimpleNamespace(weight_version="v1"),
         ):
-            accepted = Scheduler._set_or_validate_priority(scheduler, req)
+            accepted = intake._set_or_validate_priority(req)
 
         self.assertFalse(accepted)
         self.assertEqual(
@@ -490,10 +515,10 @@ class TestMakeAbortReq(CustomTestCase):
             WeightVersionEvent(old_version="v1", num_output_tokens=3)
         )
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.scheduler_components.request_retirer.get_serving",
             return_value=SimpleNamespace(weight_version="v2"),
         ):
-            abort_req = _make_abort_req(req)
+            abort_req = make_abort_req(req)
 
         self.assertIsInstance(abort_req, AbortReq)
         self.assertEqual(abort_req.rid, "r0")
