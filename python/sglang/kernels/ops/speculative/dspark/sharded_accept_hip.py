@@ -1,19 +1,14 @@
-"""DSpark rejection sampling with the draft logits on the TP vocab shards.
+"""
+DSpark rejection sampling with the draft logits on the TP vocab shards.
 
 The rule is ``AcceptSampling``'s without block verification: draft token x is
 accepted when u * q(x) < p(x), p and q being the target's and the draft's
 temperature softmax; the first rejection draws the bonus from max(p - q, 0), a
-fully accepted chain from the last row's p. No rank holds the whole draft vocab:
+fully accepted chain from the last row's p.
 
-  1. ``_stats_kernel``: each rank reduces its slice of every verify row to the
-     max and sum-exp of the target and draft logits, plus both logits of the
-     row's draft token when the slice holds it. The ranks exchange these.
-  2. ``_accept_kernel``: every rank merges them into p(x) and q(x) and tests the
-     chain with the same Philox uniforms, so all ranks decide alike; then it
-     races log(mass) + Gumbel noise over its slice of the bonus row. The ranks
-     exchange the block winners, and the draft's finish kernel picks the bonus.
+No rank holds the whole draft vocab.
 
-The bonus follows AcceptSampling's distribution, not its draws.
+The bonus follows AcceptSampling's distribution.
 """
 
 from typing import Callable, Optional
@@ -28,7 +23,6 @@ from sglang.kernels.ops.speculative.dspark.markov_sample import (
 )
 
 _BLOCK = 4096
-# Philox steps the draft never reaches, so these draws repeat none of its own.
 _ACCEPT_STEP, _BONUS_STEP = tl.constexpr(0xFFFFFFFE), tl.constexpr(0xFFFFFFFF)
 
 
@@ -76,9 +70,11 @@ def _stats_kernel(
     GAMMA: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """STATS[r] = (max, sum-exp, logit of x) of the target, then the same of the
-    draft, over this slice of verify row r at temperature; x is the row's draft
-    token, its logits -inf off the slice. The last row has no draft token."""
+    """
+    Row r over this rank's vocab slice, logits divided by the temperature,
+    target then draft: (max logit, sum-exp, drafted token's logit). The drafted
+    token's logit is -inf when another rank holds it.
+    """
     r = tl.program_id(0)
     b, i = r // SLOTS, r % SLOTS
     has_x = i < SLOTS - 1
@@ -129,11 +125,16 @@ def _accept_kernel(
     HAS_CUTOFF: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """For request b and vocab block ``part``: merge the ranks' stats and test
-    the chain (block 0 stores correct_len, trim and a capped chain's bonus in
-    LENS), then race this block of the bonus row, whose mass is max(p - q, 0)
-    after a rejection and p after a full chain."""
+    """
+    For request b and vocab block ``part``:
+    1. merge the ranks' stats into p(x) and q(x)
+    2. find the accepted length, capped by VERIFY_LENS; block 0 writes LENS
+    3. race this block of the bonus row for one bonus candidate; the mass is
+       max(p - q, 0) after a rejection and p after a full chain
+    """
     b, part = tl.program_id(0), tl.program_id(1)
+
+    # 1. Merge the ranks' stats into p(x) and q(x).
     slot = tl.arange(0, SLOTS_P2)
     rank = tl.arange(0, WORLD_P2)
     mask = (slot < SLOTS)[:, None] & (rank < WORLD)[None, :]
@@ -146,6 +147,8 @@ def _accept_kernel(
     )
     p_x = tl.exp(tl.max(tl.load(stats + 2, mask, -float("inf")), 1) - t_m) / t_s
     q_x = tl.exp(tl.max(tl.load(stats + 5, mask, -float("inf")), 1) - d_m) / d_s
+
+    # 2. Accepted length, capped by VERIFY_LENS; block 0 writes LENS.
     u, _, _, _ = _philox(KEY, slot, b, _ACCEPT_STEP, OFFSET)
     ok = (q_x > 0.0) & (tl.uint_to_uniform_float(u) * q_x < p_x)
     accepted = tl.min(tl.where((slot < SLOTS - 1) & ~ok, slot, SLOTS - 1), 0)
@@ -159,6 +162,7 @@ def _accept_kernel(
         tl.store(LENS + BS + b, accepted - capped)
         tl.store(LENS + 2 * BS + b, fixed.to(tl.int32))
 
+    # 3. Race this block of the bonus row for one bonus candidate.
     at = slot == accepted
     t_m, t_s = tl.sum(tl.where(at, t_m, 0.0), 0), tl.sum(tl.where(at, t_s, 0.0), 0)
     d_m, d_s = tl.sum(tl.where(at, d_m, 0.0), 0), tl.sum(tl.where(at, d_s, 0.0), 0)
@@ -200,24 +204,25 @@ def accept_sampling_sharded(
     offset: torch.Tensor,
     verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (correct_len int32, bonus int64, cap_trim_lens int32), each [bs].
+    """
+    Returns (correct_len int32, bonus int64, cap_trim_lens int32), each [bs].
 
-    candidates     [bs, slots]: the anchor, then the draft tokens
-    target_logits  [bs * slots, vocab], whole on every rank
-    draft_logits   [bs, gamma, padded]: this rank's vocab columns
-                   [vocab_start, vocab_start + width), then padding
-    temperatures   [bs] float32 sampling temperatures
+    candidates     [bs, slots]
+    target_logits  [bs * slots, vocab]
+    draft_logits   [bs, gamma, padded]
+    temperatures   [bs]
     key, offset    the draft's Philox key and its block counter
     """
     bs, slots = candidates.shape
     _, gamma, padded = draft_logits.shape
     assert slots - 1 <= gamma and target_logits.stride(1) == 1
     assert candidates.is_contiguous() and draft_logits.is_contiguous()
-    # Philox words go to tokens in quads of global ids.
     assert vocab_start % 4 == 0, vocab_start
+
     device = candidates.device
     parts = triton.cdiv(padded, _BLOCK)
 
+    # Per row, target then draft: (max logit, sum-exp, drafted token's logit)
     stats = torch.empty((bs * slots, 6), dtype=torch.float32, device=device)
     _stats_kernel[(bs * slots,)](
         target_logits,
@@ -237,7 +242,9 @@ def accept_sampling_sharded(
     stats = gather_stacked(stats)
     world = stats.shape[0] // (bs * slots)
 
+    # Rows: (correct_len, cap_trim_lens, bonus token_id if capped else -1)
     lens = torch.empty((3, bs), dtype=torch.int32, device=device)
+    # Per vocab block: (max key, token_id)
     partial = torch.empty((bs, parts * 2), dtype=torch.float32, device=device)
     _accept_kernel[(bs, parts)](
         stats,
