@@ -1510,6 +1510,92 @@ def test_flash_attn_qv_paged_decode_cuda_graph():
     torch.testing.assert_close(replay_lse, eager_lse, rtol=0, atol=0)
 
 
+def _bits(x):
+    # Bitwise view: torch.equal treats +0.0 and -0.0 as equal.
+    return x.contiguous().view(torch.int16)
+
+
+@pytest.mark.skipif(
+    not is_sm100_or_sm110_supported(),
+    reason="flash_attn.cute implements qv on SM100/SM110 only (not SM120).",
+)
+@pytest.mark.parametrize("page_size", [1, 128])
+@pytest.mark.parametrize("nheads", [16, 128])
+def test_flash_attn_qv_deepseek_absorbed_batch_invariant(nheads, page_size):
+    """Deterministic inference runs absorbed MLA on FA4 with num_splits=1 and
+    relies on a request's output bits not depending on the rest of the batch:
+    alone vs. batched with variable-length requests (prefill and decode),
+    one-shot prefill vs. a prefix hit plus extend, and prefill vs. one decode
+    step per token (rollout vs. trainer logprobs in RL). nheads=128 puts one
+    query position in a 128-row tile, nheads=16 puts eight.
+    """
+    from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+        is_batch_invariant,
+        set_batch_invariant,
+    )
+
+    device, dtype = "cuda", torch.bfloat16
+    d, dv, seqlen, prefix = 64, 512, 1000, 300
+    torch.random.manual_seed(nheads + page_size)
+    # (kv_len, q_len) of the other requests: decodes, prefills and extends.
+    others = [(1, 1), (130, 130), (777, 1), (2049, 513), (255, 255), (4100, 1)]
+    kv_lens = [seqlen] + [kv for kv, _ in others]
+    pages = [math.ceil(n / page_size) for n in kv_lens]
+    num_pages = sum(pages) + 1
+    k_pool = torch.randn(num_pages, page_size, 1, d, device=device, dtype=dtype)
+    v_pool = torch.randn(num_pages, page_size, 1, dv, device=device, dtype=dtype)
+    perm = torch.randperm(num_pages - 1, device=device).to(torch.int32) + 1
+    page_table = torch.zeros(len(kv_lens), max(pages), dtype=torch.int32, device=device)
+    for i, start in enumerate(itertools.accumulate([0, *pages[:-1]])):
+        page_table[i, : pages[i]] = perm[start : start + pages[i]]
+    q = [torch.randn(n, nheads, d, device=device, dtype=dtype) for n in kv_lens]
+    qv = [torch.randn(n, nheads, dv, device=device, dtype=dtype) for n in kv_lens]
+
+    def run(rows):
+        """rows: (request, q_start, kv_len); returns each request's output."""
+        q_lens = [kv_len - q_start for _, q_start, kv_len in rows]
+        cu_seqlens_q = torch.tensor(
+            [0, *itertools.accumulate(q_lens)], dtype=torch.int32, device=device
+        )
+        out = flash_attn_with_kvcache(
+            q=torch.cat([q[r][s:kv] for r, s, kv in rows]),
+            k_cache=k_pool,
+            v_cache=v_pool,
+            qv=torch.cat([qv[r][s:kv] for r, s, kv in rows]),
+            page_table=page_table[[r for r, _, _ in rows]],
+            cache_seqlens=torch.tensor(
+                [kv for _, _, kv in rows], dtype=torch.int32, device=device
+            ),
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max(q_lens),
+            causal=True,
+            num_splits=1,
+            ver=4,
+        )
+        return list(out.split(q_lens))
+
+    fillers = [(i + 1, kv - n, kv) for i, (kv, n) in enumerate(others)]
+    was_batch_invariant = is_batch_invariant()
+    set_batch_invariant(True)  # What deterministic inference sets.
+    try:
+        full = run([(0, 0, seqlen)])[0]
+        batched = run(fillers[:3] + [(0, 0, seqlen)] + fillers[3:])[3]
+        assert torch.equal(_bits(batched), _bits(full))
+
+        stage1 = run([(0, 0, prefix)])[0]
+        stage2 = run([(0, prefix, seqlen)])[0]
+        assert torch.equal(_bits(torch.cat([stage1, stage2])), _bits(full))
+
+        decode = torch.cat([run([(0, t, t + 1)])[0] for t in range(seqlen - 4, seqlen)])
+        assert torch.equal(_bits(decode), _bits(full[-4:]))
+
+        decodes = [(r, kv - 1, kv) for r, _, kv in fillers]
+        batched_decode = run(decodes[:2] + [(0, seqlen - 1, seqlen)] + decodes[2:])
+        assert torch.equal(_bits(batched_decode[2]), _bits(full[-1:]))
+    finally:
+        set_batch_invariant(was_batch_invariant)
+
+
 @pytest.mark.skipif(
     not is_sm100_or_sm110_supported(),
     reason="The dedicated hd256 kernel runs on SM100/SM110 only.",
