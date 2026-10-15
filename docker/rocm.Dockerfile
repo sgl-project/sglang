@@ -148,13 +148,14 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 
 # ===============================
-# Shared base for every ROCm 10 flavor. Assemble the stack from
+# Shared ROCm 10 base for gfx942, gfx950 and gfx1250. Assemble the stack from
 # AMD's stable wheels on a plain Ubuntu base so each output image carries only
 # its own GPU device payload.
 # The SDK lands in site-packages instead of /opt/rocm, which the rest of this
 # Dockerfile and AITER both assume, hence the path fixups below.
 #
 # This is deliberately AMD's stable channel, not a prerelease or nightly.
+# Every ROCm/PyTorch artifact below is pinned to an exact release.
 #
 # Python 3.12 (the Ubuntu 24.04 default) rather than 3.13/3.14: st_attn==0.0.7,
 # vsa==0.0.4, petit_kernel==0.0.2 and wave-lang==3.8.2 publish wheels only up to
@@ -352,9 +353,9 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # Base image 1250 with ROCm 10.1.0 and args (Python 3.12 + torch 2.12)
 FROM $BASE_IMAGE_1250_ROCM1010 AS gfx1250-rocm1010
 ENV BUILD_VLLM="0"
-# Keep the SDK's Triton. The source build the rocm1000 flavor uses is past
-# upstream #10833, which dropped the block pointers and triton_kernels that
-# sglang/kernels and the MXFP4 paths still need.
+# Keep the Triton that comes with the SDK. The rocm1000 flavor builds a newer
+# Triton from source, and that one no longer has block pointers or
+# triton_kernels (triton-lang/triton#10833), which sglang still uses.
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
@@ -534,10 +535,11 @@ RUN set -eux; \
 RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
-# Install AMD SMI Python package from ROCm distribution. sglang needs it for the
-# XGMI link-type probe in custom_all_reduce_utils, and no base image or SDK wheel
-# brings it in. ROCm 10.1 still ships share/amd_smi/amdsmi but drops the setup.py
-# beside it, so pip gets a minimal pyproject over the same directory instead.
+# Install AMD SMI Python package from ROCm distribution.
+# Neither the ROCm 7.2 base image (rocm/pytorch) nor the pip-installed ROCm 10.0.0
+# SDK pre-installs this package.
+# ROCm 10.1 ships it without a setup.py, so pip gets a generated pyproject.toml
+# over the same directory instead.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
       *rocm720*|*rocm724*|*rocm1000*|*rocm1010*) \
