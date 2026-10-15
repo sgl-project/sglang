@@ -12,7 +12,7 @@ from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3_5 import Qwen3_5EncoderConfig
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.loader.weight_utils import load_llm_encoder_weights
+from sglang.multimodal_gen.runtime.loader.weight_utils import load_stacked_weight
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextMLP
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
@@ -301,15 +301,15 @@ class Qwen3_5Model(TextEncoder):
         return not name.startswith("visual.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return load_llm_encoder_weights(
-            (
-                (name, weight)
-                for name, weight in weights
-                if self.should_materialize_checkpoint_weight(name)
-            ),
-            dict(self.named_parameters()),
-            (),
-        )
+        params = dict(self.named_parameters())
+        loaded = set()
+        for name, weight in weights:
+            if not self.should_materialize_checkpoint_weight(name):
+                continue
+            if name not in params:
+                raise KeyError(name)
+            loaded.add(load_stacked_weight(name, weight, params, ()))
+        return loaded
 
     @torch.no_grad()
     def forward(

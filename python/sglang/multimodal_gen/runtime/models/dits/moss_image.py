@@ -51,6 +51,7 @@ from sglang.kernels.ops.diffusion import (
     rmsnorm_cast_before_weight_rope_bitexact,
 )
 from sglang.multimodal_gen.configs.models.dits.moss_image import MOSSImageDiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     model_parallel_is_initialized,
@@ -389,7 +390,8 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
     padded tokens cannot influence either text or joint attention.
     """
 
-    _fsdp_shard_conditions = []
+    _fsdp_shard_conditions = [is_layer]
+    _fsdp_forward_methods = ("prepare_conditioning",)
     _compile_conditions = []
     param_names_mapping = {}
     reverse_param_names_mapping = {}
@@ -398,8 +400,12 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.TORCH_SDPA,
     }
 
-    def __init__(self, config: MOSSImageDiTConfig, hf_config=None, **kwargs):
+    def __init__(
+        self, config: MOSSImageDiTConfig, hf_config=None, quant_config=None, **kwargs
+    ):
         super().__init__(config, hf_config or {}, **kwargs)
+        if quant_config is not None:
+            raise NotImplementedError("MOSSImage DiT quantization is not implemented")
         arch = self.config
         dim, ffn_dim, num_heads = arch.dim, arch.ffn_dim, arch.num_heads
         num_layers, text_dim = arch.num_layers, arch.text_dim
