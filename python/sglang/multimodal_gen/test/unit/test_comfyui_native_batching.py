@@ -2,8 +2,6 @@
 """Opt-in native batching: fewer worker requests for a ComfyUI batch."""
 
 import logging
-import sys
-import types
 from types import SimpleNamespace
 from unittest import mock
 
