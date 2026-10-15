@@ -84,15 +84,25 @@ def capture_timing(timer, *intervals):
 
 
 class TestDeviceTimerCapture(unittest.TestCase):
-    def test_unobserved_timer_keeps_original_event_recording(self):
-        with (
-            patch("sglang.srt.utils.device_timer.torch.cuda.Event") as event,
-            patch("sglang.srt.utils.device_timer.torch.cuda.current_stream") as current,
-        ):
-            _TimingInterval.create()
-        current.assert_not_called()
-        event.assert_called_once_with(enable_timing=True)
-        event.return_value.record.assert_called_once_with()
+    def test_intervals_use_selected_device(self):
+        for track_stream in (False, True):
+            with (
+                self.subTest(track_stream=track_stream),
+                patch(
+                    "sglang.srt.utils.device_timer.torch.get_device_module"
+                ) as module,
+            ):
+                device = module.return_value
+                interval = _TimingInterval.create(track_stream=track_stream)
+                interval.end({})
+            self.assertEqual(device.Event.call_count, 2)
+            device.Event.assert_called_with(enable_timing=True)
+            self.assertEqual(device.Event.return_value.record.call_count, 2)
+            self.assertEqual(device.current_stream.call_count, int(track_stream))
+            self.assertIs(
+                interval.stream,
+                device.current_stream.return_value if track_stream else None,
+            )
 
     def test_wrapper_cleans_up_after_exception(self):
         timer = DeviceTimer()
