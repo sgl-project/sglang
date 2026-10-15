@@ -6,7 +6,7 @@ tag: NEW
 
 ## Deployment
 
-The **Docker** commands use the planned public image tag `lmsysorg/sglang:nemotron3-5-super`; that tag is not published yet, so the Docker commands are not part of the GSM8K validation below. The command panel selects either `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` or `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`. Set `HF_TOKEN` in the panel's Env control if the checkpoint requires access.
+The **Docker** commands use `lmsysorg/sglang:nemotron3-5-super`. The command panel selects either `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` or `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`. Set `HF_TOKEN` in the panel's Env control if the checkpoint requires access.
 
 Choose **B200, H200, RTX PRO 6000, or DGX Spark** on one node. B200 offers NVFP4 and BF16. H200 offers BF16; NVFP4 is greyed out. RTX PRO 6000 and DGX Spark offer NVFP4; BF16 is greyed out. Choose `bfloat16` or `float32` in **Mamba SSM DType**; `bfloat16` is the default. **High Throughput** leaves MTP off. **Low Latency** adds EAGLE MTP with top-k 1, three steps, and four draft tokens. These names identify configuration choices; no throughput or latency comparison was measured. Both command tabs use `sglang serve`.
 
@@ -40,9 +40,9 @@ The validation used text-only GSM8K prompts. It does **not** establish image or 
 - **DGX Spark, NVFP4:** both strategies completed 300-question text-only GSM8K runs at TP1 with `bfloat16` Mamba state. The `float32` choice has no completed accuracy run.
 - **KV precision:** these recipes deliberately use `--kv-cache-dtype fp8_e4m3` to match the validated runs. KV precision can affect output quality; no BF16-KV comparison was measured.
 
-Server information confirmed `speculative_algorithm: null` for High Throughput and `EAGLE` for Low Latency. The runs used installed early-access NGC weights, not the Hugging Face checkpoint IDs in the command panel or the planned public Docker image.
+Server information confirmed `speculative_algorithm: null` for High Throughput and `EAGLE` for Low Latency. The runs used installed early-access NGC weights, not the Hugging Face checkpoint IDs in the command panel or the public Docker image.
 
-The Deployment panel’s Benchmark card shows text-only GSM8K accuracy for measured selections and a pending state for unmeasured selections. The existing green Verified status marks a recipe with a completed source-run. These results do not validate the public checkpoint IDs or planned Docker image.
+The Deployment panel’s Benchmark card shows text-only GSM8K accuracy for measured selections and a pending state for unmeasured selections. The existing green Verified status marks a recipe with a completed source-run. These results do not validate the public checkpoint IDs or Docker image.
 
 ## 3. Reasoning output
 
