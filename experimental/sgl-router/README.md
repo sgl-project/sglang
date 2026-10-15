@@ -84,6 +84,29 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### LoRA cache identity
+
+LoRA routing requires workers that publish `BlockStored.lora_name`. Requests
+select the adapter through `model: "base:adapter"` on OpenAI routes, or
+`lora_path` on native routes. Salted generation requests also carry `cache_salt`.
+
+Worker block IDs are opaque and may differ across adapter loads or workers.
+The router derives adapter-aware lookup keys from event tokens and keeps a
+per-worker, per-DP-rank mapping for parent links and removals. Multiple block
+IDs can own the same lookup key; removing one leaves the other owners and
+storage tiers intact. The remote indexer bridge performs the same translation.
+Base-model events retain their existing published-key path.
+
+New replicas request `?include_lora=true` snapshots containing LoRA mappings
+(version 2). Legacy consumers receive a base-only version-1 view, so mixed
+snapshots do not prevent base-cache bootstrap during rolling upgrades. Base-only
+snapshots retain version 1 for every consumer. LoRA stores buffered during bootstrap retain their
+tokens; the original base-model buffering and replay behavior is unchanged.
+
+Reloading different adapter weights under the same public name can still
+credit stale engine blocks until their eviction. Names identify adapters;
+versioned names are needed to distinguish different weights.
+
 ### KV-event gap replay
 
 ZMQ drops KV events at the publisher's high-water mark, and a lost removal
@@ -260,9 +283,10 @@ client sent. The router picks the first of these that applies:
 1. A hash of the sticky routing key or session id, so a conversation keeps
    its rank and router replicas agree.
 2. The rank with the deepest cached prefix in the local KV tree.
-3. The rank with the fewest requests this router has in flight on it.
+3. The rank with the fewest requests this router has in flight on it, or with
+   `--dp-rank-policy round_robin`, the worker's ranks in turn.
 
-In PD mode, decode is ranked by load only. The bootstrap room satisfies
+In PD mode, decode is ranked by step 3 only. The bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
 the prefill rank.
 
@@ -411,10 +435,10 @@ text, as does any model whose template fails to load or render.
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
 re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's, V4.1's
-and Kimi-K3's native encoders and GLM-5.3's template are fixture-verified against
-SGLang's request normalization, so they forward every chat except multimodal ones
-and those with caller-provided `input_ids`. Renderers without that verification
-(HF Jinja templates)
+and Kimi-K3's native encoders and GLM-5.3's and Qwen3.8's templates are
+fixture-verified against SGLang's request normalization, so they forward every
+chat except multimodal ones and those with caller-provided `input_ids`. Renderers
+without that verification (HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
@@ -509,11 +533,11 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3 and Kimi-K3 today), router `--default-chat-template-kwargs`
+`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
-(`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`) or none, and no media yet. Tools are served with `tool_choice`
+(`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`, `qwen3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
-parser the processor reproduces (`deepseekv4`, `deepseekv41`, `kimi_k3`); `required`, named and strict
+parser the processor reproduces (`deepseekv4`, `deepseekv41`, `kimi_k3`, `qwen3_coder`); `required`, named and strict
 tools take a constraint from the engine's xgrammar, so they go to the engine
 (`kimi_k3`'s `auto` tag is reproduced).
 With `--tool-call-parser glm47`, a chat with tools also goes to the engine: its
@@ -595,6 +619,16 @@ so every text chat forwards `input_ids`. Media, a `chat_template` kwarg, `-0` in
 or tool arguments, and U+001C..U+001F in assistant history render on the worker. With
 the cookbook's parsers, chats without tools are served through `/generate`; chats with
 tools keep the engine's route (see above).
+
+## Qwen3.8
+
+Qwen3.8 (Max, 27B and Flash-Next) renders with the checkpoint's `chat_template.jinja`
+through `rust/sglang-processor`, which picks it by its template and builds the
+template context SGLang's Jinja path builds. Every text chat forwards `input_ids`.
+Media, a `chat_template` key in `chat_template_kwargs`, and text or tool numbers
+Python's `trim` or `json.dumps` treat unlike Dynamo's (such as `1e-06`) render on the
+worker. With the cookbook's `qwen3` and `qwen3_coder` parsers, text chats are served
+through `/generate`; thinking follows the template's `enable_thinking` (on by default).
 
 ## Kimi-K3
 
