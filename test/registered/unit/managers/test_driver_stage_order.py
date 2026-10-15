@@ -130,6 +130,9 @@ class _DecodeOwner:
     def commit_prefill_handoff(self, reqs):
         self.shell.log("dd.handoff")
 
+    def check_hicache_events(self):
+        self.shell.log("dd.hicache")
+
     def retracted_rids(self, mb_id):
         self.shell.log("dd.retracted")
         return []
@@ -599,7 +602,8 @@ class TestRingDriverStageOrder(CustomTestCase):
 
     def test_pd_decode(self):
         shell = _RingShell("decode", 2, decode={0: _decode_step("d0")})
-        schedule = ("ingest", "dd.retracted", "dd.poll_prealloc", "dd.poll_transfer")
+        schedule = ("ingest", "dd.hicache", "dd.retracted", "dd.poll_prealloc")
+        schedule += ("dd.poll_transfer",)
 
         # Slot 1 applies the consensus of slot 0, the slot scheduled next,
         # and budgets it against that slot.
