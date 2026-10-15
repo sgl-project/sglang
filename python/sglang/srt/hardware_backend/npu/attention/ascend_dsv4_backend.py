@@ -313,11 +313,16 @@ class CompressorAscendBackendMixin:
                 if bundle is not None
                 else None
             )
-            setattr(
-                fm,
-                f"c{ratio}_loc",
-                bundle_loc.to(torch.int32) if bundle_loc is not None else None,
-            )
+            if bundle_loc is not None:
+                setattr(fm, f"c{ratio}_loc", bundle_loc.to(torch.int32))
+            elif is_npu_arch35():
+                # A5: DP/TP ranks can reach prefill compression without the
+                # scheduler's KV bundle (out_cache_loc_dsv4 absent). The fused
+                # indexer epilog must not raise on a missing slot map there:
+                # an empty loc routes the prefill epilog to a no-op write.
+                setattr(fm, f"c{ratio}_loc", torch.empty(0, dtype=torch.int32, device=device))
+            else:
+                setattr(fm, f"c{ratio}_loc", None)
 
     def _compute_compress_locs(
         self,
