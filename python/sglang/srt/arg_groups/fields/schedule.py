@@ -12,8 +12,22 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    Derived,
 )
 from sglang.srt.utils.common import human_readable_int
+
+
+def max_running_requests_is_explicit_of(cfg) -> bool:
+    from sglang.srt.arg_groups.model_override_base import record_of
+
+    record = record_of(cfg)
+    raw = getattr(record, "_raw_input", None)
+    requested = (
+        raw.get("max_running_requests")
+        if raw is not None
+        else record.max_running_requests
+    )
+    return requested is not None
 
 
 class Schedule(msgspec.Struct):
@@ -32,6 +46,10 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of running requests.",
     ] = None
+    max_running_requests_is_explicit = Derived(
+        doc="Whether the caller supplied a request limit before resolution.",
+        fn="sglang.srt.arg_groups.fields.schedule.max_running_requests_is_explicit_of",
+    )
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
