@@ -15,7 +15,7 @@ import { config } from "/src/snippets/configs/black-forest-labs/flux3.jsx";
 ## 1. Quick start
 
 Use a [SGLang Diffusion Docker environment](/docs/sglang-diffusion/installation).
-For the latest model support, install from `main` inside the container:
+If your image predates FLUX.3 support, update from `main` inside the container:
 
 ```bash
 pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@main#subdirectory=python'
@@ -139,8 +139,9 @@ check, including repeatability and exact restoration after unloading; this does
 not validate every community adapter. For quantized deployments requiring LoRA,
 pass `--lora-path` at startup to select the generic quantized layout. Attaching
 LoRA after PrimsTS weight preparation is rejected before replacing any layers.
-FP8R startup adapters also have a synthetic rank-4 generation check on GB300;
-this does not establish compatibility with arbitrary quantized community adapters.
+FP8R and NVFP4 startup adapters also have synthetic rank-4 generation checks
+on GB300, including repeatability and exact restoration after unloading. These
+do not establish compatibility with arbitrary quantized community adapters.
 
 ## 4. Multi-GPU and memory
 
