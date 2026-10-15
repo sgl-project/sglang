@@ -79,6 +79,7 @@ from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_vocab_exchange import DraftVocabExchange
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -190,6 +191,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         self._rebuild_topk1_chain_buffers()
+        self._draft_vocab_exchange: Optional[DraftVocabExchange] = None
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
@@ -241,6 +243,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        if (
+            envs.SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE.get()
+            and self.topk == 1
+            and self.hot_token_id is None
+        ):
+            self._draft_vocab_exchange = DraftVocabExchange.maybe_create(
+                self.draft_runner.model, self.speculative_num_steps
+            )
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -757,6 +767,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
 
+        exchange = (
+            self._draft_vocab_exchange
+            if draft_tokens_topk1 is not None and topk_index.shape[0] == 1
+            else None
+        )
+
         # Forward multiple steps
         scores = None
         with IndexTopKShareState.mtp_iteration(
@@ -794,6 +810,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     if (c := self.draft_runner.canary_manager) is not None
                     else contextlib.nullcontext()
                 )
+                if exchange is not None:
+                    exchange.begin_step(i)
                 with (
                     forward_context(
                         ForwardContext(
@@ -805,6 +823,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output = self.draft_runner.forward(
                         forward_batch
                     ).logits_output
+                if exchange is not None:
+                    exchange.end()
                 maybe_detect_nan(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
@@ -819,6 +839,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
+                elif exchange is not None:
+                    topk_p, topk_index = exchange.finish_step(
+                        logits_output.next_token_logits,
+                        forward_batch.positions,
+                        draft_tokens_topk1,
+                        i,
+                        i + 1,
+                    )
                 elif self.topk == 1:
                     if _is_cuda or _is_hip:
                         topk_p, topk_index = draft_topk1_postprocess(
@@ -846,7 +874,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
+                    (
+                        exchange.vocab_size
+                        if exchange is not None
+                        else logits_output.next_token_logits.shape[-1]
+                    ),
                     f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
                 )
                 if self.hot_token_id is not None:

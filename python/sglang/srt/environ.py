@@ -557,6 +557,9 @@ class Envs:
     # ===================================================================
     # Single-token bf16 draft MoE as two GEMV passes (routed top-k + shared expert).
     SGLANG_Q35MF_DRAFT_MOE_GEMV = EnvBool(False)
+    # Greedy draft steps select the token on vocab shards and exchange one packed
+    # row (argmax + embedding) instead of all-gathering the logits.
+    SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

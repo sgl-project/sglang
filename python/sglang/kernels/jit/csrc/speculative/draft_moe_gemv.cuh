@@ -268,10 +268,9 @@ SGL_DEVICE void fence_mbarrier_init() {
  * reduce one quarter of the gate or up row against x held in registers.
  *
  * Pair q < kI is shared-expert row i = q (static, issued before the PDL wait);
- * pair q >= kI is routed slot (q - kI) / kI, row (q - kI) % kI. CTA c owns pairs
- * c, c + G, c + 2G, ...
+ * pair q >= kI is routed slot (q - kI) / kI, row (q - kI) % kI.
  */
-template <int kH, int kI, int kTopK, int kStages, bool kUsePDL>
+template <int kH, int kI, int kTopK, int kStages, bool kContig, bool kUsePDL>
 __global__ void __launch_bounds__(288, 1) draft_moe_up_tma_kernel(const DraftMoeUpParams __grid_constant__ p) {
   using namespace device;
   constexpr int kRowBytes = kH * static_cast<int>(sizeof(bf16_t));
@@ -294,7 +293,12 @@ __global__ void __launch_bounds__(288, 1) draft_moe_up_tma_kernel(const DraftMoe
   const int lane = static_cast<int>(get_lane_id());
   const int G = static_cast<int>(gridDim.x);
   const int c = static_cast<int>(blockIdx.x);
-  const int npairs = (kPairsTotal - c + G - 1) / G;
+  // kContig: CTA c owns a contiguous pair range; otherwise pairs c, c + G, ...
+  const int base = kPairsTotal / G;
+  const int rem = kPairsTotal % G;
+  const int q0 = kContig ? c * base + min(c, rem) : c;
+  const int qstep = kContig ? 1 : G;
+  const int npairs = kContig ? base + (c < rem ? 1 : 0) : (kPairsTotal - c + G - 1) / G;
 
   if (threadIdx.x == 0) {
 #pragma unroll
@@ -313,7 +317,7 @@ __global__ void __launch_bounds__(288, 1) draft_moe_up_tma_kernel(const DraftMoe
       int stage = 0;
       uint32_t phase = 0;
       for (int t = 0; t < npairs; ++t) {
-        const int q = c + t * G;
+        const int q = q0 + t * qstep;
         const bf16_t* src;
         if (q < kI) {
           src = p.w13_shared + static_cast<int64_t>(q) * kH;
@@ -388,7 +392,7 @@ __global__ void __launch_bounds__(288, 1) draft_moe_up_tma_kernel(const DraftMoe
   PDLTriggerSecondary<kUsePDL>();
   if (static_cast<int>(threadIdx.x) < npairs) {
     const int t = static_cast<int>(threadIdx.x);
-    const int q = c + t * G;
+    const int q = q0 + t * qstep;
     const float g = draft_moe::round_bf16(((s_part[t][0] + s_part[t][1]) + s_part[t][2]) + s_part[t][3]);
     const float u = draft_moe::round_bf16(((s_part[t][4] + s_part[t][5]) + s_part[t][6]) + s_part[t][7]);
     const int64_t dst = q < kI ? static_cast<int64_t>(kTopK) * kI + q : static_cast<int64_t>(q - kI);
@@ -484,7 +488,105 @@ __global__ void __launch_bounds__(256, 1) draft_moe_down_tma_kernel(const DraftM
   }
 }
 
-template <int kH, int kI, int kTopK, int kPairs, int kDownWarps, int kStages, int kCols, bool kUsePDL>
+/**
+ * \brief Down pass with one mbarrier per weight slice: slices are reduced in
+ * landing order (shared slice first). Each 8-lane group owns one output column,
+ * so a warp reduces four columns per pass with three shuffles.
+ */
+template <int kH, int kI, int kTopK, int kCols, bool kUsePDL>
+__global__ void __launch_bounds__(256, 1) draft_moe_down_v3_kernel(const DraftMoeDownParams __grid_constant__ p) {
+  using namespace device;
+  constexpr int kSlots = kTopK + 1;
+  constexpr int kWarps = 8;
+  constexpr int kGroups = kWarps * 4;
+  constexpr int kChunks = kI / 8;
+  static_assert(kI % 64 == 0, "intermediate size must tile 8 lanes x 16 bytes");
+  constexpr int kPerLane = kChunks / 8;
+  constexpr int kRounds = (kCols + kGroups - 1) / kGroups;
+  using cvec_t = AlignedVector<bf16_t, 8>;
+  constexpr int kSliceBytes = kCols * kI * static_cast<int>(sizeof(bf16_t));
+
+  extern __shared__ __align__(128) uint8_t smem[];
+  __shared__ alignas(16) bf16_t s_act[kSlots * kI];
+  __shared__ uint64_t bar[kSlots];
+  __shared__ float s_d[kSlots][kCols];
+  __shared__ float s_w[kTopK];
+  __shared__ float s_gate;
+
+  const int warp = static_cast<int>(threadIdx.x / kWarpThreads);
+  const int lane = static_cast<int>(get_lane_id());
+  const int grp = warp * 4 + lane / 8;
+  const int gl = lane % 8;
+  const int j0 = static_cast<int>(blockIdx.x) * kCols;
+  const int ncols = min(kCols, kH - j0);
+  const uint32_t bytes = static_cast<uint32_t>(ncols) * kI * sizeof(bf16_t);
+
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int s = 0; s < kSlots; ++s) ptx::mbar_init(&bar[s], 1);
+    draft_moe::fence_mbarrier_init();
+    ptx::mbar_arrive_expect_tx(&bar[kTopK], bytes);
+    draft_moe::bulk_g2s(smem + kTopK * kSliceBytes, p.w2_shared + static_cast<int64_t>(j0) * kI, bytes, &bar[kTopK]);
+  }
+
+  PDLWaitPrimary<kUsePDL>();
+
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int s = 0; s < kTopK; ++s) {
+      const int64_t e = p.topk_ids[s];
+      ptx::mbar_arrive_expect_tx(&bar[s], bytes);
+      draft_moe::bulk_g2s(smem + s * kSliceBytes, p.w2 + (e * kH + j0) * kI, bytes, &bar[s]);
+    }
+  }
+  for (int c = static_cast<int>(threadIdx.x); c < kSlots * kChunks; c += kWarps * kWarpThreads) {
+    cvec_t v;
+    v.load(p.act, c);
+    v.store(s_act, c);
+  }
+  if (threadIdx.x < kTopK) s_w[threadIdx.x] = p.topk_weights[threadIdx.x];
+  if (threadIdx.x == 0) s_gate = p.gate[0];
+  __syncthreads();
+  PDLTriggerSecondary<kUsePDL>();
+
+  for (int it = 0; it < kSlots; ++it) {
+    const int s = it == 0 ? kTopK : it - 1;
+    ptx::mbar_wait_parity(&bar[s], 0);
+    const auto* slice = reinterpret_cast<const bf16_t*>(smem + s * kSliceBytes);
+#pragma unroll
+    for (int r = 0; r < kRounds; ++r) {
+      const int jj = r * kGroups + grp;
+      const int jr = min(jj, ncols - 1);
+      float acc = 0.0f;
+#pragma unroll
+      for (int k = 0; k < kPerLane; ++k) {
+        cvec_t w, a;
+        w.load(slice + jr * kI, gl + 8 * k);
+        a.load(s_act + s * kI, gl + 8 * k);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc = fmaf(cast<fp32_t>(w[e]), cast<fp32_t>(a[e]), acc);
+      }
+      acc += __shfl_xor_sync(0xffffffffu, acc, 4);
+      acc += __shfl_xor_sync(0xffffffffu, acc, 2);
+      acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+      if (gl == 0 && jj < ncols) s_d[s][jj] = acc;
+    }
+  }
+  __syncthreads();
+  if (static_cast<int>(threadIdx.x) < ncols) {
+    const int jj = static_cast<int>(threadIdx.x);
+    float sum = 0.0f;
+#pragma unroll
+    for (int s = 0; s < kTopK; ++s) sum += draft_moe::round_bf16(s_d[s][jj] * s_w[s]);
+    const float routed = draft_moe::round_bf16(sum);
+    const float shared = draft_moe::round_bf16(s_d[kTopK][jj]);
+    float r = s_gate * shared;
+    r += routed;
+    p.out[j0 + jj] = cast<bf16_t>(r);
+  }
+}
+
+template <int kH, int kI, int kTopK, int kPairs, int kDownWarps, int kStages, int kCols, bool kContig, bool kUsePDL>
 struct DraftMoeGemv {
   static_assert(((kTopK + 1) * kI) % kPairs == 0);
   static_assert(kH % kDownWarps == 0);
@@ -586,7 +688,7 @@ struct DraftMoeGemv {
     const uint32_t grid = runtime::get_sm_count(dev.device_id);
     CHECK_HOST(((kTopK + 1) * kI + grid - 1) / grid <= 64) << "too many row pairs per CTA";
     constexpr std::size_t kSmem = static_cast<std::size_t>(kStages) * 2 * kH * sizeof(bf16_t);
-    auto kernel = draft_moe_up_tma_kernel<kH, kI, kTopK, kStages, kUsePDL>;
+    auto kernel = draft_moe_up_tma_kernel<kH, kI, kTopK, kStages, kContig, kUsePDL>;
     static const bool attr_set = [&] {
       RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
       return true;
@@ -625,6 +727,44 @@ struct DraftMoeGemv {
     };
     constexpr std::size_t kSmem = static_cast<std::size_t>(kTopK + 1) * kCols * kI * sizeof(bf16_t);
     auto kernel = draft_moe_down_tma_kernel<kH, kI, kTopK, kCols, kUsePDL>;
+    static const bool attr_set = [&] {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+      return true;
+    }();
+    (void)attr_set;
+    LaunchKernel((kH + kCols - 1) / kCols, 256, device.unwrap(), kSmem).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  static void down_v3(
+      const tvm::ffi::TensorView act,
+      const tvm::ffi::TensorView w2,
+      const tvm::ffi::TensorView w2_shared,
+      const tvm::ffi::TensorView topk_ids,
+      const tvm::ffi::TensorView topk_weights,
+      const tvm::ffi::TensorView gate,
+      const tvm::ffi::TensorView out) {
+    using namespace host;
+    auto E = SymbolicSize{"num_experts"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({kTopK + 1, kI}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(act);
+    TensorMatcher({E, kH, kI}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(w2);
+    TensorMatcher({kH, kI}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(w2_shared);
+    TensorMatcher({1, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    TensorMatcher({1, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(gate);
+    TensorMatcher({1, kH}).with_dtype<bf16_t>().with_device(device).verify(out);
+    const auto params = DraftMoeDownParams{
+        .act = static_cast<const bf16_t*>(act.data_ptr()),
+        .w2 = static_cast<const bf16_t*>(w2.data_ptr()),
+        .w2_shared = static_cast<const bf16_t*>(w2_shared.data_ptr()),
+        .topk_ids = static_cast<const int32_t*>(topk_ids.data_ptr()),
+        .topk_weights = static_cast<const float*>(topk_weights.data_ptr()),
+        .gate = static_cast<const float*>(gate.data_ptr()),
+        .out = static_cast<bf16_t*>(out.data_ptr()),
+    };
+    constexpr std::size_t kSmem = static_cast<std::size_t>(kTopK + 1) * kCols * kI * sizeof(bf16_t);
+    auto kernel = draft_moe_down_v3_kernel<kH, kI, kTopK, kCols, kUsePDL>;
     static const bool attr_set = [&] {
       RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
       return true;

@@ -154,6 +154,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        # Input embedding handed over by the previous greedy draft step, if any.
+        self.draft_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -223,7 +225,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
             if input_embeds is None:
-                input_embeds = self.model.embed_tokens(input_ids)
+                input_embeds = (
+                    self.draft_input_embeds
+                    if self.draft_input_embeds is not None
+                    else self.model.embed_tokens(input_ids)
+                )
 
             hidden_states = forward_batch.spec_info.hidden_states
 
