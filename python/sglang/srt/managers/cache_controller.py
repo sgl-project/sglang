@@ -319,6 +319,7 @@ class HiCacheController:
         self.pp_group = pp_group
         self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.storage_shard_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -426,6 +427,47 @@ class HiCacheController:
                 )
             )
         return groups
+
+    def _shard_group_ranks(self) -> List[int]:
+        me = torch.distributed.get_rank()
+        tp = (
+            torch.distributed.get_process_group_ranks(self.attn_tp_group)
+            if self.attn_tp_group is not None
+            else [me]
+        )
+        cp = (
+            torch.distributed.get_process_group_ranks(self.attn_cp_group)
+            if self.attn_cp_group is not None
+            else [me]
+        )
+        return [c + t - me for c in cp for t in tp]
+
+    def _attach_shard_groups(self) -> None:
+        if not getattr(self.storage_backend, "shard_collective", False):
+            return
+        groups = [None, None]
+        if torch.distributed.is_initialized():
+            from sglang.srt.distributed.parallel_state import (
+                create_custom_parallel_group,
+            )
+
+            ranks = self._shard_group_ranks()
+            groups = [
+                create_custom_parallel_group(group_ranks=ranks, backend="gloo")
+                for _ in range(2)
+            ]
+            if len(ranks) == 1:
+                self._destroy_sync_groups(groups)
+                groups = [None, None]
+            else:
+                self.storage_shard_groups = groups
+        self.storage_backend.set_shard_groups(*groups)
+
+    def _storage_read_barrier(self, go: bool) -> bool:
+        backend = self.storage_backend
+        if not getattr(backend, "shard_collective", False):
+            return go
+        return backend.read_barrier(go)
 
     def _destroy_sync_groups(
         self, groups: List[torch.distributed.ProcessGroup]
@@ -577,6 +619,7 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.storage_host_pool
             )
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            self._attach_shard_groups()
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -635,8 +678,10 @@ class HiCacheController:
                 pass
             self._destroy_sync_groups(self.prefetch_hits_sync_groups)
             self._destroy_sync_groups(self.prefetch_completion_sync_groups)
+            self._destroy_sync_groups(self.storage_shard_groups)
             self.prefetch_hits_sync_groups = []
             self.prefetch_completion_sync_groups = []
+            self.storage_shard_groups = []
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -675,10 +720,13 @@ class HiCacheController:
 
         # Best-effort destroy process groups created for storage ops.
         self._destroy_sync_groups(
-            self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
+            self.prefetch_hits_sync_groups
+            + self.prefetch_completion_sync_groups
+            + self.storage_shard_groups
         )
         self.prefetch_hits_sync_groups = []
         self.prefetch_completion_sync_groups = []
+        self.storage_shard_groups = []
 
         # Best-effort close (some backends rely on GC/destructor).
         try:
@@ -1109,6 +1157,7 @@ class HiCacheController:
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
             if all_success and operation.is_terminated():
                 all_success = False
+            all_success = self._storage_read_barrier(all_success)
             if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
                 batch_host_indices = operation.host_indices[

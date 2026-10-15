@@ -3,6 +3,7 @@
 import enum
 import hashlib
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -239,14 +240,66 @@ class _LogicalPool:
         return None
 
 
-def _config(tp_rank=0, is_mla=False, pull_timeout_ms=30000):
+class _Group:
+    """In-process stand-in for a gloo group: one member per thread."""
+
+    def __init__(self, size):
+        self.size = size
+        self.barrier = threading.Barrier(size, timeout=10)
+        self.vals = [None] * size
+
+    def member(self, rank):
+        return _Member(self, rank)
+
+
+class _Member:
+    def __init__(self, group, rank):
+        self.group, self.rank, self.size = group, rank, group.size
+
+    def bcast(self, tensor):
+        g = self.group
+        if self.rank == 0:
+            g.vals[0] = tensor.clone()
+        g.barrier.wait()
+        tensor.copy_(g.vals[0])
+        g.barrier.wait()
+
+    def min(self, tensor):
+        g = self.group
+        g.vals[self.rank] = tensor.clone()
+        g.barrier.wait()
+        out = torch.stack(g.vals).min(dim=0).values
+        g.barrier.wait()
+        tensor.copy_(out)
+
+
+def _run(fns):
+    out, errors = [None] * len(fns), []
+
+    def call(i):
+        try:
+            out[i] = fns[i]()
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=call, args=(i,)) for i in range(len(fns))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    if errors:
+        raise errors[0]
+    return out
+
+
+def _config(tp_rank=0, is_mla=False, pull_timeout_ms=30000, cp_size=1):
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=2,
         pp_rank=0,
         pp_size=1,
         attn_cp_rank=0,
-        attn_cp_size=1,
+        attn_cp_size=cp_size,
         is_mla_model=is_mla,
         enable_storage_metrics=False,
         is_page_first_layout=True,
@@ -292,7 +345,7 @@ class TestRadixShmemStorage(CustomTestCase):
         storage, _ = self._backend()
         wide = _FakeHostPool(2, token_bytes=2 * TOKEN_BYTES)
         storage.register_mem_host_pool_v2(wide, PoolName.INDEXER)
-        self.assertIsNone(_FakeClient.servers["test"].geometry)
+        self.assertNotIn("test", _FakeClient.servers)
         storage.batch_exists(_keys(1), _info([]))
         self.assertEqual(
             _FakeClient.servers["test"].geometry, (PAGE_SIZE, 2 * PAGE_BYTES)
@@ -345,39 +398,135 @@ class TestRadixShmemStorage(CustomTestCase):
         storage.batch_set_v1(keys, _indices(2), HiCacheStorageExtraInfo())
         self.assertEqual(storage.batch_exists(keys, _info([])), 2)
 
-    def test_rank_salt(self):
-        keys = _keys(2)
-        s0, p0 = self._backend(tp_rank=0)
-        s1, _ = self._backend(tp_rank=1)
-        s0.batch_set_v1(keys, _indices(2), _info([]))
-        self.assertEqual(s0.batch_exists(keys, _info([])), 2)
-        self.assertEqual(s1.batch_exists(keys, _info([])), 0)
-        # Rank-replicated pools share one path.
-        m0, _ = self._backend(tp_rank=0, is_mla=True)
-        m1, _ = self._backend(tp_rank=1, is_mla=True)
-        m0.batch_set_v1(keys, _indices(2), _info([]))
-        self.assertEqual(m1.batch_exists(keys, _info([])), 2)
+    def _group(self, tp=2, cp=1, is_mla=False, pages=8):
+        size = tp * cp
+        write, read = _Group(size), _Group(size)
+        ranks = []
+        for r in range(size):
+            pool = _FakeHostPool(pages)
+            storage = self.cls(_config(tp_rank=r % tp, is_mla=is_mla, cp_size=cp), pool)
+            storage.set_shard_groups(write.member(r), read.member(r))
+            storage.register_mem_pool_host(pool)
+            ranks.append((storage, pool))
+        return ranks
 
-    def test_follower_rank(self):
+    def test_tp_ranks_share_one_slot(self):
         keys = _keys(3)
-        leader, src = self._backend(tp_rank=0, is_mla=True)
-        follower, dst = self._backend(tp_rank=1, is_mla=True, pull_timeout_ms=50)
-        for p in range(3):
-            src.page(p).fill_(p + 1)
-        # A follower never asks the index: every page counts as present and
-        # sglang keeps the minimum over ranks.
-        unknown = _keys(2, "unknown")
-        self.assertEqual(follower.batch_exists(unknown, _info([])), 2)
-        # Nothing stored yet: the follower waits for the leader, then gives up.
-        got = follower.batch_get_v1(keys, _indices(3), _info([]))
-        self.assertEqual(got, [False] * 3)
-        leader.batch_set_v1(keys, _indices(3), _info([]))
-        got = follower.batch_get_v1(keys, _indices(3), _info([]))
-        self.assertEqual(got, [True] * 3)
-        for p in range(3):
-            self.assertTrue(torch.equal(dst.page(p), src.page(p)))
-        with self.assertRaises(RuntimeError):
-            follower.batch_set_v1(keys, _indices(3), _info([]))
+        ranks = self._group(tp=2)
+        for r, (_, pool) in enumerate(ranks):
+            for p in range(3):
+                pool.page(p).fill_(10 * r + p + 1)
+        got = _run(
+            [lambda s=s: s.batch_set_v1(keys, _indices(3), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[True] * 3] * 2)
+        server = _FakeClient.servers["test"]
+        self.assertEqual(server.geometry, (PAGE_SIZE, 2 * PAGE_BYTES))
+        self.assertEqual(len(server.index.paths), 3)
+        leader, follower = ranks[0][0], ranks[1][0]
+        self.assertEqual(leader.batch_exists(keys, _info([])), 3)
+        self.assertEqual(follower.batch_exists(_keys(2, "unknown"), _info([])), 2)
+
+        dsts = [_FakeHostPool(8) for _ in ranks]
+        for (s, _), dst in zip(ranks, dsts):
+            s.register_mem_pool_host(dst)
+        got = _run(
+            [lambda s=s: s.batch_get_v1(keys, _indices(3), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[True] * 3] * 2)
+        for (_, src), dst in zip(ranks, dsts):
+            for p in range(3):
+                self.assertTrue(torch.equal(dst.page(p), src.page(p)))
+
+    def test_cp_ranks_write_once_read_all(self):
+        keys = _keys(2)
+        ranks = self._group(tp=2, cp=2)
+        for r, (_, pool) in enumerate(ranks):
+            pool.buf.fill_(r % 2 + 1 if r < 2 else 99)
+        got = _run(
+            [lambda s=s: s.batch_set_v1(keys, _indices(2), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[True] * 2] * 4)
+        dsts = [_FakeHostPool(8) for _ in ranks]
+        for (s, _), dst in zip(ranks, dsts):
+            s.register_mem_pool_host(dst)
+        got = _run(
+            [lambda s=s: s.batch_get_v1(keys, _indices(2), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[True] * 2] * 4)
+        for r, dst in enumerate(dsts):
+            self.assertTrue(torch.all(dst.page(0) == r % 2 + 1))
+
+    def test_replicated_pool_written_by_leader(self):
+        keys = _keys(3)
+        ranks = self._group(tp=2, is_mla=True)
+        ranks[0][1].buf.fill_(7)
+        self.assertEqual(
+            ranks[0][0].batch_set_v1(keys, _indices(3), _info([])), [True] * 3
+        )
+        self.assertEqual(
+            ranks[1][0].batch_set_v1(keys, _indices(3), _info([])), [True] * 3
+        )
+        self.assertEqual(_FakeClient.servers["test"].geometry, (PAGE_SIZE, PAGE_BYTES))
+        dsts = [_FakeHostPool(8) for _ in ranks]
+        for (s, _), dst in zip(ranks, dsts):
+            s.register_mem_pool_host(dst)
+        got = _run(
+            [lambda s=s: s.batch_get_v1(keys, _indices(3), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[True] * 3] * 2)
+        for dst in dsts:
+            self.assertTrue(torch.all(dst.buf[: 3 * PAGE_BYTES] == 7))
+
+    def test_group_read_is_all_or_nothing_per_page(self):
+        keys = _keys(4)
+        ranks = self._group(tp=2)
+        _run(
+            [
+                lambda s=s: s.batch_set_v1(keys[:2], _indices(2), _info([]))
+                for s, _ in ranks
+            ]
+        )
+        got = _run(
+            [lambda s=s: s.batch_get_v1(keys, _indices(4), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[True, True, False, False]] * 2)
+
+        def broken(storage):
+            storage._copy = mock.Mock(side_effect=RuntimeError("copy"))
+            return storage.batch_get_v1(keys[:2], _indices(2), _info([]))
+
+        got = _run(
+            [
+                lambda: ranks[0][0].batch_get_v1(keys[:2], _indices(2), _info([])),
+                lambda: broken(ranks[1][0]),
+            ]
+        )
+        self.assertEqual(got, [[False, False]] * 2)
+
+    def test_failed_copy_is_not_published(self):
+        keys = _keys(2)
+        ranks = self._group(tp=2)
+        ranks[1][0]._copy = mock.Mock(side_effect=RuntimeError("copy"))
+        got = _run(
+            [lambda s=s: s.batch_set_v1(keys, _indices(2), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[False] * 2] * 2)
+        index = _FakeClient.servers["test"].index
+        self.assertEqual(index.paths, {})
+        self.assertEqual(len(index.free), NUM_SLOTS)
+
+    def test_read_barrier(self):
+        ranks = self._group(tp=2)
+        got = _run(
+            [
+                lambda: ranks[0][0].read_barrier(True),
+                lambda: ranks[1][0].read_barrier(False),
+            ]
+        )
+        self.assertEqual(got, [False, False])
+        got = _run([lambda s=s: s.read_barrier(True) for s, _ in ranks])
+        self.assertEqual(got, [True, True])
 
     def test_kv_derived_sidecar(self):
         storage, pool = self._backend()
@@ -469,6 +618,29 @@ class TestRadixShmemStorage(CustomTestCase):
 
 
 class TestRadixShmemConfig(CustomTestCase):
+    def test_shard_group_ranks(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        ctl = HiCacheController.__new__(HiCacheController)
+        ctl.attn_tp_group, ctl.attn_cp_group = "tp", "cp"
+        groups = {"tp": [5, 6, 7, 4], "cp": [2, 6, 10, 14]}
+        with (
+            mock.patch("torch.distributed.get_rank", return_value=6),
+            mock.patch(
+                "torch.distributed.get_process_group_ranks", side_effect=groups.get
+            ),
+        ):
+            ranks = ctl._shard_group_ranks()
+        self.assertEqual(sorted(ranks), list(range(0, 16)))
+        ctl.attn_cp_group = None
+        with (
+            mock.patch("torch.distributed.get_rank", return_value=6),
+            mock.patch(
+                "torch.distributed.get_process_group_ranks", side_effect=groups.get
+            ),
+        ):
+            self.assertEqual(sorted(ctl._shard_group_ranks()), [4, 5, 6, 7])
+
     def test_prefix_keys_forced_on(self):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
