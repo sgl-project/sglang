@@ -2279,6 +2279,67 @@ class UnifiedRadixCacheSuite:
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    def test_swa_unfinished_req_repoints_whole_insert_below_window(self):
+        # A request whose live SWA tail inside the inserted range is shorter
+        # than the window must still end up protected for the whole insert:
+        # the tree owns those slots now, and a shorter protected length lets
+        # the request free tree-owned SWA pages and re-insert them at finish.
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        full_avail = allocator.full_attn_allocator.available_size()
+        swa_avail = allocator.swa_attn_allocator.available_size()
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 8)
+        # Live SWA is [6, 8): two tokens, below the window of four.
+        evicted_len = 6
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.extend_end = len(req.full_untruncated_fill_ids)
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.kv.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        # The window already slid past [0, 6): those SWA slots are freed.
+        allocator.free_swa(kv_indices[:evicted_len])
+        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
+
+        cache.checkpoint(req, up_to=req.extend_end)
+
+        inserted = len(tokens) - (1 if self.cfg.is_eagle else 0)
+        self.assertEqual(req.kv.cache_protected_len, inserted)
+        torch.testing.assert_close(
+            req_to_token_pool.req_to_token[req.kv.req_pool_idx, : len(tokens)],
+            kv_indices,
+            check_dtype=False,
+        )
+        # A fresh matcher still needs a full live window and gets nothing.
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(m.device_prefix_len, 0)
+
+        finish_req(cache, req, len(tokens))
+        req.kv.mark_kv_released()
+        cache.sanity_check()
+        # Everything the request held is now tree-owned exactly once.
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size()
+            + cache.full_evictable_size(),
+            full_avail,
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size() + cache.swa_evictable_size(),
+            swa_avail,
+        )
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
@@ -5367,7 +5428,7 @@ class UnifiedRadixCacheSuite:
         cons.sanity_check()
 
     def test_buffer_only_load_back_uses_full_behind_swa_tombstone(self):
-        """FULL-only rematch keeps resident FULL and loads the complete SWA window."""
+        """FULL-only rematch keeps resident FULL and repairs missing SWA rows."""
         self._skip_unsupported_hicache_test()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
@@ -5462,12 +5523,13 @@ class UnifiedRadixCacheSuite:
         dispatched = {}
 
         def capture_swa_mapping():
-            load = next(iter(cons.buffer_pipeline.ongoing_buffer_load_back.values()))
-            swa_xfer = next(t for t in load.aux_xfers if t.name == PoolName.SWA)
+            load = cons.cache_controller.load_queue[-1]
+            swa_xfer = next(t for t in load.pool_transfers if t.name == PoolName.SWA)
             dispatched["device"] = swa_xfer.device_indices.clone()
-            full_window = masked_full[-len(swa_xfer.device_indices) :]
-            old_window = mapping_before[-len(swa_xfer.device_indices) :]
-            expected = torch.where(old_window > 0, old_window, swa_xfer.device_indices)
+            full_window = masked_full[-window_tokens:]
+            old_window = mapping_before[-window_tokens:]
+            expected = old_window.clone()
+            expected[old_window <= 0] = swa_xfer.device_indices
             self.assertTrue(
                 torch.equal(
                     cons_alloc.full_to_swa_index_mapping[full_window],
@@ -5485,7 +5547,7 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(int(spliced.numel()), 0)
         self.assertEqual(req.prefix_len, len(seq), "FULL rematch was lost")
-        self.assertEqual(len(dispatched["device"]), window_tokens)
+        self.assertEqual(len(dispatched["device"]), window_tokens - live_tail)
         self.assertEqual(cons_alloc.full_available_size(), full_avail0)
         k, v = self._snapshot_full_kv(cons_alloc, masked_full)
         self.assertTrue(torch.equal(k, masked_kv[0]))
