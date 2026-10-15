@@ -185,7 +185,7 @@ class LRUFileEvictor:
         concurrent ``reserve`` won't evict it before the file is committed; the
         caller must then call ``commit`` (write landed) or ``abort`` (write
         failed). Returns ``False`` -- reserving nothing -- when the write is
-        refused: this rank is not the storage owner, the value is larger than
+        refused: this rank does not own the key's namespace, the value exceeds
         the cap, there is no evictable space, or the free-space watermark cannot
         be met. When eviction is not configured the write is always admitted.
         """

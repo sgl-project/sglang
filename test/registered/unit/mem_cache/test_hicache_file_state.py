@@ -219,6 +219,11 @@ class TestFileRecurrentState(CustomTestCase):
                 replica = self.backend(replica_config)
                 replica.register_mem_host_pool_v2(state, PoolName.MAMBA)
                 self.assertTrue(replica._evictor.is_storage_owner)
+                # Reading shared KV must not make it a replica eviction candidate.
+                torch.testing.assert_close(
+                    replica.get("kv", torch.empty(size, dtype=torch.uint8)),
+                    torch.ones(size, dtype=torch.uint8),
+                )
                 self.assertFalse(replica.set("unowned-kv", torch.ones(1)))
                 for key in ("old", "new"):
                     transfer = PoolTransfer(

@@ -76,6 +76,9 @@ model namespaces are compacted to fit filesystem filename limits and also start
 with a cold cache. With file eviction enabled, each rank manages its own state
 files; the MLA KV writer also manages the shared KV files. The `max_size` limit
 applies to each rank's owned files, not to the total shared-directory size.
+If you change TP size or the namespace is compacted, old state files no longer
+count toward any active rank's cap and are not evicted; use a new storage
+directory or remove the obsolete files.
 
 ### Prefetch Policies
 
