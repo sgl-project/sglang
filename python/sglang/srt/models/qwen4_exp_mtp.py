@@ -28,6 +28,16 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
     def load_weights(self, weights, is_mtp=False):
         from sglang.srt.layers.hyperconnection import GatedResidual
 
+        if any(getattr(p, "hc_merged_down_inject", False) for p in self.parameters()):
+            weights = (
+                (
+                    name.replace(
+                        ".block_inject_weight.weight", ".input_mix_weight_down.weight"
+                    ),
+                    tensor,
+                )
+                for name, tensor in weights
+            )
         loaded = super().load_weights(weights, is_mtp=is_mtp)
         for module in self.modules():
             if isinstance(module, GatedResidual):

@@ -2,6 +2,7 @@
 
 import io
 import unittest
+from itertools import permutations
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -10,6 +11,10 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.elementwise.hc_sum_state import HCSumState, SmallTSumHCShell
 from sglang.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
+from sglang.srt.layers.hyperconnection_packed import (
+    PackedGatedResidual,
+    create_gated_residual,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -32,7 +37,7 @@ def _checkpoint(h, lowrank, dtype, seed=311):
 
 
 def _layer(h, lowrank, dtype, *, combine=True, eps=1e-6, meta=False):
-    layer = GatedResidual(
+    layer = create_gated_residual(
         HyperConnectionConfig(
             hc_count=4,
             hidden_size=h,
@@ -42,11 +47,30 @@ def _layer(h, lowrank, dtype, *, combine=True, eps=1e-6, meta=False):
             params_dtype=dtype,
         ),
         use_combine=combine,
-        packed_weights=True,
     )
     if not meta:
         layer.to(device="cuda", dtype=dtype)
     return layer.eval().requires_grad_(False)
+
+
+def _native_checkpoint(checkpoint):
+    down = checkpoint["input_mix_weight_down.weight"]
+    inject = checkpoint["block_inject_weight.weight"]
+    norm = checkpoint["hc_norm.weight"]
+    lowrank, width = down.shape
+    h = width // 4
+    npad = (lowrank + 4 + 7) // 8 * 8
+    folded = torch.zeros((npad, width), dtype=down.dtype, device=down.device)
+    folded[: lowrank + 4] = (torch.cat((down, inject)).float() * (1 + norm.float())).to(
+        down.dtype
+    )
+    return {
+        "input_mix_weight_down.weight": folded.view(npad, 4, h)
+        .permute(1, 0, 2)
+        .contiguous(),
+        "hc_norm.weight": norm.view(4, h).T.contiguous(),
+        "input_mix_weight_up.weight": checkpoint["input_mix_weight_up.weight"],
+    }
 
 
 def _reference_mix(state, checkpoint, eps):
@@ -197,7 +221,7 @@ class TestHCSumState(CustomTestCase):
             legacy = GatedResidual(config)
             self.assertFalse(legacy.prepare_sum_state_weights())
             self.assertIsNone(legacy._sum_operators)
-            final = GatedResidual(config, use_combine=False, packed_weights=True)
+            final = create_gated_residual(config, use_combine=False)
             self.assertFalse(final._packed_sum_weights)
             for dtype in (torch.bfloat16, torch.float16):
                 for h, lowrank in ((512, 64), (2560, 320)):
@@ -517,16 +541,29 @@ class TestHCSumState(CustomTestCase):
                             if route == "loader":
                                 parameters = dict(layer.named_parameters())
                                 for name, value in checkpoint.items():
+                                    name = name.replace(
+                                        "block_inject_weight.weight",
+                                        "input_mix_weight_down.weight",
+                                    )
                                     param = parameters[name]
                                     param.weight_loader(param, value)
                                 layer.prepare_sum_state_weights()
                             elif route == "direct":
                                 _model_load_weights_direct(
                                     model,
-                                    [("hc." + k, v) for k, v in checkpoint.items()],
+                                    [
+                                        ("hc." + k, v)
+                                        for k, v in _native_checkpoint(
+                                            checkpoint
+                                        ).items()
+                                    ],
                                 )
                             else:
-                                layer.load_state_dict(checkpoint)
+                                layer.begin_sum_state_update()
+                                for name, value in checkpoint.items():
+                                    layer.load_state_dict({name: value}, strict=False)
+                                    self.assertTrue(layer._sum_weights_dirty)
+                                layer.finish_sum_state_update()
                             current = layer._sum_operators[0].weights
                             self.assertEqual(
                                 (current.up.data_ptr(), current.scratch.data_ptr()),
@@ -656,12 +693,23 @@ class TestHCSumState(CustomTestCase):
                 norm.untyped_storage().data_ptr(),
                 layer._hc_packed_norm.untyped_storage().data_ptr(),
             )
-        for name in (
-            "input_mix_weight_down.weight",
-            "block_inject_weight.weight",
-            "hc_norm.weight",
-        ):
-            self.assertEqual(dict(layer.named_parameters())[name].device.type, "cpu")
+        parameters = dict(layer.named_parameters())
+        self.assertEqual(
+            set(parameters),
+            {
+                "input_mix_weight_down.weight",
+                "hc_norm.weight",
+                "input_mix_weight_up.weight",
+            },
+        )
+        self.assertTrue(all(parameter.is_cuda for parameter in parameters.values()))
+        self.assertEqual(
+            parameters["input_mix_weight_down.weight"].data_ptr(),
+            layer._hc_packed_down.data_ptr(),
+        )
+        self.assertEqual(
+            parameters["hc_norm.weight"].data_ptr(), layer._hc_packed_norm.data_ptr()
+        )
         # Check the physical pack against the checkpoint, including gamma=0.
         h = layer.hidden_size
         lowrank = layer.config.hc_lowrank
@@ -713,11 +761,10 @@ class TestHCSumState(CustomTestCase):
             layer.load_state_dict(checkpoint)
             self.check_storage(layer, checkpoint)
             state = layer.state_dict()
-            self.assertEqual(set(state), set(checkpoint))
+            native = _native_checkpoint(checkpoint)
+            self.assertEqual(set(state), set(native))
             for name, value in state.items():
-                torch.testing.assert_close(
-                    value.cpu(), checkpoint[name], rtol=0, atol=0
-                )
+                torch.testing.assert_close(value.cpu(), native[name], rtol=0, atol=0)
             buffer = io.BytesIO()
             torch.save(state, buffer)
             buffer.seek(0)
@@ -729,8 +776,9 @@ class TestHCSumState(CustomTestCase):
             # Presharded/sharded loaders copy tensors without invoking the
             # weight_loader or load_state_dict hooks. Force must refresh them.
             replacement = _checkpoint(h, lowrank, dtype, seed=419)
+            native_replacement = _native_checkpoint(replacement)
             for name, tensor in restored.state_dict().items():
-                tensor.copy_(replacement[name])
+                tensor.copy_(native_replacement[name])
             self.assertFalse(restored._sum_weights_dirty)
             restored.prepare_sum_state_weights(force=True)
             self.check_storage(restored, replacement)
@@ -747,10 +795,17 @@ class TestHCSumState(CustomTestCase):
         checkpoint = _checkpoint(h, lowrank, dtype)
         model = torch.nn.Module()
         model.hc = _layer(h, lowrank, dtype)
-        # Real parameter loaders, with RMS last, followed by one transaction end.
-        parameters = dict(model.hc.named_parameters())
-        for name, value in checkpoint.items():
-            parameters[name].weight_loader(parameters[name], value)
+
+        def load_raw(values):
+            parameters = dict(model.hc.named_parameters())
+            for name, value in values.items():
+                name = name.replace(
+                    "block_inject_weight.weight", "input_mix_weight_down.weight"
+                )
+                parameter = parameters[name]
+                parameter.weight_loader(parameter, value)
+
+        load_raw(checkpoint)  # RMS arrives last.
         model.hc.prepare_sum_state_weights()
         self.check_storage(model.hc, checkpoint)
         model.other = torch.nn.Parameter(
@@ -759,59 +814,184 @@ class TestHCSumState(CustomTestCase):
         model.other.weight_loader = Mock(
             side_effect=AssertionError("non-HC loader must not be called")
         )
-        pair = {
-            name: checkpoint[name] * 0.75
-            for name in ("input_mix_weight_down.weight", "block_inject_weight.weight")
-        }
+        replacement = _checkpoint(h, lowrank, dtype, seed=419)
         _model_load_weights_direct(
             model,
             [("other", torch.ones_like(model.other))]
-            + [("hc." + name, value) for name, value in pair.items()],
+            + [
+                ("hc." + name, value)
+                for name, value in _native_checkpoint(replacement).items()
+            ],
         )
-        checkpoint.update(pair)
+        checkpoint = replacement
         self.check_storage(model.hc, checkpoint)
+        model.other.weight_loader.assert_not_called()
         torch.testing.assert_close(
             model.other, torch.ones_like(model.other), rtol=0, atol=0
         )
-        model.other.weight_loader.assert_not_called()
-        checkpoint["hc_norm.weight"] = checkpoint["hc_norm.weight"] + 0.125
+        replacement = _checkpoint(h, lowrank, dtype, seed=450)
         _model_load_weights_direct(
-            model, [("hc.hc_norm.weight", checkpoint["hc_norm.weight"])]
+            model, [("hc." + name, value) for name, value in replacement.items()]
         )
+        checkpoint = replacement
         self.check_storage(model.hc, checkpoint)
-        # Up's ordinary nn.Linear state_dict load bypasses its weight_loader;
-        # the parent hook must still refresh the small-T derived layout.
+
+        # Raw updates may span buckets in either order; defer folding until end.
+        projection_names = (
+            "input_mix_weight_down.weight",
+            "block_inject_weight.weight",
+        )
+        for index, order in enumerate((projection_names, projection_names[::-1])):
+            replacement = _checkpoint(h, lowrank, dtype, seed=501 + index)
+            model.hc.begin_sum_state_update()
+            load_raw({order[0]: replacement[order[0]]})
+            self.assertFalse(model.hc.prepare_sum_state_weights())
+            with self.assertRaisesRegex(ValueError, "Down and Inject"):
+                model.hc.validate_sum_state_weights()
+            with self.assertRaisesRegex(ValueError, "prepared weights"):
+                model.hc.mix(self.tensor((1, 4 * h), dtype))
+            load_raw({order[1]: replacement[order[1]]})
+            # A later RMS must still be applied to RAW, never already-folded data.
+            load_raw({"hc_norm.weight": replacement["hc_norm.weight"]})
+            model.hc.validate_sum_state_weights()
+            model.hc.finish_sum_state_update()
+            checkpoint.update(
+                {
+                    name: replacement[name]
+                    for name in (*projection_names, "hc_norm.weight")
+                }
+            )
+            self.check_storage(model.hc, checkpoint)
+
+        # Native buckets carry already-folded storage; no folding on completion.
+        replacement = _checkpoint(h, lowrank, dtype, seed=611)
+        model.hc.begin_sum_state_update()
+        for name, value in _native_checkpoint(replacement).items():
+            _model_load_weights_direct(model, [("hc." + name, value)])
+        model.hc.finish_sum_state_update()
+        checkpoint = replacement
+        self.check_storage(model.hc, checkpoint)
         up_name = "input_mix_weight_up.weight"
         checkpoint[up_name] = checkpoint[up_name] * 2
         model.hc.load_state_dict({up_name: checkpoint[up_name]}, strict=False)
         self.check_storage(model.hc, checkpoint)
-        for t in (24, 25):
-            self.step(model.hc, self.tensor((t, 4 * h), dtype), checkpoint)
+
+        saved_norm = model.hc.hc_norm.weight.clone()
+        with self.assertRaisesRegex(ValueError, "RMS update requires"):
+            model.hc.load_state_dict(
+                {"hc_norm.weight": checkpoint["hc_norm.weight"] + 1}, strict=False
+            )
+        torch.testing.assert_close(model.hc.hc_norm.weight, saved_norm, rtol=0, atol=0)
         with self.assertRaisesRegex(ValueError, "Down and Inject"):
             model.hc.load_state_dict(
-                {"block_inject_weight.weight": pair["block_inject_weight.weight"]},
-                strict=False,
+                {projection_names[0]: checkpoint[projection_names[0]]}, strict=False
             )
-        names = tuple(pair)
-        for scale, order in enumerate((names, names[::-1]), start=2):
-            with self.subTest(first=order[0]):
-                updated = {name: value * scale for name, value in pair.items()}
-                _model_load_weights_direct(
-                    model, [("hc." + order[0], updated[order[0]])]
-                )
-                with self.assertRaisesRegex(ValueError, "Down and Inject"):
-                    model.hc.validate_sum_state_weights()
-                with self.assertRaisesRegex(ValueError, "prepared weights"):
-                    model.hc.mix(self.tensor((1, 4 * h), dtype))
+        # Failed non-session loads must permit a new COMPLETE update, without
+        # pretending the partially overwritten packed tensor is still usable.
+        load_raw({projection_names[0]: checkpoint[projection_names[0]]})
+        with self.assertRaisesRegex(ValueError, "Down and Inject"):
+            model.hc.prepare_sum_state_weights()
+        model.hc.begin_sum_state_update()
+        self.assertFalse(model.hc._hc_weights_ready)
+        load_raw(checkpoint)
+        model.hc.finish_sum_state_update()
+        self.check_storage(model.hc, checkpoint)
+        for t in (24, 25):
+            self.step(model.hc, self.tensor((t, 4 * h), dtype), checkpoint)
 
-                _model_load_weights_direct(
-                    model, [("hc." + order[1], updated[order[1]])]
-                )
-                model.hc.validate_sum_state_weights()
-                checkpoint.update(updated)
-                self.check_storage(model.hc, checkpoint)
-                for t in (24, 25):
-                    self.step(model.hc, self.tensor((t, 4 * h), dtype), checkpoint)
+    @torch.no_grad()
+    def test_grouped_rms_update_buckets(self):
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            _model_load_weights_direct,
+        )
+
+        h, lowrank = 512, 8
+        names = (
+            "input_mix_weight_down.weight",
+            "block_inject_weight.weight",
+            "hc_norm.weight",
+        )
+        update_seed = 717
+        for dtype in (torch.bfloat16, torch.float16):
+            layer = _layer(h, lowrank, dtype)
+            checkpoint = _checkpoint(h, lowrank, dtype)
+            layer.load_state_dict(checkpoint)
+            model = torch.nn.Module()
+            model.hc = layer
+            for native in (False, True):
+                orders = permutations((names[0], names[2]) if native else names)
+                for order in orders:
+                    for route in ("loader", "direct", "state_dict"):
+                        with self.subTest(
+                            dtype=dtype, native=native, order=order, route=route
+                        ):
+                            replacement = _checkpoint(
+                                h, lowrank, dtype, seed=update_seed
+                            )
+                            update_seed += 1
+                            replacement["input_mix_weight_up.weight"] = checkpoint[
+                                "input_mix_weight_up.weight"
+                            ]
+                            payload = (
+                                _native_checkpoint(replacement)
+                                if native
+                                else replacement
+                            )
+                            pointers = tuple(p.data_ptr() for p in layer.parameters())
+                            with patch.object(
+                                layer,
+                                "_fold_checkpoint_weights",
+                                wraps=layer._fold_checkpoint_weights,
+                            ) as fold:
+                                layer.begin_sum_state_update()
+                                for index, name in enumerate(order):
+                                    if route == "state_dict":
+                                        layer.load_state_dict(
+                                            {name: payload[name]}, strict=False
+                                        )
+                                    elif route == "direct":
+                                        _model_load_weights_direct(
+                                            model, [("hc." + name, payload[name])]
+                                        )
+                                    else:
+                                        target = name.replace(names[1], names[0])
+                                        parameter = dict(layer.named_parameters())[
+                                            target
+                                        ]
+                                        parameter.weight_loader(
+                                            parameter, payload[name]
+                                        )
+                                        self.assertFalse(
+                                            layer.prepare_sum_state_weights()
+                                        )
+                                    self.assertTrue(layer._sum_weights_dirty)
+                                    self.assertTrue(layer._hc_update_open)
+                                    fold.assert_not_called()
+                                    with self.assertRaisesRegex(
+                                        ValueError, "prepared weights"
+                                    ):
+                                        layer.mix(self.tensor((1, 4 * h), dtype))
+                                    # Missing required inputs fail only at completion,
+                                    # preserving the session so the next bucket can arrive.
+                                    if name == names[2] and index < len(order) - 1:
+                                        with self.assertRaisesRegex(ValueError, "Down"):
+                                            layer.finish_sum_state_update()
+                                        self.assertTrue(layer._hc_update_open)
+                                        self.assertTrue(layer._sum_weights_dirty)
+                                layer.finish_sum_state_update()
+                                self.assertEqual(fold.call_count, 0 if native else 1)
+                            self.assertFalse(layer._sum_weights_dirty)
+                            self.assertFalse(layer._hc_update_open)
+                            self.assertEqual(
+                                tuple(p.data_ptr() for p in layer.parameters()),
+                                pointers,
+                            )
+                            self.check_storage(layer, replacement)
+                            for t in (24, 25):
+                                self.step(
+                                    layer, self.tensor((t, 4 * h), dtype), replacement
+                                )
+                            checkpoint = replacement
 
     @torch.no_grad()
     def test_ipc_restore_rebinds_without_repacking(self):
@@ -854,8 +1034,8 @@ class TestHCSumState(CustomTestCase):
                 return_value=None,
             ),
             patch.object(
-                GatedResidual,
-                "_prepare_packed_sum_state_weights",
+                PackedGatedResidual,
+                "prepare_sum_state_weights",
                 side_effect=AssertionError("IPC must not repack shared weights"),
             ),
         ):
@@ -871,50 +1051,65 @@ class TestHCSumState(CustomTestCase):
             self.step(imported[0], self.tensor((t, 4 * h), dtype), checkpoint)
 
     @torch.no_grad()
-    def test_nccl_staging_preserves_checkpoint_storage(self):
-        from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-            broadcast_weights,
+    def test_native_export_and_offload_residency(self):
+        from sglang.srt.model_executor.model_runner_components.weight_exporter import (
+            WeightExporter,
+        )
+        from sglang.srt.utils.offloader import _get_resident_parameter_ids
+
+        layer = _layer(512, 8, torch.bfloat16)
+        layer.load_state_dict(_checkpoint(512, 8, torch.bfloat16))
+        group = object()
+        exporter = WeightExporter(
+            tp_rank=0,
+            tp_size=1,
+            gpu_id=0,
+            get_model_path=lambda: "",
+            get_model=lambda: layer,
+            _weights_send_group={"native_33001_0": group},
+        )
+        before = [(p.device, p.data_ptr()) for p in layer.parameters()]
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.broadcast") as broadcast,
+            patch("torch.distributed.distributed_c10d.destroy_process_group"),
+        ):
+            success, message = exporter.send_weights_to_remote_instance(
+                "127.0.0.1", "33001", "native"
+            )
+        self.assertTrue(success, message)
+        parameters = list(layer.parameters())
+        self.assertEqual(broadcast.call_count, len(parameters))
+        for parameter, call in zip(parameters, broadcast.call_args_list):
+            self.assertIs(call.args[0], parameter)
+            self.assertTrue(parameter.is_cuda)
+            self.assertIs(call.kwargs["group"], group)
+        self.assertEqual(before, [(p.device, p.data_ptr()) for p in parameters])
+        self.assertEqual(
+            _get_resident_parameter_ids(layer), {id(p) for p in parameters}
         )
 
-        # Exercise real H2D/D2H copies, but stub the collective itself: no
-        # process group or peer is needed to test the new staging contract.
-        model = _layer(512, 8, torch.bfloat16)
-        checkpoint = _checkpoint(512, 8, torch.bfloat16)
-        model.load_state_dict(checkpoint)
-        before = [(p.device, p.data_ptr()) for p in model.parameters()]
-        group = object()
-        for is_src in (True, False):
-            calls = []
+        # Native device placement is honored; CUDA shells are rebuilt on onload.
+        native = {
+            name: value.detach().cpu().clone()
+            for name, value in layer.state_dict().items()
+        }
+        layer.cpu()
+        self.assertTrue(all(p.device.type == "cpu" for p in layer.parameters()))
+        self.assertIsNone(layer._sum_operators)
+        layer.cuda()
+        self.assertTrue(all(p.is_cuda for p in layer.parameters()))
+        self.assertIsNotNone(layer._sum_operators)
+        for name, value in layer.state_dict().items():
+            torch.testing.assert_close(value.cpu(), native[name], rtol=0, atol=0)
 
-            def broadcast(tensor, *, src, group):
-                self.assertTrue(tensor.is_cuda)
-                self.assertEqual(src, 0)
-                calls.append(tensor.clone())
-                if not is_src:
-                    tensor.fill_(len(calls))
-
-            with (
-                patch("torch.distributed.get_backend", return_value="nccl"),
-                patch(
-                    "torch.distributed.broadcast", side_effect=broadcast
-                ) as collective,
-            ):
-                broadcast_weights(
-                    model, group=group, device=torch.device("cuda", 0), is_src=is_src
-                )
-            parameters = list(model.parameters())
-            self.assertEqual(collective.call_count, len(parameters))
-            for index, (parameter, sent, call) in enumerate(
-                zip(parameters, calls, collective.call_args_list), 1
-            ):
-                self.assertIs(call.kwargs["group"], group)
-                self.assertEqual(sent.shape, parameter.shape)
-                self.assertEqual(sent.dtype, parameter.dtype)
-                expected = (
-                    sent.cpu() if is_src else torch.full_like(parameter, index).cpu()
-                )
-                torch.testing.assert_close(parameter.cpu(), expected, rtol=0, atol=0)
-            self.assertEqual(before, [(p.device, p.data_ptr()) for p in parameters])
+        invalid = dict(layer.state_dict())
+        # Same logical shape, but interleaving is not dense: must not silently
+        # allocate an RMS copy and leave the Graph bound to stale storage.
+        invalid["hc_norm.weight"] = invalid["hc_norm.weight"].T.contiguous().T
+        self.assertFalse(invalid["hc_norm.weight"].is_contiguous())
+        with self.assertRaisesRegex(ValueError, "RMS parameter must be contiguous"):
+            layer.load_state_dict(invalid, assign=True)
 
 
 if __name__ == "__main__":

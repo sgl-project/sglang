@@ -44,7 +44,6 @@ from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
-    broadcast_weights,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
@@ -3311,12 +3310,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         start_get_weights_tic = time.time()
         with set_default_torch_dtype(model_config.dtype):
-            broadcast_weights(
-                model,
-                group=client._model_update_group,
-                device=torch.device(device_config.device_type, device_config.gpu_id),
-                is_src=False,
-            )
+            for _, tensor in model.named_parameters():
+                torch.distributed.broadcast(
+                    tensor.data,
+                    src=0,
+                    group=client._model_update_group,
+                )
             current_platform.synchronize()
 
             post_load_weights(model)

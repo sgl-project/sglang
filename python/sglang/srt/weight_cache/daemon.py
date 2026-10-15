@@ -455,20 +455,12 @@ class WeightCacheDaemon:
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
-        # Log approximate serialized metadata size (not payload-backed bytes).
-        # Only the handle blob carries real weight, so measure it directly:
-        # stringifying every entry would allocate a copy of all handles.
-        total_bytes = sum(
-            len(handle)
-            for handle in (entry.get("handle") for entry in self.state_entries.values())
-            if isinstance(handle, (str, bytes, bytearray))
-        )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
             f"Exported {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
             f"transport={self.transport_backend.name}, "
-            f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+            "IPC handles are serialized per client"
         )
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
@@ -618,6 +610,9 @@ class WeightCacheDaemon:
             del self.model
             self.model = None
         self.state_entries.clear()
+        # The transport retains tensor views for fresh per-client serialization.
+        # Release those references before returning memory to the allocator.
+        self.transport_backend = None
         current_platform.empty_cache()
         self._running = False
 
