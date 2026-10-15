@@ -74,6 +74,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             capacity=SimpleNamespace(
                 widened_max_total_num_tokens=max_total_num_tokens * kv_shard_widening,
                 kv_shard_widening=kv_shard_widening,
+                sliding_window_size=None,
             ),
             max_req_len=max_req_len,
         )

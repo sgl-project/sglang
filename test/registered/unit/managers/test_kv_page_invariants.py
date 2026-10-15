@@ -34,9 +34,9 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
 
     class _FakeChecker:
         page_size = _ps
-        req_to_token_pool = _rtp
-        token_to_kv_pool_allocator = _alloc
-        tree_cache = _tc
+        kv = SimpleNamespace(
+            req_to_token_pool=_rtp, token_to_kv_pool_allocator=_alloc, tree_cache=_tc
+        )
         counters = LaunchCounters()
         core_lists = CoreLists()
         request_registry = make_request_registry(core_lists=core_lists)

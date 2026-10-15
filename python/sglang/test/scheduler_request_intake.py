@@ -20,7 +20,7 @@ def make_request_intake(**deps) -> RequestIntake:
         core_lists=CoreLists(),
         counters=LaunchCounters(),
         kv=SimpleNamespace(tree_cache=MagicMock(), token_to_kv_pool_allocator=None),
-        capacity=None,
+        capacity=SimpleNamespace(sliding_window_size=None),
         ipc_channels=MagicMock(),
         metrics_sink=SimpleNamespace(enable_metrics=False, metrics_collector=None),
         output_streamer=MagicMock(),
@@ -41,7 +41,6 @@ def make_request_intake(**deps) -> RequestIntake:
         max_req_len=4096,
         max_req_input_len=4095,
         max_queued_requests=None,
-        sliding_window_size=None,
         chunked_prefill_size=None,
         sampling_mask_max_tokens=64,
     )

@@ -54,15 +54,19 @@ class TestCheckTreeCacheGate(CustomTestCase):
         tree_cache.supports_swa.return_value = hybrid_swa
         tree_cache.supports_mamba.return_value = hybrid_ssm
         return SchedulerInvariantChecker(
-            is_hybrid_swa=hybrid_swa,
-            is_hybrid_ssm=hybrid_ssm,
+            capacity=SimpleNamespace(
+                is_hybrid_swa=hybrid_swa,
+                is_hybrid_ssm=hybrid_ssm,
+                full_tokens_per_layer=None,
+                swa_tokens_per_layer=None,
+                widened_max_total_num_tokens=1024,
+            ),
             page_size=1,
-            full_tokens_per_layer=None,
-            swa_tokens_per_layer=None,
-            max_total_num_tokens=1024,
-            tree_cache=tree_cache,
-            token_to_kv_pool_allocator=MagicMock(),
-            req_to_token_pool=MagicMock(),
+            kv=SimpleNamespace(
+                tree_cache=tree_cache,
+                token_to_kv_pool_allocator=MagicMock(),
+                req_to_token_pool=MagicMock(),
+            ),
             pool_stats_observer=MagicMock(),
             counters=LaunchCounters(),
             request_registry=make_request_registry(),
@@ -79,7 +83,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
 
             checker._check_tree_cache()
 
-            checker.tree_cache.sanity_check.assert_not_called()
+            checker.kv.tree_cache.sanity_check.assert_not_called()
 
     def test_enabled_by_default_in_ci(self):
         with (
@@ -90,7 +94,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
 
             checker._check_tree_cache()
 
-            checker.tree_cache.sanity_check.assert_called_once()
+            checker.kv.tree_cache.sanity_check.assert_called_once()
 
     def test_explicitly_disabled_in_ci(self):
         with envs.SGLANG_IS_IN_CI.override(True):
@@ -99,7 +103,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(False):
                 checker._check_tree_cache()
 
-            checker.tree_cache.sanity_check.assert_not_called()
+            checker.kv.tree_cache.sanity_check.assert_not_called()
 
     def test_runs_when_enabled(self):
         with envs.SGLANG_IS_IN_CI.override(False):
@@ -108,7 +112,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(True):
                 checker._check_tree_cache()
 
-            checker.tree_cache.sanity_check.assert_called_once()
+            checker.kv.tree_cache.sanity_check.assert_called_once()
 
     def test_skipped_without_prefix_sharing(self):
         with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(True):
@@ -118,7 +122,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
 
             checker._check_tree_cache()
 
-            checker.tree_cache.sanity_check.assert_not_called()
+            checker.kv.tree_cache.sanity_check.assert_not_called()
 
 
 class TestPrivateSwaTokens(CustomTestCase):
@@ -181,28 +185,36 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         self.core_lists = CoreLists()
         self.mode_owners = ModeOwners()
         observer = SchedulerPoolStatsObserver(
-            tree_cache=self.cache,
-            token_to_kv_pool_allocator=self.allocator,
-            req_to_token_pool=req_pool,
+            kv=SimpleNamespace(
+                tree_cache=self.cache,
+                token_to_kv_pool_allocator=self.allocator,
+                req_to_token_pool=req_pool,
+            ),
             session_controller=None,
             hisparse_coordinator=None,
-            is_hybrid_swa=False,
-            is_hybrid_ssm=False,
+            capacity=SimpleNamespace(
+                is_hybrid_swa=False,
+                is_hybrid_ssm=False,
+                full_tokens_per_layer=None,
+                swa_tokens_per_layer=None,
+                widened_max_total_num_tokens=self.allocator.size,
+            ),
             enable_hisparse=False,
-            full_tokens_per_layer=None,
-            swa_tokens_per_layer=None,
-            max_total_num_tokens=self.allocator.size,
         )
         return SchedulerInvariantChecker(
-            is_hybrid_swa=False,
-            is_hybrid_ssm=False,
+            capacity=SimpleNamespace(
+                is_hybrid_swa=False,
+                is_hybrid_ssm=False,
+                full_tokens_per_layer=None,
+                swa_tokens_per_layer=None,
+                widened_max_total_num_tokens=self.allocator.size,
+            ),
             page_size=self.PAGE_SIZE,
-            full_tokens_per_layer=None,
-            swa_tokens_per_layer=None,
-            max_total_num_tokens=self.allocator.size,
-            tree_cache=self.cache,
-            token_to_kv_pool_allocator=self.allocator,
-            req_to_token_pool=req_pool,
+            kv=SimpleNamespace(
+                tree_cache=self.cache,
+                token_to_kv_pool_allocator=self.allocator,
+                req_to_token_pool=req_pool,
+            ),
             pool_stats_observer=observer,
             counters=self.counters,
             request_registry=make_request_registry(
@@ -246,7 +258,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             rotation_base=base,
         )
         locs = torch.cat((prefix_locs, tail_locs))
-        checker.req_to_token_pool.req_to_token[0, : len(locs)] = locs
+        checker.kv.req_to_token_pool.req_to_token[0, : len(locs)] = locs
         req = SimpleNamespace(
             kv=ReqKvInfo(
                 req_pool_idx=0,

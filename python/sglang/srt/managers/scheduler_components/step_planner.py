@@ -203,7 +203,6 @@ class StepPlanner:
         min_free_slots_delayer: Optional[MinFreeSlotsDelayer],
         dynamic_chunk_sizer: Optional[DynamicChunkSizer],
         spec_algorithm: SpeculativeAlgorithm,
-        is_hybrid_swa: bool,
         require_mlp_sync: bool,
         chunked_prefill_size: Optional[int],
         is_mixed_chunk: bool,
@@ -243,7 +242,7 @@ class StepPlanner:
         self.min_free_slots_delayer = min_free_slots_delayer
         self.dynamic_chunk_sizer = dynamic_chunk_sizer
         self.spec_algorithm = spec_algorithm
-        self.is_hybrid_swa = is_hybrid_swa
+        self.is_hybrid_swa = capacity.is_hybrid_swa
         self.require_mlp_sync = require_mlp_sync
         self.chunked_prefill_size = chunked_prefill_size
         self.is_mixed_chunk = is_mixed_chunk

@@ -20,14 +20,17 @@ from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler_components.bundles import Workers
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvCapacity,
+        KvResources,
+        Workers,
+    )
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
     )
     from sglang.srt.managers.scheduler_components.request_registry import (
         RequestRegistry,
     )
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -43,11 +46,9 @@ class UpdateRejected(Exception):
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerInternalStateController:
     workers: Workers
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    kv: KvResources
+    capacity: KvCapacity
     spec_algorithm: SpeculativeAlgorithm
-    max_running_requests: int
-    max_total_num_tokens: int
-    swa_tokens_per_layer: Optional[int]
     startup_available_gpu_memory_gb: float
     metrics_sink: MetricsSink
     rust_server: Any
@@ -84,17 +85,19 @@ class SchedulerInternalStateController:
             pp_size=get_parallel().pp_size,
         )
         state["startup_time"] = self.startup_time
-        state["effective_max_running_requests_per_dp"] = self.max_running_requests
+        state["effective_max_running_requests_per_dp"] = (
+            self.capacity.max_running_requests
+        )
         state["last_gen_throughput"] = self.metrics_sink.last_gen_throughput
 
     def _add_memory_usage(self, state: Dict[str, Any]) -> None:
         draft_worker = self.workers.draft_worker
         state["memory_usage"] = build_memory_usage(
             weight_gb=self.workers.tp_worker.model_runner.weight_load_mem_usage,
-            kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
+            kv_cache_gb=self.kv.token_to_kv_pool_allocator.get_kvcache().mem_usage,
             startup_available_gb=self.startup_available_gpu_memory_gb,
-            token_capacity=self.max_total_num_tokens,
-            token_capacity_swa=self.swa_tokens_per_layer,
+            token_capacity=self.capacity.max_total_num_tokens,
+            token_capacity_swa=self.capacity.swa_tokens_per_layer,
             target_graph_memory_usage=self.workers.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=(
                 None if draft_worker is None else draft_worker.graph_memory_usage
@@ -193,7 +196,7 @@ class SchedulerInternalStateController:
         }
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
-        upper = self.max_running_requests // get_parallel().pp_size
+        upper = self.capacity.max_running_requests // get_parallel().pp_size
         if value < 1 or value > upper:
             raise UpdateRejected(
                 f"Updating {key} to {value} is rejected because it is out of "

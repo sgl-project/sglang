@@ -175,10 +175,11 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         intake = make_request_intake(
             kv=SimpleNamespace(tree_cache=None, token_to_kv_pool_allocator=allocator),
             capacity=SimpleNamespace(
-                widened_max_total_num_tokens=allocator.size_full, kv_shard_widening=1
+                widened_max_total_num_tokens=allocator.size_full,
+                kv_shard_widening=1,
+                sliding_window_size=page_size,
             ),
             max_req_len=16 * page_size,
-            sliding_window_size=page_size,
             chunked_prefill_size=page_size,
         )
         get_context().override("test", page_size=page_size)

@@ -45,7 +45,7 @@ class KvResources:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class KvCapacity:
-    """The KV limits, known once the pools are built."""
+    """The KV limits and the pools' layout, known once the pools are built."""
 
     # Request-token capacity as the worker reports it, in logical tokens.
     max_total_num_tokens: int
@@ -57,6 +57,13 @@ class KvCapacity:
     swa_max_total_num_tokens: Optional[int]
     max_token_pool_size: int
     max_running_requests: int
+    # The layout the KV cache was built with: a hybrid SWA pool (with its
+    # window and the per-layer token counts of both pools) or a hybrid SSM one.
+    is_hybrid_swa: bool
+    is_hybrid_ssm: bool
+    sliding_window_size: Optional[int]
+    full_tokens_per_layer: Optional[int]
+    swa_tokens_per_layer: Optional[int]
 
     @property
     def widened_max_total_num_tokens(self) -> int:

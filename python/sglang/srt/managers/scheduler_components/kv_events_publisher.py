@@ -21,8 +21,8 @@ from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.bundles import KvCapacity, KvResources
     from sglang.srt.managers.scheduler_components.metrics_reporter import MetricsSink
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]
@@ -45,10 +45,9 @@ hook_custom_types(KvMetrics)
 @dataclass(kw_only=True, slots=True)
 class SchedulerKvEventsPublisher:
     kv_events_config: Optional[str]
-    tree_cache: BasePrefixCache
+    kv: KvResources
+    capacity: KvCapacity
     send_metrics_from_scheduler: Optional[zmq.Socket]
-    max_running_requests: int
-    max_total_num_tokens: int
     metrics_sink: MetricsSink
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
@@ -74,11 +73,11 @@ class SchedulerKvEventsPublisher:
 
         kv_metrics = KvMetrics()
         kv_metrics.request_active_slots = self.metrics_sink.stats.num_running_reqs.total
-        kv_metrics.request_total_slots = self.max_running_requests
+        kv_metrics.request_total_slots = self.capacity.max_running_requests
         kv_metrics.kv_active_blocks = int(
-            self.metrics_sink.stats.token_usage * self.max_total_num_tokens
+            self.metrics_sink.stats.token_usage * self.capacity.max_total_num_tokens
         )
-        kv_metrics.kv_total_blocks = self.max_total_num_tokens
+        kv_metrics.kv_total_blocks = self.capacity.max_total_num_tokens
         kv_metrics.num_requests_waiting = self.metrics_sink.stats.num_queue_reqs.total
         kv_metrics.gpu_cache_usage_perc = self.metrics_sink.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.metrics_sink.stats.cache_hit_rate
@@ -99,7 +98,7 @@ class SchedulerKvEventsPublisher:
         if not self.enable_kv_cache_events:
             return
 
-        events = self.tree_cache.take_events()
+        events = self.kv.tree_cache.take_events()
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)

@@ -16,9 +16,7 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ReqKvInfo
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.managers.scheduler_components.bundles import KvCapacity, KvResources
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]
@@ -171,17 +169,11 @@ class PoolStats:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerPoolStatsObserver:
-    tree_cache: BasePrefixCache
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
-    req_to_token_pool: ReqToTokenPool
+    kv: KvResources
+    capacity: KvCapacity
     session_controller: Any
     hisparse_coordinator: Any
-    is_hybrid_swa: bool
-    is_hybrid_ssm: bool
     enable_hisparse: bool
-    full_tokens_per_layer: Any
-    swa_tokens_per_layer: Any
-    max_total_num_tokens: int
 
     def streaming_session_count(self) -> int:
         return sum(
@@ -191,15 +183,15 @@ class SchedulerPoolStatsObserver:
         )
 
     def _session_kv_rows(self) -> List[ReqKvInfo]:
-        records = self.tree_cache.session_records().values()
+        records = self.kv.tree_cache.session_records().values()
         return [kv for kv in records if kv.holds_kv]
 
     def session_held_tokens(self) -> int:
-        page_size = self.tree_cache.page_size
+        page_size = self.kv.tree_cache.page_size
         return sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
 
     def session_held_swa_tokens(self) -> int:
-        page_size = self.tree_cache.page_size
+        page_size = self.kv.tree_cache.page_size
         return sum(
             kv_private_swa_tokens(kv, page_size) for kv in self._session_kv_rows()
         )
@@ -211,9 +203,9 @@ class SchedulerPoolStatsObserver:
         return sum(kv_mamba_slots(kv) for kv in self._session_kv_rows())
 
     def get_pool_stats(self) -> PoolStats:
-        if self.is_hybrid_swa:
+        if self.capacity.is_hybrid_swa:
             pool_stats = self._get_swa_token_info()
-        elif self.is_hybrid_ssm:
+        elif self.capacity.is_hybrid_ssm:
             pool_stats = self._get_mamba_token_info()
         else:
             pool_stats = self._get_token_info()
@@ -222,7 +214,7 @@ class SchedulerPoolStatsObserver:
             pool_stats = self._get_hisparse_token_info(pool_stats)
 
         # swa + ssm can coexist: overlay mamba fields onto swa stats
-        if self.is_hybrid_ssm:
+        if self.capacity.is_hybrid_ssm:
             mamba_stats = self._get_mamba_token_info()
             pool_stats.is_hybrid_ssm = True
             pool_stats.mamba_num_used = mamba_stats.mamba_num_used
@@ -233,10 +225,12 @@ class SchedulerPoolStatsObserver:
         return pool_stats
 
     def _get_token_info(self) -> PoolStats:
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        available_size = self.kv.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.kv.tree_cache.evictable_size()
+        num_used = self.capacity.widened_max_total_num_tokens - (
+            available_size + evictable_size
+        )
+        token_usage = num_used / self.capacity.widened_max_total_num_tokens
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,
@@ -259,14 +253,16 @@ class SchedulerPoolStatsObserver:
 
     def _get_mamba_token_info(self):
         is_mamba_radix_cache = (
-            self.tree_cache.supports_mamba()
-            and self.tree_cache.supports_prefix_sharing()
+            self.kv.tree_cache.supports_mamba()
+            and self.kv.tree_cache.supports_prefix_sharing()
         )
-        full_available_size = self.token_to_kv_pool_allocator.available_size()
+        full_available_size = self.kv.token_to_kv_pool_allocator.available_size()
         full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
+            self.kv.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
-        mamba_available_size = self.req_to_token_pool.mamba_allocator.available_size()
+        mamba_available_size = (
+            self.kv.req_to_token_pool.mamba_allocator.available_size()
+        )
         # `mamba_usage`/`mamba_num_used` track the ACTIVE bf16 pool occupancy (running
         # requests) -- this feeds throttle decisions (get_max_pool_usage) which asserts
         # usage >= 0. With int8 checkpoints the radix-cached states live in a SEPARATE
@@ -274,22 +270,22 @@ class SchedulerPoolStatsObserver:
         # pool (otherwise active.size - (available + radix_cached) goes negative). The
         # int8 cache pool's own occupancy is validated separately in the invariant check.
         has_int8_ckpt = (
-            getattr(self.req_to_token_pool, "mamba_ckpt_pool", None) is not None
+            getattr(self.kv.req_to_token_pool, "mamba_ckpt_pool", None) is not None
         )
         mamba_evictable_size = (
-            self.tree_cache.mamba_evictable_size()
+            self.kv.tree_cache.mamba_evictable_size()
             if (is_mamba_radix_cache and not has_int8_ckpt)
             else 0
         )
-        full_capacity = self.req_to_token_pool.schedulable_token_capacity(
-            self.token_to_kv_pool_allocator.size
+        full_capacity = self.kv.req_to_token_pool.schedulable_token_capacity(
+            self.kv.token_to_kv_pool_allocator.size
         )
         full_num_used = full_capacity - (full_available_size + full_evictable_size)
-        mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
+        mamba_num_used = self.kv.req_to_token_pool.mamba_pool.size - (
             mamba_available_size + mamba_evictable_size
         )
         full_token_usage = full_num_used / full_capacity
-        mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
+        mamba_usage = mamba_num_used / self.kv.req_to_token_pool.mamba_pool.size
 
         return PoolStats(
             is_hybrid_ssm=True,
@@ -305,16 +301,16 @@ class SchedulerPoolStatsObserver:
 
     def _get_swa_token_info(self) -> PoolStats:
         (full_capacity, full_available_size), (swa_capacity, swa_available_size) = (
-            self.token_to_kv_pool_allocator.swa_capacity_and_available(
-                full_capacity=self.full_tokens_per_layer,
-                swa_capacity=self.swa_tokens_per_layer,
+            self.kv.token_to_kv_pool_allocator.swa_capacity_and_available(
+                full_capacity=self.capacity.full_tokens_per_layer,
+                swa_capacity=self.capacity.swa_tokens_per_layer,
             )
         )
-        full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_evictable_size = self.tree_cache.swa_evictable_size()
+        full_evictable_size = self.kv.tree_cache.full_evictable_size()
+        swa_evictable_size = self.kv.tree_cache.swa_evictable_size()
         # Per-request SWA ring: released with the req slot, yet cached radix
         # prefixes still report swa_evictable; counting it drives usage negative.
-        if is_swa_req_ring(self.token_to_kv_pool_allocator):
+        if is_swa_req_ring(self.kv.token_to_kv_pool_allocator):
             swa_evictable_size = 0
         full_num_used = full_capacity - (full_available_size + full_evictable_size)
         swa_num_used = swa_capacity - (swa_available_size + swa_evictable_size)

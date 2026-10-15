@@ -183,19 +183,23 @@ def test_reserve_leaves_only_dense_capacity_visible():
 def test_reserved_slots_are_excluded_from_full_pool_invariant():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
     checker = SchedulerInvariantChecker(
-        is_hybrid_swa=False,
-        is_hybrid_ssm=True,
-        page_size=1,
-        full_tokens_per_layer=None,
-        swa_tokens_per_layer=None,
-        max_total_num_tokens=64,
-        tree_cache=SimpleNamespace(
-            supports_mamba=lambda: True,
-            supports_prefix_sharing=lambda: False,
-            full_protected_size=lambda: 0,
+        capacity=SimpleNamespace(
+            is_hybrid_swa=False,
+            is_hybrid_ssm=True,
+            full_tokens_per_layer=None,
+            swa_tokens_per_layer=None,
+            widened_max_total_num_tokens=64,
         ),
-        token_to_kv_pool_allocator=allocator,
-        req_to_token_pool=pool,
+        page_size=1,
+        kv=SimpleNamespace(
+            tree_cache=SimpleNamespace(
+                supports_mamba=lambda: True,
+                supports_prefix_sharing=lambda: False,
+                full_protected_size=lambda: 0,
+            ),
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=pool,
+        ),
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         counters=LaunchCounters(),
         request_registry=make_request_registry(),
@@ -217,19 +221,23 @@ def test_hybrid_pool_stats_exclude_reserved_slots():
     pool.mamba_allocator = SimpleNamespace(available_size=lambda: 1)
     pool.mamba_pool = SimpleNamespace(size=1)
     observer = SchedulerPoolStatsObserver(
-        tree_cache=SimpleNamespace(
-            supports_mamba=lambda: True, supports_prefix_sharing=lambda: False
+        kv=SimpleNamespace(
+            tree_cache=SimpleNamespace(
+                supports_mamba=lambda: True, supports_prefix_sharing=lambda: False
+            ),
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=pool,
         ),
-        token_to_kv_pool_allocator=allocator,
-        req_to_token_pool=pool,
         session_controller=None,
         hisparse_coordinator=None,
-        is_hybrid_swa=False,
-        is_hybrid_ssm=True,
+        capacity=SimpleNamespace(
+            is_hybrid_swa=False,
+            is_hybrid_ssm=True,
+            full_tokens_per_layer=None,
+            swa_tokens_per_layer=None,
+            widened_max_total_num_tokens=42,
+        ),
         enable_hisparse=False,
-        full_tokens_per_layer=None,
-        swa_tokens_per_layer=None,
-        max_total_num_tokens=42,
     )
 
     stats = observer._get_mamba_token_info()
@@ -273,19 +281,23 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         free_slots=torch.empty(0, dtype=torch.int64),
     )
     checker = SchedulerInvariantChecker(
-        is_hybrid_swa=False,
-        is_hybrid_ssm=True,
-        page_size=1,
-        full_tokens_per_layer=None,
-        swa_tokens_per_layer=None,
-        max_total_num_tokens=64,
-        tree_cache=SimpleNamespace(
-            mamba_protected_size=lambda: 0,
-            all_values_flatten=lambda: torch.empty(0, dtype=torch.int64),
-            all_mamba_values_flatten=lambda: torch.empty(0, dtype=torch.int64),
+        capacity=SimpleNamespace(
+            is_hybrid_swa=False,
+            is_hybrid_ssm=True,
+            full_tokens_per_layer=None,
+            swa_tokens_per_layer=None,
+            widened_max_total_num_tokens=64,
         ),
-        token_to_kv_pool_allocator=allocator,
-        req_to_token_pool=pool,
+        page_size=1,
+        kv=SimpleNamespace(
+            tree_cache=SimpleNamespace(
+                mamba_protected_size=lambda: 0,
+                all_values_flatten=lambda: torch.empty(0, dtype=torch.int64),
+                all_mamba_values_flatten=lambda: torch.empty(0, dtype=torch.int64),
+            ),
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=pool,
+        ),
         pool_stats_observer=SimpleNamespace(
             session_held_mamba_slots=lambda: 0,
         ),

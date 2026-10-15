@@ -3095,7 +3095,6 @@ class DisaggDecode:
         streams: Streams,
         services: SchedulerServices,
         workers: Workers,
-        sliding_window_size: Optional[int],
         hisparse_coordinator: Optional[HiSparseCoordinator],
         lora_admission: LoraAdmission,
         pool_stats_observer: SchedulerPoolStatsObserver,
@@ -3122,6 +3121,7 @@ class DisaggDecode:
         scheduler_stage_metrics = services.scheduler_stage_metrics
         metrics_collector = metrics_sink.metrics_collector
         is_hybrid_swa = workers.tp_worker.is_hybrid_swa
+        sliding_window_size = capacity.sliding_window_size
         kv_cache_dtype_str = workers.tp_worker.model_runner.kv_cache_dtype_str
         transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
         attn_cp_cpu_group = get_parallel().attn_cp_group.cpu_group

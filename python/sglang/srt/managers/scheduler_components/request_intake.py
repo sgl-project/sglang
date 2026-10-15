@@ -121,7 +121,6 @@ class RequestIntake:
         max_req_len: int,
         max_req_input_len: int,
         max_queued_requests: Optional[int],
-        sliding_window_size: Optional[int],
         chunked_prefill_size: Optional[int],
         sampling_mask_max_tokens: int,
     ):
@@ -130,6 +129,7 @@ class RequestIntake:
         self.tree_cache = kv.tree_cache
         self.token_to_kv_pool_allocator = kv.token_to_kv_pool_allocator
         self.capacity = capacity
+        self.sliding_window_size = capacity.sliding_window_size
         self.ipc_channels = ipc_channels
         self.metrics_sink = metrics_sink
         self.metrics_collector = metrics_sink.metrics_collector
@@ -151,7 +151,6 @@ class RequestIntake:
         self.max_req_len = max_req_len
         self.max_req_input_len = max_req_input_len
         self.max_queued_requests = max_queued_requests
-        self.sliding_window_size = sliding_window_size
         self.chunked_prefill_size = chunked_prefill_size
         self.sampling_mask_max_tokens = sampling_mask_max_tokens
         self._last_logged_elastic_radix_namespace: Optional[str] = None

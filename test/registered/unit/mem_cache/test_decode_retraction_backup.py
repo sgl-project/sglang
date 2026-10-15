@@ -394,17 +394,21 @@ class TestDecodeRetractionBackup(CustomTestCase):
         ):
             queue.kv_manager = queue._init_kv_manager()
         queue.pool_stats_observer = SchedulerPoolStatsObserver(
-            tree_cache=env.cache,
-            token_to_kv_pool_allocator=env.allocator,
-            req_to_token_pool=env.req_to_token_pool,
+            kv=SimpleNamespace(
+                tree_cache=env.cache,
+                token_to_kv_pool_allocator=env.allocator,
+                req_to_token_pool=env.req_to_token_pool,
+            ),
             session_controller=None,
             hisparse_coordinator=None,
-            is_hybrid_swa=hybrid_swa,
-            is_hybrid_ssm=False,
+            capacity=SimpleNamespace(
+                is_hybrid_swa=hybrid_swa,
+                is_hybrid_ssm=False,
+                full_tokens_per_layer=self.pool_size,
+                swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
+                widened_max_total_num_tokens=self.pool_size,
+            ),
             enable_hisparse=False,
-            full_tokens_per_layer=self.pool_size,
-            swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
-            max_total_num_tokens=self.pool_size,
         )
         return queue, queue.kv_manager.kv_args
 

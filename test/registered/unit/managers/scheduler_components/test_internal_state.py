@@ -31,11 +31,11 @@ def _prefill_registry(transfer) -> RequestRegistry:
 def _controller(registry: RequestRegistry) -> SchedulerInternalStateController:
     return SchedulerInternalStateController(
         workers=SimpleNamespace(tp_worker=None, draft_worker=None),
-        token_to_kv_pool_allocator=None,
+        kv=SimpleNamespace(token_to_kv_pool_allocator=None),
         spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
-        max_running_requests=0,
-        max_total_num_tokens=0,
-        swa_tokens_per_layer=0,
+        capacity=SimpleNamespace(
+            max_running_requests=0, max_total_num_tokens=0, swa_tokens_per_layer=0
+        ),
         startup_available_gpu_memory_gb=0.0,
         metrics_sink=None,
         rust_server=None,

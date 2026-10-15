@@ -614,7 +614,6 @@ class DisaggPrefill:
         pp_group: Any,
         tp_size: int,
         tp_cpu_group: Any,
-        sliding_window_size: Optional[int],
         enable_overlap: bool,
         batch_result_processor: SchedulerBatchResultProcessor,
         counters: LaunchCounters,
@@ -641,7 +640,7 @@ class DisaggPrefill:
         self.attn_tp_cpu_group = attn_tp_cpu_group
         self.tp_size = tp_size
         self.tp_cpu_group = tp_cpu_group
-        self.sliding_window_size = sliding_window_size
+        self.sliding_window_size = capacity.sliding_window_size
         self.enable_overlap = enable_overlap
         self.forward_stream = forward_stream
         self.scheduler_stage_metrics = scheduler_stage_metrics

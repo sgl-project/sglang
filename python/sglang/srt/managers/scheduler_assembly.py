@@ -239,7 +239,6 @@ class SchedulerParts:
     kv_event_lora_names: LoRANameTable
     kv: KvResources
     capacity: KvCapacity
-    sliding_window_size: Optional[int]
     disable_radix_cache: bool
     mode_owners: ModeOwners
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
@@ -496,6 +495,11 @@ def assemble_scheduler(
         ),
         max_token_pool_size=model_runner.max_token_pool_size,
         max_running_requests=max_running_requests,
+        is_hybrid_swa=is_hybrid_swa,
+        is_hybrid_ssm=is_hybrid_ssm,
+        sliding_window_size=sliding_window_size,
+        full_tokens_per_layer=full_tokens_per_layer,
+        swa_tokens_per_layer=swa_tokens_per_layer,
     )
     if (c := tp_worker.model_runner.canary_manager) is not None:
         c.attach_radix_cache(tree_cache)
@@ -717,25 +721,18 @@ def assemble_scheduler(
         get_require_mlp_sync=lambda: requires_mlp_sync,
     )
     pool_stats_observer = SchedulerPoolStatsObserver(
-        tree_cache=tree_cache,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        req_to_token_pool=req_to_token_pool,
+        kv=kv,
         session_controller=session_controller,
         hisparse_coordinator=mode_owners.hisparse_coordinator,
-        is_hybrid_swa=is_hybrid_swa,
-        is_hybrid_ssm=is_hybrid_ssm,
+        capacity=capacity,
         enable_hisparse=get_memory().enable_hisparse,
-        full_tokens_per_layer=full_tokens_per_layer,
-        swa_tokens_per_layer=swa_tokens_per_layer,
         # Match the allocator and radix counters' logical units.
-        max_total_num_tokens=capacity.widened_max_total_num_tokens,
     )
     kv_events_publisher = SchedulerKvEventsPublisher(
         kv_events_config=get_observability().kv_events_config,
-        tree_cache=tree_cache,
+        kv=kv,
         send_metrics_from_scheduler=ipc_channels.send_metrics_from_scheduler,
-        max_running_requests=max_running_requests,
-        max_total_num_tokens=max_total_num_tokens,
+        capacity=capacity,
         metrics_sink=metrics_sink,
     )
     # Router-facing load reporting; rank gating and no-op fallback live
@@ -800,15 +797,9 @@ def assemble_scheduler(
         mode_owners=mode_owners,
     )
     invariant_checker = SchedulerInvariantChecker(
-        is_hybrid_swa=is_hybrid_swa,
-        is_hybrid_ssm=is_hybrid_ssm,
+        capacity=capacity,
         page_size=get_schedule().page_size,
-        full_tokens_per_layer=full_tokens_per_layer,
-        swa_tokens_per_layer=swa_tokens_per_layer,
-        max_total_num_tokens=capacity.widened_max_total_num_tokens,
-        tree_cache=tree_cache,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        req_to_token_pool=req_to_token_pool,
+        kv=kv,
         pool_stats_observer=pool_stats_observer,
         counters=counters,
         request_registry=request_registry,
@@ -863,7 +854,6 @@ def assemble_scheduler(
         kv_event_lora_names=kv_event_lora_names,
         kv=kv,
         capacity=capacity,
-        sliding_window_size=sliding_window_size,
         disable_radix_cache=disable_radix_cache,
         mode_owners=mode_owners,
         decode_offload_manager=decode_offload_manager,
@@ -929,7 +919,6 @@ def assemble_scheduler(
         max_req_len=max_req_len,
         max_req_input_len=max_req_input_len,
         max_queued_requests=max_queued_requests,
-        sliding_window_size=sliding_window_size,
         chunked_prefill_size=chunked_prefill_size,
         sampling_mask_max_tokens=server_args.sampling_mask_max_tokens,
     )
@@ -969,7 +958,6 @@ def assemble_scheduler(
         ),
         dynamic_chunk_sizer=dynamic_chunk_sizer,
         spec_algorithm=spec_algorithm,
-        is_hybrid_swa=is_hybrid_swa,
         require_mlp_sync=requires_mlp_sync,
         chunked_prefill_size=chunked_prefill_size,
         is_mixed_chunk=is_mixed_chunk,
@@ -995,11 +983,10 @@ def assemble_scheduler(
     )
     load_inquirer = SchedulerLoadInquirer(
         # The worker reports logical DCP capacity; add KV shard widening.
-        max_total_num_tokens=capacity.widened_max_total_num_tokens,
-        max_running_requests=max_running_requests,
+        capacity=capacity,
         pool_stats_observer=pool_stats_observer,
         workers=workers,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        kv=kv,
         spec_algorithm=spec_algorithm,
         policy=policy,
         metrics_sink=metrics_sink,
@@ -1048,11 +1035,9 @@ def assemble_scheduler(
     # Reads the startup time.
     internal_state = SchedulerInternalStateController(
         workers=workers,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        kv=kv,
         spec_algorithm=spec_algorithm,
-        max_running_requests=max_running_requests,
-        max_total_num_tokens=max_total_num_tokens,
-        swa_tokens_per_layer=swa_tokens_per_layer,
+        capacity=capacity,
         startup_available_gpu_memory_gb=startup_available_gpu_memory_gb,
         metrics_sink=metrics_sink,
         rust_server=rust_server,
@@ -1315,7 +1300,6 @@ def maybe_init_disagg_prefill(
         pp_group=get_parallel().pp_group,
         tp_size=get_parallel().tp_size,
         tp_cpu_group=get_parallel().tp_group.cpu_group,
-        sliding_window_size=parts.sliding_window_size,
         enable_overlap=(not get_schedule().disable_overlap_schedule),
         batch_result_processor=parts.batch_result_processor,
         counters=parts.counters,
@@ -1338,7 +1322,6 @@ def maybe_init_disagg_decode(
         streams=parts.streams,
         services=parts.services,
         workers=parts.workers,
-        sliding_window_size=parts.sliding_window_size,
         hisparse_coordinator=parts.mode_owners.hisparse_coordinator,
         lora_admission=parts.lora_admission,
         pool_stats_observer=parts.pool_stats_observer,

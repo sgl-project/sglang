@@ -18,7 +18,11 @@ from sglang.srt.runtime_context import get_disagg, get_lora, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_policy import SchedulePolicy
-    from sglang.srt.managers.scheduler_components.bundles import Workers
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvCapacity,
+        KvResources,
+        Workers,
+    )
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
     )
@@ -30,7 +34,6 @@ if TYPE_CHECKING:
         RequestRegistry,
     )
     from sglang.srt.managers.scheduler_components.step_counters import StepCounters
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -39,11 +42,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
-    max_total_num_tokens: int
-    max_running_requests: int
+    kv: KvResources
+    capacity: KvCapacity
     pool_stats_observer: SchedulerPoolStatsObserver
     workers: Workers
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
     policy: SchedulePolicy
     metrics_sink: MetricsSink
@@ -110,12 +112,12 @@ class SchedulerLoadInquirer:
                     self.workers.tp_worker.model_runner.weight_load_mem_usage, 3
                 ),
                 kv_cache_gb=round(
-                    self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3
+                    self.kv.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3
                 ),
                 graph_gb=round(
                     sum(self.workers.tp_worker.graph_memory_usage.values()), 3
                 ),
-                token_capacity=int(self.max_total_num_tokens),
+                token_capacity=int(self.capacity.widened_max_total_num_tokens),
             )
         except (AttributeError, TypeError) as e:
             logger.debug(f"Memory metrics not available: {e}")
@@ -186,8 +188,8 @@ class SchedulerLoadInquirer:
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
             num_prealloc_ready_tokens=num_prealloc_ready_tokens,
-            max_total_num_tokens=self.max_total_num_tokens,
-            max_running_requests=self.max_running_requests,
+            max_total_num_tokens=self.capacity.widened_max_total_num_tokens,
+            max_running_requests=self.capacity.max_running_requests,
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(stats.gen_throughput, 2),
             cache_hit_rate=round(stats.cache_hit_rate, 4),
