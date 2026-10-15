@@ -541,10 +541,14 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
-    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+    def resolve_seq_lens_cpu(
+        self, batch: ScheduleBatch, stream_ordered: bool = False
+    ) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        # stream_ordered: the caller runs on the publishing (forward) stream, whose
+        # order fences the gather without a wait.
         draft_input = batch.spec_info
         if draft_input is None:
             return
@@ -558,11 +562,12 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
-                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
-                self.publish_ready.synchronize()
-            else:
-                self.publish_ready.wait()
+            if not stream_ordered:
+                if _is_hip:
+                    # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                    self.publish_ready.synchronize()
+                else:
+                    self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
