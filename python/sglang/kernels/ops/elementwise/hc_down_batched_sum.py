@@ -1,6 +1,6 @@
 """Large-T Down+Inject: branch-batched GEMM followed by merge/nonlinear.
 
-Fold weights after loading and share their storage with small-T HC.
+Consume branch-major packed weights shared with small-T HC.
 Callers own the scratch and output buffers.
 """
 
@@ -19,33 +19,6 @@ class BatchedDownWeights(msgspec.Struct, frozen=True):
     hidden_size: int
     lowrank: int
     hc_count: int = 4
-
-
-@torch.no_grad()
-def prepare_batched_down_weights(down, inject, norm_weight, hc_count=4):
-    if hc_count != 4 or down.ndim != 2 or down.shape[1] % hc_count:
-        raise ValueError("batched HC Down requires C=4 and [L,C*H] weights")
-    lowrank, width = down.shape
-    h = width // hc_count
-    if not lowrank > 0 or not h > 0:
-        raise ValueError("hidden size and lowrank must be positive")
-    if not down.is_cuda or down.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("CUDA BF16/FP16 weights required")
-    for tensor, shape in ((inject, (hc_count, width)), (norm_weight, (width,))):
-        if (
-            tensor.shape != shape
-            or tensor.device != down.device
-            or tensor.dtype != down.dtype
-        ):
-            raise ValueError("weight shape/device/dtype mismatch")
-    logical_n = lowrank + hc_count
-    padded_n = triton.cdiv(logical_n, 8) * 8
-    folded = torch.zeros((padded_n, width), device=down.device, dtype=down.dtype)
-    folded[:logical_n] = (
-        torch.cat((down, inject)).float() * (1.0 + norm_weight.float())
-    ).to(down.dtype)
-    branch_major = folded.view(padded_n, hc_count, h).permute(1, 0, 2).contiguous()
-    return BatchedDownWeights(branch_major.transpose(1, 2), h, lowrank, hc_count)
 
 
 @gluon.jit

@@ -91,18 +91,15 @@ class WeightCacheTransportBackend(ABC):
 class TorchIpcTransportBackend(WeightCacheTransportBackend):
     name = TORCH_IPC_BACKEND
 
-    def __init__(self):
-        self._exported_tensors = {}
-
     def prepare_export(
         self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
         entries: Dict[str, Dict[str, Any]] = {}
-        self._exported_tensors = {
-            name: tensor for name, (tensor, _) in state_tensors.items()
-        }
         for name, (tensor, is_param) in state_tensors.items():
             entries[name] = {
+                "handle": MultiprocessingSerializer.serialize(
+                    tensor.data, output_str=True
+                ),
                 "shape": list(tensor.shape),
                 "dtype": str(tensor.dtype).replace("torch.", ""),
                 "is_param": is_param,
@@ -118,25 +115,12 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         pid: int,
         preloaded_weights_bytes: int = 0,
     ) -> None:
-        # Reduction creates a consumer-specific IPC reference (and CPU FD).
-        # Reusing a serialized handle for later clients can outlive its event
-        # or reference-counter lease. Retain storage, not serialized leases;
-        # serializing again shares the same memory and does not copy weights.
-        client_entries = {
-            name: {
-                **entry,
-                "handle": MultiprocessingSerializer.serialize(
-                    self._exported_tensors[name].data, output_str=True
-                ),
-            }
-            for name, entry in entries.items()
-        }
         send_msg(
             conn,
             {
                 "status": "ok",
                 "config": config,
-                "entries": client_entries,
+                "entries": entries,
                 "pid": pid,
                 "transport_backend": self.name,
                 "preloaded_weights_bytes": preloaded_weights_bytes,
