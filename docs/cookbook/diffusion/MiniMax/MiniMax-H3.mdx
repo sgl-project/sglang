@@ -667,6 +667,23 @@ An image condition here is semantic reference material rather than a
 pixel-aligned first frame. Use the FL2VA tab when animating a screenshot from
 that exact starting composition.
 
+Set `reference_resize_mode` on the request to choose how reference images are
+resized before encoding:
+
+- `diffusers` (default) scales the short edge to 2048 pixels, including upscaling
+  small inputs. This preserves the original preprocessing behavior.
+- `max` only downsizes references whose short edge exceeds 2048 pixels.
+- `match` downsizes to the target canvas pixel area when needed, without
+  upscaling smaller references. Use this with the
+  [ModelTC Ref2VA Turbo LoRA](https://github.com/ModelTC/Minimax-H3-Turbo#note-on-reference-image-resizing),
+  whose training uses this policy.
+
+All modes scale without cropping, then round each dimension to the nearest
+multiple of 32. This rounding can slightly change the aspect ratio. The option
+affects Ref2VA image references, not FL2VA keyframes, video, or audio references.
+Changing it changes the conditioning input, so keep it fixed for quality and
+performance comparisons; the server does not infer it from the adapter name.
+
 ```bash Command
 curl -sS -X POST http://127.0.0.1:30010/v1/videos \
   -H "Content-Type: application/json" \
