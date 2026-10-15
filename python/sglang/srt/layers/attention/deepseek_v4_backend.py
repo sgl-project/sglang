@@ -3568,26 +3568,15 @@ class DeepseekV4AttnBackend(
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)
-                if self._low_ratio_prefill_reads_page_indices(
-                    forward_batch, layer=layer, num_qo_tokens=x.shape[0]
-                )
+                if self._low_ratio_prefill_reads_page_indices(forward_batch)
                 else None
             ),
         )
 
-    def _low_ratio_prefill_reads_page_indices(
-        self, forward_batch: ForwardBatch, *, layer, num_qo_tokens: int
-    ):
+    def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
         return (
             self.trtllm_attn
             or self.mega_attn
-            and self._mega_paged_prefill(
-                forward_batch,
-                num_qo_tokens=num_qo_tokens,
-                layer_id=layer.layer_id,
-                compress_ratio=layer.compress_ratio,
-                num_heads=64 if layer.n_local_heads <= 64 else 128,
-            )
             or self.tail_forward_metadata is not None
             or self.forward_metadata.late_layer_tail is not None
             or self.token_to_kv_pool.request_window is not None
