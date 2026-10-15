@@ -298,7 +298,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.events import LoRANameTable
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -2451,7 +2451,9 @@ class Scheduler(
 
     def init_kv_event_lora_names(self) -> None:
         """Init the table that maps lora_id to adapter name for KV events."""
-        self.kv_event_lora_names = LoRANameTable.from_lora_refs(get_lora().lora_paths)
+        self.kv_event_lora_names = KvEventLoraNames.from_lora_refs(
+            get_lora().lora_paths
+        )
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
@@ -2778,6 +2780,15 @@ class Scheduler(
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
 
+    def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
+        # Keyed by the final extra_key, so it must run after elastic namespacing.
+        # Only a cache whose events are taken prunes the table.
+        if (
+            self.kv_events_publisher.enable_kv_cache_events
+            and self.tree_cache.supports_prefix_sharing()
+        ):
+            self.kv_event_lora_names.register(req, lora_name)
+
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
             get_exec().moe.elastic_ep_backend is None
@@ -2816,6 +2827,12 @@ class Scheduler(
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()
             req.multimodal_inputs = None
+
+    def _create_generation_req(
+        self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
+    ) -> Req:
+        """Extension point for request-local state, including session requests."""
+        return Req(*args, **kwargs)
 
     def handle_generate_request(
         self,
@@ -2859,7 +2876,8 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = Req(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -2952,6 +2970,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
+                req_factory=partial(self._create_generation_req, recv_req),
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -2973,7 +2992,8 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = Req(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -2990,6 +3010,7 @@ class Scheduler(
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
@@ -3566,6 +3587,7 @@ class Scheduler(
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
@@ -4809,13 +4831,19 @@ class Scheduler(
         if not (self.attn_dp_enabled and get_exec().moe.elastic_ep_backend is not None):
             return
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        from sglang.srt.elastic_ep.topology import (
+            attn_replica_size,
+            collapse_physical_rank_status,
+        )
 
         inst = ElasticEPStateManager.instance()
         if inst is not None and inst.active_ranks_cpu is not None:
+            dp_status = collapse_physical_rank_status(
+                inst.active_ranks_cpu.tolist(),
+                attn_replica_size(),
+            )
             self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(
-                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()]
-                )
+                ActiveRanksOutput(status=dp_status)
             )
         else:
             logger.debug("[Elastic EP] active rank state is unavailable")
@@ -5769,6 +5797,19 @@ class Scheduler(
                 message=(
                     f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
                     f"({max_ep_size}). Restart with a larger --max-ep-size."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        from sglang.srt.elastic_ep.topology import attn_replica_size
+
+        replica_size = attn_replica_size()
+        if new_ep_size % replica_size != 0:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) would admit an incomplete "
+                    f"attention replica with size {replica_size}."
                 ),
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
