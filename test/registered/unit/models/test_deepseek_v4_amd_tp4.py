@@ -176,7 +176,7 @@ def _replay_fused_and_unfused(group, run, check, *, residual, pre):
 )
 def test_model_handoff_and_graph_replay(group, rows, verify):
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    from sglang.srt.models.deepseek_v4_platform_stage import (
         forward_hc_pre_from_prev_fused_boundary,
     )
 
@@ -262,15 +262,18 @@ def _moe_stub(rank, *, dual, shared_tp1):
 def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
     from sglang.srt.layers.moe import MoeA2ABackend
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    from sglang.srt.models.deepseek_v4 import (
+        DeepseekV4DecoderLayer,
+        DeepseekV4PlatformDecoderLayer,
+    )
+    from sglang.srt.models.deepseek_v4_platform_stage import (
         forward_hc_pre_from_prev_fused_boundary,
     )
-    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
 
     layer = _layer(group)
     layer.mlp = _moe_stub(group.rank_in_group, dual=dual, shared_tp1=shared_tp1)
     layer._run_moe_ffn_dp_sync = lambda *a, **kw: (
-        DeepseekV4DecoderLayer._run_moe_ffn_dp_sync(layer, *a, **kw)
+        DeepseekV4PlatformDecoderLayer._run_moe_ffn_dp_sync(layer, *a, **kw)
     )
     layer.hc_post = lambda *a: DeepseekV4DecoderLayer.hc_post(layer, *a)
     residual = torch.randn(rows, 4, 5120, device="cuda", dtype=torch.bfloat16)
@@ -298,7 +301,7 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
             "sglang.srt.layers.moe.get_moe_a2a_backend", return_value=MoeA2ABackend.NONE
         ),
         patch(
-            "sglang.srt.models.deepseek_v4.get_moe_a2a_backend",
+            "sglang.srt.models.deepseek_common.moe_transport.get_moe_a2a_backend",
             return_value=MoeA2ABackend.NONE,
         ),
         _no_deterministic_inference(),
