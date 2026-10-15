@@ -1572,21 +1572,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
-                full_allocatable_tokens = self._allocatable_token_budgets(
-                    decoding,
-                    retractable_tokens=retractable_tokens,
-                    count_retracted=True,
-                    extra_reserved_reqs=num_device_preallocated,
-                    hicache_reserved_tokens=reserved_restore_tokens,
-                )
-                if uses_swa_tail_prealloc:
-                    swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                full_allocatable_tokens, swa_allocatable_tokens = (
+                    self._swa_aware_allocatable_token_budgets(
                         decoding,
                         retractable_tokens=retractable_tokens,
                         retractable_swa_tokens=retractable_swa_tokens,
                         count_retracted=True,
                         extra_reserved_reqs=num_device_preallocated,
+                        hicache_reserved_tokens=reserved_restore_tokens,
                     )
+                )
             else:
                 prefix_indices = None
                 prefix_len = 0
