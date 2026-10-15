@@ -239,6 +239,25 @@ class CompressorDecodePlan(NamedTuple):
         return True
 
 
+# The plan build's raw H2D copy is captured with its host pointer baked in when
+# the plan is built for CUDA-graph use, so the staging buffer must outlive the
+# graph; cache it per (device, num_q_tokens) instead of per call.
+_PIN_STAGING_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _get_pin_staging_buffer(
+    num_q_tokens: int, device: torch.device, persistent: bool
+) -> torch.Tensor:
+    if not persistent:
+        return torch.empty((2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True)
+    key = (device, int(num_q_tokens))
+    buf = _PIN_STAGING_CACHE.get(key)
+    if buf is None:
+        buf = torch.empty((2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True)
+        _PIN_STAGING_CACHE[key] = buf
+    return buf
+
+
 class CompressorPrefillPlan(NamedTuple):
     compress_ratio: int
     plan_c: torch.Tensor  # [num_q_tokens, 16] uint8 --- CompressPlan
@@ -369,8 +388,8 @@ class CompressorPrefillPlan(NamedTuple):
         extend_lens_cpu = extend_lens.detach().to(torch.int64).cpu()
         rid_i64 = req_pool_indices.to(torch.int64)
         r2t_i32 = req_to_token.to(torch.int32)
-        pin_buffer = torch.empty(
-            (2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True
+        pin_buffer = _get_pin_staging_buffer(
+            num_q_tokens, req_pool_indices.device, bool(use_cuda_graph)
         )
         plan_c_pin, plan_w_pin = pin_buffer[0], pin_buffer[1]
         device = req_pool_indices.device
