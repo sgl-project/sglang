@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,9 +15,20 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-META_ELEMS = 8  # packed row tail (bf16 slots): max as fp32 bits, global index, padding
+META_ELEMS = 8  # packed row tail (bf16 slots): max as an order key, global index, padding
 # Tunable: CTAs scanning one vocab shard.
 PACK_BLOCKS = 32
+
+
+def _order_key(value: float) -> int:
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    return (~bits & 0xFFFFFFFF) if bits & 0x80000000 else (bits | 0x80000000)
+
+
+# NaN handling of the reference argmax: the split argmax of draft steps reads NaN
+# as -1e30; torch.argmax ranks NaN above every value.
+NAN_KEY_SPLIT_ARGMAX = _order_key(-1e30)
+NAN_KEY_TORCH_ARGMAX = 0xFFFFFFFF
 
 
 @cache_once
@@ -37,17 +49,18 @@ def vocab_argmax_pack(
     logits: torch.Tensor,
     embed: torch.Tensor,
     payload: torch.Tensor,
-    part_val: torch.Tensor,
+    part_key: torch.Tensor,
     part_idx: torch.Tensor,
     counter: torch.Tensor,
     vocab_start: int,
     world: int,
+    nan_key: int = NAN_KEY_SPLIT_ARGMAX,
 ) -> None:
     """Per-row shard argmax of bf16 ``logits`` [M, V_local] plus the candidate's
-    ``embed`` row, packed into ``payload`` [M, H + META_ELEMS]; scratch part_val /
-    part_idx [M, blocks], counter [M] (zero between calls)."""
-    _module(embed.shape[-1], part_val.shape[-1], world).pack(
-        logits, embed, payload, part_val, part_idx, counter, vocab_start
+    ``embed`` row, packed into ``payload`` [M, H + META_ELEMS]; int32 scratch
+    part_key / part_idx [M, blocks], counter [M] (zero between calls)."""
+    _module(embed.shape[-1], part_key.shape[-1], world).pack(
+        logits, embed, payload, part_key, part_idx, counter, vocab_start, nan_key
     )
 
 
@@ -63,8 +76,9 @@ def vocab_argmax_select(
     world: int,
 ) -> None:
     """Per row, pick the token over gathered packed rows [M, world * (H + META_ELEMS)];
-    write it to ``topk_index`` / ``draft_tokens[:, draft_column]`` (empty tensor
-    to skip), advance ``positions`` and copy its embedding row to ``next_embeds``."""
+    write it to ``topk_index`` / ``draft_tokens[:, draft_column]``, advance
+    ``positions`` (empty tensors skip either) and copy its embedding row to
+    ``next_embeds``."""
     _module(next_embeds.shape[-1], blocks, world).select(
         gathered, topk_index, topk_p, draft_tokens, positions, next_embeds, draft_column
     )
@@ -86,16 +100,17 @@ def lm_head_argmax_pack(
     lm_head_w: torch.Tensor,
     embed: torch.Tensor,
     payload: torch.Tensor,
-    part_val: torch.Tensor,
+    part_key: torch.Tensor,
     part_idx: torch.Tensor,
     counter: torch.Tensor,
     vocab_start: int,
     stages: int = 3,
     rows: int = 8,
     ctas_per_sm: int = 1,
+    nan_key: int = NAN_KEY_SPLIT_ARGMAX,
 ) -> None:
     """Shard lm_head GEMV of x [1, H] fused with the argmax and candidate pack
-    (same payload as ``vocab_argmax_pack``); part buffers sized >= SM count."""
+    (same payload as ``vocab_argmax_pack``); int32 part buffers sized >= SM count."""
     _lm_head_module(x.shape[-1], rows, stages, ctas_per_sm).run(
-        x, lm_head_w, embed, payload, part_val, part_idx, counter, vocab_start
+        x, lm_head_w, embed, payload, part_key, part_idx, counter, vocab_start, nan_key
     )

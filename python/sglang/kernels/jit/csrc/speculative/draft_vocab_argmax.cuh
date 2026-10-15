@@ -1,12 +1,15 @@
 // Greedy draft-token selection without gathering the full vocabulary.
 //
 // pack:   each rank reduces its vocab shard of the bf16 logits to (max, first index
-//         of max), NaN read as -1e30 like the split argmax it replaces, then packs
-//         the embedding row of that candidate plus (max, global index) into one row.
+//         of max), then packs the embedding row of that candidate plus (max key,
+//         global index) into one row. Values compare through an order-preserving
+//         key (-0.0 equal to +0.0); NaN takes a caller-given key: that of -1e30 to
+//         match the split argmax of draft steps, or above every value to match
+//         torch.argmax.
 // select: after an all-gather of the packed rows, every rank picks the largest
-//         max (lowest global index on ties), so the chosen token equals the
-//         argmax over the gathered logits; it writes the token, advances the
-//         position and copies the winner's embedding row for the next draft step.
+//         key (lowest global index on ties), so the chosen token equals the
+//         argmax over the gathered logits; it writes the token, optionally advances
+//         the position, and copies the winner's embedding row for the next draft step.
 // The embedding row matches the vocab-parallel lookup plus sum over ranks:
 // adding zero rows only turns -0.0 into +0.0, which the copy applies too.
 
@@ -30,14 +33,26 @@ namespace vocab_argmax {
 
 inline constexpr int kMetaElems = 8;  // packed row tail: max (fp32 bits), index (int32), padding
 
-SGL_DEVICE bool better(float v, int32_t i, float bv, int32_t bi) {
+// Unsigned order of the keys equals float order; -0.0 maps to the key of +0.0.
+// Every non-NaN value has a key above 0, the identity of the reductions.
+SGL_DEVICE uint32_t order_key(float f) {
+  uint32_t b = __float_as_uint(f);
+  b = b == 0x80000000u ? 0u : b;
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+SGL_DEVICE uint32_t value_key(float f, uint32_t nan_key) {
+  return f == f ? order_key(f) : nan_key;
+}
+
+SGL_DEVICE bool better(uint32_t v, int32_t i, uint32_t bv, int32_t bi) {
   return v > bv || (v == bv && i < bi);
 }
 
-SGL_DEVICE void warp_argmax(float& v, int32_t& i) {
+SGL_DEVICE void warp_argmax(uint32_t& v, int32_t& i) {
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
-    const float ov = __shfl_xor_sync(0xffffffffu, v, off);
+    const uint32_t ov = __shfl_xor_sync(0xffffffffu, v, off);
     const int32_t oi = __shfl_xor_sync(0xffffffffu, i, off);
     if (better(ov, oi, v, i)) {
       v = ov;
@@ -47,7 +62,7 @@ SGL_DEVICE void warp_argmax(float& v, int32_t& i) {
 }
 
 template <int kThreads>
-SGL_DEVICE void block_argmax(float& v, int32_t& i, float* s_v, int32_t* s_i) {
+SGL_DEVICE void block_argmax(uint32_t& v, int32_t& i, uint32_t* s_v, int32_t* s_i) {
   constexpr int kWarps = kThreads / 32;
   warp_argmax(v, i);
   const int warp = static_cast<int>(threadIdx.x / 32);
@@ -82,11 +97,12 @@ struct VocabArgmaxPackParams {
   const bf16_t* logits;              // [V_local], written by the lm_head GEMM
   const bf16_t* __restrict__ embed;  // [V_local, H] embedding shard
   bf16_t* payload;                   // [H + 8]
-  float* part_val;                   // [kBlocks]
+  uint32_t* part_key;                // [kBlocks]
   int32_t* part_idx;                 // [kBlocks]
   uint32_t* counter;                 // [M], zero between launches
   int32_t vocab;                     // V_local, multiple of 8
   int32_t vocab_start;               // global id of local row 0
+  uint32_t nan_key;                  // key given to NaN logits
 };
 
 struct VocabArgmaxSelectParams {
@@ -94,7 +110,7 @@ struct VocabArgmaxSelectParams {
   int64_t* topk_index;     // [M]
   float* topk_p;           // [M]
   int64_t* draft_tokens;   // [M, S] draft chain, or null
-  int64_t* positions;      // [M]
+  int64_t* positions;      // [M], or null to leave positions unchanged
   bf16_t* next_embeds;     // [M, H]
   int32_t draft_column;
   int32_t draft_stride;
@@ -109,7 +125,7 @@ template <int kH, int kBlocks, int kThreads, bool kUsePDL>
 __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const VocabArgmaxPackParams __grid_constant__ p) {
   using namespace device;
   using vec_t = AlignedVector<bf16_t, 8>;
-  __shared__ float s_v[kThreads / 32];
+  __shared__ uint32_t s_v[kThreads / 32];
   __shared__ int32_t s_i[kThreads / 32];
   __shared__ bool s_last;
 
@@ -117,11 +133,11 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
 
   const int64_t m = blockIdx.y;
   const bf16_t* logits = p.logits + m * p.vocab;
-  float* part_val = p.part_val + m * kBlocks;
+  uint32_t* part_key = p.part_key + m * kBlocks;
   int32_t* part_idx = p.part_idx + m * kBlocks;
   uint32_t* counter = p.counter + m;
   bf16_t* payload = p.payload + m * (kH + vocab_argmax::kMetaElems);
-  float best = -1e30f;
+  uint32_t best = 0u;
   int32_t bidx = 0x7fffffff;
   const int nvec = p.vocab / 8;
   for (int v = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x); v < nvec;
@@ -130,18 +146,17 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
     x.load(logits, v);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      float f = cast<fp32_t>(x[j]);
-      f = f == f ? f : -1e30f;
+      const uint32_t key = vocab_argmax::value_key(cast<fp32_t>(x[j]), p.nan_key);
       const int32_t idx = v * 8 + j;
-      if (vocab_argmax::better(f, idx, best, bidx)) {
-        best = f;
+      if (vocab_argmax::better(key, idx, best, bidx)) {
+        best = key;
         bidx = idx;
       }
     }
   }
   vocab_argmax::block_argmax<kThreads>(best, bidx, s_v, s_i);
   if (threadIdx.x == 0) {
-    part_val[blockIdx.x] = best;
+    part_key[blockIdx.x] = best;
     part_idx[blockIdx.x] = bidx;
     __threadfence();
     s_last = atomicAdd(counter, 1u) == kBlocks - 1;
@@ -150,10 +165,10 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
   if (!s_last) return;
   __threadfence();
 
-  float v = -1e30f;
+  uint32_t v = 0u;
   int32_t i = 0x7fffffff;
   if (threadIdx.x < kBlocks) {
-    v = __ldcg(part_val + threadIdx.x);
+    v = __ldcg(part_key + threadIdx.x);
     i = __ldcg(part_idx + threadIdx.x);
   }
   __syncthreads();
@@ -170,11 +185,11 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
     dst[c] = r;
   }
   if (threadIdx.x == 0) {
-    auto* meta = reinterpret_cast<int32_t*>(payload + kH);
-    meta[0] = __float_as_int(v);
-    meta[1] = p.vocab_start + i;
-    meta[2] = 0;
-    meta[3] = 0;
+    auto* meta = reinterpret_cast<uint32_t*>(payload + kH);
+    meta[0] = v;
+    meta[1] = static_cast<uint32_t>(p.vocab_start + i);
+    meta[2] = 0u;
+    meta[3] = 0u;
     *counter = 0u;
   }
 }
@@ -188,14 +203,14 @@ __global__ void __launch_bounds__(kThreads)
   const int64_t m = blockIdx.x;
   const bf16_t* gathered = p.gathered + m * kWorld * kRow;
   int win = 0;
-  const auto* meta0 = reinterpret_cast<const int32_t*>(gathered + kH);
-  float bv = __int_as_float(meta0[0]);
-  int32_t bi = meta0[1];
+  const auto* meta0 = reinterpret_cast<const uint32_t*>(gathered + kH);
+  uint32_t bv = meta0[0];
+  int32_t bi = static_cast<int32_t>(meta0[1]);
 #pragma unroll
   for (int r = 1; r < kWorld; ++r) {
-    const auto* meta = reinterpret_cast<const int32_t*>(gathered + r * kRow + kH);
-    const float v = __int_as_float(meta[0]);
-    const int32_t i = meta[1];
+    const auto* meta = reinterpret_cast<const uint32_t*>(gathered + r * kRow + kH);
+    const uint32_t v = meta[0];
+    const int32_t i = static_cast<int32_t>(meta[1]);
     if (vocab_argmax::better(v, i, bv, bi)) {
       bv = v;
       bi = i;
@@ -209,7 +224,7 @@ __global__ void __launch_bounds__(kThreads)
     p.topk_index[m] = bi;
     p.topk_p[m] = 1.0f;
     if (p.draft_tokens != nullptr) p.draft_tokens[m * p.draft_stride + p.draft_column] = bi;
-    p.positions[m] = p.positions[m] + 1;
+    if (p.positions != nullptr) p.positions[m] = p.positions[m] + 1;
   }
 }
 
@@ -232,11 +247,12 @@ struct LmHeadArgmaxParams {
   const bf16_t* __restrict__ w;       // [V_local, H] lm_head shard
   const bf16_t* __restrict__ embed;   // [V_local, H] embedding shard
   bf16_t* payload;                    // [H + 8]
-  float* part_val;                    // [grid]
+  uint32_t* part_key;                 // [grid]
   int32_t* part_idx;                  // [grid]
   uint32_t* counter;                  // [1], zero between launches
   int32_t vocab;                      // V_local
   int32_t vocab_start;
+  uint32_t nan_key;
 };
 
 /**
@@ -260,7 +276,7 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ uint64_t full_bar[kStages];
   __shared__ uint64_t empty_bar[kStages];
-  __shared__ float s_v[kRows];
+  __shared__ uint32_t s_v[kRows];
   __shared__ int32_t s_i[kRows];
   __shared__ bool s_last;
 
@@ -308,7 +324,7 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
     cvec_t xr[kChunks];
 #pragma unroll
     for (int k = 0; k < kChunks; ++k) xr[k].load(p.x, k * kWarpThreads + lane);
-    float best = -1e30f;
+    uint32_t best = 0u;
     int32_t bidx = 0x7fffffff;
     int stage = 0;
     uint32_t phase = 0;
@@ -326,11 +342,10 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
           for (int j = 0; j < 8; ++j) acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xr[k][j]), acc);
         }
         acc = warp::reduce_sum(acc);
-        float f = cast<fp32_t>(cast<bf16_t>(acc));
-        f = f == f ? f : -1e30f;
+        const uint32_t key = vocab_argmax::value_key(cast<fp32_t>(cast<bf16_t>(acc)), p.nan_key);
         const int32_t idx = r0 + t * kRows + warp;
-        if (vocab_argmax::better(f, idx, best, bidx)) {
-          best = f;
+        if (vocab_argmax::better(key, idx, best, bidx)) {
+          best = key;
           bidx = idx;
         }
       }
@@ -347,7 +362,7 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    float v = s_v[0];
+    uint32_t v = s_v[0];
     int32_t i = s_i[0];
 #pragma unroll
     for (int w = 1; w < kRows; ++w) {
@@ -356,7 +371,7 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
         i = s_i[w];
       }
     }
-    p.part_val[c] = v;
+    p.part_key[c] = v;
     p.part_idx[c] = i;
     __threadfence();
     s_last = atomicAdd(p.counter, 1u) == static_cast<uint32_t>(G) - 1;
@@ -366,10 +381,10 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
   if (!s_last) return;
   __threadfence();
   if (warp != 0) return;
-  float v = -1e30f;
+  uint32_t v = 0u;
   int32_t i = 0x7fffffff;
   for (int b = lane; b < G; b += 32) {
-    const float bv = __ldcg(p.part_val + b);
+    const uint32_t bv = __ldcg(p.part_key + b);
     const int32_t bi = __ldcg(p.part_idx + b);
     if (vocab_argmax::better(bv, bi, v, i)) {
       v = bv;
@@ -388,11 +403,11 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
     dst[k] = r;
   }
   if (lane == 0) {
-    auto* meta = reinterpret_cast<int32_t*>(p.payload + kH);
-    meta[0] = __float_as_int(v);
-    meta[1] = p.vocab_start + i;
-    meta[2] = 0;
-    meta[3] = 0;
+    auto* meta = reinterpret_cast<uint32_t*>(p.payload + kH);
+    meta[0] = v;
+    meta[1] = static_cast<uint32_t>(p.vocab_start + i);
+    meta[2] = 0u;
+    meta[3] = 0u;
     *p.counter = 0u;
   }
 }
@@ -404,10 +419,11 @@ struct LmHeadArgmax {
       const tvm::ffi::TensorView w,
       const tvm::ffi::TensorView embed,
       const tvm::ffi::TensorView payload,
-      const tvm::ffi::TensorView part_val,
+      const tvm::ffi::TensorView part_key,
       const tvm::ffi::TensorView part_idx,
       const tvm::ffi::TensorView counter,
-      int64_t vocab_start) {
+      int64_t vocab_start,
+      int64_t nan_key) {
     using namespace host;
     auto V = SymbolicSize{"vocab_local"};
     auto G = SymbolicSize{"grid"};
@@ -420,7 +436,7 @@ struct LmHeadArgmax {
         .with_device(device)
         .ensure_alignment(16)
         .verify(payload);
-    TensorMatcher({G}).with_dtype<fp32_t>().with_device(device).verify(part_val);
+    TensorMatcher({G}).with_dtype<int32_t>().with_device(device).verify(part_key);
     TensorMatcher({G}).with_dtype<int32_t>().with_device(device).verify(part_idx);
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(counter);
     const DLDevice dev = device.unwrap();
@@ -431,11 +447,12 @@ struct LmHeadArgmax {
         .w = static_cast<const bf16_t*>(w.data_ptr()),
         .embed = static_cast<const bf16_t*>(embed.data_ptr()),
         .payload = static_cast<bf16_t*>(payload.data_ptr()),
-        .part_val = static_cast<float*>(part_val.data_ptr()),
+        .part_key = static_cast<uint32_t*>(part_key.data_ptr()),
         .part_idx = static_cast<int32_t*>(part_idx.data_ptr()),
         .counter = static_cast<uint32_t*>(counter.data_ptr()),
         .vocab = static_cast<int32_t>(V.unwrap()),
         .vocab_start = static_cast<int32_t>(vocab_start),
+        .nan_key = static_cast<uint32_t>(nan_key),
     };
     constexpr std::size_t kSmem = static_cast<std::size_t>(kStages) * kRows * kH * sizeof(bf16_t);
     auto kernel = lm_head_argmax_kernel<kH, kRows, kStages, kCtasPerSm, kUsePDL>;
@@ -458,10 +475,11 @@ struct DraftVocabArgmax {
       const tvm::ffi::TensorView logits,
       const tvm::ffi::TensorView embed,
       const tvm::ffi::TensorView payload,
-      const tvm::ffi::TensorView part_val,
+      const tvm::ffi::TensorView part_key,
       const tvm::ffi::TensorView part_idx,
       const tvm::ffi::TensorView counter,
-      int64_t vocab_start) {
+      int64_t vocab_start,
+      int64_t nan_key) {
     using namespace host;
     auto M = SymbolicSize{"rows"};
     auto V = SymbolicSize{"vocab_local"};
@@ -474,7 +492,7 @@ struct DraftVocabArgmax {
         .with_device(device)
         .ensure_alignment(16)
         .verify(payload);
-    TensorMatcher({M, kBlocks}).with_dtype<fp32_t>().with_device(device).verify(part_val);
+    TensorMatcher({M, kBlocks}).with_dtype<int32_t>().with_device(device).verify(part_key);
     TensorMatcher({M, kBlocks}).with_dtype<int32_t>().with_device(device).verify(part_idx);
     TensorMatcher({M}).with_dtype<int32_t>().with_device(device).verify(counter);
     const int64_t vocab = V.unwrap();
@@ -483,11 +501,12 @@ struct DraftVocabArgmax {
         .logits = static_cast<const bf16_t*>(logits.data_ptr()),
         .embed = static_cast<const bf16_t*>(embed.data_ptr()),
         .payload = static_cast<bf16_t*>(payload.data_ptr()),
-        .part_val = static_cast<float*>(part_val.data_ptr()),
+        .part_key = static_cast<uint32_t*>(part_key.data_ptr()),
         .part_idx = static_cast<int32_t*>(part_idx.data_ptr()),
         .counter = static_cast<uint32_t*>(counter.data_ptr()),
         .vocab = static_cast<int32_t>(vocab),
         .vocab_start = static_cast<int32_t>(vocab_start),
+        .nan_key = static_cast<uint32_t>(nan_key),
     };
     LaunchKernel(dim3(kBlocks, static_cast<uint32_t>(M.unwrap())), kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(vocab_argmax_pack_kernel<kH, kBlocks, kThreads, kUsePDL>, params);
@@ -512,8 +531,12 @@ struct DraftVocabArgmax {
         .verify(gathered);
     TensorMatcher({M, 1}).with_dtype<int64_t>().with_device(device).verify(topk_index);
     TensorMatcher({M, 1}).with_dtype<fp32_t>().with_device(device).verify(topk_p);
-    TensorMatcher({M}).with_dtype<int64_t>().with_device(device).verify(positions);
     TensorMatcher({M, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(next_embeds);
+    int64_t* pos = nullptr;
+    if (positions.numel() > 0) {
+      TensorMatcher({M}).with_dtype<int64_t>().with_device(device).verify(positions);
+      pos = static_cast<int64_t*>(positions.data_ptr());
+    }
     int64_t* tokens = nullptr;
     int32_t stride = 0;
     if (draft_tokens.numel() > 0) {
@@ -528,7 +551,7 @@ struct DraftVocabArgmax {
         .topk_index = static_cast<int64_t*>(topk_index.data_ptr()),
         .topk_p = static_cast<float*>(topk_p.data_ptr()),
         .draft_tokens = tokens,
-        .positions = static_cast<int64_t*>(positions.data_ptr()),
+        .positions = pos,
         .next_embeds = static_cast<bf16_t*>(next_embeds.data_ptr()),
         .draft_column = static_cast<int32_t>(draft_column),
         .draft_stride = stride,

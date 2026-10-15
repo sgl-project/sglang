@@ -192,6 +192,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self._rebuild_topk1_chain_buffers()
         self._draft_vocab_exchange: Optional[DraftVocabExchange] = None
+        self._exchange_in_draft_steps = False
+        self._exchange_in_draft_extend = False
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
@@ -243,13 +245,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
-        if (
-            envs.SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE.get()
-            and self.topk == 1
-            and self.hot_token_id is None
-        ):
+        in_steps = envs.SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE.get()
+        # The rejection-sampling extend path needs the full draft distribution.
+        in_extend = (
+            envs.SGLANG_Q35MF_DRAFT_EXTEND_EXCHANGE.get()
+            and not _is_hip
+            and not get_spec().speculative_use_rejection_sampling
+        )
+        if (in_steps or in_extend) and self.topk == 1 and self.hot_token_id is None:
             self._draft_vocab_exchange = DraftVocabExchange.maybe_create(
                 self.draft_runner.model, self.speculative_num_steps
+            )
+            self._exchange_in_draft_steps = (
+                in_steps and self._draft_vocab_exchange is not None
+            )
+            self._exchange_in_draft_extend = (
+                in_extend and self._draft_vocab_exchange is not None
             )
 
         if get_spec().speculative_use_rejection_sampling:
@@ -602,9 +613,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            # Captured graphs keep small batches' extend logits on the vocab shards.
+            logits_processor = self.draft_runner.model.logits_processor
+            if self._exchange_in_draft_extend:
+                logits_processor.skip_vocab_gather_rows = DraftVocabExchange.MAX_ROWS
+            try:
+                self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
+            finally:
+                logits_processor.skip_vocab_gather_rows = 0
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -769,7 +787,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         exchange = (
             self._draft_vocab_exchange
-            if draft_tokens_topk1 is not None
+            if self._exchange_in_draft_steps
+            and draft_tokens_topk1 is not None
             and topk_index.shape[0] <= DraftVocabExchange.MAX_ROWS
             else None
         )
@@ -1233,6 +1252,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
+                draft_logits_output.next_token_logits
+            )
+            ret_draft_probs = None
+        elif (
+            self._exchange_in_draft_extend
+            and can_run_decode_cuda_graph
+            and self._draft_vocab_exchange.is_local(
+                draft_logits_output.next_token_logits
+            )
+        ):
+            ret_topk_p, ret_topk_index = self._draft_vocab_exchange.select_extend(
                 draft_logits_output.next_token_logits
             )
             ret_draft_probs = None

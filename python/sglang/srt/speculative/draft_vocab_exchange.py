@@ -2,7 +2,9 @@
 its shard argmax and that candidate's embedding row, one small all-gather replaces
 the logits all-gather, and the winner's row becomes the next draft step's input
 embedding (replacing the vocab-parallel lookup and its all-reduce). The selected
-token equals the argmax over the gathered logits, ties to the lowest token id."""
+token equals the argmax over the gathered logits, ties to the lowest token id;
+NaN follows the argmax each path replaces (split argmax in draft steps,
+torch.argmax after the draft extend)."""
 
 from __future__ import annotations
 
@@ -13,6 +15,8 @@ import torch
 
 from sglang.kernels.ops.speculative.draft_vocab_argmax import (
     META_ELEMS,
+    NAN_KEY_SPLIT_ARGMAX,
+    NAN_KEY_TORCH_ARGMAX,
     PACK_BLOCKS,
     vocab_argmax_pack,
     vocab_argmax_select,
@@ -72,18 +76,20 @@ class DraftVocabExchange:
         self.embed_weight = embed.weight
         self.vocab_start = embed.shard_indices.org_vocab_start_index
         self.vocab_size = model.config.vocab_size
+        self.local_vocab = embed.weight.shape[0]
         self.world = get_parallel().tp_size
         hidden = embed.weight.shape[1]
         dev = embed.weight.device
         rows = self.MAX_ROWS
         self.payload = torch.empty(rows, hidden + META_ELEMS, dtype=torch.bfloat16, device=dev)
-        self.part_val = torch.empty(rows, PACK_BLOCKS, dtype=torch.float32, device=dev)
+        self.part_key = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
         self.part_idx = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
         self.counter = torch.zeros(rows, dtype=torch.int32, device=dev)
         self.next_embeds = torch.empty(rows, hidden, dtype=torch.bfloat16, device=dev)
         self.topk_index = [torch.empty(rows, 1, dtype=torch.int64, device=dev) for _ in range(num_steps)]
         self.topk_p = [torch.empty(rows, 1, dtype=torch.float32, device=dev) for _ in range(num_steps)]
         self.no_tokens = torch.empty(0, dtype=torch.int64, device=dev)
+        self.no_positions = torch.empty(0, dtype=torch.int64, device=dev)
         self.num_rows = 1
         # Same guarded multimem all-gather as the logits gather; a cross-rank
         # all-reduce always sits between two draft steps' gathers.
@@ -103,7 +109,7 @@ class DraftVocabExchange:
     def begin_step(self, step: int, num_rows: int) -> None:
         self.num_rows = num_rows
         self.model.draft_input_embeds = self.next_embeds[:num_rows] if step > 0 else None
-        self.model.logits_processor.skip_vocab_gather = True
+        self.model.logits_processor.skip_vocab_gather_rows = self.MAX_ROWS
 
     def finish_step(
         self,
@@ -114,17 +120,7 @@ class DraftVocabExchange:
         draft_column: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = self.num_rows
-        vocab_argmax_pack(
-            local_logits,
-            self.embed_weight,
-            self.payload[:m],
-            self.part_val[:m],
-            self.part_idx[:m],
-            self.counter[:m],
-            self.vocab_start,
-            self.world,
-        )
-        gathered = self.gatherer(self.payload[:m])
+        gathered = self._pack_and_gather(local_logits, m, NAN_KEY_SPLIT_ARGMAX)
         topk_index, topk_p = self.topk_index[step][:m], self.topk_p[step][:m]
         vocab_argmax_select(
             gathered,
@@ -141,4 +137,40 @@ class DraftVocabExchange:
 
     def end(self) -> None:
         self.model.draft_input_embeds = None
-        self.model.logits_processor.skip_vocab_gather = False
+        self.model.logits_processor.skip_vocab_gather_rows = 0
+
+    def is_local(self, logits: torch.Tensor) -> bool:
+        return logits.shape[-1] == self.local_vocab and 0 < logits.shape[0] <= self.MAX_ROWS
+
+    def select_extend(self, local_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Draft-extend argmax (torch.argmax semantics) from shard-local logits."""
+        m = local_logits.shape[0]
+        gathered = self._pack_and_gather(local_logits, m, NAN_KEY_TORCH_ARGMAX)
+        topk_index = torch.empty((m, 1), dtype=torch.int64, device=local_logits.device)
+        topk_p = torch.empty((m, 1), dtype=torch.float32, device=local_logits.device)
+        vocab_argmax_select(
+            gathered,
+            topk_index,
+            topk_p,
+            self.no_tokens,
+            self.no_positions,
+            self.next_embeds[:m],
+            0,
+            PACK_BLOCKS,
+            self.world,
+        )
+        return topk_p, topk_index
+
+    def _pack_and_gather(self, local_logits: torch.Tensor, m: int, nan_key: int) -> torch.Tensor:
+        vocab_argmax_pack(
+            local_logits,
+            self.embed_weight,
+            self.payload[:m],
+            self.part_key[:m],
+            self.part_idx[:m],
+            self.counter[:m],
+            self.vocab_start,
+            self.world,
+            nan_key,
+        )
+        return self.gatherer(self.payload[:m])

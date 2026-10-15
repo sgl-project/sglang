@@ -562,6 +562,8 @@ class Envs:
     # Greedy draft steps select the token on vocab shards and exchange one packed
     # row (argmax + embedding) instead of all-gathering the logits.
     SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
+    # Same exchange for the greedy token after the draft extend (torch.argmax NaN rule).
+    SGLANG_Q35MF_DRAFT_EXTEND_EXCHANGE = EnvBool(False)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)

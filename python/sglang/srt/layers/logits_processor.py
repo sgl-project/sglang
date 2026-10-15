@@ -483,8 +483,9 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
-        # Set only around greedy draft steps that select on vocab shards.
-        self.skip_vocab_gather = False
+        # Set around greedy draft forwards that select on vocab shards: logits of
+        # at most this many rows are returned unreduced (0 = always gather).
+        self.skip_vocab_gather_rows = 0
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
@@ -918,7 +919,7 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if self.skip_vocab_gather:
+        if 0 < logits.shape[0] <= self.skip_vocab_gather_rows:
             return logits
 
         used_tp_lm_head_all_to_all = False
