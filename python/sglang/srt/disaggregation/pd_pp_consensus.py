@@ -144,9 +144,6 @@ class _DisaggPrefillRing:
     def send_ids(self) -> None:
         self.send_transfer_work = self.channel.send_next(self.transferred_rids)
 
-    def is_drained(self) -> bool:
-        return len(self.owner.transfer) == 0
-
 
 class _DisaggDecodeRing:
     """The PD decode messages around each ring slot: the PP ranks agree on the
@@ -311,14 +308,3 @@ class _DisaggDecodeRing:
         self.send_retract_work = self.channel.send_next(self.retract_rids)
         self.send_prealloc_work = self.channel.send_next(self.prealloc_rids)
         self.send_transfer_work = self.channel.send_next(self.transferred_rids)
-
-    def is_drained(self) -> bool:
-        owner = self.owner
-        queue_size = (
-            len(owner.ready)
-            + len(owner.transfer_queue.queue)
-            + len(owner.prealloc_queue.queue)
-        )
-        if get_disagg().disaggregation_decode_enable_offload_kvcache:
-            queue_size += len(owner.decode_offload_manager.ongoing_offload)
-        return queue_size == 0

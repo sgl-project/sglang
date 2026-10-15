@@ -589,6 +589,13 @@ class TestRingDriverStageOrder(CustomTestCase):
             + _at(2, "send", "recv", "dp.after_commit", "send", "send"),
         )
 
+    def test_pd_prefill_idles_while_a_transfer_is_in_flight(self):
+        """An idle ring round runs on_idle, which checks the PD lists itself,
+        as the flat loop does."""
+        shell = _RingShell("prefill", 2)
+        shell.s.mode_owners.disagg_prefill.transfer.append(object())
+        self.assertEqual(shell.run()[-1], (1, "idle"))
+
     def test_pd_decode(self):
         shell = _RingShell("decode", 2, decode={0: _decode_step("d0")})
         schedule = ("ingest", "dd.retracted", "dd.poll_prealloc", "dd.poll_transfer")

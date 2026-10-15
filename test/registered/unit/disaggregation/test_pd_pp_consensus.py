@@ -109,17 +109,6 @@ class TestDisaggDecodeRing(CustomTestCase):
         owner.apply_transfer_consensus.assert_not_called()
         self.assertIsNone(ring.release_rids)
 
-    def test_drained_counts_the_owner_lists(self):
-        owner = decode_owner_shell()
-        ring = _decode_ring(owner, _Channel())
-        with patch(f"{PP_MODULE}.get_disagg") as get_disagg:
-            get_disagg.return_value = SimpleNamespace(
-                disaggregation_decode_enable_offload_kvcache=False
-            )
-            self.assertTrue(ring.is_drained())
-            owner.ready.append(object())
-            self.assertFalse(ring.is_drained())
-
 
 class TestDisaggPrefillRing(CustomTestCase):
     def test_release_waits_for_the_slot_consensus(self):
@@ -145,7 +134,6 @@ class TestDisaggPrefillRing(CustomTestCase):
 
         ring.send_ids()
         self.assertEqual(channel.sent, [["b"]])
-        self.assertTrue(ring.is_drained())
 
 
 if __name__ == "__main__":

@@ -153,28 +153,6 @@ _DIRECT_READS = {
         "BeamCoordinator.row_budget",
         "CoreLists.decoding",
     ): 1,
-    # The PD+PP ring's drain gate before on_idle checks its own subset of the
-    # PD lists; on_idle asks is_fully_idle itself.
-    (
-        "disaggregation/pd_pp_consensus.py",
-        "_DisaggDecodeRing.is_drained",
-        "DecodePreallocQueue.queue",
-    ): 1,
-    (
-        "disaggregation/pd_pp_consensus.py",
-        "_DisaggDecodeRing.is_drained",
-        "DecodeTransferQueue.queue",
-    ): 1,
-    (
-        "disaggregation/pd_pp_consensus.py",
-        "_DisaggDecodeRing.is_drained",
-        "DisaggDecode.ready",
-    ): 1,
-    (
-        "disaggregation/pd_pp_consensus.py",
-        "_DisaggPrefillRing.is_drained",
-        "DisaggPrefill.transfer",
-    ): 1,
     # Writers of the core waiting queue (the queue-limit door evicts from it;
     # the L3 retries follow its order); they go with the loop as the only
     # writer.
