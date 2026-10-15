@@ -347,6 +347,42 @@ class TestBoundaryReductionDefaults(CustomTestCase):
                 )
 
 
+class TestDSV4AttentionBackendDefault(CustomTestCase):
+    def test_auto_keeps_flashmla_where_mega_would_silently_change_the_pool(self):
+        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+        from sglang.srt.arg_groups.deepseek_v4_hook import apply_deepseek_v4_defaults
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+        from sglang.srt.server_args import ServerArgs
+
+        def resolved(model_type="deepseek_v41", **fields):
+            args = ServerArgs(
+                model_path="local-deepseek-v41",
+                device="cuda",
+                cuda_graph_backend_prefill=Backend.DISABLED,
+                max_running_requests=32,
+                **fields,
+            )
+            args._model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["DeepseekV4ForCausalLM"], model_type=model_type
+                ),
+                hf_text_config=SimpleNamespace(model_type=model_type),
+                is_multimodal=False,
+            )
+            parse_cuda_graph_config(args)
+            apply_deepseek_v4_defaults(args, "DeepseekV4ForCausalLM")
+            return resolution_result(args, "dsv4_attn_backend")
+
+        with (
+            override_platform(is_cuda=True, is_hip=False, is_npu=False),
+            patch("sglang.srt.utils.common.is_sm100_supported", return_value=True),
+            envs.SGLANG_DSV4_KV_LAYOUT.override("auto"),
+        ):
+            self.assertEqual(resolved(), "flashmla_mega")
+            self.assertEqual(resolved(model_type="deepseek_v4"), "flashmla")
+            self.assertEqual(resolved(disaggregation_mode="prefill"), "flashmla")
+
+
 class TestDSparkCheckpointConfig(CustomTestCase):
     def test_sample_from_anchor_is_read_from_checkpoint_config(self):
         from sglang.srt.speculative.dspark_components.dspark_config import (
