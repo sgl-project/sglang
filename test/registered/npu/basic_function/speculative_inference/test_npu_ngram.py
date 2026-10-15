@@ -29,7 +29,7 @@ class TestNpuNgram(unittest.TestCase):
             device="npu",
             attention_backend="ascend",
             dtype="bfloat16",
-            mem_fraction_static=0.15,
+            mem_fraction_static=0.75,
             max_running_requests=4,
             max_total_tokens=2048,
             context_length=1024,

@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
+import triton
+import triton.language as tl
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
     attention_sinks_triton,
@@ -23,7 +25,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.hardware_backend.npu.attention.ngram import build_ngram_attention_mask
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -61,6 +62,31 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+
+
+@triton.jit
+def _build_ngram_attention_mask_kernel(
+    tree_mask,
+    prefix_lens,
+    out,
+    D: tl.constexpr,
+    KV_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    query = tl.program_id(1)
+    keys = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    prefix = tl.load(prefix_lens + batch)
+    draft_key = keys - prefix
+    ancestor = tl.load(
+        tree_mask + batch * D * D + query * D + draft_key,
+        mask=(draft_key >= 0) & (draft_key < D) & (keys < KV_LEN),
+        other=0,
+    )
+    # NGRAM uses True=allowed; FIA uses True=blocked. Allow the prefix and
+    # ancestors, while blocking sibling branches and the unused page tail.
+    blocked = (keys >= prefix) & (ancestor == 0)
+    tl.store(out + (batch * D + query) * KV_LEN + keys, blocked, keys < KV_LEN)
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -332,6 +358,26 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
+    @staticmethod
+    def _build_ngram_attention_mask(
+        tree_mask: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        draft_token_num: int,
+        padded_kv_len: int,
+    ) -> torch.Tensor:
+        """Build [B, 1, D, page-rounded KV slots] blocked masks for BSH FIA."""
+        bs = prefix_lens.numel()
+        out = torch.empty(
+            (bs, 1, draft_token_num, padded_kv_len),
+            dtype=torch.bool,
+            device=tree_mask.device,
+        )
+        if bs:
+            _build_ngram_attention_mask_kernel[
+                (bs, draft_token_num, triton.cdiv(padded_kv_len, 256))
+            ](tree_mask, prefix_lens, out, draft_token_num, padded_kv_len, 256)
+        return out
+
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -592,7 +638,7 @@ class AscendAttnBackend(AttentionBackend):
             _is_ngram_verify(forward_batch.spec_info)
             and forward_batch.forward_mode.is_target_verify()
         ):
-            self.forward_metadata.ngram_attn_mask = build_ngram_attention_mask(
+            self.forward_metadata.ngram_attn_mask = self._build_ngram_attention_mask(
                 forward_batch.spec_info.custom_mask,
                 forward_batch.seq_lens,
                 int(forward_batch.spec_info.draft_token_num),

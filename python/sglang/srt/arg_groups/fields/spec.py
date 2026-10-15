@@ -270,7 +270,7 @@ class Spec(msgspec.Struct):
     ] = 18
     speculative_ngram_capacity: A[
         int,
-        "CPU trie node capacity, including its root (>= max-trie-depth + 1). Does not limit external SAM memory.",
+        "CPU trie node capacity, including its root. Does not limit external SAM memory.",
     ] = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: A[
         Optional[str],

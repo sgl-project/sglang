@@ -6,7 +6,7 @@ import torch
 import torch_npu  # noqa: F401
 
 from sglang.srt.arg_groups.overrides import resolved_view
-from sglang.srt.hardware_backend.npu.attention.ngram import build_ngram_attention_mask
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import ServerArgs
@@ -37,12 +37,16 @@ class TestNgramAttention(unittest.TestCase):
         self.assertEqual(args.speculative_num_draft_tokens, 12)
         self.assertGreaterEqual(args.speculative_num_steps, 1)
         for invalid in (
-            dict(speculative_ngram_min_bfs_breadth=0),
-            dict(speculative_ngram_max_bfs_breadth=0),
-            dict(speculative_ngram_capacity=18),
-            dict(speculative_ngram_external_sam_budget=12),
-            dict(speculative_ngram_external_corpus_max_tokens=0),
             dict(speculative_ngram_external_corpus_path="corpus.jsonl"),
+            dict(
+                speculative_ngram_external_corpus_path="corpus.jsonl",
+                speculative_ngram_external_sam_budget=12,
+            ),
+            dict(
+                speculative_ngram_external_corpus_path="corpus.jsonl",
+                speculative_ngram_external_sam_budget=4,
+                speculative_ngram_external_corpus_max_tokens=0,
+            ),
             dict(speculative_use_rejection_sampling=True),
         ):
             with self.subTest(options=invalid), self.assertRaises(ValueError):
@@ -57,7 +61,7 @@ class TestNgramAttention(unittest.TestCase):
             [[1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 1, 0], [1, 0, 1, 1]],
             dtype=torch.bool,
         ).repeat(bs, 1, 1)
-        mask = build_ngram_attention_mask(
+        mask = AscendAttnBackend._build_ngram_attention_mask(
             tree.flatten().npu(), torch.tensor(prefixes).npu(), d, 2 * page
         )
         expected_mask = torch.ones((bs, 1, d, 2 * page), dtype=torch.bool)
@@ -111,7 +115,7 @@ class TestNgramAttention(unittest.TestCase):
                 )
 
     def test_empty_and_single_root(self):
-        mask = build_ngram_attention_mask(
+        mask = AscendAttnBackend._build_ngram_attention_mask(
             torch.empty(0, dtype=torch.bool, device="npu"),
             torch.empty(0, dtype=torch.int64, device="npu"),
             4,
@@ -119,7 +123,7 @@ class TestNgramAttention(unittest.TestCase):
         )
         self.assertEqual(mask.shape, (0, 1, 4, 128))
         mask = (
-            build_ngram_attention_mask(
+            AscendAttnBackend._build_ngram_attention_mask(
                 torch.ones(1, dtype=torch.bool, device="npu"),
                 torch.tensor([3], device="npu"),
                 1,

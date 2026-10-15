@@ -23,17 +23,6 @@ class NgramCorpus:
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
     ) -> None:
-        from sglang.srt.speculative.ngram_config import validate_ngram_config
-
-        validate_ngram_config(
-            min_bfs_breadth=min_bfs_breadth,
-            max_bfs_breadth=max_bfs_breadth,
-            max_trie_depth=max_trie_depth,
-            capacity=capacity,
-            draft_token_num=draft_token_num,
-            external_sam_budget=external_sam_budget,
-            external_corpus_max_tokens=external_corpus_max_tokens,
-        )
         cls = get_ngram_corpus_cls()
         self._obj = cls(
             capacity=capacity,

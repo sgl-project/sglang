@@ -1253,17 +1253,6 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
             "You can override this by explicitly setting --speculative-num-draft-tokens."
         )
-    from sglang.srt.speculative.ngram_config import validate_ngram_config
-
-    validate_ngram_config(
-        min_bfs_breadth=cfg.speculative_ngram_min_bfs_breadth,
-        max_bfs_breadth=cfg.speculative_ngram_max_bfs_breadth,
-        max_trie_depth=cfg.speculative_ngram_max_trie_depth,
-        capacity=cfg.speculative_ngram_capacity,
-        draft_token_num=cfg.speculative_num_draft_tokens,
-        external_sam_budget=cfg.speculative_ngram_external_sam_budget,
-        external_corpus_max_tokens=cfg.speculative_ngram_external_corpus_max_tokens,
-    )
     if cfg.speculative_num_steps is None:
         declare_resolution(
             server_args,
