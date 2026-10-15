@@ -77,6 +77,13 @@ def _pool(config):
         layers_to_capture=None,
         layer_shard_enabled=False,
     )
+    device.kv_buffer = [
+        torch.empty(device.size + 64, 1, 12, dtype=device.store_dtype)
+        for _ in range(device.layer_num)
+    ]
+    device.data_ptrs = torch.tensor(
+        [buffer.data_ptr() for buffer in device.kv_buffer], dtype=torch.uint64
+    )
     return MLATokenToKVPoolHost(
         device,
         host_to_device_ratio=2,
@@ -224,17 +231,13 @@ def _io(store, config, pages, api, write):
 
 
 class TestMooncakeDcpStorage(CustomTestCase):
-    def test_native_failures_are_explicit_per_object_failures(self):
-        """A failed native call must not kill workers or acknowledge a write.
-
-        A short result vector also cannot prove that every requested object
-        completed, even when all returned statuses indicate success.
-        """
+    def test_incomplete_native_results_cannot_acknowledge_shards(self):
+        """Every object needs a status before its logical page can be restored."""
         for layout, api, operation, failure in product(
             ("page_first", "layer_first"),
             (1, 2),
             ("get", "put", "exists"),
-            ("exception", "short", "extra", "none"),
+            ("short", "extra", "none"),
         ):
             with self.subTest(
                 layout=layout, api=api, operation=operation, failure=failure
@@ -253,12 +256,9 @@ class TestMooncakeDcpStorage(CustomTestCase):
                     "extra": [1 if operation == "exists" else 0] * 4,
                     "none": None,
                 }
-                fault = (
-                    {"side_effect": RuntimeError("injected native I/O failure")}
-                    if failure == "exception"
-                    else {"return_value": outcomes[failure]}
-                )
-                with patch.object(store.store, native_method, **fault):
+                with patch.object(
+                    store.store, native_method, return_value=outcomes[failure]
+                ):
                     if operation == "exists":
                         hits = (
                             store.batch_exists(KEYS)
@@ -332,6 +332,44 @@ class TestMooncakeDcpStorage(CustomTestCase):
                         ],
                     )
                     self.assertEqual(writer.store.segment_bytes, (64 << 20) // dcp)
+
+    def test_partial_backup_uses_whole_logical_pages(self):
+        # The batched PUT skips an existing middle object. The remaining
+        # addresses must still cover complete logical pages on each DCP shard.
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                config = _config(layout=layout)
+                source, target, objects = _pool(config), _pool(config), {}
+                source.kv_buffer.copy_(
+                    torch.arange(source.kv_buffer.numel())
+                    .reshape(source.kv_buffer.shape)
+                    .to(source.dtype)
+                )
+                writer, reader = (
+                    _store(config, source, objects),
+                    _store(config, target, objects),
+                )
+                writer.store.own(source, SOURCE_PAGES)
+                reader.store.own(target, TARGET_PAGES)
+                writer.batch_set_v2(
+                    [
+                        PoolTransfer(
+                            PoolName.KV,
+                            host_indices=_indices(config, SOURCE_PAGES[1:2]),
+                            keys=KEYS[1:2],
+                        )
+                    ]
+                )
+                self.assertEqual(_io(writer, config, SOURCE_PAGES, 2, True), [True] * 3)
+                self.assertEqual(
+                    _io(reader, config, TARGET_PAGES, 2, False), [True] * 3
+                )
+                for src, dst in zip(SOURCE_PAGES, TARGET_PAGES):
+                    for expected, actual in zip(
+                        _page_segments(source, source.kv_buffer, src),
+                        _page_segments(target, target.kv_buffer, dst),
+                    ):
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_incompatible_namespaces_miss_and_replicas_hit(self):
         config = _config()

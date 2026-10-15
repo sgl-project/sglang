@@ -157,6 +157,8 @@ class TestDcpStorageGuards(CustomTestCase):
                     prefetch_stop_policy="timeout",
                     write_through_threshold=2,
                     is_write_back=True,
+                    host_memory_mode="cache",
+                    tree_core=SimpleNamespace(is_write_through_compatible=lambda: True),
                 )
                 attachment = StorageAttachment(cache)
                 with (
@@ -206,6 +208,8 @@ class TestDcpStorageGuards(CustomTestCase):
             write_through_threshold=2,
             is_write_back=True,
             sliding_window_size=None,
+            host_memory_mode="cache",
+            tree_core=SimpleNamespace(is_write_through_compatible=lambda: True),
         )
         with (
             mock.patch(

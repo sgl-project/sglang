@@ -811,7 +811,7 @@ class HiCacheController:
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
             dcp_size=dcp_size,
-            dcp_rank=get_parallel().attn_dcp_rank,
+            dcp_rank=parallel.attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
             # FP8 caches use uint8 host buffers; key by the actual KV format.
             kv_cache_dtype=(
@@ -1483,9 +1483,3 @@ class HiCacheController:
                 self.prefetch_completion_sync_groups,
             )
             ack.completed_tokens = completed_tokens_tensor.item()
-            if self.storage_config.dcp_size > 1:
-                logger.debug(
-                    "DCP L3 prefetch: tp_rank=%d tokens=%d",
-                    self.storage_config.tp_rank,
-                    ack.completed_tokens,
-                )

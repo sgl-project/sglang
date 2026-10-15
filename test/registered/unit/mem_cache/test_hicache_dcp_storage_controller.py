@@ -76,6 +76,13 @@ def _controller(
         layers_to_capture=None,
         layer_shard_enabled=False,
     )
+    device.kv_buffer = [
+        torch.empty(device.size + 64, 1, 12, dtype=device.store_dtype)
+        for _ in range(device.layer_num)
+    ]
+    device.data_ptrs = torch.tensor(
+        [buffer.data_ptr() for buffer in device.kv_buffer], dtype=torch.uint64
+    )
     host = MLATokenToKVPoolHost(
         device,
         host_to_device_ratio=host_to_device_ratio,
@@ -324,6 +331,7 @@ class TestDcpStorageController(CustomTestCase):
 
     def test_runtime_attach_rejects_incomplete_file_payloads(self):
         for representation in (
+            "page_unified",
             "dummy",
             "split",
             "scales",
@@ -332,7 +340,9 @@ class TestDcpStorageController(CustomTestCase):
             "extra_pool",
         ):
             cc = _controller(0, dtype=torch.float16)
-            if representation == "dummy":
+            if representation == "page_unified":
+                cc.storage_host_pool.layout = "page_unified"
+            elif representation == "dummy":
                 cc.storage_host_pool.kv_buffer = None
             elif representation == "split":
                 cc.storage_host_pool.layout = "page_first_kv_split"

@@ -1077,7 +1077,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if len(missing_pages) * key_multiplier < len(key_strs):
                 # Metadata generation consumes CPU indices anyway, so select
                 # the logical pages there rather than uploading a new index.
-                page_size = host_pool.page_size or 1
+                page_size = host_pool.logical_page_size
                 host_indices = host_indices.detach().to(device="cpu")
                 host_indices = host_indices.reshape(-1, page_size)[
                     missing_pages
@@ -1483,43 +1483,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config = self._replicate_config_cls()
             config.group_ids = group_ids
 
-        try:
-            if self._uses_multi_buffer(buffer_ptrs):
-                config = config or self._replicate_config_cls()
-                results = self.store.batch_put_from_multi_buffers(
-                    key_strs, buffer_ptrs, buffer_sizes, config
-                )
-            elif config is not None:
-                results = self.store.batch_put_from(
-                    key_strs, buffer_ptrs, buffer_sizes, config
-                )
-            else:
-                results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
-        except Exception:
-            # Native calls are synchronous: after return/raise their buffers
-            # can be released by the normal controller completion protocol.
-            logger.exception("Mooncake batch PUT failed")
-            return [-1] * len(key_strs)
+        if self._uses_multi_buffer(buffer_ptrs):
+            config = config or self._replicate_config_cls()
+            results = self.store.batch_put_from_multi_buffers(
+                key_strs, buffer_ptrs, buffer_sizes, config
+            )
+        elif config is not None:
+            results = self.store.batch_put_from(
+                key_strs, buffer_ptrs, buffer_sizes, config
+            )
+        else:
+            results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
         return self._checked_batch_results(results, len(key_strs), "PUT")
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         multi_buffer = self._uses_multi_buffer(buffer_ptrs)
+        if multi_buffer:
+            results = self.store.batch_get_into_multi_buffers(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+        else:
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        if self._dcp_namespace is None:
+            return results
+        results = self._checked_batch_results(results, len(key_strs), "GET")
         expected_sizes = (
             [sum(sizes) for sizes in buffer_sizes] if multi_buffer else buffer_sizes
         )
-        try:
-            if multi_buffer:
-                results = self.store.batch_get_into_multi_buffers(
-                    key_strs, buffer_ptrs, buffer_sizes
-                )
-            else:
-                results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
-        except Exception:
-            logger.exception("Mooncake batch GET failed")
-            return [-1] * len(key_strs)
-        results = self._checked_batch_results(results, len(key_strs), "GET")
         # A positive count can still be a truncated object. Only a complete
         # physical shard is safe for the controller to publish as restored.
         return [
@@ -1527,8 +1519,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for result, expected in zip(results, expected_sizes)
         ]
 
-    @staticmethod
-    def _checked_batch_results(results, count: int, operation: str) -> List[int]:
+    def _checked_batch_results(self, results, count: int, operation: str) -> List[int]:
+        if self._dcp_namespace is None:
+            return results
         if not isinstance(results, Sequence) or len(results) != count:
             logger.warning(
                 "Mooncake batch %s returned an invalid result count", operation
@@ -1560,11 +1553,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
                     for key in key_strs
                 ]
-        try:
-            results = self.store.batch_is_exist(key_strs)
-        except Exception:
-            logger.exception("Mooncake batch EXISTS failed")
-            return [-1] * len(key_strs)
+        results = self.store.batch_is_exist(key_strs)
         return self._checked_batch_results(results, len(key_strs), "EXISTS")
 
     def get_stats(self):
