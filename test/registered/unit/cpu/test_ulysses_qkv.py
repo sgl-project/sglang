@@ -42,9 +42,11 @@ def test_pack_qkv_destination_major_cpu_is_bit_exact(dtype):
 
     actual = torch.empty_like(expected)
 
-    torch.ops.sgl_kernel.pack_qkv_destination_major_cpu(q, k, v, world_size, actual)
+    result = torch.ops.sgl_kernel.pack_qkv_destination_major_cpu(
+        q, k, v, world_size, out=actual
+    )
 
-    assert torch.equal(actual, expected)
+    assert torch.equal(result, expected)
 
 
 if __name__ == "__main__":

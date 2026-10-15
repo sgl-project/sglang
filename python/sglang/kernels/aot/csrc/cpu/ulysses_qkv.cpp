@@ -36,19 +36,19 @@
  *
  */
 
-void pack_qkv_destination_major_cpu(
-    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, int64_t world_size, at::Tensor& output) {
+at::Tensor pack_qkv_destination_major_cpu(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, int64_t world_size, at::Tensor& out) {
   CHECK_DIM(3, q);
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
-  CHECK_DIM(4, output);
+  CHECK_DIM(4, out);
   TORCH_CHECK(q.device().is_cpu() && k.device().is_cpu() && v.device().is_cpu(), "q, k, and v must be CPU tensors");
   CHECK_EQ(q.sizes(), k.sizes());
   CHECK_EQ(q.sizes(), v.sizes());
 
   CHECK_EQ(q.scalar_type(), k.scalar_type());
   CHECK_EQ(q.scalar_type(), v.scalar_type());
-  CHECK_EQ(output.scalar_type(), q.scalar_type());
+  CHECK_EQ(out.scalar_type(), q.scalar_type());
   TORCH_CHECK(
       q.layout() == at::kStrided && k.layout() == at::kStrided && v.layout() == at::kStrided,
       "q, k, and v must be strided tensors");
@@ -61,12 +61,11 @@ void pack_qkv_destination_major_cpu(
   TORCH_CHECK(global_heads % world_size == 0, "world_size must divide global_heads");
   const int64_t local_heads = global_heads / world_size;
   TORCH_CHECK(
-      output.size(0) == world_size && output.size(1) == rows && output.size(2) == local_heads &&
-          output.size(3) == 3 * head_size,
+      out.size(0) == world_size && out.size(1) == rows && out.size(2) == local_heads && out.size(3) == 3 * head_size,
       "invalid output shape");
-  TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+  TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
   if (q.numel() == 0) {
-    return;
+    return out;
   }
 
   const int64_t q_stride_row = q.stride(0);
@@ -80,7 +79,7 @@ void pack_qkv_destination_major_cpu(
     const scalar_t* q_ptr = q.data_ptr<scalar_t>();
     const scalar_t* k_ptr = k.data_ptr<scalar_t>();
     const scalar_t* v_ptr = v.data_ptr<scalar_t>();
-    scalar_t* out_ptr = output.data_ptr<scalar_t>();
+    scalar_t* out_ptr = out.data_ptr<scalar_t>();
 
     const size_t head_bytes = static_cast<size_t>(head_size) * sizeof(scalar_t);
     const int64_t total_head_slots = rows * global_heads;
@@ -106,4 +105,5 @@ void pack_qkv_destination_major_cpu(
       }
     });
   });
+  return out;
 }
