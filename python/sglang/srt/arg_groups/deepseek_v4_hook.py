@@ -212,7 +212,46 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             raise ValueError(
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
+        if cfg.dsv41_main_kv_layout != "auto" or cfg.dsv41_main_kv_consumer != "auto":
+            raise ValueError(
+                "--dsv41-main-kv-layout and --dsv41-main-kv-consumer require "
+                "DeepSeek-V4.1"
+            )
         return
+
+    if cfg.dsv41_main_kv_consumer == "staged":
+        raise ValueError(
+            "DeepSeek-V4.1 packed Main-KV staged consumption is not available; "
+            "use --dsv41-main-kv-consumer=direct on SM90"
+        )
+    if cfg.dsv41_main_kv_layout == "packed_fp4":
+        if cfg.dsv41_main_kv_consumer != "direct":
+            raise ValueError(
+                "--dsv41-main-kv-layout=packed_fp4 currently requires "
+                "--dsv41-main-kv-consumer=direct; auto remains on the legacy layout"
+            )
+        if not get_platform().is_sm90:
+            raise ValueError(
+                "DeepSeek-V4.1 packed Main-KV direct consumption requires SM90"
+            )
+        if cfg.dsv4_attn_backend not in ("auto", "flashmla"):
+            raise ValueError(
+                "DeepSeek-V4.1 packed Main-KV direct consumption requires the "
+                "FlashMLA attention backend"
+            )
+    elif cfg.dsv41_main_kv_consumer == "direct":
+        raise ValueError(
+            "--dsv41-main-kv-consumer=direct requires --dsv41-main-kv-layout=packed_fp4"
+        )
+    if cfg.dsv41_main_kv_layout == "flashmla_fp8" and (
+        envs.SGLANG_DSV4_KV_LAYOUT.get().lower() == "v41"
+        or envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower() == "fp4"
+    ):
+        raise ValueError(
+            "--dsv41-main-kv-layout=flashmla_fp8 conflicts with "
+            "the explicitly configured V4.1/FP4 legacy KV environment"
+        )
+
     if (
         cfg.dsv4_attn_backend == "trtllm"
         and cfg.cuda_graph_config.prefill.backend
