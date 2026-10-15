@@ -2564,6 +2564,29 @@ class TestQwen3CoderDetector(unittest.TestCase):
                         {keyword: branches}, json.dumps(value), value
                     )
 
+    def test_union_plain_text_skips_json_decoding(self):
+        """Plain union strings must not pay for a failed JSON decode."""
+        detector = Qwen3CoderDetector()
+        for alternative in ("object", "null"):
+            schema = {"anyOf": [{"type": "string"}, {"type": alternative}]}
+            with patch(
+                "sglang.srt.function_call.qwen3_coder_detector.json.loads"
+            ) as loads:
+                raw = "  Paris, France  "
+                self.assertEqual(
+                    detector._convert_param_value(
+                        raw, "value", {"value": schema}, "record"
+                    ),
+                    raw,
+                )
+                loads.assert_not_called()
+        for raw, expected in (("  {}", {}), ("  []", [])):
+            self._check_structured_union_value(
+                {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}]},
+                raw,
+                expected,
+            )
+
     def test_structured_union_conversion_preserves_string_values(self):
         """Structured decoding must not reinterpret plain strings or scalar unions."""
         union = {"anyOf": [{"type": "string"}, {"type": "object"}]}

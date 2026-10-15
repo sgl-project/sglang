@@ -121,7 +121,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
         param_type = self._get_param_type(param_config[param_name])
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
             schema = param_config[param_name]
-            if isinstance(schema, dict) and ("anyOf" in schema or "oneOf" in schema):
+            if (
+                isinstance(schema, dict)
+                and ("anyOf" in schema or "oneOf" in schema)
+                and param_value.lstrip().startswith(("{", "["))
+            ):
                 try:
                     value = json.loads(param_value)
                     if isinstance(value, (dict, list)) and Draft202012Validator(
