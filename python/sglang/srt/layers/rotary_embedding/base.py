@@ -139,6 +139,14 @@ class RotaryEmbedding(BaseFusedOp):
         else:
             self.use_fallback_kernel = False
 
+        self._supports_bf16_rope_store = (
+            _is_cuda
+            and type(self) is RotaryEmbedding
+            and self.use_fallback_kernel
+            and self.is_neox_style
+            and not self._force_native
+        )
+
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -152,6 +160,42 @@ class RotaryEmbedding(BaseFusedOp):
                 disable=_is_npu,
             )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
+
+    def try_bf16_rope_store(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        kv_target: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        value_scale: float,
+    ) -> torch.Tensor | None:
+        """Return contiguous rotated Q and write K/V; leave packed QKV unchanged."""
+        if (
+            not self._supports_bf16_rope_store
+            or kv_target is None
+            or qkv.dtype != torch.bfloat16
+            or qkv.shape[0] == 0
+        ):
+            return None
+        from sglang.kernels.ops.attention.rope import bf16_rope_scale_store
+
+        key_cache, value_cache, locations = kv_target
+        query_size = qkv.shape[-1] - (
+            key_cache.shape[1] * key_cache.shape[2]
+            + value_cache.shape[1] * value_cache.shape[2]
+        )
+        query = qkv.new_empty((qkv.shape[0], query_size))
+        self._match_cos_sin_cache_dtype(qkv)
+        bf16_rope_scale_store(
+            qkv,
+            query,
+            key_cache,
+            value_cache,
+            self.cos_sin_cache,
+            positions,
+            locations,
+            value_scale,
+        )
+        return query
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
