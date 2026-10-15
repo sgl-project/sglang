@@ -135,6 +135,7 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
     isa = device_isa()
     archs = hf_config.architectures
     spec, why = find_spec(backend=backend, architectures=archs, isa=isa)
+    observed = "_mono_copies" in model.__dict__
     copies = model.__dict__.pop("_mono_copies", {})
     # Ranks branch together; one that skipped the collectives below would hang its peers.
     lookups = _gather_tp(
@@ -166,6 +167,12 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
         )
 
     reasons = list(spec.model_disable_reasons(model, hf_config, copies))
+    if spec.load_tensor is not None and not observed:
+        # e.g. the layered, dummy, sharded-state and remote loaders
+        reasons.append(
+            f"{spec.name} keeps weight copies at load, and this load path does not "
+            "pass checkpoint tensors through monokernel_weights_iterator"
+        )
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     if props.multi_processor_count < spec.devices[isa].resident_blocks:
         reasons.append(
@@ -191,6 +198,15 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
     widths = tuple(
         w for w in spec.widths(isa) if w % tokens == 0 and (not keys or w in rows)
     )
+    served = _served_keys(widths=widths, tokens=tokens)
+    # Different routes would leave ranks waiting in incompatible collectives.
+    if any(other != served for other in _gather_tp(served)):
+        raise RuntimeError("monokernel: the ranks route different graph keys")
+    if not served:
+        raise ValueError(
+            f"--monokernel-backend {backend}: {spec.name} has no width for this "
+            f"server's steps ({tokens} tokens a request)"
+        )
     build_context = BuildContext(
         isa=isa,
         widths=widths,
@@ -199,15 +215,6 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
     )
     build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
     built = spec.build(model, hf_config, build_context)
-    served = _served_keys(built=built, widths=widths, tokens=tokens)
-    # Different routes would leave ranks waiting in incompatible collectives.
-    if any(other != served for other in _gather_tp(served)):
-        raise RuntimeError("monokernel: the ranks' specs serve different graph keys")
-    if not served:
-        raise ValueError(
-            f"--monokernel-backend {backend}: {spec.name} serves none of the widths "
-            f"it built ({list(widths)}, {tokens} tokens a request)"
-        )
     _install_forward(model=model, built=built, served=served)
     # Captured kernels retain weight copies that online updates cannot refresh.
     model._derived_weight_cache_error = (
@@ -305,18 +312,15 @@ def _eager_keys(*, served, captured) -> list[ShapeKey]:
     ]
 
 
-def _served_keys(
-    *, built: BuiltMonokernels, widths, tokens: int
-) -> frozenset[ShapeKey]:
-    """Resolve the supported keys of the model's step once, before any forwards."""
+def _served_keys(*, widths, tokens: int) -> frozenset[ShapeKey]:
+    """Resolve the graph keys of the model's step at the built widths, once."""
     # A speculative target runs verify steps only; a plain server runs decode.
     mode = "decode" if tokens == 1 else "target_verify"
-    keys = (
+    return frozenset(
         ShapeKey(forward_mode=mode, batch_size=w // tokens, tokens_per_request=tokens)
         for w in widths
         if w % tokens == 0
     )
-    return frozenset(k for k in keys if built.serves(k))
 
 
 def _install_forward(

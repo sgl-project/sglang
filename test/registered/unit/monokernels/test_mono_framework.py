@@ -10,6 +10,7 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     default_cuda_graph_config,
@@ -47,15 +48,10 @@ WIDTHS = (1, 2, 4, 6, 12)
 
 
 class FakeBuilt:
-    """Reject four-row decode and record routed steps to test fallback and state isolation."""
+    """Record routed steps to test state isolation."""
 
     def __init__(self):
-        self.asked = 0
         self.steps = []
-
-    def serves(self, key):
-        self.asked += 1
-        return (key.forward_mode, key.rows) != ("decode", 4)
 
     def forward(self, plan, input_ids, positions, forward_batch, input_embeds=None):
         plan.state["layers"] = plan.state.get("layers", 0) + 1
@@ -74,7 +70,11 @@ SPEC = MonoSpec(
         "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(2, 4), resident_blocks=256)
     },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
-    requires=Requirements(kv_cache_dtypes=frozenset({"fp8_e4m3"})),
+    requires=Requirements(
+        server_args={"kv_cache_dtype": frozenset({"fp8_e4m3"})},
+        hf_config={"model_type": "fake"},
+        env={"SGLANG_DSPARK_EMBED_IN_GRAPH": True},
+    ),
     numerics=Numerics(kind=NumericsKind.BITWISE),
     config_disable_reasons=lambda cfg, hf: (
         ["context_length too long"] if cfg.context_length == 7 else []
@@ -97,11 +97,10 @@ def server_args(**kw):
     return ServerArgs(**{**defaults, **kw})
 
 
-def reasons_for(cfg, arch=ARCH, isa="gfx950"):
+def reasons_for(cfg, arch=ARCH, isa="gfx950", model_type="fake"):
     model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=[arch]),
+        hf_config=SimpleNamespace(architectures=[arch], model_type=model_type),
         dtype="bfloat16",
-        quantization=None,
     )
     return monokernel_disable_reasons(cfg=cfg, model_config=model_config, isa=isa)
 
@@ -114,14 +113,15 @@ def batch(mode, bs, rows):
     )
 
 
-def install(*, archs, lookups):
+def install(*, archs, lookups=None):
     """``install_monokernel_forward`` on an ``Lm``, as rank 0 of two whose gathered
-    lookups are ``lookups``."""
+    lookups are ``lookups``, or as the only rank."""
     lm = Lm()
+    gather = {"return_value": lookups} if lookups else {"side_effect": lambda x: [x]}
     with (
         patch.object(runtime, "_backend", return_value=BACKEND),
         patch.object(runtime, "device_isa", return_value="gfx950"),
-        patch.object(runtime, "_gather_tp", return_value=lookups),
+        patch.object(runtime, "_gather_tp", **gather),
     ):
         runtime.install_monokernel_forward(
             model=lm,
@@ -147,7 +147,7 @@ class Lm(torch.nn.Module):
 def switched(tokens=1):
     """Build a fake model at ``tokens`` per request with fixed routing keys."""
     lm, built = Lm(), FakeBuilt()
-    served = runtime._served_keys(built=built, widths=WIDTHS, tokens=tokens)
+    served = runtime._served_keys(widths=WIDTHS, tokens=tokens)
     runtime._install_forward(model=lm, built=built, served=served)
     return lm, built
 
@@ -201,25 +201,33 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertIn(Feature.PIPELINE_PARALLEL.value, reasons[0])
 
     def test_every_refusal_reason_is_listed(self):
-        spec, reasons = reasons_for(
-            server_args(
-                tp_size=8,
-                kv_cache_dtype="auto",
-                enable_eplb=True,
-                context_length=7,
-                watchdog_timeout=6,
+        with envs.SGLANG_DSPARK_EMBED_IN_GRAPH.override(False):
+            spec, reasons = reasons_for(
+                server_args(
+                    tp_size=8,
+                    kv_cache_dtype="auto",
+                    enable_eplb=True,
+                    context_length=7,
+                    watchdog_timeout=6,
+                ),
+                model_type="other",
             )
-        )
         self.assertIs(spec, SPEC)
         for want in (
             "tp_size 8",
-            "--kv-cache-dtype",
+            "kv_cache_dtype 'auto'",
+            "config.model_type 'other'",
+            "SGLANG_DSPARK_EMBED_IN_GRAPH False",
             "EPLB",
             "context_length",
             "--watchdog-timeout",
         ):
             self.assertTrue(any(want in r for r in reasons), (want, reasons))
         self.assertEqual(reasons_for(server_args())[1], [])
+        # a spec whose requirements state every check it needs has no config hook
+        bare = replace(SPEC, config_disable_reasons=None)
+        with patch.object(guards, "find_spec", return_value=(bare, "")):
+            self.assertEqual(reasons_for(server_args(context_length=7))[1], [])
         self.assertIsNone(reasons_for(server_args(), arch="Other")[0])
         self.assertEqual(
             reasons_for(server_args(), isa=None), (None, ["no GPU is visible"])
@@ -250,10 +258,9 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertEqual(sizes, [1, 2, 3, 4, 8])
 
     def test_the_switch_routes_by_graph_key(self):
-        lm, built = switched()
+        lm, _ = switched()
         # SGLang's graph runners choose what to pass from the forward's parameters
         self.assertEqual(inspect.signature(lm.forward), inspect.signature(Lm().forward))
-        asked = built.asked
         x = torch.zeros(1)
         self.assertEqual(lm(x, None, batch("decode", 2, 2)), "mono")
         verify, _ = switched(tokens=6)
@@ -264,14 +271,11 @@ class TestMonokernelFramework(CustomTestCase):
         self.assertEqual(verify(x, None, batch("decode", 6, 6)), "normal")
         for normal in (
             batch("decode", 3, 3),  # a width not built
-            batch("decode", 4, 4),  # a key the spec does not serve
             batch("decode", 64, 64),  # over the largest width
             batch("target_verify", 2, 7),  # uneven rows a request
             batch("extend", 2, 9),
         ):
             self.assertEqual(lm(x, None, normal), "normal")
-        # the served keys were fixed at install: routing runs none of the spec's code
-        self.assertEqual(built.asked, asked)
 
     def test_each_forward_has_its_own_plan_state(self):
         # Reusing a plan would leak layer state into the next forward.
@@ -306,6 +310,17 @@ class TestMonokernelFramework(CustomTestCase):
         with patch.object(runtime, "_backend", return_value=None):
             self.assertIs(iterator(model=model, weights=weights), weights)
 
+    def test_a_load_path_that_skips_the_observer_is_refused(self):
+        # the layered, dummy and remote loaders never call monokernel_weights_iterator:
+        # the spec would build without its weight copies
+        gpu = SimpleNamespace(multi_processor_count=256)
+        with (
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(torch.cuda, "get_device_properties", return_value=gpu),
+            self.assertRaisesRegex(ValueError, "monokernel_weights_iterator"),
+        ):
+            install(archs=[ARCH])
+
     def test_every_rank_takes_the_same_lookup_branch(self):
         # a rank that failed to load the registered spec once returned alone while
         # its peers entered the next collective; now every rank refuses together
@@ -324,10 +339,7 @@ class TestMonokernelFramework(CustomTestCase):
         # the steps a spec serves run on the decode backend, not the base one
         dsv4 = replace(
             SPEC,
-            requires=Requirements(
-                kv_cache_dtypes=frozenset({"fp8_e4m3"}),
-                attention_backends=frozenset({"dsv4"}),
-            ),
+            requires=replace(SPEC.requires, attention_backends=frozenset({"dsv4"})),
         )
         with patch.object(guards, "find_spec", return_value=(dsv4, "")):
             _, refused = reasons_for(

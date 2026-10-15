@@ -49,14 +49,18 @@ class DeviceLimits(msgspec.Struct, frozen=True):
 
 
 class Requirements(msgspec.Struct, frozen=True):
-    """Configuration a spec needs; an empty set accepts any value."""
+    """Configuration a spec needs, checked alike for every spec at startup; an empty
+    field accepts any value."""
 
     dtypes: frozenset[str] = frozenset()
-    kv_cache_dtypes: frozenset[str] = frozenset()
     # Checked against the decode-phase backend, which runs served steps.
     attention_backends: frozenset[str] = frozenset()
-    moe_runner_backends: frozenset[str] = frozenset()
-    quantizations: frozenset[Optional[str]] = frozenset()
+    # a server argument -> its accepted values, as resolved for this server
+    server_args: Mapping[str, frozenset] = {}
+    # an HF config field -> the value the kernels are built for
+    hf_config: Mapping[str, Any] = {}
+    # an SGLang environment variable (``envs``) -> its required value
+    env: Mapping[str, Any] = {}
 
 
 class NumericsKind(enum.Enum):
@@ -117,10 +121,7 @@ class Plan(msgspec.Struct, frozen=True):
 
 
 class BuiltMonokernels(Protocol):
-    """The object a spec's build returns."""
-
-    def serves(self, key: ShapeKey) -> bool:
-        """Return whether the forward runs this graph key; asked once per key."""
+    """The object a spec's build returns; it runs every built width's steps."""
 
     def forward(self, plan: Plan, *args: Any, **kwargs: Any) -> Any:
         """Run a routed step with the model forward's arguments and outputs."""
@@ -134,12 +135,12 @@ class MonoSpec(msgspec.Struct, frozen=True):
     features: frozenset[Feature]  # the refused-by-default features it accepts
     requires: Requirements
     numerics: Numerics
-    # (cfg, hf_config), before load
-    config_disable_reasons: Callable[[Any, Any], list[str]]
     # (model, hf_config, copies): after load, with the load hook's copies
     model_disable_reasons: Callable[[torch.nn.Module, Any, dict], list[str]]
     build: Callable[[torch.nn.Module, Any, BuildContext], BuiltMonokernels]
     api: int  # the API_VERSION this spec is written against
+    # (cfg, hf_config), before load: the checks requires cannot state
+    config_disable_reasons: Optional[Callable[[Any, Any], list[str]]] = None
     # (copies, model, name, tensor): retain weights before model-specific conversion
     load_tensor: Optional[
         Callable[[dict, torch.nn.Module, str, torch.Tensor], None]
