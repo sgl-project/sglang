@@ -44,6 +44,21 @@ class CorrectionBiasCacheTestMixin:
         torch.testing.assert_close(converted_after_reload, reloaded_value.float())
         self.assertNotEqual(converted.data_ptr(), converted_after_reload.data_ptr())
 
+    def test_data_write_refreshes_cache_in_place(self):
+        correction_bias = torch.zeros(8, dtype=torch.bfloat16, device=self.device)
+        config = TopKConfig(top_k=2, correction_bias=correction_bias)
+        converted = config.correction_bias_for_dtype(torch.float32)
+
+        reloaded_value = torch.arange(8, dtype=torch.float32).to(
+            device=self.device, dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            correction_bias.data.copy_(reloaded_value)
+        converted_after_reload = config.correction_bias_for_dtype(torch.float32)
+
+        torch.testing.assert_close(converted_after_reload, reloaded_value.float())
+        self.assertEqual(converted.data_ptr(), converted_after_reload.data_ptr())
+
     def test_matching_dtype_returns_original_tensor(self):
         correction_bias = torch.randn(8, dtype=torch.float32, device=self.device)
         config = TopKConfig(top_k=2, correction_bias=correction_bias)
