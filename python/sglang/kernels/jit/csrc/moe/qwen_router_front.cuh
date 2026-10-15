@@ -674,7 +674,8 @@ struct GemvSmem {
   static constexpr uint32_t kShPart = kXq + (kShared ? kMaxM * kShRowBytes : 0);  // fp32 [kShSplits][16][8]
   static constexpr uint32_t kBarW = kShPart + (kShared ? kShSplits * 16 * 8 * 4 : 0);
   static constexpr uint32_t kBarX = kBarW + 8;
-  static constexpr uint32_t kBytes = kBarX + 8;
+  static constexpr uint32_t kBarQ = kBarX + 8;  // e4m3 token rows written (shared stage only)
+  static constexpr uint32_t kBytes = kBarQ + (kShared ? 8 : 0);
 };
 
 SGL_DEVICE uint32_t smem_addr(const void* p) {
@@ -800,6 +801,10 @@ SGL_DEVICE void mbar_init(uint32_t bar, uint32_t count) {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 
+SGL_DEVICE void mbar_arrive(uint32_t bar) {
+  asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(bar) : "memory");
+}
+
 SGL_DEVICE void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(bytes) : "memory");
 }
@@ -827,7 +832,8 @@ SGL_DEVICE void bulk_load(uint32_t dst, const void* src, uint32_t bytes, uint32_
 
 // Warps 2..7 of a CTA with shared rows: quantize the token rows to e4m3 the way
 // static_quant_fp8 does (x * (1 / scale), saturate, round to nearest even), then
-// warps 2..5 run the gate/up K splits while warps 6..7 quantize row b < M to NVFP4.
+// warps 2..5 run the gate/up K splits (after all 192 threads arrive on the kBarQ
+// mbarrier) while warps 6..7 quantize row b < M to NVFP4.
 template <uint32_t kMaxM>
 SGL_DEVICE void shared_gate_up(const Params& p, uint32_t M, uint8_t* smem, uint32_t bar_w, uint32_t bar_x) {
   using L = GemvSmem<kMaxM, true>;
@@ -851,8 +857,10 @@ SGL_DEVICE void shared_gate_up(const Params& p, uint32_t M, uint8_t* smem, uint3
     }
     *reinterpret_cast<uint4*>(smem + L::kXq + row * kShRowBytes + blk * 16) = make_uint4(q[0], q[1], q[2], q[3]);
   }
-  asm volatile("bar.sync 1, %0;" ::"r"(kThreads - 64) : "memory");
+  const uint32_t bar_q = smem_addr(smem + L::kBarQ);
+  mbar_arrive(bar_q);
   if (warp < 2 + kShSplits) {
+    mbar_wait(bar_q, 0);
     mbar_wait(bar_w, 0);
     shared_chain<kMaxM>(warp - 2, M, smem, reinterpret_cast<float*>(smem + L::kShPart));
   } else if ((p.mode & kModeQuant) && blockIdx.x < M) {
@@ -896,6 +904,7 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
   if (threadIdx.x == 0) {
     mbar_init(bar_w, 1);
     mbar_init(bar_x, 1);
+    if (has_sh) mbar_init(smem_addr(smem + L::kBarQ), kThreads - 64);
     mbar_expect_tx(bar_w, kExpertsPerCta * kHidden * 2 + (has_sh ? 8 * kHidden : 0));
 #pragma unroll
     for (uint32_t e = 0; e < kExpertsPerCta; ++e) {
