@@ -48,6 +48,8 @@ def test_rows_prefetch_graph_and_scale(config, dtype):
 
 
 def test_deepseek_block_scales_and_shard_mask(config):
+    from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+
     module = SimpleNamespace(rows=17, dim=256, row_start=100)
     init_deepseek(module, 32)
     module.weight.data.copy_(torch.randn(17, 256).to(torch.float8_e4m3fn))
@@ -67,4 +69,34 @@ def test_deepseek_block_scales_and_shard_mask(config):
     )
     expected[0, [0, 3]] = 0
     torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    device_weight = module.weight.cuda()
+    device_scale = module.scale.cuda()
+    native = torch.empty_like(result)
+
+    def native_lookup():
+        engram_gather(
+            device_weight.data_ptr(),
+            device_scale.data_ptr(),
+            ids.flatten(),
+            native.view(-1, module.dim),
+            module.dim,
+            32,
+            row_lo=module.row_start,
+            row_hi=module.row_start + module.rows,
+        )
+
+    native_lookup()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = lookup_deepseek(module, ids, 32)
+        native_lookup()
+    for indices in (
+        [[99, 100, 116, 117], [104, 107, 102, 103]],
+        [[101, 105, 108, 110], [99, 117, 116, 100]],
+    ):
+        ids.copy_(torch.tensor(indices, device="cuda"))
+        graph.replay()
+        torch.testing.assert_close(actual, native, rtol=0, atol=0)
+    del graph
     module._mooncake.close()

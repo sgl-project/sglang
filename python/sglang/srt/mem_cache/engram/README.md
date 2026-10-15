@@ -50,5 +50,5 @@ released on process exit, including when the engine kills its workers.
 
 Run `pytest -q test/manual/test_mooncake_engram.py` on a CUDA host with the
 matching Mooncake build. It compares raw lookup, table scaling, block scaling,
-shard masking and CUDA graph replay against tensor references. End-to-end
+shard masking and CUDA graph replay against native kernels and tensor references. End-to-end
 tests additionally need the original model checkpoints.
