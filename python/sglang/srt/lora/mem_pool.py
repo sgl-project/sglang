@@ -28,6 +28,8 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
     ATTN_TP_LORA_MODULE_NAMES,
     EMBEDDING_NAMES,
+    LORA_FUSED_MEMBER_SLOTS,
+    LORA_FUSED_MEMBERS,
     REPLICATED_LINEAR_LORA_NAMES,
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
@@ -88,6 +90,14 @@ def append_cache_key_suffix(
             for expert_id, cache_key in cache_keys.items()
         }
     return f"{cache_keys}#{suffix}"
+
+
+def _fused_member_slot(weight_name: str) -> Optional[Tuple[str, int]]:
+    """(fused module, slot) of a dense per-member adapter weight, e.g. ``...self_attn.k_proj.lora_A.weight``."""
+    if re.search(r"\.(?:experts|shared_experts?)\.", weight_name):
+        return None
+    projection = weight_name.split(".lora_", 1)[0].rsplit(".", 1)[-1]
+    return LORA_FUSED_MEMBER_SLOTS.get(projection)
 
 
 def _get_moe_ep_context() -> Tuple[int, int]:
@@ -1050,6 +1060,10 @@ class LoRAMemoryPool:
         if lora_adapter.embedding_layers:
             all_weight_names.extend(lora_adapter.embedding_layers.keys())
         for name in all_weight_names:
+            fused_member = _fused_member_slot(name)
+            if fused_member is not None and fused_member[0] in self.target_modules:
+                matched_modules.add(fused_member[0])
+                continue
             try:
                 target_module = get_target_module_name(name, self.target_modules)
                 matched_modules.add(target_module)
@@ -1101,6 +1115,12 @@ class LoRAMemoryPool:
                 target_module: None for target_module in self.B_buffer
             }
 
+            fused_member_modules = self._fused_member_modules(cur_layer_modules)
+            # fused module -> {(side, slot): (member weight, cache key)}
+            temp_member_weights: Dict[
+                str, Dict[Tuple[str, int], Tuple[torch.Tensor, str]]
+            ] = {target_module: {} for target_module in fused_member_modules}
+
             fused_moe = self._get_fused_shared_moe(self.base_model, layer_id)
             for name, weights in layer_weights.items():
                 cache_name = name
@@ -1112,6 +1132,24 @@ class LoRAMemoryPool:
                         f".experts.{fused_moe._num_global_routed}.",
                         name,
                     )
+                fused_member = _fused_member_slot(name)
+                if fused_member is not None and fused_member[0] in fused_member_modules:
+                    # PEFT may ship an untrained member as a zero-element placeholder.
+                    if weights.numel() == 0:
+                        continue
+                    fused_module, slot = fused_member
+                    side = "A" if "lora_A" in name else "B"
+                    temp_member_weights[fused_module][(side, slot)] = (
+                        weights,
+                        cache_name,
+                    )
+                    continue
+                if fused_member is not None and not any(
+                    target in name for target in self.target_modules
+                ):
+                    # A member of a fused module this layer lacks (e.g. q_proj on a linear-attention
+                    # layer) is not loaded, as a weight for any absent module is not.
+                    continue
                 target_module = get_target_module_name(name, self.target_modules)
 
                 # Check if this is an MoE weight (has expert index in name)
@@ -1231,6 +1269,8 @@ class LoRAMemoryPool:
             # redundant zero-fills on slots no `update_lora_info` ever points
             # a forward-time module at.
             active_target_modules: Set[str] = set()
+            # fused module -> (A writes as (slot, weight, cache key), B writes as (row offset, weight, cache key))
+            fused_member_writes: Dict[str, Tuple[list, list]] = {}
             from sglang.srt.lora.layers import FusedMoEWithLoRA
 
             for module_name, module in cur_layer_modules.items():
@@ -1286,6 +1326,23 @@ class LoRAMemoryPool:
                 # the new slot) and the wrapped layer module will read it.
                 active_target_modules.add(target_module)
 
+                if target_module in fused_member_modules:
+                    fused_member_writes[target_module] = self._fused_member_writes(
+                        module,
+                        target_module,
+                        member_weights=temp_member_weights[target_module],
+                        fused_weights=(
+                            temp_A_buffer[target_module],
+                            temp_B_buffer[target_module],
+                        ),
+                        fused_cache_keys=(
+                            temp_A_cache_keys[target_module],
+                            temp_B_cache_keys[target_module],
+                        ),
+                        lora_rank=lora_rank,
+                    )
+                    continue
+
                 if temp_A_buffer[target_module] is None:
                     # Skip weight slicing if the weight is not present in the adapter
                     continue
@@ -1311,8 +1368,23 @@ class LoRAMemoryPool:
                     f"tp{self.tp_rank}",
                 )
 
+            for name, (a_writes, b_writes) in fused_member_writes.items():
+                self._load_fused_member_writes(
+                    a_view=self.A_buffer[name][layer_id][
+                        buffer_id,
+                        : lora_rank * get_stacked_multiply(name, self.base_model),
+                        :,
+                    ],
+                    b_buffer=self.B_buffer[name][layer_id][buffer_id],
+                    a_writes=a_writes,
+                    b_writes=b_writes,
+                    lora_rank=lora_rank,
+                    pinned_layer_weights=pinned_layer_weights,
+                    load_lora_weight_tensor=load_lora_weight_tensor,
+                )
+
             for name, weights in temp_A_buffer.items():
-                if name not in active_target_modules:
+                if name not in active_target_modules or name in fused_member_writes:
                     continue
                 c = get_stacked_multiply(name, self.base_model)
                 max_r = self.max_lora_rank
@@ -1442,7 +1514,7 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, weights)
 
             for name, weights in temp_B_buffer.items():
-                if name not in active_target_modules:
+                if name not in active_target_modules or name in fused_member_writes:
                     continue
                 target_buffer = self.B_buffer[name][layer_id]
                 weights_cache_key = temp_B_cache_keys[name]
@@ -1700,6 +1772,115 @@ class LoRAMemoryPool:
                 load_lora_weight_tensor(
                     self.new_embeddings_buffer["input_embeddings"][buffer_id], None
                 )
+
+    def _fused_member_modules(
+        self, layer_modules: Dict[str, torch.nn.Module]
+    ) -> Dict[str, torch.nn.Module]:
+        """This layer's fused modules that load member by member (LORA_FUSED_MEMBERS)."""
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        modules = {}
+        for module_name, module in layer_modules.items():
+            if isinstance(module, FusedMoEWithLoRA) or getattr(
+                module, "is_shared_fused_moe", False
+            ):
+                continue
+            target_module = get_target_module_name(module_name, self.target_modules)
+            if target_module in LORA_FUSED_MEMBERS:
+                modules[target_module] = module
+        return modules
+
+    def _fused_member_writes(
+        self,
+        module: torch.nn.Module,
+        fused_module: str,
+        *,
+        member_weights: Dict[Tuple[str, int], Tuple[torch.Tensor, str]],
+        fused_weights: Tuple[Optional[torch.Tensor], Optional[torch.Tensor]],
+        fused_cache_keys: Tuple[Optional[str], Optional[str]],
+        lora_rank: int,
+    ) -> Tuple[list, list]:
+        """Each member's A slot and this rank's B rows, from per-member weights or one fused tensor."""
+        num_slots = len(LORA_FUSED_MEMBERS[fused_module])
+        fused_a, fused_b = fused_weights
+        if fused_a is not None or fused_b is not None:
+            assert fused_a is not None and fused_b is not None, (
+                f"LoRA adapter carries only one of {fused_module}'s lora_A / lora_B"
+            )
+            assert not member_weights, (
+                f"LoRA adapter carries {fused_module} both fused and as separate projections"
+            )
+            fused_a_key, fused_b_key = fused_cache_keys
+            # One A shared by every member, or one stacked per member.
+            if fused_a.shape[0] == lora_rank:
+                a_parts = [fused_a] * num_slots
+            else:
+                assert fused_a.shape[0] == num_slots * lora_rank, (
+                    f"{fused_module} lora_A has {fused_a.shape[0]} rows; expected {lora_rank} or "
+                    f"{num_slots * lora_rank}"
+                )
+                a_parts = list(torch.split(fused_a, lora_rank, dim=0))
+            b_parts = torch.split(fused_b, module.lora_b_member_full_rows(), dim=0)
+            member_weights = {}
+            for slot in range(num_slots):
+                member_weights[("A", slot)] = (
+                    a_parts[slot],
+                    append_cache_key_suffix(fused_a_key, f"member{slot}"),
+                )
+                member_weights[("B", slot)] = (
+                    b_parts[slot],
+                    append_cache_key_suffix(fused_b_key, f"member{slot}"),
+                )
+
+        b_offsets = module.lora_b_member_local_offsets()
+        a_writes, b_writes = [], []
+        for (side, slot), (weight, cache_key) in member_weights.items():
+            cache_key = append_cache_key_suffix(cache_key, f"tp{self.tp_rank}")
+            if side == "A":
+                a_writes.append((slot, module.slice_lora_a_weights(weight), cache_key))
+            else:
+                b_writes.append(
+                    (
+                        b_offsets[slot],
+                        module.slice_lora_b_member(slot, weight),
+                        cache_key,
+                    )
+                )
+        return a_writes, b_writes
+
+    def _load_fused_member_writes(
+        self,
+        *,
+        a_view: torch.Tensor,
+        b_buffer: torch.Tensor,
+        a_writes: list,
+        b_writes: list,
+        lora_rank: int,
+        pinned_layer_weights: Dict[str, torch.Tensor],
+        load_lora_weight_tensor,
+    ) -> None:
+        """Zero the adapter's fused slots, then write each present member; absent members stay zero."""
+        load_lora_weight_tensor(a_view, None)
+        for slot, weight, cache_key in a_writes:
+            weight = self._get_maybe_cached_weight_for_transfer(
+                pinned_layer_weights, cache_key, weight
+            )
+            load_lora_weight_tensor(
+                a_view[slot * lora_rank : (slot + 1) * lora_rank], weight
+            )
+        b_view = b_buffer[:, :lora_rank]
+        load_lora_weight_tensor(b_view, None)
+        for row_offset, weight, cache_key in b_writes:
+            weight = self._get_maybe_cached_weight_for_transfer(
+                pinned_layer_weights, cache_key, weight
+            )
+            load_lora_weight_tensor(
+                b_view[row_offset : row_offset + weight.shape[0]], weight
+            )
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            # Zero beyond loaded rank: the experimental dense LoRA-B kernel
+            # contracts over the full padded max_rank, so the tail must be clean.
+            load_lora_weight_tensor(b_buffer[:, lora_rank:], None)
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType
