@@ -16,6 +16,7 @@ import torch
 from comfy_api.input import VideoInput
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
+from .options import SGLDOptions
 
 
 def _enable_gguf_in_diffusion_models() -> None:
@@ -37,6 +38,28 @@ from .utils import (
     parse_step_list,
     resolve_video_path,
 )
+
+# The server clamps n to this range (image_api.py).
+MAX_SERVER_IMAGES = 10
+
+
+def _decode_image_batch(response: dict, num_images: int) -> torch.Tensor:
+    """Decode the server's images, in order, into one ComfyUI IMAGE batch."""
+    items = [item.get("b64_json") for item in response.get("data") or []]
+    if not items or not all(items):
+        raise RuntimeError("No image data in response")
+    if len(items) < num_images:
+        raise RuntimeError(
+            f"Requested {num_images} images but the server returned {len(items)}"
+        )
+    images = [convert_b64_to_tensor_image(b64) for b64 in items[:num_images]]
+    shapes = {tuple(image.shape[1:]) for image in images}
+    if len(shapes) > 1:
+        raise RuntimeError(
+            f"Server returned images of different sizes {sorted(shapes)}; "
+            "they cannot be combined into one IMAGE batch"
+        )
+    return torch.cat(images, dim=0)
 
 
 class SGLDH3DistilledSigmas:
@@ -331,6 +354,30 @@ def _loaded_lora_choices() -> list:
     return [LORA_NONE] + [a["nickname"] for a in listing.get("loaded_adapters", [])]
 
 
+class SGLDNativeModelLoader:
+    """Native SGLang model directories (FastH3, VDN-H3) that have no ComfyUI single file."""
+
+    def __init__(self):
+        self.generator = SGLDiffusionGenerator.shared()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {"model_dir": ("STRING", {"default": ""})},
+            "optional": {"sgld_options": ("SGLD_OPTIONS",)},
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "SGLDiffusion"
+
+    def load(self, model_dir, sgld_options: dict = None):
+        model_dir = os.path.abspath(os.path.expanduser(model_dir.strip()))
+        if not os.path.isfile(os.path.join(model_dir, "model_index.json")):
+            raise ValueError(f"{model_dir} is not a native model directory")
+        return (self.generator.load_model(model_dir, sgld_options=sgld_options),)
+
+
 class SGLDiffusionServerModel:
     """Node to load and manage SGLang Diffusion server connection."""
 
@@ -483,6 +530,16 @@ class SGLDiffusionGenerateImage:
                         "as revised_prompt",
                     },
                 ),
+                "num_images": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": MAX_SERVER_IMAGES,
+                        "tooltip": "Images to generate in one request, returned as "
+                        "one IMAGE batch. Image i uses seed + i.",
+                    },
+                ),
             },
         }
 
@@ -505,10 +562,15 @@ class SGLDiffusionGenerateImage:
         height: int = 1024,
         enable_teacache: bool = False,
         enhance_prompt: bool = False,
+        num_images: int = 1,
     ):
         """Generate image using SGLang Diffusion API."""
         if not positive_prompt:
             raise ValueError("Prompt cannot be empty")
+        if not 1 <= num_images <= MAX_SERVER_IMAGES:
+            raise ValueError(
+                f"num_images must be between 1 and {MAX_SERVER_IMAGES}, got {num_images}"
+            )
 
         size = f"{width}x{height}"
 
@@ -516,6 +578,7 @@ class SGLDiffusionGenerateImage:
         request_params = {
             "prompt": positive_prompt,
             "size": size,
+            "n": num_images,
             "response_format": "b64_json",
         }
 
@@ -547,11 +610,7 @@ class SGLDiffusionGenerateImage:
         except Exception as e:
             raise RuntimeError(f"Failed to generate image: {str(e)}")
 
-        # Decode base64 image
-        if not response["data"] or not response["data"][0]["b64_json"]:
-            raise RuntimeError("No image data in response")
-        image_data = response["data"][0]["b64_json"]
-        image = convert_b64_to_tensor_image(image_data)
+        image = _decode_image_batch(response, num_images)
         revised_prompt = response["data"][0].get("revised_prompt") or positive_prompt
 
         return (image, revised_prompt)
@@ -1489,6 +1548,7 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerLoraStack": SGLDiffusionServerLoraStack,
     "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
     "SGLDUNETLoader": SGLDUNETLoader,
+    "SGLDNativeModelLoader": SGLDNativeModelLoader,
     "SGLDOptions": SGLDOptions,
     "SGLDLoraLoader": SGLDLoraLoader,
 }
@@ -1505,6 +1565,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerLoraStack": "SGLDiffusion Server LoRA Stack",
     "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",
     "SGLDUNETLoader": "SGLDiffusion UNET Loader",
+    "SGLDNativeModelLoader": "SGLDiffusion Native Model Loader",
     "SGLDOptions": "SGLDiffusion Options",
     "SGLDLoraLoader": "SGLDiffusion LoRA Loader",
 }
