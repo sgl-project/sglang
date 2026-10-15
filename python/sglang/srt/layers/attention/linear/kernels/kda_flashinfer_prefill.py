@@ -71,6 +71,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     """Execute KDA prefill; FlashInfer validates the tensor contract."""
 
     uses_state_checkpoints = True
+    uses_int64_query_start_loc = True
     supports_track_state_snapshot = True
     supports_safe_gate = True
 
@@ -80,23 +81,6 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         from flashinfer.kda import recurrent_kda
 
         self._recurrent_kda = recurrent_kda
-        self._cu_seqlens_cache = None
-
-    def _int64_cu_seqlens(self, query_start_loc: torch.Tensor) -> torch.Tensor:
-        # FlashInfer syncs to read cu_seqlens unless it gets the same int64 tensor
-        # object again; an int32 input is recast per call, so every layer synced.
-        if query_start_loc.dtype == torch.int64:
-            return query_start_loc
-        try:
-            version = query_start_loc._version
-        except RuntimeError:  # inference tensors track no version counter
-            version = None
-        cached = self._cu_seqlens_cache
-        if cached is not None and cached[0] is query_start_loc and cached[1] == version:
-            return cached[2]
-        cu_seqlens = query_start_loc.to(torch.int64)
-        self._cu_seqlens_cache = (query_start_loc, version, cu_seqlens)
-        return cu_seqlens
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")
@@ -116,6 +100,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         dt_bias: torch.Tensor,
         lower_bound: float,
         return_intermediate_states: bool = False,
+        query_start_loc_int64: Optional[torch.Tensor] = None,
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
         state_checkpoint_every_n_tokens: int = 0,
@@ -144,7 +129,11 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=lower_bound,
-            cu_seqlens=self._int64_cu_seqlens(query_start_loc),
+            cu_seqlens=(
+                query_start_loc
+                if query_start_loc_int64 is None
+                else query_start_loc_int64
+            ),
             ssm_state_indices=cache_indices.to(torch.int32),
             beta_is_logit=True,
             state_checkpoints=checkpoints,
