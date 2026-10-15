@@ -42,6 +42,7 @@ import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen_image21
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_wan_rmsnorm_silu,
     fused_ltx2_rms_norm_modulate,
     hunyuan_qkv_rope_pack,
     mark_fused_ln_modulate_site,
@@ -862,6 +863,9 @@ def test_ernie_norm_scale_shift_is_bit_exact(shape):
     assert not ernie_image._ERNIE_GATED_NORM.disabled
 
 
+@pytest.mark.skipif(
+    not is_cuda(), reason="the fused QKNorm+RoPE JIT kernel is CUDA-only"
+)
 def test_ernie_qknorm_rope_is_bit_exact():
     torch.manual_seed(1)
     ernie_image._ERNIE_QKNORM_ROPE.disabled = False
@@ -1131,6 +1135,7 @@ def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
     assert all(x[0, img_tokens - 1, -1, -1].item() == 0 for x in packed)
 
 
+@pytest.mark.skipif(not is_cuda(), reason="FlashInfer CuTe QK RMSNorm is CUDA-only")
 def test_hunyuan_quality_qknorm_matches_rmsnorm():
     torch.manual_seed(1)
     site = torch.nn.Module()
@@ -1198,6 +1203,85 @@ def test_wan_and_qwen_vae_norm_gate_dispatch(norm_cls, frames) -> None:
     gate.enabled = True
     expected = wan_rmsnorm_silu(x, norm.gamma, rms_scale=float(norm.scale))
     assert torch.equal(fused(x), expected)
+
+
+@torch.no_grad()
+def test_wan_vae_rejects_empty_input() -> None:
+    x = torch.empty(1, 96, 0, 2, 2, device="cuda", dtype=torch.bfloat16).to(
+        memory_format=torch.channels_last_3d
+    )
+    gamma = torch.ones(96, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert not can_use_wan_rmsnorm_silu(x, gamma, None)
+
+
+def _wan_tiny_decoder(seed=0):
+    torch.manual_seed(seed)
+    dec = wanvae.WanDecoder3d(
+        dim=16, z_dim=4, dim_mult=[1, 1], num_res_blocks=1, temperal_upsample=[True]
+    ).to("cuda", torch.bfloat16)
+    for m in dec.modules():
+        if isinstance(m, nn.Conv3d):
+            m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
+    return dec
+
+
+def _wan_decode_chunks(dec, chunks):
+    # Mirrors AutoencoderKLWan.decode: one latent frame per chunk, feature
+    # cache threaded through the contextvars the decoder reads.
+    n_conv = sum(isinstance(m, wanvae.WanCausalConv3d) for m in dec.modules())
+    cache = [None] * n_conv
+    outs = []
+    for i, z in enumerate(chunks):
+        tok_c = wanvae.feat_cache.set(cache)
+        tok_i = wanvae.feat_idx.set(0)
+        tok_f = wanvae.first_chunk.set(i == 0)
+        try:
+            outs.append(dec(z))
+        finally:
+            wanvae.feat_cache.reset(tok_c)
+            wanvae.feat_idx.reset(tok_i)
+            wanvae.first_chunk.reset(tok_f)
+    return torch.cat(outs, dim=2)
+
+
+@torch.no_grad()
+def test_wan_vae_conv_epilogue_wiring_is_bit_exact() -> None:
+    # The lossless decoder (fused cat+pad, conv bias epilogue, bias+residual
+    # fold, bias deferred into norm2) must equal the pure aten module chain.
+    dec = _wan_tiny_decoder()
+    chunks = [_wan_cl3d((1, 4, 1, 6, 6), torch.bfloat16) for _ in range(3)]
+    fast = _wan_decode_chunks(dec, chunks)
+    saved = (
+        wanvae.cat_pad_channels_last_3d,
+        wanvae.conv_bias_epilogue,
+        wanvae.can_use_conv_bias_epilogue,
+    )
+    wanvae.cat_pad_channels_last_3d = None
+    wanvae.conv_bias_epilogue = None
+    wanvae.can_use_conv_bias_epilogue = None
+    try:
+        eager = _wan_decode_chunks(dec, chunks)
+    finally:
+        (
+            wanvae.cat_pad_channels_last_3d,
+            wanvae.conv_bias_epilogue,
+            wanvae.can_use_conv_bias_epilogue,
+        ) = saved
+    assert torch.equal(fast, eager)
+    # Deferred conv1 bias through the gated wrapper, gate off: still exact.
+    gate = VaeFastPathGate()
+    wan_vae_cuda_opt._install_norm_silu(
+        dec,
+        gate,
+        residual_block_cls=wanvae.WanResidualBlock,
+        rms_norm_cls=WanRMS_norm,
+        label="test",
+    )
+    assert torch.equal(_wan_decode_chunks(dec, chunks), eager)
+    gate.enabled = True
+    out = _wan_decode_chunks(dec, chunks)
+    rel = ((out.float() - eager.float()).norm() / eager.float().norm()).item()
+    assert rel < 2e-2, rel
 
 
 @torch.no_grad()
@@ -1302,6 +1386,7 @@ def _qwen_causal_conv(cin, cout, channels_last=True):
 
 
 @torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused cat+pad kernel is CUDA-only")
 def test_qwen_vae_causal_conv_cat_pad_is_bit_exact() -> None:
     # Fused cat + pad + relayout must reproduce the aten chain for no cache,
     # a one-frame cache (partial zero fill) and a full two-frame cache.
@@ -1502,6 +1587,7 @@ def test_autoencoder_kl_fastpath_install():
 
 
 @torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused Q/K norm is CUDA-only")
 def test_qwen21_qk_norm_verifies_and_preserves_native_fallback(monkeypatch):
     x = torch.randn(1, 257, 8, 128, device="cuda", dtype=torch.bfloat16)
     norm = qwen_image21.RMSNorm(
@@ -1546,6 +1632,7 @@ def test_qwen21_qk_norm_does_not_verify_during_capture(monkeypatch):
 
 
 @torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused LayerNorm modulation is CUDA-only")
 def test_qwen21_modulation_verifies_and_preserves_native_fallback(monkeypatch):
     x = torch.randn(1, 257, 4096, device="cuda", dtype=torch.bfloat16)
     scale = torch.randn(1, 1, 4096, device=x.device, dtype=x.dtype)
