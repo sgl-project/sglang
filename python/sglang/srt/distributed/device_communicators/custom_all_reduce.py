@@ -29,12 +29,20 @@ from sglang.srt.utils import (
     is_musa,
     log_info_on_rank0,
 )
+from sglang.srt.utils.cuda_vmm_utils import is_vmm_pointer
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
+
+
+def _is_vmm_input(inp: torch.Tensor) -> bool:
+    # cudaIpcGetMemHandle only exports cudaMalloc memory, so a graph input from
+    # cuMemCreate (expandable_segments, the memory saver, symmetric-memory
+    # pools) cannot be registered for IPC and has to be staged instead.
+    return _is_cuda and is_vmm_pointer(inp.data_ptr())
 
 
 class CustomAllreduce:
@@ -313,7 +321,8 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                registered = not (self.tms_cudagraph or _is_vmm_input(input))
+                return self._all_reduce_impl(input, registered=registered)
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
