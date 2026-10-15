@@ -278,7 +278,7 @@ def test_a_complete_adapter_loads_like_the_concatenating_loader(
 
 @pytest.mark.parametrize("kind, tp_rank", list(_cases()))
 def test_any_member_subset_loads_with_the_absent_members_zero(kind, tp_rank):
-    """A q-only adapter raised KeyError, a k/v-only or partial qkvr adapter was dropped, and a
+    """A q-only adapter raised KeyError, a k/v-only or up-only adapter raised ValueError, and a
     q_a-only MLA adapter got kv_a rows of q_a's width."""
     module_path, members, full_rows, wrapper, reference_slice = _LAYERS[kind][0](
         tp_rank
@@ -374,3 +374,8 @@ def test_the_adapter_keeps_dense_projections_per_member():
         names[:3] + [f"{_PREFIX}mlp.experts.0.gate_up_proj.lora_A.weight"]
     )
 
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
