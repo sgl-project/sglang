@@ -9,6 +9,7 @@ import pytest
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.runner.pytest_runner import (
     _estimate_failed_test_time,
+    _extract_short_test_summary,
     _is_retryable_failure,
     run_pytest,
 )
@@ -19,6 +20,42 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     ScenarioConfig,
 )
+
+
+@pytest.mark.parametrize("request_override", [None, True, False])
+@pytest.mark.parametrize("pin_consistency_quality", [True, False])
+def test_cached_consistency_case_preserves_cache_selection(
+    request_override, pin_consistency_quality
+):
+    extras = {} if request_override is None else {"enable_cache_dit": request_override}
+    case = DiffusionTestCase(
+        "cached_consistency",
+        DiffusionServerArgs(
+            model_path="test",
+            modality="video",
+            env_vars={"SGLANG_CACHE_DIT_ENABLED": "true"},
+        ),
+        DiffusionSamplingParams(prompt="test", extras=extras),
+        run_consistency_check=True,
+        pin_consistency_quality=pin_consistency_quality,
+    )
+    if pin_consistency_quality or request_override is False:
+        assert case.sampling_params.extras["quality"] == "exact"
+    else:
+        # An explicit quality tier suppresses the legacy MiniMax cache mode.
+        assert "quality" not in case.sampling_params.extras
+
+
+@pytest.mark.parametrize("pin_consistency_quality", [True, False])
+def test_cached_consistency_case_preserves_explicit_quality(pin_consistency_quality):
+    case = DiffusionTestCase(
+        "explicit_quality",
+        DiffusionServerArgs(model_path="test", modality="video", enable_cache_dit=True),
+        DiffusionSamplingParams(prompt="test", extras={"quality": "exact"}),
+        run_consistency_check=True,
+        pin_consistency_quality=pin_consistency_quality,
+    )
+    assert case.sampling_params.extras["quality"] == "exact"
 
 
 @pytest.mark.parametrize("generate_baseline", [False, True])
@@ -58,6 +95,23 @@ def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline)
 )
 def test_validation_failures_are_not_retryable(output):
     assert not _is_retryable_failure(output)
+
+
+def test_failure_summary_uses_outer_pytest_session():
+    output = "\n".join(
+        [
+            "=== short test summary info ===",
+            "FAILED nested/test_retry.py::test_slow - AssertionError: [performance]",
+            "=== 1 failed ===",
+            "nested failure was expected; outer test PASSED",
+            "=== short test summary info ===",
+            "FAILED test_parallel.py::test_destroy - AssertionError",
+            "=== 1 failed, 10 passed ===",
+        ]
+    )
+    assert _extract_short_test_summary(output) == [
+        "FAILED test_parallel.py::test_destroy - AssertionError"
+    ]
 
 
 @pytest.mark.parametrize(

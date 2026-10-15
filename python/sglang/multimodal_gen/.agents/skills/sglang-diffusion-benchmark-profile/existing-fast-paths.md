@@ -110,12 +110,12 @@ framework-specific optimization workflow.
   check dtype, alignment, shape, BCG/compile context, and the one-time equality
   self-test before proposing another fusion.
 
-4. Request-scoped fusion gates at `quality=extra-high` or `quality=high`
+4. Request-scoped fusion gates at `quality=lossless` or `quality=high`
 - Locations: `quality_gate.py`, `fused_ln_modulate.py`, `denoising.py`,
   `decoding.py`, `fast_path_gate.py`, `flux2_vae_cuda_opt.py`, and
   `wan_vae_cuda_opt.py`.
 - Behavior: `quality="lossless"` is the default exact reference path.
-  `quality="extra-high"` and `quality="high"` mount the same validated but
+  `quality="lossless"` and `quality="high"` mount the same validated but
   non-bit-exact DiT fusions and decode-scoped VAE rewrites. `high` is
   cumulative and may additionally enable model-owned approximate paths.
   Mounting is all-or-nothing per
@@ -397,13 +397,13 @@ framework-specific optimization workflow.
 
 **Request-Scoped DiT Fusions with Breakable CUDA Graphs**
 
-- DiT sites at `quality=extra-high` or `quality=high` are mounted at a request boundary. BCG warmup uses
+- DiT sites at `quality=lossless` or `quality=high` are mounted at a request boundary. BCG warmup uses
   the model's lossless sampling default unless a quality-aware graph variant
   was captured explicitly.
 - A graph captured before the request-quality mount retains the lossless module
   branches. Replaying it after the mount silently bypasses the requested fused
   kernels even when the tensor signature matches.
-- Workflow rule: an extra-high/high+BCG cell is valid only when the model has no
+- Workflow rule: an lossless/high+BCG cell is valid only when the model has no
   request-scoped DiT quality sites, or when logs prove those sites were mounted
   before the matching graph capture. A mount after `[Diffusion BCG] captured`
   invalidates the row; do not use its latency or output as request-quality
@@ -434,7 +434,7 @@ framework-specific optimization workflow.
   selector when its CUDA layout guard passes. Check that guard before treating
   the `topk`/mask chain as a new opportunity. Its fused Triton RMSNorm row
   kernels remain request-gated by weight dtype and hidden size at
-  `quality=extra-high` and `quality=high`; check those separate quality-site
+  `quality=lossless` and `quality=high`; check those separate quality-site
   guards before treating an expanded `pow/mean/rsqrt` chain as new work.
 - LTX-2.5 reuses the mature LTX-2 DiT paths. Treat the optional diffusion
   decoder separately: confirm NATTEN `na3d` is active, then inspect its
@@ -448,7 +448,7 @@ framework-specific optimization workflow.
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Bit-exact adaLN modulation / LayerNorm folding: `modulate_scale_shift` and
   `fused_layernorm_modulate` through `flux.py`, `glm_image.py`, and `sana.py`.
-- Request-scoped extra-high/high acceleration: `QualityGatedFusion` in
+- Request-scoped lossless/high acceleration: `QualityGatedFusion` in
   `quality_gate.py`, `_maybe_toggle_quality_fusions` in `denoising.py`, and
   `use_vae_fast_path` in `decoding.py`.
 - Bit-exact first-sight verify/disable: `BitExactFusionGate` in
@@ -466,7 +466,7 @@ framework-specific optimization workflow.
 - LingBot Video MoE routing: `LingBotVideoRouter._group_limited_topk` uses
   `group_limited_topk` through the diffusion facade when the CUDA layout guard
   passes, otherwise it retains the eager reference chain.
-- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="extra-high"` and `quality="high"`:
+- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="lossless"` and `quality="high"`:
   `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
   `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused

@@ -62,8 +62,10 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     ReplicatedLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -132,7 +134,10 @@ class _ResidualMergeRead:
     dtype. The producer's update must be a plain add."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, res_scale: Optional[ResidualScaling]):
         self.res_scale = res_scale
@@ -432,8 +437,7 @@ class CCA(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.config = config
@@ -446,12 +450,7 @@ class CCA(nn.Module):
         self.padding1 = self.cca_time1 - 1
         self.total_padding = self.padding0 + self.padding1
 
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
-        self.tp_rank = int(tp_rank)
-        self.tp_size = int(tp_size)
+        self.tp_rank, self.tp_size = resolve_linear_parallel_group(parallel_group)
 
         # Full (global) head counts retained for weight loading and shape asserts.
         self.num_q_heads_full = int(cca_num_q_heads)
@@ -506,8 +505,7 @@ class CCA(nn.Module):
                 gather_output=False,
                 quant_config=quant_config,
                 prefix=add_prefix("linear_q", prefix),
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
             self.linear_k = ColumnParallelLinear(
                 self.hidden_size,
@@ -516,8 +514,7 @@ class CCA(nn.Module):
                 gather_output=False,
                 quant_config=quant_config,
                 prefix=add_prefix("linear_k", prefix),
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
         else:
             self.linear_q = ReplicatedLinear(
@@ -1320,10 +1317,15 @@ class ZayaDecoderATTLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
-        (self.attn_boundary,) = append_stages(
-            (declare_attn(read=_ResidualMergeRead(self.res_scale)), self.input_norm),
-        )
+        (attn,) = self.stage_facts(res_scale=self.res_scale)
+        (self.attn_boundary,) = append_stages((attn, self.input_norm))
         self.entry_boundary = self.attn_boundary
+
+    @staticmethod
+    def stage_facts(*, res_scale: Optional[ResidualScaling] = None):
+        """The one stage an attention layer declares: its attention, read
+        through ``res_scale``."""
+        return (declare_attn(read=_ResidualMergeRead(res_scale)),)
 
     @staticmethod
     def _build_norm(config: ZayaConfig) -> nn.Module:
@@ -1371,17 +1373,21 @@ class ZayaDecoderMLPLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
-        (self.ffn_boundary,) = append_stages(
-            (
-                declare_ffn(
-                    sparse=True,
-                    next_layer_sparse=True,
-                    read=_ResidualMergeRead(self.res_scale),
-                ),
-                self.input_norm,
+        (ffn,) = self.stage_facts(res_scale=self.res_scale)
+        (self.ffn_boundary,) = append_stages((ffn, self.input_norm))
+        self.entry_boundary = self.ffn_boundary
+
+    @staticmethod
+    def stage_facts(*, res_scale: Optional[ResidualScaling] = None):
+        """The one stage an MoE layer declares: its MoE, read through
+        ``res_scale``."""
+        return (
+            declare_ffn(
+                sparse=True,
+                next_layer_sparse=True,
+                read=_ResidualMergeRead(res_scale),
             ),
         )
-        self.entry_boundary = self.ffn_boundary
 
     def forward(
         self,
@@ -1403,28 +1409,34 @@ class ZayaDecoderMLPLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _layer_class(layer_id: int):
+    # Even layer ids are attention, odd layer ids are MoE. This matches the HF
+    # checkpoint keys: ``model.layers.<2k>.self_attn.*`` (CCA) versus
+    # ``model.layers.<2k+1>.zaya_block.*`` (MoE).
+    if layer_id % 2 == 0:
+        return ZayaDecoderATTLayer
+    return ZayaDecoderMLPLayer
+
+
 def _build_layer(
     layer_id: int,
     config: ZayaConfig,
     quant_config: Optional[QuantizationConfig],
     prefix: str,
 ) -> nn.Module:
-    # Even layer ids are attention, odd layer ids are MoE. This matches the HF
-    # checkpoint keys: ``model.layers.<2k>.self_attn.*`` (CCA) versus
-    # ``model.layers.<2k+1>.zaya_block.*`` (MoE).
-    if layer_id % 2 == 0:
-        return ZayaDecoderATTLayer(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-    return ZayaDecoderMLPLayer(
+    return _layer_class(layer_id)(
         config=config,
         layer_id=layer_id,
         quant_config=quant_config,
         prefix=prefix,
     )
+
+
+def stage_facts(layer_id: int):
+    """The one stage the layer at ``layer_id`` declares, from its kind alone:
+    the model's shared declaration function, which its layers declare with
+    too (see make_layers)."""
+    return _layer_class(layer_id).stage_facts()
 
 
 class ZayaModel(nn.Module):
@@ -1459,6 +1471,7 @@ class ZayaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=stage_facts,
         )
 
         if self.pp_group.is_last_rank:

@@ -159,16 +159,21 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     )
 
     if cfg.speculative_use_block_verification:
-        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
             raise ValueError(
-                "--speculative-use-block-verification only supports EAGLE / EAGLE3 / NEXTN."
+                "--speculative-use-block-verification only supports EAGLE / EAGLE3 / "
+                "NEXTN / DFLASH / DSPARK."
             )
         if cfg.device != "cuda":
             raise ValueError(
                 "--speculative-use-block-verification only supports CUDA or ROCm."
             )
         # Block verification needs sampled proposals and their full distributions.
-        if not cfg.speculative_use_rejection_sampling:
+        # The DFLASH family's sampled drafts always carry them.
+        if (
+            cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+            and not cfg.speculative_use_rejection_sampling
+        ):
             declare_resolution(
                 server_args,
                 "handle_speculative_decoding",
@@ -600,9 +605,9 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
+    if not cfg.device.startswith(("cuda", "npu", "xpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA or NPU device."
+            "DSpark speculative decoding only supports CUDA, NPU or XPU device."
         )
 
     if cfg.attn_dp_size > 1:

@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
@@ -138,10 +138,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 f"backend for both phases, got prefill={prefill_backend!r}, "
                 f"decode={decode_backend!r}."
             )
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_fp8,
-        )
-
         unsupported = (
             ("multiple nodes", cfg.nnodes > 1),
             (
@@ -153,7 +149,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 cfg.enable_decoder_swa_bounded_replay,
             ),
             ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
-            ("the fp8 unified_kv pool", is_unified_kv_fp8()),
         )
         for feature, enabled in unsupported:
             if enabled:
@@ -294,24 +289,41 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
+        supported_prefill_cp = (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
-            or num_dp_ranks_of(cfg) != 1
-            or attn_dp_enabled_of(cfg)
-            or cfg.attn_cp_size != 1
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            or (
+                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+                and not supported_prefill_cp
+            )
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
+                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "--enable-prefill-cp with the interleave strategy. "
+                "DP attention is supported when "
+                "both servers use the same block size and target/draft KV layout."
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
-    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
-        # The captured low-ratio indexer scores a static context width; 16k
-        # keeps it inside the candidate window at under 1 ms per layer.
+    cp_breakable_prefill = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.tp_size > 1
+        and prefill_graph.backend == Backend.BREAKABLE
+    )
+    if (
+        prefill_graph.backend != Backend.DISABLED
+        and prefill_graph.max_seq_len is None
+        and not cp_breakable_prefill
+    ):
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",
@@ -326,13 +338,31 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     if cfg.enable_decoder_swa_bounded_replay:
         # Late layers see a per-request tail slice, not the captured prefill shape.
+        # The breakable backend is admitted: the tail switch runs as eager breaks and
+        # the tail is a fixed-capacity row block inside the captured segments.
         incompatible = (
             (
                 "the prefill CUDA graph",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # Late-layer communication uses one row count per attention-DP rank.
+            # Attention TP/CP shards need a separate tail padding layout.
+            (
+                "DP attention other than attention TP 1 with supported MoE backends",
+                attn_dp_enabled_of(cfg)
+                and not (
+                    cfg.attn_dp_size == cfg.tp_size
+                    and cfg.attn_cp_size == 1
+                    and (
+                        (get_platform().is_hip and cfg.moe_a2a_backend == "none")
+                        or (
+                            get_platform().is_cuda
+                            and cfg.moe_a2a_backend in ("none", "megamoe")
+                        )
+                    )
+                ),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

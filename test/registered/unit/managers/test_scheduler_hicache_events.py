@@ -124,7 +124,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
-        s._pp_pd_get_bootstrapped_ids = Mock(return_value=[])
+        s.waiting_queue = []
+        s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         s._pp_commit_comm_work = Mock()
         s.get_new_batch_prefill = self.calls.admit

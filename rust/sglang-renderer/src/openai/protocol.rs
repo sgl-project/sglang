@@ -464,56 +464,20 @@ pub(crate) fn normalize_reasoning_inputs(
     reasoning: Option<Value>,
     chat_template_kwargs: &mut Option<HashMap<String, Value>>,
 ) -> Result<(), RendererError> {
-    let mut thinking = None;
-    if let Some(Value::Object(reasoning)) = reasoning {
-        let nested_effort = reasoning
-            .get("effort")
-            .filter(|value| !value.is_null())
-            .or_else(|| {
-                reasoning
-                    .get("reasoning_effort")
-                    .filter(|value| !value.is_null())
-            });
-        if let Some(nested_effort) = nested_effort {
-            *reasoning_effort = Some(
-                serde_json::from_value(nested_effort.clone())
-                    .map_err(|error| format!("invalid reasoning effort: {error}"))?,
-            );
-        }
-
-        let enabled = reasoning
-            .get("enabled")
-            .filter(|value| !value.is_null())
-            .or_else(|| reasoning.get("enable"));
-        if enabled.is_some_and(json_truthy) {
-            thinking = Some(true);
-        }
+    let request = serde_json::json!({"reasoning": reasoning, "reasoning_effort": reasoning_effort});
+    if let Some(effort) = sglang_processor::requested_effort(&request) {
+        *reasoning_effort = Some(
+            serde_json::from_value(effort.clone())
+                .map_err(|error| format!("invalid reasoning effort: {error}"))?,
+        );
     }
-
-    if let Some(effort) = reasoning_effort.as_ref() {
-        thinking = Some(!effort.disables_thinking());
-    }
-    if let Some(thinking) = thinking {
+    if let Some(thinking) = sglang_processor::requested_thinking(&request) {
         let args = chat_template_kwargs.get_or_insert_with(HashMap::new);
         args.entry("thinking".into()).or_insert(thinking.into());
         args.entry("enable_thinking".into())
             .or_insert(thinking.into());
     }
     Ok(())
-}
-
-fn json_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "y" | "on"
-        ),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
 }
 
 fn validate_chat_request(

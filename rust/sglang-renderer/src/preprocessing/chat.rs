@@ -3,11 +3,7 @@
 
 use std::collections::HashMap;
 
-use dynamo_parsers::parsers::get_tool_parser_map;
-use dynamo_parsers::{
-    StructuralTagBuilder, StructuralTagSchemaMode, ToolCallFormatBuildContext,
-    ToolChoice as DynamoToolChoice, ToolDefinition, TriggeredTagsConfig,
-};
+use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage, ChatCompletionTool,
     ChatCompletionToolChoiceOption, ResponseFormat,
@@ -18,7 +14,10 @@ use dynamo_renderer::{
 use minijinja::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
-use sglang_processor::{OneOrMany as ProcessorOneOrMany, dynamo_tool_parser_name};
+use sglang_processor::{
+    OneOrMany as ProcessorOneOrMany, ToolConstraint, chat_tool_definitions, dynamo_tool_choice,
+    tool_constraint,
+};
 
 use crate::{
     ChatFormatter, ChatResponseProcessor, GenerateRequestMetadata, GenerationOptions, OneOrMany,
@@ -199,6 +198,7 @@ struct RenderPreparation {
     require_reasoning: bool,
     reasoning_state: Option<bool>,
     tools_enabled: bool,
+    tools: Vec<ToolDefinition>,
 }
 
 /// Applies structured chat semantics before the shared text generation path.
@@ -231,7 +231,7 @@ impl ChatPreprocessor {
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
 
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
-        let tools = chat_tool_definitions(&request);
+        let tools = preparation.tools;
         let parser =
             resolve_chat_parser(self.tool_call_parser.as_deref(), preparation.tools_enabled)?;
         if parser.is_some() {
@@ -311,11 +311,8 @@ impl ChatPreprocessor {
         validate_chat(request)?;
         self.normalize_template_args(request);
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
-        let tools_enabled = request
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty())
-            && tool_choice != DynamoToolChoice::None;
+        let tools = chat_tool_definitions(request.tools.as_deref(), &request.messages)?;
+        let tools_enabled = !tools.is_empty() && tool_choice != DynamoToolChoice::None;
         let named_tool_choice = matches!(tool_choice, DynamoToolChoice::Named(_));
         let thinking = self.formatter.as_ref().and_then(|formatter| {
             formatter.resolve_thinking(
@@ -328,6 +325,7 @@ impl ChatPreprocessor {
             require_reasoning: self.reasoning_parser.is_some() && thinking == Some(true),
             reasoning_state: thinking,
             tools_enabled,
+            tools,
         })
     }
 
@@ -360,7 +358,12 @@ impl ChatPreprocessor {
             )
         })?;
         let mut request = request.clone();
-        let final_message = prepare_continuation(&mut request);
+        // DeepSeek-V4 and V4.1 continue the final turn as SGLang's encoder path does,
+        // null and parts content included.
+        let final_message = match formatter {
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => None,
+            _ => prepare_continuation(&mut request),
+        };
         let template_args = request.chat_template_args.get_or_insert_with(HashMap::new);
         template_args.insert(
             "add_generation_prompt".into(),
@@ -498,30 +501,6 @@ fn resolve_chat_parser(
     Ok(tools_enabled.then(|| configured_parser.expect("checked").to_owned()))
 }
 
-fn chat_tool_definitions(request: &ChatRequest) -> Vec<ToolDefinition> {
-    request
-        .tools
-        .iter()
-        .flatten()
-        .map(|tool| ToolDefinition {
-            name: tool.function.name.clone(),
-            parameters: tool.function.parameters.clone(),
-            strict: tool.function.strict,
-        })
-        .collect()
-}
-
-fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> DynamoToolChoice {
-    match choice {
-        Some(ChatCompletionToolChoiceOption::None) => DynamoToolChoice::None,
-        Some(ChatCompletionToolChoiceOption::Required) => DynamoToolChoice::Required,
-        Some(ChatCompletionToolChoiceOption::Named(choice)) => {
-            DynamoToolChoice::Named(choice.function.name.clone())
-        }
-        Some(ChatCompletionToolChoiceOption::Auto) | None => DynamoToolChoice::Auto,
-    }
-}
-
 fn apply_tool_constraint(
     sampling: &mut SamplingParams,
     parser: Option<&str>,
@@ -529,96 +508,12 @@ fn apply_tool_constraint(
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
 ) -> Result<(), String> {
-    if *tool_choice == DynamoToolChoice::None {
-        return Ok(());
-    }
-    if *tool_choice == DynamoToolChoice::Required && tools.is_empty() {
-        return Err("tool_choice is \"required\" but tools is empty".into());
-    }
-    if let DynamoToolChoice::Named(name) = tool_choice
-        && !tools.iter().any(|tool| &tool.name == name)
-    {
-        return Err(format!(
-            "tool named \"{name}\" in tool_choice is not present in tools"
-        ));
-    }
-
-    let Some(parser) = parser else {
-        return Ok(());
-    };
-    let parser = dynamo_tool_parser_name(parser);
-    let config = get_tool_parser_map()
-        .get(parser)
-        .ok_or_else(|| format!("tool-call parser `{parser}` is not supported by Dynamo"))?;
-    let builder = config.structural_tag_builder.clone().or_else(|| {
-        (parser == "llama3_json"
-            && *tool_choice == DynamoToolChoice::Auto
-            && tools.iter().any(|tool| tool.strict.unwrap_or(false)))
-        .then(|| {
-            StructuralTagBuilder::TriggeredTags(TriggeredTagsConfig {
-                begin_template: r#"<|python_tag|>{"name":"{name}", "arguments":"#.to_string(),
-                end_template: "}".to_string(),
-                triggers: vec!["<|python_tag|>".to_string()],
-                content_style: Default::default(),
-                tool_call_ban_tokens: Vec::new(),
-                reasoning_end: None,
-            })
-        })
-    });
-    if let Some(builder) = builder
-        && let Some(tag) = builder
-            .build_tool_call_format(&ToolCallFormatBuildContext {
-                tool_choice,
-                tools,
-                parallel_tool_calls,
-                schema_mode: StructuralTagSchemaMode::Auto,
-                starts_in_reasoning: false,
-            })
-            .map_err(|error| error.to_string())?
-    {
-        sampling.structural_tag = Some(tag.to_string());
-        return Ok(());
-    }
-
-    if matches!(
-        tool_choice,
-        DynamoToolChoice::Required | DynamoToolChoice::Named(_)
-    ) {
-        let selected = match tool_choice {
-            DynamoToolChoice::Named(name) => tools
-                .iter()
-                .filter(|tool| tool.name == *name)
-                .collect::<Vec<_>>(),
-            _ => tools.iter().collect(),
-        };
-        let schemas = selected
-            .into_iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "properties": {
-                        "name": {"type": "string", "enum": [tool.name]},
-                        "parameters": tool.parameters.clone().unwrap_or_else(|| {
-                            serde_json::json!({"type": "object", "properties": {}})
-                        }),
-                    },
-                    "required": ["name", "parameters"],
-                })
-            })
-            .collect::<Vec<_>>();
-        let items = if schemas.len() == 1 {
-            schemas.into_iter().next().expect("one schema")
-        } else {
-            serde_json::json!({"type": "object", "anyOf": schemas})
-        };
-        let mut schema = serde_json::json!({
-            "type": "array",
-            "minItems": 1,
-            "items": items,
-        });
-        if parallel_tool_calls == Some(false) {
-            schema["maxItems"] = serde_json::json!(1);
-        }
-        sampling.json_schema = Some(schema.to_string());
+    let constraint = tool_constraint(parser, tool_choice, tools, parallel_tool_calls)
+        .map_err(|error| error.to_string())?;
+    match constraint {
+        Some(ToolConstraint::StructuralTag(tag)) => sampling.structural_tag = Some(tag),
+        Some(ToolConstraint::JsonSchema(schema)) => sampling.json_schema = Some(schema),
+        None => {}
     }
     Ok(())
 }
@@ -627,21 +522,6 @@ fn apply_tool_constraint(
 mod tests {
     use super::*;
     use crate::{RendererLimits, SamplingDefaults};
-    use dynamo_protocols::types::{
-        ChatCompletionNamedToolChoice, ChatCompletionToolType, FunctionName,
-    };
-
-    fn tool(name: &str, strict: bool) -> ToolDefinition {
-        ToolDefinition {
-            name: name.into(),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"]
-            })),
-            strict: Some(strict),
-        }
-    }
 
     fn chat_request(tool_choice: Option<ChatCompletionToolChoiceOption>) -> ChatRequest {
         ChatRequest {
@@ -709,67 +589,6 @@ mod tests {
             },
         };
         ChatPreprocessor::new(&config, Some(formatter))
-    }
-
-    #[test]
-    fn wire_tool_choices_lower_to_internal_choices() {
-        let named = Some(ChatCompletionToolChoiceOption::Named(
-            ChatCompletionNamedToolChoice {
-                r#type: ChatCompletionToolType::Function,
-                function: FunctionName {
-                    name: "get_weather".into(),
-                },
-            },
-        ));
-
-        assert!(matches!(dynamo_tool_choice(&None), DynamoToolChoice::Auto));
-        assert!(matches!(
-            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::Required)),
-            DynamoToolChoice::Required
-        ));
-        assert!(matches!(
-            dynamo_tool_choice(&named),
-            DynamoToolChoice::Named(name) if name == "get_weather"
-        ));
-    }
-
-    #[test]
-    fn required_choice_builds_a_single_call_constraint() {
-        let mut sampling = SamplingParams::default();
-        apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Required,
-            &[tool("get_weather", false), tool("get_time", false)],
-            Some(false),
-        )
-        .unwrap();
-
-        let schema: JsonValue =
-            serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
-        assert_eq!(schema["minItems"], 1);
-        assert_eq!(schema["maxItems"], 1);
-    }
-
-    #[test]
-    fn invalid_tool_choices_are_rejected_before_generation() {
-        let mut sampling = SamplingParams::default();
-        assert!(
-            apply_tool_constraint(&mut sampling, None, &DynamoToolChoice::Required, &[], None,)
-                .unwrap_err()
-                .contains("required")
-        );
-        assert!(
-            apply_tool_constraint(
-                &mut sampling,
-                None,
-                &DynamoToolChoice::Named("missing".into()),
-                &[tool("get_weather", false)],
-                None,
-            )
-            .unwrap_err()
-            .contains("missing")
-        );
     }
 
     #[test]
@@ -868,5 +687,56 @@ mod tests {
                 .options
                 .require_reasoning
         );
+    }
+
+    #[test]
+    fn deepseek_v4_continues_the_final_turn_as_sglang_does() {
+        let formatter = ChatFormatter::DeepSeekV4(sglang_processor::DeepSeekV4Profile::Official);
+        let preprocessor = chat_preprocessor_with(None, None, formatter);
+        // SGLang flattens parts, blanks null, drops the continuation's leading BOS
+        // and tokenizes the continuation on its own.
+        let user = serde_json::json!({"role": "user", "content": "Hi"});
+        let after_user = "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>";
+        let parts =
+            serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]);
+        for (first, content, prompt, continuation) in [
+            (&user, parts, after_user, "a b"),
+            (&user, JsonValue::Null, after_user, ""),
+            (
+                &user,
+                serde_json::json!("<｜begin▁of▁sentence｜>abc"),
+                after_user,
+                "abc",
+            ),
+            (
+                &serde_json::json!({"role": "system", "content": "a"}),
+                serde_json::json!("b"),
+                "<｜begin▁of▁sentence｜>a",
+                "b",
+            ),
+        ] {
+            let mut request = chat_request(None);
+            request.tools = None;
+            request.continue_final_message = true;
+            // Pinned so SGLANG_DEFAULT_THINKING and SGLANG_DSV4_REASONING_EFFORT don't apply.
+            request.chat_template_args = serde_json::from_value(
+                serde_json::json!({"thinking": false, "reasoning_effort": "low"}),
+            )
+            .unwrap();
+            request.messages = serde_json::from_value(serde_json::json!([
+                first,
+                {"role": "assistant", "content": content}
+            ]))
+            .unwrap();
+            let rendered = preprocessor.lower_to_text(request).unwrap().prompt;
+            assert_eq!(rendered.as_str(), format!("{prompt}{continuation}"));
+            let segments = rendered
+                .segments()
+                .map(|segments| segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>());
+            assert_eq!(
+                segments,
+                (!continuation.is_empty()).then(|| vec![prompt, continuation])
+            );
+        }
     }
 }

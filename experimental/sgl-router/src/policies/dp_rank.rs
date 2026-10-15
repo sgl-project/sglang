@@ -65,6 +65,7 @@ mod tests {
         let profile = EngineProfile {
             protocol: WireProtocol::default(),
             dp_ranks,
+            openai: None,
         };
         Worker::with_cb_config(spec, None, profile)
     }

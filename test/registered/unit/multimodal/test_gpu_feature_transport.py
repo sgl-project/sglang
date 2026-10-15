@@ -363,6 +363,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
         transport.prepare_for_dispatch_async = AsyncMock(return_value=items)
         manager.cuda_vmm_feature_transport = transport
+        manager.positional_embeds_transport = MagicMock()
 
         with (
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
@@ -401,6 +402,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
         transport.prepare_for_dispatch_async = AsyncMock(return_value=items)
         manager.cuda_vmm_feature_transport = transport
+        manager.positional_embeds_transport = MagicMock()
 
         with (
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
@@ -412,6 +414,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.cancel_for_dispatch.assert_not_called()
 
     def test_async_publication_keeps_event_loop_responsive(self):
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
@@ -437,7 +444,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
                 release.set()
 
         transport.prepare_for_dispatch = MagicMock(side_effect=block_publication)
-        mm_inputs = SimpleNamespace(mm_items=[object()])
+        mm_inputs = MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(2))
+            ]
+        )
 
         async def run():
             watchdog = threading.Thread(target=unblock_if_event_loop_stalls)
@@ -447,6 +458,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
                     transport.prepare_for_dispatch_async([mm_inputs])
                 )
                 while not started.is_set():
+                    if task.done():
+                        await task
                     await asyncio.sleep(0)
                 event_loop_responsive.set()
                 self.assertFalse(task.done())
@@ -519,6 +532,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
         pool = object.__new__(vmm.CudaVmmMemoryPool)
+        pool._lock = threading.Lock()
         pool.device_index = 0
         pool.consumer_count = 2
         pool._recycle_stream = object()
@@ -727,6 +741,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         class TokenizedRequest:
             def __init__(self):
                 self.mm_inputs = object()
+                self.positional_embed_overrides = None
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
@@ -786,7 +801,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         self._prepare_scheduler(scheduler)
         raw_inputs = object()
         materialized = object()
-        request = SimpleNamespace(mm_inputs=raw_inputs)
+        request = SimpleNamespace(mm_inputs=raw_inputs, positional_embed_overrides=None)
 
         with (
             patch.object(
@@ -819,6 +834,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         class TokenizedRequest:
             def __init__(self, mm_inputs):
                 self.mm_inputs = mm_inputs
+                self.positional_embed_overrides = None
 
         class BatchRequest:
             def __init__(self, batch):
@@ -987,6 +1003,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             return_pooled_hidden_states=False,
             multi_item_delimiter_indices=None,
             token_indices_to_pool=None,
+            decision_layout=None,
             mm_inputs=object(),
         )
 
@@ -1017,7 +1034,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         from sglang.srt.managers import scheduler as scheduler_module
 
         class TokenizedRequest:
-            pass
+            positional_embed_overrides = None
 
         class EmbeddingRequest:
             pass
@@ -1121,6 +1138,7 @@ class TestVmmConsumerCount(unittest.TestCase):
         proxy = object.__new__(CudaVmmTensorTransportProxy)
         proxy.consumer_count = 4
         with get_parallel().override(
+            tp_rank=3,
             attn_tp_size=2,
             attn_tp_rank=1,
             attn_cp_size=2,

@@ -572,8 +572,12 @@ impl ServerArgs {
             }
         }
         if let Some(preferred) = &self.preferred_sampling_params {
-            super::sampling::SamplingParamsInput::from_preferred(&preferred.0)
-                .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
+            // The wire schema is the contract: a preferred value the decoder
+            // rejects would 400 every request, so reject it at boot instead.
+            serde_json::from_value::<sglang_api_types::api::v1::SamplingParams>(
+                preferred.0.clone(),
+            )
+            .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
         }
         Ok(())
     }

@@ -166,6 +166,30 @@ def test_pack_qkv_destination_major_validates_inputs():
         pack_qkv_destination_major(q, q, q, 2, out=torch.empty_like(q))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 24 * 2**30,
+    reason="needs a CUDA GPU with 24 GiB free",
+)
+def test_pack_qkv_destination_major_rows_past_int32():
+    """Past 2^31 elements, the last rows must pack exactly as the same rows
+    packed alone, whether the packed output, the q/k/v views, or both pass it."""
+    rows, heads, head_size = 119_024, 56, 128
+    qkv = torch.randn(rows, 3 * heads * head_size, device="cuda", dtype=torch.bfloat16)
+    views = [
+        t.view(rows, heads, head_size) for t in qkv.split(heads * head_size, dim=-1)
+    ]
+    tail = slice(100_000, None)
+    cases = (
+        ([t.contiguous() for t in views], 4),  # only the output passes 2^31
+        (views, 4),  # both pass 2^31
+        ([t[:, :1] for t in views], 1),  # only the q/k/v views pass 2^31
+    )
+    for (q, k, v), world in cases:
+        out = pack_qkv_destination_major(q, k, v, world)[:, tail]
+        ref = pack_qkv_destination_major(q[tail], k[tail], v[tail], world)
+        assert torch.equal(out, ref)
+
+
 # ---------------------------------------------------------------------------
 # Varlen pack / scatter
 # ---------------------------------------------------------------------------

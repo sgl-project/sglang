@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
 
@@ -29,11 +30,11 @@ class GatedResidualState:
     per-stream gates, and writes its output back scaled by an injection
     coefficient computed from that same normalized residual.
 
-    Unlike the hyper-connection streams in mhc.py and ihc.py, whose read
-    produces the coefficient its write-back consumes, the coefficient here is
-    computed at write time. What has to survive from a stage's read to its
-    write-back is therefore the normalized residual itself, which this state
-    holds. Parameters belong to the owning layer's modules.
+    The read carries its normalized residual to write-back. Decode may also
+    prepare gate partials during the read; otherwise write-back computes the
+    coefficient from that normalized residual. Both follow the residual rows
+    through any slicing and are cleared after the FFN write-back.
+    Parameters belong to the owning layer's modules.
 
     Args:
         expand: Widens the layer stack's input into the stream representation,
@@ -44,6 +45,8 @@ class GatedResidualState:
         ffn_mix: The FFN stage's read.
         attn_combine: Writes the attention output back into the streams.
         ffn_combine: Writes the FFN output back into the streams.
+        attn_reads_every_row: Whether attn_mix needs every row of the
+            attention's, as a contribution computed for all of them does.
     """
 
     expand: Callable
@@ -51,8 +54,10 @@ class GatedResidualState:
     ffn_mix: Callable
     attn_combine: Callable
     ffn_combine: Callable
+    attn_reads_every_row: bool = False
     # Produced by a stage's read and consumed by that same stage's write-back.
     normed: Optional[torch.Tensor] = None
+    gate_partials: Optional[torch.Tensor] = None
 
     def _read(self, mix, residual, out_norm):
         if out_norm is not None:
@@ -60,7 +65,8 @@ class GatedResidualState:
                 "a gated hyper-connection read with a separate norm; the read "
                 "normalizes the streams itself"
             )
-        hidden_states, (residual, self.normed) = mix(residual)
+        hidden_states, residuals = mix(residual)
+        residual, self.normed, self.gate_partials = residuals
         return hidden_states, residual
 
     def read_attn_input(self, residual, out_norm=None):
@@ -71,18 +77,25 @@ class GatedResidualState:
         return self._read(self.ffn_mix, residual, out_norm)
 
     def apply_attn_combine(self, hidden_states, residual):
-        return self.attn_combine(hidden_states, (residual, self.normed))
+        return self.attn_combine(
+            hidden_states, (residual, self.normed, self.gate_partials)
+        )
 
     def apply_ffn_combine(self, hidden_states, residual):
-        return self.ffn_combine(hidden_states, (residual, self.normed))
+        return self.ffn_combine(
+            hidden_states, (residual, self.normed, self.gate_partials)
+        )
 
     def clear_coefficients(self):
         self.normed = None
+        self.gate_partials = None
 
     def slice_residual_attn_tp(self, residual):
         parallel = get_parallel()
         rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
         self.normed = self.normed.tensor_split(size)[rank]
+        if self.gate_partials is not None:
+            self.gate_partials = self.gate_partials.tensor_split(size)[rank]
         return residual.tensor_split(size)[rank]
 
     def gather_residual_attn_tp(self, residual):
@@ -99,16 +112,39 @@ class GatedResidualState:
             ffn_update=_FfnUpdate(self),
         )
 
+    @classmethod
+    def facts(cls, *, attn_reads_every_row: bool = False) -> LayerResidualOps:
+        """What residual_ops() declares (see facts_of) for a layer whose
+        attention read needs every row when ``attn_reads_every_row``. It does
+        not depend on the layer's modules, so the stages of a layer that is
+        not built declare it too."""
+        state = cls(
+            expand=None,
+            attn_mix=None,
+            ffn_mix=None,
+            attn_combine=None,
+            ffn_combine=None,
+            attn_reads_every_row=attn_reads_every_row,
+        )
+        return residual_facts(state.residual_ops())
+
 
 class _AttnReadout:
     """The normalized, gated mix of the streams, from streams that already hold
-    the previous layer's output: such a layer takes its input written back."""
+    the previous layer's output: such a layer takes its input written back. A
+    ``post_residual_addition`` is not applied."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
+
+    @property
+    def reads_after_attn_tp_gather(self):
+        return self.state.attn_reads_every_row
 
     def init_residual(self, hidden_states):
         return self.state.expand(hidden_states)
@@ -134,6 +170,8 @@ class _AttnUpdate:
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -152,7 +190,10 @@ class _FfnReadout:
     """The attention output's injection and the FFN input's mix."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -182,6 +223,8 @@ class _FfnUpdate:
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state

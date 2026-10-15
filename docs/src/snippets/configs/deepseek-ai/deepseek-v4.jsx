@@ -49,6 +49,117 @@ export const config = {
     { id: "multi-2", label: "Multi-Nodes" },
   ],
 
+  // AgentX 1P1D recipe: InferenceX PR #3664, commit df5e433239d7.
+  // The strategy presets use c16 / c48 / c256. Pro uses its MTP head;
+  // Pro Official is the InferenceX checkpoint. Acceptance simulation is omitted.
+  overlayDims: [
+    { id: "pdMode", title: "PD role", default: "prefill",
+      showWhen: (s) => s.hw === "mi355x" && s.quant === "fp4"
+        && ["pro", "pro-official"].includes(s.variant) && s.nodes === "multi-2",
+      options: [
+        { id: "router", label: "Router" },
+        { id: "prefill", label: "Prefill" },
+        { id: "decode", label: "Decode" },
+      ] },
+  ],
+  resolveRecipe: (cell, sel) => {
+    if (!cell.pd) return cell;
+    const conc = { "low-latency": 16, balanced: 48, "high-throughput": 256 }[sel.strategy];
+    const role = ["router", "prefill", "decode"].includes(sel.pdMode) ? sel.pdMode : "prefill";
+    const prefill = role === "prefill";
+    const dp = sel.strategy === "high-throughput";
+    const official = sel.variant === "pro-official";
+    const gamma = sel.strategy === "low-latency" ? 6 : 3;
+    const tp = dp || !prefill ? 8 : 4;
+    const image = "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001";
+    const router = [
+      "python3 -m sglang_router.launch_router",
+      "  --pd-disaggregation",
+      "  --prefill http://<prefill-host>:30000",
+      "  --decode http://<decode-host>:30100",
+      "  --host 0.0.0.0 --port 8000",
+      "  --policy consistent_hashing --dp-aware",
+      "  --decode-policy round_robin",
+      "  --cache-threshold 0.3",
+      "  --balance-abs-threshold 2 --balance-rel-threshold 1.1",
+      "  --disable-circuit-breaker --health-failure-threshold 100",
+      "  --health-check-timeout-secs 600 --health-check-interval-secs 30",
+    ].join(" \\\n");
+    const common = { ...cell, nnodes: 1, dockerImage: image, pdMode: role,
+      router: { port: 8000, command: router } };
+    if (role === "router") return { ...common,
+      commands: { python: router, docker: `docker run --network host --rm ${image} ${router}` } };
+    // Emit overrides only. Defaults checked against the pinned image:
+    // SGLang 3b2ad1c6ae, MORI 879983bdbd8c. ROCm model setup enables the
+    // Aiter indexer; MegaMoE MTPR defaults to 8192 and static heap is implicit.
+    // This Aiter MegaMoEV2 uses mori_shmem_create_tensor, not the CCO allocator.
+    // Leave SHMEM_MODE unset on every role so a Playground switch to MegaMoE
+    // cannot inherit ISOLATION from an otherwise TP-only base.
+    // Both command formats run in the ROCm image, which enables Aiter.
+    // HSA_NO_SCRATCH_RECLAIM overrides the image's 1.
+    const env = [
+      "HSA_NO_SCRATCH_RECLAIM=0",
+      "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
+      "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+      "SGLANG_OPT_USE_AITER_BATCHED_GEMM=1",
+      "AITER_BF16_FP8_MOE_BOUND=0",
+      "TORCH_BLAS_PREFER_HIPBLASLT=1",
+      ...(dp ? [
+        "MORI_IO_QP_MAX_SEND_WR=32767",
+        "MORI_IO_QP_MAX_CQE=32768",
+      ] : []),
+      // SGE follows NIC capabilities; MORI already selects 2 on AMD AINIC.
+      `GPU_MAX_HW_QUEUES=${dp ? 5 : 2}`,
+      ...(prefill ? ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp/standalone.grpc.sock"] : []),
+      ...(dp ? [
+        "SGLANG_DSV4_UNIFIED_KV_FP8=1",
+        // Shared-expert/gatherv default off; reduce-scatter defaults on in ROCm.
+        ...(prefill ? ["SGLANG_DP_USE_REDUCE_SCATTER=0"] : [
+          "SGLANG_SHARED_EXPERT_TP1=1",
+          "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
+          "SGLANG_DP_USE_GATHERV=1",
+        ]),
+      ] : []),
+      ...(dp && prefill ? [
+        "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
+        "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
+        "MORI_SHMEM_HEAP_SIZE=8G",
+      ] : []),
+    ];
+    const flags = [
+      "--model-path {{MODEL_NAME}}", "--trust-remote-code", `--tp ${tp}`,
+      ...(dp ? ["--attn-dp-size 8", "--enable-dp-lm-head",
+        "--enable-dp-attention-local-control-broadcast"] : []),
+      ...(dp && prefill ? ["--ep 8", "--moe-a2a-backend megamoe", "--moe-dense-tp-size 1"] : []),
+      "--enable-deepseek-v4-fp4-indexer", "--attention-backend dsv4",
+      "--kv-cache-dtype fp8_e4m3", "--page-size 256",
+      `--swa-full-tokens-ratio ${dp ? 0.15 : 0.1}`,
+      `--mem-fraction-static ${dp ? 0.92 : 0.86}`,
+      "--enforce-shared-experts-fusion",
+      "--load-balance-method round_robin", "--tokenizer-worker-num 8", "--stream-interval 20",
+      "--context-length 1048576", "--watchdog-timeout 3600", "--enable-metrics",
+      ...(official ? ["--speculative-algorithm DSPARK", `--speculative-dspark-block-size ${gamma}`]
+        : ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
+           "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"]),
+      `--max-running-requests ${conc * 2}`,
+      ...(prefill ? [
+        `--chunked-prefill-size ${dp ? 65536 : 16384}`, "--disable-cuda-graph",
+        "--enable-cache-report", "--optimistic-prefill-attempts 2",
+        "--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend mori",
+      ] : [`--cuda-graph-bs-decode ${Array.from({ length: conc * 2 / (dp ? 8 : 1) }, (_, i) => i + 1).join(" ")}`]),
+      `--disaggregation-mode ${role}`, "--disaggregation-transfer-backend mori",
+      "--host {{HOST_IP}}", `--port ${prefill ? 30000 : 30100}`,
+    ];
+    return { ...common, env, flags,
+      dockerMounts: prefill ? ["/tmp/umbp:/tmp/umbp"] : [],
+      hints: prefill ? [
+        "Start the standalone UMBP tier on this prefill node before this worker (see section 3.9).",
+        "Reserve hugepages for its 1.5 TB DRAM pool; wait for: host memory registered for GPU access.",
+        "The Docker worker shares /tmp/umbp with the UMBP process.",
+      ] : [],
+    };
+  },
+
   modelNames: {
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
@@ -221,18 +332,20 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    // Pro Official agentic + DSpark PD + UMBP pairs ran end-to-end on this build,
-    // which is also the first one carrying the Aiter MegaMoEv2 kernels the
-    // high-throughput prefill role needs.
-    "mi355x|pro-official|fp4": "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001",
-    mi300x: "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi30x-20260926",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260926",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi30x-20261007",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261007",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
   github: {
     cookbookModel: "deepseek-ai/deepseek-v4",
   },
+
+  playgroundExclusiveGroups: [
+    { axes: ["hicache", "umbp"],
+      when: { hw: ["mi355x"], variant: ["pro", "pro-official"], quant: ["fp4"] },
+      note: "HiCache and Unified Cache External Linker are mutually exclusive. Enabling one turns the other off." },
+  ],
 
   playgroundFeatures: {
 
@@ -255,12 +368,12 @@ sgl-eval run mmmu_pro \\
           // 16 needs 16 ranks, so it is absent on single-node rather than
           // listed as "(n/a)". Switch the Deploy panel's Nodes to Multi-Nodes
           // to get it back.
-          { value: 16, hide: { nodes: ["single"] } },
+          { value: 16, hide: { workerNnodes: [1] } },
         ]},
         { id: "cp", label: "CP",
           values: [null, { value: 1, label: "Off" }, 2, 4, 8],
           disable: [
-            { when: { nodes: ["multi-2"] },
+            { when: { workerNnodes: [2] },
               reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
           ] },
         { id: "dpAttn", label: "DP-Attention",
@@ -290,7 +403,7 @@ sgl-eval run mmmu_pro \\
             4,
             8,
             // Multi-node only; hidden rather than shown as "(n/a)".
-            { value: 16, hide: { nodes: ["single"] } },
+            { value: 16, hide: { workerNnodes: [1] } },
           ],
           labels: { "auto": "Auto", "false": "Off" } },
       ],
@@ -308,12 +421,13 @@ sgl-eval run mmmu_pro \\
           { id: "deepep",            label: "DeepEP",
             flags: ["--moe-a2a-backend deepep"],
             hide: { hw: ["mi300x", "mi355x"] } },
-          // MORI's expert all-to-all — the dispatch/combine backend the AMD
-          // recipes use, and what the §3.8 decode role runs. Hidden on every
-          // non-ROCm platform, the same way the MORI transfer backend is in the
-          // PD card.
+          // Expert dispatch tuning belongs to this opt-in MoE backend. The
+          // default PD recipes use TP MoE or MegaMoE, so MORI-IO alone does not
+          // need MORI_EP_LAUNCH_CONFIG_MODE.
           { id: "mori",              label: "MORI",
             flags: ["--moe-a2a-backend mori"],
+            env: ["MORI_EP_LAUNCH_CONFIG_MODE=AUTO"],
+            envWhen: { hw: ["mi355x"], variant: ["pro", "pro-official"], quant: ["fp4"] },
             hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300",
                          "rtx6000", "rtx5090", "dgx-spark"] } },
           // No strategy gate — the Playground allows MegaMoE on any strategy for
@@ -330,10 +444,8 @@ sgl-eval run mmmu_pro \\
           // fused MoE. MegaMoEv2 also addresses its dispatch/combine buffers
           // through MORI's symmetric heap, whose 4 GiB default overflows at the
           // ~4.2 GiB MegaMoEv2 wants at MTPR 8192 — hence the size here. The
-          // MODE is deliberately NOT emitted: STATIC_HEAP is MORI's own default,
-          // so on this card it would be pure noise. The PD prefill role sets it
-          // because the recipe it mirrors runs under a launcher that exports
-          // ISOLATION. See cookbook §3.7 / §3.8.
+          // Preserve the legacy manual backend preset. The MI355X Pro PD
+          // deployment recipes inherit a minimal configuration instead.
           { id: "megamoe",           label: "MegaMoE",
             // Same flag, two implementations. On ROCm it is Aiter MegaMoEv2,
             // which reaches its dispatch/combine buffers through MORI's
@@ -346,6 +458,11 @@ sgl-eval run mmmu_pro \\
                   "SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192",
                   "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
                   "MORI_SHMEM_HEAP_SIZE=8G"],
+            envOverrides: [
+              { when: { hw: ["mi355x"], variant: ["pro", "pro-official"], quant: ["fp4"] },
+                env: ["SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
+                      "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4", "MORI_SHMEM_HEAP_SIZE=8G"] },
+            ],
             envWhen: { hw: ["mi355x"] } },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
             flags: ["--moe-runner-backend flashinfer_mxfp4"],
@@ -409,7 +526,11 @@ sgl-eval run mmmu_pro \\
           flags: ["--speculative-algorithm DSPARK"],
           hide: { variant: ["flash", "pro"] },
           disable: [
-            { when: { dpAttnOn: [true] },
+            { when: { dpAttnOn: [true], hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000", "rtx5090", "dgx-spark"] },
+              reason: "DSpark is not compatible with DP Attention on the current release. For a DP + DSpark agentic recipe, see the cookbook §3.6 (B200) / §3.7 (MI355X) notes." },
+            { when: { dpAttnOn: [true], hw: ["mi355x"], variant: ["flash", "flash-official", "flash-vision"] },
+              reason: "DSpark is not compatible with DP Attention on the current release. For a DP + DSpark agentic recipe, see the cookbook §3.6 (B200) / §3.7 (MI355X) notes." },
+            { when: { dpAttnOn: [true], hw: ["mi355x"], quant: ["fp8", "nvfp4"] },
               reason: "DSpark is not compatible with DP Attention on the current release. For a DP + DSpark agentic recipe, see the cookbook §3.6 (B200) / §3.7 (MI355X) notes." },
             { when: { hw: ["mi300x"] },
               reason: "DSpark on ROCm is documented for MI355X Pro Official (0813); MI300X still requires CUDA." },
@@ -479,6 +600,13 @@ sgl-eval run mmmu_pro \\
             "MORI_IO_SQ_BACKOFF_TIMEOUT_US=500000",
             "MORI_IO_QP_MAX_SEND_WR=32767",
           ],
+          envOverrides: [
+            { when: { hw: ["mi355x"], variant: ["pro", "pro-official"], quant: ["fp4"],
+                      strategy: ["high-throughput"] },
+              env: ["MORI_IO_QP_MAX_SEND_WR=32767", "MORI_IO_QP_MAX_CQE=32768"] },
+            { when: { hw: ["mi355x"], variant: ["pro", "pro-official"], quant: ["fp4"] },
+              env: [] },
+          ],
           envWhen: { hw: ["mi300x", "mi355x"] } },
         { id: "mooncake", label: "Mooncake",
           env: [
@@ -501,7 +629,9 @@ sgl-eval run mmmu_pro \\
         { id: "mlx5_7", label: "mlx5_7", hide: { hw: ["mi300x", "mi355x"] } },
         { id: "rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5",
           label: "rdma0-7 (all NICs)",
-          defaultWhen: { hw: ["mi355x"] },
+          // PD deployment recipes inherit Auto; the NIC list is an explicit
+          // Playground override. Legacy single-node bases retain their preset.
+          defaultWhen: { hw: ["mi355x"], nodes: ["single"] },
           hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000", "rtx5090", "dgx-spark"] } },
       ],
       // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
@@ -640,10 +770,8 @@ sgl-eval run mmmu_pro \\
           ] },
         // High-throughput on Pro Official is the DP-attention arm of the agentic
         // PD recipe. Both roles keep the base cell's TP8 / DP8 and add DSpark at
-        // gamma 3, as balanced does. The arm runs one shape from concurrency 192
-        // to 512; only admission and the decode graph ladder move with the point,
-        // and those live in the "Target Concurrency" select below. The ceiling
-        // here is the 256 point, so an untouched render keeps that sizing.
+        // gamma 3, as balanced does. The 256-concurrency preset uses a
+        // 512-request ceiling and decode graphs up to 64 per DP rank.
         //
         // The roles use DIFFERENT MoE parallelism, each matched to its work.
         // Prefill goes EP8 on Aiter MegaMoEv2 (sgl-project/sglang#35619): at a
@@ -671,23 +799,11 @@ sgl-eval run mmmu_pro \\
                   strategy: ["high-throughput"] },
           env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1",
                 "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
-                // Must cover the per-rank prefill chunk — SGLang divides
-                // --chunked-prefill-size by dp_size, 65536 / 8 here. Tokens past
-                // it silently fall back to fused MoE.
-                "SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192",
+                // Default MTPR 8192 covers the per-rank chunk: 65536 / 8.
                 "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
-                // MegaMoEv2 addresses its dispatch/combine buffers through MORI's
-                // symmetric heap. STATIC_HEAP is MORI's default and is emitted
-                // only to survive a harness that sets ISOLATION, which builds no
-                // heap at all — the InferenceX agentic recipe base does exactly
-                // that, so the MegaMoE role there has to set it back. The size is
-                // the part that has to be chosen: the heap is hipMalloc'd in full
-                // on the first MegaMoE forward, after the KV pool is sized, so
-                // every byte comes out of the headroom that
-                // --mem-fraction-static 0.92 leaves. MegaMoEv2 places ~0.51 GiB
-                // per 1024 MTPR in it, i.e. ~4.2 GiB at MTPR 8192; MORI's 4 GiB
-                // default overflows at graph capture.
-                "MORI_SHMEM_MODE=STATIC_HEAP",
+                // Static heap mode is the default. The 8 GiB size overrides
+                // MORI's 4 GiB default to fit MegaMoEv2's ~4.2 GiB buffers at
+                // MTPR 8192, within the headroom left by mem-fraction-static 0.92.
                 "MORI_SHMEM_HEAP_SIZE=8G",
                 "SGLANG_SHARED_EXPERT_TP1=0",
                 "SGLANG_DP_SHARED_EXPERT_LOCAL=0",
@@ -911,12 +1027,11 @@ sgl-eval run mmmu_pro \\
       // §3.9), reached over the socket in UMBP_STANDALONE_ADDRESS.
       roleOverrides: [
         { mode: "prefill",
-          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
+          when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"], nodes: ["single"],
                   strategy: ["low-latency", "balanced", "high-throughput"] },
           enable: true,
-          env: ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock"],
-          flags: ["--hicache-storage-backend-extra-config '{\"standalone_startup_timeout_ms\":120000}'"],
-          note: "Start the UMBP tier server on the prefill node first (cookbook §3.9): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock" },
+          env: ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp/standalone.grpc.sock"],
+          note: "Start the UMBP tier server on the prefill node first (cookbook §3.9): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp/standalone.grpc.sock" },
       ],
       defaultBackend: "mori",
       backends: [
@@ -956,49 +1071,6 @@ sgl-eval run mmmu_pro \\
           { id: "4", label: "4", flags: ["--speculative-dspark-block-size 4"] },
           { id: "5", label: "5", flags: ["--speculative-dspark-block-size 5"] },
           { id: "6", label: "6", flags: ["--speculative-dspark-block-size 6"] },
-        ],
-      },
-      // The MI355X Pro Official DP-attention PD arm (§3.8 high-throughput) runs
-      // ONE shape from concurrency 192 to 512. The point only moves two numbers,
-      // and both are derived rather than tuned: admission is 2x the target
-      // concurrency on both roles, and decode captures graphs up to admission /
-      // dp_size — 8 here, since --max-running-requests is server-wide and
-      // floor-divided by attn_dp_size. Sizing admission at N instead of 2N caps
-      // the served batch below the concurrency being aimed for, which is why the
-      // ladder tops out at a quarter of the label and not at the label itself.
-      //
-      // Emitted as a function of the live role: prefill has no decode ladder,
-      // and off the two PD roles the whole select is hidden and emits nothing.
-      {
-        id: "targetConcurrency",
-        title: "Target Concurrency",
-        showWhen: (base) =>
-          base.hw === "mi355x" && base.variant === "pro-official"
-          && base.quant === "fp4" && base.strategy === "high-throughput"
-          && (base.pdMode === "prefill" || base.pdMode === "decode"),
-        default: "c256",
-        stripPrefixes: ["--max-running-requests", "--cuda-graph-bs-decode"],
-        options: [
-          { id: "c192", label: "192",
-            flags: (v, b) => b.pdMode === "decode"
-              ? ["--max-running-requests 384",
-                 "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48"]
-              : ["--max-running-requests 384"] },
-          { id: "c256", label: "256",
-            flags: (v, b) => b.pdMode === "decode"
-              ? ["--max-running-requests 512",
-                 "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64"]
-              : ["--max-running-requests 512"] },
-          { id: "c384", label: "384",
-            flags: (v, b) => b.pdMode === "decode"
-              ? ["--max-running-requests 768",
-                 "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96"]
-              : ["--max-running-requests 768"] },
-          { id: "c512", label: "512",
-            flags: (v, b) => b.pdMode === "decode"
-              ? ["--max-running-requests 1024",
-                 "--cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128"]
-              : ["--max-running-requests 1024"] },
         ],
       },
     ],
@@ -2298,7 +2370,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2321,7 +2393,7 @@ sgl-eval run mmmu_pro \\
       // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2348,7 +2420,7 @@ sgl-eval run mmmu_pro \\
       // above (§3.8), not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -3042,6 +3114,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3067,6 +3140,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3100,6 +3174,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3135,6 +3210,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3174,6 +3250,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3209,6 +3286,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3246,6 +3324,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3279,6 +3358,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3318,6 +3398,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3355,6 +3436,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3389,6 +3471,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3428,6 +3511,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3465,6 +3549,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3498,6 +3583,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3537,6 +3623,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
+        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3948,5 +4035,20 @@ sgl-eval run mmmu_pro \\
         "--port {{PORT}}",
       ],
     },
+
+    // MI355X 1P1D: two independent workers, one node per role.
+    // resolveRecipe supplies the selected role and strategy preset above.
+    { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      pd: true, nnodes: 1, verified: false, env: [], flags: [] },
+    { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      pd: true, nnodes: 1, verified: false, env: [], flags: [] },
+    { match: { hw: "mi355x", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      pd: true, nnodes: 1, verified: false, env: [], flags: [] },
+    { match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
+      pd: true, nnodes: 1, verified: false, env: [], flags: [] },
+    { match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      pd: true, nnodes: 1, verified: false, env: [], flags: [] },
+    { match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      pd: true, nnodes: 1, verified: false, env: [], flags: [] },
   ],
 };
