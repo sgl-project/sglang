@@ -52,13 +52,30 @@ class TestCpuMonitorMultiprocess(CustomTestCase):
 import os
 import time
 
+from prometheus_client import REGISTRY
+
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 
+def cpu_total():
+    for metric in REGISTRY.collect():
+        for sample in metric.samples:
+            if (sample.name == "sglang:process_cpu_seconds_total"
+                    and sample.labels.get("component") == "tokenizer"):
+                return sample.value
+    return None
+
 start_cpu_monitor_thread("tokenizer", interval=0.01)
-deadline = time.monotonic() + 0.2
-while time.monotonic() < deadline:
+deadline = time.monotonic() + 10
+while cpu_total() is None:
+    assert time.monotonic() < deadline, "CPU monitor did not initialize"
+    time.sleep(0.01)
+target_cpu_time = time.process_time() + 0.1
+while time.process_time() < target_cpu_time:
     sum(i * i for i in range(1000))
-time.sleep(0.1)
+deadline = time.monotonic() + 10
+while cpu_total() <= 0:
+    assert time.monotonic() < deadline, "CPU monitor did not sample CPU usage"
+    time.sleep(0.01)
 print(os.getpid())
 """
         with tempfile.TemporaryDirectory() as directory:
