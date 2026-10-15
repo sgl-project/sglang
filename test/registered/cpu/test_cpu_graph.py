@@ -349,6 +349,50 @@ class TestCPUGraph(CustomTestCase):
         self.assertEqual(batch.extend_seq_lens.dtype, torch.int32)
         self.assertEqual(batch.extend_start_loc.dtype, torch.int32)
 
+    def test_dynamic_prefill_axes_use_configured_token_bound(self):
+        runner = CPUGraphRunner.__new__(CPUGraphRunner)
+        runner.prefill_max_bs = 4
+        runner.dynamic_prefill_max_tokens = 1024
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+            seq_lens=torch.zeros(2, dtype=torch.int64),
+            extend_seq_lens=torch.zeros(2, dtype=torch.int32),
+            extend_prefix_lens=torch.zeros(2, dtype=torch.int32),
+            extend_start_loc=torch.zeros(2, dtype=torch.int32),
+            input_ids=torch.zeros(512, dtype=torch.int64),
+            positions=torch.zeros(512, dtype=torch.int64),
+            out_cache_loc=torch.zeros(512, dtype=torch.int64),
+            mrope_positions=None,
+        )
+
+        with patch.object(cpu_graph_runner_module, "_mark_dynamic") as mark_dynamic:
+            runner._mark_dynamic_token_axis(forward_batch)
+
+        mark_dynamic.assert_called_once_with(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch.out_cache_loc,
+            max_value=1024,
+        )
+
+    def test_dynamic_decode_axes_use_request_pool_bound(self):
+        runner = CPUGraphRunner.__new__(CPUGraphRunner)
+        runner.dynamic_decode_max_bs = 8
+        forward_batch = SimpleNamespace(
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int64),
+            mrope_positions=torch.zeros(3, 4, dtype=torch.int64),
+        )
+
+        with patch.object(
+            cpu_graph_runner_module, "_mark_dynamic_axis"
+        ) as mark_dynamic_axis:
+            runner._mark_dynamic_decode_inputs(forward_batch)
+
+        self.assertEqual(mark_dynamic_axis.call_count, 3)
+        for call in mark_dynamic_axis.call_args_list:
+            self.assertEqual(call.kwargs, {"max_value": 8})
+
     def test_prefill_padding_trims_full_hidden_states(self):
         runner = _make_cpu_graph_runner()
         runner.capture_num_tokens = [8]

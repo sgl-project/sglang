@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_lora,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.utils import (
@@ -401,22 +402,32 @@ def capture_with_skip_cross_attention(skip: bool):
         _capture_skip_cross_attention = previous
 
 
-def _mark_dynamic(*tensors: Optional[torch.Tensor]) -> None:
+def _mark_dynamic(
+    *tensors: Optional[torch.Tensor], max_value: Optional[int] = None
+) -> None:
     """Mark dim 0 dynamic with a broad runtime-compatible range."""
+    dynamic_max = max_value or _DYNAMIC_DIM_MAX
     for t in tensors:
         if t is not None:
             if t.ndim > 0 and t.shape[0] == 1:
                 torch._dynamo.maybe_mark_dynamic(t, 0)
             else:
-                torch._dynamo.mark_dynamic(t, 0, min=1, max=_DYNAMIC_DIM_MAX)
+                torch._dynamo.mark_dynamic(
+                    t, 0, min=1, max=max(dynamic_max, int(t.shape[0]))
+                )
 
 
-def _mark_dynamic_axis(tensor: Optional[torch.Tensor], dim: int) -> None:
+def _mark_dynamic_axis(
+    tensor: Optional[torch.Tensor], dim: int, max_value: Optional[int] = None
+) -> None:
     if tensor is not None:
         if tensor.ndim > 0 and tensor.shape[dim] == 1:
             torch._dynamo.maybe_mark_dynamic(tensor, dim)
         else:
-            torch._dynamo.mark_dynamic(tensor, dim, min=1, max=_DYNAMIC_DIM_MAX)
+            dynamic_max = max_value or _DYNAMIC_DIM_MAX
+            torch._dynamo.mark_dynamic(
+                tensor, dim, min=1, max=max(dynamic_max, int(tensor.shape[dim]))
+            )
 
 
 if TYPE_CHECKING:
@@ -1081,6 +1092,7 @@ class CPUGraphRunner:
             # Batch sizes to capture
             self.capture_bs = get_batch_sizes_to_capture(model_runner)
             log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
+            self.dynamic_decode_max_bs = model_runner.req_to_token_pool.size
             # bs -> ForwardBatch (text-only / skip_cross_attention=True)
             self.captured_forward_batches = {}
             # bs -> ForwardBatch (cross-attention / skip=False, enc-dec only)
@@ -1194,6 +1206,13 @@ class CPUGraphRunner:
         self.prefill_dynamic_graph: Optional[Callable] = None
         self.prefill_dynamic_graph_bs1: Optional[Callable] = None
         self.prefill_dynamic_batch_template: Optional[ForwardBatch] = None
+        schedule = get_schedule()
+        configured_prefill_max_tokens = getattr(schedule, "max_prefill_tokens", None)
+        self.dynamic_prefill_max_tokens = max(
+            int(configured_prefill_max_tokens or 0),
+            self.capture_num_tokens[-1] if self.capture_num_tokens else 0,
+            1,
+        )
         if self.capture_num_tokens:
             self.prefill_max_num_tokens = self.capture_num_tokens[-1]
             self.prefill_max_bs = model_runner.req_to_token_pool.size
@@ -1457,7 +1476,7 @@ class CPUGraphRunner:
             if not isinstance(value, torch.Tensor) or value.ndim == 0:
                 continue
             dim = value.ndim - 1 if name == "mrope_positions" else 0
-            _mark_dynamic_axis(value, dim)
+            _mark_dynamic_axis(value, dim, max_value=self.dynamic_decode_max_bs)
 
     def _refresh_dynamic_forward_batch_metadata(
         self,
@@ -1839,6 +1858,7 @@ class CPUGraphRunner:
             forward_batch.extend_seq_lens,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_start_loc,
+            max_value=self.prefill_max_bs,
         )
 
     def _mark_dynamic_token_axis(self, forward_batch: ForwardBatch) -> None:
@@ -1846,8 +1866,13 @@ class CPUGraphRunner:
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch.out_cache_loc,
+            max_value=self.dynamic_prefill_max_tokens,
         )
-        _mark_dynamic_axis(forward_batch.mrope_positions, 1)
+        _mark_dynamic_axis(
+            forward_batch.mrope_positions,
+            1,
+            max_value=self.dynamic_prefill_max_tokens,
+        )
 
     def _mark_dynamic_prefill_metadata(self) -> None:
         backend = self.model_runner.attn_backend
@@ -1857,6 +1882,7 @@ class CPUGraphRunner:
                 _mark_dynamic(
                     getattr(metadata, "query_start_loc", None),
                     getattr(metadata, "mamba_cache_indices", None),
+                    max_value=self.prefill_max_bs + 1,
                 )
 
     # ------------------------------------------------------------------
