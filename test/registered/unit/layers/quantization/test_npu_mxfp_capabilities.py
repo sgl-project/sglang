@@ -443,8 +443,8 @@ class TestNPUMXFPCapabilities(unittest.TestCase):
             root
             / "docs/docs/hardware-platforms/ascend-npus/optimization/mxfp-capabilities.mdx"
         ).read_text()
-        table = doc.split("<!-- BEGIN ASCEND MXFP CAPABILITIES -->", 1)[1].split(
-            "<!-- END ASCEND MXFP CAPABILITIES -->", 1
+        table = doc.split("{/* BEGIN ASCEND MXFP CAPABILITIES */}", 1)[1].split(
+            "{/* END ASCEND MXFP CAPABILITIES */}", 1
         )[0]
         normalize = lambda s: re.sub(
             r"\s+", " ", re.sub(r"\s*<", "<", re.sub(r">\s*", ">", s))

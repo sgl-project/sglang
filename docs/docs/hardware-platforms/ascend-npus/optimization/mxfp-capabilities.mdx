@@ -31,7 +31,7 @@ document; update both when the loader or implementation changes.
 
 ## Inventory
 
-<!-- BEGIN ASCEND MXFP CAPABILITIES -->
+{/* BEGIN ASCEND MXFP CAPABILITIES */}
 <table>
 <thead><tr><th>Path</th><th>Implementation</th><th>Checkpoint / compute</th><th>Scale / local K</th><th>Requirements / limits</th><th>Hardware evidence</th></tr></thead>
 <tbody>
@@ -54,7 +54,7 @@ document; update both when the loader or implementation changes.
 <tr><td>diffusion/dense/W4A4_MXFP4_DUALSCALE/modelslim</td><td>blocked</td><td>packed uint8 [N,K/2]; W=float4_e2m1fn_x2, A=float4_e2m1fn_x2; FRACTAL_NZ weight (not transposed); L0 scale transposed</td><td>dual: L0 FLOAT32 / block=512, L1 UE8M0 / block=32; not single-level UE8M0; K % 2 = 0</td><td>Ascend 950 for dual-level MXFP4; ops=npu_dynamic_dual_level_mx_quant, npu_dual_level_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; Diffusion ModelSlim dual-scale constructor references undefined is_dual_scale_key on this baseline; fix that path before enabling it</td><td>Not validated on this revision</td></tr>
 </tbody>
 </table>
-<!-- END ASCEND MXFP CAPABILITIES -->
+{/* END ASCEND MXFP CAPABILITIES */}
 
 ## Preflight and format boundaries
 
