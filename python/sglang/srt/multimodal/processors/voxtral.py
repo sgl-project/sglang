@@ -72,6 +72,20 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         if not audio_data:
             return None
 
+        # The /v1/audio/transcriptions endpoint sends empty text, which the
+        # tokenizer manager turns into empty input_ids (a list) rather than an
+        # empty string when a multimodal processor is attached -- normalize
+        # before the str-only helpers below.
+        if isinstance(input_text, list):
+            tokenizer = getattr(self._processor, "tokenizer", self._processor)
+            input_text = tokenizer.decode(input_text) if input_text else ""
+        # An empty prompt renders as a content-less [INST][/INST] user turn,
+        # which gives Voxtral no instruction for what to do with the audio --
+        # it free-associates a plausible-sounding but unrelated response
+        # instead of transcribing. Default to an explicit ASR instruction.
+        if not input_text or not input_text.strip():
+            input_text = "Transcribe this audio."
+
         # Insert [AUDIO] placeholders into prompt for load_mm_data's regex
         prompt_with_placeholders = self._insert_audio_placeholders(
             input_text, len(audio_data)
@@ -163,10 +177,23 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         """
         messages = self._parse_mistral_prompt(input_text)
         try:
-            input_ids = tokenizer.apply_chat_template(messages, tokenize=True)
-        except (ValueError, KeyError):
-            # Fallback if prompt parsing produces malformed messages
+            input_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, return_dict=False
+            )
+        except (ValueError, KeyError, TypeError):
+            # Fallback if prompt parsing produces malformed messages, or this
+            # tokenizer's apply_chat_template doesn't accept return_dict.
             input_ids = tokenizer.encode(input_text)
+
+        # Mistral's tokenizer (mistral-common-backed) ignores return_dict and
+        # always returns a BatchEncoding; unwrap to the plain token id list
+        # expected below.
+        if isinstance(input_ids, dict):
+            input_ids = input_ids["input_ids"]
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if input_ids and isinstance(input_ids[0], list):
+            input_ids = input_ids[0]
 
         # Insert audio tokens after the last [INST]
         inst_positions = [i for i, t in enumerate(input_ids) if t == INST_TOKEN_ID]
