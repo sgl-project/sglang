@@ -4,6 +4,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders import (
+    qwen_image21 as qwen21_padder,
+)
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
     _CaptureEntry,
@@ -30,6 +33,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import _print_warning_onc
 
 
 class QwenImageTransformer2DModel(torch.nn.Module):
+    pass
+
+
+class QwenImage21Transformer2DModel(torch.nn.Module):
     pass
 
 
@@ -202,6 +209,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
     def setUp(self):
         self.stage = DenoisingStage.__new__(DenoisingStage)
         self.qwen_model = QwenImageTransformer2DModel()
+        self.qwen21_model = QwenImage21Transformer2DModel()
         self.ideogram_model = Ideogram4Transformer2DModel()
         self.longcat_model = LongCatImageTransformer2DModel()
         self.minimax_h3_model = MiniMaxH3DiTModel()
@@ -231,6 +239,10 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 torch.zeros(4096, 128, dtype=torch.float32),
                 torch.ones(seq_len, 128, dtype=torch.float32),
             ),
+            "freqs_complex": (
+                torch.zeros(4096, 64, dtype=torch.complex64),
+                torch.ones(seq_len, 64, dtype=torch.complex64),
+            ),
             "img_shapes": [[(1, 64, 64)]],
         }
 
@@ -251,8 +263,14 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertTrue(longer["encoder_hidden_states_mask"][0, :47].all())
         self.assertFalse(longer["encoder_hidden_states_mask"][0, 47:].any())
         self.assertEqual(short["freqs_cis"][1].shape, (256, 128))
-        self.assertEqual(short["txt_seq_lens"], [256])
-        self.assertEqual(longer["txt_seq_lens"], [256])
+        # the complex RoPE cache must follow the bucket too, or every prompt
+        # length misses the captured graph
+        self.assertEqual(short["freqs_complex"][1].shape, (256, 64))
+        self.assertFalse(short["freqs_complex"][1][19:].any())
+        # a bucketed length would tell a missed graph's eager forward to attend
+        # the pad rows; the mask alone marks the valid text
+        self.assertIsNone(short["txt_seq_lens"])
+        self.assertIsNone(longer["txt_seq_lens"])
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
     def test_qwen_prompt_content_changes_do_not_change_signature(self):
@@ -276,6 +294,88 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(_attn_mask_meta_local_pad(None), 0)
         self.assertEqual(_attn_mask_meta_local_pad({"local_pad": 7}), 7)
         self.assertEqual(_attn_mask_meta_local_pad(DynamicVarlenMaskMeta()), 0)
+
+    def _qwen21_kwargs(self, prefix_len: int, *, num_layers: int = 2):
+        torch.manual_seed(prefix_len)
+        return {
+            "hidden_states": torch.zeros(1, 16, 4),
+            "timestep": torch.zeros(1),
+            "encoder_hidden_states": [torch.ones(1, prefix_len, 8)],
+            "encoder_hidden_states_mask": [torch.ones(1, prefix_len, dtype=torch.bool)],
+            "condition_latents": None,
+            "layouts": [
+                {
+                    "encoder_seq_len": prefix_len,
+                    "text_indices": torch.arange(prefix_len),
+                    "image_indices": torch.zeros(0, dtype=torch.long),
+                    "prefix_rope": torch.ones(prefix_len, 4, dtype=torch.complex64),
+                    "target_rope": torch.ones(16, 4, dtype=torch.complex64),
+                    "segments": ((0, prefix_len, False),),
+                }
+            ],
+            "prefix_caches": [
+                [
+                    {
+                        "key": torch.randn(1, prefix_len, 2, 8),
+                        "value": torch.randn(1, prefix_len, 2, 8),
+                    }
+                    for _ in range(num_layers)
+                ]
+            ],
+        }
+
+    def _qwen21_pad(self, kwargs, *, sp_world_size: int = 1):
+        with patch.object(
+            qwen21_padder, "get_sp_world_size", return_value=sp_world_size
+        ):
+            return self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.qwen21_model
+            )
+
+    def test_qwen21_prefix_lengths_share_bucket_signature(self):
+        with self._patch_buckets(16, 32):
+            short_kwargs, long_kwargs = self._qwen21_kwargs(5), self._qwen21_kwargs(13)
+            short = self._qwen21_pad(short_kwargs)
+            longer = self._qwen21_pad(long_kwargs)
+
+        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+        for out, kwargs, prefix_len in (
+            (short, short_kwargs, 5),
+            (longer, long_kwargs, 13),
+        ):
+            self.assertEqual(out["prefix_pad"].item(), 16 - prefix_len)
+            self.assertIsNone(out["prefix_caches"])
+            # layer-major [key, value] pairs, left-padded so the real rows stay
+            # contiguous ahead of the target rows
+            prefix_kv = out["prefix_kv"].unflatten(0, (-1, 2))
+            self.assertEqual(prefix_kv.shape, (2, 2, 1, 16, 2, 8))
+            self.assertFalse(prefix_kv[:, :, :, : 16 - prefix_len].any())
+            for pair, original in zip(
+                prefix_kv, kwargs["prefix_caches"][0], strict=True
+            ):
+                for padded, name in zip(pair, ("key", "value"), strict=True):
+                    self.assertTrue(
+                        torch.equal(padded[:, 16 - prefix_len :], original[name])
+                    )
+            # cached steps never read the prompt, prefix RoPE or causal segments
+            self.assertIsNone(out["encoder_hidden_states"])
+            self.assertIsNone(out["encoder_hidden_states_mask"])
+            self.assertEqual(list(out["layouts"][0]), ["target_rope"])
+            self.assertIs(
+                out["layouts"][0]["target_rope"], kwargs["layouts"][0]["target_rope"]
+            )
+            self.assertEqual(kwargs["prefix_caches"][0][0]["key"].shape[1], prefix_len)
+
+    def test_qwen21_calls_without_a_replayable_prefix_are_not_padded(self):
+        prefill = self._qwen21_kwargs(5)
+        prefill["prefix_caches"] = [[{}, {}]]
+        batched = self._qwen21_kwargs(5)
+        batched["prefix_caches"] = batched["prefix_caches"] * 2
+        with self._patch_buckets(16, 32):
+            for kwargs in (prefill, batched, self._qwen21_kwargs(33)):
+                self.assertIs(self._qwen21_pad(kwargs), kwargs)
+            kwargs = self._qwen21_kwargs(5)
+            self.assertIs(self._qwen21_pad(kwargs, sp_world_size=2), kwargs)
 
     def test_longcat_keeps_its_fixed_512_token_prompt_shape(self):
         kwargs = {
@@ -331,8 +431,8 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
 
         self.assertEqual(first["encoder_hidden_states"][0].shape[1], 64)
-        self.assertEqual(first["txt_seq_lens"], [64])
-        self.assertEqual(second["txt_seq_lens"], [64])
+        self.assertIsNone(first["txt_seq_lens"])
+        self.assertIsNone(second["txt_seq_lens"])
         self.assertTrue(first["encoder_hidden_states_mask"][0, :19].all())
         self.assertFalse(first["encoder_hidden_states_mask"][0, 19:].any())
         self.assertTrue(second["encoder_hidden_states_mask"][0, :47].all())

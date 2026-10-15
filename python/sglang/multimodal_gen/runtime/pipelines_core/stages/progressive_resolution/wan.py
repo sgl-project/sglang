@@ -68,21 +68,6 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         )
 
     # ------------------------------------------------------------------
-    # Resolution-change hook  (no-op for Wan T2V)
-    # ------------------------------------------------------------------
-
-    def _on_resolution_change(
-        self,
-        ctx,
-        batch: Req,
-        server_args: ServerArgs,
-        new_h_pixel: int,
-        new_w_pixel: int,
-    ) -> None:
-        """Wan T2V has no spatial positional embeddings that require updating."""
-        pass
-
-    # ------------------------------------------------------------------
     # Resolution alignment  (Wan patch embedding requires even spatial dims)
     # ------------------------------------------------------------------
 

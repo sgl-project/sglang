@@ -248,6 +248,14 @@ def _get_response_resize(
     return f"{width}x{height}"
 
 
+def _build_request_sampling_params(request_id: str, **kwargs):
+    # Request validation errors are client errors, as in the video API.
+    try:
+        return build_sampling_params(request_id, **kwargs)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
@@ -266,7 +274,7 @@ async def generations(
     )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
-        sampling = build_sampling_params(
+        sampling = _build_request_sampling_params(
             request_id,
             prompt=prompt,
             task_type=request.task_type,
@@ -302,6 +310,9 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
+            profile=request.profile,
+            num_profiled_timesteps=request.num_profiled_timesteps,
+            profile_all_stages=request.profile_all_stages,
             progressive_mode=request_field_value(request, "progressive_mode"),
             progressive_levels=request_field_value(request, "progressive_levels"),
             progressive_delta=request_field_value(request, "progressive_delta"),
@@ -410,6 +421,9 @@ async def edits(
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
     perf_dump_path: Optional[str] = Form(None),
+    profile: Optional[bool] = Form(False),
+    num_profiled_timesteps: Optional[int] = Form(None),
+    profile_all_stages: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
@@ -459,7 +473,7 @@ async def edits(
             task="image_edit",
             image_paths=input_paths,
         )
-        sampling = build_sampling_params(
+        sampling = _build_request_sampling_params(
             request_id,
             prompt=prompt,
             task_type=task_type,
@@ -484,6 +498,9 @@ async def edits(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
             perf_dump_path=perf_dump_path,
+            profile=profile,
+            num_profiled_timesteps=num_profiled_timesteps,
+            profile_all_stages=profile_all_stages,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

@@ -264,20 +264,34 @@ class Glm4DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        attn, ffn = self.stage_facts(
+            config,
+            layer_id,
+            post_self_attn_layernorm=self.post_self_attn_layernorm,
+            post_mlp_layernorm=self.post_mlp_layernorm,
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (
-                declare_attn(
-                    output_transform=OutputTransform(self.post_self_attn_layernorm)
-                ),
-                self.input_layernorm,
-            ),
-            (
-                declare_ffn(
-                    sparse=False,
-                    next_layer_sparse=False,
-                    output_transform=OutputTransform(self.post_mlp_layernorm),
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(
+        config: Glm4Config,
+        layer_id: int,
+        *,
+        post_self_attn_layernorm=None,
+        post_mlp_layernorm=None,
+    ):
+        """The stages a GLM-4 layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers). Its output norms are the output transforms."""
+        return (
+            declare_attn(output_transform=OutputTransform(post_self_attn_layernorm)),
+            declare_ffn(
+                sparse=False,
+                next_layer_sparse=False,
+                output_transform=OutputTransform(post_mlp_layernorm),
             ),
         )
 
@@ -344,6 +358,7 @@ class Glm4Model(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

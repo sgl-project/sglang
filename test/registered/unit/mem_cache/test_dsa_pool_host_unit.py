@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.pool_host.dsa import (
     make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -36,6 +37,9 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             self.skipTest("DSA host transfer tests only support CUDA/ROCm.")
         if not (is_cuda() or is_hip()):
             self.skipTest("CUDA/ROCm not available.")
+        cm = get_parallel().override(attn_dcp_size=1)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
 
     @staticmethod
     def _token_indices_for_pages(pages: torch.Tensor, page_size: int, device: str):

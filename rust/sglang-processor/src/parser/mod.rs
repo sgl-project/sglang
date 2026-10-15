@@ -9,7 +9,7 @@
 use std::pin::Pin;
 
 use dynamo_parsers::ToolDefinition;
-use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
+use dynamo_parsers::tool_calling::jail::Annotated;
 use dynamo_protocols::types::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::ProcessorError;
+use crate::think::ReasoningOptions;
 
 mod reasoning;
 mod tools;
@@ -27,7 +28,7 @@ mod tools;
 pub use self::reasoning::{ReasoningStreamSplitter, split_reasoning};
 pub use self::tools::{
     ToolConstraint, chat_tool_definitions, dynamo_tool_choice, dynamo_tool_parser_name,
-    tool_constraint,
+    parse_tool_calls, tool_call_stream, tool_constraint,
 };
 use self::tools::{post_tool_terminal_markers, tool_call_delta};
 
@@ -118,7 +119,10 @@ impl ChatResponseProcessor {
             parallel_tool_calls,
             choices: (0..choice_count)
                 .map(|_| ChoiceResponseProcessor {
-                    reasoning: ReasoningStreamSplitter::new(reasoning_parser.as_deref(), None),
+                    reasoning: ReasoningStreamSplitter::new(
+                        reasoning_parser.as_deref(),
+                        ReasoningOptions::default(),
+                    ),
                 })
                 .collect(),
         }
@@ -126,7 +130,7 @@ impl ChatResponseProcessor {
 
     pub fn with_reasoning_state(mut self, reasoning_state: Option<bool>) -> Self {
         for choice in &mut self.choices {
-            choice.reasoning.initial_reasoning = reasoning_state;
+            choice.reasoning.options.force_reasoning = reasoning_state;
         }
         self
     }
@@ -261,20 +265,22 @@ impl ChatResponseProcessor {
         let parsed: Pin<
             Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
         > = if let Some(parser) = self.tool_parser {
-            Box::pin(apply_tool_calling_jail(
-                Some(dynamo_tool_parser_name(&parser).to_owned()),
+            tool_call_stream(
+                &parser,
                 self.tool_choice,
                 self.tools,
                 self.uses_tool_call_structural_tag,
                 raw,
-            ))
+            )
         } else {
             Box::pin(raw)
         };
         let parallel_tool_calls = self.parallel_tool_calls;
 
         Box::pin(async_stream::stream! {
-            let mut tool_calls_seen = vec![false; count];
+            // Each choice's first tool call; with `parallel_tool_calls=false` only its
+            // deltas pass, which detectors may split into a name and argument fragments.
+            let mut first_tool_call: Vec<Option<u32>> = vec![None; count];
             futures::pin_mut!(parsed);
             while let Some(mut item) = parsed.next().await {
                 if let Some(response) = item.data.take() {
@@ -289,27 +295,24 @@ impl ChatResponseProcessor {
                     }
                     for choice in response.choices {
                         let index = choice.index as usize;
-                        let had_tool_calls = tool_calls_seen.get(index).copied().unwrap_or(false);
+                        let first = first_tool_call.get(index).copied().flatten();
+                        let had_tool_calls = first.is_some();
                         let mut tool_calls = choice.delta.tool_calls.map(|calls| {
                             calls.into_iter().map(tool_call_delta).collect::<Vec<_>>()
                         });
                         if !parallel_tool_calls
                             && let Some(calls) = tool_calls.as_mut()
                         {
-                            if had_tool_calls {
-                                calls.clear();
-                            } else {
-                                calls.truncate(1);
-                            }
+                            let first = first.or(calls.first().map(|call| call.index));
+                            calls.retain(|call| Some(call.index) == first);
                             if calls.is_empty() {
                                 tool_calls = None;
                             }
                         }
-                        let emitted_tool_calls = tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
-                        if emitted_tool_calls
-                            && let Some(seen) = tool_calls_seen.get_mut(index)
+                        if let Some(call) = tool_calls.as_ref().and_then(|calls| calls.first())
+                            && let Some(seen) = first_tool_call.get_mut(index)
                         {
-                            *seen = true;
+                            seen.get_or_insert(call.index);
                         }
                         let mut content = match choice.delta.content {
                             Some(ChatCompletionMessageContent::Text(text)) => Some(text),
@@ -469,6 +472,48 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_parses_as_sglang_does() {
+        let output = "plan</think>Sure.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n\
+            <｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let events = futures::executor::block_on(
+            processor(Some("deepseekv4"), Some("deepseek-v4"), 1)
+                .with_reasoning_state(Some(true))
+                .process_stream(stream::iter(vec![chunk(0, output, true)]))
+                .collect::<Vec<_>>(),
+        );
+        let (mut reasoning, mut content, mut calls, mut finish) =
+            (String::new(), String::new(), vec![], None);
+        for event in events {
+            if let Ok(ChatEvent::Delta {
+                reasoning_content,
+                content: text,
+                tool_calls,
+                finish_reason,
+                ..
+            }) = event
+            {
+                reasoning += reasoning_content.as_deref().unwrap_or_default();
+                content += text.as_deref().unwrap_or_default();
+                calls.extend(
+                    tool_calls
+                        .into_iter()
+                        .flatten()
+                        .map(|c| (c.name, c.arguments)),
+                );
+                finish = finish_reason.or(finish);
+            }
+        }
+        assert_eq!((reasoning.as_str(), content.as_str()), ("plan", "Sure."));
+        let call = (
+            Some("get_weather".into()),
+            Some(r#"{"city": "Paris"}"#.into()),
+        );
+        assert_eq!(calls, vec![call]);
+        assert_eq!(finish, Some(ChatFinishReason::ToolCalls));
+    }
+
+    #[test]
     fn streaming_processor_emits_semantics_without_wire_metadata() {
         let events = futures::executor::block_on(
             processor(None, Some("deepseek-r1"), 1)
@@ -530,6 +575,60 @@ mod tests {
             _ => None,
         });
         assert_eq!(roles.collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    /// Without parallel tool calls, the first call keeps every fragment a
+    /// detector streams it in (Qwen3-Coder: the name, then arguments).
+    #[test]
+    fn single_tool_call_keeps_its_argument_fragments() {
+        let tools = vec![ToolDefinition {
+            name: "f".into(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+            })),
+            strict: None,
+        }];
+        let call = |x: u8| {
+            format!(
+                "<tool_call>\n<function=f>\n<parameter=x>\n{x}\n</parameter>\n</function>\n</tool_call>"
+            )
+        };
+        let events = futures::executor::block_on(
+            ChatResponseProcessor::new(
+                Some("qwen3_coder".into()),
+                None,
+                Some(tools),
+                Some(ChatCompletionToolChoiceOption::Auto),
+                false,
+                false,
+                1,
+            )
+            .process_stream(stream::iter(vec![chunk(
+                0,
+                &format!("{}\n{}", call(42), call(7)),
+                true,
+            )]))
+            .collect::<Vec<_>>(),
+        );
+        let calls: Vec<ChatToolCallDelta> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    tool_calls: Some(calls),
+                    ..
+                }) => Some(calls.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(calls.iter().all(|call| call.index == 0), "{calls:?}");
+        assert_eq!(calls[0].name.as_deref(), Some("f"));
+        let arguments: String = calls
+            .iter()
+            .filter_map(|call| call.arguments.as_deref())
+            .collect();
+        assert_eq!(arguments, r#"{"x": 42}"#);
     }
 
     #[test]

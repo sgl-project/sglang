@@ -523,7 +523,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         )
         self.local_heads = divide(self.heads, self.tp_size)
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
 
         self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
         self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
@@ -1197,6 +1196,11 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
+    _compile_conditions = [
+        lambda name, module: isinstance(
+            module, (FluxTransformerBlock, FluxSingleTransformerBlock)
+        )
+    ]
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
     @classmethod
