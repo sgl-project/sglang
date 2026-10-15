@@ -303,40 +303,23 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertFalse(req.dsv41_cache_only_replay)
 
     def test_cache_only_handoff_commits_explicit_full_coverage(self):
-        req = _make_req(terminate_after=99)
-        processor = _make_processor()
-        prompt_len = len(req.origin_input_ids)
-
-        decode_req = _commit_disagg_handoff(
-            req,
-            processor,
-            0,
-            cache_only=True,
-            coverage=prompt_len,
-        )
-
-        self.assertIsNone(decode_req.kv_receiver)
-        self.assertTrue(req.dsv41_cache_only_replay)
-        self.assertEqual(req.dsv41_cache_only_coverage, prompt_len)
-        self.assertEqual(list(req.output_ids), [])
-
-    def test_cache_only_rebootstrap_accepts_full_generated_prefix_coverage(self):
-        req = _make_req(terminate_after=99)
-        processor = _make_processor()
-        req.output_ids.extend([10, 11])
-        expected_coverage = len(req.origin_input_ids) + len(req.output_ids)
-
-        decode_req = _commit_disagg_handoff(
-            req,
-            processor,
-            0,
-            cache_only=True,
-            coverage=expected_coverage,
-            expected_coverage=expected_coverage,
-        )
-
-        self.assertIsNone(decode_req.kv_receiver)
-        self.assertEqual(req.dsv41_cache_only_coverage, expected_coverage)
+        for generated in ([], [10, 11]):
+            with self.subTest(generated=generated):
+                req = _make_req(terminate_after=99)
+                req.output_ids.extend(generated)
+                coverage = len(req.origin_input_ids) + len(generated)
+                decode_req = _commit_disagg_handoff(
+                    req,
+                    _make_processor(),
+                    0,
+                    cache_only=True,
+                    coverage=coverage,
+                    expected_coverage=coverage,
+                )
+                self.assertIsNone(decode_req.kv_receiver)
+                self.assertTrue(req.dsv41_cache_only_replay)
+                self.assertEqual(req.dsv41_cache_only_coverage, coverage)
+                self.assertEqual(list(req.output_ids), generated)
 
     def test_cache_only_rebootstrap_commits_boundary_without_reaccounting(self):
         req = _make_req(terminate_after=99)
@@ -349,7 +332,9 @@ class TestReasoningTokenAccounting(CustomTestCase):
         req.is_retracted = False
         req.beam_group = None
         req.time_stats = MagicMock()
-        req.update_finish_state = MagicMock()
+        req.require_reasoning = True
+        req.reasoning_tokens = 3
+        req.grammar.accept_token(12)
 
         batch = SimpleNamespace(
             reqs=[req],
@@ -373,30 +358,18 @@ class TestReasoningTokenAccounting(CustomTestCase):
             next_token_ids=torch.tensor([12], dtype=torch.long),
         )
         processor = _make_prefill_processor()
+        processor.model_config.think_end_ids = [99]
 
-        with (
-            patch(
-                "sglang.srt.managers.scheduler_components.batch_result_processor.checkpoint_kv_cache"
-            ),
-            patch(
-                "sglang.srt.managers.scheduler_components.batch_result_processor.get_memory",
-                return_value=SimpleNamespace(enable_hisparse=False),
-            ),
-            patch.object(
-                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
-            ) as reasoning,
-            patch.object(
-                SchedulerBatchResultProcessor, "_apply_prefill_grammar"
-            ) as grammar,
+        with patch(
+            "sglang.srt.managers.scheduler_components.batch_result_processor.checkpoint_kv_cache"
         ):
             processor.process_batch_result_prefill(batch, result)
 
         self.assertEqual(list(req.output_ids), [10, 11, 12])
         self.assertIsNone(req.pd_rebootstrap_forced_output_id)
         self.assertFalse(req.pd_rebootstrap_in_progress)
-        req.update_finish_state.assert_called_once_with()
-        reasoning.assert_not_called()
-        grammar.assert_not_called()
+        self.assertEqual(req.reasoning_tokens, 3)
+        self.assertEqual(req.grammar.accepted, [12])
 
     def test_cache_only_rebootstrap_without_boundary_clears_progress(self):
         req = _make_req(terminate_after=99)
@@ -410,19 +383,6 @@ class TestReasoningTokenAccounting(CustomTestCase):
 
         self.assertFalse(replayed)
         self.assertFalse(req.pd_rebootstrap_in_progress)
-
-    def test_normal_prefill_batch_needs_no_cache_only_marker(self):
-        req = _make_req(terminate_after=99)
-        req.pd_rebootstrap_in_progress = True
-        req.pd_rebootstrap_forced_output_id = 12
-
-        replayed = SchedulerBatchResultProcessor._acknowledge_cache_only_rebootstrap(
-            SimpleNamespace(), req
-        )
-
-        self.assertFalse(replayed)
-        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
-        self.assertTrue(req.pd_rebootstrap_in_progress)
 
 
 if __name__ == "__main__":

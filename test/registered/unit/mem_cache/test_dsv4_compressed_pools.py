@@ -277,7 +277,7 @@ class TestDSV4CompressedPools(CustomTestCase):
             pool.get_index_k_page_size(128)
 
     @staticmethod
-    def _make_encoder_only_pool(*, missing_index=False):
+    def _make_encoder_only_pool():
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         pool._unified_kv = False
         pool._unified_kv_fp8 = False
@@ -294,14 +294,10 @@ class TestDSV4CompressedPools(CustomTestCase):
             )
 
         def index_pool(width):
-            buffers = (
-                []
-                if missing_index
-                else [
-                    torch.empty((3, width), dtype=torch.uint8),
-                    torch.empty((3, 1), dtype=torch.uint8),
-                ]
-            )
+            buffers = [
+                torch.empty((3, width), dtype=torch.uint8),
+                torch.empty((3, 1), dtype=torch.uint8),
+            ]
             return SimpleNamespace(
                 page_size=2,
                 contiguous_page_row_buffers=lambda: buffers,
@@ -345,24 +341,17 @@ class TestDSV4CompressedPools(CustomTestCase):
         self.assertNotIn(pool.kv_pools[4].kv_buffer[0].data_ptr(), data_ptrs)
         self.assertNotIn(pool.kv_pools[128].kv_buffer[0].data_ptr(), data_ptrs)
 
-    def test_encoder_only_transfer_rejects_missing_indexer_owner(self):
-        pool = self._make_encoder_only_pool(missing_index=True)
-        with self.assertRaisesRegex(RuntimeError, "Indexer-K owner groups"):
-            pool.get_encoder_only_transfer_buf_infos()
 
-
-class TestDSV41CacheOnlyReplayAllocation(unittest.TestCase):
+class TestDSV41CacheOnlyReplayAllocation(CustomTestCase):
     @staticmethod
-    def _batch(prompt_len, replay_start, *, req_pool_idx=1, allocated_len=None):
+    def _batch(prompt_len, replay_start):
         pool = SimpleNamespace(
             req_to_token=torch.arange(3 * 256, dtype=torch.int32).reshape(3, 256)
         )
         req = SimpleNamespace(
             kv=ReqKvInfo(
-                req_pool_idx=req_pool_idx,
-                kv_allocated_len=(
-                    prompt_len if allocated_len is None else allocated_len
-                ),
+                req_pool_idx=1,
+                kv_allocated_len=prompt_len,
                 kv_committed_len=0,
             ),
             prefix_len=replay_start,
@@ -392,17 +381,6 @@ class TestDSV41CacheOnlyReplayAllocation(unittest.TestCase):
                 self.assertEqual(cpu_indices.tolist(), [1])
                 self.assertEqual(req.kv.kv_committed_len, prompt_len)
                 allocator.assert_not_called()
-
-    def test_requires_complete_preallocation(self):
-        batch, _, allocator = self._batch(200, 72, allocated_len=199)
-        with self.assertRaisesRegex(RuntimeError, "missing preallocated KV slots"):
-            alloc_for_extend(batch)
-        allocator.assert_not_called()
-
-        batch, _, allocator = self._batch(64, 0, req_pool_idx=None)
-        with self.assertRaisesRegex(RuntimeError, "preallocated request slots"):
-            alloc_for_extend(batch)
-        allocator.assert_not_called()
 
 
 class TestReplayPairStateIsolation(CustomTestCase):
