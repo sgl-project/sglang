@@ -285,7 +285,7 @@ def test_spawned_workers_do_not_reexecute_launcher_main(monkeypatch) -> None:
 
 def _h3_runtime_that_must_not_start() -> SGLDiffusionGenerator:
     runtime = SGLDiffusionGenerator()
-    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3")
+    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3", 0)
     runtime.init_generator = Mock(side_effect=AssertionError("worker must not start"))
     return runtime
 
