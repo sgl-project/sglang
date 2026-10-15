@@ -67,3 +67,34 @@ def vocab_argmax_select(
     _module(next_embeds.shape[-1], blocks, world).select(
         gathered, topk_index, topk_p, draft_tokens, positions, next_embeds, draft_column
     )
+
+
+@cache_once
+def _lm_head_module(hidden: int, rows: int, stages: int, ctas_per_sm: int) -> Module:
+    args = make_cpp_args(hidden, rows, stages, ctas_per_sm, is_arch_support_pdl())
+    return load_jit(
+        "lm_head_argmax",
+        *args,
+        cuda_files=["speculative/draft_vocab_argmax.cuh"],
+        cuda_wrappers=[("run", f"LmHeadArgmax<{args}>::run")],
+    )
+
+
+def lm_head_argmax_pack(
+    x: torch.Tensor,
+    lm_head_w: torch.Tensor,
+    embed: torch.Tensor,
+    payload: torch.Tensor,
+    part_val: torch.Tensor,
+    part_idx: torch.Tensor,
+    counter: torch.Tensor,
+    vocab_start: int,
+    stages: int = 3,
+    rows: int = 8,
+    ctas_per_sm: int = 1,
+) -> None:
+    """Shard lm_head GEMV of x [1, H] fused with the argmax and candidate pack
+    (same payload as ``vocab_argmax_pack``); part buffers sized >= SM count."""
+    _lm_head_module(x.shape[-1], rows, stages, ctas_per_sm).run(
+        x, lm_head_w, embed, payload, part_val, part_idx, counter, vocab_start
+    )

@@ -873,7 +873,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             raise RuntimeError("Qwen deferred finalize does not support M=0")
 
         draft_moe = self._single_token_draft_moe
-        if draft_moe is not None and draft_moe.active and num_tokens == 1:
+        if (
+            draft_moe is not None
+            and draft_moe.active
+            and 0 < num_tokens <= draft_moe.MAX_TOKENS
+        ):
             if not defer_finalize and not self.reduce_results:
                 out = draft_moe.forward(self, hidden_states)
                 if out is not None:

@@ -13,6 +13,8 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/mbarrier.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -201,6 +203,241 @@ __global__ void __launch_bounds__(kThreads)
     p.positions[0] = p.positions[0] + 1;
   }
 }
+
+namespace vocab_argmax {
+
+SGL_DEVICE void bulk_g2s(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+          device::ptx::to_shared(smem_dst)),
+      "l"(gmem_src),
+      "r"(bytes),
+      "r"(device::ptx::to_shared(bar))
+      : "memory");
+}
+
+}  // namespace vocab_argmax
+
+struct LmHeadArgmaxParams {
+  const bf16_t* x;                    // [H] lm_head input, written by an earlier grid
+  const bf16_t* __restrict__ w;       // [V_local, H] lm_head shard
+  const bf16_t* __restrict__ embed;   // [V_local, H] embedding shard
+  bf16_t* payload;                    // [H + 8]
+  float* part_val;                    // [grid]
+  int32_t* part_idx;                  // [grid]
+  uint32_t* counter;                  // [1], zero between launches
+  int32_t vocab;                      // V_local
+  int32_t vocab_start;
+};
+
+/**
+ * \brief lm_head GEMV fused with the shard argmax and the candidate pack.
+ * Persistent: one CTA per SM owns a contiguous row range; a producer warp streams
+ * kRows rows per stage into a shared-memory ring (bulk copies, issued before the
+ * PDL wait since the weights are static); each consumer warp reduces one row of
+ * a stage. Logits are rounded to bf16 before the argmax, as when they are stored.
+ */
+template <int kH, int kRows, int kStages, int kCtasPerSm, bool kUsePDL>
+__global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
+    lm_head_argmax_kernel(const LmHeadArgmaxParams __grid_constant__ p) {
+  using namespace device;
+  static_assert(kRows >= 1 && kRows <= 8, "one consumer warp per row");
+  constexpr int kRowBytes = kH * static_cast<int>(sizeof(bf16_t));
+  constexpr int kStageBytes = kRows * kRowBytes;
+  using cvec_t = AlignedVector<bf16_t, 8>;
+  constexpr int kChunks = kH / 8 / static_cast<int>(kWarpThreads);
+  static_assert(kH % (8 * kWarpThreads) == 0);
+
+  extern __shared__ __align__(128) uint8_t smem[];
+  __shared__ uint64_t full_bar[kStages];
+  __shared__ uint64_t empty_bar[kStages];
+  __shared__ float s_v[kRows];
+  __shared__ int32_t s_i[kRows];
+  __shared__ bool s_last;
+
+  const int warp = static_cast<int>(threadIdx.x / kWarpThreads);
+  const int lane = static_cast<int>(get_lane_id());
+  const int G = static_cast<int>(gridDim.x);
+  const int c = static_cast<int>(blockIdx.x);
+  const int base = p.vocab / G, rem = p.vocab % G;
+  const int r0 = c * base + min(c, rem);
+  const int nrows = base + (c < rem ? 1 : 0);
+  const int nstages = (nrows + kRows - 1) / kRows;
+
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int s = 0; s < kStages; ++s) {
+      ptx::mbar_init(&full_bar[s], 1);
+      ptx::mbar_init(&empty_bar[s], kRows);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+
+  if (warp == kRows) {
+    if (lane == 0) {
+      int stage = 0;
+      uint32_t phase = 0;
+      for (int t = 0; t < nstages; ++t) {
+        const int rows = min(kRows, nrows - t * kRows);
+        ptx::mbar_wait_parity(&empty_bar[stage], phase ^ 1);
+        ptx::mbar_arrive_expect_tx(&full_bar[stage], static_cast<uint32_t>(rows) * kRowBytes);
+        vocab_argmax::bulk_g2s(
+            smem + stage * kStageBytes,
+            p.w + static_cast<int64_t>(r0 + t * kRows) * kH,
+            static_cast<uint32_t>(rows) * kRowBytes,
+            &full_bar[stage]);
+        if (++stage == kStages) {
+          stage = 0;
+          phase ^= 1;
+        }
+      }
+      PDLWaitPrimary<kUsePDL>();
+    }
+  } else {
+    PDLWaitPrimary<kUsePDL>();
+    cvec_t xr[kChunks];
+#pragma unroll
+    for (int k = 0; k < kChunks; ++k) xr[k].load(p.x, k * kWarpThreads + lane);
+    float best = -1e30f;
+    int32_t bidx = 0x7fffffff;
+    int stage = 0;
+    uint32_t phase = 0;
+    for (int t = 0; t < nstages; ++t) {
+      ptx::mbar_wait_parity(&full_bar[stage], phase);
+      const int rows = min(kRows, nrows - t * kRows);
+      if (warp < rows) {
+        const auto* row = reinterpret_cast<const bf16_t*>(smem + stage * kStageBytes) + warp * kH;
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kChunks; ++k) {
+          cvec_t w;
+          w.load(row, k * kWarpThreads + lane);
+#pragma unroll
+          for (int j = 0; j < 8; ++j) acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xr[k][j]), acc);
+        }
+        acc = warp::reduce_sum(acc);
+        float f = cast<fp32_t>(cast<bf16_t>(acc));
+        f = f == f ? f : -1e30f;
+        const int32_t idx = r0 + t * kRows + warp;
+        if (vocab_argmax::better(f, idx, best, bidx)) {
+          best = f;
+          bidx = idx;
+        }
+      }
+      if (lane == 0) ptx::mbar_arrive(&empty_bar[stage]);
+      if (++stage == kStages) {
+        stage = 0;
+        phase ^= 1;
+      }
+    }
+    if (lane == 0) {
+      s_v[warp] = best;
+      s_i[warp] = bidx;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float v = s_v[0];
+    int32_t i = s_i[0];
+#pragma unroll
+    for (int w = 1; w < kRows; ++w) {
+      if (vocab_argmax::better(s_v[w], s_i[w], v, i)) {
+        v = s_v[w];
+        i = s_i[w];
+      }
+    }
+    p.part_val[c] = v;
+    p.part_idx[c] = i;
+    __threadfence();
+    s_last = atomicAdd(p.counter, 1u) == static_cast<uint32_t>(G) - 1;
+  }
+  __syncthreads();
+  PDLTriggerSecondary<kUsePDL>();
+  if (!s_last) return;
+  __threadfence();
+  if (warp != 0) return;
+  float v = -1e30f;
+  int32_t i = 0x7fffffff;
+  for (int b = lane; b < G; b += 32) {
+    const float bv = __ldcg(p.part_val + b);
+    const int32_t bi = __ldcg(p.part_idx + b);
+    if (vocab_argmax::better(bv, bi, v, i)) {
+      v = bv;
+      i = bi;
+    }
+  }
+  vocab_argmax::warp_argmax(v, i);
+  const auto* erow = reinterpret_cast<const uint4*>(p.embed + static_cast<int64_t>(i) * kH);
+  auto* dst = reinterpret_cast<uint4*>(p.payload);
+  for (int k = lane; k < kH / 8; k += 32) {
+    uint4 r = erow[k];
+    r.x = vocab_argmax::clear_negative_zero(r.x);
+    r.y = vocab_argmax::clear_negative_zero(r.y);
+    r.z = vocab_argmax::clear_negative_zero(r.z);
+    r.w = vocab_argmax::clear_negative_zero(r.w);
+    dst[k] = r;
+  }
+  if (lane == 0) {
+    auto* meta = reinterpret_cast<int32_t*>(p.payload + kH);
+    meta[0] = __float_as_int(v);
+    meta[1] = p.vocab_start + i;
+    meta[2] = 0;
+    meta[3] = 0;
+    *p.counter = 0u;
+  }
+}
+
+template <int kH, int kRows, int kStages, int kCtasPerSm, bool kUsePDL>
+struct LmHeadArgmax {
+  static void run(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView w,
+      const tvm::ffi::TensorView embed,
+      const tvm::ffi::TensorView payload,
+      const tvm::ffi::TensorView part_val,
+      const tvm::ffi::TensorView part_idx,
+      const tvm::ffi::TensorView counter,
+      int64_t vocab_start) {
+    using namespace host;
+    auto V = SymbolicSize{"vocab_local"};
+    auto G = SymbolicSize{"grid"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({1, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(x);
+    TensorMatcher({V, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(w).verify(embed);
+    TensorMatcher({1, kH + vocab_argmax::kMetaElems})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(payload);
+    TensorMatcher({G}).with_dtype<fp32_t>().with_device(device).verify(part_val);
+    TensorMatcher({G}).with_dtype<int32_t>().with_device(device).verify(part_idx);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(counter);
+    const DLDevice dev = device.unwrap();
+    const uint32_t grid = runtime::get_sm_count(dev.device_id) * kCtasPerSm;
+    CHECK_HOST(G.unwrap() >= grid) << "partial buffers smaller than the grid";
+    const auto params = LmHeadArgmaxParams{
+        .x = static_cast<const bf16_t*>(x.data_ptr()),
+        .w = static_cast<const bf16_t*>(w.data_ptr()),
+        .embed = static_cast<const bf16_t*>(embed.data_ptr()),
+        .payload = static_cast<bf16_t*>(payload.data_ptr()),
+        .part_val = static_cast<float*>(part_val.data_ptr()),
+        .part_idx = static_cast<int32_t*>(part_idx.data_ptr()),
+        .counter = static_cast<uint32_t*>(counter.data_ptr()),
+        .vocab = static_cast<int32_t>(V.unwrap()),
+        .vocab_start = static_cast<int32_t>(vocab_start),
+    };
+    constexpr std::size_t kSmem = static_cast<std::size_t>(kStages) * kRows * kH * sizeof(bf16_t);
+    auto kernel = lm_head_argmax_kernel<kH, kRows, kStages, kCtasPerSm, kUsePDL>;
+    static const bool attr_set = [&] {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+      return true;
+    }();
+    (void)attr_set;
+    LaunchKernel(grid, (kRows + 1) * 32, dev, kSmem).enable_pdl(kUsePDL)(kernel, params);
+  }
+};
 
 template <int kH, int kBlocks, int kWorld, bool kUsePDL>
 struct DraftVocabArgmax {
