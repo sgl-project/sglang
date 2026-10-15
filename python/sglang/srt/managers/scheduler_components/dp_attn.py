@@ -288,6 +288,7 @@ class MLPSyncBatchInfo:
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,
+                gather=all_gather_single,
             )
 
         tp_info = global_info_tensor.view(
