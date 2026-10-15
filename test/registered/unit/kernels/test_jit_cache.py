@@ -77,7 +77,7 @@ def test_musa_ninja_uses_the_musa_device_compiler(monkeypatch):
 
     build_file = ninja.generate(
         _spec(
-            cuda_files=("/tmp/fused_rope.cu",),
+            cuda_files=("fused_rope.cu",),
             cpp_wrappers=(),
             cuda_wrappers=(("run", "Kernel::run"),),
         )
