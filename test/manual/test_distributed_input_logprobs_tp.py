@@ -38,7 +38,7 @@ def check(vocab, dtype, chunk, topk):
     full = torch.randn((9, vocab), device="cuda", generator=generator).to(dtype).float()
     width = (vocab + world - 1) // world
     start, end = rank * width, min((rank + 1) * width, vocab)
-    local = torch.full((9, width), 1e4, device="cuda")
+    local = torch.full((9, width), 1e4, device="cuda", dtype=dtype)
     local[:, : end - start] = full[:, start:end]
     group = Group()
     samples = torch.tensor([3, 7, 8], device="cuda")
@@ -50,7 +50,7 @@ def check(vocab, dtype, chunk, topk):
         input_logprob_indices_cpu=list(range(8)),
         extend_return_top_logprob=topk,
         extend_token_ids_logprob=True,
-        top_logprobs_nums=[5, 0, 3] if topk else [0, 0, 0],
+        top_logprobs_nums=[topk, 0, 3] if topk else [0, 0, 0],
         extend_logprob_pruned_lens_cpu=[4, 4, 0],
         extend_input_logprob_token_ids_gpu=targets,
         token_ids_logprobs=probes,
@@ -86,6 +86,7 @@ def check(vocab, dtype, chunk, topk):
         distributed_context=context,
     )
     reference = full.log_softmax(-1)
+    assert sampled.dtype == torch.float32
     torch.testing.assert_close(
         result.token_logprobs, reference[inputs, targets], rtol=1e-5, atol=2e-6
     )
@@ -103,12 +104,12 @@ def check(vocab, dtype, chunk, topk):
         ids = torch.tensor(result.top_logprobs_idx[0], device="cuda")
         values = torch.tensor(result.top_logprobs_val[0], device="cuda")
         assert bool(((ids >= 0) & (ids < vocab)).all())
-        assert all(len(set(row)) == 5 for row in ids.tolist())
+        assert all(len(set(row)) == topk for row in ids.tolist())
         torch.testing.assert_close(
             values, reference[:4].gather(1, ids), rtol=1e-5, atol=2e-6
         )
         torch.testing.assert_close(
-            values, reference[:4].topk(5).values, rtol=1e-5, atol=2e-6
+            values, reference[:4].topk(topk).values, rtol=1e-5, atol=2e-6
         )
         assert result.top_logprobs_val[1:] == [[[]] * 4, []]
 
@@ -121,7 +122,7 @@ def main():
         for vocab in (131, 154881):
             for dtype in (torch.float32, torch.bfloat16):
                 for chunk in (1, 4, 32):
-                    for topk in (False, True):
+                    for topk in (0, 5, 20):
                         check(vocab, dtype, chunk, topk)
                         count += 1
         torch.cuda.synchronize()

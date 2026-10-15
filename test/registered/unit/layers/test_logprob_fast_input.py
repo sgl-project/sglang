@@ -10,6 +10,7 @@ top-k indices, across chunk splits and heterogeneous per-sequence params.
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -365,6 +366,44 @@ def _assert_tied_distributed_topk(test, full_logits, target_ids, result):
 
 
 class TestFastInputLogprobs(CustomTestCase):
+    def test_native_shard_precision_and_sampled_contract(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        source = torch.tensor([[0.3, -1.7, 3.1]], dtype=torch.bfloat16)
+        for cap in (None, 2.0):
+            fake = SimpleNamespace(
+                do_tensor_parallel_all_gather_dp_attn=False,
+                _compute_lm_head=lambda *_: source.clone(),
+                logit_scale=1.75,
+                final_logit_softcapping=cap,
+            )
+            with patch("sglang.srt.layers.logits_processor._is_cpu", True):
+                got = LogitsProcessor._get_local_logits_for_distributed_logprobs(
+                    fake, None, None, None
+                )
+            expected = source.clone().mul_(1.75).float()
+            if cap:
+                expected = cap * torch.tanh(expected / cap)
+                self.assertEqual(got.dtype, torch.float32)
+            else:
+                self.assertEqual(got.dtype, torch.bfloat16)
+            torch.testing.assert_close(got.float(), expected, rtol=0, atol=0)
+
+        def gather(value):
+            self.assertEqual(value.dtype, torch.float32)
+            return torch.cat((value, value), dim=-1)
+
+        fake = SimpleNamespace(
+            use_attn_tp_group=False, _logits_gatherer=gather, vocab_size=5
+        )
+        got = LogitsProcessor._gather_sampled_logits(fake, source)
+        torch.testing.assert_close(
+            got,
+            torch.cat((source.float(), source.float()), dim=-1)[:, :5],
+            rtol=0,
+            atol=0,
+        )
+
     def test_distributed_topk_rejects_over_vocab_k(self):
         with self.assertRaisesRegex(ValueError, "exceeds global vocabulary size"):
             get_distributed_topk(

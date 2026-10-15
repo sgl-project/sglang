@@ -976,7 +976,9 @@ class InputLogprobProcessor:
                 )
                 sampled_logits = torch.empty(
                     (sample_indices.shape[0], sampled_vocab_size),
-                    dtype=chunk_logits.dtype,
+                    dtype=torch.float32
+                    if use_distributed_logprobs
+                    else chunk_logits.dtype,
                     device=chunk_logits.device,
                 )
                 if borrow_logprob_memory:

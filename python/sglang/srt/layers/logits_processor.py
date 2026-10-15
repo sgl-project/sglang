@@ -1013,13 +1013,14 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
     ) -> torch.Tensor:
-        """Compute transformed fp32 rank-local logits without vocab gather."""
+        """Keep native logits; reductions upcast only values they consume."""
         assert not self.do_tensor_parallel_all_gather_dp_attn
         logits = self._compute_lm_head(hidden_states, lm_head)
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
-        logits = logits.float()
         if self.final_logit_softcapping:
+            # Preserve the reference FP32 softcap arithmetic.
+            logits = logits.float()
             if not (_is_npu or _is_cpu):
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
@@ -1030,6 +1031,7 @@ class LogitsProcessor(nn.Module):
 
     def _gather_sampled_logits(self, local_logits: torch.Tensor) -> torch.Tensor:
         """Preserve the sampler's full-vocab contract for sampled rows only."""
+        local_logits = local_logits.float()
         if self.use_attn_tp_group:
             logits = self._gather_attn_tp_logits(local_logits)
         else:
