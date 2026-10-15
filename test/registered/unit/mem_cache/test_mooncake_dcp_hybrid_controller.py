@@ -117,6 +117,7 @@ class _HybridCase:
         self.cc.storage_backend.register_mem_host_pool_v2(self.state, PoolName.MAMBA)
         self.cache = _cache(self.cc)
         self.cache.tree_core = SimpleNamespace(page_size=128)
+        self.cache.components = {}
         self.cache.storage_existence_cache = StorageExistenceCache()
         self.tokens = list(range(512))
         self.hashes = get_storage_hash_str(self.tokens, None, page_size=128)
