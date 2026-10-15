@@ -9,7 +9,7 @@ const hardware = [
   { id: "rtx6000pro", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
 ];
 const hardwareLabels = { rtx5090: "RTX 5090", rtx6000pro: "RTX PRO 6000", h100: "H100", h200: "H200", b200: "B200", b300: "B300", gb200: "GB200", gb300: "GB300" };
-// Matched eager/BCG HTTP runs: 1 MP, batch 1, resident, default quality.
+// Matched eager/BCG HTTP runs: 1 MP, batch 1, 80-token bucket, resident.
 const graphRuns = [
   { hw: "gb300", variant: "distilled", quant: "bf16", mode: "t2i", execution: "eager" },
   { hw: "gb300", variant: "distilled", quant: "nvfp4", mode: "t2i", execution: "bcg" },
@@ -44,6 +44,8 @@ const measuredProfiles = [
     .map((topology) => ({ hw: "h200", variant: "base", quant: "bf16",
       attention: "fa", mode: "t2i", gpus_per_node: 2, ...topology })),
   ...graphRuns.flatMap((recipe) => ["eager", "bcg"].map((execution) => ({ ...recipe, execution }))),
+  { hw: "rtx5090", variant: "base", quant: "bf16", mode: "t2i",
+    attention: "sdpa", quality: "lossless" },
 ].map((recipe, index) => ({
   id: `measured-${index}`, nodes: 1, gpus_per_node: 1,
   tp_size: 1, ulysses_degree: 1, ring_degree: 1,
@@ -290,8 +292,8 @@ return {
       }
       if (selected.execution === "bcg") {
         warnings.push(s.mode === "i2i"
-          ? "Warmup needs a server-local 1024x1024 reference. Other reference sizes/counts, batching or quality settings can fall back to eager."
-          : "Graph capture reserves extra memory. Different request shapes, batching or quality settings can fall back to eager.");
+          ? "Warmup needs a server-local 1024x1024 reference. Longer prompt buckets, other reference sizes/counts, batches or quality settings can fall back to eager."
+          : "Graph capture reserves extra memory and covers the 80-token text bucket. Longer prompts, different shapes, batches or quality settings can fall back to eager.");
       }
       if (s.hw === "rtx5090" && s.placement === "resident" && Number(s.batch_size) > 1) {
         warnings.push("Full-resolution batching needs additional activation memory. Use offload or batch 1 if the resident batch does not fit.");

@@ -36,8 +36,9 @@ measured recommendations.
 The picker defaults to resident weights for its 1 MP, batch-1 workload. Its
 recommended execution uses BCG only where a matched E2E comparison showed a
 material gain: currently single-GB300 distilled NVFP4 T2I. Other combinations
-start eager; changing precision never happens automatically. Recommendations
-are best among the tested settings, not an exhaustive optimum.
+start eager; this graph recipe covers the 80-token text bucket. Changing
+precision never happens automatically. Recommendations are best among the
+tested settings, not an exhaustive optimum.
 
 <Warning>
 Review the Black Forest Labs license before production or commercial use.
@@ -144,8 +145,9 @@ The picker generates `--warmup-resolutions 1024x1024` and matching
 `--warmup-sampling-params` for the selected quality. For editing it also sets
 `flux3_mode="i2i"` and a server-local reference path: mount a 1024x1024 image
 there before starting the server. This path can differ from the client's upload
-path. Other reference dimensions/counts, batches or quality settings may run
-eager instead; check for a serving-signature miss in the server log.
+path. Longer prompt token buckets, other reference dimensions/counts, batches
+or quality settings may run eager instead; check for a serving-signature miss
+in the server log.
 
 Changing the picker workload also changes its graph warmup command. Restart
 with that command to capture the new workload. Keep eager for variable-shape
