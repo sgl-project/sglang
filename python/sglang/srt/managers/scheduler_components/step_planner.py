@@ -457,10 +457,7 @@ class StepPlanner:
             chunked_req = adder.add_chunked_req(chunked_req)
 
         if get_lora().enable_lora:
-            # The adapters of the decoding requests and of the steps in flight
-            # (a request finished at the last commit may still run in one).
-            running_loras = {req.lora_id for req in self.core_lists.decoding}
-            running_loras.update(self.pending.lora_ids())
+            running_loras = self.request_registry.lora_ids_in_use()
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
@@ -968,7 +965,7 @@ class StepPlanner:
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.request_registry.queued_reqs())}, "
-                f"#running-req: {len(self.core_lists.decoding)}"
+                f"#running-req: {len(self.request_registry.running_reqs())}"
             )
             success = False
         return success

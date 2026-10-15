@@ -5,6 +5,8 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.scheduler_request_lists import make_request_registry
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -17,7 +19,7 @@ from unittest.mock import patch
 import prometheus_client
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.request_lists import CoreLists, RequestList
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     MetricsSink,
@@ -139,16 +141,21 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     )
     if hasattr(scheduler, "disaggregation_mode"):
         _set_disaggregation_mode(test, scheduler.disaggregation_mode)
+    mode_owners = ModeOwners()
+    if not hasattr(scheduler, "request_registry"):
+        scheduler.request_registry = make_request_registry(
+            core_lists=getattr(scheduler, "lists", None) or CoreLists(),
+            mode_owners=mode_owners,
+        )
     return SchedulerMetricsReporter(
         metrics_sink=metrics_sink,
-        request_registry=getattr(scheduler, "request_registry", None),
-        core_lists=getattr(scheduler, "lists", None),
+        request_registry=scheduler.request_registry,
         counters=None,
         pool_stats_observer=getattr(scheduler, "pool_stats_observer", None),
         grammar_manager=getattr(scheduler, "grammar_manager", None),
         mm_receiver=None,
         kv_events_publisher=scheduler.kv_events_publisher,
-        mode_owners=ModeOwners(),
+        mode_owners=mode_owners,
         kv=None,
         capacity=None,
         tp_worker=scheduler.tp_worker,
@@ -288,10 +295,8 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         _set_disaggregation_mode(self, DisaggregationMode.PREFILL)
-        self.reporter.request_registry = types.SimpleNamespace()
-        self.reporter.request_registry.request_lists = lambda: {
-            "bootstrap": RequestList(name="bootstrap", reqs=[_FakeReq(100)])
-        }
+        self.reporter.mode_owners.disagg_prefill = prefill_owner_shell()
+        self.reporter.mode_owners.disagg_prefill.bootstrap_queue.queue = [_FakeReq(100)]
         self.scheduler.lists.waiting_queue = [_FakeReq(200), _FakeReq(50)]
         batch = self._make_batch()
 
@@ -308,16 +313,14 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_disagg_decode_queued_metrics(self):
         _set_disaggregation_mode(self, DisaggregationMode.DECODE)
-        self.reporter.request_registry = types.SimpleNamespace()
-        self.reporter.request_registry.request_lists = lambda: {
-            "prealloc": RequestList(
-                name="prealloc",
-                reqs=[_FakeReq(10, output_len=5), _FakeReq(20, output_len=10)],
-            ),
-            "transfer": RequestList(
-                name="transfer", reqs=[_FakeReq(30, output_len=15)]
-            ),
-        }
+        owner = self.reporter.mode_owners.disagg_decode = decode_owner_shell()
+        owner.prealloc_queue.queue = [
+            types.SimpleNamespace(req=_FakeReq(10, output_len=5)),
+            types.SimpleNamespace(req=_FakeReq(20, output_len=10)),
+        ]
+        owner.transfer_queue.queue = [
+            types.SimpleNamespace(req=_FakeReq(30, output_len=15))
+        ]
         batch = self._make_batch()
 
         with patch(
@@ -328,6 +331,28 @@ class TestForwardPassMetrics(unittest.TestCase):
 
         metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 0)
+        self.assertEqual(metrics.queued_requests.num_decode_requests, 3)
+        self.assertEqual(metrics.queued_requests.sum_decode_kv_tokens, 15 + 30 + 45)
+
+    def test_disagg_decode_queued_metrics_count_every_queued_list(self):
+        """Ready (transferred, waiting for a row) and retracted requests are
+        queued decode work too."""
+        _set_disaggregation_mode(self, DisaggregationMode.DECODE)
+        owner = self.reporter.mode_owners.disagg_decode = decode_owner_shell()
+        owner.prealloc_queue.queue = [
+            types.SimpleNamespace(req=_FakeReq(10, output_len=5))
+        ]
+        owner.prealloc_queue.retracted_queue = [_FakeReq(20, output_len=10)]
+        owner.ready = [_FakeReq(30, output_len=15)]
+        batch = self._make_batch()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=101.0,
+        ):
+            self.reporter._emit_forward_pass_metrics(batch)
+
+        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_decode_requests, 3)
         self.assertEqual(metrics.queued_requests.sum_decode_kv_tokens, 15 + 30 + 45)
 
@@ -540,11 +565,19 @@ class TestDPBalanceMetrics(CustomTestCase):
         )
 
 
+def _transfer_req(*, host_staged, priority):
+    """A transfer queue entry: a DecodeRequest's host_staged and priority."""
+    return types.SimpleNamespace(
+        host_staged=host_staged,
+        priority=priority,
+        req=types.SimpleNamespace(priority=priority),
+    )
+
+
 class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             lists=CoreLists(),
-            request_registry=types.SimpleNamespace(queued_reqs=lambda: []),
             grammar_manager=[],
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
@@ -582,20 +615,15 @@ class TestIdleMetrics(CustomTestCase):
         self.reporter.metrics_sink.metrics_collector = collector
         self.reporter.metrics_sink.current_scheduler_metrics_enabled = True
         host_reqs = [
-            types.SimpleNamespace(host_staged=True, priority=priority)
-            for priority in (1, 2)
+            _transfer_req(host_staged=True, priority=priority) for priority in (1, 2)
         ]
         transfer_queue = types.SimpleNamespace(
-            queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)],
+            queue=[*host_reqs, _transfer_req(host_staged=False, priority=1)],
             num_pending_deferred_releases=lambda: 0,
         )
-        self.reporter.mode_owners.disagg_decode = types.SimpleNamespace(
+        self.reporter.mode_owners.disagg_decode = decode_owner_shell(
             transfer_queue=transfer_queue
         )
-        self.scheduler.request_registry.request_lists = lambda: {
-            "prealloc": RequestList(name="prealloc", reqs=[]),
-            "transfer": RequestList(name="transfer", reqs=transfer_queue.queue),
-        }
         for _ in host_reqs:
             collector.increment_decode_host_receive_reqs()
 

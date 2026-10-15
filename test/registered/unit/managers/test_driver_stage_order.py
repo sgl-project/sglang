@@ -121,7 +121,7 @@ class _DecodeOwner:
     def prefetch_prefill_dp_rank_queries(self):
         self.shell.log("dd.prefetch")
 
-    def intake(self):
+    def intake(self, *, lora_ids_in_use):
         self.shell.log("dd.intake")
 
     def pop_reqs_to_admit(self, slot):
@@ -150,7 +150,7 @@ class _DecodeOwner:
         self.shell.log("dd.apply_retract", slot.index)
         return rids
 
-    def apply_prealloc_consensus(self, rids, slot):
+    def apply_prealloc_consensus(self, rids, slot, *, lora_ids_in_use):
         self.shell.log("dd.apply_prealloc", slot.index)
         return rids
 
@@ -327,7 +327,9 @@ class _Shell:
             get_context().override(
                 "test", disable_overlap_schedule=not self.s.enable_overlap
             )
-            self.s.mode.stages = init_mode_stages(self.s.parts, self.s.loop_schedules())
+            self.s.mode.stages = init_mode_stages(
+                self.s.parts, self.s.loop_schedules(), lora_ids_in_use=set
+            )
             try:
                 _dispatch_event_loop_once(self.s)
             except _Stop:
@@ -599,6 +601,13 @@ class TestRingDriverStageOrder(CustomTestCase):
             + _at(2, *schedule, ("prefill", None), *_FINALIZE_NONE, ("exchange", 1))
             + _at(2, "send", "recv", "dp.after_commit", "send", "send"),
         )
+
+    def test_pd_prefill_idles_while_a_transfer_is_in_flight(self):
+        """An idle ring round runs on_idle, which checks the PD lists itself,
+        as the flat loop does."""
+        shell = _RingShell("prefill", 2)
+        shell.s.parts.mode_owners.disagg_prefill.transfer.append(object())
+        self.assertEqual(shell.run()[-1], (1, "idle"))
 
     def test_pd_decode(self):
         shell = _RingShell("decode", 2, decode={0: _decode_step("d0")})

@@ -41,7 +41,7 @@ class _Channel:
 
 
 def _decode_ring(owner, channel):
-    return _DisaggDecodeRing(owner, channel, 2, schedule=Mock())
+    return _DisaggDecodeRing(owner, channel, 2, schedule=Mock(), lora_ids_in_use=set)
 
 
 class TestDisaggDecodeRing(CustomTestCase):
@@ -86,7 +86,9 @@ class TestDisaggDecodeRing(CustomTestCase):
         ring.exchange_ids(next_slot, next_first_rank_mb_id=0)
 
         owner.apply_retract_consensus.assert_called_once_with(["r", "q"], next_slot)
-        owner.apply_prealloc_consensus.assert_called_once_with([["p"], []], next_slot)
+        owner.apply_prealloc_consensus.assert_called_once_with(
+            [["p"], []], next_slot, lora_ids_in_use=set
+        )
         owner.apply_transfer_consensus.assert_called_once_with(["t"], next_slot)
         self.assertEqual(channel.sent, [["old"]])
         self.assertEqual(ring.consensus_retract_rids, ["r"])
@@ -106,17 +108,6 @@ class TestDisaggDecodeRing(CustomTestCase):
 
         owner.apply_transfer_consensus.assert_not_called()
         self.assertIsNone(ring.release_rids)
-
-    def test_drained_counts_the_owner_lists(self):
-        owner = decode_owner_shell()
-        ring = _decode_ring(owner, _Channel())
-        with patch(f"{PP_MODULE}.get_disagg") as get_disagg:
-            get_disagg.return_value = SimpleNamespace(
-                disaggregation_decode_enable_offload_kvcache=False
-            )
-            self.assertTrue(ring.is_drained())
-            owner.ready.append(object())
-            self.assertFalse(ring.is_drained())
 
 
 class TestDisaggPrefillRing(CustomTestCase):
@@ -143,7 +134,6 @@ class TestDisaggPrefillRing(CustomTestCase):
 
         ring.send_ids()
         self.assertEqual(channel.sent, [["b"]])
-        self.assertTrue(ring.is_drained())
 
 
 if __name__ == "__main__":

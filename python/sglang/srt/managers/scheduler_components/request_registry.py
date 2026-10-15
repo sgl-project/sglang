@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import AbortReq
@@ -60,24 +60,36 @@ class RequestRegistry:
         # Read at call time: a PD role switch replaces the owners.
         self.mode_owners = mode_owners
 
-    def queued_reqs(self) -> List[Req]:
-        """The requests waiting for admission, in list order."""
+    def reqs(self, where: Callable[[RequestList], bool]) -> List[Req]:
+        """The members of the lists `where` selects, in list order (the same
+        on every rank)."""
         return [
             req
             for entry in self.request_lists().values()
-            if entry.queued
+            if where(entry)
             for req in entry.reqs
         ]
+
+    def queued_reqs(self) -> List[Req]:
+        """The requests waiting for admission, in list order."""
+        return self.reqs(lambda entry: entry.queued)
 
     def collect_inflight_reqs(self) -> List[Req]:
         """The requests past prefill admission that a step may still run, in
         list order (the same on every rank)."""
-        return [
-            req
-            for entry in self.request_lists().values()
-            if entry.inflight
-            for req in entry.reqs
-        ]
+        return self.reqs(lambda entry: entry.inflight)
+
+    def running_reqs(self) -> List[Req]:
+        """The running requests, in list order."""
+        return self.reqs(lambda entry: entry.counts_running)
+
+    def lora_ids_in_use(self) -> Set[Optional[str]]:
+        """The adapters LoRA admission keeps: those of the lists that pin
+        them, and of the steps in flight (a request finished at the last
+        commit may still run in one)."""
+        lora_ids = {req.lora_id for req in self.reqs(lambda entry: entry.pins_lora)}
+        lora_ids.update(self.pending.lora_ids())
+        return lora_ids
 
     def request_lists(self) -> Dict[str, RequestList]:
         """The lists that own the live requests, by name: the core lists, then
@@ -90,6 +102,7 @@ class RequestRegistry:
                 abort=self._abort_waiting_reqs,
                 health_check=True,
                 waiting=True,
+                counts_queued=True,
             ),
             # Abort method 2: call `set_finish_with_abort`. The request still
             # runs one prefill forward, with its input cut to one token.
@@ -104,6 +117,9 @@ class RequestRegistry:
                 inflight=True,
                 health_check=True,
                 retract_on_pause=True,
+                holds_kv=True,
+                pins_lora=True,
+                counts_running=True,
             ),
             # A PD prefill node keeps a live mid-chunk request across a pause:
             # its KV sender still reads the KV a retraction would free.
@@ -116,6 +132,8 @@ class RequestRegistry:
                 abort=self._defer_chunked_abort,
                 health_check=True,
                 retract_on_pause=self.mode_owners.disagg_prefill is None,
+                holds_kv=True,
+                partly_prefilled=True,
             ),
         ]
         if self.mode_owners.disagg_prefill is not None:

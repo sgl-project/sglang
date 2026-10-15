@@ -138,7 +138,11 @@ def handle_pd_role_switch(
             )
             maybe_init_disagg_decode(parts, disaggregation_mode=disaggregation_mode)
             maybe_init_disagg_move_gate(parts)
-            stages = init_mode_stages(parts, scheduler.loop_schedules())
+            stages = init_mode_stages(
+                parts,
+                scheduler.loop_schedules(),
+                scheduler.hub.request_registry.lora_ids_in_use,
+            )
             scheduler.mode = SchedulerMode(
                 disaggregation_mode=disaggregation_mode,
                 stages=stages,

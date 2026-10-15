@@ -663,7 +663,7 @@ class Scheduler:
                 waiting_for_result = False
 
             if busy_self_check:
-                self.parts.invariant_checker.self_check_during_busy()
+                self.hub.invariant_checker.self_check_during_busy()
 
     def launch_step(
         self,
@@ -735,7 +735,7 @@ class Scheduler:
         self.parts.request_retirer.release_held(record.step)
         self.parts.step_counters.record(record)
         if CHECK_REQUEST_LISTS:
-            self.parts.invariant_checker.check_no_finished_reqs(
+            self.hub.invariant_checker.check_no_finished_reqs(
                 self.hub.request_registry.request_lists()
             )
 
@@ -1315,26 +1315,24 @@ class Scheduler:
         # holding KV until an ack lands keep the scheduler from fully idle.
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
             if not get_memory().enable_hisparse:
-                has_leak, messages = self.parts.invariant_checker._check_all_pools(
+                has_leak, messages = self.hub.invariant_checker._check_all_pools(
                     self.parts.pool_stats_observer.get_pool_stats(),
                 )
                 if has_leak:
-                    self.parts.invariant_checker._report_leak(
-                        "pool", "\n".join(messages)
-                    )
-                self.parts.invariant_checker._check_req_pool()
+                    self.hub.invariant_checker._report_leak("pool", "\n".join(messages))
+                self.hub.invariant_checker._check_req_pool()
                 # Byte-conservation diagnostic (allocator-owned; static pools
                 # return [] — the token identity above can't see byte leaks).
                 byte_violations = (
                     self.parts.kv.token_to_kv_pool_allocator.verify_byte_accounting()
                 )
                 if byte_violations:
-                    self.parts.invariant_checker._report_leak(
+                    self.hub.invariant_checker._report_leak(
                         "pool-bytes", "\n".join(byte_violations)
                     )
 
             # tree cache sanity check
-            self.parts.invariant_checker._check_tree_cache()
+            self.hub.invariant_checker._check_tree_cache()
 
         # metrics every 30s
         self.hub.metrics_reporter._maybe_log_idle_metrics()
@@ -1380,7 +1378,7 @@ class Scheduler:
                 message=(
                     "Reject attach: scheduler is not idle. "
                     f"#queue-req={len(self.hub.request_registry.queued_reqs())} "
-                    f"#running-req={len(self.parts.lists.decoding)}"
+                    f"#running-req={len(self.hub.request_registry.running_reqs())}"
                 ),
             )
 
@@ -1435,7 +1433,7 @@ class Scheduler:
                 message=(
                     "Reject detach: scheduler is not idle. "
                     f"#queue-req={len(self.hub.request_registry.queued_reqs())} "
-                    f"#running-req={len(self.parts.lists.decoding)}"
+                    f"#running-req={len(self.hub.request_registry.running_reqs())}"
                 ),
             )
 

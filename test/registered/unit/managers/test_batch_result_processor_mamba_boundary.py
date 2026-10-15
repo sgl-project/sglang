@@ -203,7 +203,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
 
         scheduler.process_batch_result = process_batch_result
         scheduler.mode.stages = init_mode_stages(
-            scheduler.parts, scheduler.loop_schedules()
+            scheduler.parts, scheduler.loop_schedules(), lora_ids_in_use=set
         )
 
         with (

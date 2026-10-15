@@ -3,7 +3,7 @@ the request ids each PD owner acts on, over the PP channel."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.runtime_context import get_disagg
@@ -144,9 +144,6 @@ class _DisaggPrefillRing:
     def send_ids(self) -> None:
         self.send_transfer_work = self.channel.send_next(self.transferred_rids)
 
-    def is_drained(self) -> bool:
-        return len(self.owner.transfer) == 0
-
 
 class _DisaggDecodeRing:
     """The PD decode messages around each ring slot: the PP ranks agree on the
@@ -160,10 +157,12 @@ class _DisaggDecodeRing:
         pp_loop_size: int,
         *,
         schedule: Callable[[ScheduleSlot], Optional[ScheduleBatch]],
+        lora_ids_in_use: Callable[[], Set[Optional[str]]],
     ):
         self.owner = owner
         self.channel = channel
         self.schedule = schedule
+        self.lora_ids_in_use = lora_ids_in_use
         # Per slot: the ids it put to each consensus, or None.
         self.rmbs: List[Optional[List[str]]] = [None] * pp_loop_size
         self.pmbs: List[Optional[List]] = [None] * pp_loop_size
@@ -289,7 +288,9 @@ class _DisaggDecodeRing:
         self.consensus_prealloc_rids = None
         if self.pmbs[next_mb_id] is not None:
             self.consensus_prealloc_rids = owner.apply_prealloc_consensus(
-                self.channel.recv_prev(), next_slot
+                self.channel.recv_prev(),
+                next_slot,
+                lora_ids_in_use=self.lora_ids_in_use,
             )
         self.channel.commit(send_prealloc_work)
 
@@ -307,14 +308,3 @@ class _DisaggDecodeRing:
         self.send_retract_work = self.channel.send_next(self.retract_rids)
         self.send_prealloc_work = self.channel.send_next(self.prealloc_rids)
         self.send_transfer_work = self.channel.send_next(self.transferred_rids)
-
-    def is_drained(self) -> bool:
-        owner = self.owner
-        queue_size = (
-            len(owner.ready)
-            + len(owner.transfer_queue.queue)
-            + len(owner.prealloc_queue.queue)
-        )
-        if get_disagg().disaggregation_decode_enable_offload_kvcache:
-            queue_size += len(owner.decode_offload_manager.ongoing_offload)
-        return queue_size == 0

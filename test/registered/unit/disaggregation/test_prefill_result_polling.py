@@ -242,7 +242,7 @@ class _Scheduler:
         )
 
     def init_mode_stages(self):
-        self.stages = init_mode_stages(self, self.loop_schedules())
+        self.stages = init_mode_stages(self, self.loop_schedules(), lora_ids_in_use=set)
 
     def __init__(
         self,

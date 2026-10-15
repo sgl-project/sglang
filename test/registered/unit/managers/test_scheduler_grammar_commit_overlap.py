@@ -128,7 +128,9 @@ class TestGrammarCommitOverlap(CustomTestCase):
 
         s.mode.step_launcher = SimpleNamespace(run_batch=run_batch)
         s.process_batch_result = process_batch_result
-        s.mode.stages = init_mode_stages(s.parts, s.loop_schedules())
+        s.mode.stages = init_mode_stages(
+            s.parts, s.loop_schedules(), lora_ids_in_use=set
+        )
 
         with self.assertRaises(StopIteration):
             s.event_loop_overlap()

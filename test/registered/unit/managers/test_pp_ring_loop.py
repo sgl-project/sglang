@@ -190,7 +190,9 @@ class TestPPSlotTag(CustomTestCase):
         s.parts.lists.waiting_queue = []
         s.parts.pending = PendingSteps()
         s.parts.flags.enable_skip_finishing_decode = False
-        s.mode.stages = init_mode_stages(s.parts, s.loop_schedules())
+        s.mode.stages = init_mode_stages(
+            s.parts, s.loop_schedules(), lora_ids_in_use=set
+        )
         reqs = [_Req() for _ in range(3)]
         slots = [ScheduleSlot(index=0), ScheduleSlot(index=1)]
         for slot, launched in ((slots[0], reqs[:2]), (slots[1], reqs[2:])):
@@ -277,7 +279,7 @@ class TestPPSlotTag(CustomTestCase):
         owner.pop_reqs_to_admit(ScheduleSlot(index=0))
         next_slot = ScheduleSlot(index=1)
         owner.apply_retract_consensus([], next_slot)
-        owner.apply_prealloc_consensus([[], []], next_slot)
+        owner.apply_prealloc_consensus([[], []], next_slot, lora_ids_in_use=set)
         owner.apply_transfer_consensus([], next_slot)
 
         self.assertEqual(budgeted, [1, 1, 1])

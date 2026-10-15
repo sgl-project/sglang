@@ -585,10 +585,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         queue.enable_priority_scheduling = True
         queue.schedule_low_priority_values_first = low_priority_values_first
-        queue.core_lists = CoreLists()
-        queue.core_lists.decoding = []
         queue.get_ready = lambda: []
-        queue.get_pending_lora_ids = MagicMock(return_value=set())
         queue.enable_hisparse = False
         queue.enable_lora = False
         queue.enable_decode_hicache = False
@@ -597,7 +594,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         return queue
 
     def test_prealloc_lora_slots_cover_inflight_steps_and_queues(self):
-        """In-flight requests retain their adapter slots."""
+        """In-flight requests retain their adapter slots: the registry's
+        adapters in use cover decoding, the steps in flight, and PD decode's
+        transfer and ready lists."""
         running, finished, transferring, waiting = [
             self._new_decode_req(rid, 0)
             for rid in ("running", "finished", "transferring", "waiting")
@@ -613,11 +612,22 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         queue = self._new_queue(reqs)
         queue.transfer_queue.queue = [transferring]
-        queue.core_lists = CoreLists()
-        queue.core_lists.decoding = [running.req]
+        core_lists = CoreLists()
+        core_lists.decoding = [running.req]
         # A step in flight still runs a request its predecessor's commit finished.
-        queue.get_pending_lora_ids.return_value = {finished.req.lora_id}
-        queue.get_ready = lambda: [waiting.req]
+        pending = PendingSteps()
+        pending.push(SimpleNamespace(step=SimpleNamespace(reqs=[finished.req])))
+        queue.held_rebootstrap_reqs = []
+        owner = decode_owner_shell(
+            prealloc_queue=queue,
+            transfer_queue=queue.transfer_queue,
+            ready=[waiting.req],
+        )
+        registry = make_request_registry(
+            core_lists=core_lists,
+            pending=pending,
+            mode_owners=ModeOwners(disagg_decode=owner),
+        )
         queue.enable_decode_hicache = False
         queue.enable_lora = True
         get_context().override("test", enable_lora_overlap_loading=False)
@@ -631,7 +641,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         )
         queue.can_schedule_lora_req = lora_admission.can_schedule_lora_req
 
-        preallocated, failed = queue.pop_preallocated([])
+        preallocated, failed = queue.pop_preallocated(
+            [], lora_ids_in_use=registry.lora_ids_in_use
+        )
 
         self.assertEqual(preallocated, [reqs[0], reqs[2]])
         self.assertEqual(failed, [])
@@ -650,7 +662,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue = self._new_queue(reqs)
 
         with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated([])
+            preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated],
@@ -671,7 +683,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue = self._new_queue(reqs, low_priority_values_first=True)
 
         with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated([])
+            preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated],
@@ -689,7 +701,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue = self._new_queue([failed_low, healthy_high])
 
         with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated([])
+            preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated], ["healthy-high"]
@@ -715,7 +727,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
                 queue.token_to_kv_pool_allocator.available_size.return_value = 100
                 queue._required_alloc_tokens = MagicMock(return_value=charge)
 
-                preallocated, failed = queue.pop_preallocated([])
+                preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
                 queue._required_alloc_tokens.assert_called_once_with(
                     fill_len=3, prefix_len=0

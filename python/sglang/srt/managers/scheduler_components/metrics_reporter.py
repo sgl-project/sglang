@@ -46,7 +46,6 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.constrained.grammar_manager import GrammarManager
     from sglang.srt.disaggregation.encoder.receiver import MMReceiverBase
-    from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.managers.scheduler_components.bundles import (
@@ -620,7 +619,6 @@ class SchedulerMetricsReporter:
 
     metrics_sink: MetricsSink
     request_registry: RequestRegistry
-    core_lists: CoreLists
     counters: LaunchCounters
     pool_stats_observer: SchedulerPoolStatsObserver
     grammar_manager: GrammarManager
@@ -719,19 +717,15 @@ class SchedulerMetricsReporter:
 
         prefill_q = WelfordAccumulator()
         decode_q = WelfordAccumulator()
+        registry = self.request_registry
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            for req in self.request_registry.request_lists()["bootstrap"].reqs:
-                prefill_q.add(len(req.origin_input_ids))
-            for req in self.core_lists.waiting_queue:
+            for req in registry.reqs(lambda entry: entry.counts_queued):
                 prefill_q.add(len(req.origin_input_ids))
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            lists = self.request_registry.request_lists()
-            for req in lists["prealloc"].reqs:
-                decode_q.add(req.seqlen)
-            for req in lists["transfer"].reqs:
+            for req in registry.reqs(lambda entry: entry.counts_queued):
                 decode_q.add(req.seqlen)
         else:
-            for req in self.core_lists.waiting_queue:
+            for req in registry.reqs(lambda entry: entry.counts_queued):
                 if len(req.output_ids) > 0:
                     decode_q.add(req.seqlen)
                 else:
@@ -963,16 +957,14 @@ class SchedulerMetricsReporter:
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
-            f"#queue-req: {len(self.core_lists.waiting_queue)}, "
+            f"#queue-req: {len(self.request_registry.queued_reqs())}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
         if prefill_stats.log_replay_tokens:
             msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            lists = self.request_registry.request_lists()
-            msg += f"#bootstrap-req: {len(lists['bootstrap'].reqs)}, "
-            msg += f"#inflight-req: {len(lists['transfer'].reqs)}, "
+            msg += self.mode_owners.disagg_prefill.queue_log_msg()
             num_optimistic = sum(1 for r in batch.reqs if r.disagg.pending_bootstrap)
             msg += f"#optimistic-req: {num_optimistic}, "
 
@@ -1068,7 +1060,7 @@ class SchedulerMetricsReporter:
                     prefill_stats.num_running_reqs
                 )
             self.metrics_sink.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.core_lists.waiting_queue, priority_enabled
+                self.request_registry.queued_reqs(), priority_enabled
             )
             self.metrics_sink.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.metrics_sink.stats.cache_hit_rate = cache_hit_rate
@@ -1090,12 +1082,8 @@ class SchedulerMetricsReporter:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                lists = self.request_registry.request_lists()
-                self.metrics_sink.stats.num_prefill_bootstrap_queue_reqs = (
-                    QueueCount.from_reqs(lists["bootstrap"].reqs, priority_enabled)
-                )
-                self.metrics_sink.stats.num_prefill_inflight_queue_reqs = (
-                    QueueCount.from_reqs(lists["transfer"].reqs, priority_enabled)
+                self.mode_owners.disagg_prefill.report_queue_stats(
+                    self.metrics_sink.stats, priority_enabled
                 )
                 self.metrics_sink.stats.kv_transfer_speed_gb_s = (
                     self.metrics_sink.kv_transfer_speed_gb_s
@@ -1104,7 +1092,9 @@ class SchedulerMetricsReporter:
                     self.metrics_sink.kv_transfer_latency_ms
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                self._update_decode_queue_stats(priority_enabled)
+                self.mode_owners.disagg_decode.report_queue_stats(
+                    self.metrics_sink.stats, priority_enabled
+                )
 
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
@@ -1143,7 +1133,7 @@ class SchedulerMetricsReporter:
                 self._mfu_log_write_bytes += write_bytes
 
             if x := self.metrics_sink.scheduler_status_logger:
-                x.maybe_dump(batch, self.core_lists.waiting_queue)
+                x.maybe_dump(batch, self.request_registry.queued_reqs())
 
         # Periodic work: log + heavy metrics at decode_log_interval
         if (
@@ -1251,14 +1241,13 @@ class SchedulerMetricsReporter:
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            self._update_decode_queue_stats(get_schedule().enable_priority_scheduling)
-            msg += f"pre-allocated usage: {self.mode_owners.disagg_decode.prealloc_queue.num_tokens_pre_allocated / self.capacity.max_total_num_tokens:.2f}, "
-            lists = self.request_registry.request_lists()
-            msg += f"#prealloc-req: {len(lists['prealloc'].reqs)}, "
-            msg += f"#transfer-req: {len(lists['transfer'].reqs)}, "
-            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
-                msg += f"#host-receive-req: {self.metrics_sink.stats.num_decode_host_receive_queue_reqs.total}, "
-            msg += f"#retracted-req: {len(lists['retracted'].reqs)}, "
+            disagg_decode = self.mode_owners.disagg_decode
+            disagg_decode.report_queue_stats(
+                self.metrics_sink.stats, get_schedule().enable_priority_scheduling
+            )
+            msg += disagg_decode.queue_log_msg(
+                self.metrics_sink.stats, self.capacity.max_total_num_tokens
+            )
 
         if (
             get_disagg().language_only
@@ -1338,12 +1327,8 @@ class SchedulerMetricsReporter:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                lists = self.request_registry.request_lists()
-                self.metrics_sink.stats.num_prefill_bootstrap_queue_reqs = (
-                    QueueCount.from_reqs(lists["bootstrap"].reqs, priority_enabled)
-                )
-                self.metrics_sink.stats.num_prefill_inflight_queue_reqs = (
-                    QueueCount.from_reqs(lists["transfer"].reqs, priority_enabled)
+                self.mode_owners.disagg_prefill.report_queue_stats(
+                    self.metrics_sink.stats, priority_enabled
                 )
 
             # Streaming session metrics
@@ -1446,11 +1431,11 @@ class SchedulerMetricsReporter:
             mem_pool = lora_manager.memory_pool
             slots_total = mem_pool.max_loras_per_batch
 
-            # Calculate active adapters from the decoding requests
+            # Calculate active adapters from the running requests
             # This gives a true measure of current load for autoscaling purposes
             active_lora_ids = {
                 req.lora_id
-                for req in self.core_lists.decoding
+                for req in self.request_registry.running_reqs()
                 if req.lora_id is not None
             }
 
@@ -1478,27 +1463,6 @@ class SchedulerMetricsReporter:
                     self.metrics_sink.stats.token_usage / 0.9,
                 )
 
-    def _update_decode_queue_stats(self, priority_enabled: bool) -> None:
-        lists = self.request_registry.request_lists()
-        transfer_queue = self.mode_owners.disagg_decode.transfer_queue
-        self.metrics_sink.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-            lists["prealloc"].reqs, priority_enabled
-        )
-        self.metrics_sink.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-            lists["transfer"].reqs, priority_enabled
-        )
-        self.metrics_sink.stats.num_decode_deferred_kv_release_reqs = (
-            transfer_queue.num_pending_deferred_releases()
-        )
-        host_reqs = (
-            [req for req in transfer_queue.queue if req.host_staged]
-            if get_disagg().disaggregation_decode_host_receive_threshold < 1
-            else []
-        )
-        self.metrics_sink.stats.num_decode_host_receive_queue_reqs = (
-            QueueCount.from_reqs(host_reqs, priority_enabled)
-        )
-
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
         # Preserve the transition so the rate limit cannot leave a finite idle gauge.
@@ -1510,10 +1474,11 @@ class SchedulerMetricsReporter:
             return
         # The running-reqs gauge holds the last batch report until the next
         # one (on PD prefill that is the last forward-batch snapshot, which
-        # no later report zeroes). If it disagrees with the decoding requests
+        # no later report zeroes). If it disagrees with the running requests
         # -- the true idle value -- publish now instead of waiting out the window.
+        running_reqs = self.request_registry.running_reqs()
         gauge_stale = self.metrics_sink.stats.num_running_reqs.total != len(
-            self.core_lists.decoding
+            running_reqs
         )
         if (
             not gauge_stale
@@ -1535,7 +1500,7 @@ class SchedulerMetricsReporter:
 
         priority_enabled = get_schedule().enable_priority_scheduling
         self.metrics_sink.stats.num_running_reqs = QueueCount.from_reqs(
-            self.core_lists.decoding, priority_enabled
+            running_reqs, priority_enabled
         )
         self.metrics_sink.stats.gen_throughput = 0
         self.metrics_sink.stats.num_queue_reqs = QueueCount.from_reqs(
@@ -1543,13 +1508,11 @@ class SchedulerMetricsReporter:
         )
         self.metrics_sink.stats.num_grammar_queue_reqs = len(self.grammar_manager)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            lists = self.request_registry.request_lists()
-            self.metrics_sink.stats.num_prefill_bootstrap_queue_reqs = (
-                QueueCount.from_reqs(lists["bootstrap"].reqs, priority_enabled)
-            )
-            self.metrics_sink.stats.num_prefill_inflight_queue_reqs = (
-                QueueCount.from_reqs(lists["transfer"].reqs, priority_enabled)
+            self.mode_owners.disagg_prefill.report_queue_stats(
+                self.metrics_sink.stats, priority_enabled
             )
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            self._update_decode_queue_stats(priority_enabled)
+            self.mode_owners.disagg_decode.report_queue_stats(
+                self.metrics_sink.stats, priority_enabled
+            )
         self.metrics_sink.metrics_collector.log_stats(self.metrics_sink.stats)

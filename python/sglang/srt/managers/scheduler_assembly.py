@@ -15,7 +15,7 @@ import functools
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional, Set, Tuple
 
 import torch
 
@@ -268,7 +268,6 @@ class SchedulerParts:
     step_builder: StepBuilder
     dp_attn_adapter: SchedulerDPAttnAdapter
     pool_stats_observer: SchedulerPoolStatsObserver
-    invariant_checker: SchedulerInvariantChecker
     kv_events_publisher: SchedulerKvEventsPublisher
     load_publisher: SchedulerLoadPublisher
     services: SchedulerServices
@@ -295,6 +294,7 @@ class SchedulerHub:
     component that does, so nothing in the parts or the mode takes one."""
 
     request_registry: RequestRegistry
+    invariant_checker: SchedulerInvariantChecker
     request_intake: RequestIntake
     step_planner: StepPlanner
     weight_updater: SchedulerWeightUpdaterManager
@@ -732,26 +732,6 @@ def assemble_scheduler(
         # Match the allocator and radix counters' logical units.
         max_total_num_tokens=capacity.widened_max_total_num_tokens,
     )
-    invariant_checker = SchedulerInvariantChecker(
-        is_hybrid_swa=is_hybrid_swa,
-        is_hybrid_ssm=is_hybrid_ssm,
-        page_size=get_schedule().page_size,
-        full_tokens_per_layer=full_tokens_per_layer,
-        swa_tokens_per_layer=swa_tokens_per_layer,
-        max_total_num_tokens=capacity.widened_max_total_num_tokens,
-        tree_cache=tree_cache,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        req_to_token_pool=req_to_token_pool,
-        pool_stats_observer=pool_stats_observer,
-        counters=counters,
-        core_lists=lists,
-        pending=pending,
-        scheduler_stage_metrics=scheduler_stage_metrics,
-    )
-    # The watchdogs dump the pools once the invariant checker exists.
-    watchdog.invariant_checker = invariant_checker
-    if soft_watchdog is not None:
-        soft_watchdog.invariant_checker = invariant_checker
     kv_events_publisher = SchedulerKvEventsPublisher(
         kv_events_config=get_observability().kv_events_config,
         tree_cache=tree_cache,
@@ -811,6 +791,37 @@ def assemble_scheduler(
         pending=pending,
         request_retirer=request_retirer,
     )
+    request_registry = RequestRegistry(
+        core_lists=lists,
+        grammar_manager=grammar_manager,
+        request_retirer=request_retirer,
+        ipc_channels=ipc_channels,
+        kv=kv,
+        mm_receiver=mm_receiver,
+        pending=pending,
+        decode_offload_manager=decode_offload_manager,
+        mode_owners=mode_owners,
+    )
+    invariant_checker = SchedulerInvariantChecker(
+        is_hybrid_swa=is_hybrid_swa,
+        is_hybrid_ssm=is_hybrid_ssm,
+        page_size=get_schedule().page_size,
+        full_tokens_per_layer=full_tokens_per_layer,
+        swa_tokens_per_layer=swa_tokens_per_layer,
+        max_total_num_tokens=capacity.widened_max_total_num_tokens,
+        tree_cache=tree_cache,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        req_to_token_pool=req_to_token_pool,
+        pool_stats_observer=pool_stats_observer,
+        counters=counters,
+        request_registry=request_registry,
+        pending=pending,
+        scheduler_stage_metrics=scheduler_stage_metrics,
+    )
+    # The watchdogs dump the pools once the invariant checker exists.
+    watchdog.invariant_checker = invariant_checker
+    if soft_watchdog is not None:
+        soft_watchdog.invariant_checker = invariant_checker
     if get_exec().dllm.dllm_algorithm is None:
         mode_owners.dllm = None
     else:
@@ -880,7 +891,6 @@ def assemble_scheduler(
         step_builder=step_builder,
         dp_attn_adapter=dp_attn_adapter,
         pool_stats_observer=pool_stats_observer,
-        invariant_checker=invariant_checker,
         kv_events_publisher=kv_events_publisher,
         load_publisher=load_publisher,
         services=services,
@@ -898,25 +908,14 @@ def assemble_scheduler(
     )
     maybe_init_disagg_decode(parts, disaggregation_mode=disaggregation_mode)
     maybe_init_disagg_move_gate(parts)
-    stages = init_mode_stages(parts, schedules)
+    stages = init_mode_stages(parts, schedules, request_registry.lora_ids_in_use)
     mode = SchedulerMode(
         disaggregation_mode=disaggregation_mode,
         stages=stages,
         step_launcher=init_step_launcher(parts, stages),
     )
 
-    # The hub over the mode owners
-    request_registry = RequestRegistry(
-        core_lists=lists,
-        grammar_manager=grammar_manager,
-        request_retirer=request_retirer,
-        ipc_channels=ipc_channels,
-        kv=kv,
-        mm_receiver=mm_receiver,
-        pending=pending,
-        decode_offload_manager=decode_offload_manager,
-        mode_owners=mode_owners,
-    )
+    # The rest of the hub over the mode owners
     request_intake = RequestIntake(
         core_lists=lists,
         counters=counters,
@@ -1023,7 +1022,6 @@ def assemble_scheduler(
     metrics_reporter = SchedulerMetricsReporter(
         metrics_sink=metrics_sink,
         request_registry=request_registry,
-        core_lists=lists,
         counters=counters,
         pool_stats_observer=pool_stats_observer,
         grammar_manager=grammar_manager,
@@ -1078,6 +1076,7 @@ def assemble_scheduler(
     )
     hub = SchedulerHub(
         request_registry=request_registry,
+        invariant_checker=invariant_checker,
         request_intake=request_intake,
         step_planner=step_planner,
         weight_updater=weight_updater,
@@ -1319,7 +1318,6 @@ def maybe_init_disagg_decode(
         request_retirer=parts.request_retirer,
         flags=parts.flags,
         core_lists=parts.lists,
-        pending=parts.pending,
         policy=parts.policy,
         future_map=parts.future_map,
         ngram_embedding_manager=parts.ngram_embedding_manager,
@@ -1336,8 +1334,13 @@ def maybe_init_disagg_move_gate(parts: SchedulerParts) -> None:
         )
 
 
-def init_mode_stages(parts: SchedulerParts, schedules: LoopSchedules) -> ModeStages:
-    """Choose the mode's stages, once; a PD role switch rebuilds them."""
+def init_mode_stages(
+    parts: SchedulerParts,
+    schedules: LoopSchedules,
+    lora_ids_in_use: Callable[[], Set[Optional[str]]],
+) -> ModeStages:
+    """Choose the mode's stages, once; a PD role switch rebuilds them. PD
+    decode admission takes the adapters the scheduler's requests pin."""
     owners = parts.mode_owners
     hisparse = owners.hisparse_coordinator
     if owners.dllm is not None:
@@ -1376,7 +1379,7 @@ def init_mode_stages(parts: SchedulerParts, schedules: LoopSchedules) -> ModeSta
         stages = dict(
             schedule=schedules.schedule_disagg_decode,
             prefetch=owner.prefetch_prefill_dp_rank_queries,
-            intake=owner.intake,
+            intake=functools.partial(owner.intake, lora_ids_in_use=lora_ids_in_use),
             hold_finished=(
                 owner.hold_finished
                 if parts.decode_offload_manager is not None
@@ -1386,6 +1389,7 @@ def init_mode_stages(parts: SchedulerParts, schedules: LoopSchedules) -> ModeSta
                 _DisaggDecodeRing,
                 owner,
                 schedule=schedules.schedule_disagg_decode,
+                lora_ids_in_use=lora_ids_in_use,
             ),
         )
     else:

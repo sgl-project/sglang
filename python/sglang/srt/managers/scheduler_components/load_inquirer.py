@@ -58,18 +58,25 @@ class SchedulerLoadInquirer:
             == DisaggregationMode.DECODE
         ):
             return 0
-        lists = self.request_registry.request_lists()
-        waiting_queue_prefix_matched = self.policy.waiting_queue_prefix_matched(
-            lists["waiting"].reqs
-        )
+        registry = self.request_registry
+        queued = registry.queued_reqs()
+        waiting_queue_prefix_matched = self.policy.waiting_queue_prefix_matched(queued)
         cache_miss_rate = 1.0 - self.metrics_sink.recent_cache_hit_rate
         num_tokens = 0
-        for req in lists["waiting"].reqs:
+        for req in queued:
             if waiting_queue_prefix_matched:
                 num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
             else:
                 num_tokens += int(req.seqlen * cache_miss_rate)
-        for cr in lists["chunked"].reqs:
+        # The other waiting requests that own no KV yet (PD prefill
+        # bootstrap) were never prefix-matched.
+        for req in registry.reqs(
+            lambda entry: (
+                entry.counts_queued and not entry.holds_kv and not entry.queued
+            )
+        ):
+            num_tokens += int(req.seqlen * cache_miss_rate)
+        for cr in registry.reqs(lambda entry: entry.partly_prefilled):
             num_tokens += max(0, cr.seqlen - cr.prefix_len)
         return num_tokens
 
@@ -77,42 +84,23 @@ class SchedulerLoadInquirer:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         stats = self.metrics_sink.stats
-        lists = self.request_registry.request_lists()
-        num_running_reqs = len(lists["decoding"].reqs)
+        registry = self.request_registry
+        num_running_reqs = len(registry.running_reqs())
 
-        queued = [req for entry in lists.values() if entry.queued for req in entry.reqs]
-        waiting_queues = [queued]
-        pending_token_queues = [queued]
-        awaiting_kv_tokens = 0
-        if disaggregation_mode == DisaggregationMode.PREFILL:
-            prefill_bootstrap_queue = lists["bootstrap"].reqs
-            waiting_queues.append(prefill_bootstrap_queue)
-            pending_token_queues.append(prefill_bootstrap_queue)
-        elif disaggregation_mode == DisaggregationMode.DECODE:
-            decode_prealloc_queue = lists["prealloc"].reqs
-            decode_transfer_queue = lists["transfer"].reqs
-            decode_retracted_queue = lists["retracted"].reqs
-            waiting_queues.append(decode_prealloc_queue)
-            waiting_queues.append(decode_transfer_queue)
-            waiting_queues.append(decode_retracted_queue)
-            # In disaggregated decode, transfer-queue requests and ready
-            # requests have already pre-allocated decode-side KV slots, so
-            # they are already included in num_used_tokens.
-            pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
-            # KV not yet arrived from the prefill side.
-            awaiting_kv_tokens = sum(
-                req.seqlen
-                for queue in (decode_prealloc_queue, decode_transfer_queue)
-                for req in queue
-            )
-
-        num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+        queued = registry.queued_reqs()
+        num_waiting_reqs = len(registry.reqs(lambda entry: entry.counts_queued))
+        # The waiting requests that own KV (PD decode's transfer and ready
+        # requests) are in num_used_tokens already.
+        pending_reqs = registry.reqs(
+            lambda entry: entry.counts_queued and not entry.holds_kv
+        )
+        awaiting_kv_tokens = sum(
+            req.seqlen for req in registry.reqs(lambda entry: entry.awaits_kv)
+        )
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
         )
-        num_total_tokens = num_used_tokens + sum(
-            req.seqlen for queue in pending_token_queues for req in queue
-        )
+        num_total_tokens = num_used_tokens + sum(req.seqlen for req in pending_reqs)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
@@ -151,33 +139,22 @@ class SchedulerLoadInquirer:
             )
 
         mode_str = "null"
-        prefill_bootstrap = prefill_inflight = 0
-        decode_prealloc = decode_transfer = decode_retracted = 0
+        queue_metrics = {}
         decode_prealloc_ready = 0
         num_prealloc_ready_tokens = 0
         if disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
-            prefill_bootstrap = len(lists["bootstrap"].reqs)
-            prefill_inflight = len(lists["transfer"].reqs)
+            queue_metrics = self.mode_owners.disagg_prefill.load_queue_metrics()
         elif disaggregation_mode == DisaggregationMode.DECODE:
             mode_str = "decode"
-            decode_prealloc = len(lists["prealloc"].reqs)
-            decode_transfer = len(lists["transfer"].reqs)
-            decode_retracted = len(lists["retracted"].reqs)
-            ready_reqs = [
-                decode_req.req
-                for decode_req in self.mode_owners.disagg_decode.prealloc_queue.queue
-                if decode_req.waiting_for_input
-            ]
+            disagg_decode = self.mode_owners.disagg_decode
+            queue_metrics = disagg_decode.load_queue_metrics()
+            ready_reqs = disagg_decode.prealloc_ready_reqs()
             decode_prealloc_ready = len(ready_reqs)
             num_prealloc_ready_tokens = sum(req.seqlen for req in ready_reqs)
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
-            prefill_bootstrap_queue_reqs=prefill_bootstrap,
-            prefill_inflight_queue_reqs=prefill_inflight,
-            decode_prealloc_queue_reqs=decode_prealloc,
-            decode_transfer_queue_reqs=decode_transfer,
-            decode_retracted_queue_reqs=decode_retracted,
+            **queue_metrics,
             kv_transfer_speed_gb_s=stats.kv_transfer_speed_gb_s,
             kv_transfer_latency_ms=stats.kv_transfer_latency_ms,
         )

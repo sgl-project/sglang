@@ -335,7 +335,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.process_batch_result = process_batch_result
         scheduler.parts.step_counters = SimpleNamespace(record=record_step_counters)
         scheduler.mode.stages = init_mode_stages(
-            scheduler.parts, scheduler.loop_schedules()
+            scheduler.parts,
+            scheduler.loop_schedules(),
+            scheduler.hub.request_registry.lora_ids_in_use,
         )
         with (
             get_parallel().override(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0),
@@ -424,7 +426,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.parts.mode_owners.hisparse_coordinator = None
         scheduler.mode.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.hub.request_registry = SimpleNamespace(
-            poll_timeout_aborts=Mock(return_value=[])
+            poll_timeout_aborts=Mock(return_value=[]), lora_ids_in_use=set
         )
         scheduler.scheduler_stage_metrics = None
         scheduler.parts.metrics_sink = SimpleNamespace(record_scheduler_active=Mock())

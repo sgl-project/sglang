@@ -143,7 +143,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.parts.ngram_embedding_manager = Mock()
         s.parts.ngram_embedding_manager.prepare_for_forward.return_value = None
 
-        s.mode.stages = init_mode_stages(s.parts, s.loop_schedules())
+        s.mode.stages = init_mode_stages(
+            s.parts, s.loop_schedules(), lora_ids_in_use=set
+        )
         step = s.get_next_batch_to_run(ScheduleSlot())
 
         self.assertIsNone(step)
@@ -195,7 +197,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         # Stop the infinite loop at admission; no PP transport or GPU is needed.
         s.hub.step_planner.get_new_batch_prefill.side_effect = StopIteration
 
-        s.mode.stages = init_mode_stages(s.parts, s.loop_schedules())
+        s.mode.stages = init_mode_stages(
+            s.parts, s.loop_schedules(), lora_ids_in_use=set
+        )
         with self.assertRaises(StopIteration):
             s.event_loop_pp()
 

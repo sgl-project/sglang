@@ -54,7 +54,7 @@ class TestHiSparseStagingList(unittest.TestCase):
         )
         scheduler.hisparse_coordinator.staging = []
         scheduler.mode.stages = init_mode_stages(
-            scheduler.parts, scheduler.loop_schedules()
+            scheduler.parts, scheduler.loop_schedules(), lora_ids_in_use=set
         )
         step = SimpleNamespace(
             prefill_reqs=lambda: [live, done],
