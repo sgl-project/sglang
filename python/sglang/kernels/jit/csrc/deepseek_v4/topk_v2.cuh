@@ -649,9 +649,11 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
       // Rank 0 redoes an overflowing row below. The sync keeps the redo off smem
       // and output the peers may still use; their staged writes get overwritten,
       // but INDICES ones would race with it, so there the peers skip them too.
+      // Unconditional: with kPeersDefer the peers read rank 0's smem after bar-3,
+      // and rank 0 must not exit before they finish.
       const bool overflow = ClusterN::template forward<kPDL, /*kPeersDefer=*/!kNeedStaging>(problem, &smem);
       device::PDLTriggerSecondary<kPDL>();
-      if (kNeedStaging || overflow) cluster.sync();
+      cluster.sync();
       if (by != 0) return;
       problem.out = stage_out;
       if (!overflow) [[likely]] {

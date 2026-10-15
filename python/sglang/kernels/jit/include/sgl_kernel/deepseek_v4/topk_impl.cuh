@@ -982,7 +982,7 @@ struct TopKCluster : TopKRadixBase<10> {
       cluster.sync();  // bar 3
 
       if constexpr (kPeersDefer) {
-        // Final at bar-3; rank 0 must not reuse them until every peer is past here.
+        // Final at bar-3; the caller syncs the cluster before rank 0 reuses them or exits.
         if (is_overflow(smem_0->count_gt, smem_0->count_eq, topk)) [[unlikely]] {
           return true;
         }
