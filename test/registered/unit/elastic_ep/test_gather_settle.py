@@ -37,52 +37,39 @@ class _Gather:
             raise self.exc
 
 
-class _SettleCase(CustomTestCase):
-    def setUp(self):
-        import sglang.srt.distributed.utils as dist_utils
-
-        self._utils = dist_utils
-        self._saved = dist_utils.all_gather_single
-
-    def tearDown(self):
-        self._utils.all_gather_single = self._saved
-
-    def _run(self, gather):
-        self._utils.all_gather_single = gather
-        mooncake_all_gather_settling(None, None, group=None)
+def _run(gather):
+    mooncake_all_gather_settling(None, None, group=None, gather=gather)
 
 
-class TestQuietPathIsUntouched(_SettleCase):
+class TestQuietPathIsUntouched(CustomTestCase):
     def test_a_gather_that_succeeds_is_posted_once(self):
         gather = _Gather(refusals=0)
-        self._run(gather)
+        _run(gather)
         self.assertEqual(gather.calls, 1)
 
     def test_an_unrelated_runtime_error_is_not_retried(self):
         """Only the inactive refusal is ours to wait on; everything else propagates."""
         gather = _Gather(refusals=1, exc=RuntimeError("CUDA error: out of memory"))
-        self._utils.all_gather_single = gather
         with self.assertRaises(RuntimeError) as caught:
-            mooncake_all_gather_settling(None, None, group=None)
+            _run(gather)
         self.assertIn("out of memory", str(caught.exception))
         self.assertEqual(gather.calls, 1)
 
 
-class TestRefusalIsWaitedOut(_SettleCase):
+class TestRefusalIsWaitedOut(CustomTestCase):
     def test_the_gather_lands_once_the_view_settles(self):
         gather = _Gather(refusals=3)
-        self._run(gather)
+        _run(gather)
         self.assertEqual(gather.calls, 4)
 
     def test_a_view_that_never_settles_still_fails(self):
         """Loudly, and naming the condition rather than passing Mooncake's text up."""
         gather = _Gather(refusals=10**9)
-        self._utils.all_gather_single = gather
         saved = elastic_ep._GATHER_SETTLE_BUDGET_S
         elastic_ep._GATHER_SETTLE_BUDGET_S = 0.2
         try:
             with self.assertRaises(RuntimeError) as caught:
-                mooncake_all_gather_settling(None, None, group=None)
+                _run(gather)
         finally:
             elastic_ep._GATHER_SETTLE_BUDGET_S = saved
         message = str(caught.exception)
