@@ -154,6 +154,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
+from sglang.srt.sampling.overrides import apply_model_sampling_overrides
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -1487,6 +1488,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
+        sampling_kwargs = apply_model_sampling_overrides(
+            sampling_kwargs, self.model_config.hf_config.architectures
+        )
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
