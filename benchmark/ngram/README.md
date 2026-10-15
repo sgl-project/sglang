@@ -12,8 +12,8 @@ The dedicated source branch is `aaron/ngram-code-edit-benchmark`, based on
 preparation helper, and the raw-token corpus API fix required for matched inputs.
 
 This is the Baseten-inspired reconstruction, not an exact reproduction of the
-unpublished settings behind TRT PR #11434. The runner implements the comparison;
-GPU performance and output agreement still need to be measured.
+unpublished settings behind TRT PR #11434. The runner records performance and
+output agreement separately; speedups alone do not establish equivalent outputs.
 
 ## Use the prebuilt SGLang environment (recommended)
 
@@ -29,8 +29,8 @@ sglang-kernel 0.4.6.post1, TVM FFI 0.1.11, Transformers 5.12.1, and Tokenizers
 `check_env.py` verifies these installed versions, compiler tools, source import
 path, CUDA 13 PyTorch, and visibility of exactly one GPU before each launch.
 The published image still needs an initial download and a compatible host
-NVIDIA driver/container integration. Container execution has not yet been
-validated on the assigned H200.
+NVIDIA driver/container integration. Environment checks do not establish
+output equivalence; inspect the completed run's correctness reports too.
 
 First export `trt-inputs.json` in the existing TRT environment as described below.
 Then, on the host, set your assigned GPU UUID (obtain it with
@@ -254,6 +254,57 @@ its speedups, or a successful SGLang benchmark exit without strict comparison,
 as proof of equivalent outputs. Fixed-length output with EOS ignored does not
 measure edit correctness or natural stopping. The initial experiment exercises
 one external source; distractors/multiple SAMs require a separate workload.
+
+## Inspect output mismatches without rerunning inference
+
+From the host, inspect a completed result directory using Python's standard
+library. This reads the saved outputs and verifies that the summary agrees
+with them; it does not start a server or load model weights:
+
+```bash
+python3 benchmark/ngram/inspect_code_edit_mismatches.py \
+  "$BENCH_INPUTS_DIR/sglang-results-$BENCH_RUN_ID"
+```
+
+For decoded text around each first differing token, use the existing container
+and local tokenizer. Its normal environment preflight still runs, but the
+inspection itself performs no model inference:
+
+```bash
+bash benchmark/ngram/run_container.sh \
+  python benchmark/ngram/inspect_code_edit_mismatches.py \
+  "/work/sglang-results-$BENCH_RUN_ID" \
+  --model-path /work/model \
+  --output "/work/sglang-results-$BENCH_RUN_ID/mismatch-details.json"
+```
+
+The report contains unique affected task IDs, counts per repetition, same-mode
+repeatability, pairwise comparisons between modes, first differing token IDs,
+nearby token windows, and the original saved text. With `--model-path`, it also
+includes decoded windows and tokenizer pieces. Tokenizer metadata must match
+the saved input export. Special tokens are retained. Token IDs are authoritative:
+decoding a window can split a multi-token UTF-8 character.
+
+Use `--mode path_probability --task-id 17 --limit 3 --context-tokens 16` to
+focus the printed examples on an actual affected task ID. These filters do not
+remove data from the JSON report. Omit `--output` when repeating inspection,
+or choose a new filename; existing reports are never overwritten.
+
+For 100 requests and three repetitions, 27 mismatches means 27 of 300
+request/repetition pairs, not necessarily 27 distinct prompts. Counts divisible
+by three do not establish that the same prompts differ every time. Equal counts
+in two modes do not establish that their actual outputs agree.
+
+Greedy speculative decoding should emit the same tokens if the target model
+produces the same predictions for the same prefixes. NGRAM verifies against
+the target logits computed in a tree-shaped forward pass, whereas baseline
+uses ordinary decode passes. Numerical differences across execution shapes
+can change a near-tied argmax; a mask, position, cache, or acceptance bug can
+also cause divergence. Existing artifacts do not contain target logits or
+verification trees. Diagnosing the cause requires an instrumented replay at
+the first divergence, comparing the common prefix, scores, tree ancestry,
+positions, and KV state. Do not infer a harmless numerical explanation solely
+from a low mismatch rate or from all speculative modes agreeing.
 
 ## Local validation
 
