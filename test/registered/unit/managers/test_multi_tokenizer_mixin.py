@@ -1,3 +1,4 @@
+import asyncio
 import pickle
 import unittest
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
+    MultiTokenizerRouter,
     TokenizerWorker,
     _cached_output_fields,
     _handle_output_by_index,
@@ -544,6 +546,54 @@ class TestMultiTokenizerMixin(CustomTestCase):
             worker.multi_http_worker_event_loop()
 
         self.assertEqual(sent, [("worker-a", ["rid-0", "rid-1"])])
+
+    def test_tokenizer_router_sends_one_message_per_worker(self):
+        output = _handle_output_by_indices(_make_batch_token_id_output(), [0, 1, 0])
+        output.rids = ["token-rid-0", "token-rid-1", "token-rid-2"]
+        output.decoded_texts = ["first", "second", "third"]
+        output.http_worker_ipcs = ["worker-b", "worker-a", "worker-b"]
+        router = MultiTokenizerRouter.__new__(MultiTokenizerRouter)
+        sent = []
+        router.socket_mapping = SimpleNamespace(
+            send_output=lambda target, obj, is_tokenizer=False: sent.append(
+                (target, obj.rids, obj.decoded_texts, obj.http_worker_ipcs)
+            )
+        )
+
+        asyncio.run(router._distribute_result_to_workers(output))
+
+        self.assertEqual(
+            sent,
+            [
+                (
+                    "worker-b",
+                    ["token-rid-0", "token-rid-2"],
+                    ["first", "third"],
+                    ["worker-b", "worker-b"],
+                ),
+                ("worker-a", ["token-rid-1"], ["second"], ["worker-a"]),
+            ],
+        )
+
+    def test_tokenizer_router_sends_unsplittable_outputs_per_request(self):
+        output = _make_batch_embedding_output()
+        output.http_worker_ipcs = ["worker-a", "worker-a"]
+        abort = AbortReq(rid="abort-rid", http_worker_ipc="worker-b")
+        router = MultiTokenizerRouter.__new__(MultiTokenizerRouter)
+        sent = []
+        router.socket_mapping = SimpleNamespace(
+            send_output=lambda target, obj: sent.append((target, obj))
+        )
+
+        asyncio.run(router._distribute_result_to_workers(output))
+        asyncio.run(router._distribute_result_to_workers(abort))
+
+        self.assertEqual(
+            [(target, obj.rids) for target, obj in sent[:2]],
+            [("worker-a", ["embedding-rid-0"]), ("worker-a", ["embedding-rid-1"])],
+        )
+        self.assertEqual(sent[2][0], "worker-b")
+        self.assertIs(sent[2][1], abort)
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)
