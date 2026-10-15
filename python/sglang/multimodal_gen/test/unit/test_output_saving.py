@@ -1,3 +1,5 @@
+import shutil
+
 import numpy as np
 import pytest
 import torch
@@ -73,6 +75,24 @@ def test_png_output_saving_uses_fast_pillow_path(
     assert save_calls == [("PNG", expected_compress_level)]
 
 
+def test_warm_image_writer_takes_the_default_jpeg_path(tmp_path, monkeypatch):
+    written = []
+    imwrite = output_utils.imageio.imwrite
+
+    def imwrite_spy(path, frame, **kwargs):
+        written.append((path, kwargs))
+        return imwrite(path, frame, **kwargs)
+
+    monkeypatch.setattr(output_utils.imageio, "imwrite", imwrite_spy)
+    monkeypatch.setattr(output_utils.tempfile, "tempdir", str(tmp_path))
+
+    output_utils.warm_image_writer()
+
+    assert len(written) == 1
+    assert written[0][0].endswith(".jpg") and written[0][1] == {"quality": 75}
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
     output_path = tmp_path / "sample.mp4"
     calls = []
@@ -82,15 +102,15 @@ def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
         def write(*_args, **_kwargs):
             pass
 
-    def mimsave_spy(path, frames, **kwargs):
+    def encode_spy(path, frames, **kwargs):
         calls.append((path, frames, kwargs))
         assert kwargs["audio_path"].endswith(".wav")
-        assert kwargs["audio_codec"] == "aac"
+        assert kwargs["quality"] == 5
 
     def fail_legacy_mux(**_kwargs):
         raise AssertionError("the two-pass mux path should not run")
 
-    monkeypatch.setattr(output_utils.imageio, "mimsave", mimsave_spy)
+    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
     monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
     monkeypatch.setattr(output_utils, "_maybe_mux_audio_into_mp4", fail_legacy_mux)
 
@@ -110,6 +130,61 @@ def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_x264_preset_reaches_every_video_save_path(tmp_path, monkeypatch):
+    presets = []
+
+    class FakeWavFile:
+        @staticmethod
+        def write(*_args, **_kwargs):
+            pass
+
+    def parallel_save(samples, _paths, **kwargs):
+        presets.append(("parallel", kwargs["x264_preset"]))
+        return [False] * len(samples)
+
+    def direct_save(**kwargs):
+        presets.append(("direct", kwargs["x264_preset"]))
+        return False
+
+    def encode_spy(_path, _frames, **kwargs):
+        encoder = "single-pass" if "audio_path" in kwargs else "ffmpeg"
+        presets.append((encoder, kwargs["x264_preset"]))
+
+    monkeypatch.setattr(output_utils, "_try_save_cuda_videos_direct", parallel_save)
+    monkeypatch.setattr(output_utils, "_try_save_cuda_video_direct", direct_save)
+    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
+    monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
+
+    output_utils.save_outputs(
+        [torch.zeros((3, 1, 2, 3)), torch.zeros((3, 1, 2, 3))],
+        DataType.VIDEO,
+        fps=24,
+        save_output=True,
+        build_output_path=lambda idx: str(tmp_path / f"sample_{idx}.mp4"),
+        x264_preset="ultrafast",
+    )
+    save_materialized_output(
+        MaterializedOutput(
+            sample=None,
+            frames=[_rgb_frame()],
+            audio=np.zeros((320, 2), dtype=np.float32),
+            fps=24,
+        ),
+        DataType.VIDEO,
+        str(tmp_path / "with_audio.mp4"),
+        audio_sample_rate=32000,
+        x264_preset="ultrafast",
+    )
+
+    assert {encoder for encoder, _ in presets} == {
+        "parallel",
+        "direct",
+        "ffmpeg",
+        "single-pass",
+    }
+    assert {preset for _, preset in presets} == {"ultrafast"}
+
+
 def test_video_audio_single_pass_failure_falls_back(tmp_path, monkeypatch):
     output_path = tmp_path / "sample.mp4"
     calls = []
@@ -120,12 +195,12 @@ def test_video_audio_single_pass_failure_falls_back(tmp_path, monkeypatch):
         def write(*_args, **_kwargs):
             pass
 
-    def mimsave_spy(path, frames, **kwargs):
+    def encode_spy(path, frames, **kwargs):
         calls.append((path, frames, kwargs))
         if "audio_path" in kwargs:
             raise RuntimeError("unsupported audio input")
 
-    monkeypatch.setattr(output_utils.imageio, "mimsave", mimsave_spy)
+    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
     monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
     monkeypatch.setattr(
         output_utils,
@@ -243,3 +318,11 @@ def test_multiple_videos_use_parallel_direct_save_with_serial_fallback(
     assert kwargs["fps"] == 24
     assert len(serial_calls) == 1
     assert serial_calls[0]["save_file_path"] == paths[1]
+
+
+def test_video_output_preserves_pinned_encoder(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda _: "/system/ffmpeg")
+    monkeypatch.setattr(
+        output_utils.imageio_ffmpeg, "get_ffmpeg_exe", lambda: "/pinned/ffmpeg"
+    )
+    assert output_utils._resolve_ffmpeg_exe() == "/pinned/ffmpeg"

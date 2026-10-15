@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.distributed import parallel_state
@@ -26,21 +27,72 @@ logger = logging.getLogger(__name__)
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 
 
-def register_scale_cohort(rank_offset: int, target_ep_size: int) -> None:
+class ScaleCohort(msgspec.Struct, frozen=True, kw_only=True):
+    target_ep_size: int
+    cuda_graph_enabled: bool
+    attn_tp_size: int
+    attn_cp_size: int
+
+
+def register_scale_cohort(
+    rank_offset: int, target_ep_size: int, cuda_graph_enabled: bool
+) -> None:
     store = get_global_tcp_store()
     if store is None:
         raise RuntimeError("Elastic EP scale-up requires the global TCPStore.")
-    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", str(target_ep_size).encode())
+    parallel = get_parallel()
+    payload = msgspec.json.encode(
+        ScaleCohort(
+            target_ep_size=target_ep_size,
+            cuda_graph_enabled=cuda_graph_enabled,
+            attn_tp_size=parallel.attn_tp_size,
+            attn_cp_size=parallel.attn_cp_size,
+        )
+    )
+    store.set(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", payload)
 
 
-def get_scale_cohort_target(rank_offset: int) -> Optional[int]:
+def get_scale_cohort(rank_offset: int) -> Optional[ScaleCohort]:
     store = get_global_tcp_store()
     if store is None:
         return None
     key = f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}"
     if not store.check([key]):
         return None
-    return int(store.get(key).decode())
+    return msgspec.json.decode(store.get(key), type=ScaleCohort)
+
+
+def validate_scale_cohort_topology(cohort: ScaleCohort) -> None:
+    from sglang.srt.elastic_ep.topology import validate_matching_attention_topology
+
+    parallel = get_parallel()
+    validate_matching_attention_topology(
+        primary_attn_tp_size=parallel.attn_tp_size,
+        primary_attn_cp_size=parallel.attn_cp_size,
+        joining_attn_tp_size=cohort.attn_tp_size,
+        joining_attn_cp_size=cohort.attn_cp_size,
+    )
+
+
+def update_dp_attention_for_elastic_ep(
+    *, physical_ep_size: int, physical_ep_rank: int
+) -> int:
+    """Apply a physical EP topology to the logical DP-attention runtime."""
+    from sglang.srt.elastic_ep.topology import (
+        attn_replica_size,
+        physical_ep_rank_to_dp_rank,
+        physical_ep_size_to_dp_size,
+    )
+    from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+
+    replica_size = attn_replica_size()
+    dp_size = physical_ep_size_to_dp_size(physical_ep_size, replica_size)
+    update_dp_attention_post_scale(
+        new_dp_size=dp_size,
+        new_dp_rank=physical_ep_rank_to_dp_rank(physical_ep_rank, replica_size),
+    )
+    get_parallel().override_permanently(num_dp_ranks=dp_size)
+    return dp_size
 
 
 @dataclass
@@ -260,6 +312,17 @@ class ElasticEPStateManager:
         return inst.pending_ep_size
 
     @classmethod
+    def get_data_plane_ep_size(cls) -> int:
+        inst = cls._instance
+        assert inst is not None, "Elastic EP state is not initialized."
+        if inst.pending_ep_size is not None and inst.scale_phase in (
+            "configuring_data_plane",
+            "syncing_new_world",
+        ):
+            return inst.pending_ep_size
+        return inst.effective_ep_size
+
+    @classmethod
     def get_scale_phase(cls) -> str:
         inst = cls._instance
         if inst is None:
@@ -318,14 +381,7 @@ def elastic_expanded_world_enabled() -> bool:
         return False
     if get_parallel().max_ep_size is None:
         return False
-    active_target_size = inst.effective_ep_size
-    if inst.pending_ep_size is not None and inst.scale_phase in (
-        "configuring_data_plane",
-        "syncing_new_world",
-    ):
-        active_target_size = inst.pending_ep_size
-
-    return active_target_size > inst.original_ep_size
+    return ElasticEPStateManager.get_data_plane_ep_size() > inst.original_ep_size
 
 
 def _refresh_ep_members() -> None:
@@ -447,7 +503,7 @@ def get_healthy_expert_location_src_rank(
     *, invoked_in_elastic_ep_rejoin_path: bool
 ) -> int:
     world_group = get_parallel().world_group
-    # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+    # NOTE: do not key off the launch-time `ep_join_mode` here.
     # A rank that was started as a rejoin rank may later act as a healthy
     # rank in a subsequent recovery cycle.
     local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)

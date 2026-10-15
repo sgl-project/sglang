@@ -4,7 +4,7 @@ import gc
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -17,6 +17,7 @@ from typing import (
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
@@ -51,14 +52,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
-    ps: Any
-    dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
+    # Taken at construction: a batch can stop profiling while a scoped
+    # override has moved the TP group.
+    dp_tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
+        self.dp_tp_cpu_group = get_dp_tp_group().cpu_group
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
-                ps=self.ps,
                 cpu_group=self.dp_tp_cpu_group,
             )
             return
@@ -274,7 +276,7 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
+            if get_device().gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -287,7 +289,7 @@ class SchedulerProfilerManager:
 
         if get_parallel().tp_rank != 0:
             return ""
-        if self.ps.dp_size > 1 and get_parallel().dp_rank != 0:
+        if get_parallel().num_dp_ranks > 1 and get_parallel().dp_rank != 0:
             return ""
         if get_parallel().pp_size > 1 and get_parallel().pp_rank != 0:
             return ""
@@ -342,7 +344,7 @@ class SchedulerProfilerManager:
                 filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 
                 # Only add other ranks if parallelism is enabled (size > 1)
-                if self.ps.dp_size > 1:
+                if get_parallel().num_dp_ranks > 1:
                     filename_parts.append(f"DP-{get_parallel().dp_rank}")
                 if get_parallel().pp_size > 1:
                     filename_parts.append(f"PP-{get_parallel().pp_rank}")
@@ -387,7 +389,7 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
+            if get_device().gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()

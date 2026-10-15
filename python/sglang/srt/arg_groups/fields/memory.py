@@ -1,11 +1,4 @@
-"""Config fields of the ``memory`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``memory`` bag, which is what ``get_memory()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``memory`` namespace."""
 
 from __future__ import annotations
 
@@ -77,19 +70,18 @@ class Memory(msgspec.Struct):
     ] = False
     enable_page_major_kv_layout: A[
         bool,
-        "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
-        "KV caches in a page-granularity envelope (page is the outermost axis, "
-        "layer-major within a page) instead of the default per-layer "
-        "(layer-major) layout. Requires the Triton attention / linear-attn / "
-        "Mamba backends.",
+        "Store the Mamba state and full/SWA KV caches as one entry per token "
+        "slot, holding every layer's state, in a single page-granular buffer "
+        "instead of one buffer per layer. Implied by --enable-unified-memory, "
+        "and currently supported only with it.",
     ] = False
     enable_unified_memory: A[
         bool,
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
-        "sub-pools. Requires the Triton attention / linear-attn / Mamba "
-        "backends. Supported PD-disaggregation and speculative-decoding "
-        "configurations are validated at startup.",
+        "sub-pools. Requires stride-aware attention, linear-attention and Mamba "
+        "backends; the allowed backends and the supported PD-disaggregation and "
+        "speculative-decoding configurations are validated at startup.",
     ] = False
     enable_session_radix_cache: A[
         bool,
@@ -153,7 +145,7 @@ class Memory(msgspec.Struct):
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast, seaweedfs. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
@@ -167,6 +159,8 @@ class Memory(msgspec.Struct):
                 "simm",
                 "mori",
                 "shm",
+                "tensorcast",
+                "seaweedfs",
             ],
         ),
     ] = None

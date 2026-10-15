@@ -13,6 +13,7 @@ Covers warmup and cfg-parallel guard paths introduced alongside this file:
 All tests are CPU-only; no model loading, no distributed init.
 """
 
+import json
 import unittest
 from collections import deque
 from types import SimpleNamespace
@@ -27,9 +28,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
     LongLive2T2VConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    normalize_quality,
+)
+from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -59,6 +67,11 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
     should_include_warmup_image,
     supports_synthetic_warmup,
+)
+from sglang.multimodal_gen.test.server.gpu_cases import ONE_GPU_CASES, TWO_GPU_CASES
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    _get_extra_arg_value,
+    _with_warmup_quality,
 )
 
 
@@ -653,6 +666,134 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(num_frames, 17)
         pipeline_config.adjust_num_frames.assert_called_once_with(17)
 
+    def test_server_warmup_preserves_explicit_frames_without_cuda_graphs(self):
+        server_args = SimpleNamespace(
+            pipeline_config=LTX25PipelineConfig(),
+            enable_breakable_cuda_graph=False,
+            pipeline_class_name="LTX2Pipeline",
+            num_gpus=2,
+            warmup_num_frames=49,
+        )
+
+        num_frames = _resolve_warmup_num_frames(
+            server_args, LTX25SamplingParams(), server_based_warmup=True
+        )
+
+        self.assertEqual(num_frames, 57)
+
+    def test_sana_ci_warmup_matches_formal_shape(self):
+        case = next(case for case in ONE_GPU_CASES if case.id == "sana_wm_ti2v")
+        resolution = _get_extra_arg_value(
+            case.server_args.extras, "--warmup-resolutions"
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=SanaWMPipelineConfig(),
+            pipeline_class_name=None,
+            model_path=case.server_args.model_path,
+            model_id=None,
+            backend="sglang",
+            num_gpus=1,
+            warmup_steps=1,
+            warmup_num_frames=None,
+            warmup_sampling_params=None,
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_cfg_parallel=False,
+        )
+        with patch.object(
+            SamplingParams, "from_pretrained", return_value=SanaWMSamplingParams()
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=[resolution],
+                warmup_input_path="synthetic-warmup.png",
+                server_based_warmup=True,
+            )
+        self.assertEqual(resolution, case.sampling_params.output_size)
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual((reqs[0].width, reqs[0].height), (384, 640))
+        self.assertEqual(reqs[0].num_frames, case.sampling_params.num_frames)
+
+    def test_ci_warmup_runs_the_request_quality(self):
+        """A request below the server default level unmounts the fusions warmup
+        mounted, so its timed run takes an unwarmed path; warmup must match."""
+        for case in ONE_GPU_CASES + TWO_GPU_CASES:
+            request_quality = case.sampling_params.extras.get("quality")
+            if request_quality is None:
+                continue
+            warmup = _get_extra_arg_value(
+                case.server_args.extras, "--warmup-sampling-params"
+            )
+            self.assertIsNotNone(warmup, case.id)
+            self.assertEqual(
+                json.loads(warmup)["quality"],
+                normalize_quality(request_quality),
+                case.id,
+            )
+
+    def test_warmup_quality_merges_into_existing_warmup_params(self):
+        merged = _with_warmup_quality(
+            ["--load-x", """--warmup-sampling-params '{"num_frames": 9}'"""],
+            "exact",
+        )
+        self.assertEqual(
+            json.loads(_get_extra_arg_value(merged, "--warmup-sampling-params")),
+            {"num_frames": 9, "quality": "exact"},
+        )
+        self.assertEqual(merged[0], "--load-x")
+        kept = _with_warmup_quality(
+            ["""--warmup-sampling-params='{"quality": "lossless"}'"""], "exact"
+        )
+        self.assertEqual(
+            json.loads(_get_extra_arg_value(kept, "--warmup-sampling-params")),
+            {"quality": "lossless"},
+        )
+
+    def test_ltx25_ci_warmup_matches_formal_decoder_and_shape(self):
+        case = next(
+            case
+            for case in TWO_GPU_CASES
+            if case.id == "ltx_2_5_diffusion_decoder_2gpus"
+        )
+        extras = case.server_args.extras
+        server_args = SimpleNamespace(
+            pipeline_config=LTX25PipelineConfig(),
+            pipeline_class_name=None,
+            model_path=case.server_args.model_path,
+            model_id=None,
+            backend="sglang",
+            num_gpus=2,
+            warmup_steps=1,
+            warmup_num_frames=int(_get_extra_arg_value(extras, "--warmup-num-frames")),
+            warmup_sampling_params=_get_extra_arg_value(
+                extras, "--warmup-sampling-params"
+            ),
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_cfg_parallel=False,
+        )
+        resolution = _get_extra_arg_value(extras, "--warmup-resolutions")
+        with patch.object(
+            SamplingParams, "from_pretrained", return_value=LTX25SamplingParams()
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=[resolution],
+                warmup_input_path="synthetic-warmup.png",
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(len(reqs), 1)
+        req = reqs[0]
+        self.assertEqual(resolution, case.sampling_params.output_size)
+        self.assertEqual(server_args.warmup_num_frames, case.sampling_params.num_frames)
+        self.assertEqual((req.width, req.height, req.num_frames), (768, 448, 57))
+        self.assertEqual(
+            req.sampling_params.use_diffusion_decoder,
+            case.sampling_params.extras["use_diffusion_decoder"],
+        )
+        self.assertEqual(req.num_inference_steps, 2)
+
     def test_server_based_warmup_uses_video_supported_resolution_budget(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
@@ -772,6 +913,8 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_based_expected = {
             ModelTaskType.T2I: False,
             ModelTaskType.T2V: False,
+            ModelTaskType.V2V: False,
+            ModelTaskType.F2V: False,
             ModelTaskType.TI2I: True,
             ModelTaskType.TI2V: True,
             ModelTaskType.I2I: True,

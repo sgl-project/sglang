@@ -33,13 +33,14 @@ def create_flashinfer_kv_indices_triton(
     req_to_token_ptr_stride,
     ENTRY_PAGE_SIZE: tl.constexpr = 1,
     TOKEN_BLOCK_PARALLEL: tl.constexpr = False,
+    token_mapping=None,
 ):
     """Gather per-request token ids into a flat CSR kv_indices stream.
 
     ``ENTRY_PAGE_SIZE == 1`` (default): the source table is token-granular and
     entries are emitted verbatim -- byte-identical to the historical kernel.
     ``ENTRY_PAGE_SIZE == ps``: the source is the translator's PAGE-granular
-    read table (entries already kernel-facing page ids); token ids are rebuilt
+    read table (entries already physical page ids); token ids are rebuilt
     as ``token = entry * ps + pos % ps``, exact because converting an id keeps
     its offset inside the page.
     ``TOKEN_BLOCK_PARALLEL`` (default False): launched on a 2D grid
@@ -48,6 +49,7 @@ def create_flashinfer_kv_indices_triton(
     (which bottlenecks long-context spec decode, where this kernel runs every
     iteration). With the default, the kernel is the historical
     one-program-per-request loop and 1D launch sites are unaffected.
+    ``token_mapping`` remaps gathered token ids in the same pass, preserving -1.
     """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
@@ -95,6 +97,8 @@ def create_flashinfer_kv_indices_triton(
                 mask=mask,
             )
             data = entry.to(tl.int64) * ENTRY_PAGE_SIZE + pos % ENTRY_PAGE_SIZE
+        if token_mapping is not None:
+            data = tl.load(token_mapping + data, mask=mask & (data >= 0), other=-1)
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 

@@ -17,7 +17,6 @@ from sglang.srt.managers.load_snapshot import (
 from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
@@ -33,7 +32,6 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
     disaggregation_mode: DisaggregationMode
-    ps: ParallelState
     server_args: ServerArgs
     max_total_num_tokens: int
     max_running_requests: int
@@ -66,15 +64,15 @@ class SchedulerLoadInquirer:
         Args:
             chunk_deduct: extra tokens to subtract from the chunked request's
                 remaining count. At batch-scheduling time the current chunk
-                has been planned but ``prefix_indices`` does not yet include it,
+                has been planned but ``prefix_len`` does not yet include it,
                 so callers pass ``extend_input_len`` here. At load-reporting
-                time ``prefix_indices`` is already up-to-date, so the default
+                time ``prefix_len`` is already up-to-date, so the default
                 0 is correct.
         """
         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
         if self.get_chunked_req() is not None:
             req = self.get_chunked_req()
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+            num_pending_tokens += req.seqlen - req.prefix_len - chunk_deduct
         return num_pending_tokens
 
     def get_num_waiting_uncached_tokens(self) -> int:
@@ -91,7 +89,7 @@ class SchedulerLoadInquirer:
                 num_tokens += int(req.seqlen * cache_miss_rate)
         cr = self.get_chunked_req()
         if cr is not None:
-            num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
+            num_tokens += max(0, cr.seqlen - cr.prefix_len)
         return num_tokens
 
     def get_loads(self) -> LoadSnapshot:

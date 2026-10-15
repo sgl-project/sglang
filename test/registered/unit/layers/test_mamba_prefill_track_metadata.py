@@ -221,14 +221,19 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         )
         runner = SimpleNamespace(
             device="cpu",
+            is_draft_worker=False,
             model_config=SimpleNamespace(
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
-            kv_index_translator=SimpleNamespace(rebind_write_loc=lambda forward: None),
+            # A pass-through runner: its plan hands the batch its ids untouched.
+            kv_index_translator=SimpleNamespace(
+                own_plan=lambda batch: SimpleNamespace(
+                    bind=lambda batch, reader, cols=None: None
+                )
+            ),
             prefill_attention_backend_str="torch_native",
             ngram_embedding_manager=SimpleNamespace(enabled=False),
             lora_manager=None,
-            ps=SimpleNamespace(attn_dcp_size=1),
             attn_backend=SimpleNamespace(
                 get_cpu_graph_seq_len_fill_value=lambda: 1,
                 get_cuda_graph_seq_len_fill_value=lambda: 1,
