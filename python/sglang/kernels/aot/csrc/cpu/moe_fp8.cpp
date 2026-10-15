@@ -2,7 +2,7 @@
 #include "gemm.h"
 #include "moe.h"
 
-template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4, bool is_fp8_pertensor = false>
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4, bool is_fp8_pertensor>
 void fused_experts_fp_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
