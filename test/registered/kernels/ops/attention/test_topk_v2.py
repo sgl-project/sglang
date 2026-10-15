@@ -39,6 +39,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_packed_v2,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
+    topk_v2_plan_is_written,
 )
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -379,30 +380,69 @@ def _narrow_seed(dist, *rest):
     return seed
 
 
-# Longest row that never reaches the CUDA cluster path, which still truncates an
-# overflowing threshold bin (the smallest get_static_cluster_floor in topk_v2.cuh).
-CUDA_MAX_NON_CLUSTER_SEQ = 24576
+# Above the cluster floor and the persistent pool's cluster count on Hopper and
+# Blackwell, so every row goes to the persistent cluster kernel there.
+PERSISTENT_SHAPE = (40, 131072)
+
+
+def _assert_persistent_route(seq_lens):
+    """The plan is only written past the persistent pool's cluster count, so a
+    written plan that routes every row to the pool means the persistent kernel."""
+    assert topk_v2_plan_is_written(seq_lens)
+    assert _plan(seq_lens)[0, 1].item() == seq_lens.numel()
 
 
 @pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
-@pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 20480), (4, 32768), (4, 65536)])
+@pytest.mark.parametrize(
+    "batch,seq", [(6, 8192), (4, 20480), (4, 32768), (4, 65536), PERSISTENT_SHAPE]
+)
 @torch.inference_mode()
 def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> None:
     """No tolerance here: the threshold bin holds the whole row at k=2048, so a
     dropped candidate is a wrong answer rather than a tie swap. Covers
-    register-path and streaming-path shapes, and a ROCm split-path shape (above
-    split_floor); tie staging is per-template.
+    register-path and streaming-path shapes; on CUDA the two longest reach the
+    small-batch and persistent cluster kernels, on ROCm the split path (above
+    split_floor). Tie staging is per-template.
     """
-    if not is_hip() and seq > CUDA_MAX_NON_CLUSTER_SEQ:
-        pytest.skip("CUDA may route this shape to the unrefined cluster path")
     torch.manual_seed(_narrow_seed(dist, batch, seq))
     device = "cuda"
     k = 2048
     width = (seq + 3) & ~3
     scores = _single_bin_scores(dist, batch, width, device)[:, :seq]
     seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    if not is_hip() and (batch, seq) == PERSISTENT_SHAPE:
+        _assert_persistent_route(seq_lens)
 
     our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(
+        scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k, max_permit_error=0
+    )
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA persistent cluster kernel")
+@pytest.mark.parametrize("mode", ["page_table", "dual"])
+@torch.inference_mode()
+def test_topk_v2_persistent_overflow_page_modes(mode: str) -> None:
+    """Rows of the persistent pool whose threshold bin overflows, next to rows
+    whose bin does not, stay exact through the page-table (and raw) outputs."""
+    batch, seq = PERSISTENT_SHAPE
+    k = 2048
+    torch.manual_seed(_narrow_seed("narrow_bin", batch, seq, len(mode)))
+    device = "cuda"
+    scores = torch.randn(batch, seq, dtype=torch.float32, device=device)
+    scores[::2] = _single_bin_scores("narrow_bin", batch // 2, seq, device)
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    _assert_persistent_route(seq_lens)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device)
+
+    if mode == "page_table":
+        our_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
+    else:
+        transformed_raw, our_raw = _run_dual(scores, seq_lens, page_table, inv_cpu, k)
+        for row in range(batch):
+            assert sorted(transformed_raw[row]) == sorted(our_raw[row])
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(
         scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k, max_permit_error=0

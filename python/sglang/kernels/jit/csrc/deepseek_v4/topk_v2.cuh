@@ -483,6 +483,28 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
 }
 #endif  // USE_ROCM
 
+/// Written by the persistent cluster kernel into the last output slot (never a
+/// valid index there) when the row's threshold bin overflowed rank 0's tie buffer.
+inline constexpr int32_t kClusterRowDeferred = INT32_MIN;
+
+/// Waits for the persistent pool and says whether it left this row to
+/// topk_main_kernel; staging modes also stage the pool's row into `staged`.
+template <bool kPDL, TopKMode kMode>
+SGL_DEVICE bool cluster_row_deferred(const TopKPagedParams& params, uint32_t batch_id, int32_t* staged) {
+  device::PDLWaitPrimary<kPDL>();
+  // Before the row is read: triggering after it delays the dependent launch
+  // (+4% back to back at 128 rows on B300).
+  device::PDLTriggerSecondary<kPDL>();
+  const auto row = params.get_output_ptr(batch_id);
+  if constexpr (kMode == TopKMode::INDICES) {
+    return row[params.topk - 1] == kClusterRowDeferred;
+  } else {
+    for_each_item(params.topk, [&](uint32_t tx, uint32_t) { staged[tx] = row[tx]; });
+    __syncthreads();
+    return staged[params.topk - 1] == kClusterRowDeferred;
+  }
+}
+
 /**
  * \brief Main kernel for the short items and epilogue of long items.
  * \tparam kPDL whether to use PDL to synchronize with the cluster kernel (if any)
@@ -527,26 +549,17 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
     static_assert(kLevel == 2 || kLevel == 3, "we only support level = 0,1,2,3 now");
     if (problem.seq_len <= kReg4MaxSeqLen) {
       Register4::forward<kPDLEarly>(problem, &smem);
-    } else if (problem.seq_len <= cluster_threshold) {
+    } else if (
+        problem.seq_len <= cluster_threshold || cluster_row_deferred<kPDLFinal, kMode>(params, bx, s_topk_indices)) {
       Streaming::forward<kPDLEarly>(problem, &smem);
     } else [[unlikely]] {
-      // Cluster path: the pool already selected into our output row; the only
-      // work left is the epilogue, so this is the one path that waits for it.
+      // Cluster path: the pool already selected into our output row, which
+      // cluster_row_deferred (the one path that waits for the pool) staged; the
+      // only work left is the epilogue.
       if constexpr (kNeedStaging) {
-        device::PDLWaitPrimary<kPDLFinal>();
-        problem.out = params.get_output_ptr(bx);  // in-place transform
-        device::PDLTriggerSecondary<kPDL>();
-        if constexpr (kMode == TopKMode::KPOOL) {
-          for_each_item(problem.topk, [&](uint32_t tx, uint32_t) { s_topk_indices[tx] = problem.out[tx]; });
-          __syncthreads();
-          const auto out = problem.out;
-          problem.out = s_topk_indices;
-          return paged_transform<kMode>(problem, out, params.template get_transform<kMode>(bx));
-        }
-        return paged_transform<kMode>(problem, problem.out, params.template get_transform<kMode>(bx));
-      } else {
-        return device::PDLTriggerSecondary<kPDL>();
+        return paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
       }
+      return;
     }
   }
 
@@ -593,7 +606,9 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
   while (idx >= 0) {
     const auto it = params.item(idx);
     const auto problem = params.problem(it.batch_id, it.seq_len);
-    ClusterN::template forward<false>(problem, &smem);
+    // topk_main_kernel redoes an overflowing row; only rank 0 returns true.
+    const bool overflow = ClusterN::template forward</*kUsePDL=*/false>(problem, &smem);
+    if (overflow && threadIdx.x == 0) problem.out[problem.topk - 1] = kClusterRowDeferred;
     idx -= kNumPersistentClusters;
     if (idx >= 0) __syncthreads();
   }
@@ -624,24 +639,31 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
   if (problem.seq_len <= kReg4MaxSeqLen) {
     if (by != worker_rank) return;
     Register4::forward<kPDL>(problem, &smem);
-  } else if (problem.seq_len <= params.static_cluster_floor) {
-    if (by != worker_rank) return;
-    Streaming::forward<kPDL>(problem, &smem);
   } else {
-    auto cluster = cooperative_groups::this_cluster();
-    if constexpr (kNeedStaging) {
-      problem.out = cluster.map_shared_rank(s_topk_indices, 0);
-    }
-    ClusterN::forward<kPDL>(problem, &smem);
-    if constexpr (kNeedStaging) {
+    if (problem.seq_len > params.static_cluster_floor) {
+      auto cluster = cooperative_groups::this_cluster();
+      const auto stage_out = problem.out;
+      if constexpr (kNeedStaging) {
+        problem.out = cluster.map_shared_rank(s_topk_indices, 0);
+      }
+      // Rank 0 redoes an overflowing row below. The sync keeps the redo off smem
+      // and output the peers may still use; their staged writes get overwritten,
+      // but INDICES ones would race with it, so there the peers skip them too.
+      const bool overflow = ClusterN::template forward<kPDL, /*kPeersDefer=*/!kNeedStaging>(problem, &smem);
       device::PDLTriggerSecondary<kPDL>();
-      cluster.sync();
+      if (kNeedStaging || overflow) cluster.sync();
       if (by != 0) return;
-      problem.out = s_topk_indices;
-      return paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
-    } else {
-      return device::PDLTriggerSecondary<kPDL>();
+      problem.out = stage_out;
+      if (!overflow) [[likely]] {
+        if constexpr (kNeedStaging) {
+          return paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
+        }
+        return;
+      }
+    } else if (by != worker_rank) {
+      return;
     }
+    Streaming::forward<kPDL>(problem, &smem);
   }
 
   device::PDLTriggerSecondary<kPDL>();
