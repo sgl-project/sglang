@@ -2010,26 +2010,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
             if return_indices:
                 topk_result = torch.full(
-                    (x.shape[0], self.index_topk),
+                    (x_meta.shape[0], self.index_topk),
                     -1,
-                    device=x.device,
+                    device=x_meta.device,
                     dtype=torch.int32,
                 )
             else:
                 topk_result = torch.empty(
-                    (0, self.index_topk), device=x.device, dtype=torch.int32
+                    (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
             graph_dispatch_fn = (
                 bcg_dsa_indexer_prefill_split
                 if is_in_breakable_cuda_graph()
                 else pcg_dsa_indexer_prefill_split
             )
+            # ROCm aiter fused RMSNorm+quant hands over (x, x_s[, x_bf16]).
+            x_parts = x if isinstance(x, tuple) else (x,)
             graph_dispatch_fn(
                 layer_id=layer_id,
-                x=x,
+                x=x_parts[0],
                 q_lora=q_lora,
                 positions=positions,
                 topk_result=topk_result,
+                x_s=x_parts[1] if len(x_parts) > 1 else None,
+                x_bf16=x_parts[2] if len(x_parts) > 2 else None,
             )
             result = _broadcast_indexer_topk_from_rank0(
                 topk_result if return_indices else None
