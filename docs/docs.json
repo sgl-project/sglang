@@ -1518,6 +1518,7 @@
                   {
                     "group": "FLUX",
                     "pages": [
+                      "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
                     ]
                   },
