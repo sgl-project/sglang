@@ -3,5 +3,6 @@
 
 //! Client protocols served by converting to and from chat completions.
 
+pub(crate) mod anthropic;
 pub(crate) mod responses;
 pub(crate) mod sse;

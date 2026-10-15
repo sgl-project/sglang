@@ -474,6 +474,18 @@ def _install_parallel_properties() -> None:
 _install_parallel_properties()
 
 
+def linear_attn_parallel_group() -> str:
+    """The group linear attention partitions its heads over: the attention-TP
+    group, or the TP group under CP-TP group sharing, where the attention-TP
+    group is one rank wide."""
+    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+
+
+def linear_attn_tp_size() -> int:
+    """The width of ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -632,7 +644,6 @@ class Resources(_FlagGroupBase):
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = msgspec.field(default_factory=dict)
-    flashinfer_megamoe_workspaces: dict = msgspec.field(default_factory=dict)
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None
@@ -670,11 +681,9 @@ class ForwardFlags:
         "is_extend_in_batch": False,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
-        # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
         # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
         # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
         # defer_moe_finalize: next layer's fused collective absorbs the finalize.
-        "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
         "defer_moe_finalize": False,
@@ -683,6 +692,10 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # This forward's MoE runs on attention-TP-local token slices (the
+        # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
+        # that slices); read by the benchmark routing override.
+        "attn_tp_sequence_sharded": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -694,12 +707,12 @@ class ForwardFlags:
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
-            "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "attn_tp_sequence_sharded",
         }
     )
 
@@ -1491,6 +1504,37 @@ def publish(
     (bags re-projected, provenance reset, role overwritten), which is what
     lets one process rebuild an engine after shutting the previous one down.
     """
+    return _configure_context(_CONTEXT, server_args, role=role, ranks=ranks)
+
+
+def create_context(
+    server_args, *, role: str, ranks: SpawnRanks | None = None
+) -> RuntimeContext:
+    """Build a model-owned context without replacing the active process config."""
+    context = RuntimeContext(parallel=ParallelContext())
+    return _configure_context(context, server_args, role=role, ranks=ranks)
+
+
+@contextmanager
+def use_context(context: RuntimeContext):
+    """Activate a model context for serialized embedded SRT work.
+
+    Like process group scopes, this changes process globals and requires the
+    caller to serialize model execution. It does not isolate concurrent threads.
+    The previous context is restored by identity without re-projecting its bags.
+    """
+    global _CONTEXT, _PARALLEL
+    previous_context, previous_parallel = _CONTEXT, _PARALLEL
+    _CONTEXT, _PARALLEL = context, context.parallel
+    try:
+        yield context
+    finally:
+        _CONTEXT, _PARALLEL = previous_context, previous_parallel
+
+
+def _configure_context(
+    context, server_args, *, role: str, ranks: SpawnRanks | None = None
+) -> RuntimeContext:
     if _ROLE_NS_MODE == "enforce" and role not in ROLE_NAMESPACE_SETS:
         # Fail closed at publish time, not at the first stray read.
         raise ValueError(
@@ -1498,8 +1542,8 @@ def publish(
             "its namespace set (None for the full tree)."
         )
     server_args.resolve_once()
-    discarded = _CONTEXT.overrides_log()
-    _CONTEXT.set_server_args(server_args)
+    discarded = context.overrides_log()
+    context.set_server_args(server_args)
     if discarded:
         logger.warning(
             "publish(role=%s) re-projected the config bags and dropped %d "
@@ -1510,16 +1554,16 @@ def publish(
                 f"{source}({', '.join(sorted(fields))})" for source, fields in discarded
             ),
         )
-    _CONTEXT._publish_role = role
+    context._publish_role = role
     # Disabled DCP has rank zero even in processes without a rank bundle.
-    if not _CONTEXT.parallel.dcp_enabled:
-        _CONTEXT.parallel.override_permanently(attn_dcp_rank=0)
+    if not context.parallel.dcp_enabled:
+        context.parallel.override_permanently(attn_dcp_rank=0)
     # The device is assigned by the launcher; it is not a config field.
-    _CONTEXT.config_bag("device")._set(
+    context.config_bag("device")._set(
         "gpu_id", ranks.gpu_id if ranks is not None else None
     )
     if ranks is not None:
-        parallel = _CONTEXT.parallel
+        parallel = context.parallel
         placement = derive_spawn_ranks(
             world_rank=ranks.world_rank,
             tp_size=parallel.tp_size,
@@ -1553,7 +1597,7 @@ def publish(
             file=sys.stderr,
             flush=True,
         )
-    return _CONTEXT
+    return context
 
 
 def _attention_ranks(parallel, tp_rank: int) -> dict:
@@ -1775,9 +1819,11 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_npu": "is_npu",
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
+    "is_mps": "is_mps",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+    "is_sm110": "is_sm110_supported",
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
@@ -1994,13 +2040,12 @@ def exports_expert_balancedness_to_prometheus() -> bool:
 
 
 def cutedsl_moe_max_num_tokens() -> int:
-    """The CuteDSL A2A per-rank token budget.
+    """Largest token count one forward routes through a CuteDSL MoE layer on one
+    DP rank; sizes the standard-allgather wrapper, MegaMoE, and AR fusion buffers.
 
     Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
-    this derives from the bags and follows a post-publish override;
-    ``overrides.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
-    resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
-    capture, and the decode/verify bound.
+    this follows a post-publish override. Max over the prefill bound, the
+    piecewise-prefill capture, and the decode/verify bound.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -2061,6 +2106,12 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # socket; present iff
                                               # load_endpoint_port_base
                                               # is present
+            "replay_endpoint_port_base": 5558,
+                                              # ROUTER replay port; rank r
+                                              # = base + r, same host rule
+                                              # as the SUB endpoints;
+                                              # present only when
+                                              # replay_endpoint is tcp
         }
 
     Returns None (i.e. "no publisher to describe") when any of:
@@ -2135,4 +2186,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     if resolved_range is not None:
         descriptor["load_endpoint_port_base"] = resolved_range[1]
         descriptor["load_topic"] = LOAD_TOPIC
+    resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
+    if resolved_replay is not None:
+        descriptor["replay_endpoint_port_base"] = resolved_replay[1]
     return descriptor

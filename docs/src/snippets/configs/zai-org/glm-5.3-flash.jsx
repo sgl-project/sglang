@@ -1,7 +1,7 @@
 export const config = {
   modelName: "GLM-5.3-Flash",
 
-  supportedHardware: ["gb300", "h100", "h200", "b200", "b300", "gb200", "mi355x"],
+  supportedHardware: ["b300", "gb300", "h100", "h200", "b200", "gb200", "mi355x"],
 
   matchDims: [
     {
@@ -91,6 +91,22 @@ export const config = {
             "--dsa-decode-backend tilelang",
           ],
         },
+        // Order matters: a disabled pick is re-seated onto the first enabled
+        // option, so this entry must stay after BF16 + TileLang to keep the
+        // Hopper default unchanged.
+        {
+          id: "bf16-q8-prefill",
+          label: "BF16 + Q8 sparse prefill",
+          disabled: (s) => !["h100", "h200"].includes(s.hw),
+          disableReason: "The Q8KV8 sparse prefill kernel is SM90-only (Hopper).",
+          stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
+          flags: [
+            "--kv-cache-dtype bfloat16",
+            "--dsa-prefill-backend flashmla_sparse_q8",
+            "--dsa-decode-backend tilelang",
+          ],
+          hints: ["Measured on H200: higher prefill throughput than BF16 + TileLang; requires a build with PR #41790."],
+        },
       ],
     },
     {
@@ -136,12 +152,11 @@ export const config = {
           label: "L1 + L2",
           subtitle: "Host memory",
           flags: (s) => s.hw === "mi355x"
-            ? ["--enable-hierarchical-cache", "--hicache-ratio 0.50",
-              "--hicache-write-policy write_through", "--hicache-io-backend direct",
-              "--hicache-mem-layout page_first_direct"]
+            ? ["--enable-hierarchical-cache", "--hicache-size 180",
+              "--hicache-write-policy write_through"]
             : ["--enable-hierarchical-cache", "--hicache-size 32"],
           hints: (s) => s.hw === "mi355x"
-            ? ["Host cache matches the measured 0.50-ratio, write-through MI355X recipe; check available RAM."]
+            ? ["About 750 GB of host memory per node; the measured MI355X agentic recipe."]
             : ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
@@ -271,7 +286,16 @@ sgl-eval run gsm8k \\
             ],
           },
         ]},
-        { id: "cp", label: "CP", values: [null, 1, 2, 4] },
+        {
+          id: "cp", label: "CP",
+          values: [null, 1, 2, 4, {
+            value: 8,
+            disable: { hw: ["gb300", "gb200", "h100", "h200", "mi355x"] },
+            disableReason: "CP=8 is available on the eight-GPU B200 and B300 recipes. Set TP=8 first.",
+          }],
+          disable: { pdMode: ["prefill", "decode"] },
+          disableReason: "GLM-5.3-Flash CP/TP group sharing does not support PD disaggregation. Set PD mode to Off to enable CP.",
+        },
         {
           id: "dpAttn",
           label: "DP-Attention",
@@ -304,6 +328,13 @@ sgl-eval run gsm8k \\
         options: [
           { id: null, label: "Inherited" },
           {
+            id: "flashinfer_trtllm",
+            label: "flashinfer_trtllm",
+            flags: ["--moe-runner-backend flashinfer_trtllm"],
+            disable: { hw: ["h100", "h200", "mi355x"] },
+            disableReason: "Use flashinfer_trtllm on B200, B300, GB200 or GB300; Hopper uses DeepGemm and MI355X uses AITER.",
+          },
+          {
             id: "deep_gemm",
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
@@ -317,8 +348,8 @@ sgl-eval run gsm8k \\
           },
         ],
       },
-      ep: { label: "EP", values: [
-        null, 2, 4,
+      ep: { label: "EP", matchCp: true, denseTpMatchesCp: true, values: [
+        null, 1, 2, 4,
         {
           value: 8,
           disable: [
@@ -329,6 +360,19 @@ sgl-eval run gsm8k \\
           ],
         },
       ]},
+    },
+
+    pdDisagg: {
+      modes: [
+        { id: "off", label: "Off" },
+        { id: "prefill", label: "Prefill",
+          stripFlags: ["--attn-cp-size", "--enable-prefill-cp", "--cp-strategy"] },
+        { id: "decode", label: "Decode",
+          stripFlags: ["--attn-cp-size", "--enable-prefill-cp", "--cp-strategy"] },
+      ],
+      transferBackends: [{ id: "mooncake", label: "Mooncake" }],
+      notes: [{ mode: ["prefill", "decode"], when: { pdMode: ["prefill", "decode"] },
+        text: "PD serving is a preview. Prefill CP is disabled: CP/TP group sharing cannot currently transfer the KDA state between PD workers." }],
     },
 
     parsers: {
@@ -394,9 +438,32 @@ sgl-eval run gsm8k \\
   },
 
   cells: [
-    // Four MI355X VFs, TP4/EP4. The fixed-source AgentX comparison also used
-    // HiCache L2 and CPU multimodal transport. These cookbook commands are
-    // supported starting points, not post-merge measurements of every overlay.
+    // The first cell seeds both widgets on a fresh page load.
+    {
+      match: { hw: "b300", strategy: "low-latency", quant: "fp8" },
+      nnodes: 1,
+      verified: true,
+      verificationStatus: (s) =>
+        s.bcg !== "off" ? "unverified" : (s.hicache === "off" ? "in-progress" : "unverified"),
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--dsa-prefill-backend trtllm",
+        "--dsa-decode-backend trtllm",
+        "--kv-cache-dtype fp8_e4m3",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // Four MI355X VFs, TP4/EP4. The MXFP4 Low Latency chunk and memory fraction
+    // come from AgentX with the 180 GB/rank HiCache L2 tier; the other cells
+    // are supported starting points, not measurements of every overlay.
     {
       match: { hw: "mi355x", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
@@ -445,9 +512,9 @@ sgl-eval run gsm8k \\
         "--quantization quark",
         "--tp-size 4", "--ep-size 4",
         "--page-size 64",
-        "--mem-fraction-static 0.82", "--max-running-requests 96",
+        "--mem-fraction-static 0.85", "--max-running-requests 96",
         "--cuda-graph-max-bs-decode 96", "--min-free-slots-delay 1",
-        "--chunked-prefill-size 8192", "--max-prefill-tokens 8192",
+        "--chunked-prefill-size 65536", "--max-prefill-tokens 65536",
         "--prefill-decode-interval 0",
         "--dsa-prefill-backend tilelang", "--dsa-decode-backend tilelang",
         "--linear-attn-verify-backend triton", "--kv-cache-dtype fp8_e4m3",
@@ -928,7 +995,9 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        ["off", "l2"].includes(s.hicache)
+          ? (s.kvDsaPair === "bf16-q8-prefill" ? "in-progress" : "verified")
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -976,7 +1045,9 @@ sgl-eval run gsm8k \\
       verified: true,
       verificationStatus: (s) =>
         s.bcg !== "off" ? "unverified" :
-        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
+        ["off", "l2"].includes(s.hicache)
+          ? (s.kvDsaPair === "bf16-q8-prefill" ? "in-progress" : "verified")
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1027,28 +1098,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b300", strategy: "low-latency", quant: "fp8" },
-      nnodes: 1,
-      verified: true,
-      verificationStatus: (s) =>
-        s.bcg !== "off" ? "unverified" : (s.hicache === "off" ? "in-progress" : "unverified"),
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp-size 8",
-        "--dsa-prefill-backend trtllm",
-        "--dsa-decode-backend trtllm",
-        "--kv-cache-dtype fp8_e4m3",
-        "--moe-runner-backend flashinfer_trtllm",
-        "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 5",
-        "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 6",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

@@ -10,7 +10,7 @@ use super::{
     call_item, custom_input, failed_error, message_item, new_id, now_secs, output_text_part,
     reasoning_item, response_object, usage_from_chat, EchoContext, Finish,
 };
-use crate::protocol::sse::{data_payload, write_event, LineBuffer, SseTransducer};
+use crate::protocol::sse::{data_payload, write_event, Data, LineBuffer, SseTransducer};
 
 enum Open {
     Reasoning {
@@ -77,8 +77,10 @@ impl ResponsesStream {
         if self.terminal {
             return;
         }
-        let Some(chunk) = data_payload(line) else {
-            return;
+        let chunk = match data_payload(line) {
+            Some(Data::Json(chunk)) => chunk,
+            // [DONE] and non-JSON lines are left to `finish`, as before.
+            _ => return,
         };
         self.ensure_started(out);
         if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
