@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.utils import compute_num_reserved_tokens
@@ -27,7 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 def _build_server_args(
-    scheduler: Scheduler, *, extension: Optional[ModuleType] = None
+    scheduler: Scheduler,
+    *,
+    extension: Optional[ModuleType] = None,
+    health_generate_headers: Optional[Dict[str, str]] = None,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -74,6 +77,7 @@ def _build_server_args(
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        health_generate_headers=dict(health_generate_headers or {}),
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(

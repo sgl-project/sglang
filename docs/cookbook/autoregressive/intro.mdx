@@ -64,7 +64,7 @@ metatags:
   <Card
     title="Meta"
     mode="card"
-    href="/cookbook/autoregressive/Meta/MuseGlimmer"
+    href="/cookbook/autoregressive/Meta/MuseSparkOpen"
     img="/cards/logos/meta.png"
   />
   <Card
@@ -106,7 +106,7 @@ metatags:
   <Card
     title="NVIDIA"
     mode="card"
-    href="/cookbook/autoregressive/NVIDIA/Nemotron3.5-Lightning"
+    href="/cookbook/autoregressive/NVIDIA/Nemotron3.5-Super"
     img="/cards/logos/nvidia.png"
   />
   <Card
