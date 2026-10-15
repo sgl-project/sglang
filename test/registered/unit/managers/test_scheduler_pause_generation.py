@@ -183,7 +183,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             PendingStep(
                 step=step,
                 result=result,
-                slot=scheduler.flat_slot,
                 launch_ts=0.0,
                 after_idle_gap=False,
             )
@@ -464,7 +463,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         event_log: List[str] = []
 
-        def process_result(batch, result, slot):
+        def process_result(batch, result):
             self.assertFalse(scheduler.pending)
             event_log.append("drain")
 
@@ -536,9 +535,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-                scheduler.process_batch_result.assert_called_once_with(
-                    batch, result, scheduler.flat_slot
-                )
+                scheduler.process_batch_result.assert_called_once_with(batch, result)
                 self.assertFalse(scheduler.pending)
 
     def test_pd_decode_retract_requeues_for_rebootstrap(self):

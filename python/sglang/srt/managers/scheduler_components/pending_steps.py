@@ -21,7 +21,6 @@ from typing import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
     from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
 
 
@@ -29,8 +28,6 @@ if TYPE_CHECKING:
 class PendingStep:
     step: ScheduleBatch
     result: Union[GenerationBatchResult, EmbeddingBatchResult]
-    # The slot it was scheduled for; its commit reopens that slot's admission.
-    slot: ScheduleSlot
     # Launch stamps: when the step launched, and whether the scheduler
     # launched nothing in the iteration before.
     launch_ts: float

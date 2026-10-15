@@ -1801,7 +1801,6 @@ class Scheduler:
         record = PendingStep(
             step=step,
             result=result,
-            slot=slot,
             launch_ts=launch_ts,
             after_idle_gap=after_idle_gap,
         )
@@ -1843,7 +1842,7 @@ class Scheduler:
 
     def commit_step(self, record: PendingStep) -> None:
         """The host commit of one launched step, popped from pending."""
-        self.process_batch_result(record.step, record.result, record.slot)
+        self.process_batch_result(record.step, record.result)
         self.step_counters.record(record)
 
     def leave_finished_reqs(self) -> None:
@@ -2619,7 +2618,6 @@ class Scheduler:
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        slot: ScheduleSlot,
     ):
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.

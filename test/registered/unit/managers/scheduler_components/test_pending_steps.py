@@ -1,7 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import (
     PendingStep,
     PendingSteps,
@@ -22,7 +21,6 @@ def _record(reqs, mode=ForwardMode.DECODE, chunked_req=None):
     return PendingStep(
         step=step,
         result=None,
-        slot=ScheduleSlot(),
         launch_ts=0.0,
         after_idle_gap=False,
     )

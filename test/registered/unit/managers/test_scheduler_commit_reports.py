@@ -67,7 +67,7 @@ class TestCommitReports(CustomTestCase):
             patch.object(scheduler_mod, "flush_trace_batch"),
             patch.object(scheduler_mod, "commit_step_counters"),
         ):
-            s.process_batch_result(batch, result, "slot")
+            s.process_batch_result(batch, result)
         names = [c[0] for c in order.mock_calls]
         return s, batch, order, names
 
