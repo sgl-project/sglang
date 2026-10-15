@@ -37,7 +37,7 @@ RUN cd /sgl-workspace/sglang \
 
 Pick your hardware to generate the launch command:
 
-- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. Verified on H200 and GB300; H20-3e, H800, H100, and B200 recipes are provided unverified. AMD MI325X and MI350X recipes (TP8 + EP8 with AITER, without speculative decoding) are provided unverified; the MI325X accuracy in the benchmark card was measured by AMD.
+- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. Verified on H200 and GB300; H20-3e, H800, H100, and B200 recipes are provided unverified. On AMD MI300X/MI325X (gfx942) and MI350X/MI355X (gfx950), use the TP8 + EP8 AITER recipe (without speculative decoding). AMD MI325X and MI350X recipes (TP8 + EP8 with AITER, without speculative decoding) are provided unverified; the MI325X accuracy in the benchmark card was measured by AMD.
 
 For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. The combination is verified: prefix hits return from Mooncake L3 on every TP rank.
 

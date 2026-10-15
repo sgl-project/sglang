@@ -1,6 +1,6 @@
 export const config = {
   modelName: "Ling-3.1-flash",
-  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300", "mi325x", "mi350x"],
+  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300", "mi300x", "mi325x", "mi350x", "mi355x"],
   groupHardware: false,
   variants: [{ id: "default", label: "Ling-3.1-flash" }],
   quantizations: [{ id: "fp8", label: "FP8" }],
@@ -17,7 +17,7 @@ export const config = {
     CURL_PORT: { target: "curl", label: "Server port", default: "30000" },
   },
   curl: "curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"model\":\"{{MODEL_NAME}}\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 15% of 240?\"}]}'",
-  dockerImages: { "h20-3e": "lmsysorg/sglang:dev-ling-3.1-flash", h200: "lmsysorg/sglang:dev-ling-3.1-flash", h800: "lmsysorg/sglang:dev-ling-3.1-flash", h100: "lmsysorg/sglang:dev-ling-3.1-flash", b200: "lmsysorg/sglang:dev-ling-3.1-flash", gb300: "lmsysorg/sglang:dev-ling-3.1-flash", mi325x: "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi30x-20261013", mi350x: "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261013" },
+  dockerImages: { "h20-3e": "lmsysorg/sglang:dev-ling-3.1-flash", h200: "lmsysorg/sglang:dev-ling-3.1-flash", h800: "lmsysorg/sglang:dev-ling-3.1-flash", h100: "lmsysorg/sglang:dev-ling-3.1-flash", b200: "lmsysorg/sglang:dev-ling-3.1-flash", gb300: "lmsysorg/sglang:dev-ling-3.1-flash", mi300x: "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi30x-20261011", mi325x: "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi30x-20261011", mi350x: "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011", mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261011" },
   dockerHostNetworkWhen: (_sel, { flags }) =>
     flags.some((flag) => flag === "--hicache-storage-backend mooncake"),
   benchmarkCommands: {
@@ -86,7 +86,7 @@ export const config = {
             id: "deep_gemm",
             label: "DeepGEMM",
             flags: ["--moe-runner-backend deep_gemm"],
-            hide: { hw: ["mi325x", "mi350x"] },
+            hide: { hw: ["mi300x", "mi325x", "mi350x", "mi355x"] },
           },
           {
             id: "aiter",
@@ -242,6 +242,24 @@ export const config = {
       ],
     },
     {
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "Same TP8+EP8 AITER recipe as MI325X (both gfx942); not independently qualified. Requires the ROCm gated-MLA fix, which the listed nightly image predates; see [Install SGLang](#install).",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--ep 8",
+        "--mem-fraction-static 0.8",
+        "--moe-runner-backend aiter",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-backend-prefill disabled",
+        "--cuda-graph-bs-decode 1 2 4 8 16 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       warn: "AMD-validated recipe, not rerun by SGLang. Requires the ROCm gated-MLA fix, which the listed nightly image predates; see [Install SGLang](#install).",
@@ -263,6 +281,24 @@ export const config = {
       match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       warn: "Same TP8+EP8 AITER recipe as MI325X with the gfx950 image; Ling-3.1-flash has not been qualified on this GPU. Requires the ROCm gated-MLA fix, which the listed nightly image predates; see [Install SGLang](#install).",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--ep 8",
+        "--mem-fraction-static 0.8",
+        "--moe-runner-backend aiter",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-backend-prefill disabled",
+        "--cuda-graph-bs-decode 1 2 4 8 16 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "Same TP8+EP8 AITER recipe as MI325X with the gfx950 MI35X image; bring-up only, not qualified. Requires the ROCm gated-MLA fix, which the listed nightly image predates; see [Install SGLang](#install).",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
