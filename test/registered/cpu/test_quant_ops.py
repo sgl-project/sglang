@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
 
 
 def _dequant_fp8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -64,6 +64,22 @@ class TestCPUQuantOps(CustomTestCase):
         self.assertIs(returned_scale, static_scale)
         torch.testing.assert_close(
             static_q.float(),
+            torch.clamp(x.float() / static_scale, -448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .float(),
+        )
+
+    def test_static_quant_fp8_cpu_3d(self):
+        """Regression: CPU static quant must preserve ndim >= 2 input shapes."""
+        x = torch.randn(2, 3, 64, dtype=torch.bfloat16) / 4
+        static_scale = torch.tensor([0.01], dtype=torch.float32)
+
+        q, returned_scale = static_quant_fp8(x, static_scale)
+
+        self.assertEqual(q.shape, x.shape)
+        self.assertIs(returned_scale, static_scale)
+        torch.testing.assert_close(
+            q.float(),
             torch.clamp(x.float() / static_scale, -448.0, 448.0)
             .to(torch.float8_e4m3fn)
             .float(),
