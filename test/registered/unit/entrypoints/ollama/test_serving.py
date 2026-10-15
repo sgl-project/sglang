@@ -2,9 +2,12 @@
 
 import asyncio
 import unittest
+from types import SimpleNamespace
+
+from fastapi.responses import StreamingResponse
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -23,7 +26,9 @@ class _FakeTokenizer:
 
     def apply_chat_template(self, messages, **kwargs):
         self.chat_template_kwargs = kwargs
-        return [1, 2, 3]
+        if kwargs.get("return_dict") is False:
+            return [1, 2, 3]
+        return {"input_ids": [1, 2, 3]}
 
     def encode(self, text):
         return [1, 2, 3]
@@ -39,6 +44,7 @@ class _FakeTokenizerManager:
         self.last_request = None
 
     def generate_request(self, request, raw_request):
+        request.normalize_batch_and_arguments()
         self.last_request = request
 
         async def _generate():
@@ -53,7 +59,7 @@ class _FakeTokenizerManager:
         return _generate()
 
 
-class TestOllamaServing(unittest.TestCase):
+class TestOllamaServing(CustomTestCase):
     def setUp(self):
         self.tokenizer_manager = _FakeTokenizerManager()
         self.serving = OllamaServing(self.tokenizer_manager)
@@ -104,6 +110,43 @@ class TestOllamaServing(unittest.TestCase):
         self.assertEqual(
             self.tokenizer_manager.last_request.sampling_params["max_new_tokens"],
             2,
+        )
+
+    def test_default_is_capped_at_2048(self):
+        self.tokenizer_manager.context_len = 8192
+        self.assertEqual(self.serving._get_default_max_new_tokens(3), 2048)
+
+    def test_default_is_zero_when_context_is_exhausted(self):
+        self.assertEqual(self.serving._get_default_max_new_tokens(9), 0)
+        self.assertEqual(self.serving._get_default_max_new_tokens(12), 0)
+
+    def test_default_uses_model_config_when_context_len_is_unavailable(self):
+        self.tokenizer_manager.context_len = None
+        self.tokenizer_manager.model_config = SimpleNamespace(context_len=8)
+        self.assertEqual(self.serving._get_default_max_new_tokens(3), 4)
+
+    def test_default_is_preserved_without_context_metadata(self):
+        self.tokenizer_manager.context_len = None
+        self.assertEqual(self.serving._get_default_max_new_tokens(3), 2048)
+
+    def test_streaming_chat_uses_the_same_input_normalization(self):
+        async def consume():
+            response = await self.serving.handle_chat(
+                OllamaChatRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                    stream=True,
+                ),
+                raw_request=object(),
+            )
+            self.assertIsInstance(response, StreamingResponse)
+            async for _ in response.body_iterator:
+                pass
+
+        asyncio.run(consume())
+        self.assertEqual(self.tokenizer_manager.last_request.input_ids, [1, 2, 3])
+        self.assertEqual(
+            self.tokenizer_manager.last_request.sampling_params["max_new_tokens"], 6
         )
 
 

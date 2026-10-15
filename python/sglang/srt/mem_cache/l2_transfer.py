@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from functools import cache
 from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -54,38 +56,104 @@ class L2TransferEngine:
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
 
-    def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
-        start_event = self._start_event(None)
+    @staticmethod
+    def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
+        """Resolve controller IDs into this pool's device-buffer indices.
+
+        Call on the transfer stream after the producer event. The host-transfer
+        move gate prevents relocation until the transfer completes.
+        """
+        # Mamba state pools do not inherit KVCache's default attributes.
+        translate = getattr(transfer.device_pool, "host_transfer_translate", None)
+        if translate is None:
+            return transfer.device_indices
+        original_device = transfer.device_indices.device
+        # The direct backend supplies CPU indices even for a CUDA pool.
+        # Translate alongside the v2p table, then restore the backend's device.
+        indices = transfer.device_indices.to(
+            getattr(transfer.device_pool, "device", original_device)
+        ).contiguous()
+        dcp_size = getattr(transfer.host_pool, "dcp_size", 1)
+        if dcp_size > 1:
+            # The MLA host pool selects this rank and collapses logical IDs.
+            # Translate in local virtual space, then preserve that widened
+            # interface (including token order) for the host pool.
+            resolved = translate(indices // dcp_size) * dcp_size + indices % dcp_size
+        else:
+            resolved = translate(indices)
+        return resolved.to(original_device)
+
+    def _prepare_transfers(self, transfers: list[L2Transfer]) -> list[L2Transfer]:
+        prepared = []
+        for transfer in transfers:
+            host_indices, device_indices = transfer.host_pool.prepare_transfer_indices(
+                transfer.host_indices,
+                self._resolve_device_indices(transfer),
+                self.io_backend,
+            )
+            prepared.append(
+                transfer._replace(
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
+            )
+        return prepared
+
+    @contextmanager
+    def _submission(self, transfers, stream, transfer_key, start_event=None):
+        start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        with device_module.stream(self.device_to_host_stream):
-            start_event.wait(self.device_to_host_stream)
-            ack_start.record()
+        completion = TransferCompletion(ack_start, ack_finish, timing_enabled)
+        domains = shared_host_layout_domains(t.host_pool for t in transfers)
+        for domain in domains:
+            domain.acquire_layout()
+        finish_recorded = False
+        try:
+            with device_module.stream(stream):
+                # Index preparation can read producer-owned device indices.
+                start_event.wait(stream)
+                prepared = self._prepare_transfers(transfers)
+                ack_start.record()
+                yield prepared, completion
+                ack_finish.record()
+                finish_recorded = True
+                self._record_stream(transfers + prepared, stream)
+        except Exception:
+            stream.synchronize()
+            raise
+        finally:
+            for domain in reversed(domains):
+                domain.release_layout(
+                    ack_finish if finish_recorded else None,
+                    (id(self), transfer_key),
+                )
+
+    def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
+        with self._submission(
+            transfers, self.device_to_host_stream, "device_to_host"
+        ) as (transfers, completion):
             for transfer in transfers:
-                transfer.host_pool.backup_from_device_all_layer(
+                transfer.host_pool.backup_from_device_all_layer_physical(
                     transfer.device_pool,
                     transfer.host_indices,
                     transfer.device_indices,
                     self.io_backend,
                 )
-            ack_finish.record()
-            self._record_stream(transfers, self.device_to_host_stream)
-        return TransferCompletion(ack_start, ack_finish, timing_enabled)
+        return completion
 
     def submit_host_to_device(
         self,
         transfers: list[L2Transfer],
         *,
-        layer_num: int,
+        transfer_layer_id_max: int,
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
-        start_event = self._start_event(start_event)
-        ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        primary = transfers[0] if transfers else None
-        with device_module.stream(self.host_to_device_stream):
-            start_event.wait(self.host_to_device_stream)
-            ack_start.record()
-            for layer_id in range(layer_num):
+        with self._submission(
+            transfers, self.host_to_device_stream, "host_to_device", start_event
+        ) as (transfers, completion):
+            primary = transfers[0] if transfers else None
+            for layer_id in range(transfer_layer_id_max):
                 for transfer in transfers:
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
@@ -98,7 +166,7 @@ class L2TransferEngine:
                         and layer_id >= transfer.host_pool.layer_num
                     ):
                         continue
-                    transfer.host_pool.load_to_device_per_layer(
+                    transfer.host_pool.load_to_device_per_layer_physical(
                         transfer.device_pool,
                         transfer.host_indices,
                         transfer.device_indices,
@@ -108,9 +176,7 @@ class L2TransferEngine:
                     )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
-            ack_finish.record()
-            self._record_stream(transfers, self.host_to_device_stream)
-        return TransferCompletion(ack_start, ack_finish, timing_enabled)
+        return completion
 
     @staticmethod
     def _start_event(start_event):
@@ -120,8 +186,12 @@ class L2TransferEngine:
         return start_event
 
     @staticmethod
-    def _record_stream(transfers: list[L2Transfer], stream) -> None:
+    def _record_stream(transfers: list[L2Transfer], stream, resolved=()) -> None:
+        tensors = []
         for transfer in transfers:
-            for indices in (transfer.host_indices, transfer.device_indices):
-                if indices.is_cuda:
-                    indices.record_stream(stream)
+            tensors.extend((transfer.host_indices, transfer.device_indices))
+        # Keep temporary translated indices alive until the transfer completes.
+        tensors.extend(resolved)
+        for indices in tensors:
+            if indices is not None and indices.is_cuda:
+                indices.record_stream(stream)

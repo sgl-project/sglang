@@ -27,7 +27,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -39,6 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
+from sglang.srt.runtime_context import get_parallel
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -49,7 +50,13 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config,
+            layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+            stage_boundaries=False,
+        )
 
         # Input layer concats embeds + target_hidden before qkv (input dim 2x).
         self.is_input_layer = layer_id == 0
@@ -187,12 +194,13 @@ class LlamaModel(nn.Module):
         else:
             self.fc_norm = None
 
-        self.layers = nn.ModuleList(
-            [
-                LlamaDecoderLayer(config, i, quant_config, prefix)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    LlamaDecoderLayer(config, i, quant_config, prefix)
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_output = getattr(config, "norm_output", False)
@@ -270,7 +278,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Cache draft SWA size from server args once; consumed both by the post-init
         # attention patch below and by `get_attention_sliding_window_size` later.

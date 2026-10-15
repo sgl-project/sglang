@@ -2,8 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -24,9 +24,8 @@ class TestDeepseekV32FP4DP(CustomTestCase):
         other_args = [
             "--tp",
             "4",
-            "--dp",
+            "--attn-dp-size",
             "4",
-            "--enable-dp-attention",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",
@@ -56,13 +55,11 @@ class TestDeepseekV32FP4DP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=500,
             num_threads=500,
-            num_shots=20,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
@@ -124,13 +121,11 @@ class TestDeepseekV32FP4TP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=500,
             num_threads=500,
-            num_shots=20,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():

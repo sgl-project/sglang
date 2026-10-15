@@ -1,0 +1,527 @@
+{
+  "model": "zai-org/GLM-5.3",
+  "revision": "aca966e4e02791568aa6a4ced368624b3d897f42",
+  "settings": {"reasoning_parser": "glm45", "tool_call_parser": "glm47"},
+  "cases": [
+    {
+      "name": "chat",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {"model": "zai-org/GLM-5.3", "messages": [{"role": "user", "content": "Hi"}]},
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "Greet back.</think>Hello!",
+          "output_ids": [38, 3744, 1182, 13, 154842, 9703, 0],
+          "meta_info": {
+            "id": "r",
+            "finish_reason": {"type": "stop", "matched": 154827},
+            "prompt_tokens": 12,
+            "weight_version": "default",
+            "reasoning_tokens": 2,
+            "completion_tokens": 7,
+            "cached_tokens": 0
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "r",
+          "object": "chat.completion",
+          "created": 1791964699,
+          "model": "zai-org/GLM-5.3",
+          "choices": [
+            {
+              "index": 0,
+              "message": {"role": "assistant", "content": "Hello!", "reasoning_content": "Greet back."},
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 154827
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 19,
+            "completion_tokens": 7,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 2
+          },
+          "metadata": {"weight_version": "default"}
+        }
+      }
+    },
+    {
+      "name": "watermark",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "watermark": {"key": "00ff", "context_window": 4}
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "Greet back.</think>Hello!",
+          "output_ids": [38, 3744, 1182, 13, 154842, 9703, 0],
+          "meta_info": {
+            "id": "r",
+            "finish_reason": {"type": "stop", "matched": 154827},
+            "prompt_tokens": 12,
+            "weight_version": "default",
+            "reasoning_tokens": 2,
+            "completion_tokens": 7,
+            "cached_tokens": 0
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
+        "sampling_params": {"watermark": {"key": "00ff", "context_window": 4}},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "r",
+          "object": "chat.completion",
+          "created": 1791964699,
+          "model": "zai-org/GLM-5.3",
+          "choices": [
+            {
+              "index": 0,
+              "message": {"role": "assistant", "content": "Hello!", "reasoning_content": "Greet back."},
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 154827
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 19,
+            "completion_tokens": 7,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 2
+          },
+          "metadata": {"weight_version": "default"}
+        }
+      }
+    },
+    {
+      "name": "chat_stream",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {"model": "zai-org/GLM-5.3", "messages": [{"role": "user", "content": "Hi"}], "stream": true},
+      "engine": {
+        "status": 200,
+        "frames": [
+          {"text": "Greet", "output_ids": [38, 3744], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 12, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 2, "cached_tokens": 0}},
+          {"text": " back.</th", "output_ids": [1182, 3918, 339], "meta_info": {"completion_tokens": 5}},
+          {"text": "ink>Hel", "output_ids": [766, 29, 32561], "meta_info": {"completion_tokens": 8}},
+          {"text": "lo!", "output_ids": [385, 0], "meta_info": {"completion_tokens": 10, "finish_reason": {"type": "stop", "matched": 154827}, "reasoning_tokens": 2}}
+        ]
+      },
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "stream": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "events": [
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " back."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "Hel"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "lo!"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 154827}]},
+          "[DONE]"
+        ]
+      }
+    },
+    {
+      "name": "chat_effort_low",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "reasoning_effort": "low"
+      },
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 12035, 154827, 13041, 154828, 154841],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "chat_thinking_cut",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 3,
+        "stream": true
+      },
+      "engine": {
+        "status": 200,
+        "frames": [
+          {"text": "Greet", "output_ids": [38, 3744], "meta_info": {"id": "r", "finish_reason": null, "prompt_tokens": 12, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 2, "cached_tokens": 0}},
+          {"text": " back", "output_ids": [1182], "meta_info": {"completion_tokens": 3, "finish_reason": {"type": "length", "length": 3}, "reasoning_tokens": 3}}
+        ]
+      },
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
+        "sampling_params": {"max_new_tokens": 3},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "stream": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "events": [
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": "Greet"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": " back"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964699, "model": "zai-org/GLM-5.3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "length", "matched_stop": null}]},
+          "[DONE]"
+        ]
+      }
+    },
+    {
+      "name": "chat_continue",
+      "endpoint": "chat",
+      "synthetic": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}],
+        "continue_final_message": true
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "!",
+          "output_ids": [0],
+          "meta_info": {
+            "id": "r",
+            "finish_reason": {"type": "stop", "matched": 154827},
+            "prompt_tokens": 12,
+            "weight_version": "default",
+            "reasoning_tokens": 2,
+            "completion_tokens": 1,
+            "cached_tokens": 0
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841,
+          9703
+        ],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "r",
+          "object": "chat.completion",
+          "created": 1791964700,
+          "model": "zai-org/GLM-5.3",
+          "choices": [
+            {
+              "index": 0,
+              "message": {"role": "assistant", "content": "", "reasoning_content": "!"},
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 154827
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 13,
+            "completion_tokens": 1,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 2
+          },
+          "metadata": {"weight_version": "default"}
+        }
+      }
+    },
+    {
+      "name": "chat_thinking_part",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [
+          {"role": "user", "content": "Hi"},
+          {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "Greet."}, {"type": "text", "text": "Hi!"}]
+          },
+          {"role": "user", "content": "Again"}
+        ]
+      },
+      "generate": {
+        "input_ids": [
+          154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841,
+          154842, 13041, 0, 154827, 30268, 154828, 154841
+        ],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "chat_tool_reference",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [
+          {
+            "role": "user",
+            "content": [{"type": "text", "text": "Use "}, {"type": "tool_reference", "name": "f"}]
+          }
+        ]
+      },
+      "generate": {
+        "input_ids": [
+          154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 10248, 220, 154828,
+          154841
+        ],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "tools_empty",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {"model": "zai-org/GLM-5.3", "messages": [{"role": "user", "content": "Hi"}], "tools": []},
+      "generate": {
+        "input_ids": [154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841],
+        "sampling_params": {},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "tools",
+      "endpoint": "chat",
+      "unsupported": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+      }
+    },
+    {
+      "name": "tools_none",
+      "endpoint": "chat",
+      "unsupported": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+        "tool_choice": "none"
+      }
+    },
+    {
+      "name": "chat_user_thinking_part",
+      "endpoint": "chat",
+      "unsupported": true,
+      "request": {
+        "model": "zai-org/GLM-5.3",
+        "messages": [{"role": "user", "content": [{"type": "thinking", "thinking": "x"}]}]
+      }
+    }
+  ],
+  "chat_model": {
+    "context_length": 1048576,
+    "generation_config": {"temperature": 1.0, "top_p": 0.95},
+    "always_thinks": true
+  },
+  "generate_defaults": {
+    "rid": null,
+    "session_id": null,
+    "text": null,
+    "input_ids": null,
+    "input_embeds": null,
+    "image_data": null,
+    "video_data": null,
+    "audio_data": null,
+    "mm_hashes": null,
+    "mm_content_hashes": null,
+    "use_audio_in_video": false,
+    "video_config": null,
+    "sampling_params": null,
+    "watermark": null,
+    "return_logprob": null,
+    "logprob_start_len": null,
+    "top_logprobs_num": null,
+    "token_ids_logprob": null,
+    "return_sampling_mask": null,
+    "sampling_logprobs_mode": null,
+    "return_text_in_logprobs": false,
+    "return_flat_raw_top_logprobs": false,
+    "return_flat_raw_output_top_logprobs": false,
+    "return_flat_raw_top_logprobs_b64": false,
+    "stream": false,
+    "log_metrics": true,
+    "return_hidden_states": false,
+    "return_routed_experts": false,
+    "routed_experts_start_len": 0,
+    "return_indexer_topk": false,
+    "modalities": null,
+    "session_params": null,
+    "lora_path": null,
+    "lora_id": null,
+    "custom_logit_processor": null,
+    "positional_embed_overrides": null,
+    "bootstrap_host": null,
+    "bootstrap_port": null,
+    "bootstrap_room": null,
+    "bootstrap_pair_key": null,
+    "decode_tp_size": null,
+    "routed_dp_rank": null,
+    "data_parallel_rank": null,
+    "disagg_prefill_dp_rank": null,
+    "routing_key": null,
+    "conversation_id": null,
+    "http_worker_ipc": null,
+    "background": false,
+    "require_reasoning": false,
+    "max_thinking_tokens": null,
+    "priority": null,
+    "extra_key": null,
+    "no_logs": false,
+    "custom_labels": null,
+    "return_bytes": false,
+    "return_entropy": false,
+    "return_prompt_token_ids": false,
+    "external_trace_header": null,
+    "need_wait_for_mm_inputs": null,
+    "num_items_assigned": null,
+    "encoder_urls": null,
+    "max_dynamic_patch": null,
+    "min_dynamic_patch": null,
+    "image_max_dynamic_patch": null,
+    "video_max_dynamic_patch": null,
+    "images_config": null,
+    "multi_item_delimiter_indices": null,
+    "token_indices_to_pool": null,
+    "cache_salt": null,
+    "kv_hints": null
+  },
+  "sampling_defaults": {
+    "completions": {
+      "temperature": 1.0,
+      "max_new_tokens": 16,
+      "min_new_tokens": 0,
+      "stop": null,
+      "stop_token_ids": null,
+      "stop_regex": null,
+      "top_p": 1.0,
+      "top_k": -1,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "regex": null,
+      "json_schema": null,
+      "ebnf": null,
+      "n": 1,
+      "no_stop_trim": false,
+      "ignore_eos": false,
+      "skip_special_tokens": true,
+      "logit_bias": null,
+      "custom_params": null,
+      "sampling_seed": null,
+      "watermark": null
+    },
+    "chat": {
+      "temperature": 1.0,
+      "max_new_tokens": null,
+      "min_new_tokens": 0,
+      "stop": null,
+      "stop_token_ids": null,
+      "stop_regex": null,
+      "top_p": 0.95,
+      "top_k": -1,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "regex": null,
+      "ebnf": null,
+      "n": 1,
+      "no_stop_trim": false,
+      "ignore_eos": false,
+      "skip_special_tokens": true,
+      "logit_bias": null,
+      "custom_params": null,
+      "sampling_seed": null,
+      "spaces_between_special_tokens": true,
+      "watermark": null
+    }
+  }
+}

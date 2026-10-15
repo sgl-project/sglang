@@ -29,7 +29,7 @@ class TestAscendW4A4(GSM8KAscendMixin, CustomTestCase):
         "4",
         "--mem-fraction-static",
         "0.8",
-        "--cuda-graph-bs",
+        "--cuda-graph-bs-decode",
         "64",
         "--disable-radix-cache",
     ]
