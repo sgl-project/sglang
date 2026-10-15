@@ -245,6 +245,10 @@ def handle_monokernel(server_args: ServerArgs) -> None:
             "handle_monokernel",
             cuda_graph_config=with_phase(graph, Phase.DECODE, bs=new, max_bs=max(new)),
         )
+    logger.warning(
+        "--monokernel-backend is experimental. Its kernels, coverage and plugin API "
+        "may change."
+    )
     logger.info(
         "--monokernel-backend %s: %s on %s, widths %s (%d tokens a request)",
         backend,

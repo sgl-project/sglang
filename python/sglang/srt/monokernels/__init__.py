@@ -1,4 +1,4 @@
-"""Full-forward dispatch for vendor monokernel plugins.
+"""Experimental full-forward dispatch for vendor monokernel plugins.
 
 General plugins register specs through the sglang.srt.plugins entry point.
 The runtime validates configuration, observes weight loading, and routes

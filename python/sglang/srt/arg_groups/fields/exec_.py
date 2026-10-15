@@ -184,7 +184,7 @@ class ExecKernel(msgspec.Struct):
     ] = None
     monokernel_backend: A[
         Optional[str],
-        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons.",
+        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = None
     prefill_attention_backend: A[
         Optional[str],
