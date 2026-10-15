@@ -6,6 +6,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    is_one_nvlink_clique,
+)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.runtime_context import (
     get_exec,
@@ -410,6 +413,8 @@ class FlashInferWorkspaceManager:
         self._max_token_num_seen: Optional[int] = None
         self._max_hidden_dim_seen: Optional[int] = None
         self._logged_init = False
+        # Group-wide NVLink-clique verdict; computed once (it is a collective).
+        self._one_clique: Optional[bool] = None
         self._workspace_size_check_kwarg = None
         self._workspace_size_check_strategy_type = None
 
@@ -492,6 +497,28 @@ class FlashInferWorkspaceManager:
         node_pg = cpu_group if cpu_group is not None else group
         if node_pg is not None:
             gpus_per_node = sum(in_the_same_node_as(node_pg, source_rank=0))
+        # MNNVL fabric handles are only importable inside one NVLink clique, so a
+        # cross-node group must be gated by a group-wide check; the per-GPU
+        # `is_mnnvl_fabric_supported` is True on every rank regardless of placement.
+        # Evaluated once (all ranks reach it together) and cached for re-entry.
+        spans_nodes = gpus_per_node is not None and gpus_per_node < world_size
+        if backend == "mnnvl" and spans_nodes and self._one_clique is None:
+            self._one_clique = is_one_nvlink_clique(
+                node_pg, torch.device("cuda", torch.cuda.current_device())
+            )
+        if backend == "mnnvl" and spans_nodes and not self._one_clique:
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                "FlashInfer AllReduce fusion disabled: the %d ranks of this group "
+                "span more than one NVLink clique, which the MNNVL backend does not "
+                "support. On SLURM this usually means the job was placed across "
+                "topology blocks; set --segment equal to --nodes.",
+                world_size,
+            )
+            self.workspace = None
+            self.initialized = False
+            return
+
         comm_backend = None
         if (
             _TorchDistBackend is not None
@@ -551,6 +578,7 @@ class FlashInferWorkspaceManager:
                 logger.info(
                     f"FlashInfer AllReduce Fusion enabled and workspace initialized: "
                     f"backend={self.backend}, rank={rank}, world_size={world_size}, "
+                    f"one_nvlink_clique={self._one_clique}, "
                     f"max_token_num={self.max_token_num}, hidden_dim={self.hidden_dim}"
                 )
                 self._logged_init = True
@@ -561,9 +589,16 @@ class FlashInferWorkspaceManager:
                 )
         except Exception as e:
             _flashinfer_allreduce_unavailable = True
+            hint = ""
+            if "INVALID_HANDLE" in str(e) and spans_nodes:
+                hint = (
+                    " The group spans nodes; if its GPUs are not in one NVLink "
+                    f"clique the fabric handle cannot be imported (clique check: "
+                    f"{self._one_clique})."
+                )
             logger.warning(
-                f"Failed to initialize FlashInfer workspace (backend={backend}): {e}. "
-                "Disabling flashinfer allreduce fusion permanently."
+                f"Failed to initialize FlashInfer workspace (backend={backend}): {e}."
+                f"{hint} Disabling flashinfer allreduce fusion permanently."
             )
             self.workspace = None
             self._workspace_size_check_kwarg = None
