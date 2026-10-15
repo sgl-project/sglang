@@ -73,7 +73,7 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 - Leave `--mem-fraction-static` at its default. SGLang auto-selects the `ling3` reasoning and tool-call parsers for this architecture; you can change the parser settings in the Playground.
 - **NEXTN:** add `--speculative-algorithm NEXTN` for built-in MTP speculative decoding. Measured acceptance length is 2.61 on random tokens and 2.13 on real-text probes.
 - **Long context:** the checkpoint supports 262,144 tokens natively. For up to 1,048,576 tokens, add the YaRN override from §3.4.
-- **Topology:** the Low-Latency recipe runs TP-only (no `--ep-size`) and decodes about 9% faster at batch size 1 on H200 (TPOT 3.29 ms vs 3.63 ms, verified); the High-Throughput recipe adds `--ep 8` and leads at concurrency 32. TP-only relies on the loader's TP-requant support; it fails loudly at startup on builds without it.
+- **Topology:** the Low-Latency recipe runs TP-only (no `--ep-size`) and is clearly faster at batch size 1 (about 9-13% lower TPOT on H200, verified on both 2048/512 and 8192/1024 workloads). At concurrency 16-32 the two recipes deliver the same throughput within ~2%. TP-only relies on the loader's TP-requant support; it fails loudly at startup on builds without it.
 - For prefix-heavy, multi-turn workloads, select **Cache fork and tail** in the Playground. It combines `--mamba-radix-cache-strategy extra_buffer`, `--chunked-prefill-size 4096`, and `SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK=1`. GPU checks confirmed both fork and tail states are cached, saving about 576 tokens per subsequent turn in the measured workload.
 
 ### Playground support

@@ -13,11 +13,13 @@ export const benchmarks = [
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-ling-3.1-flash",
     speed: [
-      { workload: { dataset: "random", isl: 4096, osl: 512, max_concurrency: 32 },
-        ttft_ms: 680.80, tpot_ms: 19.06, tokens_per_sec_per_gpu: 1640.8 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 290.71, tpot_ms: 3.74, tokens_per_sec_per_gpu: 279.1 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 331.71, tpot_ms: 12.44, tokens_per_sec_per_gpu: 1357.1 },
     ],
     accuracy: { gsm8k_pct: 96.89, stop_rate_pct: 99.77 },
-    notes: "EP8 with NEXTN. bs=1 250.7 tok/s (TPOT 3.63 ms); conc32 output 1458.5 tok/s. Matched standard-decoding control: 96.97% / 99.77%.",
+    notes: "EP8 with NEXTN. bs=1 output 248.1 tok/s (this workload); accept length 2.51-2.61. Matched standard-decoding control: 96.97% / 99.77%.",
   },
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
