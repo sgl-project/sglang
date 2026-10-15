@@ -7,9 +7,15 @@ from typing import Callable, Optional
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.utils import is_npu
+
+if is_npu():
+    # Ascend does not map the generic libdevice stubs to CANN implementations.
+    from triton.language.extra.cann import libdevice
+else:
+    from triton.language.extra import libdevice
 
 # Measured fastest for 1-64 rows, where the per-block Philox work sets latency.
 _BLOCK = 1024
