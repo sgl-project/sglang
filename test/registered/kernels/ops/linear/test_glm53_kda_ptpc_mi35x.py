@@ -1,5 +1,6 @@
 """MI35X correctness for GLM-5.3-Flash KDA PTPC projections."""
 
+import itertools
 import unittest
 
 import torch
@@ -11,6 +12,7 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.models.glm5_next import (
     GLM53_KDA_PTPC_BF16_MAX_M,
+    GLM53_KDA_W8A16_DECODE_CONFIGS,
     Glm5NextLinearAttention,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
@@ -173,11 +175,15 @@ class TestGLM53KDAPTPC(CustomTestCase):
         self.assertIn("_fp8_ptpc_weight", dict(layer.named_buffers()))
 
     def test_no_copy_packed_first_stage_preserves_decode_and_uses_ptpc_prefill(self):
-        for tp, (qkv_size, beta_size) in {
-            4: (6144, 16),
-            8: (3072, 8),
-        }.items():
+        for (tp, (qkv_size, beta_size)), fp8_beta in itertools.product(
+            {4: (6144, 16), 8: (3072, 8)}.items(), (False, True)
+        ):
             fg_size = 256
+            fp8_rows = qkv_size + beta_size + fg_size if fp8_beta else qkv_size + fg_size
+            fp8_rows = (fp8_rows + 15) // 16 * 16
+            w8a16_configs = (
+                GLM53_KDA_W8A16_DECODE_CONFIGS[(fp8_rows, 4096)] if fp8_beta else None
+            )
             output_size = qkv_size + beta_size + fg_size
             generator = torch.Generator(device="cuda").manual_seed(tp)
             weight = (
@@ -202,12 +208,10 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 qkv_size=qkv_size,
                 beta_size=beta_size,
                 fg_size=fg_size,
+                w8a16_configs=w8a16_configs,
             )
             candidate.process_weights_after_loading(layer)
-            self.assertEqual(
-                layer._fp8_ptpc_weight.shape[0],
-                qkv_size + fg_size,
-            )
+            self.assertEqual(layer._fp8_ptpc_weight.shape[0], fp8_rows)
             for m in (1, 8192):
                 x = (
                     torch.randn(
@@ -220,7 +224,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
                     * 0.1
                 )
                 expected = baseline.apply(layer, x)
-                with self.subTest(tp=tp, m=m):
+                with self.subTest(tp=tp, fp8_beta=fp8_beta, m=m):
                     if m == 1:
                         actual = candidate.apply(layer, x)
                         torch.testing.assert_close(actual, expected, atol=0, rtol=0)

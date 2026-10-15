@@ -826,6 +826,10 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         self.qkv_size = qkv_size
         self.beta_size = beta_size
         self.fg_size = fg_size
+        # W8A16 decode appends beta to the FP8 weight so one GEMM produces
+        # qkv, f/g, and beta. PTPC prefill reads only the qkv/f/g prefix: the
+        # CK kernel rejects the padded N, and beta stays a BF16 GEMM there.
+        self.fp8_beta = w8a16_configs is not None
 
     def is_active(self, num_tokens: int) -> bool:
         return super().is_active(num_tokens) and num_tokens <= self.fp8_max_m
@@ -848,12 +852,12 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
                 f"{expected_size} rows, got dtype={weight.dtype}, "
                 f"shape={tuple(weight.shape)}"
             )
-        packed_weight = torch.cat(
-            (
-                weight[: self.qkv_size],
-                weight[self.qkv_size + self.beta_size :],
-            )
-        )
+        fg_offset = self.qkv_size + self.beta_size
+        packed_rows = [weight[: self.qkv_size], weight[fg_offset:]]
+        if self.fp8_beta:
+            packed_rows.append(weight[self.qkv_size : fg_offset])
+            packed_rows.append(weight.new_zeros(-expected_size % 16, weight.shape[1]))
+        packed_weight = torch.cat(packed_rows)
         fp8_weight, weight_scale = aiter.pertoken_quant(
             packed_weight,
             quant_dtype=aiter.dtypes.fp8,
@@ -886,13 +890,17 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         config: dict,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         packed_output = self.apply_w8a16(layer, x, config)
-        qkv, fg_a = torch.split(
+        used = self.qkv_size + self.fg_size + self.beta_size
+        qkv, fg_a, beta, _ = torch.split(
             packed_output,
-            (self.qkv_size, self.fg_size),
+            (
+                self.qkv_size,
+                self.fg_size,
+                self.beta_size,
+                packed_output.shape[-1] - used,
+            ),
             dim=-1,
         )
-        beta_weight = layer.weight[self.qkv_size : self.qkv_size + self.beta_size]
-        beta = tgemm.mm(x, beta_weight, otype=x.dtype)
         return qkv, beta, fg_a
 
     def apply_ptpc_prefill(
@@ -910,10 +918,11 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
 
         if q_input is None:
             q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
+        rows = self.qkv_size + self.fg_size
         packed_output = apply_fp8_ptpc_linear(
             q_input,
-            layer._fp8_ptpc_weight,
-            layer._fp8_ptpc_weight_scale,
+            layer._fp8_ptpc_weight[:rows],
+            layer._fp8_ptpc_weight_scale[:rows],
         )
         qkv, fg_a = torch.split(
             packed_output,

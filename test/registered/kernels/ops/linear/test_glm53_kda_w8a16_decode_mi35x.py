@@ -20,7 +20,7 @@ register_amd_ci(
 )
 
 # Packed qkv/f_a/g_a layouts per local (N, K): (qkv, beta, fg) row counts.
-PACKED_LAYOUTS = {(6400, 4096): (6144, 16, 256), (3328, 4096): (3072, 8, 256)}
+PACKED_LAYOUTS = {(6416, 4096): (6144, 16, 256), (3344, 4096): (3072, 8, 256)}
 
 
 def _token_counts(rows):
@@ -87,15 +87,7 @@ class TestGLM53KDAW8A16Decode(CustomTestCase):
         for (n, k), rows in GLM53_KDA_W8A16_DECODE_CONFIGS.items():
             layer, method, packed, generator = self._layer(n, k, seed=n + k)
             weight = layer.weight
-            if packed:
-                qkv, beta, fg = packed
-                fp8_rows = torch.cat((weight[:qkv], weight[qkv + beta :]))
-                deq = self._dequantized(fp8_rows)
-                reference_weight = torch.cat(
-                    (deq[:qkv], weight[qkv : qkv + beta].float(), deq[qkv:])
-                )
-            else:
-                reference_weight = self._dequantized(weight)
+            reference_weight = self._dequantized(weight)
             for m in _token_counts(rows):
                 with self.subTest(n=n, k=k, m=m):
                     config = method.w8a16_config(m)

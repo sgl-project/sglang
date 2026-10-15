@@ -764,6 +764,35 @@ class TestGLM53KDAPTPC(CustomTestCase):
             self.assertIs(attention.fused_qkvbfg_a_proj.inputs[-1], bf16_input)
             self.assertEqual(apply_decode.call_count, 1)
 
+    def test_w8a16_decode_reads_beta_from_packed_fp8_output(self):
+        method = Glm53KdaPackedPtpcLinearMethod(
+            bf16_max_m=8,
+            fp8_max_m=16,
+            qkv_size=12,
+            beta_size=2,
+            fg_size=8,
+            w8a16_configs=((2, {}),),
+        )
+        self.assertTrue(method.fp8_beta)
+        self.assertFalse(
+            Glm53KdaPackedPtpcLinearMethod(
+                bf16_max_m=8, fp8_max_m=16, qkv_size=12, beta_size=2, fg_size=8
+            ).fp8_beta
+        )
+        packed_output = torch.arange(3 * 32, dtype=torch.float32).view(3, 32)
+        mm = MagicMock()
+        with (
+            patch.object(method, "apply_w8a16", return_value=packed_output),
+            patch.object(unquant, "tgemm", SimpleNamespace(mm=mm), create=True),
+        ):
+            qkv, beta, fg = method.apply_w8a16_decode(
+                torch.nn.Module(), torch.empty(3, 8), {}
+            )
+        torch.testing.assert_close(qkv, packed_output[:, :12])
+        torch.testing.assert_close(fg, packed_output[:, 12:20])
+        torch.testing.assert_close(beta, packed_output[:, 20:22])
+        mm.assert_not_called()
+
     def test_model_selector_wires_w8a16_tables(self):
         model_module = sys.modules[Glm5NextLinearAttention.__module__]
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
@@ -788,7 +817,7 @@ class TestGLM53KDAPTPC(CustomTestCase):
             "weight",
             torch.nn.Parameter(torch.empty(4096, 2048, device="meta")),
         )
-        tables = {(6400, 4096): ((16, {"a": 1}),), (4096, 2048): ((64, {"b": 2}),)}
+        tables = {(6416, 4096): ((16, {"a": 1}),), (4096, 2048): ((64, {"b": 2}),)}
         selector = "qkv_proj,f_a_proj,g_a_proj,o_proj"
         for enabled in (False, True):
             with (
@@ -803,7 +832,10 @@ class TestGLM53KDAPTPC(CustomTestCase):
                 attention._configure_ptpc_modules()
                 self.assertEqual(
                     attention.fused_qkvbfg_a_proj.quant_method.w8a16_configs,
-                    tables[(6400, 4096)] if enabled else None,
+                    tables[(6416, 4096)] if enabled else None,
+                )
+                self.assertEqual(
+                    attention.fused_qkvbfg_a_proj.quant_method.fp8_beta, enabled
                 )
                 self.assertEqual(
                     attention.o_proj.quant_method.w8a16_configs,

@@ -385,7 +385,7 @@ def _w8a16_config(block_m, block_n, num_ksplit, num_warps, num_stages, waves_per
 # ascending (max token count, gemm_a16w8_blockscale_preshuffle config) rows
 # from MI355X cold-cache sweeps; token counts above the last row stay BF16.
 GLM53_KDA_W8A16_DECODE_CONFIGS: dict[tuple[int, int], tuple[tuple[int, dict], ...]] = {
-    (6400, 4096): (
+    (6416, 4096): (
         (1, _w8a16_config(8, 16, 4, 1, 3, 2)),
         (4, _w8a16_config(8, 16, 8, 1, 3, 0)),
         (8, _w8a16_config(8, 32, 8, 2, 3, 0)),
@@ -401,7 +401,7 @@ GLM53_KDA_W8A16_DECODE_CONFIGS: dict[tuple[int, int], tuple[tuple[int, dict], ..
         (32, _w8a16_config(32, 32, 4, 2, 3, 2)),
         (64, _w8a16_config(64, 64, 4, 8, 3, 0)),
     ),
-    (3328, 4096): (
+    (3344, 4096): (
         (1, _w8a16_config(8, 16, 8, 1, 3, 0)),
         (4, _w8a16_config(8, 16, 8, 1, 3, 2)),
         (8, _w8a16_config(16, 16, 8, 1, 3, 2)),
@@ -744,7 +744,7 @@ class Glm5NextLinearAttention(nn.Module):
                     fg_size=self.split_sizes[2],
                     w8a16_configs=w8a16_configs(
                         self.fused_qkvbfg_a_proj,
-                        self.split_sizes[0] + self.split_sizes[2],
+                        (sum(self.split_sizes) + 15) // 16 * 16,
                     ),
                 )
             elif self.fuse_bfg:
