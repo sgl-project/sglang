@@ -1877,6 +1877,7 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_Q35MF_GDN_TILED_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Plugin system

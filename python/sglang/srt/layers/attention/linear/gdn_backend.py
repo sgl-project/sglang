@@ -1486,6 +1486,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
         out = q.new_empty(seq_len, HV, V)
+        verify_options = {}
+        if envs.SGLANG_Q35MF_GDN_TILED_VERIFY.get():
+            verify_options = dict(block_v=32, num_warps=2)
         gdn_replayssm_spec_decode(
             q=q,
             k=k,
@@ -1523,6 +1526,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            **verify_options,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
