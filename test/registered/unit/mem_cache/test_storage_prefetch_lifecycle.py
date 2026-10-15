@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -47,6 +48,9 @@ def _staged_fixture(full_match=2):
         prefetch_anchor_info=lambda node: (None, None),
         match_full_device_prefix=Mock(return_value=(full_match, 1, full_match)),
         collect_full_device_indices=Mock(return_value=torch.arange(8)),
+        swa_tombstone_ranges=Mock(
+            side_effect=lambda key, start, end, **kwargs: [(start, end)]
+        ),
         root_node_handle=lambda extra_key=None: 0,
         inc_full_pin=Mock(),
         dec_full_pin=Mock(),
@@ -93,6 +97,12 @@ def _staged_fixture(full_match=2):
     cache.cache_controller = cc
     pipeline = BufferModePipeline.__new__(BufferModePipeline)
     pipeline._cache = cache
+    pipeline._swa_component = SimpleNamespace(
+        pool_name=PoolName.SWA,
+        component_type=ComponentType.SWA,
+        full_window_pages=2,
+    )
+    pipeline._auxiliary_swa_component = None
     pipeline.reset()
     cache.buffer_pipeline = pipeline
     pipeline.staged_prefetches[_REQ] = _StagedPrefetch(
@@ -157,6 +167,7 @@ def _terminated_query(cache, rid, hit_tokens):
         handle=handle,
         storage_hit_count=hit_tokens,
         stats_requested_tokens=8,
+        all_hash_values=None,
         is_terminated=lambda: True,
     )
     cache.ongoing_prefetch[handle] = _OngoingPrefetch(
