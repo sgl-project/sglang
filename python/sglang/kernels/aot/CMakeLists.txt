@@ -65,10 +65,11 @@ FetchContent_Declare(
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
+# PyTorch 2.15's triton 3.9.0 pin (release/3.9.x); swap for the v3.9.0 tag once it exists.
 FetchContent_Declare(
     repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.8.0.tar.gz
-    URL_HASH SHA256=d50981f98bf61a5ce21d2a0c6ac067c20b7f741acf3bee4b8370edc3b63fd337
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/aad2a60d958f945420c5c40936b37d411fb02e89.tar.gz
+    URL_HASH SHA256=afbe1e2f172f3f95f6b58d2ff1006bb0388416de6f966ac7884ea1345f3286f9
 )
 FetchContent_Populate(repo-triton)
 
