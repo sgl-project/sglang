@@ -44,6 +44,7 @@ CTAs are co-resident, so every spin wait makes progress.
 """
 
 import struct
+from functools import reduce
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -218,6 +219,24 @@ assert N_SPLIT * THREADS * CAND_BATCH >= MAX_INDEX_BLOCKS
 assert N_SPLIT == 2 * TOTAL_INDEX_HEADS
 assert N_SPLIT * TOPK_BLOCKS <= INDEX_CP_FROM_BLOCKS <= THREADS
 assert MAX_TOKENS <= SPARSE_BLOCK
+
+# The merge's thread map: a thread holds 4 dims of one head, so the CTA needs
+# H * HEAD_DIM / 4 slots. At TP4 that is exactly THREADS and one round covers
+# every head, which is why the map was written as `tid // (HEAD_DIM // 4)`. At
+# TP2 H is 32 and the map needs 1024 slots: one round merges only the first 16
+# heads and leaves half of attnq unwritten, so o_proj reads uninitialized memory
+# and the layer comes out NaN. The CTA walks the map in MERGE_PASSES rounds.
+MERGE_SLOTS = H * (HEAD_DIM // 4)
+MERGE_PASSES = -(-MERGE_SLOTS // THREADS)
+# TP8 (H = 8) needs only half a CTA, so its tail round would have to be masked
+# out of both the amax reduction and the store -- without that it would write
+# past O_K / 4 words and corrupt the pool. That belongs with the H = 8 thread-map
+# work the split and selection stages also need, so until then this refuses
+# loudly at import rather than corrupting silently.
+assert MERGE_SLOTS == MERGE_PASSES * THREADS, (
+    f"the merge needs {MERGE_SLOTS} thread slots, not a whole number of "
+    f"{THREADS}-thread rounds: H = {H} needs a masked tail round"
+)
 
 
 def build_post_attn_kernel(
@@ -1069,9 +1088,12 @@ def build_post_attn_kernel(
         def merge_token(k):
             """Token k's partitions merged (the paged decode's reduce; thread = 4 dims
             of one head) and quantized per token (standalone quant: scale = amax *
-            (1 / FP8_MAX), x * rcp(scale)) -> (this thread's fp8 word, scale)."""
-            hm = tid // (HEAD_DIM // 4)
-            e0 = tid * 4
+            (1 / FP8_MAX), x * rcp(scale)) -> (this thread's fp8 words, one per
+            merge round, and the token's scale).
+
+            One round at TP4, where the CTA's threads cover every head; two at
+            TP2. The quantization scale spans every round, because it is one
+            scale for the token's whole merged row."""
             sp0 = k * N_SPLIT  # token k's partitions
             # wave 0 waits on every partition's l, then the CTA polls once: 512
             # threads x 24 loads spinning through the whole split load the memory
@@ -1084,49 +1106,70 @@ def build_post_attn_kernel(
                     ]
                 )
             gpu.barrier()
-            # one batch: every partition's (m, l) and this thread's 4 outputs
-            got = mb_poll(
-                [(mb("sp_m"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
-                + [(mb("sp_l"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
-                + [
-                    (mb("sp_o"), ((sp0 + i) * O_K + e0) // 2, 2) for i in range(N_SPLIT)
-                ],
-                batch=3 * N_SPLIT,
-            )
-            mls = got[: 2 * N_SPLIT]
-            ovs = got[2 * N_SPLIT :]
-            m_i = [mls[i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
-            l_i = [mls[N_SPLIT + i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
-            gm = m_i[0]
-            for i in range_constexpr(1, N_SPLIT):
-                gm = fx.max(gm, m_i[i])
-            sl = [l_i[i] * hw_exp2((m_i[i] - gm) * LOG2E) for i in range(N_SPLIT)]
-            gs = sl[0]
-            for i in range_constexpr(1, N_SPLIT):
-                gs = gs + sl[i]
-            gs = (gs > 0.0).select(gs, fx.Float32(1.0))
-            av = [fx.Float32(0.0) for _ in range(4)]
-            for i in range_constexpr(N_SPLIT):
-                wi = sl[i] / gs
-                o01 = bf2_f32(ovs[i][0])
-                o23 = bf2_f32(ovs[i][1])
-                av = [
-                    av[0] + wi * o01[0],
-                    av[1] + wi * o01[1],
-                    av[2] + wi * o23[0],
-                    av[3] + wi * o23[1],
-                ]
-            a0, a1, a2, a3 = (bf16_round(x) for x in av)
-            amax = block_max(
-                fx.max(
-                    fx.max(fmath.absf(a0), fmath.absf(a1)),
-                    fx.max(fmath.absf(a2), fmath.absf(a3)),
+
+            def merge_round(rnd):
+                """Round rnd's four merged dims: slot rnd * THREADS + tid holds
+                dims 4 slot .. + 4, which belong to head slot / (HEAD_DIM / 4)."""
+                slot = rnd * THREADS + tid
+                hm = slot // (HEAD_DIM // 4)
+                e0 = slot * 4
+                # one batch: every partition's (m, l) and this thread's 4 outputs
+                got = mb_poll(
+                    [(mb("sp_m"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
+                    + [(mb("sp_l"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
+                    + [
+                        (mb("sp_o"), ((sp0 + i) * O_K + e0) // 2, 2)
+                        for i in range(N_SPLIT)
+                    ],
+                    batch=3 * N_SPLIT,
                 )
-            )
+                mls = got[: 2 * N_SPLIT]
+                ovs = got[2 * N_SPLIT :]
+                m_i = [mls[i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
+                l_i = [mls[N_SPLIT + i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
+                gm = m_i[0]
+                for i in range_constexpr(1, N_SPLIT):
+                    gm = fx.max(gm, m_i[i])
+                sl = [l_i[i] * hw_exp2((m_i[i] - gm) * LOG2E) for i in range(N_SPLIT)]
+                gs = sl[0]
+                for i in range_constexpr(1, N_SPLIT):
+                    gs = gs + sl[i]
+                gs = (gs > 0.0).select(gs, fx.Float32(1.0))
+                av = [fx.Float32(0.0) for _ in range(4)]
+                for i in range_constexpr(N_SPLIT):
+                    wi = sl[i] / gs
+                    o01 = bf2_f32(ovs[i][0])
+                    o23 = bf2_f32(ovs[i][1])
+                    av = [
+                        av[0] + wi * o01[0],
+                        av[1] + wi * o01[1],
+                        av[2] + wi * o23[0],
+                        av[3] + wi * o23[1],
+                    ]
+                return [bf16_round(x) for x in av]
+
+            # The round index must NOT be called `q`: that is the kernel's
+            # attention-q pointer parameter, and a name rebound inside a dynamic
+            # region is carried as that region's state (initialized to None,
+            # which cannot be an scf.for iter_arg). Shadowing it here fails the
+            # build with a message naming only `q`, which points nowhere near.
+            rounds = [merge_round(rnd) for rnd in range(MERGE_PASSES)]
+
+            def round_max(a):
+                return fx.max(
+                    fx.max(fmath.absf(a[0]), fmath.absf(a[1])),
+                    fx.max(fmath.absf(a[2]), fmath.absf(a[3])),
+                )
+
+            # one scale for the token's whole row, so the amax spans every round
+            amax = block_max(reduce(fx.max, [round_max(a) for a in rounds]))
             x_scale = amax * (1.0 / FP8_MAX)
             # an all-zero row (a pad row) quantizes to zeros, not 0 * inf
             inv = (amax == 0.0).select(fx.Float32(0.0), hw_rcp(x_scale))
-            return fp8_pack4(a0 * inv, a1 * inv, a2 * inv, a3 * inv), x_scale
+            return [
+                fp8_pack4(a[0] * inv, a[1] * inv, a[2] * inv, a[3] * inv)
+                for a in rounds
+            ], x_scale
 
         # ======================================= 2b. attention merge (S > 1)
         # One task per token, in parallel on its own CTA: merged in the o tasks, the
@@ -1135,14 +1178,15 @@ def build_post_attn_kernel(
             if const_expr(tokens > 1):
                 for k in range(start("merge"), tokens, G):
                     k = fx.Int32(k)
-                    word, x_scale = merge_token(k)
+                    words, x_scale = merge_token(k)
                     # plain words, then the scale: its pair is the flag
-                    bo.buffer_store(
-                        word,
-                        rsrc(mb("attnq")),
-                        k * (O_K // 4) + tid,
-                        cache_modifier=CM_DEV,
-                    )
+                    for qstore, w in enumerate(words):
+                        bo.buffer_store(
+                            w,
+                            rsrc(mb("attnq")),
+                            k * (O_K // 4) + qstore * THREADS + tid,
+                            cache_modifier=CM_DEV,
+                        )
                     release_stores()
                     gpu.barrier()
                     if tid == 0:
@@ -1179,9 +1223,10 @@ def build_post_attn_kernel(
 
                 if const_expr(tokens == 1):
                     # the merge folded in: the partitions -> this CTA's fp8 input
-                    word, x_scale = merge_token(0)
+                    words, x_scale = merge_token(0)
                     x_scales = [x_scale]
-                    fx.ptr_store(word, xs + tid)
+                    for qo, w in enumerate(words):
+                        fx.ptr_store(w, xs + (qo * THREADS + tid))
                 else:
                     # the merge tasks' fp8 inputs: every token's scale (published
                     # after its plain words), then the words, 16 B a load
@@ -1403,6 +1448,13 @@ def build_post_attn_kernel(
         MID8_LDS = tokens * MID16_WORDS
         MIDSC_WORDS = MOE_SLOTS * INTER // 32
         MIDSC_LDS = MID8_LDS + tokens * MID8_WORDS
+        # Both narrow-path mid passes are INTER-sized, so neither fits a fixed
+        # number of THREADS-wide rounds: MOE_SLOTS * INTER is 3840 at TP4 but
+        # 7680 at TP2. The wide path (stage_moe_wide) already derives its own
+        # counts; these two are the narrow path's.
+        MID_COPY_ROUNDS = -(-(MOE_SLOTS * INTER) // (2 * THREADS))  # 4 TP4, 8 TP2
+        MID8_SLOTS = MID8_WORDS // 2  # 8 elements a lane, 4 lanes a 32-block
+        MID8_ROUNDS = -(-MID8_SLOTS // THREADS)  # 1 at TP4, 2 at TP2
 
         def mx8_scale(vals, offsets):
             """E8M0 byte (>= 1) of the 32-block the lanes xor-``offsets`` apart share,
@@ -2479,10 +2531,10 @@ def build_post_attn_kernel(
                             + fx.min(tid * 2 + i * 2 * THREADS, MOE_SLOTS * INTER - 2),
                             2,
                         )
-                        for i in range(4)
+                        for i in range(MID_COPY_ROUNDS)
                     ]
                 )
-                for i in range_constexpr(4):
+                for i in range_constexpr(MID_COPY_ROUNDS):
                     e = tid * 2 + i * 2 * THREADS
                     if e < MOE_SLOTS * INTER:
                         fx.ptr_store(
@@ -2500,22 +2552,29 @@ def build_post_attn_kernel(
             # then MXFP8 in a pass of its own: quantizing inside stage_mids (after
             # each poll) serializes it behind the polls, though the arithmetic is tiny
             for k in range_constexpr(tokens):
-                if tid < MID8_WORDS // 2:  # 8 elements a lane, 4 lanes a 32-block
-                    w = fx.Vector(
-                        fx.ptr_load(xs + (k * MID16_WORDS + tid * 4), result_type=v4f)
-                    ).bitcast(fx.Int32)
-                    f = [v for j in range(4) for v in bf2_f32(w[j])]
-                    sc, inv = mx8_scale(f, (1, 2))
-                    qv = [mx8_q(v, inv) for v in f]
-                    fx.ptr_store(
-                        fp8_pack4(*qv[:4]), xs + (MID8_LDS + k * MID8_WORDS + tid * 2)
-                    )
-                    fx.ptr_store(
-                        fp8_pack4(*qv[4:]),
-                        xs + (MID8_LDS + k * MID8_WORDS + tid * 2 + 1),
-                    )
-                    if tid % 4 == 0:
-                        fx.ptr_store(sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + tid // 4))
+                # THREADS is a multiple of 64, so a round's offset never moves a
+                # lane out of its wave: the 4-lane group mx8_scale xor-reduces
+                # over is the same one it would be in the single-round case.
+                for mr in range_constexpr(MID8_ROUNDS):
+                    ms = tid + mr * THREADS
+                    if ms < MID8_SLOTS:
+                        w = fx.Vector(
+                            fx.ptr_load(xs + (k * MID16_WORDS + ms * 4), result_type=v4f)
+                        ).bitcast(fx.Int32)
+                        f = [v for j in range(4) for v in bf2_f32(w[j])]
+                        sc, inv = mx8_scale(f, (1, 2))
+                        qv = [mx8_q(v, inv) for v in f]
+                        fx.ptr_store(
+                            fp8_pack4(*qv[:4]), xs + (MID8_LDS + k * MID8_WORDS + ms * 2)
+                        )
+                        fx.ptr_store(
+                            fp8_pack4(*qv[4:]),
+                            xs + (MID8_LDS + k * MID8_WORDS + ms * 2 + 1),
+                        )
+                        if ms % 4 == 0:
+                            fx.ptr_store(
+                                sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + ms // 4)
+                            )
             gpu.barrier()
             # the shared expert once, B column l % 16 = token l % 16's mid -> opart
             # (free once the split is done); each token's reduce adds its column
