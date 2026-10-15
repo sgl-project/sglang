@@ -26,6 +26,7 @@ import logging
 import os
 import socket
 import time
+from array import array
 from multiprocessing import shared_memory
 from typing import Dict, List, Optional, Sequence
 from unittest.mock import patch
@@ -47,6 +48,10 @@ def edge_shm_sync_enabled() -> bool:
 
 def _multihost_enabled() -> bool:
     return os.environ.get("SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST", "0") == "1"
+
+
+def _leader_tcp_enabled() -> bool:
+    return os.environ.get("SGLANG_Q35MF_EDGE_MULTIHOST_TCP", "0") == "1"
 
 
 class ShmTagExchange:
@@ -154,6 +159,46 @@ class ShmTagExchange:
             pass
 
 
+class _LeaderLink:
+    """Persistent TCP connection between the two host leaders; one send and one exact
+    receive per call (payloads are a few hundred bytes, so the sends never block)."""
+
+    def __init__(self, leaders: dist.ProcessGroup, first: bool, timeout_s: float):
+        from sglang.srt.utils.network import get_local_ip_auto
+
+        server = None
+        box: List[Optional[tuple]] = [None]
+        if first:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.bind(("0.0.0.0", 0))
+            server.listen(1)
+            box[0] = (get_local_ip_auto(), server.getsockname()[1])
+        src = dist.get_process_group_ranks(leaders)[0]
+        dist.broadcast_object_list(box, src=src, group=leaders)
+        if first:
+            server.settimeout(timeout_s)
+            self.sock, _ = server.accept()
+            server.close()
+        else:
+            self.sock = socket.create_connection(box[0], timeout=timeout_s)
+        self.sock.settimeout(timeout_s)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def swap(self, payload: bytes) -> bytes:
+        self.sock.sendall(len(payload).to_bytes(4, "little") + payload)
+        size = int.from_bytes(self._recv_exact(4), "little")
+        return self._recv_exact(size)
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise RuntimeError("EDGE leader link closed by the peer leader")
+            buf += chunk
+        return bytes(buf)
+
+
 class HierTagExchange:
     """ShmTagExchange.allgather for a group that spans hosts: ranks exchange through
     shared memory on their host, and only the host leaders run one gloo all_gather."""
@@ -177,27 +222,38 @@ class HierTagExchange:
         )
         host = hosts.index(hostnames[me])
         self.is_leader = me == self.members[host][0]
+        self.host = host
         self.world = len(ranks)
         self.local_max = max(len(m) for m in self.members)
         self.local = ShmTagExchange(local_groups[host], kind + "l", width)
         self.full = ShmTagExchange(
             local_groups[host], kind + "f", width, rows=self.world
         )
+        # Two hosts: the leaders swap rows over one TCP connection instead of a gloo all_gather.
+        self.link = None
+        if self.is_leader and len(self.members) == 2 and _leader_tcp_enabled():
+            self.link = _LeaderLink(self.leaders, host == 0, self.local.timeout_s)
 
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
         n = len(values)
         rows_here = self.local.allgather(values)
         if not self.is_leader:
             return self.full.read_rows(n)
-        flat = torch.zeros(self.local_max * n, dtype=torch.int64)
-        flat[: len(rows_here) * n] = torch.tensor(
-            [v for row in rows_here for v in row], dtype=torch.int64
-        )
-        outs = [torch.empty_like(flat) for _ in self.members]
-        dist.all_gather(outs, flat, group=self.leaders)
+        mine = [v for row in rows_here for v in row]
+        if self.link is not None:
+            peer = array("q")
+            peer.frombytes(self.link.swap(array("q", mine).tobytes()))
+            per_host = (
+                [mine, peer.tolist()] if self.host == 0 else [peer.tolist(), mine]
+            )
+        else:
+            flat = torch.zeros(self.local_max * n, dtype=torch.int64)
+            flat[: len(mine)] = torch.tensor(mine, dtype=torch.int64)
+            outs = [torch.empty_like(flat) for _ in self.members]
+            dist.all_gather(outs, flat, group=self.leaders)
+            per_host = [out.tolist() for out in outs]
         table: List[List[int]] = [[] for _ in range(self.world)]
-        for m, out in zip(self.members, outs):
-            vals = out.tolist()
+        for m, vals in zip(self.members, per_host):
             for j, g in enumerate(m):
                 table[g] = vals[j * n : (j + 1) * n]
         self.full.publish_rows(table)
