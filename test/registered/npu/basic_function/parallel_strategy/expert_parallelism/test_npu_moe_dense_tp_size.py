@@ -15,7 +15,11 @@ from sglang.test.test_utils import (
 
 register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
-
+register_npu_ci(
+    est_time=7200,
+    suite="nightly-acc-4-npu-a5",
+    nightly=True,
+)
 
 class TestAscendMoeDenseTPSize(CustomTestCase):
     """Testcase: Verify that the model accuracy remains uncompromised when the parameter --moe-dense-tp-size is configured to 1.

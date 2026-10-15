@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(
     est_time=7200,
     suite="nightly-acc-4-npu-a5",
-    nightly=True,
+    nightly=false,
 )
 
 DEEPSEEK_V4_FLASH_FP8_4P_ENVS = {
