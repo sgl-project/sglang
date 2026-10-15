@@ -85,11 +85,15 @@ MAX_TOKENS = 16  # tokens one mono step serves (the MFMA B operand holds 16)
 # buys *fewer* tokens per step: TP2 carries 32 q heads and INTER 1536 against
 # TP4's 16 and 768.
 #
-# TP2 measured by COMPILE_ONLY builds of the own-mode kernel (ih2): S = 13 and
-# S = 14 compile clean, S = 15 reports local memory 172,960 and S = 16 182,304,
-# against the 163,840 limit. The cap is 12, well inside that, for margin and
-# because the MoE down stage -- the second overflow carrier, which scales with
-# INTER rather than H -- stays out of the binding budget there.
+# TP2 measured by COMPILE_ONLY builds of the own-mode kernel (ih2), and
+# re-measured after the pool was resized by INTER: S = 12, 13 and 14 compile
+# clean, S = 15 reports local memory 172,960 and S = 16 182,304, against the
+# 163,840 limit. The numbers did not move, because every width from WIDE_FROM up
+# takes the expert-grouped pool, which that fix did not touch.
+#
+# The cap is 12 rather than 14 because 12 is the widest step a GPU run has
+# actually checked (mono-check, widths 1-4 and 12); 13 and 14 are known only to
+# compile. Raising it is a measurement away, not a code change.
 #
 # Do NOT take these from tools/lds_budget_pr44319.py: that mirror models
 # count = 1 and is low by 256 B per token in own mode, where qs collapses to a
@@ -111,8 +115,17 @@ MAX_WIDTH = min(
     _LDS_MAX_WIDTH,
 )
 assert MAX_WIDTH >= 1, "SGLANG_TEST_MONO_MAX_WIDTH must leave at least one width"
-# indexer context parallelism: a rank computes every index q head
-MAX_QKV_ROWS = qkv_rows(TP)
+# The widest fused projection any build asks for. ``IndexHeads.__post_init__``
+# pins count to TOTAL_INDEX_HEADS under CP and LOCAL_INDEX_HEADS otherwise, and
+# LOCAL is never the larger, so CP's every-index-head rows are the bound.
+#
+# This was ``qkv_rows(TP)``, reading "a rank computes every index q head" -- true
+# only because TOTAL_INDEX_HEADS happens to be 4: qkv_rows is injective, so
+# qkv_rows(TP) and qkv_rows(TOTAL_INDEX_HEADS) coincide at TP4 and nowhere else.
+# It is too small at TP1 (9472 against 9856) and at TP2 for a CP build (4992
+# against 5248). TP4 is byte-identical either way, so this cannot move the
+# working build.
+MAX_QKV_ROWS = qkv_rows(TOTAL_INDEX_HEADS)
 # indexer context parallelism serves a request past this many index blocks: its
 # selection costs a fixed overhead that the one-head path's O(n^2) ranking only
 # exceeds beyond here
@@ -137,6 +150,17 @@ class IndexHeads:
 
     ``count > 1`` used to select CP on its own, which is why TP2 was refused:
     its own pair is not context parallelism.
+
+    **No caller builds ``cp=True`` today, at any TP.** The host passes
+    ``ONE_INDEX_HEAD``; the only other constructions are
+    ``IndexHeads(heads.count, 0)`` (pre_attn) and the jit boundary's
+    round-trip, both of which carry the flag they were given. So every
+    ``heads.cp`` branch in the kernels -- the striped block list, the ``// TP``
+    block index and sub-region size, and ``sel_cp``'s peer exchange -- is
+    unreachable in this build. They are kept as the upstream author's lineage,
+    not because they run: do not infer from their presence that CP is a tested
+    path. CP also cannot serve TP2 as written, since its peer exchange indexes
+    ``peer_addr(part // 2)`` for ``part < N_SPLIT``, i.e. up to peer 3.
     """
 
     count: int = LOCAL_INDEX_HEADS
@@ -150,6 +174,13 @@ class IndexHeads:
             f"got {self.count}"
         )
         assert 0 <= self.own < max(self.count, 1)
+        # pre_attn.py's SCRATCH_X8 is sized from MAX_QKV_ROWS, so a build whose
+        # projection is wider than that bound overruns the norm tasks' x8 rows
+        # silently.
+        assert self.rows <= MAX_QKV_ROWS, (
+            f"{self.count} index heads need {self.rows} projection rows, past "
+            f"the MAX_QKV_ROWS bound of {MAX_QKV_ROWS}"
+        )
 
     @property
     def rows(self) -> int:

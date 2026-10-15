@@ -198,9 +198,20 @@ CAND_CAP = 256
 SEL_WORDS = 2 * THREADS
 assert SEL_WORDS >= 2 * N_SPLIT * TOPK_BLOCKS
 # The candidates, their counter and the lane groups' maxima borrow ``p8``, and a
-# long share's entries ``red``: the selections run between barriers, after K1's
-# last ``red`` use and before a split task's P is written. K4's 16-token build
-# uses all but 4 KB of the 160 KB LDS, so they get no arrays of their own.
+# long share's entries ``red``. K4's 16-token build uses all but 4 KB of the
+# 160 KB LDS, so they get no arrays of their own.
+#
+# What makes the borrow safe is that a selection's words are dead before the
+# region's owner writes it: the chosen ids leave ``p8`` in ``blk``, which
+# ``read_blk`` consumes immediately, and a barrier separates that from the pass'
+# P stores. ``red`` is past K1's last use by the time the split stage runs.
+#
+# This used to read "before a split task's P is written", which was true only
+# while a task made one selection. With SPLIT_PASSES > 1 (stage_split) pass 1
+# selects *after* pass 0 has written and read its P -- safe because pass 0's P is
+# consumed by its own PV mfma and put to ``sp_o`` first, with the end-of-pass
+# barrier ordering the two. Do not restore the old wording: it would read as a
+# guarantee the two-pass split does not provide.
 SEL_P8_WORDS = 2 * CAND_CAP + 2 + WAVES * TOPK_BLOCKS
 # blocks a thread keys in its split task's eighth of a context (<= MAX_INDEX_BLOCKS)
 CAND_BATCH = 2
@@ -1064,8 +1075,11 @@ def build_post_attn_kernel(
                         ov.append((pscale * acc) * inv_l)
                     mb_put_bf(mb("sp_o"), ts * O_K + p * O_K_SUB + e0, ov)
                     if const_expr(SPLIT_PASSES > 1):
-                        # the next pass overwrites opart, which this one has just
-                        # read; at TP4 there is no next pass and no barrier
+                        # The next pass overwrites opart, which this one has
+                        # just read -- and, less obviously, re-borrows ``p8``
+                        # for its selection while this pass' P still sits
+                        # there. Both need the separation; at TP4 there is no
+                        # next pass and no barrier.
                         gpu.barrier()
                 # every head's max and exp-sum, now that every pass has filled hst
                 if tid < H:

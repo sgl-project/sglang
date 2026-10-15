@@ -59,6 +59,10 @@ print(json.dumps({
     "MID8_ROUNDS": l.MID8_ROUNDS,
     "WIDE_FROM": l.WIDE_FROM,
     "HIDDEN": c.HIDDEN,
+    "BLOCKS": c.BLOCKS,
+    "SH_TASKS": l.SH_TASKS,
+    "MAX_QKV_ROWS": c.MAX_QKV_ROWS,
+    "cp_rows": c.qkv_rows(c.TOTAL_INDEX_HEADS),
     # lists, not dicts: JSON would turn the int widths into string keys
     "pool": [l.pool_words(s) for s in range(1, c.MAX_TOKENS + 1)],
     "wide": [l.wide_moe(s) for s in range(1, c.MAX_TOKENS + 1)],
@@ -266,6 +270,25 @@ class TestMonoM3PerTP(CustomTestCase):
         self.assertFalse(self.v[8]["MERGE_ROUNDS_WHOLE"], "TP8 merge")
         for tp in (2, 4):
             self.assertTrue(self.v[tp]["MERGE_ROUNDS_WHOLE"], f"TP{tp} merge")
+
+    def test_one_cta_per_shared_expert_task(self):
+        """``has_sh = start("shared") < SH_TASKS`` with ``start`` taken mod
+        BLOCKS: past BLOCKS tasks the guard admits every CTA and the tasks
+        beyond it are silently never run. INTER scales as 1 / TP, so the
+        requirement is loosest at the smallest TP."""
+        for tp, v in self.v.items():
+            self.assertLessEqual(v["SH_TASKS"], v["BLOCKS"], f"TP{tp} shared")
+
+    def test_the_projection_bound_covers_both_index_head_modes(self):
+        """``MAX_QKV_ROWS`` sizes SCRATCH_X8, so it must cover the widest
+        projection a build can ask for -- CP's every-index-head rows, since
+        own mode's are never more. It used to be ``qkv_rows(TP)``, which is
+        that number only at TP4."""
+        for tp, v in self.v.items():
+            self.assertGreaterEqual(v["MAX_QKV_ROWS"], v["own_rows"], f"TP{tp} own")
+            self.assertGreaterEqual(v["MAX_QKV_ROWS"], v["cp_rows"], f"TP{tp} cp")
+        # and the TP4 build is unmoved by having said it that way
+        self.assertEqual(self.v[4]["MAX_QKV_ROWS"], 2944)
 
 
 if __name__ == "__main__":

@@ -82,6 +82,15 @@ UG_ROWS = 16
 UG_PER_SLOT = INTER // UG_ROWS
 SH_ROWS = 8  # mid rows per shared-expert up / gate task (a half task)
 SH_TASKS = INTER // SH_ROWS
+# The tasks are handed out one per CTA (``has_sh = start("shared") < SH_TASKS``,
+# post_attn.py), and ``start`` is taken mod BLOCKS -- so past BLOCKS tasks the
+# guard still admits every CTA while tasks BLOCKS.. simply never run, dropping
+# their mid rows from the shared expert with no diagnostic. INTER scales as
+# 1 / TP, so this holds from TP2 up (192 tasks) and fails at TP1 (384).
+assert SH_TASKS <= BLOCKS, (
+    f"{SH_TASKS} shared-expert tasks over {BLOCKS} CTAs: INTER = {INTER} needs "
+    f"a CTA to carry more than one, which stage_moe does not implement"
+)
 DN_ROWS = 32
 N_DN = HIDDEN // DN_ROWS
 # The router logits are written SCORE_COPIES times and CTA b polls copy
