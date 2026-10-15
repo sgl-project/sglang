@@ -20,6 +20,12 @@
 //!
 //! Anything toktier declines encodes on Hugging Face (`fallback_hf`): a
 //! toktier error can cost latency, never an id.
+//!
+//! Routes 1 and 2 are cheaper than `hf` only when toktier admits its fast CPU
+//! engine on this build (`plan().backends` holds `FastCpu`), which is what
+//! seals the prefix a repair starts from. With only the reference engine, a
+//! session turn re-encodes the whole transcript: exact, but no faster than
+//! `hf`. The backend warns at startup in that state.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -113,6 +119,15 @@ impl ToktierTokenizer {
             reasons = ?plan.reasons,
             "toktier tokenizer loaded"
         );
+        if !plan.backends.contains(&toktier::Backend::FastCpu) {
+            tracing::warn!(
+                family,
+                reasons = ?plan.reasons,
+                "toktier admitted no accelerated engine on this build: every route runs the \
+                 reference engine, exact but no faster than `hf`; `toktier-rust doctor` has \
+                 the build facts"
+            );
+        }
         Ok(Self {
             inner,
             tok,
