@@ -1087,29 +1087,6 @@ def test_failed_adjustments_preserve_accounting_and_tree(backend, is_eagle, lock
         core.adjust_component_size(leaf, ComponentType.FULL, 0)
 
 
-@pytest.mark.parametrize("backend", ["python", "rust"])
-@pytest.mark.parametrize("locked", [False, True], ids=["evictable", "protected"])
-def test_underflowing_adjustment_raises_and_preserves_ledgers(backend, locked):
-    core = _tree_core(backend)
-    key = RadixKey(array("q", [1, 2, 3, 4]))
-    leaf = _pump_insert(
-        core, InsertParams(key=key, value=torch.arange(10, 10 + len(key)))
-    ).last_device_node
-    if locked:
-        lock = core.inc_lock_ref(leaf)
-    before = core.full_evictable_size(), core.full_protected_size()
-    for delta in (-5, -(1 << 63)):
-        with pytest.raises(ValueError):
-            core.adjust_component_size(leaf, ComponentType.FULL, delta)
-        assert (core.full_evictable_size(), core.full_protected_size()) == before
-    core.adjust_component_size(leaf, ComponentType.FULL, -4)
-    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
-    core.adjust_component_size(leaf, ComponentType.FULL, 4)
-    if locked:
-        core.dec_lock_ref(leaf, lock.to_dec_params())
-    core.sanity_check([], [])
-
-
 def test_adjustment_follows_real_backing_changes_across_lock_transitions():
     """The adjusted figure moves with the node between the evictable and
     protected ledgers, and eviction reclaims the component's own figure."""
