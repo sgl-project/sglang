@@ -347,7 +347,7 @@ def _keep_prefill_rows(
         renew = 2 * read >= _embedding_token_count(result.embedding)
     else:
         # Only the cache's own tensor is safe to keep by reference.
-        cached = embedding_cache.mm_cache.get(cache_hash)
+        cached = embedding_cache.peek(cache_hash)
         renew = cached is None or cached.embedding is not result.embedding
     if renew:
         flat = result.embedding.reshape(-1, result.embedding.shape[-1])

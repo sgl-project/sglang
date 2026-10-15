@@ -908,8 +908,12 @@ def test_keeping_rows_leaves_the_cache_order_alone():
         torch.zeros(1, dtype=torch.long),
     )
 
-    assert list(mm_schedule.embedding_cache.mm_cache) == [11, 12]
+    cache = mm_schedule.embedding_cache
+    assert list(cache.mm_cache) == [11, 12]
     assert len(mm_schedule._prefill_rows) == 1
+    assert cache.peek(11) is cache.mm_cache[11]
+    assert cache.peek(13) is None
+    assert list(cache.mm_cache) == [11, 12]
 
 
 if __name__ == "__main__":
