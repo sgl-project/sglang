@@ -71,8 +71,8 @@ def _req(rid, *, priority=0, max_new_tokens=8, holds_row=False):
 
 
 class _Adder(PrefillAdder):
-    """Admits every request offered while free_tokens is unspent; preemption
-    is PrefillAdder's own, against free_tokens."""
+    """Admits every request offered; preemption is PrefillAdder's own,
+    against free_tokens free KV tokens."""
 
     free_tokens = 0
     # Whether the pass budget is spent before the first candidate.
