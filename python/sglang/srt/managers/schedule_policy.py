@@ -9,6 +9,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
 )
@@ -580,6 +581,27 @@ class _PrefillAdmission:
     is_chunked: bool
 
 
+def mamba_prefill_chunk_grid() -> int:
+    """Grid a truncated prefill cut must land on, or 1 to leave the cut alone.
+
+    DCP donates a mamba checkpoint only when the cached prefix is a whole
+    number of kernel chunks from the extend start and also on the radix page.
+    A cut off that grid costs the request every later donation. Without DCP,
+    #40907 donates from a prefix-relative snapshot, so rounding the cut would
+    only drop up to one grid of prefill budget. A PrefillAdder built before
+    the server config is published, as in unit tests, also leaves the cut.
+    """
+    ctx = get_context()
+    if not (
+        ctx.is_config_namespace_published("exec")
+        and ctx.is_config_namespace_published("parallel")
+        and get_exec().mamba.enable_mamba_extra_buffer
+        and get_parallel().dcp_enabled
+    ):
+        return 1
+    return mamba_cache_chunk_size()
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -601,20 +623,11 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
     ):
         self.page_size = page_size
-        # A mamba checkpoint may only be donated at a depth that is both on the
-        # radix page and a whole number of kernel chunks from the extend start,
-        # and those two grids meet only where the prefix itself is chunk
-        # aligned. A chunk that stops anywhere else therefore costs the request
-        # every later donation, not just this one, so keep the cut on the grid.
-        # Unit tests build a PrefillAdder with no published server config.
-        # The real scheduler publishes `exec` before it gets here. A missing
-        # namespace means the extra buffer is off, so the cut stays put.
-        self.mamba_chunk_grid = (
-            mamba_cache_chunk_size()
-            if get_context().is_config_namespace_published("exec")
-            and get_exec().mamba.enable_mamba_extra_buffer
-            else 1
-        )
+        # DCP donates a checkpoint only on the kernel chunk grid. A cut off
+        # that grid costs the request every later donation, so keep it there.
+        # Without DCP the prefix-relative depth rule already donates, and
+        # rounding would only shorten the chunk.
+        self.mamba_chunk_grid = mamba_prefill_chunk_grid()
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator

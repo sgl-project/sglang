@@ -44,7 +44,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
-    mamba_cache_chunk_size,
     publish,
     spawn_world_rank,
 )
@@ -222,6 +221,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -1719,14 +1719,13 @@ class Scheduler(
             )
 
     def init_mamba_truncation_align(self):
-        """A mamba checkpoint may only be donated where the cached prefix sits
-        on the kernel chunk grid, so a chunk that stops anywhere else costs the
-        request every donation it would have made after that, not just one.
-        Use the LCM to preserve any existing alignment."""
-        if not get_exec().mamba.enable_mamba_extra_buffer:
-            return
-
-        chunk_size = mamba_cache_chunk_size()
+        """Under DCP a mamba checkpoint may only be donated where the cached
+        prefix sits on the kernel chunk grid, so a chunk that stops anywhere
+        else costs the request every donation it would have made after that.
+        Without DCP the prefix-relative rule already donates, so leave the
+        existing alignment alone. Use the LCM to preserve any alignment that
+        is already set."""
+        chunk_size = mamba_prefill_chunk_grid()
         if chunk_size <= 1:
             return
 

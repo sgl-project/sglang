@@ -17,7 +17,8 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.schedule_policy import PrefillAdder, mamba_prefill_chunk_grid
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -156,6 +157,54 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
 
     def test_no_rounding_without_the_mamba_extra_buffer(self):
         self.assertEqual(self._floor(100, 8192, grid=1), 100)
+
+    def _published_grid(self, *, dcp_size: int, strategy: str = "extra_buffer") -> int:
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy=strategy,
+            dcp_size=dcp_size,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            return mamba_prefill_chunk_grid()
+
+    def test_dcp_extra_buffer_uses_the_chunk_grid(self):
+        self.assertEqual(self._published_grid(dcp_size=2), CHUNK)
+        self.assertEqual(
+            self._floor(100, 8192, grid=self._published_grid(dcp_size=2)), 64
+        )
+
+    def test_non_dcp_extra_buffer_leaves_the_cut(self):
+        # #40907 already donates from a prefix-relative snapshot here, so the
+        # cut must stay where the prefill budget put it.
+        self.assertEqual(self._published_grid(dcp_size=1), 1)
+        self.assertEqual(
+            self._floor(100, 8192, grid=self._published_grid(dcp_size=1)), 100
+        )
+
+    def test_non_dcp_does_not_change_truncation_alignment(self):
+        # The old gate would write the chunk size into a still-empty alignment.
+        scheduler = object.__new__(Scheduler)
+        scheduler.truncation_align_size = None
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            dcp_size=1,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            scheduler.init_mamba_truncation_align()
+        self.assertIsNone(scheduler.truncation_align_size)
+
+    def test_dcp_folds_the_chunk_into_truncation_alignment(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.truncation_align_size = 48
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            dcp_size=2,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            scheduler.init_mamba_truncation_align()
+        self.assertEqual(scheduler.truncation_align_size, 192)
 
     def test_every_chunk_of_a_cut_up_request_can_still_donate(self):
         # Walk a 100k prompt through chunks the scheduler cut to whatever the
