@@ -5,6 +5,50 @@ use super::*;
 use crate::state::kv_events::wire::{BlockRemoved, BlockStored};
 use crate::state::load_monitor::engine_reported_load::LoadStat;
 
+/// Bootstrap buffers LoRA tokens until ingestion can translate opaque IDs.
+#[tokio::test]
+async fn pump_keeps_lora_tokens_while_bootstrap_holds_batches() {
+    let id = worker_id("http://w1", 0);
+    let tracker = pending_tracker(std::slice::from_ref(&id));
+    let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+    h.tx.send(WorkerEvent::Batch {
+        worker: id.clone(),
+        seq: 6,
+        batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            block_hashes: vec![100],
+            parent_block_hash: None,
+            token_ids: vec![1, 2],
+            block_size: 2,
+            lora_id: None,
+            lora_name: Some("adapter-a".into()),
+            cache_salt: None,
+            is_bigram: false,
+            medium: Some("GPU".into()),
+        })]),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.tree.node_count(), 0);
+    h.ctrl_tx
+        .send(PumpControl::AbandonBootstrap {
+            obligations: obligations(&tracker, std::slice::from_ref(&id)),
+        })
+        .await
+        .unwrap();
+    drop(h.tx);
+    drop(h.ctrl_tx);
+    h.pump.await.unwrap();
+    assert_eq!(
+        h.tree.prefix_depths(None, &[1132550695741458728]),
+        HashMap::from([(id, 1)])
+    );
+    assert!(
+        h.tree.prefix_depths(None, &[100]).is_empty(),
+        "opaque IDs must not receive prompt credit"
+    );
+}
+
 /// The manager re-runs `add_worker` for a worker it already knows (its
 /// reconcile loop does so for a worker that advertises no model name), so a
 /// rank the tracker already holds must not buy another sweep: a `Pending`
@@ -314,6 +358,10 @@ async fn pump_applies_block_stored_to_tree() {
         worker: id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![10, 20, 30],
             token_ids: vec![],
@@ -348,6 +396,10 @@ async fn pump_keeps_host_backed_block_owned_across_device_eviction() {
 
     let stored = |medium: Option<&str>| {
         KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![10, 20],
             token_ids: vec![],
@@ -413,6 +465,10 @@ async fn pump_tallies_applied_events_by_medium() {
 
     let stored = |medium: Option<&str>, hashes: Vec<i64>| {
         KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: hashes,
             token_ids: vec![],
@@ -522,6 +578,10 @@ async fn pump_filters_out_of_order_seq() {
         worker: id.clone(),
         seq: 5,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![10],
             token_ids: vec![],
@@ -569,6 +629,10 @@ async fn pump_handles_all_blocks_cleared() {
         worker: id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![1, 2],
             token_ids: vec![],
@@ -616,6 +680,10 @@ async fn pump_drops_events_from_detached_workers() {
         worker: dead_id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![42],
             token_ids: vec![],
@@ -631,6 +699,10 @@ async fn pump_drops_events_from_detached_workers() {
         worker: live_id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![99],
             token_ids: vec![],

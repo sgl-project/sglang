@@ -138,6 +138,7 @@ class FullTopKIndexer:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            compute_topk_plan=not self.use_deep_select_decode,
         )
         if d is None:
             return
