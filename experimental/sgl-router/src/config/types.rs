@@ -101,6 +101,11 @@ pub enum TokenizerBackend {
     /// `fastokens` BPE encoding with Hugging Face decoding.
     #[value(name = "fast")]
     Fast,
+    /// `toktier` session-delta encoding with Hugging Face decoding; needs the
+    /// `toktier` build feature.
+    #[cfg(feature = "toktier")]
+    #[value(name = "toktier")]
+    Toktier,
 }
 
 /// Router tokenizer encode settings.

@@ -18,6 +18,8 @@ use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
+#[cfg(feature = "toktier")]
+use crate::tokenizer::toktier::SessionScope;
 use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
@@ -73,8 +75,20 @@ async fn openai_route(
     );
     let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
     let tokens = routing.needs_request_tokens(ctx);
-    let request = PreparedRequest::openai(ctx, path, model, fields, &headers, body, tokens)?;
+    let request = {
+        #[cfg(feature = "toktier")]
+        let _session = toktier_session(ctx, &headers);
+        PreparedRequest::openai(ctx, path, model, fields, &headers, body, tokens)?
+    };
     routing.dispatch(ctx, request, headers, start).await
+}
+
+/// Binds the affinity session id for the toktier backend while the request is
+/// prepared, so the prompt encodes as the delta of that session's transcript.
+/// Preparation is synchronous: the binding never spans an await.
+#[cfg(feature = "toktier")]
+fn toktier_session(ctx: &AppContext, headers: &HeaderMap) -> SessionScope {
+    SessionScope::bind(affinity_session_id(ctx, headers))
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
@@ -87,7 +101,11 @@ pub async fn generate(
     let start = Instant::now();
     let model = ModelId(ctx.config.model.id.clone());
     let routing = ModelRouting::lookup(&ctx, &model)?;
-    let request = PreparedRequest::generate(&ctx, model, body)?;
+    let request = {
+        #[cfg(feature = "toktier")]
+        let _session = toktier_session(&ctx, &headers);
+        PreparedRequest::generate(&ctx, model, body)?
+    };
     routing.dispatch(&ctx, request, headers, start).await
 }
 
@@ -388,12 +406,7 @@ impl<'a> RoutingContext<'a> {
             .sticky
             .as_ref()
             .and_then(|config| nonempty_header(headers, &config.header_name));
-        let session_id = ctx
-            .config
-            .model
-            .affinity
-            .as_ref()
-            .and_then(|config| nonempty_header(headers, &config.session_id_header));
+        let session_id = affinity_session_id(ctx, headers);
         Ok(Self {
             prefix_matches: None,
             load_snapshot: None,
@@ -410,6 +423,15 @@ fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
+}
+
+/// The affinity `--session-id-header` value, when affinity is configured and the header is set.
+fn affinity_session_id<'a>(ctx: &AppContext, headers: &'a HeaderMap) -> Option<&'a str> {
+    ctx.config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| nonempty_header(headers, &config.session_id_header))
 }
 
 fn pick_prefill_worker(

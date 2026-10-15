@@ -82,7 +82,10 @@ pub struct ModelArgs {
     pub disable_input_ids_forwarding: bool,
 
     /// Encode backend for router tokenization. fast uses fastokens for encoding and HF for
-    /// decoding, falling back to hf when fastokens cannot load the tokenizer.
+    /// decoding, falling back to hf when fastokens cannot load the tokenizer. toktier (builds
+    /// with the `toktier` feature) encodes each chat as the delta of its affinity session's
+    /// transcript, with HF decoding, falling back to hf for tokenizers it ships no
+    /// certified artifact for.
     #[arg(long, value_enum, default_value = "hf", value_name = "BACKEND")]
     pub tokenizer_backend: TokenizerBackend,
 
@@ -3239,6 +3242,17 @@ mod tests {
                 l1_cache_mb: 4096,
             }
         );
+        #[cfg(feature = "toktier")]
+        {
+            let toktier = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--tokenizer-backend",
+                "toktier",
+            ]))
+            .unwrap();
+            assert_eq!(toktier.model.tokenizer.backend, TokenizerBackend::Toktier);
+        }
     }
 
     #[test]

@@ -5,6 +5,8 @@ pub mod adapter;
 pub mod chat_formatter;
 mod kimi;
 pub mod stats;
+#[cfg(feature = "toktier")]
+pub mod toktier;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
