@@ -540,6 +540,8 @@ async fn mismatched_block_size_is_refused() {
 /// one-node tree.
 fn one_rank_body(seq: i64, with_tree: bool) -> PeerSnapshot {
     PeerSnapshot {
+        lora_blocks: Vec::new(),
+
         format: SNAPSHOT_FORMAT,
         block_size: BLOCK_SIZE,
         is_bigram: false,
