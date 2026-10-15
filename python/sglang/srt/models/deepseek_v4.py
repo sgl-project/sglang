@@ -1169,7 +1169,6 @@ class MQALayer(MqaAttentionBase):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         compress_ratio_override: Optional[int] = None,
-        is_nextn: bool = False,
     ) -> None:
         super().__init__(
             config,
@@ -1300,7 +1299,6 @@ class MQALayer(MqaAttentionBase):
         self.use_mega_attention = (
             self.is_dsv41
             and _is_cuda
-            and not is_nextn
             and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
         )
         self.mega_cos_sin_cache = self.mega_wo_a = None
@@ -2885,7 +2883,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
-            is_nextn=is_nextn,
         )
         moe_alt_stream = (
             alt_streams[0]
@@ -2978,7 +2975,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str,
         alt_streams: Optional[List[torch.cuda.Stream]],
         compress_ratio_override: Optional[int],
-        is_nextn: bool,
     ) -> MQALayer:
         return MQALayer(
             config=config,
@@ -2987,7 +2983,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=prefix,
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
-            is_nextn=is_nextn,
         )
 
     def bind_next(self, next_layer: Optional[nn.Module]) -> None:

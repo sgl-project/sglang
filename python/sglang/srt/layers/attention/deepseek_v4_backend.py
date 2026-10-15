@@ -3757,7 +3757,7 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            use_mega_paged = self.mega_attn and self._mega_paged_prefill(
+            use_mega_paged = cos_sin_cache is not None and self._mega_paged_prefill(
                 forward_batch,
                 num_qo_tokens=q.shape[0],
                 layer_id=layer_id,
@@ -3794,7 +3794,7 @@ class DeepseekV4AttnBackend(
                     cos_sin_cache=cos_sin_cache,
                 )
 
-            if self.mega_attn:
+            if cos_sin_cache is not None:
                 return self._forward_mega_decode(
                     q=q.squeeze(1),
                     swa_k_cache=swa_k_cache,
@@ -3975,7 +3975,7 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        if self.mega_attn:
+        if cos_sin_cache is not None:
             return self._forward_mega_prefill(
                 q=q_flat,
                 kv=kv,

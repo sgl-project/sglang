@@ -548,7 +548,7 @@ def create_deepseek_v4_attn_backend(
     """Construct the DSV4 backend matching --dsv4-attn-backend."""
     if is_dsv4_trtllm_attn_enabled():
         cls = DeepseekV4TrtllmAttnBackend
-    elif is_dsv4_mega_attn_enabled() and not model_runner.is_draft_worker:
+    elif is_dsv4_mega_attn_enabled():
         cls = DeepseekV4MegaAttnBackend
     else:
         cls = DeepseekV4AttnBackend
