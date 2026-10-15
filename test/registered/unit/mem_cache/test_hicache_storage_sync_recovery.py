@@ -437,9 +437,15 @@ class TestStorageSyncRecovery(unittest.TestCase):
     def test_sync_knobs_are_popped_and_validated(self):
         cc = HiCacheController.__new__(HiCacheController)
         cc.storage_sync_failed, cc.storage_sync_failure = True, "stale"
-        extra = {"storage_failure_policy": "raise", "storage_sync_timeout": 30, "x": 1}
-        cc._apply_storage_extra_config(extra)
+        extra = {
+            "storage_failure_policy": "raise",
+            "storage_sync_timeout": 30,
+            "storage_get_timeout_s": 7,
+            "x": 1,
+        }
+        timeouts = cc._apply_storage_extra_config(extra)
         self.assertEqual(extra, {"x": 1})
+        self.assertEqual((timeouts.query_s, timeouts.get_s), (5.0, 7.0))
         self.assertEqual(
             (cc.storage_failure_policy, cc.storage_sync_timeout), ("raise", 30.0)
         )

@@ -64,12 +64,6 @@ device_module = get_device_module()
 _STORAGE_THREAD_JOIN_TIMEOUT_S = 10
 
 
-class HiCacheStorageWedgedError(RuntimeError):
-    """A storage worker did not stop during a reset. The reset completed with
-    fresh workers; the stuck one keeps its host memory quarantined, and the
-    rank-agreed storage health bit degrades L3 at the next drain."""
-
-
 class _WorkerGeneration(threading.local):
     def __init__(self):
         # None on threads that are not storage workers (the scheduler thread).
@@ -608,9 +602,12 @@ class HiCacheController:
 
     def _end_inflight(self, operation: StorageOperation, prefetch: bool) -> None:
         with self._inflight_lock:
+            # Compare-and-clear: a returning abandoned worker must not clear
+            # the slot the live worker's operation occupies by now.
             if prefetch:
-                self._inflight_prefetch_op = None
-            else:
+                if self._inflight_prefetch_op is operation:
+                    self._inflight_prefetch_op = None
+            elif self._inflight_backup_op is operation:
                 self._inflight_backup_op = None
             spans = operation.quarantined_spans
             operation.quarantined_spans = []
@@ -637,7 +634,7 @@ class HiCacheController:
         still touch stay quarantined, and its layout lease is not waited for."""
         abandoned = self.abandoned_thread_idents()
         for domain in shared_host_layout_domains(self._host_pools()):
-            domain.abandoned_lease_holders = frozenset(abandoned)
+            domain.abandon_leases_of(abandoned)
         self.mem_pool_host.clear()
 
     def _start_storage_threads(self):
@@ -735,11 +732,21 @@ class HiCacheController:
         self._wedged_threads = [
             thread for thread in self._wedged_threads if thread.is_alive()
         ] + wedged
+        if self.storage_failure_policy == "raise":
+            consequence = (
+                "storage_failure_policy=raise fails every rank at its next "
+                "HiCache drain"
+            )
+        else:
+            consequence = (
+                "L3 is degraded on every rank until the storage backend is "
+                "re-attached, which needs the abandoned worker(s) to return "
+                "(restart the server if they never do)"
+            )
         self.storage_wedged_reason = (
             f"HiCache storage worker(s) {[t.name for t in wedged]} did not stop "
             f"within {_STORAGE_THREAD_JOIN_TIMEOUT_S}s and were abandoned with their "
-            "host memory quarantined; L3 is degraded on every rank until the storage "
-            "backend is re-attached, which needs the abandoned worker(s) to return."
+            f"host memory quarantined; {consequence}."
         )
         logger.error(self.storage_wedged_reason)
         return self.storage_wedged_reason
@@ -1414,7 +1421,10 @@ class HiCacheController:
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
-            if all_success and operation.is_terminated():
+            # An abandoned worker issues no further backend call either.
+            if all_success and (
+                operation.is_terminated() or not self._storage_worker_is_live()
+            ):
                 all_success = False
             if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
@@ -1485,7 +1495,11 @@ class HiCacheController:
         # Read from KV-derived sidecar pools, if any. A KV miss already decides
         # the batch, so no second bounded call (and no second pin) is issued.
         sidecar_hits: dict[str, int] = {}
-        if len(kv_derived_transfers) > 0 and kv_hits > 0:
+        if (
+            len(kv_derived_transfers) > 0
+            and kv_hits > 0
+            and self._storage_worker_is_live()
+        ):
             current_kv_derived_transfers = [
                 PoolTransfer(
                     name=transfer.name,
@@ -1703,6 +1717,9 @@ class HiCacheController:
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            if not self._storage_worker_is_live():
+                # An abandoned worker issues no further backend call.
+                break
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size

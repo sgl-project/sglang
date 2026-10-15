@@ -284,7 +284,7 @@ class HybridCacheController(BaseHiCacheController):
         if (
             thread is not None
             and thread.is_alive()
-            and getattr(self, "pp_rank", 0) == 0
+            and self.storage_config.pp_rank == 0
         ):
             self.pp_prefetch_command_queue.put(None)
 
@@ -1338,6 +1338,10 @@ class HybridCacheController(BaseHiCacheController):
             operation = None
             try:
                 objects = broadcast_pyobj(objects, rank, group, src=source)
+                if not self._storage_worker_is_live():
+                    # Abandoned inside the broadcast: the ticket state and the
+                    # host pool belong to the live generation now.
+                    return
                 if not objects:
                     continue
                 ticket = objects[0]
@@ -1401,7 +1405,8 @@ class HybridCacheController(BaseHiCacheController):
                 # Preserve every KV/sidecar ACK even when local allocation fails.
                 self._publish(self.prefetch_buffer, operation)
             finally:
-                if is_source and objects:
+                # A reset replaced the queue an abandoned source took from.
+                if is_source and objects and self._storage_worker_is_live():
                     self.pp_prefetch_command_queue.task_done()
 
     def write_storage(
@@ -1575,8 +1580,10 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
+        if (
+            not operation.is_terminated()
+            and self._storage_worker_is_live()
+            and kv_completed_pages == len(operation.hash_value)
         ):
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
@@ -1668,6 +1675,9 @@ class HybridCacheController(BaseHiCacheController):
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys, operation.hash_value, backup_transfers
             ):
+                if not self._storage_worker_is_live():
+                    # An abandoned worker issues no further backend call.
+                    break
                 results.update(
                     self._bounded_storage_call(
                         StorageCallKind.SET,

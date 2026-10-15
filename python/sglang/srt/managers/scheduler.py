@@ -117,7 +117,6 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.managers.cache_controller import HiCacheStorageWedgedError
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -300,6 +299,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageWedgedError
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -5365,17 +5365,23 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True) -> tuple[bool, str]:
-        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+    def flush_cache(self, empty_cache: bool = True) -> bool:
+        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache.
+
+        Raises HiCacheStorageWedgedError after the pools are flushed when a
+        HiCache storage worker could not be stopped: the flush itself is
+        complete and the engine keeps serving with L3 degraded.
+        """
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
-            storage_error = None
+            storage_error: Optional[HiCacheStorageWedgedError] = None
             try:
                 self.tree_cache.reset()
             except HiCacheStorageWedgedError as e:
-                # The tree is reset; only the stuck storage worker is reported.
-                storage_error = str(e)
+                # The tree is reset; the device pools are flushed below, then
+                # the stuck worker is reported.
+                storage_error = e
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
@@ -5389,19 +5395,20 @@ class Scheduler(
                 current_platform.empty_cache()
             if storage_error is not None:
                 logger.error("Cache flushed, but %s", storage_error)
-                return False, f"Cache flushed, but {storage_error}"
+                raise storage_error
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
-            return True, ""
-        message = (
-            "Cache not flushed because there are pending requests. "
-            f"#queue-req: {len(self.waiting_queue)}, "
-            f"#running-req: {len(self.running_batch.reqs)}"
-        )
-        logging.warning(message)
-        return False, message
+            success = True
+        else:
+            logging.warning(
+                f"Cache not flushed because there are pending requests. "
+                f"#queue-req: {len(self.waiting_queue)}, "
+                f"#running-req: {len(self.running_batch.reqs)}"
+            )
+            success = False
+        return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         return self.internal_state.get_internal_state(recv_req)

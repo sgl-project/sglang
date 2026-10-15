@@ -14,10 +14,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import (
-    CacheOperation,
-    HiCacheStorageWedgedError,
-)
+from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
@@ -47,6 +44,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
 )
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageWedgedError,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,

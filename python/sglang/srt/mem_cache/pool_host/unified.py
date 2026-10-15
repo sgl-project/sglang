@@ -34,6 +34,8 @@ class _SharedPageEnvelopeHostBacking:
     class _LayoutLeaseState(threading.local):
         def __init__(self):
             self.depth = 0
+            # The lease token this thread holds while depth > 0.
+            self.token: Optional[int] = None
 
     class _Side:
         def __init__(
@@ -203,12 +205,15 @@ class _SharedPageEnvelopeHostBacking:
         # the backend returns. Compaction blocks new leases and drains both.
         self._layout_condition = threading.Condition(self.lock)
         self._layout_users = 0
-        # Thread idents holding a lease. Those in abandoned_lease_holders are
-        # inside a storage call nobody waits for (an orphaned or abandoned
-        # worker): compaction does not wait for them and leaves the pages they
-        # may still write where they are.
+        # Lease token -> ident of the thread holding it. A token in
+        # _abandoned_lease_tokens belongs to a storage call nobody waits for
+        # (an orphaned or abandoned worker): compaction does not wait for it
+        # and leaves the pages that call may still write where they are.
+        # Tokens rather than idents: an ident is reused once its thread exits,
+        # and a later lease taken under it must be waited for.
+        self._next_lease_token = 0
         self._layout_holders: dict[int, int] = {}
-        self.abandoned_lease_holders: frozenset[int] = frozenset()
+        self._abandoned_lease_tokens: set[int] = set()
         self._layout_lease_state = self._LayoutLeaseState()
         self._compacting = False
         self._pending_transfer_events = {}
@@ -357,9 +362,15 @@ class _SharedPageEnvelopeHostBacking:
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 self._finish_compaction()
+                holders = sorted(
+                    ident
+                    for token, ident in self._layout_holders.items()
+                    if token not in self._abandoned_lease_tokens
+                )
                 raise RuntimeError(
                     "Unified host pool layout is still leased by an in-flight "
-                    "storage call; it cannot be cleared until that call returns."
+                    f"storage call on thread(s) {holders}; it cannot be cleared "
+                    "until that call returns."
                 )
             self._layout_condition.wait(remaining)
         events = list(self._pending_transfer_events.values())
@@ -369,9 +380,25 @@ class _SharedPageEnvelopeHostBacking:
     def _awaited_layout_users(self) -> int:
         return sum(
             1
-            for ident in self._layout_holders
-            if ident not in self.abandoned_lease_holders
+            for token in self._layout_holders
+            if token not in self._abandoned_lease_tokens
         )
+
+    def abandon_leases_of(self, idents: set[int]) -> None:
+        """Stop waiting for the leases these threads hold right now: they are
+        inside a storage call nobody waits for, and the pages it may still
+        write are quarantined, so compaction leaves them in place."""
+        with self._layout_condition:
+            abandoned = {
+                token
+                for token, ident in self._layout_holders.items()
+                if ident in idents
+            }
+            if not abandoned:
+                return
+            self._abandoned_lease_tokens |= abandoned
+            if self._awaited_layout_users() == 0:
+                self._layout_condition.notify_all()
 
     def _finish_compaction(self) -> None:
         self._compacting = False
@@ -386,7 +413,10 @@ class _SharedPageEnvelopeHostBacking:
             while self._compacting:
                 self._layout_condition.wait()
             self._layout_users += 1
-            self._layout_holders[threading.get_ident()] = 1
+            token = self._next_lease_token
+            self._next_lease_token += 1
+            self._layout_holders[token] = threading.get_ident()
+            self._layout_lease_state.token = token
             self._layout_lease_state.depth = 1
 
     def _prune_completed_transfer_events_locked(self) -> None:
@@ -417,7 +447,10 @@ class _SharedPageEnvelopeHostBacking:
             if self._layout_lease_state.depth:
                 return
             self._layout_users -= 1
-            self._layout_holders.pop(threading.get_ident(), None)
+            token = self._layout_lease_state.token
+            self._layout_lease_state.token = None
+            self._layout_holders.pop(token, None)
+            self._abandoned_lease_tokens.discard(token)
             if self._awaited_layout_users() == 0:
                 self._layout_condition.notify_all()
 

@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 
 
+class HiCacheStorageWedgedError(RuntimeError):
+    """A HiCache storage worker could not be stopped by a cache reset."""
+
+    # Raised by the tree cache's reset() after it completed with fresh
+    # workers: the stuck one keeps its host memory quarantined and the
+    # rank-agreed storage health bit degrades L3 at the next drain.
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int

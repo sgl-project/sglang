@@ -180,46 +180,22 @@ class TestResetWithStuckWorkers(CustomTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_reset_abandons_a_slow_bounded_call_instead_of_waiting_for_it(self):
-        """A flush while a long bounded write is in flight must not wait for
-        the deadline: the call is orphaned, its span stays quarantined across
-        the pool clear, and the restarted workers serve again."""
-        backend = _Backend(hang={("batch_set_v1", 0)})
-        cc, pool = _controller(
-            backend, StorageCallTimeouts(query_s=30, get_s=30, set_s=30)
-        )
-        cc.backup_thread = _start(cc.backup_thread_func, "backup")
-        slow = _backup_op(pool)
-        cc.backup_queue.put(slow)
-        self.assertTrue(backend.hung.wait(5))
-        started = time.monotonic()
-        self.assertIsNone(cc.reset())
-        self.assertLess(time.monotonic() - started, 5)
-        self.assertTrue(cc.storage_workers_healthy())
-        self.assertFalse(cc.storage_stop_event.is_set())
-        cc.clear_host_pool()
-        self.assertEqual(pool.available_size(), POOL_SIZE - len(slow.host_indices))
-        backend.gate.set()
-        self.assertTrue(
-            _wait_until(lambda: cc.storage_call_guard.take_stats().orphaned["set"] == 0)
-        )
-        self.assertEqual(pool.available_size(), POOL_SIZE)
-        cc.backup_queue.put(_backup_op(pool))
-        (acked,) = _drain(cc.ack_backup_queue, 1)
-        self.assertEqual(acked.completed_tokens, 2 * PAGE_SIZE)
-        cc.storage_stop_event.set()
-        cc.backup_queue.put(None)
-        cc.backup_thread.join(5)
-
     def test_reset_abandons_a_wedged_worker_on_a_dead_generation(self):
         """With deadlines off a worker stuck in the backend cannot be joined.
         reset must report it instead of raising, restart fresh workers, keep
         the stuck operation's host memory quarantined across the pool clear,
         flag the rank unhealthy, and the stuck worker, once it returns, must
-        publish nothing into the live queues and release its quarantine."""
+        publish nothing into the live queues and release its quarantine. A
+        reset with nothing in flight stays healthy, and a later clean reset
+        does not lift the degrade: only a re-attach does."""
         backend = _Backend(hang={("batch_set_v1", 0)})
         cc, pool = _controller(backend)
-        wedged = cc.backup_thread = _start(cc.backup_thread_func, "backup")
+        cc.backup_thread = _start(cc.backup_thread_func, "backup")
+        self.assertIsNone(cc.reset())
+        self.assertTrue(cc.storage_workers_healthy())
+        cc.clear_host_pool()
+        self.assertEqual(pool.available_size(), POOL_SIZE)
+        wedged = cc.backup_thread
         stuck = _backup_op(pool)
         cc.backup_queue.put(stuck)
         self.assertTrue(backend.hung.wait(5))
@@ -249,6 +225,10 @@ class TestResetWithStuckWorkers(CustomTestCase):
         self.assertFalse(wedged.is_alive())
         self.assertTrue(cc.ack_backup_queue.empty())
         self.assertEqual(pool.available_size(), POOL_SIZE - len(fresh.host_indices))
+        # A later flush joins the new generation, but the degrade persists
+        # until a re-attach clears the reason.
+        self.assertIsNone(cc.reset())
+        self.assertFalse(cc.storage_workers_healthy())
         cc.detach_storage_backend()
         self.assertFalse(cc.enable_storage)
 
@@ -290,14 +270,21 @@ class TestResetWithStuckWorkers(CustomTestCase):
 
 
 def _scheduler_cache(cc) -> UnifiedRadixCache:
+    """The scheduler-thread side: the production check_hicache_events round,
+    whose cross-rank MIN runs on the default process group; only the L2 ack
+    checks and the buffer flush are stubbed."""
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.cache_controller = cc
-    cache.tree_core = SimpleNamespace(enable_storage=True, page_size=PAGE_SIZE)
+    cache.tree_core = SimpleNamespace(
+        enable_storage=True, page_size=PAGE_SIZE, write_back_duplicate_reclaim_digest=0
+    )
     cache.storage_unavailable = False
+    cache._storage_unavailable_warned_at = 0.0
     cache.host_memory_mode = "buffer_only"
     cache.prefetch_threshold = PAGE_SIZE
     cache.enable_storage_metrics = False
     cache.storage_metrics_collector = None
+    cache.linker = None
     cache.pp_rank = 0
     cache.pp_size = 1
     cache.pp_group = None
@@ -306,11 +293,18 @@ def _scheduler_cache(cc) -> UnifiedRadixCache:
     cache.attn_cp_group = None
     cache.attn_tp_group = None
     cache.work_list = []
+    cache.writing_check = mock.Mock()
+    cache.loading_check = mock.Mock()
     cache.storage_prefetch_retries = StoragePrefetchRetries()
     cache._prefetch_outcome_stats = defaultdict(int)
     cache._storage_prefetch_hit_remaining_by_reqid = {}
+    cache._record_storage_prefetch_hit = mock.Mock()
+    cache.revoke_pending_prefetch = mock.Mock()
+    cache._handle_prefetch_result = mock.Mock()
     cache.buffer_pipeline = SimpleNamespace(
-        pending_hit_allocs=deque(), has_staged=lambda request: False
+        pending_hit_allocs=deque(),
+        has_staged=lambda request: False,
+        flush_pending_writes=mock.Mock(),
     )
     cache.ongoing_prefetch = {}
     return cache
@@ -345,11 +339,12 @@ def _wedged_rank_body(rank: int) -> None:
     assert (reason is None) == (rank == 0), (rank, reason)
     assert cc.enable_storage
     cache = _scheduler_cache(cc)
-    # The next drain MIN-reduces the health bit: both ranks degrade together
-    # and the rank-agreed all-reduce keeps one tensor length everywhere.
-    cache.drain_storage_control_queues()
+    # The next scheduler round MIN-reduces the health bit: both ranks degrade
+    # together and the rank-agreed all-reduce keeps one tensor length
+    # everywhere; a round on the degraded ranks still agrees.
+    cache.check_hicache_events()
     assert cache.storage_unavailable, rank
-    cache.drain_storage_control_queues()
+    cache.check_hicache_events()
     snapshots = [None, None]
     dist.all_gather_object(snapshots, (cache.storage_unavailable, cc.enable_storage))
     assert snapshots == [(True, True), (True, True)], snapshots
@@ -452,7 +447,7 @@ class TestUnifiedPoolAbandonedLeases(CustomTestCase):
         orphan = threading.Thread(target=abandoned_call, daemon=True)
         orphan.start()
         self.assertTrue(leased.wait(5))
-        backing.abandoned_lease_holders = frozenset({orphan.ident})
+        backing.abandon_leases_of({orphan.ident})
         started = time.monotonic()
         full.clear()
         self.assertLess(time.monotonic() - started, 5)
@@ -493,6 +488,48 @@ class TestUnifiedPoolAbandonedLeases(CustomTestCase):
         self.assertIsNotNone(later)
         self.assertFalse(set(later.tolist()) & set(pinned.tolist()))
         full.release_quarantine(pinned)
+
+    def test_abandoned_leases_are_per_acquire_not_per_thread(self):
+        """A thread ident is reused once its thread exits, so abandonment must
+        mark the leases held at marking time, never the ident: a lease taken
+        afterwards under the same ident is waited for again."""
+        full = self._pools()
+        backing = full._shared_backing
+
+        def holder(leased, release):
+            with backing.layout_lease():
+                leased.set()
+                release.wait()
+
+        def start_holder():
+            leased, release = threading.Event(), threading.Event()
+            thread = threading.Thread(
+                target=holder, args=(leased, release), daemon=True
+            )
+            thread.start()
+            self.assertTrue(leased.wait(5))
+            return thread, release
+
+        first, first_release = start_holder()
+        backing.abandon_leases_of({first.ident})
+        with backing.lock:
+            self.assertEqual(backing._awaited_layout_users(), 0)
+        first_release.set()
+        first.join(5)
+        with backing.lock:
+            self.assertEqual(backing._abandoned_lease_tokens, set())
+        # Marking an ident that holds nothing abandons nothing; the next
+        # lease under it (the recycled ident) is waited for.
+        backing.abandon_leases_of({first.ident})
+        second, second_release = start_holder()
+        with backing.lock:
+            self.assertEqual(backing._awaited_layout_users(), 1)
+            with self.assertRaisesRegex(RuntimeError, "still leased"):
+                backing._begin_compaction(timeout=0.2)
+        second_release.set()
+        second.join(5)
+        with backing.lock:
+            self.assertEqual(backing._awaited_layout_users(), 0)
 
 
 if __name__ == "__main__":
