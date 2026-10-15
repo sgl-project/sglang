@@ -100,11 +100,12 @@ class TestAcceptTailParity(CustomTestCase):
         )
 
         for field in eager.__struct_fields__:
+            graph_value, eager_value = getattr(graph, field), getattr(eager, field)
+            if eager_value is None:
+                self.assertIsNone(graph_value, field)
+                continue
             self.assertTrue(
-                torch.equal(
-                    getattr(graph, field).cpu().long(),
-                    getattr(eager, field).cpu().long(),
-                ),
+                torch.equal(graph_value.cpu().long(), eager_value.cpu().long()),
                 field,
             )
         self.assertEqual(

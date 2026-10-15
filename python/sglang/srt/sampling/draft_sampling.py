@@ -21,6 +21,10 @@ from sglang.kernels.ops.sampling import top_k_renorm_probs, top_p_renorm_probs
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.multi_layer_eagle import wide_row_softmax_triton
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_compiler_backend
+
+_is_npu = is_npu()
 
 
 class DraftOverrides(msgspec.Struct, frozen=True):
@@ -34,6 +38,11 @@ class DraftOverrides(msgspec.Struct, frozen=True):
     @property
     def has_cutoff(self) -> bool:
         return self.top_k is not None or self.top_p is not None
+
+    @property
+    def sampling_top_k(self) -> int:
+        """The draft top_k of a non-greedy row."""
+        return TOP_K_ALL if self.top_k is None else self.top_k
 
     @classmethod
     def from_spec(cls) -> DraftOverrides:
@@ -92,15 +101,25 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
 
     @classmethod
     def buffers(cls, max_bs: int, device) -> DraftSamplingParams:
-        """Static graph buffers; ``copy_from`` stages each batch into them."""
+        """Static graph buffers. The server's fixed values are written once
+        here; staging a batch (``copy_from`` or the fused prepare kernel) only
+        rewrites what varies per request: the temperature when the server sets
+        none, and top_k, which marks request-greedy rows."""
         overrides = DraftOverrides.from_spec()
-        return cls.greedy(
+        params = cls.greedy(
             max_bs,
             device,
             apply_top_k=overrides.top_k is not None,
             apply_top_p=overrides.top_p is not None,
             greedy_override=overrides.temperature == 0,
         )
+        if overrides.temperature:
+            params.temperatures.fill_(overrides.temperature)
+        if not params.greedy_override:
+            params.top_ks.fill_(overrides.sampling_top_k)
+        if overrides.top_p is not None:
+            params.top_ps.fill_(overrides.top_p)
+        return params
 
     @classmethod
     def from_sampling_info(
@@ -124,8 +143,7 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
             greedy = torch.ones_like(greedy)
         elif overrides.temperature is not None:
             temperatures = torch.full_like(temperatures, overrides.temperature)
-        top_k = TOP_K_ALL if overrides.top_k is None else overrides.top_k
-        top_ks = torch.full_like(greedy, top_k, dtype=torch.int32)
+        top_ks = torch.full_like(greedy, overrides.sampling_top_k, dtype=torch.int32)
         top_ks.masked_fill_(greedy, 1)
         top_p = 1.0 if overrides.top_p is None else overrides.top_p
         top_ps = torch.full_like(temperatures, top_p)
@@ -146,17 +164,18 @@ class DraftSamplingParams(msgspec.Struct, frozen=True):
         )
 
     def copy_from(self, sampling_info, bs: int) -> None:
-        """Stage a batch into these graph buffers in place. Padding rows keep
-        earlier, still valid values; their outputs are discarded."""
-        params = self.from_sampling_info(
-            sampling_info, batch_size=bs, device=self.top_ks.device
-        )
-        assert params.flags == self.flags, (
-            "draft sampling buffers predate the server's draft options"
-        )
-        self.temperatures[:bs].copy_(params.temperatures)
-        self.top_ks[:bs].copy_(params.top_ks)
-        self.top_ps[:bs].copy_(params.top_ps)
+        """Stage a batch into ``buffers()`` in place: the per-request values
+        only, the server's fixed ones were written at allocation. Padding rows
+        keep earlier, still valid values; their outputs are discarded."""
+        if sampling_info is None:
+            self.top_ks[:bs].fill_(1)
+            return
+        overrides = DraftOverrides.from_spec()
+        if overrides.temperature is None:
+            self.temperatures[:bs].copy_(sampling_info.temperatures.reshape(-1)[:bs])
+        if not self.greedy_override:
+            self.top_ks[:bs].fill_(overrides.sampling_top_k)
+            self.top_ks[:bs].masked_fill_(sampling_info.top_ks.reshape(-1)[:bs] <= 1, 1)
 
 
 def build_draft_probs(
@@ -219,22 +238,39 @@ def sample_indices_from_probs(
     return torch.minimum(indices, last_supported)
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _follow_maps(maps, initial_indices, edges: int):
+    index = initial_indices
+    path = [index]
+    for edge in range(edges):
+        index = maps[:, edge].gather(-1, index[:, None])[:, 0]
+        path.append(index)
+    return torch.stack(path, dim=1)
+
+
 def sample_candidate_path(
     *, candidate_ids: torch.Tensor, probs: torch.Tensor, uniforms: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Walk a [bs, slots, K, K] lattice: each slot samples from the q row its
-    predecessor picked. Returns the tokens and the realized q rows."""
+    predecessor picked. Returns the tokens and the realized q rows. The torch
+    path draws every transition row at once, then follows the picked ones."""
     if probs.is_cuda:
         return selector_walk_triton(
             candidate_ids=candidate_ids, probs=probs, uniforms=uniforms
         )
-    batch, num_slots, topk = candidate_ids.shape
-    previous = torch.zeros(batch, dtype=torch.int64, device=probs.device)
-    tokens, q_rows = [], []
-    for slot in range(num_slots):
-        q_row = probs[:, slot].gather(1, previous.view(-1, 1, 1).expand(-1, 1, topk))
-        q_row = q_row.squeeze(1)
-        previous = sample_indices_from_probs(q_row, uniforms[:, slot : slot + 1])
-        q_rows.append(q_row)
-        tokens.append(candidate_ids[:, slot].gather(1, previous.view(-1, 1)).squeeze(1))
-    return torch.stack(tokens, dim=-1).to(torch.int64), torch.stack(q_rows, dim=1)
+    _, num_slots, top_k = candidate_ids.shape
+    initial_probs = probs[:, 0, 0]
+    initial_indices = sample_indices_from_probs(initial_probs, uniforms[:, :1])
+    transition_probs = probs[:, 1:]
+    local_maps = sample_indices_from_probs(
+        transition_probs, uniforms[:, 1:, None, None]
+    )
+    torch._dynamo.mark_static(local_maps, 1)
+    torch._dynamo.mark_static(local_maps, 2)
+    path_indices = _follow_maps(local_maps, initial_indices, num_slots - 1)
+    tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
+    realized_rows = transition_probs.gather(
+        2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
+    )[:, :, 0]
+    q_rows = torch.cat((initial_probs.unsqueeze(1), realized_rows), dim=1)
+    return tokens, q_rows

@@ -1084,6 +1084,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            cutoff_draft_probs=accept.cutoff_draft_probs,
         )
 
         next_draft_input = make_next_draft_input(

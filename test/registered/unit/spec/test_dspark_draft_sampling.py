@@ -156,6 +156,34 @@ class TestDsparkDraftOverrides(unittest.TestCase):
                 verify_num_draft_tokens=GAMMA + 1,
             )
         torch.testing.assert_close(sampling.call_args.kwargs["draft_probs"], q)
+        # A q handed in (the verify builds it once for the accept and the
+        # estimator) is scored as is, never rebuilt.
+        given = q * 0.5
+        with (
+            mock.patch.object(
+                dspark_verify.AcceptGreedy, "execute", return_value=(zeros,) * 3
+            ),
+            mock.patch.object(
+                dspark_verify.AcceptSampling, "execute", return_value=(zeros,) * 3
+            ) as sampling,
+            mock.patch.object(
+                dspark_verify.SelectMixedAccept, "execute", return_value=selected
+            ),
+            mock.patch.object(
+                dspark_verify, "cutoff_draft_probs", side_effect=AssertionError
+            ),
+        ):
+            dspark_verify.accept_draft_tokens(
+                candidates=torch.zeros(BS, GAMMA + 1, dtype=torch.long),
+                target_logits=torch.zeros(BS * (GAMMA + 1), VOCAB),
+                draft_block=block,
+                sampling_info=_sampling_info(),
+                draft_input=None,
+                gamma=GAMMA,
+                verify_num_draft_tokens=GAMMA + 1,
+                draft_probs=given,
+            )
+        self.assertIs(sampling.call_args.kwargs["draft_probs"], given)
 
     def test_folded_sampler_stages_cutoffs_for_replay(self):
         self.spec.speculative_draft_top_k = 3

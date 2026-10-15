@@ -30,11 +30,13 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.sampling.draft_sampling import build_draft_probs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
+    cutoff_draft_probs,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -170,6 +172,18 @@ class TargetVerifyExecutor:
         # Simulated acceptance overwrites correct_len below, so a sampling accept
         # (draft/target softmax + rejection) would be computed only to be discarded.
         accept_sampling_info = None if simulate and _is_hip else sampling_info
+        # Built once here: the sampling accept and the accept estimator both
+        # score the draft against this same q.
+        cutoff_q = None
+        if (
+            draft_block.cutoffs is not None
+            and not draft_block.greedy_draft
+            and accept_sampling_info is not None
+            and not accept_sampling_info.is_all_greedy
+        ):
+            cutoff_q = cutoff_draft_probs(
+                draft_block.corrected_logits, draft_block.cutoffs
+            )
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
@@ -181,6 +195,7 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
+            draft_probs=cutoff_q,
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -198,6 +213,7 @@ class TargetVerifyExecutor:
             tp_sync=self._tp_sync,
             sync_site=sync_site,
             simulated_correct_len=self._simulated_correct_len,
+            cutoff_draft_probs=cutoff_q,
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
@@ -525,6 +541,9 @@ class AcceptOuts(msgspec.Struct):
     commit_lens: torch.Tensor
     new_seq_lens: torch.Tensor
     out_tokens: torch.Tensor
+    # The cut-off draft q the sampling accept scored, [bs, gamma, vocab], for
+    # the accept estimator to reuse; None when no draft cutoff override is set.
+    cutoff_draft_probs: Optional[torch.Tensor] = None
 
 
 class DsparkVerifyEpilogue:
@@ -819,6 +838,7 @@ def build_accept_outs(
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
     out: Optional[AcceptOuts] = None,
+    cutoff_draft_probs: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into."""
     bs = correct_len.shape[0]
@@ -858,6 +878,7 @@ def build_accept_outs(
         commit_lens=finalized.commit_lens,
         new_seq_lens=finalized.new_seq_lens,
         out_tokens=out_tokens,
+        cutoff_draft_probs=cutoff_draft_probs,
     )
     if out is not None:
         out.correct_len.copy_(accept.correct_len)
@@ -866,6 +887,7 @@ def build_accept_outs(
         out.commit_lens.copy_(accept.commit_lens)
         out.new_seq_lens.copy_(accept.new_seq_lens)
         out.out_tokens.copy_(accept.out_tokens)
+        out.cutoff_draft_probs = cutoff_draft_probs
         return out
     return accept
 
@@ -903,7 +925,10 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
     block_verification: bool = False,
+    draft_probs: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``draft_probs``: the cut-off q already built for this block, else it is
+    rebuilt here from the kept step logits."""
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
@@ -932,9 +957,9 @@ def accept_draft_tokens(
                 temperatures=draft_block.temperatures,
                 rows_per_request=gamma_rows,
             ).view(bs, gamma_rows, vocab)
-        else:
+        elif draft_probs is None:
             # The draft drew from the cut-off q; rebuild that exact q here.
-            draft_probs = build_draft_probs(
+            draft_probs = cutoff_draft_probs(
                 draft_block.corrected_logits, draft_block.cutoffs
             )
         expect(_VERIFY_DRAFT_PROBS, draft_probs)

@@ -66,7 +66,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.sampling.draft_sampling import DraftSamplingParams
+from sglang.srt.sampling.draft_sampling import DraftOverrides, DraftSamplingParams
 from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -680,6 +680,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 and self.eagle_worker.topk == 1
             ):
                 sampling_params = DraftSamplingParams.buffers(max_bs, self.device)
+                self._draft_overrides = DraftOverrides.from_spec()
                 draft_probs = torch.empty(
                     (max_bs, self.speculative_num_steps, vocab_size),
                     dtype=torch.float,
@@ -816,6 +817,13 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             bs=bs,
         )
 
+        # The draft sampling buffers hold the server's fixed values; the fused
+        # fill stages only what varies per request (see DraftSamplingParams.buffers).
+        params = buffers.sampling_params
+        stage_temperatures = (
+            params is not None and self._draft_overrides.temperature is None
+        )
+        stage_top_ks = params is not None and not params.greedy_override
         fill_draft_extend_prepare_buffers(
             buffers.input_ids,
             buffers.positions,
@@ -828,12 +836,12 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts,
             buffers.num_accept_tokens,
             buffers.select_index,
-            None,
+            params.temperatures if stage_temperatures else None,
             forward_batch.seq_lens,
             forward_batch.req_pool_indices,
             forward_batch.spec_info.num_correct_drafts,
             forward_batch.spec_info.num_accept_tokens,
-            None,
+            forward_batch.sampling_info.temperatures if stage_temperatures else None,
             buffers.hidden_states,
             (
                 forward_batch.spec_info.hidden_states
@@ -852,10 +860,10 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.captured_req_width,
             self.num_front_tokens,
             self.seq_len_fill_value,
+            top_ks=params.top_ks if stage_top_ks else None,
+            src_top_ks=forward_batch.sampling_info.top_ks if stage_top_ks else None,
+            sampling_top_k=self._draft_overrides.sampling_top_k if stage_top_ks else 0,
         )
-
-        if buffers.sampling_params is not None:
-            buffers.sampling_params.copy_from(forward_batch.sampling_info, raw_bs)
 
         # Refresh the host mirror only when published; hand replay None
         # otherwise so no consumer reads a stale buffer.

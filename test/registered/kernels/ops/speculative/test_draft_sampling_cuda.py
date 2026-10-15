@@ -63,6 +63,35 @@ class TestDraftSamplingCUDA(unittest.TestCase):
         )
         self.assertTrue(bool((buffer[:, [0, 2]] == -1.0).all()))
 
+    def test_fused_prepare_top_k_staging_matches_native(self):
+        # The Triton prepare fill and its native fallback stage the same
+        # temperatures and draft top_k from the same sources.
+        from sglang.kernels.ops.speculative.multi_layer_eagle import (
+            fill_draft_extend_prepare_buffers_native,
+            fill_draft_extend_prepare_buffers_triton,
+        )
+        from sglang.test.draft_sampling_common import run_prepare_fill
+
+        src_top_ks = torch.tensor([1, 50], dtype=torch.int32)
+        src_temperatures = torch.tensor([[0.7], [1.2]])
+        results = [
+            run_prepare_fill(
+                impl,
+                device="cuda",
+                src_top_ks=src_top_ks,
+                src_temperatures=src_temperatures,
+                sampling_top_k=20,
+            )
+            for impl in (
+                fill_draft_extend_prepare_buffers_triton,
+                fill_draft_extend_prepare_buffers_native,
+            )
+        ]
+        (triton_temps, triton_top_ks), (native_temps, native_top_ks) = results
+        torch.testing.assert_close(triton_temps, native_temps)
+        self.assertEqual(triton_top_ks.tolist(), native_top_ks.tolist())
+        self.assertEqual(triton_top_ks.tolist(), [1, 20, 20, 7])
+
 
 if __name__ == "__main__":
     unittest.main()

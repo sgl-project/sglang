@@ -167,6 +167,21 @@ class DraftParams(NamedTuple):
         )
 
 
+def cutoff_draft_probs(
+    step_logits: torch.Tensor, cutoffs: DraftSamplingParams
+) -> torch.Tensor:
+    """The cut-off q of every kept step, [bs, gamma, vocab], built with the
+    same per-step [bs, vocab] calls ``_draft_step`` sampled from, so the verify
+    meets the kernels the draft ran and q matches bit for bit."""
+    return torch.stack(
+        [
+            build_draft_probs(step_logits[:, step], cutoffs)
+            for step in range(step_logits.shape[1])
+        ],
+        dim=1,
+    )
+
+
 def draft_tp_rng_sites(*, greedy_draft: bool) -> frozenset[SpecTpSyncSite]:
     """The draft site draws from the torch RNG only when a cutoff override
     redraws outside the fused kernel; the kernel's Philox noise matches across

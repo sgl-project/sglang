@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -41,7 +40,7 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.sampling.draft_sampling import (
     DraftSamplingParams,
     candidate_probs,
-    sample_indices_from_probs,
+    sample_candidate_path,
 )
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -1075,16 +1074,6 @@ def _score_edges(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def _follow_maps(maps, initial_indices, edges: int):
-    index = initial_indices
-    path = [index]
-    for edge in range(edges):
-        index = maps[:, edge].gather(-1, index[:, None])[:, 0]
-        path.append(index)
-    return torch.stack(path, dim=1)
-
-
 class CandidateSelector(nn.Module):
     """Scores the K x K transitions between adjacent proposal slots, then walks them.
 
@@ -1156,29 +1145,11 @@ class CandidateSelector(nn.Module):
         """Walk one path, with q over the K candidates for the verify. Greedy rows
         are point masses, selected rather than branched, so one captured graph
         serves greedy and sampling batches alike."""
-        probs = candidate_probs(scores, params)
-        if probs.is_cuda:
-            return selector_walk_triton(
-                candidate_ids=candidate_ids, probs=probs, uniforms=uniforms
-            )
-        top_k = self.top_k
-        initial_probs = probs[:, 0, 0]
-        initial_indices = sample_indices_from_probs(initial_probs, uniforms[:, :1])
-        transition_probs = probs[:, 1:]
-        local_maps = sample_indices_from_probs(
-            transition_probs, uniforms[:, 1:, None, None]
+        return sample_candidate_path(
+            candidate_ids=candidate_ids,
+            probs=candidate_probs(scores, params),
+            uniforms=uniforms,
         )
-        torch._dynamo.mark_static(local_maps, 1)
-        torch._dynamo.mark_static(local_maps, 2)
-        path_indices = _follow_maps(
-            local_maps, initial_indices, int(scores.shape[1]) - 1
-        )
-        tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
-        realized_rows = transition_probs.gather(
-            2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
-        )[:, :, 0]
-        q_rows = torch.cat((initial_probs.unsqueeze(1), realized_rows), dim=1)
-        return tokens, q_rows
 
 
 class DFlash2DraftModel(DFlashDraftModel):

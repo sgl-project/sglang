@@ -517,12 +517,14 @@ def fill_draft_extend_prepare_buffers_kernel(
     num_accept_tokens_ptr,  # int32
     select_index_ptr,  # int64
     temperatures_ptr,  # float32 [max_bs, 1] (dummy when HAS_TEMPS is False)
+    top_ks_ptr,  # int32 [max_bs] draft top_k (dummy when HAS_TOP_KS is False)
     # per-request sources (length raw_bs)
     src_seq_lens_ptr,
     src_req_pool_indices_ptr,
     src_num_correct_drafts_ptr,
     src_num_accept_tokens_ptr,
     src_temperatures_ptr,  # dummy when HAS_TEMPS is False
+    src_top_ks_ptr,  # int32 request top_k (dummy when HAS_TOP_KS is False)
     # chain hidden window, flat [num_tokens * hidden] (dummies when HAS_HIDDEN
     # is False)
     hidden_states_ptr,
@@ -542,7 +544,9 @@ def fill_draft_extend_prepare_buffers_kernel(
     hidden_numel,
     num_global,
     num_token_programs,
+    sampling_top_k,  # draft top_k written for non-greedy rows
     HAS_TEMPS: tl.constexpr,
+    HAS_TOP_KS: tl.constexpr,
     HAS_HIDDEN: tl.constexpr,
     HAS_GATHERED: tl.constexpr,
     BLOCK_TOK: tl.constexpr,
@@ -618,6 +622,11 @@ def fill_draft_extend_prepare_buffers_kernel(
         if HAS_TEMPS:
             t = tl.load(src_temperatures_ptr + i, mask=is_real, other=1.0)
             tl.store(temperatures_ptr + i, t, mask=in_bs)
+        if HAS_TOP_KS:
+            # A request-greedy row (top_k <= 1) drafts its argmax; the rest
+            # draft under the server's draft top_k.
+            k = tl.load(src_top_ks_ptr + i, mask=is_real, other=sampling_top_k)
+            tl.store(top_ks_ptr + i, tl.where(k <= 1, 1, sampling_top_k), mask=in_bs)
     elif pid == num_token_programs + max_bs:
         if HAS_GATHERED:
             g_offs = tl.arange(0, GLOBAL_BLOCK)
@@ -661,11 +670,15 @@ def fill_draft_extend_prepare_buffers_triton(
     num_tokens_per_bs,
     num_front_tokens,
     seq_len_fill_value,
+    top_ks=None,
+    src_top_ks=None,
+    sampling_top_k=0,
 ):
     max_num_token = input_ids.shape[0]
     num_tokens = src_input_ids.shape[0]
     max_bs = seq_lens.shape[0]
     has_temps = temperatures is not None
+    has_top_ks = top_ks is not None
     has_hidden = src_hidden_states is not None
     has_gathered = global_num_tokens is not None
 
@@ -701,11 +714,13 @@ def fill_draft_extend_prepare_buffers_triton(
         num_accept_tokens,
         select_index,
         temperatures if has_temps else seq_lens,
+        top_ks if has_top_ks else seq_lens,
         src_seq_lens,
         src_req_pool_indices,
         src_num_correct_drafts,
         src_num_accept_tokens,
         src_temperatures if has_temps else seq_lens,
+        src_top_ks if has_top_ks else seq_lens,
         hidden_states if has_hidden else seq_lens,
         src_hidden_states if has_hidden else seq_lens,
         global_num_tokens if has_gathered else seq_lens,
@@ -721,7 +736,9 @@ def fill_draft_extend_prepare_buffers_triton(
         hidden_numel,
         num_global,
         num_token_programs,
+        sampling_top_k,
         HAS_TEMPS=has_temps,
+        HAS_TOP_KS=has_top_ks,
         HAS_HIDDEN=has_hidden,
         HAS_GATHERED=has_gathered,
         BLOCK_TOK=BLOCK_TOK,
@@ -757,6 +774,9 @@ def fill_draft_extend_prepare_buffers_native(
     num_tokens_per_bs,
     num_front_tokens,
     seq_len_fill_value,
+    top_ks=None,
+    src_top_ks=None,
+    sampling_top_k=0,
 ):
     """Native PyTorch implementation of fill_draft_extend_prepare_buffers.
 
@@ -784,9 +804,17 @@ def fill_draft_extend_prepare_buffers_native(
     select_index[:bs] = idx * num_tokens_per_bs + num_front_tokens
     select_index[:bs] += num_correct_drafts[:bs].to(torch.int64)
 
+    # Flat views: the buffers are [max_bs] or [max_bs, 1], the sources [raw_bs]
+    # or [raw_bs, 1], exactly as the kernel indexes them.
     if temperatures is not None:
+        temperatures = temperatures.view(-1)
         temperatures[:bs].fill_(1.0)
-        temperatures[:raw_bs].copy_(src_temperatures)
+        temperatures[:raw_bs].copy_(src_temperatures.reshape(-1)[:raw_bs])
+
+    if top_ks is not None:
+        top_ks = top_ks.view(-1)
+        top_ks[:bs].fill_(sampling_top_k)
+        top_ks[:raw_bs].masked_fill_(src_top_ks.reshape(-1)[:raw_bs] <= 1, 1)
 
     if global_num_tokens is not None:
         global_num_tokens.fill_(bs * num_tokens_per_bs)

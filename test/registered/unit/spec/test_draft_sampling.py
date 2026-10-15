@@ -17,6 +17,7 @@ from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner imp
 )
 from sglang.srt.speculative.spec_utils import sample_draft_proposal
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.draft_sampling_common import run_prepare_fill
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -157,6 +158,37 @@ class TestDraftSampling(unittest.TestCase):
             stored_q = runner.buffers.draft_probs[:, step]
             torch.testing.assert_close(stored_q, expected)
             torch.testing.assert_close(ret.topk_p, stored_q.gather(1, ret.topk_index))
+
+    def test_fused_prepare_stages_temperature_and_top_k(self):
+        # The multi-layer runner stages the per-request draft params through
+        # the fused prepare fill: request-greedy rows get top_k 1, the rest the
+        # server's draft top_k, padding rows a valid non-greedy value, and rows
+        # past the bucket stay untouched. A server temperature is never staged.
+        from sglang.kernels.ops.speculative.multi_layer_eagle import (
+            fill_draft_extend_prepare_buffers_native,
+        )
+
+        src_top_ks = torch.tensor([1, 50], dtype=torch.int32)
+        src_temperatures = torch.tensor([[0.7], [1.2]])
+        temperatures, top_ks = run_prepare_fill(
+            fill_draft_extend_prepare_buffers_native,
+            device="cpu",
+            src_top_ks=src_top_ks,
+            src_temperatures=src_temperatures,
+            sampling_top_k=20,
+        )
+        torch.testing.assert_close(temperatures, torch.tensor([0.7, 1.2, 1.0, 9.0]))
+        self.assertEqual(top_ks.tolist(), [1, 20, 20, 7])
+        temperatures, top_ks = run_prepare_fill(
+            fill_draft_extend_prepare_buffers_native,
+            device="cpu",
+            src_top_ks=src_top_ks,
+            src_temperatures=src_temperatures,
+            sampling_top_k=TOP_K_ALL,
+            stage_temperatures=False,
+        )
+        torch.testing.assert_close(temperatures, torch.full((4,), 9.0))
+        self.assertEqual(top_ks.tolist(), [1, TOP_K_ALL, TOP_K_ALL, 7])
 
     def test_empty_batch(self):
         q = build_draft_probs(

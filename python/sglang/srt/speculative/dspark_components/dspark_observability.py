@@ -838,6 +838,7 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        cutoff_draft_probs: Optional[torch.Tensor] = None,
     ) -> None:
         planner = self._planner
         self._maybe_record_sts_collect(
@@ -862,6 +863,7 @@ class DsparkStepObservers:
                 corrected_logits=draft_block.corrected_logits,
                 draft_temperatures=draft_block.temperatures,
                 draft_cutoffs=draft_block.cutoffs,
+                draft_probs=cutoff_draft_probs,
                 greedy_mask=draft_block.greedy_mask,
                 target_logits=target_logits,
                 target_temperatures=(
