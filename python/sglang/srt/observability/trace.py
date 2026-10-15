@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
@@ -39,6 +39,8 @@ tracer: Optional[trace.Tracer] = None
 global_trace_modules: Optional[List[str]] = None
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
+# Bounds what a caller can attach to every root span.
+_TRACED_HEADER_MAX_LEN = 1024
 
 try:
     from opentelemetry import context, propagate, trace
@@ -71,8 +73,26 @@ except ImportError:
     logger.debug("opentelemetry package is not installed, tracing disabled")
 
 
-def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
-    return {h: headers[h] for h in TRACE_HEADERS if h in headers}
+def _traced_request_headers() -> Tuple[str, ...]:
+    return tuple(name.lower() for name in envs.SGLANG_TRACE_REQUEST_HEADERS.get())
+
+
+def extract_trace_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+    names = (*TRACE_HEADERS, *_traced_request_headers())
+    return {h: headers[h] for h in names if h in headers}
+
+
+def _request_header_attributes(
+    headers: Optional[Mapping[str, str]],
+) -> Dict[str, str]:
+    if not headers:
+        return {}
+    by_name = {name.lower(): value for name, value in headers.items()}
+    return {
+        f"http.request.header.{name}": by_name[name][:_TRACED_HEADER_MAX_LEN]
+        for name in _traced_request_headers()
+        if by_name.get(name)
+    }
 
 
 def get_global_trace_level() -> int:
@@ -336,6 +356,7 @@ def start_root_span(
     attrs = {"rid": orig_rid, "module": f"sglang::{module_name}"}
     if bootstrap_room:
         attrs["bootstrap_room"] = str(hex(bootstrap_room))
+    attrs.update(_request_header_attributes(external_trace_header))
     return tracer.start_span(
         name=f"{role} Req {orig_rid[:8]}",
         start_time=ts,
