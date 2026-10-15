@@ -41,7 +41,6 @@ from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -157,6 +156,10 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
+        # KV pages the hit-time plan skips in front of the KV transfer: the
+        # device trim, then the span head a component's block groups serve.
+        self.prefetch_kv_page_offset = 0
+        self.group_skip_pages = 0
         self.start_time = time.monotonic()
         # Take the whole span as present instead of querying for it; the read
         # itself is fail-soft, so a wrong guess shortens the fetch.
@@ -898,10 +901,12 @@ class HybridCacheController(BaseHiCacheController):
                 if draft_host_layer is None:
                     continue
 
+                # Finish every draft before the final target-layer event,
+                # including chains deeper than the target model.
                 def draft_layer_mapper(
                     layer_id: int,
                     *,
-                    expected_layer_id: int = depth,
+                    expected_layer_id: int = min(depth, self.transfer_layer_id_max - 1),
                     host_layer_id: int = draft_host_layer,
                 ) -> Optional[int]:
                     if layer_id == expected_layer_id:
@@ -962,15 +967,25 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        device_indices: Optional[torch.Tensor] = None,
+        anchor_indices: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
+        """Queue an H2D of ``host_indices`` into freshly allocated FULL rows,
+        or into caller-owned ``device_indices`` (kept on failure); side pools
+        bind their device slots against ``anchor_indices`` (default: the KV
+        destination rows)."""
         need_load_kv = host_indices.numel() > 0
+        caller_owned = device_indices is not None
 
         full_allocator = getattr(
             self.mem_pool_device_allocator,
             "full_attn_allocator",
             self.mem_pool_device_allocator,
         )
-        if not need_load_kv:
+        if caller_owned:
+            assert len(device_indices) == len(host_indices)
+        elif not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:
             device_indices = full_allocator.alloc(len(host_indices))
@@ -979,11 +994,13 @@ class HybridCacheController(BaseHiCacheController):
 
         pool_transfers = self._resolve_device_transfers(
             extra_pools,
-            kv_device_indices=device_indices,
+            kv_device_indices=(
+                anchor_indices if anchor_indices is not None else device_indices
+            ),
             kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
-            if need_load_kv:
+            if need_load_kv and not caller_owned:
                 full_allocator.free(device_indices)
             return None
 
@@ -1513,8 +1530,6 @@ class HybridCacheController(BaseHiCacheController):
                     )
                 pool_hits = count_pool_hits(results)
             except Exception:
-                if not get_memory().enable_unified_memory:
-                    raise
                 logger.exception(
                     "HiCache sidecar prefetch failed for request %s",
                     operation.request_id,
@@ -1544,6 +1559,7 @@ class HybridCacheController(BaseHiCacheController):
             operation.sidecar_hash_values = original_hashes
             operation.sidecar_hit_pages = len(original_hashes)
         operation.hash_value = original_hashes[trim_pages:]
+        operation.prefetch_kv_page_offset += trim_pages
         operation.storage_hit_count -= trim_tokens
         operation.storage_start += trim_tokens
 
@@ -1630,7 +1646,7 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
@@ -1719,7 +1735,6 @@ class HybridCacheController(BaseHiCacheController):
             return None
         newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
         derived_transfers: list[PoolTransfer] = []
-        anchor_transfers = []
 
         def rollback_allocated() -> None:
             for prev_pool, prev_free_fn, prev_indices in reversed(newly_allocated):
@@ -1734,11 +1749,6 @@ class HybridCacheController(BaseHiCacheController):
             if entry is None:
                 continue
             if pool.device_indices is not None or pool.host_indices is None:
-                continue
-            if entry.device_indices_from_anchor_fn is not None:
-                # Allocate independent pools first: their allocation/eviction
-                # can compact SWA before its physical IDs are captured.
-                anchor_transfers.append((pool, entry))
                 continue
             # device_alloc_fn / device_free_fn override entry.device_pool's
             # methods for pools whose device_pool is a raw KV pool (layout)
@@ -1757,28 +1767,6 @@ class HybridCacheController(BaseHiCacheController):
                 return None
             pool.device_indices = indices
             newly_allocated.append((pool, free_fn, indices))
-
-        for pool, entry in anchor_transfers:
-            if kv_device_indices is None or not pool.anchor_index_parts:
-                rollback_allocated()
-                return None
-            anchor_indices = torch.cat(
-                [
-                    kv_device_indices[part] if isinstance(part, slice) else part
-                    for part in pool.anchor_index_parts
-                ]
-            )
-            assert len(anchor_indices) == len(pool.host_indices)
-            bind = entry.device_indices_from_anchor_fn
-            indices = bind(anchor_indices)
-            if indices is None and entry.device_evict_fn:
-                entry.device_evict_fn(len(anchor_indices))
-                indices = bind(anchor_indices)
-            if indices is None:
-                rollback_allocated()
-                return None
-            pool.device_indices = indices
-            newly_allocated.append((pool, entry.device_free_fn, anchor_indices))
 
         # Assign indices to deferred pools from their source.
         for pool in derived_transfers:

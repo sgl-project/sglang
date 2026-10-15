@@ -561,7 +561,6 @@ class Cosmos3DenseMLP(nn.Module):
             and up.dtype == torch.bfloat16
             and up.is_contiguous()
             and not torch.is_grad_enabled()
-            and not torch.compiler.is_compiling()
         ):
             up = relu2(up, fast_math=False)
         else:
@@ -830,7 +829,6 @@ class Cosmos3CrossAttention(nn.Module):
             use_fused_qk_norm_rope
             and multiview_layout is None
             and q.device.type == "cuda"
-            and not torch.compiler.is_compiling()
             and get_sp_world_size() == 1
             and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
             and self.norm_q.weight.dtype == q.dtype
@@ -1844,7 +1842,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         use_fused_qk_norm_rope = T > 1 or (
             enable_t1_fused_qk_norm_rope
             and hidden_gen.device.type == "cuda"
-            and not torch.compiler.is_compiling()
             and get_sp_world_size() == 1
             and can_use_fused_inplace_qknorm_rope(
                 self.head_dim,

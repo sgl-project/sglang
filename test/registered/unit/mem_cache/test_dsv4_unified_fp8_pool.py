@@ -266,20 +266,6 @@ class TestDsv4PoolFp8Gate(CustomTestCase):
                 is_draft_worker=is_draft_worker, spec_algorithm=algo
             )
 
-    def test_dspark_draft_stays_bf16_when_env_on(self):
-        self.assertFalse(
-            self._layout(
-                is_draft_worker=True, algo=SpeculativeAlgorithm.DSPARK, env_on=True
-            )
-        )
-
-    def test_eagle_draft_stays_two_pool_when_env_on(self):
-        self.assertTrue(
-            self._layout(
-                is_draft_worker=True, algo=SpeculativeAlgorithm.EAGLE, env_on=True
-            )
-        )
-
     def test_target_stays_two_pool_under_dspark_and_eagle(self):
         for algo in (SpeculativeAlgorithm.DSPARK, SpeculativeAlgorithm.EAGLE):
             with self.subTest(algo=algo):

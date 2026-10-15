@@ -218,8 +218,7 @@ class DecLockRefParams:
 
     A segment release requires its component's boundary entry; a missing
     entry must not be treated as a lock reaching the root. ``node_id`` is
-    ``None`` only for receipts that never came from a unified-tree acquire
-    (legacy caches, session sentinels).
+    ``None`` only for legacy caches; the unified tree rejects such a receipt.
     """
 
     node_id: Optional[int] = None
@@ -595,6 +594,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         node). None means retry admission; zero can be a successful
         auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
+
+    def load_back_is_cache_owned(self) -> bool:
+        """Whether the slots loaded by ``init_load_back`` belong to this cache.
+
+        False means they belong to the request, which inserts them like any
+        computed KV once its forward confirms the load.
+        """
+        return True
 
     def finish_storage_prefetch_admission(
         self,
