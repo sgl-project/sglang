@@ -376,6 +376,8 @@ def test_residual_gate_add_rocm_never_takes_ptx_path():
     assert can_use_residual_gate_add_rocm(residual, update, gate)
     with pytest.raises(RuntimeError, match="CUDA"):
         residual_gate_add_cuda(residual, update, gate)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @CUDA_NATIVE_ONLY
 def test_scaled_residual_add_is_bit_exact(dtype):
