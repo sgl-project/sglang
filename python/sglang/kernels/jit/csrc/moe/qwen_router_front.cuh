@@ -7,6 +7,8 @@
 // Every CTA computes the logits of kExpertsPerCta experts for all tokens on
 // tensor cores; CTA b < M also quantizes token row b. The last CTA to arrive
 // (acq_rel counter, no spinning) runs top-k and builds the routing tables.
+// router_tail_kernel runs the same top-k, quantization and tables behind a
+// router GEMM computed elsewhere (bitwise to the stock chain given its logits).
 //
 // Given the same bf16 logits, the softmax / top-k / renormalize arithmetic
 // follows the operation order of the Triton router kernel
@@ -687,7 +689,10 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
   const uint32_t tb = blockIdx.x * 8;
   trace_stamp<kTrace>(p, tb + 0);
 
-  // Router weights are static: load them before waiting on the producer grid.
+  // Router weights are static: start pulling this CTA's 32 KB into L2 before
+  // waiting on the producer grid. ptxas moves plain loads below griddepcontrol.wait.
+  asm volatile("prefetch.global.L2 [%0];" ::"l"(p.weight + static_cast<size_t>(expert0) * kHidden + threadIdx.x * 64)
+               : "memory");
   U32x8 w[8];
   {
     const bf16_t* src = p.weight + static_cast<size_t>(expert0 + (g & 3)) * kHidden + warp * kKPerWarp + 16 * c;
@@ -764,6 +769,33 @@ __global__ __launch_bounds__(kThreads, 1) void router_front_kernel(const __grid_
   }
 }
 
+/// \brief Routing tail behind an external router GEMM: CTA 0 runs softmax / top-10 /
+/// renormalize and builds the routing tables from p.logits; CTA b > 0 quantizes token row b - 1.
+template <uint32_t kMaxM, bool kUsePDL>
+__global__ __launch_bounds__(kThreads, 1) void router_tail_kernel(const __grid_constant__ Params p) {
+  __shared__ uint32_t s_mask[kExperts];
+  __shared__ int16_t s_tile[kExperts];
+  __shared__ int16_t s_ids[kMaxTokens * kTopK];
+  __shared__ uint32_t s_warp[kWarps];
+
+  device::PDLWaitPrimary<kUsePDL>();
+  // The dependent grid reads our outputs only after its own griddepcontrol.wait.
+  device::PDLTriggerSecondary<kUsePDL>();
+  if (blockIdx.x == 0) {
+    topk_and_tables<kMaxM, false>(p, s_mask, s_tile, s_ids, s_warp);
+    return;
+  }
+  const uint32_t row = blockIdx.x - 1;
+  const uint32_t qk = (threadIdx.x / 32) * kKPerWarp + (threadIdx.x % 32) * kKPerLane;
+  const U32x8 v = ld_produced32(p.x + static_cast<size_t>(row) * kHidden + qk);
+  uint32_t sf;
+  uint2 packed;
+  quantize_block(v.lo, v.hi, p.global_scale[0], sf, packed);
+  const uint32_t blk = qk / kSfVec;
+  *reinterpret_cast<uint2*>(p.x_fp4 + static_cast<size_t>(row) * (kHidden / 2) + blk * 8) = packed;
+  p.x_sf[static_cast<size_t>(row) * kBlocksPerRow + blk] = static_cast<uint8_t>(sf);
+}
+
 template <uint32_t kMaxM, bool kUsePDL, bool kTrace>
 struct RouterFrontKernel {
   static void
@@ -838,6 +870,68 @@ struct RouterFrontKernel {
     };
     LaunchKernel(kNumCtas, kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(router_front_kernel<kMaxM, kUsePDL, kTrace>, params);
+  }
+
+  /// \brief Top-k, input quantization and routing tables from router logits computed elsewhere.
+  static void run_tail(
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView global_scale,
+      const tvm::ffi::TensorView topk_weights,
+      const tvm::ffi::TensorView topk_ids,
+      const tvm::ffi::TensorView x_fp4,
+      const tvm::ffi::TensorView x_sf,
+      const tvm::ffi::TensorView tile_idx_to_expert_idx,
+      const tvm::ffi::TensorView tile_idx_to_mn_limit,
+      const tvm::ffi::TensorView expanded_idx_to_permuted_idx,
+      const tvm::ffi::TensorView permuted_idx_to_expanded_idx,
+      const tvm::ffi::TensorView total_num_padded_tokens,
+      const tvm::ffi::TensorView num_non_exiting_tiles,
+      int64_t tile_log2) {
+    using namespace host;
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto T_ = SymbolicSize{"max_tiles"};
+    auto P_ = SymbolicSize{"max_permuted"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
+    TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
+    TensorMatcher({M_, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
+    TensorMatcher({M_, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    TensorMatcher({M_, kHidden / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(8).verify(x_fp4);
+    TensorMatcher({M_, kBlocksPerRow}).with_dtype<uint8_t>().with_device(device).verify(x_sf);
+    TensorMatcher({T_}).with_dtype<int32_t>().with_device(device).verify(tile_idx_to_expert_idx);
+    TensorMatcher({T_}).with_dtype<int32_t>().with_device(device).verify(tile_idx_to_mn_limit);
+    TensorMatcher({M_, kTopK}).with_dtype<int32_t>().with_device(device).verify(expanded_idx_to_permuted_idx);
+    TensorMatcher({P_}).with_dtype<int32_t>().with_device(device).verify(permuted_idx_to_expanded_idx);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(total_num_padded_tokens);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(num_non_exiting_tiles);
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    CHECK_HOST(M <= kMaxM && kMaxM <= kMaxTokens) << "router_tail: num_tokens " << M << " exceeds " << kMaxM;
+    CHECK_HOST(tile_log2 >= 4 && tile_log2 <= 10) << "router_tail: tile_log2 " << tile_log2;
+    CHECK_HOST(static_cast<uint64_t>(T_.unwrap()) >= M * kTopK) << "router_tail: tile table too small";
+    CHECK_HOST(static_cast<uint64_t>(P_.unwrap()) >= (static_cast<uint64_t>(M) * kTopK) << tile_log2)
+        << "router_tail: permutation table too small";
+    if (M == 0) return;
+    Params params{};
+    params.x = static_cast<const bf16_t*>(x.data_ptr());
+    params.global_scale = static_cast<const float*>(global_scale.data_ptr());
+    params.logits = static_cast<bf16_t*>(logits.data_ptr());
+    params.topk_weights = static_cast<float*>(topk_weights.data_ptr());
+    params.topk_ids = static_cast<int32_t*>(topk_ids.data_ptr());
+    params.x_fp4 = static_cast<uint8_t*>(x_fp4.data_ptr());
+    params.x_sf = static_cast<uint8_t*>(x_sf.data_ptr());
+    params.tile_idx_to_expert_idx = static_cast<int32_t*>(tile_idx_to_expert_idx.data_ptr());
+    params.tile_idx_to_mn_limit = static_cast<int32_t*>(tile_idx_to_mn_limit.data_ptr());
+    params.expanded_idx_to_permuted_idx = static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
+    params.permuted_idx_to_expanded_idx = static_cast<int32_t*>(permuted_idx_to_expanded_idx.data_ptr());
+    params.total_num_padded_tokens = static_cast<int32_t*>(total_num_padded_tokens.data_ptr());
+    params.num_non_exiting_tiles = static_cast<int32_t*>(num_non_exiting_tiles.data_ptr());
+    params.num_tokens = M;
+    params.tile_log2 = static_cast<uint32_t>(tile_log2);
+    params.full = 1u;
+    LaunchKernel(1 + M, kThreads, device.unwrap()).enable_pdl(kUsePDL)(router_tail_kernel<kMaxM, kUsePDL>, params);
   }
 
   /// \brief Logits and softmax top-k only (for runners that take ids / weights directly).

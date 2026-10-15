@@ -1,8 +1,9 @@
 """Single-launch MoE router front end for 512-expert / top-10 / 4096-hidden models.
 
 Replaces router GEMM + softmax top-k + NVFP4 activation quant + routing-table
-build (moe_sort) at decode token counts (M <= 16). Outputs are written into a
-preallocated :class:`RouterFrontBuffers` so the launch is CUDA-graph safe.
+build (moe_sort) at decode token counts (M <= 16); :func:`router_tail` replaces
+everything after the router GEMM. Outputs are written into a preallocated
+:class:`RouterFrontBuffers` so the launch is CUDA-graph safe.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ def _jit_module(max_m: int, trace: bool = False) -> Module:
         cuda_files=["moe/qwen_router_front.cuh"],
         cuda_wrappers=[
             ("run", f"RouterFrontKernel<{args}>::run"),
+            ("run_tail", f"RouterFrontKernel<{args}>::run_tail"),
             ("run_topk", f"RouterFrontKernel<{args}>::run_topk"),
         ],
         # No fast-math: the top-k and quantization arithmetic is pinned to
@@ -122,6 +124,35 @@ def router_front(
         out.num_non_exiting_tiles,
         out.arrival,
         trace if trace is not None else out.arrival,
+        out.tile_log2,
+    )
+    return out
+
+
+def router_tail(
+    logits: torch.Tensor,
+    x: torch.Tensor,
+    global_scale: torch.Tensor,
+    out: RouterFrontBuffers,
+) -> RouterFrontBuffers:
+    """Top-k, NVFP4 input quant and routing tables from router logits [M, 512] bf16 computed elsewhere.
+
+    Writes every ``out`` field except ``out.logits``; x [M, 4096] bf16, global_scale [1] fp32.
+    """
+    _jit_module(_max_m_bucket(x.shape[0])).run_tail(
+        logits,
+        x,
+        global_scale,
+        out.topk_weights,
+        out.topk_ids,
+        out.x_fp4,
+        out.x_sf,
+        out.tile_idx_to_expert_idx,
+        out.tile_idx_to_mn_limit,
+        out.expanded_idx_to_permuted_idx,
+        out.permuted_idx_to_expanded_idx,
+        out.total_num_padded_tokens,
+        out.num_non_exiting_tiles,
         out.tile_log2,
     )
     return out

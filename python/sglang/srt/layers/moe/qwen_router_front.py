@@ -1,10 +1,11 @@
 """Single-kernel router front end for Qwen MoE blocks on the CuTe DSL NVFP4 runner.
 
-At decode token counts the stock chain (router GEMM, top-k, NVFP4 input quant,
-moe_sort) is replaced by one kernel that writes the same tensors the grouped
-GEMMs consume; FC1 / FC2 / finalize then run as in FlashInfer's
-``_moe_core_impl``. Enabled by SGLANG_Q35MF_ROUTE_FUSED; every unsupported
-configuration keeps the stock path.
+At decode token counts the stock chain after the router GEMM (top-k, NVFP4
+input quant, moe_sort) is replaced by one kernel that writes the same tensors
+the grouped GEMMs consume; FC1 / FC2 / finalize then run as in FlashInfer's
+``_moe_core_impl``. Enabled by SGLANG_Q35MF_ROUTE_FUSED (SGLANG_Q35MF_ROUTE_GEMV
+also moves the router GEMM into the kernel); every unsupported configuration
+keeps the stock path.
 """
 
 # Copyright (c) 2025 by FlashInfer team.
@@ -151,6 +152,7 @@ def forward_routed(
     from sglang.kernels.ops.moe.qwen_router_front import (
         RouterFrontBuffers,
         router_front,
+        router_tail,
     )
     from sglang.srt.layers.moe.topk import build_precomputed_topk_output
 
@@ -185,7 +187,13 @@ def forward_routed(
     ]
     tactic = _choose_tactic(wrapper, inputs)
     bufs.set_tile_size(tactic[0])
-    router_front(hidden_states, block.gate.weight, experts._cutedsl_input_scale, bufs)
+    if envs.SGLANG_Q35MF_ROUTE_GEMV.get():
+        router_front(
+            hidden_states, block.gate.weight, experts._cutedsl_input_scale, bufs
+        )
+    else:
+        router_logits, _ = block.gate(hidden_states)
+        router_tail(router_logits, hidden_states, experts._cutedsl_input_scale, bufs)
     # Capture hook and expert-distribution recorder, as select_experts would run them.
     build_precomputed_topk_output(
         bufs.topk_weights, bufs.topk_ids, block.topk.topk_config, block.topk.layer_id

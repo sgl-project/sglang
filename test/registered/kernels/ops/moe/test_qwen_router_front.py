@@ -1,9 +1,10 @@
 """Single-kernel MoE router front end vs the stock chain it replaces.
 
-Given the kernel's own bf16 logits, the softmax / top-10 / renormalize output must equal
-the Triton router bit for bit, the NVFP4 input quantization must equal fp4_quantize
+Given the same bf16 logits, the softmax / top-10 / renormalize output must equal the
+Triton router bit for bit, the NVFP4 input quantization must equal fp4_quantize
 (cute-dsl, linear scales), and the routing tables must equal moe_sort on every entry the
-grouped GEMMs read. The logits themselves are checked against an fp32 reference.
+grouped GEMMs read. The fused GEMV's logits are checked against an fp32 reference; the
+tail kernel takes the stock router GEMM's logits.
 """
 
 import sys
@@ -42,10 +43,6 @@ def _inputs(m: int, seed: int, clustered: bool):
 @pytest.mark.parametrize("tile", [128, 256])
 @pytest.mark.parametrize("clustered", [False, True])
 def test_router_front_matches_stock_chain(m: int, tile: int, clustered: bool) -> None:
-    from flashinfer import fp4_quantize
-    from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers, moe_sort
-
-    from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
     from sglang.kernels.ops.moe.qwen_router_front import RouterFrontBuffers, router_front
 
     x, weight, gs = _inputs(m, seed=1000 + m, clustered=clustered)
@@ -56,8 +53,31 @@ def test_router_front_matches_stock_chain(m: int, tile: int, clustered: bool) ->
 
     ref = x.float() @ weight.float().t()
     torch.testing.assert_close(out.logits.float(), ref, rtol=1.6e-2, atol=1e-2)
+    _assert_matches_stock_chain(out, out.logits, x, gs, m, tile)
 
-    w_ref, ids_ref = moe_fused_gate(out.logits, None, TOP_K, scoring_func="softmax", renormalize=True)
+
+@requires_blackwell
+@pytest.mark.parametrize("m", [1, 7, 9, 16])
+@pytest.mark.parametrize("tile", [128, 256])
+def test_router_tail_matches_stock_chain(m: int, tile: int) -> None:
+    """Behind the stock router GEMM the whole front end must be bitwise to the stock chain."""
+    from sglang.kernels.ops.moe.qwen_router_front import RouterFrontBuffers, router_tail
+
+    x, weight, gs = _inputs(m, seed=3000 + m, clustered=False)
+    logits = torch.nn.functional.linear(x, weight)
+    out = RouterFrontBuffers(m, tile, "cuda")
+    router_tail(logits, x, gs, out)
+    torch.cuda.synchronize()
+    _assert_matches_stock_chain(out, logits, x, gs, m, tile)
+
+
+def _assert_matches_stock_chain(out, logits, x, gs, m: int, tile: int) -> None:
+    from flashinfer import fp4_quantize
+    from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers, moe_sort
+
+    from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+
+    w_ref, ids_ref = moe_fused_gate(logits, None, TOP_K, scoring_func="softmax", renormalize=True)
     assert torch.equal(out.topk_ids, ids_ref)
     assert torch.equal(out.topk_weights.view(torch.int32), w_ref.view(torch.int32))
 
