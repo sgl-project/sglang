@@ -39,7 +39,7 @@ jobs:
       (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'cu130')
     strategy:
       matrix:
-        python-version: ["3.10"]
+        python-version: ["3.11"]
         cuda-version: ["13.0"]
         arch: [x86_64, aarch64]
         include:
