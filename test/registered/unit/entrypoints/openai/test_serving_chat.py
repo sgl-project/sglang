@@ -1506,6 +1506,102 @@ class ServingChatTestCase(CustomTestCase):
                     prompt = self.tm.tokenizer.encode.call_args.args[0]
                     self.assertEqual("calculator" in prompt, expects_tools)
 
+    def test_dsv41_tool_history_arguments(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv41"
+        error_result = "failed to parse function arguments: unexpected EOF"
+
+        cases = [
+            ('{"key":"alpha', '{"key":"alpha', None),
+            ("not-json", "not-json", None),
+            ("", "", None),
+            ("{}", "", None),
+            (
+                '{"key":"alpha","count":2}',
+                '<｜DSML｜ parameter name="key" string="true">alpha</｜DSML｜ parameter>'
+                '\n<｜DSML｜ parameter name="count" string="false">2</｜DSML｜ parameter>',
+                None,
+            ),
+            *[
+                (value, None, "must be a JSON object")
+                for value in ('"alpha"', '["alpha"]', "null", "true", "2")
+            ],
+        ]
+        for arguments, expected_body, expected_error in cases:
+            with self.subTest(arguments=arguments):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Run the lookup."},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": error_result,
+                        },
+                    ],
+                )
+                original = request.model_dump()
+                if expected_error:
+                    with self.assertRaisesRegex(ValueError, expected_error):
+                        self.chat._process_messages(request, is_multimodal=False)
+                else:
+                    self.chat._process_messages(request, is_multimodal=False)
+                    prompt = self.tm.tokenizer.encode.call_args.args[0]
+                    self.assertIn(
+                        '<｜DSML｜ invoke name="lookup">'
+                        f"\n{expected_body}\n</｜DSML｜ invoke>",
+                        prompt,
+                    )
+                    self.assertIn(error_result, prompt)
+                self.assertEqual(request.model_dump(), original)
+
+    def test_jinja_rejects_malformed_tool_history_arguments(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Run the lookup."},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"key":"alpha',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "failed to parse function arguments: unexpected EOF",
+                },
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "must be valid JSON"):
+            self.chat._process_messages(request, is_multimodal=False)
+        self.tm.tokenizer.apply_chat_template.assert_not_called()
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"

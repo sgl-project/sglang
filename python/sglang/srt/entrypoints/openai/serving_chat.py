@@ -1543,7 +1543,10 @@ class OpenAIServingChat(OpenAIServingBase):
         messages = [msg.model_dump() for msg in request.messages]
         for message in messages:
             normalize_assistant_tool_call_arguments(
-                message, strict=self.chat_encoding_spec != "kimi_k3"
+                # V4.1 also preserves rejected calls so clients can replay
+                # their tool-argument validation errors for model recovery.
+                message,
+                strict=self.chat_encoding_spec not in ("kimi_k3", "dsv41"),
             )
 
         prompt_ids = self._encode_messages(
