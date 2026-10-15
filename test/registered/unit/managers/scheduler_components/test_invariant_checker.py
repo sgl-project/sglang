@@ -241,9 +241,9 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         locs = torch.cat((prefix_locs, tail_locs))
         checker.req_to_token_pool.req_to_token[0, : len(locs)] = locs
         req = SimpleNamespace(
-            kv=SimpleNamespace(
-                holds_kv=True,
+            kv=ReqKvInfo(
                 req_pool_idx=0,
+                kv_committed_len=len(locs),
                 kv_allocated_len=len(locs),
                 cache_protected_len=self.PAGE_SIZE,
             ),

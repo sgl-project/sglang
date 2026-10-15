@@ -6,7 +6,7 @@ import torch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.dllm.prefill_adder import DllmPrefillAdder
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -1208,7 +1208,7 @@ class TestPrefillAdder(CustomTestCase):
             req.needs_host_load_back.return_value = True
             req.last_node = MagicMock()
             req.best_match_node = MagicMock()
-            req.kv = SimpleNamespace(cache_protected_len=0)
+            req.kv = ReqKvInfo(cache_protected_len=0)
 
             req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=False)
 
@@ -1435,7 +1435,7 @@ class TestPrefillAdder(CustomTestCase):
         req.host_hit_length = host_hit
         req.needs_host_load_back.return_value = True
         req.best_match_node = req.last_node
-        req.kv = SimpleNamespace(cache_protected_len=prefix_len)
+        req.kv = ReqKvInfo(cache_protected_len=prefix_len)
         return req
 
     def _build_mamba_restore_admission(self, *, holds_state, available_slots):
@@ -1448,10 +1448,10 @@ class TestPrefillAdder(CustomTestCase):
         adder.rem_mamba_slots = available_slots
         req = self._create_host_hit_req(host_hit=32, tail=8)
         req.mamba_host_hit_length = 1
-        req.kv.holds_mamba = holds_state
+        req.kv.mamba_pool_idx = torch.tensor([0]) if holds_state else None
 
         def load_back(params):
-            req.kv.holds_mamba = True
+            req.kv.mamba_pool_idx = torch.tensor([0])
             return req.host_hit_length, req.last_node
 
         self.mock_tree_cache.init_load_back.side_effect = load_back
