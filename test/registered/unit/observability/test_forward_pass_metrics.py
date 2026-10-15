@@ -334,6 +334,28 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metrics.queued_requests.num_decode_requests, 3)
         self.assertEqual(metrics.queued_requests.sum_decode_kv_tokens, 15 + 30 + 45)
 
+    def test_disagg_decode_queued_metrics_count_every_queued_list(self):
+        """Ready (transferred, waiting for a row) and retracted requests are
+        queued decode work too."""
+        _set_disaggregation_mode(self, DisaggregationMode.DECODE)
+        owner = self.reporter.mode_owners.disagg_decode = decode_owner_shell()
+        owner.prealloc_queue.queue = [
+            types.SimpleNamespace(req=_FakeReq(10, output_len=5))
+        ]
+        owner.prealloc_queue.retracted_queue = [_FakeReq(20, output_len=10)]
+        owner.ready = [_FakeReq(30, output_len=15)]
+        batch = self._make_batch()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=101.0,
+        ):
+            self.reporter._emit_forward_pass_metrics(batch)
+
+        metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
+        self.assertEqual(metrics.queued_requests.num_decode_requests, 3)
+        self.assertEqual(metrics.queued_requests.sum_decode_kv_tokens, 15 + 30 + 45)
+
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
         scheduler.server_args = _publish_server_args(

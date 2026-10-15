@@ -54,8 +54,7 @@ class RequestList:
     # The load counts the members among its waiting requests.
     counts_queued: bool = False
     # PD decode: the members' KV has not arrived from the prefill side; the
-    # load counts their tokens as awaited, and the forward pass metrics as
-    # queued decode work.
+    # load counts their tokens as awaited.
     awaits_kv: bool = False
     # The member stopped between two prefill chunks: the load counts its
     # prompt tokens still to prefill.

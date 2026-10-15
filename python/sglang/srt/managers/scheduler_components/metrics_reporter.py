@@ -722,7 +722,7 @@ class SchedulerMetricsReporter:
             for req in registry.reqs(lambda entry: entry.counts_queued):
                 prefill_q.add(len(req.origin_input_ids))
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            for req in registry.reqs(lambda entry: entry.awaits_kv):
+            for req in registry.reqs(lambda entry: entry.counts_queued):
                 decode_q.add(req.seqlen)
         else:
             for req in registry.reqs(lambda entry: entry.counts_queued):
