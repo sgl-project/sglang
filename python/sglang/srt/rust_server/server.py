@@ -69,6 +69,12 @@ class RustServer:
         self._max_per_poll = max_per_poll
 
     @classmethod
+    def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
+        """Headers a healthy ``/health_generate`` carries; a deployment's
+        router may read its metadata off the deep health probe."""
+        return {}
+
+    @classmethod
     def _load_extension(cls) -> ModuleType:
         from sglang.srt.rust_extensions import load_rust_extension
 
@@ -167,7 +173,11 @@ class RustServer:
 
         extension = cls._load_extension()
         server = extension.Server(
-            _build_server_args(scheduler, extension=extension),
+            _build_server_args(
+                scheduler,
+                extension=extension,
+                health_generate_headers=cls._health_generate_headers(scheduler),
+            ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
             port_offset=local_dp_rank,
