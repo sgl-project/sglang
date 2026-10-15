@@ -12,8 +12,9 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,9 @@ class SingleTokenDraftMoe:
     def __init__(self, layer_id: int) -> None:
         self.layer_id = layer_id
         self.active = True
+        self.fused_router = envs.SGLANG_Q35MF_DRAFT_MOE_ROUTER.get()
         self._scratch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._router_scratch: Optional[Tuple[torch.Tensor, ...]] = None
 
     def _unsupported_reason(self, block, hidden_states, topk_output) -> Optional[str]:
         experts, shared = block.experts, block.shared_expert
@@ -56,12 +59,39 @@ class SingleTokenDraftMoe:
             return "non-contiguous operands"
         return None
 
+    @staticmethod
+    def _router_unsupported_reason(block) -> Optional[str]:
+        cfg = block.topk.topk_config
+        if (
+            cfg.scoring_func != "softmax"
+            or not cfg.renormalize
+            or cfg.use_grouped_topk
+            or cfg.correction_bias is not None
+            or cfg.custom_routing_function is not None
+            or cfg.num_fused_shared_experts != 0
+            or cfg.routed_scaling_factor not in (None, 1.0)
+            or block.topk.enable_waterfill
+        ):
+            return "router is not plain softmax top-k with renormalization"
+        w = block.gate.weight
+        if w.dtype != torch.bfloat16 or w.shape[0] % 32 != 0 or not w.is_contiguous():
+            return f"router weight {w.dtype} {tuple(w.shape)}"
+        return None
+
+    def _route(self, block, hidden_states: torch.Tensor):
+        if self._router_scratch is None:
+            return block.topk(hidden_states, block.gate(hidden_states)[0])
+        from sglang.kernels.ops.speculative.draft_moe_gemv import draft_router_topk
+
+        logits, counter, weights, ids = self._router_scratch
+        draft_router_topk(hidden_states, block.gate.weight, logits, counter, weights, ids)
+        return StandardTopKOutput(topk_weights=weights, topk_ids=ids, router_logits=logits)
+
     def forward(self, block, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         """Return the block output, or None when the caller must take the stock path."""
         from sglang.kernels.ops.speculative.draft_moe_gemv import draft_moe_gemv
 
-        router_logits, _ = block.gate(hidden_states)
-        topk_output = block.topk(hidden_states, router_logits)
+        topk_output = self._route(block, hidden_states)
         if self._scratch is None:
             reason = self._unsupported_reason(block, hidden_states, topk_output)
             if reason is None and torch.cuda.is_current_stream_capturing():
@@ -76,11 +106,25 @@ class SingleTokenDraftMoe:
                 return None
             inter = block.experts.w2_weight.shape[-1]
             topk = topk_output.topk_ids.shape[-1]
+            dev = hidden_states.device
             self._scratch = (
-                torch.empty(topk + 1, inter, dtype=torch.bfloat16, device=hidden_states.device),
-                torch.empty(1, dtype=torch.float32, device=hidden_states.device),
+                torch.empty(topk + 1, inter, dtype=torch.bfloat16, device=dev),
+                torch.empty(1, dtype=torch.float32, device=dev),
             )
-            logger.info("Single-token draft MoE active for layer %d.", self.layer_id)
+            router_reason = self._router_unsupported_reason(block) if self.fused_router else "off"
+            if router_reason is None:
+                num_experts = block.gate.weight.shape[0]
+                self._router_scratch = (
+                    torch.empty(num_experts, dtype=torch.float32, device=dev),
+                    torch.zeros(1, dtype=torch.int32, device=dev),
+                    torch.empty(1, topk, dtype=torch.float32, device=dev),
+                    torch.empty(1, topk, dtype=torch.int32, device=dev),
+                )
+            logger.info(
+                "Single-token draft MoE active for layer %d (fused router: %s).",
+                self.layer_id,
+                "yes" if router_reason is None else router_reason,
+            )
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):

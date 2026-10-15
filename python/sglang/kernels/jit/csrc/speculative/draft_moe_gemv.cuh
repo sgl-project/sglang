@@ -38,6 +38,8 @@ SGL_DEVICE float silu_f32(float x) {
   return x / (1.0f + expf(-x));
 }
 
+inline constexpr float kNegInf = -__builtin_huge_valf();
+
 SGL_DEVICE float round_bf16(float x) {
   return device::cast<fp32_t>(device::cast<bf16_t>(x));
 }
@@ -585,6 +587,152 @@ __global__ void __launch_bounds__(256, 1) draft_moe_down_v3_kernel(const DraftMo
     p.out[j0 + jj] = cast<bf16_t>(r);
   }
 }
+
+struct DraftRouterParams {
+  const bf16_t* x;                // [H], written by an earlier grid
+  const bf16_t* __restrict__ w;   // [E, H] router weight
+  float* logits;                  // [E] scratch: bf16-rounded logits
+  uint32_t* counter;              // [1], zero between launches
+  float* topk_weights;            // [K]
+  int32_t* topk_ids;              // [K]
+};
+
+/**
+ * \brief Single-token router: softmax over E logits, top-K (ties to the lowest
+ * expert id, NaN ranked as -1e30), renormalized weights in selection order.
+ * One warp per router row; the static weight row is loaded before the PDL wait.
+ * The last CTA to finish (fenced atomic counter) runs the selection on one warp.
+ */
+template <int kH, int kE, int kTopK, bool kUsePDL>
+__global__ void __launch_bounds__(256) draft_router_kernel(const DraftRouterParams __grid_constant__ p) {
+  using namespace device;
+  constexpr int kWarps = 8;
+  constexpr int kVecN = static_cast<int>(kMaxVecBytes / sizeof(bf16_t));
+  using vec_t = AlignedVector<bf16_t, kVecN>;
+  constexpr int kPerLane = kH / kVecN / static_cast<int>(kWarpThreads);
+  static_assert(kH % (kVecN * kWarpThreads) == 0, "hidden size must tile the warp");
+  static_assert(kE % kWarps == 0 && kE % kWarpThreads == 0, "expert count must tile the CTA");
+  constexpr int kPerLaneE = kE / static_cast<int>(kWarpThreads);
+  __shared__ bool s_last;
+
+  const int warp = static_cast<int>(threadIdx.x / kWarpThreads);
+  const int lane = static_cast<int>(get_lane_id());
+  const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
+
+  vec_t w[kPerLane];
+  const bf16_t* wrow = p.w + static_cast<int64_t>(row) * kH;
+#pragma unroll
+  for (int k = 0; k < kPerLane; ++k) w[k].load(wrow, k * kWarpThreads + lane);
+
+  PDLWaitPrimary<kUsePDL>();
+  PDLTriggerSecondary<kUsePDL>();
+
+  float acc = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kPerLane; ++k) {
+    vec_t xv;
+    xv.load(p.x, k * kWarpThreads + lane);
+#pragma unroll
+    for (int j = 0; j < kVecN; ++j) acc = fmaf(cast<fp32_t>(w[k][j]), cast<fp32_t>(xv[j]), acc);
+  }
+  acc = warp::reduce_sum(acc);
+  if (lane == 0) {
+    p.logits[row] = draft_moe::round_bf16(acc);
+    __threadfence();
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    s_last = atomicAdd(p.counter, 1u) == gridDim.x - 1;
+  }
+  __syncthreads();
+  if (!s_last || warp != 0) return;
+  __threadfence();
+
+  // Selection keys: order-preserving 16-bit image of the bf16 logit, then the
+  // complemented id, so an unsigned max picks the largest logit, lowest id on ties.
+  float v[kPerLaneE];
+  uint32_t key[kPerLaneE];
+  float row_max = draft_moe::kNegInf;
+#pragma unroll
+  for (int i = 0; i < kPerLaneE; ++i) {
+    const float l = __ldcg(p.logits + i * kWarpThreads + lane);
+    v[i] = l == l ? l : -1e30f;
+    row_max = fmaxf(row_max, v[i]);
+    const uint32_t b = __float_as_uint(cast<fp32_t>(cast<bf16_t>(v[i]))) >> 16;
+    const uint32_t ord = (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u);
+    key[i] = (ord << 16) | (0xffffu - static_cast<uint32_t>(i * kWarpThreads + lane));
+  }
+  row_max = warp::reduce_max(row_max);
+  float lsum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kPerLaneE; ++i) lsum += expf(v[i] - row_max);
+  const float row_sum = warp::reduce_sum(lsum);
+
+  float sel_w[kTopK];
+  int32_t sel_id[kTopK];
+  float routed_sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) {
+    uint32_t best = 0;
+#pragma unroll
+    for (int i = 0; i < kPerLaneE; ++i) best = max(best, key[i]);
+    best = __reduce_max_sync(0xffffffffu, best);
+    const int32_t id = static_cast<int32_t>(0xffffu - (best & 0xffffu));
+    float lw = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kPerLaneE; ++i) {
+      if (key[i] == best) {
+        lw = v[i];
+        key[i] = 0;
+      }
+    }
+    lw = __shfl_sync(0xffffffffu, lw, id % kWarpThreads);
+    const float pw = expf(lw - row_max) / row_sum;
+    sel_w[k] = pw;
+    sel_id[k] = id;
+    routed_sum += pw;
+  }
+  if (lane == 0) {
+    const float norm = routed_sum > 0.0f ? routed_sum : 1.0f;
+#pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+      p.topk_weights[k] = sel_w[k] / norm;
+      p.topk_ids[k] = sel_id[k];
+    }
+    *p.counter = 0u;
+  }
+}
+
+template <int kH, int kE, int kTopK, bool kUsePDL>
+struct DraftRouter {
+  static void run(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView w,
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView counter,
+      const tvm::ffi::TensorView topk_weights,
+      const tvm::ffi::TensorView topk_ids) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({1, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
+    TensorMatcher({kE, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(w);
+    TensorMatcher({kE}).with_dtype<fp32_t>().with_device(device).verify(logits);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(counter);
+    TensorMatcher({1, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
+    TensorMatcher({1, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    const auto params = DraftRouterParams{
+        .x = static_cast<const bf16_t*>(x.data_ptr()),
+        .w = static_cast<const bf16_t*>(w.data_ptr()),
+        .logits = static_cast<float*>(logits.data_ptr()),
+        .counter = static_cast<uint32_t*>(counter.data_ptr()),
+        .topk_weights = static_cast<float*>(topk_weights.data_ptr()),
+        .topk_ids = static_cast<int32_t*>(topk_ids.data_ptr()),
+    };
+    LaunchKernel(kE / 8, 256, device.unwrap()).enable_pdl(kUsePDL)(draft_router_kernel<kH, kE, kTopK, kUsePDL>, params);
+  }
+};
 
 template <int kH, int kI, int kTopK, int kPairs, int kDownWarps, int kStages, int kCols, bool kContig, bool kUsePDL>
 struct DraftMoeGemv {

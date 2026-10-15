@@ -104,3 +104,31 @@ def draft_moe_gemv(
         module.up(x, w13, w13_shared, shared_gate_w, topk_ids, act, gate)
         module.down(act, w2, w2_shared, topk_ids, topk_weights, gate, out)
     return out
+
+
+@cache_once
+def _draft_router_module(hidden: int, experts: int, topk: int) -> Module:
+    args = make_cpp_args(hidden, experts, topk, is_arch_support_pdl())
+    return load_jit(
+        "draft_router",
+        *args,
+        cuda_files=["speculative/draft_moe_gemv.cuh"],
+        cuda_wrappers=[("run", f"DraftRouter<{args}>::run")],
+        extra_cuda_cflags=["--use_fast_math"],
+    )
+
+
+def draft_router_topk(
+    x: torch.Tensor,
+    router_w: torch.Tensor,
+    logits: torch.Tensor,
+    counter: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> None:
+    """Single-token softmax router: x [1, H] @ router_w [E, H]^T rounded to bf16,
+    top-K (lowest id on ties) with renormalized weights. Scratch: logits fp32 [E],
+    counter int32 [1] (zero between calls)."""
+    _draft_router_module(x.shape[-1], router_w.shape[0], topk_ids.shape[-1]).run(
+        x, router_w, logits, counter, topk_weights, topk_ids
+    )
