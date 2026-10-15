@@ -1656,7 +1656,13 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if self.prefill_aware_swa:
+            if self.prefill_aware_swa and any(
+                seq_len > prompt_len
+                for seq_len, prompt_len in zip(
+                    forward_batch.seq_lens_cpu.tolist(),
+                    forward_batch.reference_lens_cpu,
+                )
+            ):
                 query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 output = q.new_empty(
                     (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
@@ -3147,9 +3153,28 @@ class AscendAttnBackend(AttentionBackend):
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if self.prefill_aware_swa:
-                return self.forward_decode_graph(
-                    q, k, v, layer, forward_batch, save_kv_cache=False
+                query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                output = q.new_empty(
+                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim)
                 )
+                self.native_attn.run_sdpa_forward_decode(
+                    query,
+                    output,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens_cpu,
+                    scaling=layer.scaling,
+                    enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+                    sliding_window_size=self.sliding_window_size,
+                    reference_lens=self.reference_lens[
+                        forward_batch.req_pool_indices.cpu().long()
+                    ],
+                    logit_cap=layer.logit_cap,
+                    logit_capping_method=layer.logit_capping_method,
+                )
+                return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
