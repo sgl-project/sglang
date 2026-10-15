@@ -2647,10 +2647,13 @@ class TestQwen3CoderDetector(unittest.TestCase):
             ({"anyOf": [{"type": "string"}, {"$ref": "#/$defs/missing"}]}, "{}"),
         ):
             self._check_structured_union_value(schema, raw, raw)
+
+    def test_union_schema_references_never_fetch(self):
+        """Unresolved external references must not trigger network access."""
         with patch(
             "urllib.request.urlopen",
             side_effect=AssertionError("Unexpected schema fetch"),
-        ):
+        ) as urlopen:
             self._check_structured_union_value(
                 {
                     "anyOf": [
@@ -2661,6 +2664,7 @@ class TestQwen3CoderDetector(unittest.TestCase):
                 "{}",
                 "{}",
             )
+            urlopen.assert_not_called()
 
     def test_integer_parameter_conversion(self):
         """
