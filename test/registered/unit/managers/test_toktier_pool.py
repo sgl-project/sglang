@@ -59,6 +59,31 @@ def _manager(tokenizer):
     return manager
 
 
+def _pool_wrapper(session_key=None):
+    """A wrapper with its own pool of two workers, in the given session-key
+    mode (None: the variable unset, so the adapter's default applies)."""
+    with patch.dict(os.environ, {"TOKTIER_SGLANG_SCHED_WORKERS": "2"}):
+        if session_key is None:
+            os.environ.pop("TOKTIER_SGLANG_SESSION_KEY", None)
+        else:
+            os.environ["TOKTIER_SGLANG_SESSION_KEY"] = session_key
+        return _wrap_tokenizer_with_toktier(AutoTokenizer.from_pretrained(MODEL))
+
+
+def _two_turns(manager):
+    """Two turns of one session through _tokenize_texts, the second
+    extending the first."""
+    request = SimpleNamespace(session_id="session-pool", cache_salt=None, rid="r1")
+
+    async def run():
+        with _toktier_session_scope(request):
+            first, _ = await manager._tokenize_texts(TRANSCRIPT)
+            second, _ = await manager._tokenize_texts(TRANSCRIPT + NEXT_TURN)
+        return first, second
+
+    return asyncio.run(run())
+
+
 @unittest.skipUnless(HAS_TOKTIER_ADAPTER, "toktier package (>= 0.3.0) not installed")
 class TestToktierPool(CustomTestCase):
     @classmethod
@@ -91,17 +116,31 @@ class TestToktierPool(CustomTestCase):
         self.assertIsNone(token_type_ids)
 
     def test_session_append_through_the_pool_matches_reference(self):
-        request = SimpleNamespace(session_id="session-pool", cache_salt=None, rid="r1")
-
-        async def run():
-            with _toktier_session_scope(request):
-                first, _ = await self.manager._tokenize_texts(TRANSCRIPT)
-                second, _ = await self.manager._tokenize_texts(TRANSCRIPT + NEXT_TURN)
-            return first, second
-
-        first, second = asyncio.run(run())
+        # The bound session_id is read in "contextvar" mode, and a keyed
+        # request is served on its home worker's session path; the default
+        # "auto" mode looks sessions up by content instead.
+        wrapped = _pool_wrapper("contextvar")
+        self.addCleanup(wrapped.close)
+        first, second = _two_turns(_manager(wrapped))
         self.assertEqual(first, self.hf.encode(TRANSCRIPT))
         self.assertEqual(second, self.hf.encode(TRANSCRIPT + NEXT_TURN))
+        stats = wrapped.stats()
+        self.assertEqual(stats["how"], {"sched_session": 2})
+        # Both turns went to the same worker, the session's home.
+        self.assertEqual(list(stats["scheduler"]["tasks_by_worker"].values()), [2])
+
+    def test_default_mode_is_content_lookup_on_the_pool(self):
+        # Without TOKTIER_SGLANG_SESSION_KEY the bound session_id is not read;
+        # both turns are served by content lookup on the worker chosen from
+        # the text's start.
+        wrapped = _pool_wrapper()
+        self.addCleanup(wrapped.close)
+        first, second = _two_turns(_manager(wrapped))
+        self.assertEqual(first, self.hf.encode(TRANSCRIPT))
+        self.assertEqual(second, self.hf.encode(TRANSCRIPT + NEXT_TURN))
+        stats = wrapped.stats()
+        self.assertEqual(stats["how"], {"sched_auto": 2})
+        self.assertEqual(list(stats["scheduler"]["tasks_by_worker"].values()), [2])
 
     def test_inputs_the_pool_does_not_take_fall_through(self):
         pool = toktier_sglang.tokenize_texts_with_pool
