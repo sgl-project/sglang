@@ -245,12 +245,8 @@ class _HybridCase:
         if not self.cache._check_hybrid_prefetch_result(
             self.op.handle,
             operation,
-            operation.completed_tokens,
             operation.hash_value,
             operation.host_indices,
-            0,
-            None,
-            RadixKey(self.tokens),
         ):
             return
         assert self.incoming.keys == [self.hashes[self.expected - 1]]
