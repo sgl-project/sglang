@@ -68,6 +68,14 @@ class SchedulerLoadInquirer:
                 num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
             else:
                 num_tokens += int(req.seqlen * cache_miss_rate)
+        # The other waiting requests that own no KV yet (PD prefill
+        # bootstrap) were never prefix-matched.
+        for req in registry.reqs(
+            lambda entry: (
+                entry.counts_queued and not entry.holds_kv and not entry.queued
+            )
+        ):
+            num_tokens += int(req.seqlen * cache_miss_rate)
         for cr in registry.reqs(lambda entry: entry.partly_prefilled):
             num_tokens += max(0, cr.seqlen - cr.prefix_len)
         return num_tokens
