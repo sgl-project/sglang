@@ -1,3 +1,4 @@
-# Published sglang-kernel==0.4.9 and sgl-deep-ep==0.1.2.post1 pin torch==2.14.1; CI replaces that kernel anyway.
+# Published sglang-kernel==0.4.9 pins torch==2.14.1; CI rebuilds it from source against 2.15.
+# sgl-deep-ep and sgl-deep-gemm are NOT rebuilt: pin their torch 2.15 RC builds before trusting results.
 # Remove once the pinned sglang-kernel and sgl-deep-ep pin this torch.
 torch==2.15.0
