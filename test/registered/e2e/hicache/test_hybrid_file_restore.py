@@ -106,6 +106,7 @@ class TestHybridFileRestore(CustomTestCase):
         response.raise_for_status()
         result = response.json()
         self.assertNotEqual(result["meta_info"]["finish_reason"]["type"], "abort")
+        self.assertTrue(result["text"].strip(), "Expected a non-empty model response")
         return result
 
     def test_fresh_process_restores_rank_shards(self):
@@ -116,13 +117,23 @@ class TestHybridFileRestore(CustomTestCase):
             allow_patterns=["*.json", "*.py", "*.safetensors", "*.model"],
         )
         tokenizer = get_tokenizer(model_path, trust_remote_code=True)
-        task = tokenizer.encode(
-            "\nWhat is 17 plus 25? Explain the calculation briefly."
+        tokens = tokenizer.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Reference notes: the library lends books to readers. " * 64
+                        + "\nWhat is 17 plus 25? Explain the calculation briefly."
+                    ),
+                }
+            ],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=False,
         )
-        notes = tokenizer.encode(
-            "Reference notes: the library lends books to readers. "
-        )
-        tokens = (notes * (513 // len(notes) + 1))[: 513 - len(task)] + task
+        # Trim only repeated notes, preserving the chat template and question.
+        self.assertGreater(len(tokens), 513)
+        tokens = tokens[:64] + tokens[-449:]
         hashes = get_storage_hash_str(tokens[:512], None, page_size=64)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
