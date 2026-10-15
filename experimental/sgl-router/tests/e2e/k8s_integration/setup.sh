@@ -51,7 +51,7 @@ kubectl config use-context "${CONTEXT}"
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_DOCKER_BUILD:-}" == "1" ]]; then
     log "SKIP_DOCKER_BUILD=1 — skipping docker build; expecting images to exist locally."
-    for img in sgl-router:e2e sgl-router-fake-worker:e2e; do
+    for img in sgl-router:e2e sgl-router-fake-worker:e2e sgl-router-fake-kv-worker:e2e; do
         if ! docker image inspect "${img}" >/dev/null 2>&1; then
             log "ERROR: ${img} not found locally; cannot continue without building."
             exit 1
@@ -69,6 +69,15 @@ else
         -f "${SCRIPT_DIR}/Dockerfile.fake_worker" \
         -t sgl-router-fake-worker:e2e \
         "${SCRIPT_DIR}"
+
+    # KV-publishing variant, used by the cache-aware peer-bootstrap tests. Kept
+    # separate from the plain fake worker so those tests do not pay for pyzmq +
+    # msgspec, and so a break in one image cannot mask the other.
+    log "Building sgl-router-fake-kv-worker:e2e ..."
+    docker build \
+        -f "${SCRIPT_DIR}/Dockerfile.fake_kv_worker" \
+        -t sgl-router-fake-kv-worker:e2e \
+        "${SCRIPT_DIR}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -77,6 +86,7 @@ fi
 log "Loading images into kind cluster '${CLUSTER_NAME}'..."
 kind load docker-image sgl-router:e2e --name "${CLUSTER_NAME}"
 kind load docker-image sgl-router-fake-worker:e2e --name "${CLUSTER_NAME}"
+kind load docker-image sgl-router-fake-kv-worker:e2e --name "${CLUSTER_NAME}"
 
 # ---------------------------------------------------------------------------
 # Step 4: Apply namespace and RBAC

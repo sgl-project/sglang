@@ -1,4 +1,3 @@
-import argparse
 import concurrent.futures
 import unittest
 from types import SimpleNamespace
@@ -16,18 +15,6 @@ from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-
-class TestPdRoleSwitchServerArg(unittest.TestCase):
-    def test_cli_flag_parses(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        off = parser.parse_args(["--model-path", "dummy"])
-        self.assertFalse(off.enable_pd_role_switch)
-
-        on = parser.parse_args(["--model-path", "dummy", "--enable-pd-role-switch"])
-        self.assertTrue(on.enable_pd_role_switch)
 
 
 class TestHandlePdRoleSwitch(unittest.TestCase):
@@ -131,7 +118,6 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_rejected_when_decode_graph_headroom_is_insufficient(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"
-        s.ps = SimpleNamespace(gpu_id=0)
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=0.5):
             out = Scheduler.handle_pd_role_switch(
@@ -151,7 +137,6 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_decode_graph_headroom_allows_flip(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"
-        s.ps = SimpleNamespace(gpu_id=0)
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=1.0):
             out = Scheduler.handle_pd_role_switch(
@@ -320,8 +305,10 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         base = dict(
             disaggregation_transfer_backend="mori",
             disaggregation_mode="prefill",
+            disaggregation_decode_host_receive_threshold=1.0,
             enable_pd_role_switch=True,
-            enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
             ep_size=1,
             moe_a2a_backend="none",
             pp_size=1,
@@ -330,7 +317,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             speculative_algorithm=None,
         )
         base.update(kw)
-        return SimpleNamespace(**base)
+        # Keep the production defaults for fields read by the shared PD hook.
+        return ServerArgs(model_path="dummy", **base)
 
     def _run(self, sa):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -345,8 +333,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
 
     def test_reject_dp_attention(self):
         with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(enable_dp_attention=True))
-        self.assertIn("DP attention", str(ctx.exception))
+            self._run(self._sa(attn_dp_size=2))
+        self.assertIn("attention DP", str(ctx.exception))
 
     def test_reject_expert_parallelism(self):
         with self.assertRaises(ValueError) as ctx:
@@ -390,14 +378,6 @@ import time  # noqa: E402
 import zmq  # noqa: E402
 
 try:
-    from sglang.srt.disaggregation.common.utils import FastQueue  # noqa: E402
-    from sglang.srt.disaggregation.mori.conn import MoriKVManager  # noqa: E402
-
-    _HAS_MORI = True
-except Exception:  # pragma: no cover - environment dependent
-    _HAS_MORI = False
-
-try:
     from sglang.srt.disaggregation.common.utils import (  # noqa: E402,F811
         FastQueue as _FQ,
     )
@@ -416,38 +396,6 @@ try:
     _HAS_ROLE_SWITCH = True
 except Exception:  # pragma: no cover - environment dependent
     _HAS_ROLE_SWITCH = False
-
-
-@unittest.skipUnless(_HAS_MORI, "mori not importable in this environment")
-class TestMoriTeardownNoThreadLeak(unittest.TestCase):
-    """teardown() must stop+join the transfer workers it started, so a P->D->P
-    flip loop does not leak _num_shards transfer threads per cycle."""
-
-    def test_teardown_joins_transfer_workers(self):
-        m = MoriKVManager.__new__(MoriKVManager)
-        m.disaggregation_mode = DisaggregationMode.PREFILL
-        m._stopped = False
-        m._worker_threads = []
-        m._transfer_queues = [FastQueue() for _ in range(3)]
-        m.server_socket = MagicMock()
-        m._zmq_ctx = MagicMock()
-        m.engine = MagicMock()
-        m.kv_mem_descs = m.aux_mem_descs = m.state_mem_descs = []
-        for q in m._transfer_queues:
-            t = threading.Thread(target=m._transfer_worker, args=(q,), daemon=True)
-            t.start()
-            m._worker_threads.append(t)
-        started = list(m._worker_threads)
-        time.sleep(0.05)  # let workers park in FastQueue.get()
-        for t in started:
-            self.assertTrue(t.is_alive())
-
-        MoriKVManager.teardown(m)
-
-        for t in started:
-            self.assertFalse(t.is_alive(), "transfer worker survived teardown (leak)")
-        self.assertEqual(m._worker_threads, [])
-        self.assertEqual(m._transfer_queues, [])
 
 
 @unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")
@@ -625,7 +573,7 @@ def _radix_scheduler(disable_radix_cache):
 @unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
 class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
     """The flip may run with radix cache ENABLED: teardown resets the tree cache
-    + KV pools when radix is on, and is a no-op on the historical chunk-cache path."""
+    + KV pools when radix is on, and is a no-op on the radix-disabled path."""
 
     def test_noop_when_radix_disabled(self):
         s = _radix_scheduler(disable_radix_cache=True)

@@ -7,6 +7,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
@@ -74,7 +75,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         else:
-            if _is_npu:
+            platform_allocator_cls = current_platform.get_paged_allocator_cls()
+            if platform_allocator_cls is not None:
+                PagedTokenToKVPoolAllocatorClass = platform_allocator_cls
+            elif _is_npu:
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
@@ -166,6 +170,30 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        """Free room for a decode-node preallocation; None means it is ready.
+
+        Returns a description of the shortfall when it cannot be met, for the
+        caller to attach to whichever request it was admitting. Separate
+        buffers make the sliding-window side the only one that needs
+        reclaiming here, since the full side is priced by the caller's budget.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        available = self.swa_available_size()
+        if available < swa_tokens:
+            tree_cache.evict_for_alloc(
+                EvictParams(swa_num_tokens=swa_tokens - available)
+            )
+            available = self.swa_available_size()
+        if available < swa_tokens:
+            return (
+                f"SWA eviction insufficient: needed={swa_tokens}, available={available}"
+            )
+        return None
+
     def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
         return (
             (full_capacity, self.full_available_size()),
@@ -175,7 +203,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         full_shortfall = max(0, num_tokens - self.full_available_size())
         swa_shortfall = max(0, num_tokens - self.swa_available_size())
@@ -232,14 +260,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Sliding-window token ids as the PD transfer engine addresses them.
-
-        The sibling of `translate_kv_indices_for_transfer` for the SWA state
-        component. On a static pool the sliding-window buffers are indexed by
-        the same ids the kernels use, so the read-path translate IS the answer.
-        A virtual-id pool must override: the transfer addresses raw bytes and
-        needs PHYSICAL ids, not kernel-facing ones.
-        """
+        """Map full-pool token ids to SWA-buffer token ids for PD transfer."""
         return self.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):

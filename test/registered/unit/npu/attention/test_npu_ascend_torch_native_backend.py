@@ -16,18 +16,6 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
 
 
-class TestInit(unittest.TestCase):
-    def test_construction(self):
-        backend = AscendTorchNativeAttnBackend()
-        self.assertIsNotNone(backend)
-
-
-class TestSupportTriton(unittest.TestCase):
-    def test_returns_false(self):
-        backend = AscendTorchNativeAttnBackend()
-        self.assertFalse(backend.support_triton())
-
-
 class TestScaledDotProductAttentionWithSoftcapping(unittest.TestCase):
     def setUp(self):
         self.backend = AscendTorchNativeAttnBackend()

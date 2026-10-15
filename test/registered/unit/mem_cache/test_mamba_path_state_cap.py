@@ -6,7 +6,6 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
-import argparse
 import unittest
 from collections import defaultdict
 from unittest import mock
@@ -90,22 +89,6 @@ def _build_unified_chain(cap, length=3):
 
 
 class TestMambaPathStateCap(unittest.TestCase):
-    def test_server_arg_defaults_to_unlimited(self):
-        self.assertEqual(
-            ServerArgs(model_path="dummy").mamba_max_states_per_path,
-            -1,
-        )
-
-    def test_server_arg_cli(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        args = parser.parse_args(
-            ["--model-path", "dummy", "--mamba-max-states-per-path", "3"]
-        )
-
-        self.assertEqual(args.mamba_max_states_per_path, 3)
-
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
             args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)

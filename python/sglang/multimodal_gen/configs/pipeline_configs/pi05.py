@@ -6,9 +6,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
-    ModelDeploymentConfig,
-)
 
 
 @dataclass
@@ -162,5 +159,20 @@ class Pi05PipelineConfig(PipelineConfig):
             self.action_horizon * self.action_dim * self.default_num_inference_steps
         )
 
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig()
+
+def register():
+    from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Pi05SamplingParams,
+        pipeline_config_cls=Pi05PipelineConfig,
+        hf_model_paths=[
+            "lerobot/pi05_base",
+            "lerobot/pi05_libero_base",
+        ],
+        model_detectors=[
+            lambda hf_id: "pi05" in hf_id.lower(),
+            lambda hf_id: "pi0.5" in hf_id.lower(),
+        ],
+    )

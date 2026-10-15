@@ -1,5 +1,6 @@
 ---
 title: SANA-WM
+description: "Deploy SANA-WM with SGLang - a camera-controlled text+image-to-video world model with WASD/IJKL 6-DoF camera control, served three ways: dense bidirectional and chunk-causal batch streaming over /v1/videos (SanaWMTwoStagePipeline), and live over a realtime WebSocket API (SanaWMRealtimePipeline, /v1/realtime_video/generate)."
 metatags:
     description: "Deploy SANA-WM with SGLang - a camera-controlled text+image-to-video world model with WASD/IJKL 6-DoF camera control, served three ways: dense bidirectional and chunk-causal batch streaming over /v1/videos (SanaWMTwoStagePipeline), and live over a realtime WebSocket API (SanaWMRealtimePipeline, /v1/realtime_video/generate)."
 ---
@@ -8,7 +9,30 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["world model", "720p video", "minute-scale", "6-DoF camera control", "realtime"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/SANA/sana-wm.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+For realtime mode, use the [WebSocket client](#7-realtime-websocket-api); the Request tab only checks model metadata in that mode.
+
+<Accordion title="Installation and prerequisites">
+
+<a id="2-installation" />
+
+SGLang-diffusion offers multiple installation methods depending on your hardware platform. Please refer to the [SGLang Diffusion installation guide](../../../docs/sglang-diffusion/installation).
+
+SANA-WM adds the `SanaWMTransformer3DModel` + GDN kernels, the `SanaWMTwoStagePipeline` (dense bidirectional + chunk-causal streaming), and the `SanaWMRealtimePipeline` with the `/v1/realtime_video` WebSocket router. Use `sglang serve` to launch the diffusion server.
+
+</Accordion>
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [SANA-WM](https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional) is NVLabs' 2.6B text-and-image-to-video world model for 720p, minute-scale generation with explicit per-frame 6-DoF camera control. Its hybrid recurrent/softmax attention keeps long causal histories bounded, while an LTX-2 refiner supplies the detail that the fast Stage-1 world model does not produce on its own.
 
@@ -32,12 +56,6 @@ Choose the dense checkpoint for the best bounded-clip quality and the streaming 
 | Output | up to 720p (704×1280) @ 16 fps, minute-scale |
 
 For architecture and training details, see the [SANA-WM paper](https://arxiv.org/abs/2605.15178) and [model card](https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional) (Apache-2.0).
-
-## 2. Installation
-
-SGLang-diffusion offers multiple installation methods depending on your hardware platform. Please refer to the [SGLang Diffusion installation guide](../../../docs/sglang-diffusion/installation).
-
-SANA-WM adds the `SanaWMTransformer3DModel` + GDN kernels, the `SanaWMTwoStagePipeline` (dense bidirectional + chunk-causal streaming), and the `SanaWMRealtimePipeline` with the `/v1/realtime_video` WebSocket router. Use `sglang serve` to launch the diffusion server.
 
 ## 3. Model Setup
 
@@ -487,3 +505,9 @@ At WebSocket `init` the realtime adapter fills SANA-WM defaults that differ from
 <Note>
 `guidance_scale` applies to the dense path (§4) only; the distilled streaming path uses `streaming_cfg_scale` (default `1.0`, i.e. no CFG) so a `guidance_scale` override never accidentally enables CFG on the streaming stage. `denoising_step_list = (1000, 960, 889, 727, 0)` is the official 4-step streaming schedule (it must end in 0).
 </Note>
+
+## 10. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

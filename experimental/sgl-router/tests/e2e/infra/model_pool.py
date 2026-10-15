@@ -4,7 +4,8 @@ Adapted from SMG's e2e_test/infra/model_pool.py — the 1200-line original
 manages a pool of long-lived workers across many tests; here we only
 need a thin wrapper around ``sglang.launch_server`` that:
 
-  - allocates GPU(s) for the worker (via ``CUDA_VISIBLE_DEVICES``),
+  - binds the worker to GPU(s) inside this process's own
+    ``CUDA_VISIBLE_DEVICES`` allotment,
   - spawns ``python3 -m sglang.launch_server`` with the right args,
   - waits for ``/health`` to come up,
   - optionally injects ``--kv-events-config`` so the worker exposes
@@ -14,6 +15,10 @@ A test owns a ``ModelInstance`` for its duration; teardown shuts the
 worker down. No cross-test pooling — the acceptance tests are slow
 enough already (model load dominates) that pooling complexity wasn't
 worth porting.
+
+It also owns the logical-to-physical device mapping
+(:func:`visible_devices`, :func:`resolve_device_ids`), which ``conftest.py``
+uses to size the GPU allocator and to pin the session-scoped server.
 """
 
 from __future__ import annotations
@@ -46,6 +51,71 @@ def _wait_for_process_group_exit(pgid: int, timeout: float) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.1)
+
+
+def _is_selectable_device(token: str) -> bool:
+    """Whether CUDA would accept *token* as a device to expose."""
+    if token.lstrip("-").isdigit():
+        return not token.startswith("-")
+    return token.startswith(("GPU-", "MIG-"))
+
+
+def visible_devices() -> list[str] | None:
+    """The devices this process owns, as ``CUDA_VISIBLE_DEVICES`` spells them.
+
+    ``None`` means the variable is unset, so CUDA exposes every GPU and this
+    harness falls back to treating the whole box as available. Entries are kept
+    verbatim (indices, ``GPU-<uuid>``, ``MIG-<uuid>``) because
+    :func:`resolve_device_ids` needs only their position.
+
+    Parsing follows CUDA's own rule: enumeration stops at the first entry that
+    is invalid or already seen, so ``0,-1,1`` exposes one device, ``0,0``
+    exposes one, and ``-1`` (the idiom for hiding every GPU) exposes none.
+    Counting raw tokens instead would publish a logical index that resolves
+    onto a card another worker already holds, or onto no card at all.
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return None
+    devices: list[str] = []
+    for token in (token.strip() for token in raw.split(",")):
+        if not _is_selectable_device(token) or token in devices:
+            break
+        devices.append(token)
+    if len(devices) != len([token for token in raw.split(",") if token.strip()]):
+        logger.warning(
+            "CUDA_VISIBLE_DEVICES=%r exposes only %d device(s): CUDA stops "
+            "enumerating at the first invalid or repeated entry",
+            raw,
+            len(devices),
+        )
+    return devices
+
+
+def resolve_device_ids(gpu_ids: list[int]) -> list[str]:
+    """Map logical GPU indices onto the devices this process actually owns.
+
+    CI gives each runner a slice of a shared 8-GPU box through
+    ``CUDA_VISIBLE_DEVICES`` (e.g. ``2,3``), and a child's
+    ``CUDA_VISIBLE_DEVICES`` is absolute rather than relative to the parent's:
+    writing a bare ``1`` there puts the worker on physical GPU 1 — a card
+    another job owns, whose memory this job cannot see, cannot clean up before
+    the run, and will lose a race against. Index into the inherited list
+    instead. An index past the end of the allotment raises here rather than
+    silently escaping it.
+    """
+    visible = visible_devices()
+    if visible is None:
+        return [str(gpu) for gpu in gpu_ids]
+    resolved: list[str] = []
+    for gpu in gpu_ids:
+        if not 0 <= gpu < len(visible):
+            raise ValueError(
+                f"logical GPU {gpu} is outside this process's allotment of "
+                f"{len(visible)}: CUDA_VISIBLE_DEVICES={','.join(visible)}"
+            )
+        resolved.append(visible[gpu])
+    return resolved
 
 
 def _get_open_port() -> int:
@@ -84,6 +154,8 @@ class ModelInstance:
     port: int
     process: subprocess.Popen
     model_id: str
+    # Logical, as passed to spawn_worker; the child's CUDA_VISIBLE_DEVICES
+    # holds the resolved devices. Callers hand these back to the allocator.
     gpu_ids: list[int] = field(default_factory=list)
     kv_events_endpoint: str | None = None
     log_path: Path | None = None
@@ -150,11 +222,12 @@ def spawn_worker(
 
     Args:
         model_id: Key into :data:`model_specs.MODEL_SPECS`.
-        gpu_ids: Concrete GPU indices to bind via ``CUDA_VISIBLE_DEVICES``.
+        gpu_ids: Logical GPU indices, resolved against this process's own
+            ``CUDA_VISIBLE_DEVICES`` allotment by :func:`resolve_device_ids`.
         port: HTTP port; auto-assigned if None.
         enable_kv_events: If True, inject ``--kv-events-config`` with a
             ZMQ publisher so the router's introspection picks up the
-            kv_events block from ``/server_info`` (Patch 1).
+            kv_events block from ``/server_info``.
         kv_events_port: ZMQ publisher port. Auto-assigned if None and
             ``enable_kv_events`` is True.
         disagg_mode: "prefill" or "decode" for PD-disagg launches; passed
@@ -203,12 +276,14 @@ def spawn_worker(
         cmd.extend(extra_args)
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+    devices = resolve_device_ids(gpu_ids)
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
     logger.info(
-        "spawning sglang worker: model=%s port=%d gpus=%s disagg=%s",
+        "spawning sglang worker: model=%s port=%d gpus=%s devices=%s disagg=%s",
         model_id,
         port,
         gpu_ids,
+        env["CUDA_VISIBLE_DEVICES"],
         disagg_mode,
     )
 

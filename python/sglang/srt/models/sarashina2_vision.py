@@ -14,6 +14,7 @@
 """Inference-only Sarashina2Vision model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -107,7 +108,7 @@ class Sarashina2VisionForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input tokens with multimodal data hashes for RadixAttention."""
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)

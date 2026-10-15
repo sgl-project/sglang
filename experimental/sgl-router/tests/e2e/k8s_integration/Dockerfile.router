@@ -18,8 +18,10 @@ RUN apt-get update \
 
 WORKDIR /build
 
-# Copy just the sgl-router crate (context is the repo root)
+# Copy the sgl-router crate and its sglang-processor path dependency (context is the repo root)
 COPY experimental/sgl-router /build/experimental/sgl-router
+COPY rust/Cargo.toml /build/rust/Cargo.toml
+COPY rust/sglang-processor /build/rust/sglang-processor
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

@@ -61,6 +61,9 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
+    # skips cached-row compression for replay rows folded into the extend.
+    folds_encoder_swa_replay: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set
@@ -84,6 +87,12 @@ class AttentionBackend(ABC):
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
     kv_index_translator = None
+
+    def get_fused_kv_write_buffers(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return token-major K/V buffers and physical slots for a fused writer."""
+        return None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
@@ -152,6 +161,9 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+    # Most requests one replay of that captured metadata can carry (None: no
+    # bound). Fixed at init: the dp-attention replay vote checks it too.
+    prefill_cuda_graph_max_batch_size: Optional[int] = None
 
     # Backends may keep MIXED prefill eager under DP attention when replaying
     # the EXTEND graph is a known serving-performance regression.
@@ -159,6 +171,7 @@ class AttentionBackend(ABC):
 
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False
+    dllm_attention = None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
@@ -201,6 +214,9 @@ class AttentionBackend(ABC):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        return
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,

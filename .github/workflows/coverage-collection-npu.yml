@@ -1,0 +1,27 @@
+# Coverage data collection pipeline for the NPU precision test selection.
+# Delegates to pr-test-npu.yml with coverage_mode=true, which switches:
+#   - Runners to the coverage pool (shared /root/.cache with setup-covstub)
+#   - use_coverage_runner=true on all test jobs
+#   - Skips pr-gate, multimodal-gen, recommend, analyze
+#   - Runs setup-covstub to assemble coverage data and publish it to the
+#     shared disk at a fixed path (/root/.cache/tests/precise-test/coverage)
+# pr-test-npu-finish is the final gate in the called workflow.
+#
+# Manually triggered only (workflow_dispatch): PRs run the standard
+# pr-test-npu.yml instead; this pipeline builds the full coverage baseline
+# on demand.
+name: Coverage Collection (NPU)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: npu-coverage-collection-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    uses: ./.github/workflows/pr-test-npu.yml
+    with:
+      coverage_mode: true
+    secrets: inherit
