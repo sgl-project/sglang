@@ -113,6 +113,7 @@ class DllmManager:
                 inflight=True,
                 health_check=True,
                 holds_kv=True,
+                pins_lora=True,
                 counts_running=True,
             ),
             # Started requests between two of their blocks: the running
@@ -125,6 +126,7 @@ class DllmManager:
                 abort=self.abort_between_blocks,
                 health_check=True,
                 holds_kv=True,
+                pins_lora=True,
                 counts_running=True,
             ),
         ]

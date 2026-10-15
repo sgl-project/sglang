@@ -673,6 +673,7 @@ class HiSparseCoordinator:
                 reqs=self.staging,
                 inflight=True,
                 holds_kv=True,
+                pins_lora=True,
                 counts_running=True,
             )
         ]

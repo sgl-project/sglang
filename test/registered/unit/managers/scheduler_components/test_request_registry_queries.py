@@ -1,4 +1,5 @@
-"""The registry's cross-list queries in each mode: the running requests."""
+"""The registry's cross-list queries in each mode: the running requests and
+the adapters in use."""
 
 import unittest
 from types import SimpleNamespace
@@ -49,6 +50,24 @@ class TestRunningRequests(CustomTestCase):
                 req = _req("r")
                 registry = make_request_registry(mode_owners=ModeOwners(**owners(req)))
                 self.assertEqual(registry.running_reqs(), [req])
+
+
+# The lists of launched requests that rejoin a step later, whose adapters
+# admission must keep.
+_STAGED = {
+    "dllm_staging": lambda req: dict(dllm=_dllm(staging=[req])),
+    "dllm_between_blocks": lambda req: dict(dllm=_dllm(between_blocks=[req])),
+    "hisparse_staging": lambda req: dict(hisparse_coordinator=_hisparse([req])),
+}
+
+
+class TestLoraIdsInUse(CustomTestCase):
+    def test_staged_requests_keep_their_adapters(self):
+        for name, owners in _STAGED.items():
+            with self.subTest(name):
+                req = _req("r", lora_id="adapter")
+                registry = make_request_registry(mode_owners=ModeOwners(**owners(req)))
+                self.assertEqual(registry.lora_ids_in_use(), {"adapter"})
 
 
 if __name__ == "__main__":
