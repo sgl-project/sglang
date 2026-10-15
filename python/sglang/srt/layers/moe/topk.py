@@ -900,10 +900,8 @@ class TopK(BaseFusedOp):
         self.topk_config.torch_native = True
         # [NOTE] XPU device support for topk kernels
         #   - support 'topk_softmax' and 'topk_sigmoid'
-        #   - support up to 8 top-k and 256 experts
-        self.topk_config.torch_native = not (
-            self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
-        )
+        #   - support up to 512 experts
+        self.topk_config.torch_native = not router_logits.shape[1] <= 512
 
         return select_experts(
             hidden_states=hidden_states,
