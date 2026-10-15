@@ -1101,8 +1101,8 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        # extra_buffer: commit_kda_replayssm_spec also folds the interval-crossing
-        # step into the track slot, so `temporal` stays current without a flush.
+        # extra_buffer: the same fold also snapshots the interval-crossing step
+        # into the track slot, so `temporal` stays current without a flush.
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
