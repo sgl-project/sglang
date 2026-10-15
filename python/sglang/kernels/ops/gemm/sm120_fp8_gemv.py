@@ -21,16 +21,18 @@ _MAX_K = 32768  # static smem limit: K bytes <= 48KB with margin
 _MAX_N = 32768  # very large N is served well by cuBLAS already
 
 
-def _config(n: int) -> tuple[int, int, int]:
+def _config(n: int, k: int) -> tuple[int, int, int]:
     """(rows_per_warp, k_unroll, num_warps)."""
     if n >= 8192:
         return (2, 1, 8)
+    if n <= 6144 and k <= 6144:
+        return (4, 1, 8)
     return (1, 1, 8)
 
 
 @cache_once
 def _jit_sm120_fp8_gemv_module(n: int, k: int) -> Module:
-    rows, unroll, warps = _config(n)
+    rows, unroll, warps = _config(n, k)
     args = make_cpp_args(n, k, rows, unroll, warps)
     return load_jit(
         "sm120_fp8_gemv",
