@@ -52,11 +52,16 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
         w_kc=torch.randn(heads, rank, rank),
         rotary_emb=rotary,
         indexer=Mock(return_value=indices),
-        _can_fuse_bmm_into_attention=lambda batch: False,
+        current_attention_backend="dsa",
         is_dcp_q_replicate_phase=lambda batch: False,
         _fuse_rope_for_trtllm_mla=lambda batch: False,
     )
-    for name in ("_split_q_nope_pe", "should_run_indexer"):
+    for name in (
+        "_split_q_nope_pe",
+        "should_run_indexer",
+        "_can_fuse_bmm_into_attention",
+        "_make_mla_bmm_fusion_plan",
+    ):
         setattr(attn, name, MethodType(getattr(MLA, name), attn))
     attn.run_mla_indexer = Mock(wraps=MethodType(MLA.run_mla_indexer, attn))
     prepared = []
@@ -76,6 +81,7 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
         lambda: SimpleNamespace(fetch_qkv_latent=lambda: latent),
     )
     monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
+    monkeypatch.setattr(forward_mla, "is_graph_dsa_split_op_surface", lambda _: True)
     monkeypatch.setattr(forward_mla, "_SGLANG_EXPERIMENTAL_LORA_OPTI", False)
     monkeypatch.setattr(forward_mla, "_ENABLE_DSA_Q8KV8_BORN_FP8_Q", False)
     monkeypatch.setattr(
@@ -108,6 +114,20 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
     torch.testing.assert_close(q_pe, query[..., rank:] + 10)
     torch.testing.assert_close(k, latent[:, rank : 2 * rank].unsqueeze(1) + 2)
     torch.testing.assert_close(k_pe, latent[:, 2 * rank :].unsqueeze(1) + 20)
+
+
+def test_default_prepare_keeps_bmm_attention_fusion(monkeypatch):
+    attn = SimpleNamespace(
+        dcp_size=1,
+        use_dsa=True,
+        use_deep_gemm_bmm=False,
+        w_kc=torch.empty(2, 4, 4),
+        current_attention_backend="dsa",
+    )
+    attn.prepare_mla_qkv = MethodType(MLA.prepare_mla_qkv, attn)
+    monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
+    monkeypatch.setattr(forward_mla, "is_graph_dsa_split_op_surface", lambda _: True)
+    assert MLA._can_fuse_bmm_into_attention(attn, SimpleNamespace())
 
 
 @pytest.mark.parametrize("piecewise", [False, True])

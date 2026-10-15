@@ -171,6 +171,12 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
+        # Custom preparation needs the absorbed query before attention runs.
+        if (
+            getattr(self.prepare_mla_qkv, "__func__", None)
+            is not DeepseekMLAForwardMixin.prepare_mla_qkv
+        ):
+            return False
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return False
         if self.dcp_size > 1:

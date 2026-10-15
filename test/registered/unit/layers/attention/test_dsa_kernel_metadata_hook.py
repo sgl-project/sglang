@@ -1,7 +1,7 @@
 """Custom DSA metadata must observe the current SRT metadata on every forward."""
 
 import sys
-from types import SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -90,6 +90,139 @@ def test_eager_metadata_hook_sees_current_request_page_table(monkeypatch):
         torch.testing.assert_close(metadata.page_table_1, page_table[requests, :3])
     assert len(seen) == 2
     assert seen[0][1] is not seen[1][1]
+
+
+@pytest.mark.parametrize("path", ["capture", "loop", "kpool", "fused", "fallback"])
+def test_multistep_refreshes_custom_metadata_for_every_child(monkeypatch, path):
+    multi = dsa_backend.DeepseekSparseAttnMultiStepBackend
+    children = []
+    seen = []
+    calls = []
+    count = 4 if path in ("fused", "fallback") else 2
+
+    def metadata():
+        return SimpleNamespace(
+            **{
+                name: None
+                for name in (
+                    "cache_seqlens_int32",
+                    "cu_seqlens_k",
+                    "page_table_1",
+                    "dsa_cache_seqlens_int32",
+                    "dsa_cu_seqlens_k",
+                    "real_page_table",
+                )
+            }
+        )
+
+    for index in range(count):
+        child = SimpleNamespace(
+            experimental_kpool_metadata_fusion=path == "kpool",
+            decode_cuda_graph_metadata={size: metadata() for size in (3, 1, 0)},
+            set_dsa_prefill_impl=lambda **kwargs: None,
+        )
+
+        def update(md, precomputed, mode, child=child):
+            calls.append("fused")
+            md.requests = precomputed.requests
+
+        def replay(*, bs, precomputed, forward_mode, child=child):
+            calls.append("replay")
+            child.forward_metadata = SimpleNamespace(requests=precomputed.requests)
+
+        def sibling(*, src_backend, child=child, **kwargs):
+            calls.append("sibling")
+            child.forward_metadata = SimpleNamespace(
+                requests=src_backend.forward_metadata.requests
+            )
+
+        def capture(*, req_pool_indices, child=child, **kwargs):
+            child.forward_metadata = SimpleNamespace(requests=req_pool_indices)
+
+        def hook(batch, child=child, index=index):
+            seen.append((index, batch, child.forward_metadata.requests.clone()))
+
+        child._update_kpool_metadata_from_precomputed = update
+        child.init_forward_metadata_replay_cuda_graph_from_precomputed = replay
+        child._copy_replay_metadata_from_sibling = sibling
+        child._apply_cuda_graph_metadata = capture
+        child.init_forward_metadata_out_graph = MethodType(
+            DSA.init_forward_metadata_out_graph, child
+        )
+        child.init_kernel_metadata = hook
+        children.append(child)
+
+    def precompute(*, req_pool_indices, **kwargs):
+        return SimpleNamespace(
+            requests=req_pool_indices,
+            **{
+                name: None
+                for name in (
+                    "flashmla_metadata",
+                    "cache_seqlens",
+                    "cu_seqlens_k",
+                    "page_indices",
+                    "dsa_cache_seqlens",
+                    "dsa_cu_seqlens_k",
+                    "real_page_table",
+                    "max_len",
+                    "seqlens_expanded_size",
+                )
+            },
+        )
+
+    children[0]._precompute_replay_metadata = precompute
+    module = ModuleType("sglang.kernels.ops.attention.fused_metadata_copy")
+
+    def fused_copy(*args):
+        if path == "fallback":
+            raise RuntimeError("simulated unavailable fused copy")
+
+    module.fused_metadata_copy_multi_cuda = fused_copy
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    backend = multi.__new__(multi)
+    backend.attn_backends = children
+    backend.speculative_num_steps = count + 1
+    for requests in ([2, 0, 1], [1], []):
+        size = len(requests)
+        lengths = torch.full((size,), 4, dtype=torch.int32)
+        batch = SimpleNamespace(
+            batch_size=size,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_pool_indices=torch.tensor(requests, dtype=torch.int64),
+            seq_lens=lengths,
+            seq_lens_cpu=lengths,
+            seq_lens_sum=4 * size,
+            spec_info=None,
+            out_cache_loc=torch.arange(size),
+        )
+        start = len(seen)
+        multi.init_forward_metadata_out_graph(
+            backend, batch, in_capture=path == "capture"
+        )
+        assert len(seen) == start + count
+        for index, (observed_index, view, observed_requests) in enumerate(seen[start:]):
+            assert observed_index == index
+            assert view.forward_mode == ForwardMode.DECODE
+            assert view.actual_forward_mode == batch.forward_mode
+            assert view.out_cache_loc is batch.out_cache_loc
+            torch.testing.assert_close(observed_requests, batch.req_pool_indices)
+    if path == "kpool":
+        assert calls.count("sibling") == 3
+    elif path == "fused":
+        assert calls.count("fused") == 9
+        assert calls.count("replay") == 3
+    elif path != "capture":
+        assert calls.count("replay") == 3 * count
+
+    def fail_hook(batch):
+        raise ValueError("custom metadata failed")
+
+    children[0].init_kernel_metadata = fail_hook
+    with pytest.raises(ValueError, match="custom metadata failed"):
+        multi.init_forward_metadata_out_graph(
+            backend, batch, in_capture=path == "capture"
+        )
 
 
 if __name__ == "__main__":
