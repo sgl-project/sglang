@@ -422,8 +422,10 @@ def compute_spec_logprobs(
             max_accept,
             dim=0,
         )
+        # Keep the logits dtype like the sampler's in-place div_; fp32 temperatures
+        # would otherwise promote bf16 true-on-policy logits to fp32.
         gathered_logprobs = torch.nn.functional.log_softmax(
-            gathered_logits / temperatures, dim=-1
+            (gathered_logits / temperatures).to(gathered_logits.dtype), dim=-1
         )
     gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
 
