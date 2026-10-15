@@ -1,5 +1,6 @@
-"""The PD consensus around each PP ring slot: a rank past the first agrees
-with the ids the previous rank sent, and the owner applies the agreed ids."""
+"""The PD owners around each PP ring slot: a rank past the first agrees with
+the ids the previous rank sent, the owner applies the agreed ids, and a chunk
+sent before its commit waits for its forward."""
 
 import unittest
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ from sglang.srt.disaggregation.pd_pp_consensus import (
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -157,6 +158,40 @@ class TestDisaggPrefillRing(CustomTestCase):
 
         ring.send_ids()
         self.assertEqual(channel.sent, [["b"]])
+
+
+class TestPPChunkSend(CustomTestCase):
+    """A PP ring slot sends the chunk the previous slot launched before that
+    chunk's commit; the transfer waits for the forward that writes it."""
+
+    def _send_chunk(self, pp_size):
+        enter_scope(self, published_topology(pp_size=pp_size))
+        sends = []
+        forward_done = object()
+        sender = SimpleNamespace(_early_send_wait_event=None)
+        owner = prefill_owner_shell(
+            enable_overlap=False,
+            forward_stream=SimpleNamespace(record_event=lambda: forward_done),
+            checkpoint=Mock(),
+            check_bootstrap=lambda req: True,
+            send_kv_chunk=lambda req: sends.append(sender._early_send_wait_event),
+        )
+        req = SimpleNamespace(rid="chunked", extend_end=8, prefix_len=4)
+        owner.kv_senders[req.rid] = sender
+
+        chunked_req, _ = owner.process_prefill_chunk(req, [], [])
+
+        self.assertIs(chunked_req, req)
+        return sends, forward_done
+
+    def test_a_pp_chunk_send_waits_for_its_forward(self):
+        sends, forward_done = self._send_chunk(pp_size=2)
+        self.assertEqual(sends, [forward_done])
+
+    def test_a_flat_chunk_send_follows_its_commit(self):
+        # Without PP the step committed before this schedule: nothing to wait on.
+        sends, _ = self._send_chunk(pp_size=1)
+        self.assertEqual(sends, [None])
 
 
 if __name__ == "__main__":

@@ -1449,6 +1449,13 @@ class DisaggPrefill:
             # else: still bootstrapping, keep computing without sending
         elif not self.enable_overlap:
             # With overlap, the commit of the chunk sends it, once its KV is ready.
+            if get_parallel().pp_size > 1:
+                # A PP ring slot sends the chunk the previous slot launched,
+                # before its commit: the transfer waits for the forwards
+                # launched so far, that chunk's last among them.
+                self.kv_senders[
+                    req.rid
+                ]._early_send_wait_event = self.forward_stream.record_event()
             self.send_kv_chunk(req)
         return chunked_req, waiting
 
