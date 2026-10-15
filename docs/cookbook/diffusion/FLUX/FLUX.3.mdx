@@ -15,10 +15,11 @@ import { config } from "/src/snippets/configs/black-forest-labs/flux3.jsx";
 ## 1. Quick start
 
 Use a [SGLang Diffusion Docker environment](/docs/sglang-diffusion/installation).
-Until your image contains this integration, install the model-support PR inside it:
+Until your image contains this integration and its serving fixes, install the
+follow-up PR (which includes the model-support PR) inside it:
 
 ```bash
-pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@refs/pull/44418/head#subdirectory=python'
+pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@refs/pull/44493/head#subdirectory=python'
 ```
 
 <Deployment config={config} />
@@ -139,7 +140,8 @@ check, including repeatability and exact restoration after unloading; this does
 not validate every community adapter. For quantized deployments requiring LoRA,
 pass `--lora-path` at startup to select the generic quantized layout. Attaching
 LoRA after PrimsTS weight preparation is rejected before replacing any layers.
-Quantized LoRA combinations still need separate end-to-end validation.
+FP8R startup adapters also have a synthetic rank-4 generation check on GB300;
+this does not establish compatibility with arbitrary quantized community adapters.
 
 ## 4. Multi-GPU and memory
 
@@ -154,6 +156,12 @@ For example, two-GPU TP uses `--num-gpus 2 --tp-size 2`; two-GPU Ulysses
 uses `--num-gpus 2 --tp-size 1 --ulysses-degree 2`. Base also permits CFG
 parallelism; distilled checkpoints have no CFG branch to parallelize.
 More GPUs do not guarantee lower latency, particularly over PCIe.
+
+Ulysses inherits all-to-all streaming through the shared attention layer.
+Leave its pipeline-group policy automatic; short sequences need not benefit.
+TP-only deployments do not use this path. Encoding-while-decoding overlaps
+video-frame decoding with video-file encoding, so it does not apply to this
+still-image pipeline.
 
 <Note>
 Under sequence parallelism every rank holds the full DiT, so combining it with
@@ -288,12 +296,42 @@ batching rather than assuming a batch-1 recipe fits on a 32 GB card at batch 2.
 ## 8. Validation boundaries
 
 The release BF16 and FP8R checkpoints have single-GB300/H200 generation checks;
-NVFP4 has GB300 checks. Base BF16 also has an RTX 5090 check. Each uses eager
+NVFP4 has GB300 and RTX 5090 checks. RTX 5090 also has Base BF16 and both
+checkpoints' FP8R and Cache-DiT checks. Single-GPU measurements use eager
 execution, all components resident, batch 1, 1024x1024 T2I and I2I, two
 prompts/seeds and repeated requests. Base uses 50 steps and distilled uses 16.
 Repeated requests matched pixel-for-pixel within each tested configuration.
 This does not establish official-reference parity or validate every combination
 of hardware, parallelism, batching and optional features in the picker.
+
+### Multi-GPU measurements
+
+Base BF16, 50 steps, CFG 3.5, batch 1 and `quality="exact"`. These are warmed
+localhost HTTP medians through PNG decoding, excluding loading and warmup;
+two prompts/seeds and two timed rounds per prompt. Software: PyTorch
+2.14.1+cu130, Transformers 5.19.0, FlashInfer 0.7.1. Both runs use checkpoint
+`d8acde427a698bdb98b5c1c941c60fa4c97e9f28`. The H200 run uses FA3 and
+NVLink; the RTX 4090 run uses Torch SDPA over PCIe without CUDA peer access.
+
+| GPUs | Topology | T2I 1024x1024 | I2I, 1 MP reference/output |
+| --- | --- | --- | --- |
+| 2x H200 | TP2 | 4.27 s | Not measured |
+| 2x H200 | Ulysses 2, streaming auto | 4.68 s | Not measured |
+| 4x RTX 4090 | TP4 | 16.97 s | 32.61 s |
+| 4x RTX 4090 | TP2 x Ulysses 2 | 16.28 s | 32.63 s |
+
+The picker keeps TP as its multi-GPU starting point, not a guarantee that TP
+always wins. A hybrid topology can help on PCIe; validate it on your own
+interconnect. H100, B200 and other unmeasured resource shapes are extrapolated
+starting points and are not labelled verified.
+
+On the same two H200s, Ulysses streaming reduced 2048x2048 T2I from 24.00 to
+22.87 s and editing a 2048x2048 reference into a 1024x1024 output from 31.01
+to 29.54 s. Streamed and non-streamed outputs matched pixel-for-pixel in these
+samples, with no quantization or caching. At 1024x1024, automatic dispatch
+selected no streaming groups and gave no speedup. TP and SP themselves are
+not bit-identical: sample SSIM was 0.9890-0.9985. None of these comparisons
+establishes which path is closer to an official reference.
 
 ### Single-GPU measurements
 

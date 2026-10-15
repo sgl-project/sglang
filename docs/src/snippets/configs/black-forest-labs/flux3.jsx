@@ -9,6 +9,22 @@ const hardware = [
   { id: "rtx6000pro", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
 ];
 const hardwareLabels = { rtx5090: "RTX 5090", rtx6000pro: "RTX PRO 6000", h100: "H100", h200: "H200", b200: "B200", b300: "B300", gb200: "GB200", gb300: "GB300" };
+const measuredProfiles = [
+  ...["gb300", "h200"].flatMap((hw) => ["base", "distilled"].flatMap((variant) =>
+    (hw === "gb300" ? ["bf16", "fp8r", "nvfp4"] : ["bf16", "fp8r"])
+      .map((quant) => ({ hw, variant, quant, attention: "fa" })))),
+  ...["base", "distilled"].flatMap((variant) =>
+    (variant === "base" ? ["bf16", "fp8r", "nvfp4"] : ["fp8r", "nvfp4"])
+      .map((quant) => ({ hw: "rtx5090", variant, quant, attention: "sdpa" }))),
+  ...[{ tp_size: 2, ulysses_degree: 1 }, { tp_size: 1, ulysses_degree: 2 }]
+    .map((topology) => ({ hw: "h200", variant: "base", quant: "bf16",
+      attention: "fa", mode: "t2i", gpus_per_node: 2, ...topology })),
+].map((recipe, index) => ({
+  id: `measured-${index}`, nodes: 1, gpus_per_node: 1,
+  tp_size: 1, ulysses_degree: 1, ring_degree: 1,
+  placement: "resident", execution: "eager", quality: "exact",
+  batch_size: 1, outputs: 1, default: index === 0, ...recipe,
+}));
 
 return {
   modelName: "FLUX.3",
@@ -181,13 +197,8 @@ return {
         nodes: { min: 1, max: 1 },
         gpus_per_node: { min: 1, max: 8 },
       },
-      verifiedRecipes: [{
-        id: "gb300-base-bf16", hw: "gb300", nodes: 1,
-        gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1,
-        variant: "base", quant: "bf16", placement: "resident", attention: "fa",
-        execution: "eager", quality: "exact", batch_size: 1, outputs: 1,
-        default: true,
-      }],
+      verifiedRecipes: measuredProfiles.filter((recipe) =>
+        recipe.variant === "base" && recipe.quant === "bf16" && recipe.ulysses_degree === 1),
       autoTopology: (s) => ({
         tp_size: Number(s.gpus_per_node) || 1,
         ulysses_degree: 1,
@@ -233,17 +244,14 @@ return {
       if (Number(s.batch_size) > 1) {
         parallel.push(`--batching-max-size ${Number(s.batch_size)}`, `--batching-delay-ms ${Number(s.batch_delay) || 0}`);
       }
-      const testedProfile = (["gb300", "h200"].includes(s.hw) && s.attention === "fa"
-          && ["base", "distilled"].includes(s.variant)
-          && (s.quant === "bf16" || s.quality === "exact")
-          && (s.hw === "gb300" || s.quant !== "nvfp4"))
-        || (s.hw === "rtx5090" && s.attention === "sdpa"
-          && s.variant === "base" && s.quant === "bf16");
-      const verified = testedProfile && gpus === 1
-        && s.placement === "resident"
-        && s.execution === "eager" && ["exact", "lossless"].includes(s.quality)
-        && Number(s.batch_size) === 1 && Number(s.outputs) === 1;
+      const selected = { ...s, ...topology };
+      const verified = measuredProfiles.some((recipe) =>
+        Object.entries(recipe).every(([key, value]) =>
+          ["id", "default"].includes(key) || String(selected[key]) === String(value)));
       const warnings = verified ? [] : ["This exact hardware, checkpoint and topology combination is not yet end-to-end verified."];
+      if (verified && s.mode === "i2i") {
+        warnings.push("Verified recipes cover 1 MP references and output, batch 1; larger inputs require separate capacity validation.");
+      }
       if (s.hw === "rtx5090" && s.placement === "resident" && Number(s.batch_size) > 1) {
         warnings.push("Full-resolution batching needs additional activation memory. Use offload or batch 1 if the resident batch does not fit.");
       }
