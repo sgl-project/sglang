@@ -109,7 +109,7 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
-    if x.is_cuda and not _UNCACHED_STAGING:
+    if x.is_cuda and not _UNCACHED_STAGING and not torch.compiler.is_compiling():
         from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
             IPC_A2A_MULTI,
             ipc_a2a_multi_ready,
@@ -169,7 +169,9 @@ def _ipc_ready_group():
         ipc_a2a_ready,
     )
 
-    if _UNCACHED_STAGING:
+    # The transport's custom-class handles cannot be traced; a compiled graph
+    # keeps the NCCL all-to-all (traceable) instead of breaking here.
+    if _UNCACHED_STAGING or torch.compiler.is_compiling():
         return None
     group = get_sp_group().ulysses_group
     return group if ipc_a2a_ready(group) else None

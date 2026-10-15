@@ -1191,6 +1191,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name=self._cache_dit_dual_model_name(),
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=has_separate_cfg,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d, %d)",
@@ -2068,6 +2069,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             module.disable_offload()
         # clear the list for avoid overhead during real request
         self._offloaded_dit_modules_for_compile.clear()
+        # The warmup traced the offload hooks, whose graph breaks inside the
+        # block loop make Dynamo skip the DiT frame for good. Forget it, so
+        # this request compiles whole graphs from the cached autotune results.
+        torch._dynamo.reset()
         yield
 
     def forward(
