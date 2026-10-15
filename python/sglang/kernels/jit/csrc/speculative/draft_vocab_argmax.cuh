@@ -84,19 +84,20 @@ struct VocabArgmaxPackParams {
   bf16_t* payload;                   // [H + 8]
   float* part_val;                   // [kBlocks]
   int32_t* part_idx;                 // [kBlocks]
-  uint32_t* counter;                 // [1], zero between launches
+  uint32_t* counter;                 // [M], zero between launches
   int32_t vocab;                     // V_local, multiple of 8
   int32_t vocab_start;               // global id of local row 0
 };
 
 struct VocabArgmaxSelectParams {
-  const bf16_t* gathered;  // [world, H + 8]
-  int64_t* topk_index;     // [1]
-  float* topk_p;           // [1]
-  int64_t* draft_tokens;   // row 0 of the draft chain, or null
-  int64_t* positions;      // [1]
-  bf16_t* next_embeds;     // [H]
+  const bf16_t* gathered;  // [M, world * (H + 8)]
+  int64_t* topk_index;     // [M]
+  float* topk_p;           // [M]
+  int64_t* draft_tokens;   // [M, S] draft chain, or null
+  int64_t* positions;      // [M]
+  bf16_t* next_embeds;     // [M, H]
   int32_t draft_column;
+  int32_t draft_stride;
 };
 
 /**
@@ -114,13 +115,19 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
 
   PDLWaitPrimary<kUsePDL>();
 
+  const int64_t m = blockIdx.y;
+  const bf16_t* logits = p.logits + m * p.vocab;
+  float* part_val = p.part_val + m * kBlocks;
+  int32_t* part_idx = p.part_idx + m * kBlocks;
+  uint32_t* counter = p.counter + m;
+  bf16_t* payload = p.payload + m * (kH + vocab_argmax::kMetaElems);
   float best = -1e30f;
   int32_t bidx = 0x7fffffff;
   const int nvec = p.vocab / 8;
   for (int v = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x); v < nvec;
        v += kBlocks * kThreads) {
     vec_t x;
-    x.load(p.logits, v);
+    x.load(logits, v);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       float f = cast<fp32_t>(x[j]);
@@ -134,10 +141,10 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
   }
   vocab_argmax::block_argmax<kThreads>(best, bidx, s_v, s_i);
   if (threadIdx.x == 0) {
-    p.part_val[blockIdx.x] = best;
-    p.part_idx[blockIdx.x] = bidx;
+    part_val[blockIdx.x] = best;
+    part_idx[blockIdx.x] = bidx;
     __threadfence();
-    s_last = atomicAdd(p.counter, 1u) == kBlocks - 1;
+    s_last = atomicAdd(counter, 1u) == kBlocks - 1;
   }
   __syncthreads();
   if (!s_last) return;
@@ -146,14 +153,14 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
   float v = -1e30f;
   int32_t i = 0x7fffffff;
   if (threadIdx.x < kBlocks) {
-    v = __ldcg(p.part_val + threadIdx.x);
-    i = __ldcg(p.part_idx + threadIdx.x);
+    v = __ldcg(part_val + threadIdx.x);
+    i = __ldcg(part_idx + threadIdx.x);
   }
   __syncthreads();
   vocab_argmax::block_argmax<kThreads>(v, i, s_v, s_i);
 
   const auto* row = reinterpret_cast<const uint4*>(p.embed + static_cast<int64_t>(i) * kH);
-  auto* dst = reinterpret_cast<uint4*>(p.payload);
+  auto* dst = reinterpret_cast<uint4*>(payload);
   for (int c = static_cast<int>(threadIdx.x); c < kH / 8; c += kThreads) {
     uint4 r = row[c];
     r.x = vocab_argmax::clear_negative_zero(r.x);
@@ -163,28 +170,30 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
     dst[c] = r;
   }
   if (threadIdx.x == 0) {
-    auto* meta = reinterpret_cast<int32_t*>(p.payload + kH);
+    auto* meta = reinterpret_cast<int32_t*>(payload + kH);
     meta[0] = __float_as_int(v);
     meta[1] = p.vocab_start + i;
     meta[2] = 0;
     meta[3] = 0;
-    *p.counter = 0u;
+    *counter = 0u;
   }
 }
 
-/** \brief Pick the winner among the gathered rows and publish it. One CTA. */
+/** \brief Pick the winner among the gathered rows and publish it. One CTA per batch row. */
 template <int kH, int kWorld, int kThreads, bool kUsePDL>
 __global__ void __launch_bounds__(kThreads)
     vocab_argmax_select_kernel(const VocabArgmaxSelectParams __grid_constant__ p) {
   constexpr int kRow = kH + vocab_argmax::kMetaElems;
   device::PDLWaitPrimary<kUsePDL>();
+  const int64_t m = blockIdx.x;
+  const bf16_t* gathered = p.gathered + m * kWorld * kRow;
   int win = 0;
-  const auto* meta0 = reinterpret_cast<const int32_t*>(p.gathered + kH);
+  const auto* meta0 = reinterpret_cast<const int32_t*>(gathered + kH);
   float bv = __int_as_float(meta0[0]);
   int32_t bi = meta0[1];
 #pragma unroll
   for (int r = 1; r < kWorld; ++r) {
-    const auto* meta = reinterpret_cast<const int32_t*>(p.gathered + r * kRow + kH);
+    const auto* meta = reinterpret_cast<const int32_t*>(gathered + r * kRow + kH);
     const float v = __int_as_float(meta[0]);
     const int32_t i = meta[1];
     if (vocab_argmax::better(v, i, bv, bi)) {
@@ -193,14 +202,14 @@ __global__ void __launch_bounds__(kThreads)
       win = r;
     }
   }
-  const auto* row = reinterpret_cast<const uint4*>(p.gathered + win * kRow);
-  auto* dst = reinterpret_cast<uint4*>(p.next_embeds);
+  const auto* row = reinterpret_cast<const uint4*>(gathered + win * kRow);
+  auto* dst = reinterpret_cast<uint4*>(p.next_embeds + m * kH);
   for (int c = static_cast<int>(threadIdx.x); c < kH / 8; c += kThreads) dst[c] = row[c];
   if (threadIdx.x == 0) {
-    p.topk_index[0] = bi;
-    p.topk_p[0] = 1.0f;
-    if (p.draft_tokens != nullptr) p.draft_tokens[p.draft_column] = bi;
-    p.positions[0] = p.positions[0] + 1;
+    p.topk_index[m] = bi;
+    p.topk_p[m] = 1.0f;
+    if (p.draft_tokens != nullptr) p.draft_tokens[m * p.draft_stride + p.draft_column] = bi;
+    p.positions[m] = p.positions[m] + 1;
   }
 }
 
@@ -454,19 +463,20 @@ struct DraftVocabArgmax {
       const tvm::ffi::TensorView counter,
       int64_t vocab_start) {
     using namespace host;
+    auto M = SymbolicSize{"rows"};
     auto V = SymbolicSize{"vocab_local"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({1, V}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
+    TensorMatcher({M, V}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
     TensorMatcher({V, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(embed);
-    TensorMatcher({1, kH + vocab_argmax::kMetaElems})
+    TensorMatcher({M, kH + vocab_argmax::kMetaElems})
         .with_dtype<bf16_t>()
         .with_device(device)
         .ensure_alignment(16)
         .verify(payload);
-    TensorMatcher({kBlocks}).with_dtype<fp32_t>().with_device(device).verify(part_val);
-    TensorMatcher({kBlocks}).with_dtype<int32_t>().with_device(device).verify(part_idx);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(counter);
+    TensorMatcher({M, kBlocks}).with_dtype<fp32_t>().with_device(device).verify(part_val);
+    TensorMatcher({M, kBlocks}).with_dtype<int32_t>().with_device(device).verify(part_idx);
+    TensorMatcher({M}).with_dtype<int32_t>().with_device(device).verify(counter);
     const int64_t vocab = V.unwrap();
     CHECK_HOST(vocab % 8 == 0) << "local vocab " << vocab << " must be a multiple of 8";
     const auto params = VocabArgmaxPackParams{
@@ -479,7 +489,7 @@ struct DraftVocabArgmax {
         .vocab = static_cast<int32_t>(vocab),
         .vocab_start = static_cast<int32_t>(vocab_start),
     };
-    LaunchKernel(kBlocks, kThreads, device.unwrap())
+    LaunchKernel(dim3(kBlocks, static_cast<uint32_t>(M.unwrap())), kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(vocab_argmax_pack_kernel<kH, kBlocks, kThreads, kUsePDL>, params);
   }
 
@@ -492,23 +502,26 @@ struct DraftVocabArgmax {
       const tvm::ffi::TensorView next_embeds,
       int64_t draft_column) {
     using namespace host;
+    auto M = SymbolicSize{"rows"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({1, kWorld * (kH + vocab_argmax::kMetaElems)})
+    TensorMatcher({M, kWorld * (kH + vocab_argmax::kMetaElems)})
         .with_dtype<bf16_t>()
         .with_device(device)
         .ensure_alignment(16)
         .verify(gathered);
-    TensorMatcher({1, 1}).with_dtype<int64_t>().with_device(device).verify(topk_index);
-    TensorMatcher({1, 1}).with_dtype<fp32_t>().with_device(device).verify(topk_p);
-    TensorMatcher({1}).with_dtype<int64_t>().with_device(device).verify(positions);
-    TensorMatcher({1, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(next_embeds);
+    TensorMatcher({M, 1}).with_dtype<int64_t>().with_device(device).verify(topk_index);
+    TensorMatcher({M, 1}).with_dtype<fp32_t>().with_device(device).verify(topk_p);
+    TensorMatcher({M}).with_dtype<int64_t>().with_device(device).verify(positions);
+    TensorMatcher({M, kH}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(next_embeds);
     int64_t* tokens = nullptr;
+    int32_t stride = 0;
     if (draft_tokens.numel() > 0) {
       auto S = SymbolicSize{"num_steps"};
-      TensorMatcher({1, S}).with_dtype<int64_t>().with_device(device).verify(draft_tokens);
+      TensorMatcher({M, S}).with_dtype<int64_t>().with_device(device).verify(draft_tokens);
       CHECK_HOST(draft_column >= 0 && draft_column < S.unwrap()) << "draft column out of range";
       tokens = static_cast<int64_t*>(draft_tokens.data_ptr());
+      stride = static_cast<int32_t>(S.unwrap());
     }
     const auto params = VocabArgmaxSelectParams{
         .gathered = static_cast<const bf16_t*>(gathered.data_ptr()),
@@ -518,8 +531,9 @@ struct DraftVocabArgmax {
         .positions = static_cast<int64_t*>(positions.data_ptr()),
         .next_embeds = static_cast<bf16_t*>(next_embeds.data_ptr()),
         .draft_column = static_cast<int32_t>(draft_column),
+        .draft_stride = stride,
     };
-    LaunchKernel(1, kThreads, device.unwrap())
+    LaunchKernel(static_cast<uint32_t>(M.unwrap()), kThreads, device.unwrap())
         .enable_pdl(kUsePDL)(vocab_argmax_select_kernel<kH, kWorld, kThreads, kUsePDL>, params);
   }
 };

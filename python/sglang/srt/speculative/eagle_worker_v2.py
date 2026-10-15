@@ -769,7 +769,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         exchange = (
             self._draft_vocab_exchange
-            if draft_tokens_topk1 is not None and topk_index.shape[0] == 1
+            if draft_tokens_topk1 is not None
+            and topk_index.shape[0] <= DraftVocabExchange.MAX_ROWS
             else None
         )
 
@@ -811,7 +812,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     else contextlib.nullcontext()
                 )
                 if exchange is not None:
-                    exchange.begin_step(i)
+                    exchange.begin_step(i, topk_index.shape[0])
                 with (
                     forward_context(
                         ForwardContext(

@@ -43,9 +43,10 @@ def vocab_argmax_pack(
     vocab_start: int,
     world: int,
 ) -> None:
-    """Shard argmax of bf16 ``logits`` [1, V_local] plus the candidate's ``embed``
-    row, packed into ``payload`` [1, H + META_ELEMS]."""
-    _module(embed.shape[-1], part_val.shape[0], world).pack(
+    """Per-row shard argmax of bf16 ``logits`` [M, V_local] plus the candidate's
+    ``embed`` row, packed into ``payload`` [M, H + META_ELEMS]; scratch part_val /
+    part_idx [M, blocks], counter [M] (zero between calls)."""
+    _module(embed.shape[-1], part_val.shape[-1], world).pack(
         logits, embed, payload, part_val, part_idx, counter, vocab_start
     )
 
@@ -61,7 +62,7 @@ def vocab_argmax_select(
     blocks: int,
     world: int,
 ) -> None:
-    """Pick the token over gathered packed rows [1, world * (H + META_ELEMS)];
+    """Per row, pick the token over gathered packed rows [M, world * (H + META_ELEMS)];
     write it to ``topk_index`` / ``draft_tokens[:, draft_column]`` (empty tensor
     to skip), advance ``positions`` and copy its embedding row to ``next_embeds``."""
     _module(next_embeds.shape[-1], blocks, world).select(

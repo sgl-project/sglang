@@ -64,6 +64,8 @@ def _unsupported_reason(model, num_steps: int) -> Optional[str]:
 class DraftVocabExchange:
     """Owns the packed-row buffers, the all-gather and the per-step outputs."""
 
+    MAX_ROWS = 2
+
     def __init__(self, model, num_steps: int) -> None:
         self.model = model
         embed = model.model.embed_tokens
@@ -73,18 +75,20 @@ class DraftVocabExchange:
         self.world = get_parallel().tp_size
         hidden = embed.weight.shape[1]
         dev = embed.weight.device
-        self.payload = torch.empty(1, hidden + META_ELEMS, dtype=torch.bfloat16, device=dev)
-        self.part_val = torch.empty(PACK_BLOCKS, dtype=torch.float32, device=dev)
-        self.part_idx = torch.empty(PACK_BLOCKS, dtype=torch.int32, device=dev)
-        self.counter = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.next_embeds = torch.empty(1, hidden, dtype=torch.bfloat16, device=dev)
-        self.topk_index = [torch.empty(1, 1, dtype=torch.int64, device=dev) for _ in range(num_steps)]
-        self.topk_p = [torch.empty(1, 1, dtype=torch.float32, device=dev) for _ in range(num_steps)]
+        rows = self.MAX_ROWS
+        self.payload = torch.empty(rows, hidden + META_ELEMS, dtype=torch.bfloat16, device=dev)
+        self.part_val = torch.empty(rows, PACK_BLOCKS, dtype=torch.float32, device=dev)
+        self.part_idx = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
+        self.counter = torch.zeros(rows, dtype=torch.int32, device=dev)
+        self.next_embeds = torch.empty(rows, hidden, dtype=torch.bfloat16, device=dev)
+        self.topk_index = [torch.empty(rows, 1, dtype=torch.int64, device=dev) for _ in range(num_steps)]
+        self.topk_p = [torch.empty(rows, 1, dtype=torch.float32, device=dev) for _ in range(num_steps)]
         self.no_tokens = torch.empty(0, dtype=torch.int64, device=dev)
+        self.num_rows = 1
         # Same guarded multimem all-gather as the logits gather; a cross-rank
         # all-reduce always sits between two draft steps' gathers.
         self.gatherer = triton_symm_mem_ag.MultimemAllGatherer(
-            max_tokens=1, enabled=True, skip_entry_sync=True
+            max_tokens=self.MAX_ROWS, enabled=True, skip_entry_sync=True
         )
 
     @classmethod
@@ -96,8 +100,9 @@ class DraftVocabExchange:
         logger.info("Draft vocab exchange active (tp=%d).", get_parallel().tp_size)
         return cls(model, num_steps)
 
-    def begin_step(self, step: int) -> None:
-        self.model.draft_input_embeds = self.next_embeds if step > 0 else None
+    def begin_step(self, step: int, num_rows: int) -> None:
+        self.num_rows = num_rows
+        self.model.draft_input_embeds = self.next_embeds[:num_rows] if step > 0 else None
         self.model.logits_processor.skip_vocab_gather = True
 
     def finish_step(
@@ -108,25 +113,26 @@ class DraftVocabExchange:
         step: int,
         draft_column: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        m = self.num_rows
         vocab_argmax_pack(
             local_logits,
             self.embed_weight,
-            self.payload,
-            self.part_val,
-            self.part_idx,
-            self.counter,
+            self.payload[:m],
+            self.part_val[:m],
+            self.part_idx[:m],
+            self.counter[:m],
             self.vocab_start,
             self.world,
         )
-        gathered = self.gatherer(self.payload)
-        topk_index, topk_p = self.topk_index[step], self.topk_p[step]
+        gathered = self.gatherer(self.payload[:m])
+        topk_index, topk_p = self.topk_index[step][:m], self.topk_p[step][:m]
         vocab_argmax_select(
             gathered,
             topk_index,
             topk_p,
             draft_tokens if draft_tokens is not None else self.no_tokens,
             positions,
-            self.next_embeds,
+            self.next_embeds[:m],
             draft_column,
             PACK_BLOCKS,
             self.world,
