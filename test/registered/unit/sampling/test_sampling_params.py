@@ -315,6 +315,24 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
+    # --- stop_token_ids ---
+    def test_stop_token_ids_out_of_vocab_raises(self):
+        """Out-of-vocab stop_token_ids must be rejected at request validation.
+
+        The min_new_tokens penalizer scatters every stop id in the batch into a
+        [batch, vocab_size + 1] tensor, so one out-of-range id crashed the server.
+        """
+        for token_id in (self.VOCAB_SIZE, 1_000_000, -1):
+            with self.subTest(token_id=token_id):
+                sp = self._make(stop_token_ids=[1, token_id])
+                with self.assertRaises(ValueError):
+                    sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_vocab_boundaries_accepted(self):
+        """Test that stop_token_ids at both ends of [0, vocab_size) are accepted."""
+        sp = self._make(stop_token_ids=[0, self.VOCAB_SIZE - 1])
+        sp.verify(self.VOCAB_SIZE)
+
     # --- sampling_seed ---
     def test_sampling_seed_valid(self):
         """Test that None (the default) and the int64 min/max boundaries are accepted."""
