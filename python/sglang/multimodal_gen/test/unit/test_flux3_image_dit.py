@@ -193,6 +193,10 @@ def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
         packed.rope = {mode: native.rope(ids) for mode, ids in packed.ids.items()}
         cached = native(packed)["image"].float()
         torch.testing.assert_close(cached, predicted, rtol=0, atol=0)
+        packed.static_hidden = {}
+        for _ in range(2):
+            reused = native(packed)["image"].float()
+            torch.testing.assert_close(reused, predicted, rtol=0, atol=0)
         for mode, rows in packed.sample(1).rope.items():
             start, end = packed.mode_indices[mode][1]
             assert torch.equal(rows, packed.rope[mode][start:end])
@@ -218,6 +222,13 @@ def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
     )
     assert cosine > 0.9995, cosine
     torch.testing.assert_close(predicted, expected, atol=3e-2, rtol=3e-2)
+    with torch.inference_mode():
+        packed.timesteps["image"].fill_(0.3)
+        packed.data["image"].mul_(0.9)
+        reused = native(packed)["image"]
+        packed.static_hidden = None
+        uncached = native(packed)["image"]
+        torch.testing.assert_close(reused, uncached, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA kernels")

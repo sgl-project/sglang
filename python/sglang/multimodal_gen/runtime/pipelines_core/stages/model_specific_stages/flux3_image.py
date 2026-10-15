@@ -777,6 +777,17 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                 and resolve_sequential_cfg(packed, guidance)
             )
             self._sequential_cfg_active = sequential_cfg
+            if (
+                not flow_map
+                and not server_args.enable_breakable_cuda_graph
+                and not server_args.enable_torch_compile
+                and not server_args.dit_layerwise_offload
+                and not server_args.enable_cfg_parallel
+                and not sequential_cfg
+                and batch.skip_softmax_params is None
+                and self.transformer.can_reuse_mode_blocks()
+            ):
+                packed.static_hidden = {}
             self._maybe_enable_cache_dit_and_torch_compile(num_steps, batch)
             with (
                 torch.inference_mode(),

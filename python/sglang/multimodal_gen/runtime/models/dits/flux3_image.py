@@ -114,6 +114,8 @@ class Packed:
     timesteps_ref: Tensor | None = None
     # Request-owned positional tables; the ids do not change during denoising.
     rope: dict[str, Tensor] | None = None
+    # Eager-only reuse of invariant text/reference mode-block outputs.
+    static_hidden: dict[str, Tensor] | None = None
 
     @property
     def num_samples(self) -> int:
@@ -131,6 +133,7 @@ class Packed:
         timesteps = {}
         mode_indices = {}
         rope = None if self.rope is None else {}
+        static_hidden = None if self.static_hidden is None else {}
         for mode in self.data:
             bounds = self.mode_indices[mode][first:stop]
             start, end = bounds[0][0], bounds[-1][1]
@@ -141,10 +144,14 @@ class Packed:
             mode_indices[mode] = [(lo - start, hi - start) for lo, hi in bounds]
             if rope is not None:
                 rope[mode] = self.rope[mode][start:end]
+            if static_hidden is not None and mode in self.static_hidden:
+                static_hidden[mode] = self.static_hidden[mode][start:end]
         timesteps_ref = (
             None if self.timesteps_ref is None else self.timesteps_ref[first:stop]
         )
-        return Packed(data, ids, timesteps, mode_indices, timesteps_ref, rope)
+        return Packed(
+            data, ids, timesteps, mode_indices, timesteps_ref, rope, static_hidden
+        )
 
 
 def pack(
@@ -846,20 +853,29 @@ class Flux3ImageDiT(Flux3Transformer):
 
     def _packed_blocks(self, packed, content, x, rope, early, single, layout):
         """All samples in one varlen sequence per block (no sequence parallel)."""
+        cached = packed.static_hidden if packed.static_hidden is not None else {}
+        x.update(cached)
         mode_rope = {mode: _with_positions(rows) for mode, rows in rope.items()}
         for depth in range(self.depth):
             for mode in content:
+                if mode in cached:
+                    continue
                 x[mode] = self.content_mode_blocks[mode][depth](
                     x[mode],
                     mode_rope[mode],
                     early[mode],
                     seq_lens=_seq_lens(packed.mode_indices[mode]),
                 )
-            x[TEXT] = self.txt_mode_blocks[depth](
-                x[TEXT],
-                mode_rope[TEXT],
-                early[TEXT],
-                seq_lens=_seq_lens(packed.mode_indices[TEXT]),
+            if TEXT not in cached:
+                x[TEXT] = self.txt_mode_blocks[depth](
+                    x[TEXT],
+                    mode_rope[TEXT],
+                    early[TEXT],
+                    seq_lens=_seq_lens(packed.mode_indices[TEXT]),
+                )
+        if packed.static_hidden is not None:
+            packed.static_hidden.update(
+                (mode, x[mode]) for mode in (TEXT, "image_cond") if mode in x
             )
         hidden = layout.pack(x)
         joint_rope = _with_positions(layout.pack(rope))
@@ -872,6 +888,14 @@ class Flux3ImageDiT(Flux3Transformer):
                 hidden, joint_rope, joint_mods, seq_lens=layout.sample_lengths
             )
         return hidden
+
+    def can_reuse_mode_blocks(self) -> bool:
+        return get_sp_world_size() == 1 and all(
+            block.attention._usp.backend
+            in (AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA)
+            for blocks in [self.txt_mode_blocks, *self.content_mode_blocks.values()]
+            for block in blocks
+        )
 
     def _sp_blocks(self, packed, content, x, rope, early, single, layout):
         """One sequence per CFG sample, each sharded across the SP group.
