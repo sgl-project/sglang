@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.layers import muse_spark_fp4_moe
+from sglang.srt.layers import muse_spark_expert_tp, muse_spark_fp4_moe
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.muse_spark_bf16_moe import MuseSpark1xBf16Experts
 from sglang.srt.layers.muse_spark_fp4_moe import MuseSpark1xFp4Experts
@@ -89,6 +89,20 @@ def _layer(experts: nn.Module) -> nn.Module:
     layer._fused_ffn_boundary = None
     layer.operator_dtype = torch.bfloat16
     return layer
+
+
+# EP-only layout: the experts read the expert TP width at construction and load.
+_NO_EXPERT_TP = patch.object(
+    muse_spark_expert_tp, "get_parallel", return_value=SimpleNamespace(moe_tp_size=1)
+)
+
+
+def setUpModule():
+    _NO_EXPERT_TP.start()
+
+
+def tearDownModule():
+    _NO_EXPERT_TP.stop()
 
 
 def _make_model(ep_rank: int, *, keep_checkpoint_layout: bool = True):
