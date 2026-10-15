@@ -51,7 +51,7 @@ def _requantize_tensor_scale_int8(
 class TestCPUQuantOps(CustomTestCase):
     def test_per_token_quant_int8_python_dispatch_cpu(self):
         """Public CPU dispatch keeps the CUDA dtype and scale-shape contract."""
-        x = torch.linspace(-1.0, 1.0, steps=2 * 3 * 33).reshape(2, 3, 33)
+        x = torch.linspace(-1.0, 1.0, steps=2 * 3 * 64).reshape(2, 3, 64)
         x = x.to(torch.bfloat16)
 
         x_q, scales, x_sum = per_token_quant_int8(x, cal_sum=True)
