@@ -662,17 +662,72 @@ def _empty_xpu_moe_expert_weight(
     return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]
 
 
+_W8A16_SCALE_BLOCK_K = 128
+
+
 class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
     """Opt-in gfx950 PTPC method for GLM-5.3 KDA projections."""
 
-    def __init__(self, module_name: str, bf16_max_m: int):
+    def __init__(
+        self,
+        module_name: str,
+        bf16_max_m: int,
+        w8a16_configs: Optional[tuple[tuple[int, dict], ...]] = None,
+    ):
         super().__init__()
         self.module_name = module_name
         self.bf16_max_m = bf16_max_m
+        # (max token count, kernel config) rows, ascending, for decode GEMMs
+        # with BF16 activations against the PTPC FP8 weights.
+        self.w8a16_configs = w8a16_configs
         self._fp8_ptpc_ready = False
 
     def is_active(self, num_tokens: int) -> bool:
         return self._fp8_ptpc_ready and num_tokens > self.bf16_max_m
+
+    def w8a16_config(self, num_tokens: int) -> Optional[dict]:
+        if not (self.w8a16_configs and self._fp8_ptpc_ready) or num_tokens == 0:
+            return None
+        for max_m, config in self.w8a16_configs:
+            if num_tokens <= max_m:
+                return config
+        return None
+
+    def _register_w8a16_scale(self, layer: torch.nn.Module, weight_scale) -> None:
+        if not self.w8a16_configs:
+            return
+        k = layer._fp8_ptpc_weight.shape[1]
+        if k % _W8A16_SCALE_BLOCK_K:
+            raise ValueError(
+                f"GLM-5.3 KDA W8A16 decode requires K divisible by "
+                f"{_W8A16_SCALE_BLOCK_K}, got {k} for {self.module_name}"
+            )
+        # The blockscale kernel reads one scale per (row, 128-wide K block);
+        # repeat the per-channel scale instead of keeping a second FP8 copy.
+        layer.register_buffer(
+            "_w8a16_weight_scale",
+            weight_scale.expand(-1, k // _W8A16_SCALE_BLOCK_K).contiguous(),
+            persistent=False,
+        )
+
+    @staticmethod
+    def apply_w8a16(layer: torch.nn.Module, x: torch.Tensor, config: dict):
+        from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
+            gemm_a16w8_blockscale_preshuffle,
+        )
+
+        weight = layer._fp8_ptpc_weight
+        n, k = weight.shape
+        output = gemm_a16w8_blockscale_preshuffle(
+            x.reshape(-1, k),
+            weight.view(n // 16, k * 16),
+            layer._w8a16_weight_scale,
+            dtype=x.dtype,
+            prequant=False,
+            # The wrapper adds derived keys to the config it is given.
+            config=dict(config),
+        )
+        return output.view(*x.shape[:-1], n)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import aiter
@@ -704,6 +759,7 @@ class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
             weight_scale.contiguous(),
             persistent=False,
         )
+        self._register_w8a16_scale(layer, weight_scale)
         self._fp8_ptpc_ready = True
 
     def apply(
@@ -714,7 +770,14 @@ class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
     ) -> torch.Tensor:
         use_fp8 = not isinstance(x, torch.Tensor)
         if isinstance(x, torch.Tensor):
-            use_fp8 = self.is_active(x.numel() // x.shape[-1])
+            num_tokens = x.numel() // x.shape[-1]
+            w8a16_config = self.w8a16_config(num_tokens)
+            if w8a16_config is not None:
+                output = self.apply_w8a16(layer, x, w8a16_config)
+                if output.shape[-1] != self.output_size:
+                    output = output[..., : self.output_size]
+                return output if bias is None else output + bias
+            use_fp8 = self.is_active(num_tokens)
         if use_fp8:
             assert self._fp8_ptpc_ready, (
                 "quantized PTPC input requires repacked FP8 weights"
@@ -756,8 +819,9 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         qkv_size: int,
         beta_size: int,
         fg_size: int,
+        w8a16_configs: Optional[tuple[tuple[int, dict], ...]] = None,
     ):
-        super().__init__("qkv_proj,f_a_proj,g_a_proj", bf16_max_m)
+        super().__init__("qkv_proj,f_a_proj,g_a_proj", bf16_max_m, w8a16_configs)
         self.fp8_max_m = fp8_max_m
         self.qkv_size = qkv_size
         self.beta_size = beta_size
@@ -804,6 +868,7 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
             weight_scale.contiguous(),
             persistent=False,
         )
+        self._register_w8a16_scale(layer, weight_scale)
         self._fp8_ptpc_ready = True
 
     def apply(
@@ -813,6 +878,22 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return UnquantizedLinearMethod.apply(self, layer, x, bias)
+
+    def apply_w8a16_decode(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        config: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        packed_output = self.apply_w8a16(layer, x, config)
+        qkv, fg_a = torch.split(
+            packed_output,
+            (self.qkv_size, self.fg_size),
+            dim=-1,
+        )
+        beta_weight = layer.weight[self.qkv_size : self.qkv_size + self.beta_size]
+        beta = tgemm.mm(x, beta_weight, otype=x.dtype)
+        return qkv, beta, fg_a
 
     def apply_ptpc_prefill(
         self,

@@ -366,6 +366,52 @@ GLM53_KDA_FUSED_O_NORM_MIN_M = {
 }
 
 
+def _w8a16_config(block_m, block_n, num_ksplit, num_warps, num_stages, waves_per_eu):
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": num_ksplit,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "waves_per_eu": waves_per_eu,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg",
+    }
+
+
+# Decode W8A16 (BF16 activations x PTPC FP8 weights) configs per local (N, K):
+# ascending (max token count, gemm_a16w8_blockscale_preshuffle config) rows
+# from MI355X cold-cache sweeps; token counts above the last row stay BF16.
+GLM53_KDA_W8A16_DECODE_CONFIGS: dict[tuple[int, int], tuple[tuple[int, dict], ...]] = {
+    (6400, 4096): (
+        (1, _w8a16_config(8, 16, 4, 1, 3, 2)),
+        (4, _w8a16_config(8, 16, 8, 1, 3, 0)),
+        (8, _w8a16_config(8, 32, 8, 2, 3, 0)),
+        (16, _w8a16_config(16, 64, 4, 4, 3, 0)),
+        (32, _w8a16_config(32, 128, 4, 8, 3, 2)),
+        (64, _w8a16_config(64, 128, 4, 8, 3, 2)),
+    ),
+    (4096, 2048): (
+        (1, _w8a16_config(16, 64, 8, 4, 3, 2)),
+        (4, _w8a16_config(8, 16, 4, 2, 3, 0)),
+        (8, _w8a16_config(8, 16, 8, 1, 2, 0)),
+        (16, _w8a16_config(16, 16, 4, 1, 3, 0)),
+        (32, _w8a16_config(32, 32, 4, 2, 3, 2)),
+        (64, _w8a16_config(64, 64, 4, 8, 3, 0)),
+    ),
+    (3328, 4096): (
+        (1, _w8a16_config(8, 16, 8, 1, 3, 0)),
+        (4, _w8a16_config(8, 16, 8, 1, 3, 2)),
+        (8, _w8a16_config(16, 16, 8, 1, 3, 2)),
+        (16, _w8a16_config(16, 16, 8, 1, 3, 0)),
+        (32, _w8a16_config(32, 128, 8, 8, 3, 0)),
+        (64, _w8a16_config(64, 64, 4, 8, 3, 0)),
+    ),
+}
+
+
 class Glm5NextLinearAttention(nn.Module):
     _PACKED_MODULES_MAPPING = {
         "fused_qkvbfg_a_proj": [
@@ -650,7 +696,20 @@ class Glm5NextLinearAttention(nn.Module):
                 "quantization is shared"
             )
 
-        def set_ptpc_method(module, module_name, bf16_max_m):
+        use_w8a16 = envs.SGLANG_OPT_GLM53_KDA_W8A16_DECODE.get()
+        if use_w8a16 and not ptpc_modules:
+            raise ValueError(
+                "SGLANG_OPT_GLM53_KDA_W8A16_DECODE requires "
+                "SGLANG_OPT_GLM53_KDA_PTPC_MODULES"
+            )
+
+        def w8a16_configs(module, n=None):
+            if not use_w8a16:
+                return None
+            weight_n, k = module.weight.shape
+            return GLM53_KDA_W8A16_DECODE_CONFIGS.get((n or weight_n, k))
+
+        def set_ptpc_method(module, module_name, bf16_max_m, w8a16=None):
             if not isinstance(module.quant_method, UnquantizedLinearMethod):
                 raise ValueError(
                     f"GLM-5.3-Flash KDA PTPC requires UnquantizedLinearMethod for "
@@ -659,6 +718,7 @@ class Glm5NextLinearAttention(nn.Module):
             module.quant_method = Glm53KdaPtpcLinearMethod(
                 module_name=module_name,
                 bf16_max_m=bf16_max_m,
+                w8a16_configs=w8a16,
             )
 
         if selected_shared_input_modules:
@@ -682,6 +742,10 @@ class Glm5NextLinearAttention(nn.Module):
                     qkv_size=self.split_sizes[0],
                     beta_size=self.split_sizes[1],
                     fg_size=self.split_sizes[2],
+                    w8a16_configs=w8a16_configs(
+                        self.fused_qkvbfg_a_proj,
+                        self.split_sizes[0] + self.split_sizes[2],
+                    ),
                 )
             elif self.fuse_bfg:
                 set_ptpc_method(self.qkv_proj, "qkv_proj", first_stage_max_m)
@@ -705,6 +769,7 @@ class Glm5NextLinearAttention(nn.Module):
                     self.o_proj,
                     "o_proj",
                     GLM53_KDA_PTPC_BF16_MAX_M["o_proj"],
+                    w8a16_configs(self.o_proj),
                 )
 
     @staticmethod
@@ -825,6 +890,14 @@ class Glm5NextLinearAttention(nn.Module):
                 self.fused_qkvbfg_a_proj,
                 hidden_states,
                 q_input=prequant,
+            )
+            fg_a_states = fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+        elif (
+            isinstance(method, Glm53KdaPackedPtpcLinearMethod)
+            and (w8a16_config := method.w8a16_config(num_tokens)) is not None
+        ):
+            qkv, beta, fg_a_states = method.apply_w8a16_decode(
+                self.fused_qkvbfg_a_proj, hidden_states, w8a16_config
             )
             fg_a_states = fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
         else:
