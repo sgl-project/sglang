@@ -34,6 +34,11 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
+from sglang.kernels.jit.utils.occupancy import (
+    NoSchedulableClustersError,
+    get_max_active_clusters,
+)
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_packed_v2,
@@ -385,9 +390,23 @@ def _narrow_seed(dist, *rest):
 PERSISTENT_SHAPE = (40, 131072)
 
 
-def _assert_persistent_route(seq_lens):
+def _has_persistent_pool(batch):
+    """Whether the persistent cluster kernel exists here and takes `batch` rows:
+    SUPPORT_CLUSTER (SM90 / SM100) and fewer probed clusters than rows."""
+    if is_hip() or not 9 <= get_jit_cuda_arch().major < 11:
+        return False
+    try:
+        return batch > get_max_active_clusters(8, occupancy=2)
+    except NoSchedulableClustersError:
+        return False
+
+
+def _assert_persistent_route_where_supported(seq_lens):
     """The plan is only written past the persistent pool's cluster count, so a
-    written plan that routes every row to the pool means the persistent kernel."""
+    written plan that routes every row to the pool means the persistent kernel.
+    Other devices take the non-cluster path, which the caller still checks."""
+    if not _has_persistent_pool(seq_lens.numel()):
+        return
     assert topk_v2_plan_is_written(seq_lens)
     assert _plan(seq_lens)[0, 1].item() == seq_lens.numel()
 
@@ -410,8 +429,8 @@ def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> 
     width = (seq + 3) & ~3
     scores = _single_bin_scores(dist, batch, width, device)[:, :seq]
     seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
-    if not is_hip() and (batch, seq) == PERSISTENT_SHAPE:
-        _assert_persistent_route(seq_lens)
+    if (batch, seq) == PERSISTENT_SHAPE:
+        _assert_persistent_route_where_supported(seq_lens)
 
     our_raw = _run_raw(scores, seq_lens, k)
     ref_raw = _reference(scores, seq_lens, k)
@@ -425,7 +444,8 @@ def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> 
 @torch.inference_mode()
 def test_topk_v2_persistent_overflow_page_modes(mode: str) -> None:
     """Rows of the persistent pool whose threshold bin overflows, next to rows
-    whose bin does not, stay exact through the page-table (and raw) outputs."""
+    whose bin does not, stay exact through the page-table (and raw) outputs.
+    Without the pool (e.g. SM80 / SM120) the same rows check the fallback."""
     batch, seq = PERSISTENT_SHAPE
     k = 2048
     torch.manual_seed(_narrow_seed("narrow_bin", batch, seq, len(mode)))
@@ -433,7 +453,7 @@ def test_topk_v2_persistent_overflow_page_modes(mode: str) -> None:
     scores = torch.randn(batch, seq, dtype=torch.float32, device=device)
     scores[::2] = _single_bin_scores("narrow_bin", batch // 2, seq, device)
     seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
-    _assert_persistent_route(seq_lens)
+    _assert_persistent_route_where_supported(seq_lens)
     num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
     page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device)
 

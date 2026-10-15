@@ -21,6 +21,11 @@ import unittest
 import pytest
 import torch
 
+from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
+from sglang.kernels.jit.utils.occupancy import (
+    NoSchedulableClustersError,
+    get_max_active_clusters,
+)
 from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
     fast_kpool_topk_transform_fused,
 )
@@ -185,15 +190,27 @@ def test_topk_membership_including_overfull_coarse_bins(distribution, start):
     )
 
 
+def _has_persistent_pool(rows):
+    """Whether the top-k v2 persistent cluster kernel exists here and takes `rows`
+    rows: SUPPORT_CLUSTER (SM90 / SM100) and fewer probed clusters than rows."""
+    if not 9 <= get_jit_cuda_arch().major < 11:
+        return False
+    try:
+        return rows > get_max_active_clusters(8, occupancy=2)
+    except NoSchedulableClustersError:
+        return False
+
+
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or is_hip(), reason="CUDA cluster routes"
+    not torch.cuda.is_available() or is_hip(), reason="CUDA top-k v2 routes"
 )
 @pytest.mark.parametrize("rows", [1, 40])
 def test_planned_v2_keeps_top_pools_when_the_coarse_bin_overflows(rows):
-    """Long decode rows go to the cluster kernels (small-batch at 1 row,
-    persistent at 40). With more than 2048 distinct pool scores in one coarse
-    bin they must still return the exact top pools, not an arbitrary subset,
-    including across graph replays that flip the bin between overflowing and not.
+    """Long decode rows go to the cluster kernels where they exist (small-batch
+    at 1 row, persistent at 40), else to the non-cluster path. With more than
+    2048 distinct pool scores in one coarse bin they must still return the exact
+    top pools, not an arbitrary subset, including across graph replays that flip
+    the bin between overflowing and not.
     """
     torch.manual_seed(1234)
     pools, group_topk, kpool, tail = 131072, 512, 4, 3
@@ -202,7 +219,7 @@ def test_planned_v2_keeps_top_pools_when_the_coarse_bin_overflows(rows):
     plan = plan_topk_v2(lengths)
     # The transform reads the plan before its PDL wait, so not back to back.
     torch.cuda.synchronize()
-    if rows > 1:
+    if _has_persistent_pool(rows):
         # Written only past the persistent pool's cluster count.
         assert topk_v2_plan_is_written(lengths) and plan[0, 1].item() == rows
     scores = torch.empty(rows, pools, device="cuda")
