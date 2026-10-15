@@ -18,6 +18,11 @@ from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+    ShmTagExchange,
+    fold_u64,
+    get_shm_exchange,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
@@ -3300,6 +3305,16 @@ class UnifiedRadixCache(BasePrefixCache):
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
+        exchange = self._shm_count_exchange()
+        if exchange is not None:
+            rows = exchange.allgather(
+                [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
+            )
+            assert all(row[-2:] == rows[0][-2:] for row in rows), (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
+            mins = [min(col) for col in zip(*rows)]
+            return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
         ready_counts = torch.tensor(
             [
                 write_acks,
@@ -3326,6 +3341,20 @@ class UnifiedRadixCache(BasePrefixCache):
             tuple(count_values[2:-2]),
             extra_pool_names,
         )
+
+    def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
+        # Only the single-group, single-stage layout; anything else keeps the gloo reduce.
+        if self.pp_size > 1 or self.cache_controller is None:
+            return None
+        groups = [
+            g
+            for g in (self.attn_cp_group, self.attn_tp_group)
+            if g is not None and torch.distributed.get_world_size(group=g) > 1
+        ]
+        if len(groups) > 1:
+            return None
+        group = groups[0] if groups else (self.tp_group if self.tp_world_size > 1 else None)
+        return get_shm_exchange(group, "hicache")
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
