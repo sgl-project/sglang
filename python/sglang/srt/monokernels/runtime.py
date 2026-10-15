@@ -355,12 +355,13 @@ def _format_steps(keys) -> str:
 
 
 def _format_weight_copies(copies: dict) -> str:
-    kinds: dict = {}
-    for key, t in copies.items():
-        n, b = kinds.get(key[0], (0, 0))
-        kinds[key[0]] = (n + 1, b + t.numel() * t.element_size())
+    totals: dict = {}  # kind -> (tensors, bytes)
+    for (kind, *_), tensor in copies.items():
+        count, nbytes = totals.get(kind, (0, 0))
+        totals[kind] = (count + 1, nbytes + tensor.numel() * tensor.element_size())
     return ", ".join(
-        f"{k} {n} x {b / 2**20:.1f} MiB" for k, (n, b) in sorted(kinds.items())
+        f"{kind} ({count} tensor{'' if count == 1 else 's'}, {nbytes / 2**20:.1f} MiB)"
+        for kind, (count, nbytes) in sorted(totals.items())
     )
 
 
