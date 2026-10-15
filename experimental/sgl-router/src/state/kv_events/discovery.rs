@@ -109,8 +109,9 @@ pub async fn fetch_event_config(
     let body = fetch_with_retry(&server_info_url, worker_url, client).await?;
 
     // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
-    // token bigrams; the router must mirror that on the selection side.
-    let is_bigram = classify_bigram(body.speculative_algorithm.as_deref(), worker_url);
+    // token bigrams, except on hybrid (Mamba/linear-attention) models.
+    let is_bigram = classify_bigram(body.speculative_algorithm.as_deref(), worker_url)
+        && !body.uses_mamba_radix_cache;
 
     let block = match body.kv_events {
         Some(b) => b,
@@ -196,6 +197,10 @@ struct ServerInfoResponse {
     /// token bigrams — see [`EventConfig::is_bigram`].
     #[serde(default)]
     speculative_algorithm: Option<String>,
+    /// Hybrid (Mamba/linear-attention) models keep unigram KV keys even
+    /// under EAGLE.
+    #[serde(default)]
+    uses_mamba_radix_cache: bool,
 }
 
 /// Whether a worker's `/server_info` `speculative_algorithm` means it hashes KV
