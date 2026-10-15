@@ -375,7 +375,9 @@ class GroupCoordinator:
             torch.compiler.is_compiling()
             and self.srt_custom_allreduce is not None
             and not async_op
-            and op == torch.distributed.ReduceOp.SUM
+            # Compare by identity: Dynamo before torch 2.14 cannot trace
+            # RedOpType.__eq__ and breaks the graph on `==`.
+            and op is torch.distributed.ReduceOp.SUM
             and not input_.is_cpu
         ):
             return diffusion_all_reduce(input_, group_name=self.unique_name)
@@ -384,7 +386,7 @@ class GroupCoordinator:
             if (
                 not async_op
                 and custom_ar is not None
-                and op == torch.distributed.ReduceOp.SUM
+                and op is torch.distributed.ReduceOp.SUM
                 and not input_.is_cpu
                 and not custom_ar.disabled
                 and custom_ar.should_custom_ar(input_)
@@ -447,6 +449,8 @@ class GroupCoordinator:
                 return list(output_tensor.chunk(world_size, dim=dim))
             return output_tensor
         else:
+            if not input_.is_contiguous():
+                input_ = input_.contiguous()
             all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:

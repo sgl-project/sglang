@@ -593,12 +593,14 @@ def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.
 
 
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
-    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
-    if not tensor.is_cuda:
-        return tensor.to("cpu", non_blocking=True)
+    """Enqueue an accelerator-to-pinned-host copy on the current stream."""
+    if tensor.device.type == "cpu":
+        return tensor
+    if not is_pin_memory_available(tensor.device):
+        return tensor.to("cpu")
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
-    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
     return host
 
 
@@ -3660,13 +3662,16 @@ def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
         return None
 
     from sglang.srt.rust_extensions import load_rust_extension
+    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 
     grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
     return grpc_native.start_metadata_server(
         host=serving.host,
         port=serving.grpc_port,
         server_info_json=json.dumps(
-            msgspec_to_builtins(build_server_info(server_args, scheduler_info)),
+            msgspec_to_builtins(
+                redact_watermark_secrets(build_server_info(server_args, scheduler_info))
+            ),
             default=str,
         ),
     )
@@ -4155,6 +4160,11 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # MoE stays SCATTERED and the a2a op owns dispatch/combine -- but we
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
+            return True
+        elif moe_a2a_backend.is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
             return True
         elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
