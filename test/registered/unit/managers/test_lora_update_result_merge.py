@@ -94,6 +94,7 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
             manager = TokenizerControlMixin()
             manager.auto_create_handle_loop = Mock()
             manager.lora_update_lock = asyncio.Lock()
+            manager.merged_lora_name = None
             manager.lora_registry = LoRARegistry([original] if duplicate else [])
             manager.pending_lora_unloads = {}
             manager.lora_ref_cache = {}

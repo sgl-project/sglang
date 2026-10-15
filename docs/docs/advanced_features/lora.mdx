@@ -13,6 +13,8 @@ The following server arguments are relevant for multi-LoRA serving:
 
 * `enable_lora`: Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.
 
+* `enable_lora_merge`: Enable the merge/unmerge endpoints and capture decode graphs without LoRA kernels. See [Merge an adapter into a replica](#merge-an-adapter-into-a-replica) for memory requirements and restrictions.
+
 * `enable_lora_overlap_loading`: Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.
 
 * `lora_paths`: The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: &lt;PATH&gt; | &lt;NAME&gt;=&lt;PATH&gt; | JSON with schema &#123;"lora_name":str,"lora_path":str,"pinned":bool&#125;.
@@ -37,6 +39,61 @@ The following server arguments are relevant for multi-LoRA serving:
 
 From client side, the user needs to provide a list of strings as input batch, and a list of adaptor names that each input sequence corresponds to.
 
+
+## Merge an adapter into a replica
+
+With the Python frontend on NVIDIA CUDA, `--enable-lora-merge` enables `POST /merge_lora_weights` and
+`POST /unmerge_lora_weights`. Use these when a replica will serve one adapter
+for long enough to amortize the transition. Ordinary multi-LoRA serving remains
+the default.
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3-4B \
+    --enable-lora --enable-lora-merge --lora-paths adapter_a=ADAPTER_PATH \
+    --tp-size 1 --mem-fraction-static 0.65
+
+curl --fail http://localhost:30000/merge_lora_weights \
+    -H 'Content-Type: application/json' -d '{"lora_name":"adapter_a"}'
+
+curl --fail http://localhost:30000/generate \
+    -H 'Content-Type: application/json' \
+    -d '{"text":"Explain prefix caching.","lora_path":"adapter_a","sampling_params":{"max_new_tokens":64}}'
+
+curl --fail -X POST http://localhost:30000/unmerge_lora_weights
+```
+
+Both endpoints stop new admissions, wait for admitted generations to finish,
+and return after the transition. Continue using the same `lora_path` while
+merged. Base-model requests and requests for other adapters return an error.
+`GET /model_info` reports `merged_lora_name`, or `null` when unmerged. Repeating
+a merge for the same adapter, or unmerging an already unmerged replica, succeeds
+without changing the weights.
+
+Merge computes the dense update in FP32 and writes it into the existing weight
+storage. A GPU copy of each affected base-weight slice is retained until unmerge,
+which restores it exactly. Provision memory for these copies; merging an adapter
+that targets every linear layer can require nearly another model's worth of
+weight memory. Lower `--mem-fraction-static` if needed. A failed allocation
+restores the unmerged state on every tensor-parallel rank.
+
+Merged decode uses a separately captured graph without LoRA kernels. Merged
+prefill runs eagerly. The flag adds graph capture work at startup; transitions
+do not recapture graphs. Merge and unmerge flush the replica's prefix cache,
+including recurrent state, because BF16/FP16 merged execution can round differently
+from the unmerged computation. Unmerge does not accumulate rounding error.
+
+This implementation supports unquantized dense linear adapters, fused QKV/MLP
+projections, and tensor parallelism. Expert layers, embedding/LM-head adapters,
+DP/PP, multiple tokenizer workers, speculative decoding, disaggregation, memory
+saving, CPU offload, shared weight caching, and external KV caching are not
+supported. Unmerge before loading adapters, unloading the merged adapter, or
+updating base weights.
+
+The Python engine exposes `merge_lora_weights(name)`, `unmerge_lora_weights()`,
+and their `async_` variants. A pool scheduler can stop routing new work to a
+replica, await merge, and then send only that adapter's requests to it. Await
+unmerge before returning it to mixed-adapter service. These operations are local
+to each replica; they do not add a shared controller to the generation path.
 
 ## Usage
 

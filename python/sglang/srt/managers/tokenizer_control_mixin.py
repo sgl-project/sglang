@@ -51,7 +51,9 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoRAMergeOutput,
     LoRAUpdateOutput,
+    MergeLoRAWeightsReqInput,
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
@@ -73,6 +75,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnmergeLoRAWeightsReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -138,6 +141,7 @@ _COMMUNICATOR_SPECS = [
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
+    ("merge_lora_weights", LoRAMergeOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
@@ -627,6 +631,45 @@ class TokenizerControlMixin:
 
         return success, message
 
+    async def merge_lora_weights(
+        self: TokenizerManager,
+        obj: MergeLoRAWeightsReqInput | UnmergeLoRAWeightsReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoRAMergeOutput:
+        self.auto_create_handle_loop()
+        # Keep the drain lock and frontend state consistent if the HTTP client
+        # disconnects after the scheduler has begun changing weights.
+        task = asyncio.create_task(self._merge_lora_weights(obj))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def _merge_lora_weights(self: TokenizerManager, obj) -> LoRAMergeOutput:
+        try:
+            if not get_lora().enable_lora_merge:
+                raise ValueError("Launch with --enable-lora-merge to use merge/unmerge")
+            # Existing readers hold this lock until generation finishes. Take
+            # it before the adapter lock: generation may implicitly load a LoRA.
+            async with self.model_update_lock.writer_lock, self.lora_update_lock:
+                if isinstance(obj, MergeLoRAWeightsReqInput):
+                    ref = self.lora_registry.get_all_adapters().get(obj.lora_name)
+                    if ref is None:
+                        raise ValueError(f"Adapter '{obj.lora_name}' is not loaded")
+                    obj.lora_id = ref.lora_id
+                results = await self.merge_lora_weights_communicator(obj)
+                result = results[0]  # Merge mode requires DP=1.
+                if result.success:
+                    self.merged_lora_name = result.merged_lora_name
+                return result
+        except ValueError as e:
+            return LoRAMergeOutput(
+                success=False,
+                error_message=str(e),
+                merged_lora_name=self.merged_lora_name,
+            )
+
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -635,6 +678,8 @@ class TokenizerControlMixin:
             "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
         )
 
+        if obj.lora_name == self.merged_lora_name:
+            raise ValueError("Unmerge the adapter before unloading it")
         lora_id = self.pending_lora_unloads.get(obj.lora_name)
         if lora_id is None:
             # Stop new requests from using this adapter before unloading it.
@@ -675,6 +720,8 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if self.merged_lora_name is not None:
+                    raise ValueError("Unmerge before loading adapters")
                 if obj.lora_name in self.pending_lora_unloads:
                     raise ValueError(
                         f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
@@ -764,6 +811,8 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if self.merged_lora_name is not None:
+                    raise ValueError("Unmerge before loading adapters")
                 if obj.lora_name in self.pending_lora_unloads:
                     raise ValueError(
                         f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "

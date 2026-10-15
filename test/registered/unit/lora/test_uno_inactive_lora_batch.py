@@ -28,6 +28,7 @@ class TestUnoInactiveLoRABatch(CustomTestCase):
     def test_all_base_batch_clears_stale_routing_before_graph_metadata(self):
         backend = _InactiveSkippingBackend()
         manager = LoRAManager.__new__(LoRAManager)
+        manager.merged_lora_id = None
         manager.lora_backend = backend
         forward_batch = SimpleNamespace(lora_ids=[None], batch_size=1)
 

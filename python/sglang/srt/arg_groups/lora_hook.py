@@ -33,6 +33,32 @@ def check_lora_server_args(server_args: Any):
                 "--enable-lora is set to False, any provided lora_paths will be ignored."
             )
 
+    if cfg.enable_lora_merge:
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError("LoRA merging requires the Python frontend")
+        if not cfg.enable_lora:
+            raise ValueError("--enable-lora-merge requires --enable-lora")
+        if (
+            cfg.dp_size != 1
+            or cfg.pp_size != 1
+            or cfg.attn_dp_size != 1
+            or cfg.tokenizer_worker_num != 1
+            or cfg.speculative_algorithm
+            or cfg.disaggregation_mode != "null"
+            or cfg.enable_memory_saver
+            or cfg.cpu_offload_gb > 0
+            or cfg.offload_group_size > 0
+            or cfg.weight_cache_mode != "off"
+            or cfg.enable_hierarchical_cache
+            or cfg.enable_lmcache
+        ):
+            raise ValueError(
+                "LoRA merging requires one tokenizer, DP=PP=1, and no speculative "
+                "decoding, disaggregation, memory saver, CPU offload, shared weights, "
+                "or external KV cache; "
+                "tensor parallelism is supported"
+            )
+
     if cfg.enable_lora:
         if cfg.enable_lora_overlap_loading is None:
             declare_resolution(

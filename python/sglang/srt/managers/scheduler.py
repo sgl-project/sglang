@@ -117,6 +117,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.lora.merge import merge_weights, unmerge_weights
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -159,6 +160,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoRAMergeOutput,
+    MergeLoRAWeightsReqInput,
     MMInputsProcessError,
     OpenSessionReqInput,
     PauseGenerationReqInput,
@@ -182,6 +185,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnmergeLoRAWeightsReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1833,6 +1837,8 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (MergeLoRAWeightsReqInput, self.merge_lora_weights),
+                (UnmergeLoRAWeightsReqInput, self.merge_lora_weights),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -5854,6 +5860,61 @@ class Scheduler(
             new_ep_size=new_ep_size,
             pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
             scale_phase=ElasticEPStateManager.get_scale_phase(),
+        )
+
+    def merge_lora_weights(self, recv_req) -> LoRAMergeOutput:
+        manager = self.tp_worker.model_runner.lora_manager
+        error = None
+        was_merged = manager.merged_lora_id if manager is not None else None
+        try:
+            if not get_lora().enable_lora_merge:
+                raise ValueError("LoRA merging is not enabled")
+            if not self.is_fully_idle():
+                raise ValueError("Drain all requests before merging or unmerging")
+            if self.weight_updater._session is not None:
+                raise ValueError("Finish the weight update before merging")
+        except ValueError as e:
+            error = str(e)
+        errors = get_parallel().tp_group.all_gather_object(error)
+        if any(errors):
+            return LoRAMergeOutput(
+                success=False, error_message="; ".join(e for e in errors if e)
+            )
+        try:
+            if isinstance(recv_req, MergeLoRAWeightsReqInput):
+                if manager.merged_lora_id != recv_req.lora_id:
+                    merge_weights(manager, recv_req.lora_id)
+            else:
+                unmerge_weights(manager)
+            torch.cuda.synchronize()
+        except Exception as e:
+            error = str(e)
+        # A failed allocation on one TP rank must not leave the other ranks
+        # serving merged weights. All ranks reach this collective on failure.
+        errors = get_parallel().tp_group.all_gather_object(error)
+        if any(errors):
+            if isinstance(recv_req, UnmergeLoRAWeightsReqInput):
+                # Restoration only copies existing allocations. A device failure
+                # here leaves the TP group unsafe to serve; stop the worker.
+                raise RuntimeError(f"LoRA restoration failed: {errors}")
+            if (
+                was_merged is None
+                and manager is not None
+                and manager.merged_lora_id is not None
+            ):
+                unmerge_weights(manager)
+                torch.cuda.synchronize()
+        elif manager.merged_lora_id != was_merged:
+            self.flush_cache(empty_cache=False)
+        name = (
+            manager.lora_refs[manager.merged_lora_id].lora_name
+            if manager is not None and manager.merged_lora_id is not None
+            else None
+        )
+        return LoRAMergeOutput(
+            success=not any(errors),
+            error_message="; ".join(e for e in errors if e) or None,
+            merged_lora_name=name,
         )
 
     def load_lora_adapter(

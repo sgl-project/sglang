@@ -115,6 +115,7 @@ class TestDPAttentionBackendContract(CustomTestCase):
                 pool.max_loras_per_batch = 3
                 pool.uid_to_buffer_id = {None: 0, "adapter": 1}
                 manager = LoRAManager.__new__(LoRAManager)
+                manager.merged_lora_id = None
                 manager.attn_dp_enabled = attn_dp_enabled
                 manager.max_loras_per_batch = 3
                 manager.num_pinned_loras = 1
@@ -285,6 +286,7 @@ def test_communicator_publishes_layout_at_each_transition(
 @pytest.mark.parametrize("can_run_decode_cuda_graph", [False, True])
 def test_manager_uses_current_dp_cuda_graph_eligibility(can_run_decode_cuda_graph):
     manager = LoRAManager.__new__(LoRAManager)
+    manager.merged_lora_id = None
     manager.attn_dp_enabled = True
     manager.max_bs_in_cuda_graph = 4
     tokens = torch.zeros(2, dtype=torch.int64)
