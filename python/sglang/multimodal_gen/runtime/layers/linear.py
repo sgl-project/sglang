@@ -69,6 +69,13 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 
+def _uses_weight_loader_v2(quant_method: QuantizeMethodBase) -> bool:
+    # Subclasses inherit their base method's parameter types and loader contract.
+    return any(
+        cls.__name__ in WEIGHT_LOADER_V2_SUPPORTED for cls in type(quant_method).__mro__
+    )
+
+
 def adjust_scalar_to_fused_array(
     param: torch.Tensor, loaded_weight: torch.Tensor, shard_id: str | int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -492,7 +499,7 @@ class ColumnParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if _uses_weight_loader_v2(self.quant_method)
                 else self.weight_loader
             ),
         )
@@ -1147,7 +1154,7 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if _uses_weight_loader_v2(self.quant_method)
                 else self.weight_loader
             ),
         )
