@@ -25,7 +25,7 @@ register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
 
-class DSV41FlashAccuracyMixin(GSM8KMixin, _run_accuracy_eval):
+class DSV41FlashAccuracyMixin(GSM8KMixin):
     # Use the zero-shot chat evaluator, not the legacy five-shot completion path.
     gsm8k_backend = "sgl_eval"
     gsm8k_score_threshold = 0.95
