@@ -916,6 +916,15 @@ def test_keeping_rows_leaves_the_cache_order_alone():
     assert list(cache.mm_cache) == [11, 12]
 
 
+def test_first_row_out_of_range_is_an_error():
+    # Kept rows start at row 12, but the chunk needs rows from row 0 on.
+    rows = torch.zeros(4, HIDDEN)
+    with pytest.raises(AssertionError):
+        mm_schedule.get_embedding_chunk(rows, 0, 9, VIDEO_RUNS, first_row=12)
+    with pytest.raises(AssertionError):
+        mm_schedule._slice_item_chunk(rows, _run_item(), 3, 9, first_row=12)
+
+
 if __name__ == "__main__":
     import sys
 

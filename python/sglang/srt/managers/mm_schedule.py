@@ -71,6 +71,9 @@ def get_embedding_chunk(
             end_index += end - start + 1
     # some models' embedding is 3-dim, reshape it to 2-dim
     embedding = embedding.reshape(-1, embedding.shape[-1])
+    assert (
+        0 <= first_row <= start_index <= end_index <= first_row + embedding.shape[0]
+    ), f"{first_row=} {start_index=} {end_index=} {embedding.shape=}"
     embedding_chunk = embedding[start_index - first_row : end_index - first_row]
     return embedding_chunk, start_index, end_index
 
@@ -270,6 +273,9 @@ def _slice_item_chunk(
         start, end = item.offsets[0]
         local_start = max(start, chunk_start) - start
         local_end = min(end + 1, chunk_start + chunk_len) - start
+        assert 0 <= first_row <= local_start <= local_end <= first_row + emb.shape[0], (
+            f"{first_row=} {local_start=} {local_end=} {emb.shape=}"
+        )
         return emb[local_start - first_row : local_end - first_row], local_end
     chunk, _, end_row = get_embedding_chunk(
         embedding=emb,
