@@ -382,11 +382,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Drive the decode kernel as varlen prefill with one table row per token.
-
-        ``seq_lens`` includes cached prefixes; the kernel derives causal SWA
-        validity from it. This path runs eagerly.
-        """
+        """Run varlen prefill eagerly, including at BCG breaks."""
 
         assert q.ndim == 3, f"{q.shape=}"
         num_qo_padded, num_heads, head_dim = q.shape
@@ -395,7 +391,12 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         # Build VarSeq metadata from the same extend lengths as the sparse tables.
         core = self.forward_metadata.core_attn_metadata
         if core.trtllm_prefill_qmeta is None:
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            tail = self.forward_metadata.late_layer_tail
+            extend_seq_lens_cpu = (
+                tail.extend_seq_lens_cpu
+                if tail is not None
+                else forward_batch.extend_seq_lens_cpu
+            )
             assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
             batch_size = len(extend_seq_lens_cpu)
             cum_lens = [0] * (batch_size + 1)
@@ -404,7 +405,11 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sum_q = cum_lens[-1]
             max_q_len = max(int(x) for x in extend_seq_lens_cpu)
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
+            # SWA masking uses causal lengths, not -1 sentinels: make them
+            # tail-relative while keeping compressed KV indices full-context.
+            seq_lens_i32 = (
+                tail.extend_seq_lens if tail is not None else forward_batch.seq_lens
+            ).to(torch.int32)
             assert seq_lens_i32.shape == (batch_size,), f"{seq_lens_i32.shape=}"
             core.trtllm_prefill_qmeta = (
                 self._move_to_device(cum_lens),

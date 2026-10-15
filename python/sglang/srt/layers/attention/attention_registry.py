@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
     hybrid_gdn_config,
+    hybrid_kda_config,
     hybrid_lightning_config,
     kimi_linear_config,
     mamba2_config,
@@ -74,6 +75,20 @@ def create_flashinfer_backend(runner):
         )
 
         return FlashInferMLAAttnBackend(runner)
+
+
+@register_attention_backend("llada2_cfg_flashinfer")
+def create_llada2_cfg_flashinfer_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("LLaDA2 CFG attention does not use an MLA backend")
+
+    from sglang.srt.layers.attention.llada2_cfg_flashinfer_backend import (
+        LLaDA2CFGFlashInferAttnBackend,
+    )
+
+    return LLaDA2CFGFlashInferAttnBackend(
+        runner, init_new_workspace=runner.init_new_workspace
+    )
 
 
 @register_attention_backend("trtllm_mla")
@@ -388,7 +403,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
-        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.linear.kda_backend import (
+            KDAAttnBackend,
+            flashinfer_kda_prefill_default,
+        )
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,
         )
@@ -430,6 +448,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         prefill_default = None
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
             prefill_default = flashinfer_gdn_prefill_default(runner)
+        elif hybrid_kda_config(runner.model_config) is not None and not is_npu():
+            prefill_default = flashinfer_kda_prefill_default(runner)
         runner.linear_attn_backends = resolve_linear_attn_backends(
             prefill_default=prefill_default
         )

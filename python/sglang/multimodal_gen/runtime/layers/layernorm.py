@@ -26,6 +26,10 @@ from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
 )
+from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+    is_supported_rmsnorm_hf_hidden_size,
+    rmsnorm_hf,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -38,6 +42,11 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+from sglang.srt.utils.custom_op import register_custom_op
+
+# An opaque op to torch.compile, as srt.models.utils registers it: a bare JIT
+# launch graph-breaks every layer that normalizes q/k.
+fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
 
 _is_cuda = current_platform.is_cuda()
 _is_rocm = current_platform.is_rocm()
@@ -102,11 +111,13 @@ class RMSNorm(CustomOp):
         eps: float = 1e-6,
         dtype: torch.dtype = torch.float32,
         var_hidden_size: Optional[int] = None,
+        cast_x_before_out_mul: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
+        self.cast_x_before_out_mul = cast_x_before_out_mul
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
@@ -126,6 +137,22 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
+        if self.cast_x_before_out_mul:
+            if residual is not None or self.variance_size_override is not None:
+                return self.forward_native(x, residual)
+            x_2d = x.contiguous().reshape(-1, shape[-1])
+            if (
+                x_2d.dtype in (torch.float16, torch.bfloat16)
+                and self.weight.dtype == x_2d.dtype
+                and is_supported_rmsnorm_hf_hidden_size(x_2d.shape[-1])
+            ):
+                return rmsnorm_hf(
+                    x_2d,
+                    self.weight.data,
+                    self.variance_epsilon,
+                ).view(shape)
+            return self.forward_native(x)
+
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
@@ -200,10 +227,13 @@ class RMSNorm(CustomOp):
 
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        weight = self.weight
-        if x.device.type == "mps" and weight.dtype != x.dtype:
-            weight = weight.to(dtype=x.dtype)
-        x = (x * weight).to(orig_dtype)
+        if self.cast_x_before_out_mul:
+            x = self.weight * x.to(orig_dtype)
+        else:
+            weight = self.weight
+            if x.device.type == "mps" and weight.dtype != x.dtype:
+                weight = weight.to(dtype=x.dtype)
+            x = (x * weight).to(orig_dtype)
         if residual is None:
             return x
         else:
@@ -915,10 +945,21 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_xpu(self, *args, **kwargs):
-        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_xpu(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        normalized = self.norm(x)
+        if scale.dim() == 4:
+            # scale/shift: [batch_size, num_frames, 1, inner_dim]
+            num_frames = scale.shape[1]
+            frame_seqlen = normalized.shape[1] // num_frames
+            modulated = (
+                normalized.unflatten(1, (num_frames, frame_seqlen)) * (1 + scale)
+                + shift
+            ).flatten(1, 2)
+        else:
+            modulated = normalized * (1 + scale) + shift
+        return modulated.to(x.dtype)
 
     @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
@@ -1150,7 +1191,6 @@ def apply_qk_norm_rope(
     if (
         fused_enabled
         and (_is_cuda or _is_rocm)
-        and not torch.compiler.is_compiling()
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
