@@ -1049,10 +1049,7 @@ def _fwd_kernel_ep_scatter_1(
 
     for start_m in tl.range(0, cur_expert_padded_token_num, BLOCK_E, num_stages=4):
         offsets = start_m + off_expert
-        # Mask the tail block: an expert whose token count is not a multiple
-        # of BLOCK_E must not store past its own segment, otherwise the -1
-        # padding lanes race with the next expert's program writing the same
-        # m_indices region.
+        # Safety net; callers already pad the counts to BLOCK_E.
         tl.store(
             m_indices_start_ptr + offsets,
             tl.where(offsets < cur_expert_valid_token_num, cur_expert, -1),
@@ -1168,8 +1165,8 @@ def ep_scatter(
     expert_alignment: int = 128,
     expert_start: int = 0,
 ):
-    # tl.arange needs pow2, and the kernel's unmasked stores need BLOCK_E to
-    # divide the expert_alignment-padded segments; lowbit satisfies both.
+    # tl.arange needs pow2; lowbit gives the largest pow2 dividing
+    # expert_alignment, which callers pad the per-expert counts to.
     BLOCK_E = expert_alignment & -expert_alignment
     BLOCK_D = quant_block_size  # block size of quantization
     num_warps = 8
