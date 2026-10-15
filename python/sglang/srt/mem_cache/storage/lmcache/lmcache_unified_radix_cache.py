@@ -760,7 +760,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if flow is None or flow.load is None:
             return
         tree_owned_len = flow.load.local_hit_tokens + flow.loaded_skip_tokens
-        req.kv.cache_protected_len = min(req.kv.cache_protected_len, tree_owned_len)
+        req.kv.protect_prefix(min(req.kv.cache_protected_len, tree_owned_len))
         if self.is_swa_enabled:
             external_tokens = len(flow.load.device_indices)
             swa_missing_end = flow.load.local_hit_tokens + max(
@@ -838,7 +838,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # Move the request lock to the published boundary.
         self.unlock(req.lock)
         req.lock = self.lock(matched.last_device_node)
-        req.kv.cache_protected_len = total_hit
+        req.kv.protect_prefix(total_hit)
         req.last_node = matched.last_device_node
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False

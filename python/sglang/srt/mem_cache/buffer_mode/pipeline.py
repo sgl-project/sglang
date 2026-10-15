@@ -1308,7 +1308,7 @@ class BufferModePipeline:
             return False
         req.prefix_len = matched_len
         req.last_node = node_id
-        req.kv.cache_protected_len = matched_len
+        req.kv.protect_prefix(matched_len)
         full_tokens = max(0, f.matched_len + f.num_tokens - matched_len)
         swa_tokens = sum(
             len(t.host_indices)
