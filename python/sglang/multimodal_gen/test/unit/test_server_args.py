@@ -402,11 +402,11 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
 
         self.assertFalse(args.is_component_attention_backend_automatic("text_encoder"))
 
-    def _fasth3_args(self, capability=(9, 0), cuda=True, **kwargs):
+    def _fasth3_args(self, capability=(9, 0), rocm=False, **kwargs):
         with (
             patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
-                return_value=cuda,
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_rocm",
+                return_value=rocm,
             ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_capability",
@@ -448,8 +448,9 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
                     args.is_component_attention_backend_automatic("transformer")
                 )
 
-    def test_fasth3_keeps_dense_attention_off_cuda(self):
-        args = self._fasth3_args((9, 0), cuda=False)
+    def test_fasth3_keeps_the_rocm_default_backend(self):
+        args = self._fasth3_args((9, 0), rocm=True)
+        self.assertEqual(args.attention_backend, "aiter")
         self.assertEqual(args.component_attention_backends, {})
         self.assertFalse(args.is_component_attention_backend_automatic("transformer"))
 
