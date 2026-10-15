@@ -21,6 +21,7 @@ from sglang.kernels.jit.utils.compile import (
     cuda_stubs_dir,
     load_jit,
     make_cpp_args,
+    parallel_compile,
 )
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "is_musa_runtime",
     "make_cpp_args",
     "load_jit",
+    "parallel_compile",
     "cuda_stubs_dir",
     "override_jit_cuda_arch",
     "get_activation_cuda_cflags",
