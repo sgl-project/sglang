@@ -124,7 +124,13 @@ class BuiltMonokernels(Protocol):
     """The object a spec's build returns; it runs every built width's steps."""
 
     def forward(self, plan: Plan, *args: Any, **kwargs: Any) -> Any:
-        """Run a routed step with the model forward's arguments and outputs."""
+        """Run a routed step in place of the model's forward.
+
+        It takes that forward's arguments and returns what it returns, writes the KV
+        cache and auxiliary hidden states the standard path writes for every row,
+        padded rows included, and is capturable in a CUDA graph: no host sync, and
+        shapes fixed by plan.key.
+        """
 
 
 class MonoSpec(msgspec.Struct, frozen=True):
