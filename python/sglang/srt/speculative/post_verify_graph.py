@@ -21,7 +21,7 @@ import contextlib
 import logging
 import os
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -337,10 +337,16 @@ class PostVerifyGraph:
             )
 
     def _load(self, slot: _Slot, inputs: Dict[str, torch.Tensor], sim_len):
+        # One multi-tensor copy per dtype; one memcpy per input costs ~4 us of GPU time each.
+        groups: Dict[torch.dtype, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         for name, src in inputs.items():
             dst = slot.inputs[name]
             if dst.data_ptr() != src.data_ptr():
-                dst.copy_(src, non_blocking=True)
+                dsts, srcs = groups.setdefault(src.dtype, ([], []))
+                dsts.append(dst)
+                srcs.append(src)
+        for dsts, srcs in groups.values():
+            torch._foreach_copy_(dsts, srcs, non_blocking=True)
         if sim_len is not None:
             slot.inputs["sim_len"].copy_(sim_len, non_blocking=True)
             done = self._sim_len_done[self._sim_len_slot]
