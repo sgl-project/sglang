@@ -88,7 +88,7 @@ export const config = {
       : s.guidance === "three" ? { guidance_scale: 5, uncond_skip_layers: [], slg_layers: [22], slg_scale: 3 } : {};
     return `curl --fail-with-body http://{{CURL_HOST}}:{{CURL_PORT}}/v1/images/generations \\
   -H 'Content-Type: application/json' \\
-  -d '${JSON.stringify({ model: "{{MODEL_NAME}}", prompt: "A quiet coastal town at sunrise, cinematic photography", size: "1024x1024", seed: 42, quality: s.quality, response_format: "b64_json", ...guidance }, null, 2)}'`;
+  -d '${JSON.stringify({ model: "{{MODEL_NAME}}", prompt: "A quiet coastal town at sunrise, cinematic photography", size: "1024x1024", seed: 42, quality: s.quality, response_format: "b64_json", output_format: "png", ...guidance }, null, 2)}'`;
   },
   cells: [],
 };
