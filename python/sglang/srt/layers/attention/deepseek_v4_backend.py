@@ -1625,9 +1625,6 @@ class DeepseekV4AttnBackend(
         for_prefill_graph: bool = False,
         max_seq_len_override: Optional[int] = None,
     ) -> DSV4Metadata:
-        # Each request contributes only its last SWA_WINDOW extend tokens, with the
-        # window floored at seq_len - SWA_WINDOW: a tail shorter than a window reads
-        # rows the previous chunk's tail wrote.
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None

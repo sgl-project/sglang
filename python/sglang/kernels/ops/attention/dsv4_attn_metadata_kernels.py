@@ -446,7 +446,8 @@ def late_layer_tail_layout(
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
     """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
     Returns (token indices into the extend, per-request tail lengths, per-row
-    absolute window floor)."""
+    absolute window floor). The floor is seq_len - tail_len, so a tail shorter
+    than tail_len reads rows the request wrote before this extend."""
     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]

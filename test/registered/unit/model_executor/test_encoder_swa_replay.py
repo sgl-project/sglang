@@ -212,9 +212,8 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         torch.testing.assert_close(layout.indices, expected.indices)
 
     def test_short_tail_floors_one_window_back(self):
-        """A final prefill chunk shorter than a window reads the window rows the
-        previous chunk wrote, so its tail is floored at seq_len - SWA_WINDOW.
-        Covers a batch of one request and a batch of several."""
+        """A final chunk shorter than a window reads the rows the previous chunk's
+        tail wrote, so its tail is floored at seq_len - SWA_WINDOW."""
         cpu = torch.device("cpu")
         _, _, floor = late_layer_tail_layout(
             extend_lens_cpu=[40], seq_lens_cpu=[300], tail_len=SWA_WINDOW, device=cpu

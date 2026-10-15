@@ -677,9 +677,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     def swa_reprefill_tail_tokens(self, req=None) -> int:
-        # Only caches whose matched SWA is not reusable as is (the unified_kv
-        # ring, decoder bounded replay) hold back a trailing window for
-        # re-prefill; they override this. req is the request being matched.
+        # Caches whose matched SWA is not reusable as is override this.
         return 0
 
     def supports_mamba(self) -> bool:

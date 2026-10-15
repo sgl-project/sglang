@@ -3602,22 +3602,14 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._sliding_window_size
 
     def swa_reprefill_tail_tokens(self, req=None) -> int:
-        """
-        unified_kv needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never stored in the tree, so a
-        reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring.
+        """Tokens at the end of a matched prefix to re-prefill because their SWA
+        cannot be reused as is.
 
-        Applies to plain radix reuse as well as HiCache -- the ring is stale
-        either way. Without decoder bounded replay, returns 0 once SWA has a host
-        pool to restore exact contents from, and for every non-unified_kv layout,
-        whose SWA slots are content-stable.
-
-        DeepSeek-V4.1 decoder SWA bounded replay writes late-layer window KV only
-        for an extend's tail rows, so a matched prefix may lack it; holding one
-        window back keeps every hit extend at least a window long. A streaming
-        turn that borrows its session's record needs no hold-back: that record
-        is the request's own KV, whose last window is written.
+        unified_kv keeps SWA in a per-request ring (state_slot/pos) the tree never
+        stores, so a reused window would read another request's stale slots; a
+        host pool restores exact contents instead. Decoder SWA bounded replay
+        writes late-layer window KV only for an extend's tail rows, so a matched
+        prefix may lack it; a streaming turn borrowing its own record has it.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
