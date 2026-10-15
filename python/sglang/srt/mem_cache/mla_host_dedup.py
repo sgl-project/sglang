@@ -50,6 +50,17 @@ def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
     )
 
 
+def mla_host_dedup_enabled(
+    kv_cache, storage_backend: Optional[str], enabled: bool
+) -> bool:
+    """Use the same gate for host budgeting and host-pool construction."""
+    return (
+        enabled
+        and mla_host_dedup_eligible(kv_cache, storage_backend)
+        and mla_dedup_rank_and_size()[1] > 1
+    )
+
+
 class MLAHostDedupBroadcaster:
     """Layerwise MLA/DSA broadcast over a dedicated NCCL group."""
 
@@ -258,11 +269,7 @@ def maybe_create_mla_host_dedup_context(
     enabled: bool = False,
 ) -> Optional[MLAHostDedupContext]:
     """Create dedup state before host allocation, or preserve the original path."""
-    if not enabled:
-        return None
-    if not mla_host_dedup_eligible(kv_cache, storage_backend):
-        return None
-    if mla_dedup_rank_and_size()[1] <= 1:
+    if not mla_host_dedup_enabled(kv_cache, storage_backend, enabled):
         return None
 
     broadcaster = MLAHostDedupBroadcaster.build(kv_cache, tp_group, attn_tp_group)

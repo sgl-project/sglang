@@ -14,6 +14,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.mla_host_dedup import (
+    mla_dedup_rank_and_size,
+    mla_host_dedup_enabled,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     host_memory_budget_bytes,
     host_memory_budget_scope,
@@ -79,23 +83,72 @@ def _estimate_hicache_bytes(
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 
+def _dedup_host_memory_budget(device_bytes: int, *, auto_size: bool) -> int:
+    """Distribute one host snapshot by physical bytes, including local drafts.
+
+    All ranks participate once, before constructing any pools. Per-pool
+    collectives are unsafe because PP stages can build different pool counts.
+    """
+    available = host_memory_budget_bytes(auto_size=auto_size, split_by_ranks=False)
+    if not torch.distributed.is_initialized():
+        return available
+    world = get_parallel().world_group
+    value = torch.tensor([device_bytes, available], dtype=torch.int64)
+    values = [torch.empty_like(value) for _ in range(world.world_size)]
+    torch.distributed.all_gather(values, value, group=world.cpu_group)
+    local_ranks = ranks_per_host()
+    first = world.rank_in_group // local_ranks * local_ranks
+    local = values[first : first + local_ranks]
+    total_bytes = sum(int(v[0]) for v in local)
+    if total_bytes == 0:
+        # A host containing only dummy peers needs no payload budget.
+        return 0
+    available = min(int(v[1]) for v in local)
+    return available * int(device_bytes) // total_bytes
+
+
 @contextmanager
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
 ):
-    """Reduce the default HiCache ratio until this machine's host pools fit.
+    """Budget physical host pools and reduce the default ratio until they fit.
 
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
+    Dedup still needs an ownership-aware budget in that case; it must not give
+    the source only one rank's share while dummy peers leave theirs unused.
     """
-    fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    memory = get_memory()
+    if not enabled:
         yield
         return
-    requested = get_memory().hicache_ratio
+    pool = params.token_to_kv_pool_allocator.get_kvcache()
+    dedup = mla_host_dedup_enabled(
+        pool, memory.hicache_storage_backend, memory.enable_mla_hicache_host_dedup
+    )
+    fraction = memory.hicache_host_memory_fraction
+    if fraction is None and not dedup:
+        yield
+        return
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    budget = int(host_memory_budget_bytes(auto_size=True) * fraction)
-    ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
-    # One collective before any pool is built: PP stages own different pool
+    if dedup:
+        if mla_dedup_rank_and_size()[0] != 0:
+            # DSA includes indexer bytes here. Draft sidecars remain rank-local.
+            device_bytes -= _pool_bytes(pool)
+        budget = _dedup_host_memory_budget(device_bytes, auto_size=fraction is not None)
+    else:
+        budget = host_memory_budget_bytes(auto_size=True)
+    if fraction is None:
+        with host_memory_budget_scope(budget):
+            yield
+        return
+    budget = int(budget * fraction)
+    requested = memory.hicache_ratio
+    ratio = (
+        min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
+        if device_bytes
+        else requested
+    )
+    # Synchronize before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
     if torch.distributed.is_initialized():
         value = torch.tensor([ratio], dtype=torch.float64)
