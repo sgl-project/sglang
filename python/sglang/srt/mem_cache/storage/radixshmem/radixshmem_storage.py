@@ -2,10 +2,14 @@
 
 radixshmem keeps its own index and SlotStore; sglang keeps its host staging
 pool and pages are copied between the two. One slot holds the whole page of
-the attention TP/CP group: a head-sharded pool stores every attention-TP
-rank's part side by side, a rank-replicated pool (MLA) stores one copy.
-Keys are sglang's chained page hashes folded to uint64 and salted per model,
-PP stage and pool, so every rank of the group reads the same slot.
+the attention TP/CP group. MHA KV pages are stored as
+(2, layer, page, kv_heads, head_dim) over all KV heads and Mamba states as
+temporal plus conv over all heads, whatever the host layout and TP size:
+each rank copies its own heads into place, so instances with different TP
+sizes share slots. Pools whose shape is not known are stored as the ranks'
+parts side by side, keyed by the TP size; rank-replicated pools (MLA) store
+one copy. Keys are sglang's chained page hashes folded to uint64 and salted
+per model, PP stage, pool and slot shape.
 
 The anchor pool (kv) owns the radix path of a prefix. The swa and mamba
 pools ride on that path as radixshmem's SWA and MAMBA components with their
@@ -92,6 +96,56 @@ def _as_comm(group):
     return group if hasattr(group, "bcast") else _Comm(group)
 
 
+class _Part:
+    def __init__(
+        self,
+        view: Callable[[int], torch.Tensor],
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        axis: Optional[int],
+        spans: Sequence[Tuple[int, int, int]],
+        write: bool,
+    ):
+        self.view = view
+        self.shape = tuple(int(x) for x in shape)
+        self.dtype = dtype
+        self.axis = axis
+        self.spans = list(spans)
+        self.write = write
+        self.nbytes = int(np.prod(self.shape)) * dtype.itemsize
+        self.offset = 0
+
+
+class _Layout:
+    def __init__(self, parts: List[_Part], local_bytes: int):
+        offset = 0
+        for part in parts:
+            part.offset = offset
+            offset += part.nbytes
+        self.parts = parts
+        self.slot_bytes = offset
+        self.local_bytes = local_bytes
+        self.tag = ";".join(f"{p.dtype}{p.shape}@{p.axis}" for p in parts)
+
+
+def _narrow(t: torch.Tensor, axis: Optional[int], start: int, length: int):
+    return t if axis is None else t.narrow(axis, start, length)
+
+
+def _shard_spans(
+    local: int, parts: int, part: int, groups
+) -> List[Tuple[int, int, int]]:
+    if not groups:
+        return [(0, part * local, local)]
+    spans, loc, glob = [], 0, 0
+    for full in groups:
+        sub = full // parts
+        spans.append((loc, glob + part * sub, sub))
+        loc += sub
+        glob += full
+    return spans
+
+
 class _Pool:
     def __init__(
         self,
@@ -103,13 +157,15 @@ class _Pool:
         salt: int,
         kind,
         mask: int,
+        layout: Optional[_Layout] = None,
     ):
         self.name = name
         self.host_pool = host_pool
         self.page_bytes = page_bytes
         self.sharded = parts > 1
-        self.slot_bytes = page_bytes * parts
-        self.offset = part * page_bytes
+        self.layout = layout
+        self.slot_bytes = layout.slot_bytes if layout else page_bytes * parts
+        self.offset = 0 if layout else part * page_bytes
         self.salt = salt
         self.kind = kind
         self.mask = mask
@@ -143,6 +199,8 @@ class RadixShmemStorage(HiCacheStorage):
             ),
         }
         self.swa_window_pages = int(cfg.get("radixshmem_swa_window_pages", 0))
+        self.kv_heads_override = cfg.get("radixshmem_kv_heads")
+        self.device_pools: Dict[Any, Any] = {}
         self.insert_ok = radixshmem.InsertError.OK
         self.host_pools: Dict[Any, Any] = {}
         self.pools: Dict[Any, _Pool] = {}
@@ -181,6 +239,9 @@ class RadixShmemStorage(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: Any, host_pool_name) -> None:
         self._register(host_pool_name, host_pool)
 
+    def describe_pool(self, name, device_pool: Any) -> None:
+        self.device_pools[name] = getattr(device_pool, "mamba_pool", device_pool)
+
     def _register(self, name, host_pool: Any) -> None:
         self.host_pools[name] = host_pool
         if self.index is None:
@@ -207,16 +268,121 @@ class RadixShmemStorage(HiCacheStorage):
             window = None
         return -(-int(window) // block_size) if window else 0
 
+    def _kv_heads(self, name, local: int) -> Optional[int]:
+        if self.tp_parts == 1:
+            return local
+        if self.kv_heads_override:
+            return int(self.kv_heads_override)
+        if name not in (PoolName.KV, PoolName.SWA):
+            return None
+        try:
+            from sglang.srt.runtime_context import process_model_config
+
+            model = process_model_config()
+            text = model.hf_text_config
+            if name == PoolName.SWA and hasattr(text, "swa_num_key_value_heads"):
+                return int(text.swa_num_key_value_heads)
+            return int(model.get_total_num_kv_heads())
+        except Exception:
+            return None
+
+    def _mha_layout(self, name, host_pool: Any) -> Optional[_Layout]:
+        from sglang.srt.mem_cache.pool_host.mha import (
+            AsymmetricMHATokenToKVPoolHost,
+            MHATokenToKVPoolHost,
+        )
+
+        if not isinstance(host_pool, MHATokenToKVPoolHost) or isinstance(
+            host_pool, AsymmetricMHATokenToKVPoolHost
+        ):
+            return None
+        kv = getattr(host_pool, "kv_buffer", None)
+        if not isinstance(kv, torch.Tensor):
+            return None
+        heads, ps = int(host_pool.head_num), int(host_pool.page_size)
+        total = self._kv_heads(name, heads)
+        if not total:
+            return None
+        replicas = max(1, self.tp_parts // total)
+        if heads != max(1, total // self.tp_parts) or self.tp_parts % replicas:
+            return None
+        layout = host_pool.layout
+        if layout == "page_first":
+            view = lambda t: kv[:, t : t + ps].permute(0, 2, 1, 3, 4)
+        elif layout == "layer_first":
+            view = lambda t: kv[:, :, t : t + ps]
+        elif layout == "page_first_direct":
+            view = lambda t: kv[:, t // ps]
+        elif layout == "page_head":
+            view = lambda t: kv[:, t // ps].permute(0, 3, 2, 1, 4)
+        else:
+            return None
+        shape = (2, int(host_pool.layer_num), ps, total, int(host_pool.head_dim))
+        group = self.tp_part // replicas
+        part = _Part(
+            view,
+            shape,
+            kv.dtype,
+            3,
+            [(0, group * heads, heads)],
+            self.tp_part % replicas == 0,
+        )
+        return _Layout([part], 2 * shape[1] * ps * heads * shape[4] * kv.itemsize)
+
+    def _mamba_layout(self, name, host_pool: Any) -> Optional[_Layout]:
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+        if not isinstance(host_pool, MambaPoolHost):
+            return None
+        if getattr(host_pool, "slot_state_device_tensors", None):
+            return None
+        device = self.device_pools.get(name)
+        groups = getattr(device, "conv_shard_groups", None)
+        conv_axis = getattr(device, "conv_slice_axis", 0)
+        page_first = host_pool.layout in ("page_first", "page_first_direct")
+
+        def at(buf):
+            if page_first:
+                return lambda t: buf[t]
+            return lambda t: buf[:, t].unsqueeze(1)
+
+        parts, local_bytes = [], 0
+        tensors = [(host_pool.temporal_buffer, 0, None)] + [
+            (buf, conv_axis, groups) for buf in host_pool.conv_buffer
+        ]
+        for buf, axis, subs in tensors:
+            if buf is None or buf.numel() == 0:
+                continue
+            view = at(buf)
+            local = tuple(view(0).shape)
+            local_bytes += int(np.prod(local)) * buf.itemsize
+            if axis is None:
+                parts.append(_Part(view, local, buf.dtype, None, [], self.tp_part == 0))
+                continue
+            dim = 2 + axis
+            if subs is not None and sum(subs) != local[dim] * self.tp_parts:
+                return None
+            shape = list(local)
+            shape[dim] = local[dim] * self.tp_parts
+            spans = _shard_spans(local[dim], self.tp_parts, self.tp_part, subs)
+            parts.append(_Part(view, shape, buf.dtype, dim, spans, True))
+        return _Layout(parts, local_bytes) if parts else None
+
     def _make_pool(self, name, host_pool: Any, anchor: Optional[_Pool]) -> _Pool:
         sharded = self._sharded(name) and self.tp_parts > 1
+        layout = None
+        if self._sharded(name):
+            layout = self._mha_layout(name, host_pool) or self._mamba_layout(
+                name, host_pool
+            )
         parts = self.tp_parts if sharded else 1
         part = self.tp_part if sharded else 0
-        page_bytes = _page_bytes(host_pool)
+        page_bytes = layout.local_bytes if layout else _page_bytes(host_pool)
         kind, mask = self.full, self.full_mask
         salt = _salt(
             self.config.model_name,
             f"pp{self.config.pp_rank}/{self.config.pp_size}",
-            f"tp{parts}",
+            layout.tag if layout else f"tp{parts}",
             str(name),
         )
         component = self.components.get(name)
@@ -229,7 +395,7 @@ class RadixShmemStorage(HiCacheStorage):
         ):
             kind, mask = component
             salt = anchor.salt
-        return _Pool(name, host_pool, page_bytes, parts, part, salt, kind, mask)
+        return _Pool(name, host_pool, page_bytes, parts, part, salt, kind, mask, layout)
 
     def _attach(self) -> None:
         if self.index is not None:
@@ -275,6 +441,7 @@ class RadixShmemStorage(HiCacheStorage):
             self.store = client.store
             self._data_view = self.store.data_view()
             self._data_base = np.frombuffer(self._data_view, dtype=np.uint8).ctypes.data
+            self._data = torch.frombuffer(self._data_view, dtype=torch.uint8)
             self.distributed = self.leader and bool(client.is_distributed())
             self.block_size = block_size
             self.slot_bytes = slot_bytes
@@ -531,6 +698,9 @@ class RadixShmemStorage(HiCacheStorage):
     ) -> None:
         if not pairs:
             return
+        if pool.layout is not None:
+            self._copy_layout(pool, host_indices, pairs, to_slot)
+            return
         ptrs, sizes = pool.host_pool.get_page_buffer_meta(host_indices)
         per = len(ptrs) // (len(host_indices) // pool.host_pool.page_size)
         for i, slot in pairs:
@@ -545,6 +715,29 @@ class RadixShmemStorage(HiCacheStorage):
                 else:
                     ctypes.memmove(ptrs[j], at, sizes[j])
                 at += sizes[j]
+
+    def _copy_layout(self, pool: _Pool, host_indices, pairs, to_slot: bool) -> None:
+        ps = int(pool.host_pool.page_size)
+        for i, slot in pairs:
+            token = int(host_indices[i * ps])
+            base = int(self.store.slot_offset(int(slot), pool.kind))
+            for part in pool.layout.parts:
+                if to_slot and not part.write:
+                    continue
+                start = base + part.offset
+                stored = (
+                    self._data[start : start + part.nbytes]
+                    .view(part.dtype)
+                    .view(part.shape)
+                )
+                local = part.view(token)
+                for loc, glob, length in part.spans or [(0, 0, 0)]:
+                    src = _narrow(local, part.axis, loc, length)
+                    dst = _narrow(stored, part.axis, glob, length)
+                    if to_slot:
+                        dst.copy_(src)
+                    else:
+                        src.copy_(dst)
 
     # ---- ALL_PAGES pools: one radix path ----
 

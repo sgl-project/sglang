@@ -342,7 +342,13 @@ class HybridCacheController(BaseHiCacheController):
             raise
 
         for entry in host_pools or []:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+            self._register_storage_entry(entry)
+
+    def _register_storage_entry(self, entry: PoolEntry) -> None:
+        describe = getattr(self.storage_backend, "describe_pool", None)
+        if describe is not None:
+            describe(entry.name, entry.device_pool)
+        self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def detach_storage_backend(self):
         super().detach_storage_backend()
@@ -360,7 +366,7 @@ class HybridCacheController(BaseHiCacheController):
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+            self._register_storage_entry(entry)
 
     @staticmethod
     def parse_storage_backend_extra_config(
