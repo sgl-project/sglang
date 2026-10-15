@@ -24,10 +24,15 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 VOCAB, HIDDEN, NUM_AUX = 11, 4, 3
 
 
-def _resolve(*, is_draft_worker=False):
+def _resolve(*, is_draft_worker=False, num_layers=32, num_loops=1):
+    model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            num_hidden_layers=num_layers, num_loops=num_loops
+        )
+    )
     return resolve_spec_aux_hidden_state_config(
         server_args=None,
-        model_config=None,
+        model_config=model_config,
         spec_algorithm=SpeculativeAlgorithm.from_string(None),
         is_draft_worker=is_draft_worker,
     )
@@ -43,7 +48,7 @@ def test_cli_parses_method_and_layer_ids():
             "dummy",
             "--aux-hidden-state-capture",
             "dflash",
-            "--aux-hidden-state-layer-ids",
+            "--return-aux-hidden-state-layer-ids",
             "1",
             "16",
             "31",
@@ -51,23 +56,23 @@ def test_cli_parses_method_and_layer_ids():
     )
     args.resolve_once()
     assert args.aux_hidden_state_capture == "dflash"
-    assert args.aux_hidden_state_layer_ids == [1, 16, 31]
+    assert args.return_aux_hidden_state_layer_ids == [1, 16, 31]
 
 
 @pytest.mark.parametrize(
     "fields,match",
     [
         (
-            dict(aux_hidden_state_layer_ids=[1, 2]),
+            dict(return_aux_hidden_state_layer_ids=[1, 2]),
             "requires --aux-hidden-state-capture",
         ),
         (
             dict(aux_hidden_state_capture="dflash"),
-            "requires --aux-hidden-state-layer-ids",
+            "requires --return-aux-hidden-state-layer-ids",
         ),
         (
             dict(aux_hidden_state_capture="dspark"),
-            "requires --aux-hidden-state-layer-ids",
+            "requires --return-aux-hidden-state-layer-ids",
         ),
         (
             dict(aux_hidden_state_capture="eagle3", speculative_algorithm="EAGLE3"),
@@ -76,6 +81,27 @@ def test_cli_parses_method_and_layer_ids():
         (
             dict(aux_hidden_state_capture="eagle3", pp_size=2),
             "only supports pp_size == 1",
+        ),
+        (
+            dict(
+                aux_hidden_state_capture="eagle3",
+                return_aux_hidden_state_layer_ids=[],
+            ),
+            "must not be empty",
+        ),
+        (
+            dict(
+                aux_hidden_state_capture="dflash",
+                return_aux_hidden_state_layer_ids=[1, 1],
+            ),
+            "must not repeat",
+        ),
+        (
+            dict(
+                aux_hidden_state_capture="dflash",
+                return_aux_hidden_state_layer_ids=[-1],
+            ),
+            "must be non-negative",
         ),
     ],
 )
@@ -101,7 +127,7 @@ def test_disabled_by_default():
 
 def test_eagle3_capture_without_draft():
     with published_topology(
-        aux_hidden_state_capture="eagle3", aux_hidden_state_layer_ids=[1, 5]
+        aux_hidden_state_capture="eagle3", return_aux_hidden_state_layer_ids=[1, 5]
     ):
         config = _resolve()
     assert config.eagle_use_aux_hidden_state
@@ -115,7 +141,7 @@ def test_eagle3_capture_without_draft():
 @pytest.mark.parametrize("method,is_dspark", [("dflash", False), ("dspark", True)])
 def test_dflash_family_capture_without_draft(method, is_dspark):
     with published_topology(
-        aux_hidden_state_capture=method, aux_hidden_state_layer_ids=[1, 16, 31]
+        aux_hidden_state_capture=method, return_aux_hidden_state_layer_ids=[1, 16, 31]
     ):
         config = _resolve()
     assert config.dflash_use_aux_hidden_state
@@ -127,10 +153,26 @@ def test_dflash_family_capture_without_draft(method, is_dspark):
 
 def test_draft_runner_never_captures():
     with published_topology(
-        aux_hidden_state_capture="dflash", aux_hidden_state_layer_ids=[1]
+        aux_hidden_state_capture="dflash", return_aux_hidden_state_layer_ids=[1]
     ):
         config = _resolve(is_draft_worker=True)
     assert not config.dflash_use_aux_hidden_state
+
+
+def test_layer_id_beyond_target_depth_is_rejected():
+    with published_topology(
+        aux_hidden_state_capture="dflash", return_aux_hidden_state_layer_ids=[1, 8]
+    ):
+        with pytest.raises(ValueError, match="out of range"):
+            _resolve(num_layers=8)
+
+
+def test_loop_models_span_num_hidden_layers_times_num_loops():
+    with published_topology(
+        aux_hidden_state_capture="dflash", return_aux_hidden_state_layer_ids=[1, 12]
+    ):
+        config = _resolve(num_layers=8, num_loops=2)
+    assert config.dflash_target_layer_ids == [1, 12]
 
 
 class _Model:
@@ -209,7 +251,7 @@ def test_full_capture_keeps_last_hidden_next_to_aux():
     output, hidden_states, aux = _run_logits_processor(
         CaptureHiddenMode.FULL,
         aux_hidden_state_capture="dflash",
-        aux_hidden_state_layer_ids=[0, 1, 2],
+        return_aux_hidden_state_layer_ids=[0, 1, 2],
     )
     torch.testing.assert_close(output.hidden_states, torch.cat(aux, dim=-1))
     torch.testing.assert_close(output.last_hidden_states, hidden_states)

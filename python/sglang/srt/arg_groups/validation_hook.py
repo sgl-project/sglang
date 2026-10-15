@@ -694,9 +694,10 @@ def validate_aux_hidden_state_capture(server_args: Any):
     cfg = resolving_view(server_args)
     method = cfg.aux_hidden_state_capture
     if method is None:
-        if cfg.aux_hidden_state_layer_ids is not None:
+        if cfg.return_aux_hidden_state_layer_ids is not None:
             raise ValueError(
-                "--aux-hidden-state-layer-ids requires --aux-hidden-state-capture."
+                "--return-aux-hidden-state-layer-ids requires "
+                "--aux-hidden-state-capture."
             )
         return
     if cfg.speculative_algorithm is not None:
@@ -709,10 +710,25 @@ def validate_aux_hidden_state_capture(server_args: Any):
             "--aux-hidden-state-capture only supports pp_size == 1: the capture "
             "hooks only see the layers on the last pipeline rank."
         )
-    if method != "eagle3" and not cfg.aux_hidden_state_layer_ids:
+    if method != "eagle3" and not cfg.return_aux_hidden_state_layer_ids:
         raise ValueError(
             f"--aux-hidden-state-capture {method} requires "
-            "--aux-hidden-state-layer-ids."
+            "--return-aux-hidden-state-layer-ids."
+        )
+    layer_ids = cfg.return_aux_hidden_state_layer_ids
+    if layer_ids is None:
+        return
+    if len(layer_ids) == 0:
+        raise ValueError("--return-aux-hidden-state-layer-ids must not be empty.")
+    if any(layer_id < 0 for layer_id in layer_ids):
+        raise ValueError(
+            "--return-aux-hidden-state-layer-ids must be non-negative, got "
+            f"{list(layer_ids)}."
+        )
+    if len(set(layer_ids)) != len(layer_ids):
+        raise ValueError(
+            "--return-aux-hidden-state-layer-ids must not repeat a layer, got "
+            f"{list(layer_ids)}."
         )
 
 

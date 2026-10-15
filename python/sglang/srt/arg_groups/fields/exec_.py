@@ -135,7 +135,7 @@ class ExecFeatures(msgspec.Struct):
             choices=["eagle3", "dflash", "dspark"],
         ),
     ] = None
-    aux_hidden_state_layer_ids: A[
+    return_aux_hidden_state_layer_ids: A[
         Optional[List[int]],
         "Target layer ids captured by --aux-hidden-state-capture, in the "
         "convention of a draft config's target layer ids. Required for dflash "
