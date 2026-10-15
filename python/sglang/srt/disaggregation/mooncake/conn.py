@@ -1843,6 +1843,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # shards it per rank).
         if self._should_skip_cp_replicated_state_transfer():
             skip_state = True
+        if (
+            self.kv_shard_state_peer_only
+            and info is not None
+            and not self._is_state_peer(
+                dst_tp_rank=info.dst_tp_rank, dst_attn_tp_size=info.dst_attn_tp_size
+            )
+        ):
+            skip_state = True
 
         if not self.is_hybrid_mla_backend:
             return skip_kv, skip_state
