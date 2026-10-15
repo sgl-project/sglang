@@ -12,7 +12,7 @@ inputs:
         - an object { "prefix": "...", "expected_count": N }: for matrix jobs
     required: true
   max-wait-minutes:
-    description: 'Maximum time to wait before timing out'
+    description: 'Maximum wall-clock time to wait before reporting `timeout`. On GitHub-hosted runners, whose jobs are hard-capped at 6h, keep it under 360 with room for job setup.'
     required: false
     default: '240'
   poll-interval-seconds:
@@ -47,7 +47,8 @@ runs:
           const jobSpecs = JSON.parse(process.env.INPUT_JOBS);
           const maxWaitMinutes = parseInt(process.env.INPUT_MAX_WAIT_MINUTES);
           const pollIntervalSeconds = parseInt(process.env.INPUT_POLL_INTERVAL_SECONDS);
-          const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
+          // Each poll also spends time on API calls, so only a deadline bounds the real wait.
+          const deadlineMs = Date.now() + maxWaitMinutes * 60 * 1000;
 
           const { resolveCiLabels } = require(
             `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
@@ -136,7 +137,7 @@ runs:
             }
           }
 
-          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          for (let attempt = 0; ; attempt++) {
             const { jobs, cached } = await fetchJobs();
 
             let allCompleted = true;
@@ -205,8 +206,13 @@ runs:
               return;
             }
 
-            console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
-            await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
+            const remainingMs = deadlineMs - Date.now();
+            if (remainingMs <= 0) {
+              break;
+            }
+            const sleepMs = Math.min(pollIntervalSeconds * 1000, remainingMs);
+            console.log(`Waiting ${Math.ceil(sleepMs / 1000)}s... (attempt ${attempt + 1}, ${Math.ceil(remainingMs / 60000)} min left of ${maxWaitMinutes})`);
+            await new Promise(resolve => setTimeout(resolve, sleepMs));
           }
 
           core.setFailed(`Timeout waiting for ${stageName} jobs`);
