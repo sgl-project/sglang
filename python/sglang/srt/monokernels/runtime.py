@@ -6,7 +6,7 @@ from __future__ import annotations
 import functools
 import logging
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 import torch
 import torch.distributed as dist
@@ -30,6 +30,14 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+
 logger = logging.getLogger(__name__)
 
 # Source-contract inventory for test_mono_contract.
@@ -45,6 +53,7 @@ SGLANG_READS = {
     ),
     "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
     "srt/model_executor/forward_batch_info.py": (
+        "ForwardBatch",
         "forward_mode",
         "batch_size",
         "input_ids",
@@ -59,6 +68,7 @@ SGLANG_READS = {
         '"_derived_weight_cache_error"',
     ),
     "srt/model_executor/runner/decode_cuda_graph_runner.py": (
+        "DecodeCudaGraphRunner",
         "capture_bs",
         "model_runner",
     ),
@@ -82,7 +92,7 @@ def _backend() -> Optional[str]:
     return get_exec().kernel.monokernel_backend
 
 
-def _gather_tp(obj) -> list:
+def _gather_tp(obj: Any) -> list[Any]:
     """Gather a value from every TP rank through the CPU group."""
     group = get_parallel().tp_group
     if group.world_size == 1:
@@ -92,7 +102,9 @@ def _gather_tp(obj) -> list:
     return out
 
 
-def monokernel_weights_iterator(*, model, weights):
+def monokernel_weights_iterator(
+    *, model: torch.nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
     """Let the spec observe checkpoint tensors before model-specific conversion."""
     backend = _backend()
     if backend is None:
@@ -102,6 +114,7 @@ def monokernel_weights_iterator(*, model, weights):
     )
     if spec is None or spec.load_tensor is None:
         return weights
+    # the copies ride on the model from the loader to install_monokernel_forward
     copies = model.__dict__.setdefault("_mono_copies", {})
 
     def watched():
@@ -112,7 +125,7 @@ def monokernel_weights_iterator(*, model, weights):
     return watched()
 
 
-def shape_key(forward_batch) -> Optional[ShapeKey]:
+def shape_key(forward_batch: ForwardBatch) -> Optional[ShapeKey]:
     """The graph key of a DECODE or TARGET_VERIFY step, else None."""
     mode = forward_batch.forward_mode
     if mode.is_decode():
@@ -127,7 +140,12 @@ def shape_key(forward_batch) -> Optional[ShapeKey]:
     return ShapeKey(forward_mode=name, batch_size=bs, tokens_per_request=rows // bs)
 
 
-def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) -> None:
+def install_monokernel_forward(
+    *,
+    model: torch.nn.Module,
+    hf_config: PretrainedConfig,
+    capture_tail_hooks: list[Callable[..., None]],
+) -> None:
     """Build the selected spec and install its forward; runs before KV cache sizing."""
     backend = _backend()
     if backend is None:
@@ -264,7 +282,13 @@ class _CaptureCheck:
         self.captured: dict[int, Optional[ShapeKey]] = {}
         self.is_done = False
 
-    def __call__(self, runner, out, forward_batch, num_tokens) -> None:
+    def __call__(
+        self,
+        runner: DecodeCudaGraphRunner,
+        out: Any,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+    ) -> None:
         if self.is_done or not torch.cuda.is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
         self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
@@ -299,7 +323,9 @@ class _CaptureCheck:
         )
 
 
-def _eager_keys(*, served, captured) -> list[ShapeKey]:
+def _eager_keys(
+    *, served: frozenset[ShapeKey], captured: Iterable[Optional[ShapeKey]]
+) -> list[ShapeKey]:
     """Return served keys larger than every captured graph of their mode."""
     # A step pads up to the smallest captured graph of its mode that holds it.
     largest: dict = {}
@@ -314,7 +340,7 @@ def _eager_keys(*, served, captured) -> list[ShapeKey]:
     ]
 
 
-def _served_keys(*, widths, tokens: int) -> frozenset[ShapeKey]:
+def _served_keys(*, widths: tuple[int, ...], tokens: int) -> frozenset[ShapeKey]:
     """The graph keys of the model's step at each width that holds whole requests."""
     # A speculative target runs verify steps only; a plain server runs decode.
     mode = "decode" if tokens == 1 else "target_verify"
@@ -326,7 +352,7 @@ def _served_keys(*, widths, tokens: int) -> frozenset[ShapeKey]:
 
 
 def _install_forward(
-    *, model, built: BuiltMonokernels, served: frozenset[ShapeKey]
+    *, model: torch.nn.Module, built: BuiltMonokernels, served: frozenset[ShapeKey]
 ) -> None:
     """Install shape-based dispatch while preserving the original forward signature."""
     original = model.forward
@@ -344,7 +370,7 @@ def _install_forward(
     model.forward = forward
 
 
-def _format_steps(keys) -> str:
+def _format_steps(keys: Iterable[ShapeKey]) -> str:
     """Format supported batch sizes grouped by step mode and tokens per request."""
     sizes: dict = {}
     for k in keys:
@@ -357,7 +383,7 @@ def _format_steps(keys) -> str:
     )
 
 
-def _format_weight_copies(copies: dict) -> str:
+def _format_weight_copies(copies: dict[tuple, torch.Tensor]) -> str:
     totals: dict = {}  # kind -> (tensors, bytes)
     for (kind, *_), tensor in copies.items():
         count, nbytes = totals.get(kind, (0, 0))

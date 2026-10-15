@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import enum
 import importlib
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import msgspec
 
@@ -167,13 +167,15 @@ def register(*, backend: str, architecture: str, path: str) -> None:
     specs[architecture] = path
 
 
-def spec_registered(*, backend: str, architectures) -> bool:
+def spec_registered(*, backend: str, architectures: Optional[Sequence[str]]) -> bool:
     """Whether the backend registers a spec for any architecture, usable or not."""
     specs = _REGISTRY.get(backend, {})
     return any(arch in specs for arch in architectures or ())
 
 
-def find_spec(*, backend: str, architectures, isa: Optional[str]):
+def find_spec(
+    *, backend: str, architectures: Optional[Sequence[str]], isa: Optional[str]
+) -> tuple[Optional[MonoSpec], str]:
     """The compatible spec and an empty reason, or None and a rejection reason."""
     if backend not in _REGISTRY:
         return None, (

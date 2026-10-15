@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -16,7 +16,11 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
-from sglang.srt.monokernels.spec import Feature, NumericsKind, find_spec
+from sglang.srt.monokernels.spec import Feature, MonoSpec, NumericsKind, find_spec
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +70,10 @@ SGLANG_READS = {
         "model_config_of",
         "resolving_view",
     ),
+    "srt/configs/model_config.py": ("ModelConfig",),
     "srt/environ.py": ("envs", "SGLANG_RAGGED_VERIFY_MODE"),
     "srt/model_executor/cuda_graph_config.py": ("Phase", "DECODE", "with_phase"),
+    "srt/server_args.py": ("ServerArgs",),
 }
 
 # Leave time for peers to abort before the process watchdog fires.
@@ -91,7 +97,7 @@ def device_isa() -> Optional[str]:
     return f"sm_{props.major}{props.minor}"
 
 
-def _ragged_verify(cfg) -> bool:
+def _ragged_verify(cfg: Any) -> bool:
     mode = envs.SGLANG_RAGGED_VERIFY_MODE.get().lower()
     return cfg.speculative_algorithm is not None and mode != "static"
 
@@ -140,7 +146,9 @@ def features_in_use(cfg: Any) -> set[Feature]:
     return {feature for feature, probe in _PROBES.items() if probe(cfg)}
 
 
-def monokernel_disable_reasons(*, cfg, model_config, isa):
+def monokernel_disable_reasons(
+    *, cfg: Any, model_config: ModelConfig, isa: Optional[str]
+) -> tuple[Optional[MonoSpec], list[str]]:
     """Return the matching spec and all configuration rejection reasons."""
     if isa is None:
         return None, ["no GPU is visible"]
@@ -197,7 +205,7 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
 
 
 def covered_capture_sizes(
-    *, widths, tokens_per_request: int, sizes: list[int]
+    *, widths: tuple[int, ...], tokens_per_request: int, sizes: list[int]
 ) -> list[int]:
     """Capture each batch size the spec covers, plus the configured sizes above them."""
     covered = sorted(
@@ -208,7 +216,7 @@ def covered_capture_sizes(
     return covered + sorted(b for b in set(sizes) if b > covered[-1])
 
 
-def handle_monokernel(server_args) -> None:
+def handle_monokernel(server_args: ServerArgs) -> None:
     """Validate the selected backend and resolve its decode capture sizes."""
     cfg = resolving_view(server_args)
     backend = cfg.monokernel_backend
