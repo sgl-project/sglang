@@ -528,11 +528,16 @@ class SchedulerDisaggMixin:
             backend=sa.disagg_transfer_backend,
         )
 
-        # Use GPU buffer when engine supports GPUDirect RDMA, CPU pinned otherwise
+        # Use GPU buffer when engine supports GPUDirect RDMA, CPU pinned otherwise.
+        # disagg_role_device overrides the auto-detected device when set.
+        if sa.disagg_role_device != "auto":
+            device_type = sa.disagg_role_device
+        elif engine.supports_gpu_direct:
+            device_type = current_platform.device_type
+        else:
+            device_type = "cpu"
         device = (
-            f"{current_platform.device_type}:{physical_gpu_id}"
-            if engine.supports_gpu_direct
-            else "cpu"
+            device_type if device_type == "cpu" else f"{device_type}:{physical_gpu_id}"
         )
         buffer = TransferTensorBuffer(
             pool_size=pool_size, device=device, role_name=self._disagg_role.value

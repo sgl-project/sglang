@@ -14,16 +14,6 @@ _MOONCAKE_AVAILABLE = None
 
 
 def _check_mooncake() -> bool:
-    """Probe whether the real Mooncake native extension loads on this host.
-
-    This must import ``mooncake.engine`` itself, not just sglang's wrapper
-    module (which always imports cleanly): the wrapper only raises once it
-    tries the real import inside ``__init__``. Importing the wrapper here
-    would make "auto" always look like Mooncake is available, defeating the
-    fallback. This also means a future Mooncake release with a working
-    non-CUDA (e.g. Intel XPU) build is picked up automatically the moment the
-    import succeeds, with no change needed here.
-    """
     global _MOONCAKE_AVAILABLE
     if _MOONCAKE_AVAILABLE is None:
         try:
@@ -142,6 +132,23 @@ def _recv_exact(conn: socket.socket, n: int) -> bytes:
     return b"".join(chunks)
 
 
+def _recv_exact_or_none(conn: socket.socket, n: int) -> bytes | None:
+    chunk = conn.recv(n)
+    if not chunk:
+        return None
+    chunks = [chunk]
+    remaining = n - len(chunk)
+    while remaining > 0:
+        chunk = conn.recv(remaining)
+        if not chunk:
+            raise ConnectionError(
+                "MockTransferEngine: peer closed before sending all data"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _recv_into_exact(conn: socket.socket, view: memoryview) -> None:
     offset = 0
     remaining = len(view)
@@ -156,16 +163,7 @@ def _recv_into_exact(conn: socket.socket, view: memoryview) -> None:
 
 
 class MockTransferEngine(BaseTransferEngine):
-    """Non-RDMA fallback: moves bytes over a plain TCP loopback/LAN socket.
-
-    Used when Mooncake is unavailable (e.g. its wheel links libcudart and
-    there is no CUDA runtime, as on Intel XPU hosts) or when the backend is
-    explicitly set to "mock". ``supports_gpu_direct`` stays False (the base
-    class default) so callers stage through a CPU pinned buffer instead of a
-    device buffer.
-    """
-
-    _HEADER = struct.Struct("!QQ")  # dst_addr, length
+    _HEADER = struct.Struct("!QQ")
 
     def __init__(self, hostname: str = "127.0.0.1", port: int = 0):
         self._lock = threading.Lock()
@@ -176,10 +174,12 @@ class MockTransferEngine(BaseTransferEngine):
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind((hostname, port))
         self._server.listen(16)
+        self._server.settimeout(0.5)
         bound_port = self._server.getsockname()[1]
         self._session_id = f"{hostname}:{bound_port}"
 
         self._stop = threading.Event()
+        self._conn_threads: list[threading.Thread] = []
         self._accept_thread = threading.Thread(
             target=self._accept_loop, daemon=True, name="mock-transfer-engine-accept"
         )
@@ -196,38 +196,65 @@ class MockTransferEngine(BaseTransferEngine):
             self._local_len = length
 
     def deregister_buffer(self, ptr: int) -> None:
+        self._stop.set()
+        self._accept_thread.join()
+        self._server.close()
+        with self._lock:
+            conn_threads = list(self._conn_threads)
+        for conn_thread in conn_threads:
+            conn_thread.join(timeout=5)
+            if conn_thread.is_alive():
+                logger.warning(
+                    "MockTransferEngine: a connection thread outlived "
+                    "deregister_buffer; a write may still land after teardown"
+                )
         with self._lock:
             self._local_ptr = 0
             self._local_len = 0
-        self._stop.set()
-        self._server.close()
 
     def _accept_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 conn, _ = self._server.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
-            threading.Thread(
+            conn_thread = threading.Thread(
                 target=self._serve_conn, args=(conn,), daemon=True
-            ).start()
+            )
+            with self._lock:
+                self._conn_threads.append(conn_thread)
+            conn_thread.start()
 
     def _serve_conn(self, conn: socket.socket) -> None:
         try:
-            dst_addr, length = self._HEADER.unpack(_recv_exact(conn, self._HEADER.size))
-            with self._lock:
-                ptr, size = self._local_ptr, self._local_len
-            if dst_addr < ptr or dst_addr + length > ptr + size:
-                raise ValueError(
-                    f"dst_addr {dst_addr}+{length} outside registered buffer "
-                    f"[{ptr}, {ptr + size})"
-                )
-            _recv_into_exact(conn, _memoryview_from_ptr(dst_addr, length))
-            conn.sendall(b"\x01")
+            while True:
+                header = _recv_exact_or_none(conn, self._HEADER.size)
+                if header is None:
+                    return
+                dst_addr, length = self._HEADER.unpack(header)
+                with self._lock:
+                    ptr, size = self._local_ptr, self._local_len
+                if dst_addr < ptr or dst_addr + length > ptr + size:
+                    raise ValueError(
+                        f"dst_addr {dst_addr}+{length} outside registered buffer "
+                        f"[{ptr}, {ptr + size})"
+                    )
+                _recv_into_exact(conn, _memoryview_from_ptr(dst_addr, length))
+                conn.sendall(b"\x01")
         except Exception:
             logger.exception("MockTransferEngine: failed to serve incoming transfer")
         finally:
             conn.close()
+
+    def _send_one(
+        self, conn: socket.socket, src_addr: int, dst_addr: int, length: int
+    ) -> None:
+        conn.sendall(self._HEADER.pack(dst_addr, length))
+        conn.sendall(_memoryview_from_ptr(src_addr, length))
+        if _recv_exact(conn, 1) != b"\x01":
+            raise ValueError("peer did not ack the transfer")
 
     def transfer_sync(
         self, dst_session_id: str, src_addr: int, dst_addr: int, length: int
@@ -235,10 +262,9 @@ class MockTransferEngine(BaseTransferEngine):
         try:
             host, port_str = dst_session_id.rsplit(":", 1)
             with socket.create_connection((host, int(port_str))) as conn:
-                conn.sendall(self._HEADER.pack(dst_addr, length))
-                conn.sendall(_memoryview_from_ptr(src_addr, length))
-                if _recv_exact(conn, 1) != b"\x01":
-                    raise ValueError("peer did not ack the transfer")
+                self._send_one(
+                    conn, src_addr=src_addr, dst_addr=dst_addr, length=length
+                )
             return 0
         except Exception:
             logger.exception(
@@ -253,11 +279,19 @@ class MockTransferEngine(BaseTransferEngine):
         dst_addrs: list[int],
         lengths: list[int],
     ) -> int:
-        for src_addr, dst_addr, length in zip(src_addrs, dst_addrs, lengths):
-            ret = self.transfer_sync(dst_session_id, src_addr, dst_addr, length)
-            if ret != 0:
-                return ret
-        return 0
+        try:
+            host, port_str = dst_session_id.rsplit(":", 1)
+            with socket.create_connection((host, int(port_str))) as conn:
+                for src_addr, dst_addr, length in zip(src_addrs, dst_addrs, lengths):
+                    self._send_one(
+                        conn, src_addr=src_addr, dst_addr=dst_addr, length=length
+                    )
+            return 0
+        except Exception:
+            logger.exception(
+                "MockTransferEngine: batch_transfer_sync to %s failed", dst_session_id
+            )
+            return -1
 
 
 def create_transfer_engine(
@@ -266,13 +300,7 @@ def create_transfer_engine(
     ib_device: str | None = None,
     backend: str = "auto",
 ) -> BaseTransferEngine:
-    """Factory: builds the transfer engine for ``backend``.
-
-    "mooncake" requires the mooncake package and raises if it is missing.
-    "mock" is the non-RDMA TCP fallback, usable on any device/host. "auto"
-    prefers mooncake and falls back to the mock engine when mooncake is
-    unavailable.
-    """
+    """Factory: builds the transfer engine for ``backend`` ("auto", "mock", "mooncake")."""
     if backend == "mooncake":
         if not _check_mooncake():
             raise RuntimeError(
