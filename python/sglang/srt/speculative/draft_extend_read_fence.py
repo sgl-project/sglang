@@ -24,10 +24,13 @@ import enum
 import logging
 import threading
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -97,10 +100,20 @@ class DraftExtendReadFence:
         )
 
     @classmethod
-    def from_env(cls) -> Optional[DraftExtendReadFence]:
+    def from_env(
+        cls, *, allocator: BaseTokenToKVPoolAllocator
+    ) -> Optional[DraftExtendReadFence]:
         capture_marker = draft_extend_in_graph_fence_enabled()
         allow_pre_replay = envs.SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE.get()
         if not (capture_marker or allow_pre_replay):
+            return None
+        # Under PD (need_sort) a fence that ends before the replay's KV writes is
+        # sound only if freed pages wait for them before reuse.
+        if allocator.need_sort and not allocator.supports_reuse_guard:
+            logger.warning(
+                "Draft-extend read fence off: %s has no KV page reuse guard",
+                type(allocator).__name__,
+            )
             return None
         return cls(
             capture_marker=capture_marker,

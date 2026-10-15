@@ -39,6 +39,9 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Implements set_reuse_guard_event (see PagedTokenToKVPoolAllocator).
+    supports_reuse_guard = False
+
     @abc.abstractmethod
     def __init__(
         self,

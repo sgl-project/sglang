@@ -298,7 +298,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.buffers.share_buffers(exclude={"select_index"})
 
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
-        self.read_fence = DraftExtendReadFence.from_env()
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        self.read_fence = DraftExtendReadFence.from_env(allocator=allocator)
+        # PD only: a KV transfer into a page freed during the replay is not
+        # stream-ordered against the replay's KV writes.
+        self.kv_reuse_guard = (
+            allocator if self.read_fence is not None and allocator.need_sort else None
+        )
 
         self.backend = resolve_decode_backend(self)
 
@@ -321,6 +327,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self.draft_extend_attn_backend, self.forward_mode
             )
         )
+
+    def _kv_writes_done_event(self, shared_read_ends: SharedReadEnds):
+        """An event after this replay when the published read-done event precedes
+        the replay's KV writes; None when the barrier already covers them."""
+        fence_ends_early = shared_read_ends is SharedReadEnds.PRE_REPLAY or (
+            shared_read_ends is SharedReadEnds.IN_REPLAY
+            and self.in_graph_metadata_prep_done is not None
+        )
+        if not fence_ends_early:
+            return None
+        event = self.device_module.Event()
+        event.record()
+        return event
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -692,6 +711,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self._publish_read_done(
                 in_graph=shared_read_ends is SharedReadEnds.IN_REPLAY
                 and self.in_graph_metadata_prep_done is not None
+            )
+        if self.kv_reuse_guard is not None:
+            self.kv_reuse_guard.set_reuse_guard_event(
+                self._kv_writes_done_event(shared_read_ends)
             )
 
         out = LogitsProcessorOutput(

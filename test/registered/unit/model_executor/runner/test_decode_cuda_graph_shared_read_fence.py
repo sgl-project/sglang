@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import create_autospec
 
 import pytest
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -9,6 +10,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -93,6 +96,40 @@ def _extend_runner(*, declared: SharedReadEnds, fence, has_marker: bool):
     return runner
 
 
+class _UnguardedAllocator(BaseTokenToKVPoolAllocator):
+    def __init__(self, *, need_sort):
+        super().__init__(
+            size=64,
+            page_size=4,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=need_sort,
+        )
+
+    def alloc(self, need_size):
+        raise NotImplementedError
+
+    def clear(self):
+        pass
+
+    def free(self, free_index):
+        raise NotImplementedError
+
+
+def _allocator(*, need_sort, guarded=True):
+    if not guarded:
+        return _UnguardedAllocator(need_sort=need_sort)
+    return PagedTokenToKVPoolAllocator(
+        size=64,
+        page_size=4,
+        dtype=torch.float16,
+        device="cpu",
+        kvcache=None,
+        need_sort=need_sort,
+    )
+
+
 def _fence(*, ctl_path=None, allow_pre_replay=False):
     # Tests drive the control-file poll by hand instead of the background thread.
     return DraftExtendReadFence(
@@ -116,7 +153,9 @@ def test_draft_extend_fence_disabled_by_default():
         envs.SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE.override(False),
         envs.SGLANG_Q35MF_PDDEC_FENCE_AB_CTL.override(""),
     ):
-        assert DraftExtendReadFence.from_env() is None
+        assert (
+            DraftExtendReadFence.from_env(allocator=_allocator(need_sort=True)) is None
+        )
         backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
         assert backend.shared_read_ends(DRAFT_EXTEND) is SharedReadEnds.UNKNOWN
 
@@ -214,7 +253,7 @@ def test_draft_extend_static_policies_from_env():
         envs.SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE.override(False),
         envs.SGLANG_Q35MF_PDDEC_FENCE_AB_CTL.override(""),
     ):
-        fence = DraftExtendReadFence.from_env()
+        fence = DraftExtendReadFence.from_env(allocator=_allocator(need_sort=False))
         assert fence.capture_marker
         assert fence.policy_for_round() is DraftExtendFencePolicy.IN_GRAPH
     with (
@@ -222,10 +261,46 @@ def test_draft_extend_static_policies_from_env():
         envs.SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE.override(True),
         envs.SGLANG_Q35MF_PDDEC_FENCE_AB_CTL.override(""),
     ):
-        fence = DraftExtendReadFence.from_env()
+        fence = DraftExtendReadFence.from_env(allocator=_allocator(need_sort=False))
         # The measurement arm needs no marker.
         assert not fence.capture_marker
         assert fence.policy_for_round() is DraftExtendFencePolicy.PRE_REPLAY
+
+
+def test_draft_extend_fence_off_under_pd_without_reuse_guard():
+    # PD transfers into reused pages are not stream-ordered: no guard, no fine fence.
+    with (
+        envs.SGLANG_Q35MF_PDDEC_FENCE.override(True),
+        envs.SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE.override(False),
+        envs.SGLANG_Q35MF_PDDEC_FENCE_AB_CTL.override(""),
+    ):
+        from_env = DraftExtendReadFence.from_env
+        assert from_env(allocator=_allocator(need_sort=True, guarded=False)) is None
+        assert from_env(allocator=_allocator(need_sort=True)) is not None
+        assert (
+            from_env(allocator=_allocator(need_sort=False, guarded=False)) is not None
+        )
+
+
+@pytest.mark.parametrize(
+    "ends, has_marker, guarded",
+    [
+        (SharedReadEnds.IN_REPLAY, True, True),
+        (SharedReadEnds.PRE_REPLAY, False, True),
+        # These fences already wait for the end of the replay.
+        (SharedReadEnds.IN_REPLAY, False, False),
+        (SharedReadEnds.POST_REPLAY, False, False),
+        (SharedReadEnds.UNKNOWN, True, False),
+    ],
+)
+def test_draft_extend_kv_writes_need_guard_only_when_fence_ends_early(
+    ends, has_marker, guarded
+):
+    runner = _extend_runner(declared=ends, fence=None, has_marker=has_marker)
+    runner.device_module = SimpleNamespace(
+        Event=lambda: SimpleNamespace(record=lambda: None)
+    )
+    assert (runner._kv_writes_done_event(ends) is not None) is guarded
 
 
 if __name__ == "__main__":
