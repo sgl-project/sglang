@@ -2759,6 +2759,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if state.time_stats.trace_ctx.tracing_enable
                     else None
                 )
+                state.time_stats.trace_ctx.trace_set_root_error(
+                    recv_obj.finished_reasons[i]
+                )
                 # Reuse the first batch's arrival time: a streaming request that
                 # finishes in its first output has no decode interval.
                 state.time_stats.set_finished_time(
@@ -3605,7 +3608,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
         state.finished = True
-        state.time_stats.set_finished_time()
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
@@ -3614,6 +3616,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
+        state.time_stats.trace_ctx.trace_set_root_error(finish_reason)
+        state.time_stats.set_finished_time()
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,

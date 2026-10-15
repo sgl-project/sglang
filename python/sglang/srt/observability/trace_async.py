@@ -849,6 +849,11 @@ class TraceReqContextAsync:
             self.root_span.set_attributes(attrs)
         self._append_op({"type": "set_root_attrs", "attrs": attrs})
 
+    def trace_set_root_error(self, finish_reason: Optional[Dict[str, Any]]):
+        if not self.tracing_enable or not self.root_span:
+            return
+        _trace_mod.set_root_span_error(self.root_span, finish_reason)
+
     def trace_set_thread_attrs(self, attrs: Dict[str, Any]):
         if not self.tracing_enable:
             return

@@ -505,6 +505,46 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestTraceRecordsAbortStatus(CustomTestCase):
+    """Finishing a request ends its root span, so an abort's status must be
+    recorded on the span before that, on each path that finishes a request."""
+
+    def _traced_state(self, tm, rid):
+        state = _make_req_state(rid)
+        state.time_stats.trace_ctx = MagicMock(tracing_enable=True)
+        tm.rid_to_state[rid] = state
+        return state.time_stats.trace_ctx
+
+    def _assert_recorded_before_finish(self, trace_ctx, finish_reason):
+        trace_ctx.trace_set_root_error.assert_called_once_with(finish_reason)
+        calls = [name for name, _, _ in trace_ctx.method_calls]
+        self.assertLess(
+            calls.index("trace_set_root_error"), calls.index("trace_req_finish")
+        )
+
+    def test_abort_from_scheduler(self):
+        tm = _make_tokenizer_manager(self)
+        trace_ctx = self._traced_state(tm, "abort_rid")
+        abort_req = _make_abort_req("abort_rid")
+
+        tm._handle_abort_req(abort_req)
+
+        self._assert_recorded_before_finish(trace_ctx, abort_req.finished_reason)
+
+    def test_abort_in_batch_output(self):
+        tm = _make_tokenizer_manager(self)
+        trace_ctx = self._traced_state(tm, "batch_abort_rid")
+        reason = {"type": "abort", "message": "busy", "status_code": 503}
+
+        asyncio.run(
+            tm._handle_batch_output(
+                _make_batch_str_output("batch_abort_rid", finished_reason=reason)
+            )
+        )
+
+        self._assert_recorded_before_finish(trace_ctx, reason)
+
+
 class TestRequestTpotGating(CustomTestCase):
     """Request TPOT is observed once, only for requests with a real decode
     interval that ran to completion on a non-prefill worker."""
