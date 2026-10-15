@@ -25,7 +25,6 @@ from test_unified_radix_cache_unittest import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
-    DecLockRefParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -70,7 +69,7 @@ class TestHybridL3Restore(CustomTestCase):
         req.extend_end = len(tokens)
         req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
         req.last_node = cache.root_node_handle()
-        req.lock_receipt = DecLockRefParams()
+        req.lock = cache.lock(req.last_node)
         indices = allocator.alloc(len(tokens))
         self.assertIsNotNone(indices)
         pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
@@ -156,7 +155,7 @@ class TestHybridL3Restore(CustomTestCase):
             self.assertEqual(host.available_size(), available)
             match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
             self.assertEqual(match.host_hit_length, 0)
-            self.assertEqual(len(match.device_indices), 0)
+            self.assertEqual(match.device_prefix_len, 0)
             self.assertNotIn(handle, cache.ongoing_prefetch)
 
     def _seed_two_checkpoints(self, prod, pa, pp, *, page):
@@ -168,14 +167,14 @@ class TestHybridL3Restore(CustomTestCase):
             self.assertEqual(depth, pages * page)
             indices = pp.req_to_token[req.kv.req_pool_idx, :depth]
             self._fill_full_kv(pa, indices, marker=7)
-            prod.cache_unfinished_req(req)
+            prod.checkpoint(req, up_to=req.extend_end)
             match = prod.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:depth])))
             )
             leaf = match.last_device_node
             oracles[pages] = (
                 state,
-                self._snapshot_full_kv(pa, match.device_indices),
+                self._snapshot_full_kv(pa, prod.path_device_indices(match.last_device_node)),
             )
             self._backup_node(prod, leaf)
             self._write_path_to_l3(prod, leaf)
@@ -239,7 +238,7 @@ class TestHybridL3Restore(CustomTestCase):
                         self._run_prefetch_to_completion(cons, handle)
                     cons.check_hicache_events()
                     match = cons.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
-                    self.assertEqual(len(match.device_indices), 0)
+                    self.assertEqual(match.device_prefix_len, 0)
                     self.assertEqual(match.host_hit_length, expected_tokens)
                     self.assertEqual(host.available_size(), available - 1)
                     state_host = cons.tree_core.get_component_host_value(
@@ -259,9 +258,9 @@ class TestHybridL3Restore(CustomTestCase):
                     )
                     self._load_back_node(cons, match.last_host_node, req=req)
                     loaded = cons.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
-                    self.assertEqual(len(loaded.device_indices), expected_tokens)
+                    self.assertEqual(loaded.device_prefix_len, expected_tokens)
                     actual_k, actual_v = self._snapshot_full_kv(
-                        ca, loaded.device_indices
+                        ca, cons.path_device_indices(loaded.last_device_node)
                     )
                     torch.testing.assert_close(actual_k, wanted_k, rtol=0, atol=0)
                     torch.testing.assert_close(actual_v, wanted_v, rtol=0, atol=0)
