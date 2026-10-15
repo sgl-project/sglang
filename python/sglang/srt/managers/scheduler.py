@@ -5161,9 +5161,8 @@ class Scheduler(
         return ClearHiCacheReqOutput(success=if_success)
 
     def _elastic_scale_down_in_transition(self) -> bool:
-        """True during FLIP_MASK -> RECONFIG (map + NIXL peer state inconsistent)."""
-        if self.server_args.elastic_ep_backend is None:
-            return False
+        """True during FLIP_MASK -> RECONFIG (map + NIXL peer state inconsistent).
+        Without elastic EP the phase reads "disabled"."""
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
         return ElasticEPStateManager.get_scale_phase() in ("retiring", "reconfiguring")
@@ -5194,7 +5193,7 @@ class Scheduler(
 
         That broadcast is a collective too, so a survivor reconfiguring a tick late
         blocks against peers that already moved on, with no fault to break the wedge."""
-        if self.server_args.elastic_ep_backend is None:
+        if get_exec().moe.elastic_ep_backend is None:
             return
         model_runner = self.tp_worker.model_runner
         # Passed as a callable, not a value: only a retiree in DRAIN consults it.

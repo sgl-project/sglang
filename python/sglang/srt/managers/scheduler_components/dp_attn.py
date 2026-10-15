@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
@@ -262,6 +263,7 @@ class MLPSyncBatchInfo:
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,
+                gather=all_gather_single,
             )
 
         tp_info = global_info_tensor.view(
