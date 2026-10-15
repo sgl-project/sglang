@@ -2094,17 +2094,17 @@ def clear_inherited_rocprofiler_registration():
 
     When a profiler registers, HIP writes the library path into the environment
     variable ROCPROFILER_REGISTER_LIBRARY. A child process inherits that
-    variable through exec, so the child believes a profiler has already
-    registered and refuses to register its own. torch.profiler in the child
-    then records CPU rows only: it reports no GPU events and no error.
+    variable, so the child thinks a profiler has already registered and refuses
+    to register its own. torch.profiler in the child then records CPU rows
+    only: it reports no GPU events and no error.
 
-    Only ROCm sets this variable, so this function returns immediately on a
-    CUDA build. Only PyTorch 2.12 and newer hit the problem, because their
-    kineto talks to rocprofiler-sdk; PyTorch 2.11 and older use roctracer and
-    ignore the variable, so deleting it changes nothing for them.
+    Only ROCm sets this variable, so this function returns right away on a CUDA
+    build. Only PyTorch 2.12 and newer hit the problem, because of
+    rocprofiler-sdk; PyTorch 2.11 and older use roctracer, so deleting the
+    variable changes nothing for them.
 
     This function deletes the variable only when no profiler is running in this
-    process, so it never disturbs a profiler that is really collecting data.
+    process, so it never breaks a profiler that is really collecting data.
     The process must call this function before it imports torch.
     """
     if os.environ.get("ROCPROFILER_REGISTER_LIBRARY") is None:
