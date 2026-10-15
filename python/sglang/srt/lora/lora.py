@@ -37,6 +37,7 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 # keys ("...experts.<module>..."), while excluding "shared_experts." (where the
 # preceding char is "_", not ".").
 _ROUTED_EXPERT_PATTERN = re.compile(r"\.experts\.")
+_MOE_EXPERT_PATTERN = re.compile(r"\.(?:experts|shared_experts?)\.")
 
 logger = logging.getLogger(__name__)
 
@@ -216,10 +217,9 @@ class LoRAAdapter(nn.Module):
             )
 
     def _normalize_weights(self):
+        # qkv / qkvr / MLA qkv_a / dense gate_up stay per member: the memory pool writes each
+        # member into its slot of the fused buffer (LORA_FUSED_MEMBERS).
         for layer in self.layers:
-            weight_names = list(layer.weights.keys())
-            self.normalize_qkv_proj(weight_names, layer.weights)
-            self.normalize_inkling_qkvr_proj(weight_names, layer.weights)
             self._normalize_shared_expert_moe(layer.weights)
             self._rename_expert_w_to_proj(layer.weights)
             # Stack gate_proj + x_proj → in_proj for Mamba layers (before gate_up normalization)
@@ -230,107 +230,6 @@ class LoRAAdapter(nn.Module):
             self._normalize_in_proj_ba(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
-            weight_names = list(layer.weights.keys())
-            self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
-
-    def normalize_inkling_qkvr_proj(
-        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
-    ):
-        """Normalize Inkling split attention LoRA keys into the runtime qkvr layer.
-
-        Inkling checkpoints expose separate attention projections
-        (wq_du/wk_dv/wv_dv/wr_du), while the serving model uses a single
-        MergedColumnParallelLinear named qkvr with those slices in that order.
-        """
-        for weight_name in weight_names:
-            if "wq_du" not in weight_name:
-                continue
-
-            q_name = weight_name
-            k_name = weight_name.replace("wq_du", "wk_dv")
-            v_name = weight_name.replace("wq_du", "wv_dv")
-            r_name = weight_name.replace("wq_du", "wr_du")
-            qkvr_name = weight_name.replace("wq_du", "qkvr")
-
-            if any(name not in weights for name in (k_name, v_name, r_name)):
-                continue
-
-            cat_dim = weights[q_name].dim() - 2
-            weights[qkvr_name] = torch.cat(
-                (
-                    weights[q_name],
-                    weights[k_name],
-                    weights[v_name],
-                    weights[r_name],
-                ),
-                cat_dim,
-            )
-            weights.pop(q_name)
-            weights.pop(k_name)
-            weights.pop(v_name)
-            weights.pop(r_name)
-
-        for weight_name in list(weights.keys()):
-            if "qkvr" not in weight_name or "lora_A" not in weight_name:
-                continue
-            if weights[weight_name].shape[-2] != self.config.r:
-                continue
-            repeat_dims = [1] * weights[weight_name].dim()
-            repeat_dims[-2] = 4
-            weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
-
-    def normalize_qkv_proj(
-        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
-    ):
-        # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
-        target_module = set()
-        for weight_name in weight_names:
-            if "k_proj" in weight_name:
-                target_module.add("k_proj")
-            if "q_proj" in weight_name:
-                target_module.add("q_proj")
-            if "v_proj" in weight_name:
-                target_module.add("v_proj")
-            if "qkv_proj" in weight_name:
-                target_module.add("qkv_proj")
-        if len(target_module) == 0:
-            return
-
-        for weight_name in weight_names:
-            # We assume every lora adaptor should contain lora modules for q_proj
-            if "q_proj" in weight_name:
-                q_name = weight_name
-                k_name = weight_name.replace("q_proj", "k_proj")
-                v_name = weight_name.replace("q_proj", "v_proj")
-                qkv_name = weight_name.replace("q_proj", "qkv_proj")
-
-                # If k_proj doesn't have lora, initialize it to zero
-                k_proj_weight = (
-                    weights[k_name]
-                    if "k_proj" in target_module
-                    else torch.zeros_like(weights[v_name])
-                )
-                weights[qkv_name] = torch.cat(
-                    (
-                        weights[q_name],
-                        k_proj_weight,
-                        weights[v_name],
-                    ),
-                    0,
-                )
-                weights.pop(q_name)
-                if "k_proj" in target_module:
-                    weights.pop(k_name)
-                weights.pop(v_name)
-            elif "qkv_proj" in weight_name:
-                # If qkv_proj is already stacked, we normalize it following the SGL convention.
-                qkv_name = weight_name
-                q_name = weight_name.replace("qkv_proj", "q_proj")
-                k_name = weight_name.replace("qkv_proj", "k_proj")
-                v_name = weight_name.replace("qkv_proj", "v_proj")
-                if "lora_A" in weight_name:
-                    weights[qkv_name] = weights[qkv_name].repeat(3, 1)
-                # else: no-op as LoRA B weight is already stacked.
 
     def _normalize_shared_expert_moe(self, weights: Dict[str, torch.Tensor]):
         """Reshape flat Inkling shared-sink factors to shared-outer 3D form."""
@@ -538,7 +437,10 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
+        """Stack routed- and shared-expert gate/up factors; dense gate/up load per member."""
         for weight_name in weight_names:
+            if not _MOE_EXPERT_PATTERN.search(weight_name):
+                continue
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
@@ -575,33 +477,6 @@ class LoRAAdapter(nn.Module):
         # Orphan up_proj weights (no matching gate_proj) are kept as-is.
         # Models with non-gated MLP/shared-experts declare up_proj in
         # supported_lora_modules so they get their own buffer and wrapping.
-
-    def normalize_fused_qkv_a_proj(
-        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
-    ):
-        """Fuse separate q_a_proj and kv_a_proj_with_mqa LoRA weights into
-        a single fused_qkv_a_proj_with_mqa entry (concat along dim 0 for
-        both A and B), matching the DeepSeek MLA fused projection layout."""
-        for weight_name in weight_names:
-            if "q_a_proj" not in weight_name:
-                continue
-            if "fused_qkv_a_proj_with_mqa" in weight_name:
-                continue
-
-            q_a_name = weight_name
-            kv_a_name = weight_name.replace("q_a_proj", "kv_a_proj_with_mqa")
-            fused_name = weight_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-
-            kv_a_weight = (
-                weights[kv_a_name]
-                if kv_a_name in weights
-                else torch.zeros_like(weights[q_a_name])
-            )
-
-            weights[fused_name] = torch.cat((weights[q_a_name], kv_a_weight), dim=0)
-            weights.pop(q_a_name)
-            if kv_a_name in weights:
-                weights.pop(kv_a_name)
 
     def pin_weights_in_cpu(self):
         for layer in self.layers:
