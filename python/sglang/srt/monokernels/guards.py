@@ -136,6 +136,9 @@ def features_in_use(cfg: Any) -> set[Feature]:
 
 def monokernel_disable_reasons(*, cfg, model_config, isa):
     """Return the matching spec and all configuration rejection reasons."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+    from sglang.srt.environ import envs
+
     if isa is None:
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
@@ -148,9 +151,30 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
         f"{f.value} is in use and the spec does not accept it"
         for f in sorted(features_in_use(cfg) - spec.features, key=lambda f: f.name)
     ]
-    reasons += _requirement_reasons(
-        spec=spec, isa=isa, cfg=cfg, model_config=model_config
-    )
+    req = spec.requires
+    dtype = str(model_config.dtype).replace("torch.", "")  # resolved, e.g. bfloat16
+    _, decode_backend = attention_backends_of(cfg)
+    one_of = [
+        ("tp_size", cfg.tp_size, spec.devices[isa].tp_sizes),
+        ("dtype", dtype, req.dtypes),
+        # Served steps run on the decode-phase backend.
+        ("decode attention backend", decode_backend, req.attention_backends),
+    ] + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
+    exactly = [
+        # another model's config may not have the field at all
+        (f"config.{key}", getattr(hf_config, key, None), want)
+        for key, want in req.hf_config.items()
+    ] + [(name, getattr(envs, name).get(), want) for name, want in req.env.items()]
+    reasons += [
+        f"{what} {value!r} is not one of {sorted(map(str, allowed))}"
+        for what, value, allowed in one_of
+        if allowed and value not in allowed
+    ]
+    reasons += [
+        f"{what} {value!r} is not {want!r}"
+        for what, value, want in exactly
+        if value != want
+    ]
     watchdog = cfg.watchdog_timeout
     if watchdog and deadline_s(watchdog) < MIN_DEADLINE_S:
         reasons.append(
@@ -167,36 +191,6 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
     if spec.config_disable_reasons is not None:
         reasons += spec.config_disable_reasons(cfg, hf_config)
     return spec, reasons
-
-
-def _requirement_reasons(*, spec, isa, cfg, model_config) -> list[str]:
-    """Return a reason for each declared requirement the server does not meet."""
-    from sglang.srt.arg_groups.overrides import attention_backends_of
-    from sglang.srt.environ import envs
-
-    req = spec.requires
-    dtype = str(model_config.dtype).replace("torch.", "")  # resolved, e.g. bfloat16
-    _, decode_backend = attention_backends_of(cfg)
-    one_of = [
-        ("tp_size", cfg.tp_size, spec.devices[isa].tp_sizes),
-        ("dtype", dtype, req.dtypes),
-        # Served steps run on the decode-phase backend.
-        ("decode attention backend", decode_backend, req.attention_backends),
-    ] + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
-    exactly = [
-        # another model's config may not have the field at all
-        (f"config.{key}", getattr(model_config.hf_config, key, None), want)
-        for key, want in req.hf_config.items()
-    ] + [(name, getattr(envs, name).get(), want) for name, want in req.env.items()]
-    return [
-        f"{what} {value!r} is not one of {sorted(map(str, allowed))}"
-        for what, value, allowed in one_of
-        if allowed and value not in allowed
-    ] + [
-        f"{what} {value!r} is not {want!r}"
-        for what, value, want in exactly
-        if value != want
-    ]
 
 
 def covered_capture_sizes(
