@@ -97,6 +97,8 @@ The Base model defaults to CFG 3.5 against an empty negative prompt. Both
 variants reuse the package's text encoder and VAE. Keep the checkpoint revision,
 precision, attention backend, guidance and sampling parameters fixed when
 comparing outputs.
+Explicit `guidance_scale=1` uses scale 1, not the package default;
+`true_cfg_scale`, when provided, takes precedence over `guidance_scale`.
 
 ### Quantized checkpoints
 

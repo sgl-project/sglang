@@ -83,6 +83,7 @@ class Flux3ImageSamplingParams(SamplingParams):
 
     # The reference CFG pairs the prompt with an empty negative prompt.
     negative_prompt: str = ""
+    guidance_scale: float | None = None
     # ``None`` infers it per request: i2i with reference images, else t2i.
     flux3_mode: str | None = None
 
@@ -110,8 +111,14 @@ class Flux3ImageSamplingParams(SamplingParams):
             self.flux3_mode = "t2i"
 
     def _adjust(self, server_args: Any) -> None:
-        super()._adjust(server_args)
         package = server_args.pipeline_config.flux3_package
+        if (
+            self.guidance_scale is None
+            and package is not None
+            and not package.config.dit.flow_map
+        ):
+            self.guidance_scale = package.config.sampler.guidance
+        super()._adjust(server_args)
         if package is None or not package.config.dit.flow_map:
             return
         # Reject CFG here so the API answers 400; the stages repeat these checks

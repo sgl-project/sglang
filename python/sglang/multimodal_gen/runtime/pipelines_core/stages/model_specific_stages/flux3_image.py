@@ -481,7 +481,6 @@ def _cfg_scale(batch: Req, package_config) -> float | None:
     value = batch.true_cfg_scale
     if value is None:
         value = batch.guidance_scale
-    requested = value is not None and value > 1.0
     if package_config.dit.flow_map:
         # As in the reference, any scale other than 1 asks for CFG.
         if value is not None and float(value) != 1.0:
@@ -490,7 +489,7 @@ def _cfg_scale(batch: Req, package_config) -> float | None:
                 "drop guidance_scale"
             )
         return None
-    return float(value) if requested else package_config.sampler.guidance
+    return float(value) if value is not None else package_config.sampler.guidance
 
 
 class Flux3ImageTextEncodeStage(PipelineStage):

@@ -522,8 +522,7 @@ class TestFlux3RequestControls(unittest.TestCase):
             Flux3ImageSamplingParams(flux3_mode="unsupported")
 
     def test_base_cfg_scale_is_per_request_with_the_package_default(self):
-        """There is no server CFG flag: a request without a scale (or the
-        generic default 1.0) gets the package's, any other scale is used."""
+        """Only an omitted scale takes the package default; explicit 1 is not 3.5."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_image import (
             _cfg_scale,
         )
@@ -531,9 +530,23 @@ class TestFlux3RequestControls(unittest.TestCase):
         base = SimpleNamespace(
             dit=SimpleNamespace(flow_map=False), sampler=SimpleNamespace(guidance=3.5)
         )
-        for scale, expected in ((None, 3.5), (1.0, 3.5), (5.0, 5.0)):
+        for scale, expected in ((None, 3.5), (1.0, 1.0), (5.0, 5.0)):
             batch = SimpleNamespace(true_cfg_scale=None, guidance_scale=scale)
             self.assertEqual(_cfg_scale(batch, base), expected)
+        server_args = SimpleNamespace(
+            pipeline_config=Flux3ImagePipelineConfig(
+                flux3_package=SimpleNamespace(config=base)
+            ),
+            output_path=None,
+            comfyui_mode=False,
+        )
+        for requested, expected in ((None, 3.5), (1.0, 1.0), (5.0, 5.0)):
+            params = Flux3ImageSamplingParams(prompt="a fox", guidance_scale=requested)
+            params._adjust(server_args)
+            self.assertEqual(_cfg_scale(params, base), expected)
+        params = Flux3ImageSamplingParams(prompt="a fox", true_cfg_scale=1.0)
+        params._adjust(server_args)
+        self.assertEqual(_cfg_scale(params, base), 1.0)
 
     def test_synthetic_warmup_keeps_a_reference_only_for_i2i(self):
         """Under breakable CUDA graphs no warmup reference is synthesized; an
