@@ -232,6 +232,9 @@ class _DisaggDecodeRing:
         return transferred_rids
 
     def take_ids(self, mb_id: int) -> None:
+        # As the flat loop's intake: finished HiCache loads unpin their nodes
+        # before this slot preallocates against the tree.
+        self.owner.check_hicache_events()
         # reaching consensus through PP ranks
         self.retract_rids = self._get_retract_ids(mb_id)
         self.rmbs[mb_id] = self.retract_rids

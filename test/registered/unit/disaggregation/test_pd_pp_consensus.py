@@ -66,6 +66,29 @@ class TestDisaggDecodeRing(CustomTestCase):
         self.assertEqual(ring.rmbs[0], ["b"])
         self.assertIsNone(ring.rmbs[1])
 
+    def test_take_ids_drains_decode_hicache_events_first(self):
+        # As the flat loop's intake: finished load-backs unpin their nodes
+        # before the slot polls the requests waiting for room.
+        calls = []
+        owner = decode_owner_shell(
+            enable_decode_hicache=True,
+            tree_cache=SimpleNamespace(
+                check_hicache_events=lambda: calls.append("hicache")
+            ),
+            retracted_rids=lambda mb_id: calls.append("retract") or [],
+            poll_prealloc_rids=lambda: ([], []),
+            aborted_prealloc_rids=set,
+            poll_transfer_rids=lambda: [],
+        )
+        channel = _Channel()
+        channel.is_first_rank = True
+        ring = _decode_ring(owner, channel)
+
+        ring.take_ids(0)
+        ring.take_ids(1)
+
+        self.assertEqual(calls, ["hicache", "retract"] * 2)
+
     @patch(f"{PP_MODULE}.get_disagg")
     def test_exchange_ids_applies_the_consensus_of_the_next_slot(self, get_disagg):
         get_disagg.return_value = SimpleNamespace(
