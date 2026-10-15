@@ -10,9 +10,10 @@ runs the spec's forward, and every other step the model's own. No model code
 changes. ``spec`` holds what a model declares, and the registry.
 
 This package is the framework only. Vendor packages hold each model's spec,
-glue and kernels, and list each spec under the ``sglang.monokernels`` entry
-points (AMD's: sgl-amd-mono, https://github.com/sgl-project/sgl-amd-mono).
-Without one, ``--enable-monokernel`` refuses to start and says why.
+forward and kernels; SGLang loads them as general plugins (``sglang.srt.plugins``
+entry points), and each calls ``register`` for its specs (AMD's: sgl-amd-mono,
+https://github.com/sgl-project/sgl-amd-mono). Without one,
+``--enable-monokernel`` refuses to start and says why.
 
 Every wait in a vendor's kernels has a deadline: a failed wait stops its launch
 and flags every peer, whose waits stop too, so a rank finishes a step only with
@@ -22,5 +23,6 @@ process tree.
 
 from sglang.experimental.monokernels.guards import handle_monokernel
 from sglang.experimental.monokernels.runtime import attach, watch_weights
+from sglang.experimental.monokernels.spec import API_VERSION, register
 
-__all__ = ["attach", "handle_monokernel", "watch_weights"]
+__all__ = ["API_VERSION", "attach", "handle_monokernel", "register", "watch_weights"]

@@ -3,15 +3,15 @@
 that finds it. A spec module imports without its model, so the config hook can
 refuse a setup before any process starts.
 
-Specs live in vendor packages (e.g. sgl-amd-mono), which list them under the
-``sglang.monokernels`` entry-point group: the name is the HF architecture, the
-value the spec's ``module:attribute`` path. A spec states the ``API_VERSION`` it
-was written against; any other version is refused at startup."""
+Specs live in vendor packages (e.g. sgl-amd-mono), which SGLang loads as general
+plugins (the ``sglang.srt.plugins`` entry points, in every process): the plugin
+calls ``register(architecture, "module:attribute")`` for each spec, and the spec
+module is imported only when a server asks for it. A spec states the
+``API_VERSION`` it was written against; any other version is refused at startup."""
 
 from __future__ import annotations
 
 import enum
-import functools
 import importlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
@@ -19,7 +19,6 @@ from typing import Any, Callable, Mapping, Optional
 # The plugin API a spec is written against: MonoSpec, BuildContext, ShapeKey, and
 # the built model's ``serves(key)`` and ``forward(plan, *inputs)``
 API_VERSION = 1
-ENTRY_POINTS = "sglang.monokernels"
 
 
 class Feature(enum.Enum):
@@ -142,23 +141,15 @@ class MonoSpec:
         return self.devices[isa].widths
 
 
-# HF architecture -> the "module:attribute" paths of specs registered in-process
-# (tests); installed packages list theirs under ENTRY_POINTS
+# HF architecture -> the "module:attribute" paths of its registered specs
 _REGISTRY: dict[str, tuple[str, ...]] = {}
 
 
-@functools.cache
-def _entry_points() -> dict[str, tuple[str, ...]]:
-    from importlib.metadata import entry_points
-
-    out: dict[str, tuple[str, ...]] = {}
-    for ep in entry_points(group=ENTRY_POINTS):
-        out[ep.name] = out.get(ep.name, ()) + (ep.value,)
-    return out
-
-
 def register(architecture: str, path: str) -> None:
-    _REGISTRY[architecture] = _REGISTRY.get(architecture, ()) + (path,)
+    """Register the spec at ``path`` ("module:attribute") for an HF architecture;
+    a plugin calls it from its ``sglang.srt.plugins`` entry point."""
+    if path not in _REGISTRY.get(architecture, ()):
+        _REGISTRY[architecture] = _REGISTRY.get(architecture, ()) + (path,)
 
 
 def unregister(architecture: str, path: str) -> None:
@@ -172,7 +163,7 @@ def find_spec(architectures, isa: Optional[str]):
     A spec that fails to import or states another API version is a reason too."""
     why = []
     for arch in architectures or ():
-        for path in _REGISTRY.get(arch, ()) + _entry_points().get(arch, ()):
+        for path in _REGISTRY.get(arch, ()):
             module, _, attr = path.partition(":")
             try:
                 spec = getattr(importlib.import_module(module), attr)
@@ -188,6 +179,6 @@ def find_spec(architectures, isa: Optional[str]):
                 return spec, ""
     archs = list(architectures or ())
     return None, "; ".join(why) or (
-        f"no monokernel spec for {archs} on {isa} (installed packages list theirs "
-        f"under the {ENTRY_POINTS!r} entry points)"
+        f"no monokernel spec for {archs} on {isa}: install a plugin that registers "
+        "one (e.g. sgl-amd-mono)"
     )

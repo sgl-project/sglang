@@ -1,5 +1,5 @@
 """The monokernel plugin on CPU with a fake spec and a fake forward (RFC #43949):
-the registry and its entry points, the API version, feature refusal, the config
+the registry plugins fill, the API version, feature refusal, the config
 checks, the modes that take only BITWISE specs, capture sizes, routing by graph
 key from the keys fixed at attach, the normal path's reasons, the spec's forward
 bound to its plan, the load hook's weight copies, and the deadlines."""
@@ -133,7 +133,7 @@ def attached(widths=None, tokens=6):
     return SimpleNamespace(mono=rt), built
 
 
-def test_registry_reports_broken_and_mismatched_specs(monkeypatch):
+def test_registry_reports_broken_and_mismatched_specs():
     registry.register("Broken", "no_such_module:SPEC")
     registry.register("Old", f"{__name__}:OLD_SPEC")
     try:
@@ -144,11 +144,14 @@ def test_registry_reports_broken_and_mismatched_specs(monkeypatch):
     finally:
         registry.unregister("Broken", "no_such_module:SPEC")
         registry.unregister("Old", f"{__name__}:OLD_SPEC")
-    # installed packages list their specs as entry points
-    monkeypatch.setattr(
-        registry, "_entry_points", lambda: {"Pkg": (f"{__name__}:SPEC",)}
-    )
-    assert registry.find_spec(["Pkg"], "gfx950")[0] is SPEC
+    # a plugin registers its spec for an architecture, once however often it runs
+    registry.register("Pkg", f"{__name__}:SPEC")
+    registry.register("Pkg", f"{__name__}:SPEC")
+    try:
+        assert registry._REGISTRY["Pkg"] == (f"{__name__}:SPEC",)
+        assert registry.find_spec(["Pkg"], "gfx950")[0] is SPEC
+    finally:
+        registry.unregister("Pkg", f"{__name__}:SPEC")
 
 
 def test_registry_finds_the_spec_for_the_isa():
