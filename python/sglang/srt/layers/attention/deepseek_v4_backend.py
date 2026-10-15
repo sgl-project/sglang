@@ -941,6 +941,13 @@ def _tail_rows(
     return t[token_indices]
 
 
+def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
+    assert t.shape[0] <= num_rows, (t.shape[0], num_rows)
+    if t.shape[0] == num_rows:
+        return t
+    return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
+
+
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
@@ -1103,6 +1110,7 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
     supports_ragged_verify_graph: bool = True
+    folds_encoder_swa_replay: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
 
@@ -1134,6 +1142,7 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.encoder_replay = False
+        self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
@@ -1192,11 +1201,7 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_capacity: Optional[int] = None
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
-        # Prefill CUDA graph tail block (bounded replay inside the graph): row
-        # capacity, persistent index/location buffers, held metadata per block size.
-        self._bcg_tail_capacity: Optional[int] = None
-        self._bcg_tail_buffers: Optional[tuple] = None
-        self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
+        self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -1632,6 +1637,12 @@ class DeepseekV4AttnBackend(
             tail_len=SWA_WINDOW,
             device=device,
         )
+        if self.encoder_row_floor is not None:
+            # Folded hits: a tail row never reads below its request's replay start.
+            swa_replay_start = torch.maximum(
+                swa_replay_start,
+                self.encoder_row_floor[token_indices].to(swa_replay_start.dtype),
+            )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
@@ -1864,13 +1875,24 @@ class DeepseekV4AttnBackend(
             get_local_dp_buffer_len(),
         )
         tail = tail_metadata.late_layer_tail
-        # Inside the prefill CUDA graph the tail block is padded to a fixed capacity;
-        # the eager breaks (attention, low-ratio sources) clip their inputs to the
-        # batch's non-padded count, so point it at the real tail rows while the
-        # late layers run.
-        saved = saved + (forward_batch.global_num_token_non_padded_cpu,)
+        saved = saved + (
+            forward_batch.global_num_token_non_padded_cpu,
+            forward_batch.global_num_token_non_padded,
+            forward_batch.num_token_non_padded,
+        )
         if tail.real_rows_count is not None:
             forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
+            non_padded = forward_batch.global_num_token_non_padded
+            if non_padded is not None:
+                if self._bcg_tail_num_token_non_padded is None:
+                    self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
+                bound = torch.clamp(
+                    non_padded,
+                    max=tail.real_rows_count,
+                    out=self._bcg_tail_num_token_non_padded,
+                )
+                forward_batch.global_num_token_non_padded = bound
+                forward_batch.num_token_non_padded = bound
         # The layers before the switch published top-k into the full metadata's
         # buffers; carry the tail rows into the tail metadata's (padding stays -1).
         full_core = saved[0].core_attn_metadata
@@ -1912,9 +1934,13 @@ class DeepseekV4AttnBackend(
             forward_batch.attn_cp_metadata,
             local_dp_buffer_len,
             non_padded,
+            non_padded_gpu,
+            local_non_padded,
         ) = saved
         set_local_dp_buffer_len(local_dp_buffer_len)
         forward_batch.global_num_token_non_padded_cpu = non_padded
+        forward_batch.global_num_token_non_padded = non_padded_gpu
+        forward_batch.num_token_non_padded = local_non_padded
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).
@@ -2541,6 +2567,7 @@ class DeepseekV4AttnBackend(
             return
 
         self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -3092,6 +3119,11 @@ class DeepseekV4AttnBackend(
             # length is the request count; padded rows belong to no request.
             start_loc = forward_batch.extend_start_loc
             seq_lens = forward_batch.extend_seq_lens[: start_loc.shape[0]]
+            skip = forward_batch.encoder_swa_compress_skip
+            if skip is not None:
+                # Folded replay rows are cached already; compress the new rows only.
+                start_loc = start_loc + skip
+                seq_lens = seq_lens - skip
             self._low_ratio_compress_fused(
                 layer,
                 x,
@@ -3100,6 +3132,9 @@ class DeepseekV4AttnBackend(
                 extend_offsets=(start_loc.to(torch.int32), seq_lens.to(torch.int32)),
             )
         else:
+            rows = forward_batch.encoder_swa_compress_rows
+            if rows is not None and forward_batch.forward_mode.is_extend():
+                x, req, pos = x[rows], req[rows], pos[rows]
             self._low_ratio_compress_torch(
                 layer,
                 x,
@@ -4218,6 +4253,12 @@ class DeepseekV4AttnBackend(
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
                 swa_replay_start = raw_positions - (offset - group_first)
+            elif swa_replay_start is None and self.encoder_row_floor is not None:
+                # Folded replay: hits floor every row at their replay start;
+                # MLP-sync padding rows follow the real ones with floor 0.
+                swa_replay_start = _pad_rows(
+                    self.encoder_row_floor, num_rows=raw_positions.shape[0]
+                )
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,

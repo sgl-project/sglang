@@ -3,8 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/forward_context.py
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
+
+import torch
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadata
@@ -18,6 +20,33 @@ class ForwardContext:
     forward_batch: Optional["Req"] = None
     # A persistent CFG residual must be anchored to real DiT features.
     force_spectrum_real: bool = False
+    _trtllm_gen_sequence_metadata_cache: dict[
+        tuple[int, int, int, int],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ] = field(default_factory=dict)
+
+    @torch.compiler.disable
+    def get_trtllm_gen_sequence_metadata(
+        self, device_index: int, batch: int, q_len: int, kv_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return shared dense ragged-attention metadata for this model forward."""
+        key = (device_index, batch, q_len, kv_len)
+        metadata = self._trtllm_gen_sequence_metadata_cache.get(key)
+        if metadata is None:
+            # Built on the device: a host-to-device copy cannot be captured by
+            # a CUDA graph.
+            device = torch.device("cuda", device_index)
+            metadata = (
+                torch.arange(
+                    0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=device
+                ),
+                torch.arange(
+                    0, (batch + 1) * kv_len, kv_len, dtype=torch.int32, device=device
+                ),
+                torch.full((batch,), kv_len, dtype=torch.int32, device=device),
+            )
+            self._trtllm_gen_sequence_metadata_cache[key] = metadata
+        return metadata
 
 
 _forward_context: Optional["ForwardContext"] = None
