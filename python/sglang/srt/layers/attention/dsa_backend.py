@@ -3472,7 +3472,7 @@ class DeepseekSparseAttnBackend(
                 q_nope.new_empty((rows, heads, v_head_dim), dtype=torch.bfloat16),
                 q_nope.new_empty((rows, heads), dtype=torch.float32),
             )
-        local_page_table, _ = localize_dcp_page_table(
+        local_page_table, owned_counts = localize_dcp_page_table(
             self._dcp_page_table_cache,
             metadata=self.forward_metadata,
             layer_id=layer.layer_id,
@@ -3492,6 +3492,7 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             workspace=workspace,
             return_lse=True,
+            lengths=owned_counts,
         )
         return out.view(rows, heads, v_head_dim), lse
 
