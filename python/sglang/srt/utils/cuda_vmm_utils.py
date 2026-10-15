@@ -667,7 +667,7 @@ class VmmReservation:
 
 def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
     """True iff ``ok`` holds on every rank in ``group`` (BAND all-reduce)."""
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device="cpu")
     dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
     return flag.item() == 1
 
@@ -989,7 +989,6 @@ class VmmGraphInputManager:
         """
         FABRIC_HANDLE_BYTES = 64
         MAX_VMM_BASES = 4096
-        MAX_CHUNKS_PER_INPUT = 16
 
         t0 = time.perf_counter()
 
@@ -1025,12 +1024,15 @@ class VmmGraphInputManager:
             local_input_chunks = [
                 [int(idx) for idx in indices] for indices in input_chunk_indices
             ]
-            for chunks in local_input_chunks:
-                if len(chunks) > MAX_CHUNKS_PER_INPUT:
-                    raise RuntimeError(
-                        "Too many VMM chunks for graph input: "
-                        f"{len(chunks)} > {MAX_CHUNKS_PER_INPUT}"
-                    )
+            # Every rank must pack the same input struct, so the per-input span
+            # width is the widest input on any rank (floored at 16 slots).
+            widest_input = torch.tensor(
+                [max((len(c) for c in local_input_chunks), default=0)],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            dist.all_reduce(widest_input, op=dist.ReduceOp.MAX, group=self.group)
+            max_chunks_per_input = max(16, int(widest_input.item()))
 
             # All-gather base metadata and per-input VMM spans. A captured tensor
             # can cross expandable-segment allocation boundaries, so peer mappings
@@ -1041,7 +1043,7 @@ class VmmGraphInputManager:
             base_struct = struct.Struct(
                 f"<QQ{FABRIC_HANDLE_BYTES}s" if use_fabric else "<QQ"
             )
-            input_struct = struct.Struct(f"<QQ{MAX_CHUNKS_PER_INPUT}Q")
+            input_struct = struct.Struct(f"<QQ{max_chunks_per_input}Q")
             base_offset = header_struct.size
             input_offset = base_offset + MAX_VMM_BASES * base_struct.size
             payload_size = input_offset + new_count * input_struct.size
@@ -1067,7 +1069,7 @@ class VmmGraphInputManager:
             for i, (chunks, offset) in enumerate(
                 zip(local_input_chunks, input_offsets)
             ):
-                padded_chunks = chunks + [0] * (MAX_CHUNKS_PER_INPUT - len(chunks))
+                padded_chunks = chunks + [0] * (max_chunks_per_input - len(chunks))
                 input_struct.pack_into(
                     local_payload,
                     input_offset + i * input_struct.size,

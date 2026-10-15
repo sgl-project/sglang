@@ -69,7 +69,7 @@ class TestVLMViTCudaGraph(CustomTestCase):
         os.makedirs(output_path, exist_ok=True)
 
         # -------- compose --model_args --------
-        model_args = f'model_version="{model_version}",' f"tp={tp}"
+        model_args = f'model_version="{model_version}",tp={tp}'
 
         # -------- build command list --------
         cmd = [
@@ -140,14 +140,14 @@ class TestVLMViTCudaGraph(CustomTestCase):
                 other_args=[
                     "--mm-attention-backend",
                     "fa3",
-                    "--enforce-piecewise-cuda-graph",
-                    "--piecewise-cuda-graph-max-tokens",
+                    "--cuda-graph-backend-prefill=tc_piecewise",
+                    "--cuda-graph-max-bs-prefill",
                     "8192",
                     "--chunked-prefill-size",
                     "8192",
                     "--disable-radix-cache",
                     "--disable-overlap-schedule",
-                    "--piecewise-cuda-graph-compiler",
+                    "--cuda-graph-tc-compiler",
                     "eager",
                 ],
                 env=process_env,

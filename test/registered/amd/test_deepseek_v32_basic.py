@@ -30,9 +30,8 @@ class TestDeepseekV32DP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
         ]
@@ -64,7 +63,7 @@ class TestDeepseekV32DP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -72,7 +71,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -84,7 +83,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 10)
@@ -132,7 +131,7 @@ class TestDeepseekV32TP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -140,7 +139,7 @@ class TestDeepseekV32TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -152,7 +151,7 @@ class TestDeepseekV32TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32)\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 15)

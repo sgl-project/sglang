@@ -17,9 +17,12 @@ from sglang.utils import logger
 
 try:
     from torchcodec.decoders import AudioDecoder
-except ImportError:
+except (ImportError, OSError, RuntimeError) as e:
+    # TorchCodec may be installed but unable to load its FFmpeg libraries.
     logger.warning(
-        "torchcodec is not installed; audio inputs will fail at request time"
+        "torchcodec is unavailable; video audio-track detection and "
+        "audio decoding via AudioDecoder are disabled: %s",
+        e,
     )
     AudioDecoder = None
 
@@ -169,9 +172,9 @@ class MiMoAudioPipeline:
         Output: (mel-spectrogram tensor [T, n_mels], audio_token_len int).
         """
         self._ensure_audio_dependencies()
-        assert isinstance(
-            audio, (str, bytes, tuple)
-        ), f"audio must be a str, bytes or tuple, but got {type(audio)}"
+        assert isinstance(audio, (str, bytes, tuple)), (
+            f"audio must be a str, bytes or tuple, but got {type(audio)}"
+        )
         if isinstance(audio, tuple):
             waveform, original_sr = audio
         else:
@@ -256,9 +259,9 @@ class MiMoAudioPipeline:
         if isinstance(audio, (str, bytes, tuple)):
             return self.preprocess_audio(audio)
 
-        assert (
-            audio.shape[1] >= self.audio_channels
-        ), f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
+        assert audio.shape[1] >= self.audio_channels, (
+            f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
+        )
         T = audio.shape[0]
         audio = audio[:, : self.audio_channels].to(torch.long)
         padded_T = (

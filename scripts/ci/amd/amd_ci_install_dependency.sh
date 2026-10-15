@@ -25,6 +25,12 @@ done
 
 OPTIONAL_DEPS="${1:-}"
 
+if [[ ",${OPTIONAL_DEPS}," == *,diffusion,* ]]; then
+  # MiniMax H3 uses ffprobe for input admission and output audio validation.
+  docker exec ci_sglang apt-get update
+  docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang apt-get install -y --no-install-recommends ffmpeg
+fi
+
 # Build python extras
 EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
@@ -135,38 +141,8 @@ ensure_httpx() {
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 }
 
-# Helper function to git clone with retries
-git_clone_with_retry() {
-  local repo_url="$1"
-  local dest_dir="${2:-}"
-  local branch_args="${3:-}"
-  local max_attempts=3
-
-  for attempt in $(seq 1 $max_attempts); do
-    echo "Git clone attempt $attempt/$max_attempts: $repo_url"
-
-    # prevent from partial clone
-    if [ -n "$dest_dir" ] && [ -d "$dest_dir" ]; then
-      rm -rf "$dest_dir"
-    fi
-
-    if git \
-      -c http.lowSpeedLimit=1000 \
-      -c http.lowSpeedTime=30 \
-      clone --depth 1 ${branch_args:+$branch_args} "$repo_url" "$dest_dir"; then
-      echo "Git clone succeeded."
-      return 0
-    fi
-
-    if [ $attempt -lt $max_attempts ]; then
-      echo "Git clone failed, retrying in 5 seconds..."
-      sleep 5
-    fi
-  done
-
-  echo "Git clone failed after $max_attempts attempts: $repo_url"
-  return 1
-}
+# shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../utils/git_clone_with_retry.sh"
 
 # Install checkout sglang
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
@@ -197,7 +173,9 @@ else
   git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
   docker cp lmms-eval ci_sglang:/
   docker exec ci_sglang git config --global --add safe.directory /lmms-eval
-  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  # pyarrow 26 needs NumPy 2 at import, but lmms-eval pins numpy 1.26.4;
+  # drop the cap once lmms-eval allows NumPy 2.
+  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . "pyarrow<26"
 
   # lmms-eval v0.4.1 pulls latex2sympy2, which pins antlr4-python3-runtime==4.7.2
   # and uninstalls the 4.9.3 that sgl-eval's latex2sympy2_extended requires, so

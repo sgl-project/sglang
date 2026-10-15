@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
@@ -14,10 +16,12 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_gfx1250_supported, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
     "DSA indexer weights_proj LoRA is incompatible with "
@@ -31,60 +35,6 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
     return is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
 
 
-if _is_cuda:
-
-    def _scale_head_gate_graph_fake_impl(
-        weights_raw: torch.Tensor,
-        n_heads_inv_sqrt: float,
-        softmax_scale: float,
-        q_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.empty(
-            (weights_raw.shape[0], weights_raw.shape[1], q_scale.shape[-1]),
-            dtype=torch.float32,
-            device=weights_raw.device,
-        )
-
-    # In-graph (PCG/BCG) head gate for the fused path: weights_proj is folded
-    # into wk_weights_proj, so weights_raw is precomputed and there is no GEMM.
-    @register_custom_op(fake_impl=_scale_head_gate_graph_fake_impl)
-    def scale_head_gate_graph(
-        weights_raw: torch.Tensor,
-        n_heads_inv_sqrt: float,
-        softmax_scale: float,
-        q_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        weights = weights_raw * n_heads_inv_sqrt
-        return weights.unsqueeze(-1) * q_scale * softmax_scale
-
-    def _logits_head_gate_graph_fake_impl(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        n_heads_inv_sqrt: float,
-        softmax_scale: float,
-        q_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.empty(
-            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
-            dtype=torch.float32,
-            device=x.device,
-        )
-
-    # In-graph (PCG/BCG) head gate for the NON-prefill path
-    @register_custom_op(fake_impl=_logits_head_gate_graph_fake_impl)
-    def logits_head_gate_graph(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        n_heads_inv_sqrt: float,
-        softmax_scale: float,
-        q_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
-        weights = out * n_heads_inv_sqrt
-        weights = weights.unsqueeze(-1) * q_scale * softmax_scale
-        return weights
-
-
 @register_custom_op(mutates_args=["topk_result"])
 @register_split_op()
 def pcg_dsa_indexer_prefill_split(
@@ -93,6 +43,8 @@ def pcg_dsa_indexer_prefill_split(
     q_lora: torch.Tensor,
     positions: torch.Tensor,
     topk_result: torch.Tensor,
+    x_s: Optional[torch.Tensor] = None,
+    x_bf16: Optional[torch.Tensor] = None,
 ) -> None:
     # Default in-graph indexer path for non-CP prefill: runs the whole indexer
     # (q/k proj, head gate, k-cache store, topk) as one eager split op. PCG calls
@@ -103,8 +55,18 @@ def pcg_dsa_indexer_prefill_split(
     # call site pre-allocates it at a static, padded shape and a downstream
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
-    assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
-    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+    #
+    # A quantized activation tuple (x, x_s[, x_bf16]) cannot cross the custom-op
+    # schema, so the call site passes its parts separately.
+    assert _is_cuda or _is_hip, (
+        "Internal error: DSA graph dispatch is only supported on CUDA and ROCm"
+    )
+    if _is_hip and not _is_gfx1250_supported:
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+    else:
+        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+    if x_s is not None:
+        x = (x, x_s) if x_bf16 is None else (x, x_s, x_bf16)
 
     forward_context = get_tc_piecewise_forward_context()
     forward_batch = forward_context.forward_batch
@@ -129,6 +91,27 @@ def pcg_dsa_indexer_prefill_split(
             return_indices=return_indices,
             num_tokens=extend_num_tokens,
             topk_result=topk_result,
+        )
+        return
+
+    # Same fused Q/K writer as the eager ROCm path, sliced to the unpadded count.
+    if indexer._aiter_fused_fp8_active(forward_batch):
+        q_fp8, weights = indexer._aiter_fused_fp8_prepare_and_store(
+            x,
+            q_lora,
+            positions,
+            forward_batch,
+            layer_id,
+            num_tokens=extend_num_tokens,
+        )
+        indexer._get_topk_ragged(
+            False,
+            forward_batch,
+            layer_id,
+            q_fp8,
+            weights,
+            metadata,
+            topk_result,
         )
         return
 

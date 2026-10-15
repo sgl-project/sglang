@@ -33,6 +33,20 @@ logger = logging.getLogger(__name__)
 _FLASHINFER_GDN_ALIGNMENT = 32
 
 
+def copy_verify_intermediate_rows(
+    destination: torch.Tensor,
+    positional_source: torch.Tensor,
+    dst_indices_raw: torch.Tensor,
+) -> None:
+    """Move FlashInfer's positional verify snapshots to their owned rows."""
+    count = dst_indices_raw.shape[0]
+    destination.index_copy_(
+        0,
+        dst_indices_raw.to(device=destination.device, dtype=torch.long),
+        positional_source[:count],
+    )
+
+
 def _empty_aligned_like(
     tensor: torch.Tensor, alignment: int = _FLASHINFER_GDN_ALIGNMENT
 ) -> torch.Tensor:
@@ -109,7 +123,12 @@ def _get_flashinfer_gdn_kernels():
 
     Returns (available, prefill_fn, mtp_fn, decode_fn, mtp_bf16_fn).
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16
+    global \
+        _flashinfer_gdn_available, \
+        _flashinfer_chunk_gated_delta_rule, \
+        _flashinfer_gated_delta_rule_mtp, \
+        _flashinfer_gated_delta_rule_decode, \
+        _flashinfer_gated_delta_rule_mtp_bf16
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -335,12 +354,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self,
         intermediate_states_buffer: torch.Tensor,
         batch_size: int,
+        force_scratch: bool = False,
     ) -> tuple[torch.Tensor, bool]:
         # FlashInfer requires exact capture B, which may exceed the pool-scoped
         # buffer; padded tiers use stable scratch and copy owned rows back.
-        direct = intermediate_states_buffer[:batch_size]
-        if direct.shape[0] == batch_size:
-            return direct, False
+        if not force_scratch:
+            direct = intermediate_states_buffer[:batch_size]
+            if direct.shape[0] == batch_size:
+                return direct, False
 
         stream_key = (
             torch.cuda.current_stream(intermediate_states_buffer.device).cuda_stream
@@ -473,15 +494,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         state_checkpoint_every_n_tokens: int = 0,
         **kwargs,
     ) -> tuple:
-        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.fla.l2norm import (
+            gdn_prefill_qkv_prepare_fwd,
+        )
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi = l2norm_fwd(q[0].contiguous())
-        k_fi = l2norm_fwd(k[0].contiguous())
-        v_fi = v[0].contiguous()
+        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
 
         output = kwargs.get("output")
         output_fi = None
@@ -593,6 +614,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        stable_rows: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         # MTP verify using FlashInfer gated_delta_rule_mtp kernel (SM90 + SM100+).
@@ -618,16 +640,17 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         intermediate_states_buffer_mtp = intermediate_states_buffer
         copy_verify_intermediate_back = False
-        if self.use_state_pool and intermediate_states_buffer is not None:
-            # The SM100 bf16 MTP kernel indexes this scratch buffer by the
-            # per-call batch id, while SGLang's speculative state cache is
-            # Graph padding can exceed the pool-scoped scratch; use exact-B storage
-            # and copy owned rows back before post-verify commit reads the pool.
+        if intermediate_states_buffer is not None and (
+            self.use_state_pool or stable_rows
+        ):
+            # FlashInfer writes positional rows; isolate them in exact-B scratch.
             (
                 intermediate_states_buffer_mtp,
                 copy_verify_intermediate_back,
             ) = self._prepare_verify_intermediate_buffer(
-                intermediate_states_buffer, batch_size
+                intermediate_states_buffer,
+                batch_size,
+                force_scratch=stable_rows,
             )
         if not self._mutable_inputs_are_aligned(
             ("ssm_states", ssm_states),
@@ -692,7 +715,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm=True,
         )
 
-        if copy_verify_intermediate_back:
+        if stable_rows and intermediate_states_buffer is not None:
+            # Persist positional output under PP-stable request rows.
+            copy_verify_intermediate_rows(
+                intermediate_states_buffer,
+                intermediate_states_buffer_mtp,
+                intermediate_state_indices[:batch_size],
+            )
+        elif copy_verify_intermediate_back:
             intermediate_states_buffer.copy_(
                 intermediate_states_buffer_mtp[: intermediate_states_buffer.shape[0]]
             )
