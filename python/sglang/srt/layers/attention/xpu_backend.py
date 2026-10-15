@@ -760,10 +760,20 @@ class XPUAttentionBackend(AttentionBackend):
             )
 
         # Check if we should use local attention
+        has_irope = hasattr(layer, "use_irope") and layer.use_irope
+        if has_irope and (
+            self.attention_chunk_size is not None
+            and metadata.local_attn_metadata is None
+        ):
+            raise ValueError(
+                "Full prefill graph does not support models with "
+                "attention_chunk_size and use_irope (chunked local attention); "
+                "local_attn_metadata is None."
+            )
         use_local_attn = (
             self.attention_chunk_size is not None
             and metadata.local_attn_metadata is not None
-            and (hasattr(layer, "use_irope") and layer.use_irope)
+            and has_irope
         )
 
         # We do cascade attention for Target Verify with topk > 1
@@ -1879,24 +1889,43 @@ class XPUAttentionBackend(AttentionBackend):
 
         if max_seq_len_k > 0:
             num_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
+            valid_mask = (
+                self.full_cg_prefill_strided_indices[:num_pages][None, :]
+                < seq_lens[:, None]
+            )
             token_slots = self.req_to_token[
                 forward_batch.req_pool_indices[:bs][:, None],
                 self.full_cg_prefill_strided_indices[:num_pages][None, :],
             ]
+            safe_token_slots = torch.where(
+                valid_mask, token_slots, torch.zeros_like(token_slots)
+            )
             page_table_slice = (
-                token_slots // self.page_size if self.page_size > 1 else token_slots
+                safe_token_slots // self.page_size
+                if self.page_size > 1
+                else safe_token_slots
+            )
+            page_table_slice = torch.where(
+                valid_mask, page_table_slice, torch.zeros_like(page_table_slice)
             )
             m.page_table[:, :num_pages].copy_(page_table_slice.to(torch.int32))
             m.page_table[:, num_pages:].zero_()
             if self.use_sliding_window_kv_pool:
                 swa_starts = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    token_slots
+                    safe_token_slots
                 )
                 swa_page_slice = (
                     swa_starts // self.page_size if self.page_size > 1 else swa_starts
                 )
+                swa_page_slice = torch.where(
+                    valid_mask, swa_page_slice, torch.zeros_like(swa_page_slice)
+                )
                 m.swa_page_table[:, :num_pages].copy_(swa_page_slice.to(torch.int32))
                 m.swa_page_table[:, num_pages:].zero_()
+        else:
+            m.page_table.zero_()
+            if self.use_sliding_window_kv_pool:
+                m.swa_page_table.zero_()
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             num_out = forward_batch.out_cache_loc.shape[0]

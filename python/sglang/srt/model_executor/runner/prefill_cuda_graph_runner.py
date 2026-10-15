@@ -127,6 +127,29 @@ def _is_full_or_bcg_backend(backend: Any) -> bool:
     )
 
 
+def _has_chunked_local_attn(model_runner: Any) -> bool:
+    if getattr(model_runner, "attention_chunk_size", None) is not None:
+        return True
+    model_config = getattr(model_runner, "model_config", None)
+    if (
+        model_config is not None
+        and getattr(model_config, "attention_chunk_size", None) is not None
+    ):
+        return True
+    attn_backend = getattr(model_runner, "attn_backend", None)
+    if (
+        attn_backend is not None
+        and getattr(attn_backend, "attention_chunk_size", None) is not None
+    ):
+        return True
+    model = getattr(model_runner, "model", None)
+    if model is not None and hasattr(model, "modules"):
+        for module in model.modules():
+            if getattr(module, "use_irope", False):
+                return True
+    return False
+
+
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -519,14 +542,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self._is_full_backend = _is_full_graph_backend(self.backend)
         if self._is_full_backend:
-            if (
-                getattr(model_runner, "attention_chunk_size", None) is not None
-                or getattr(model_runner.attn_backend, "attention_chunk_size", None)
-                is not None
-            ):
+            if _has_chunked_local_attn(model_runner):
                 raise ValueError(
                     "Full prefill CUDA/XPU graph does not support models with "
-                    "attention_chunk_size (chunked local attention / iRoPE)"
+                    "attention_chunk_size or use_irope (chunked local attention / iRoPE)"
                 )
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
@@ -1398,6 +1417,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if self._is_full_backend and _has_chunked_local_attn(self.model_runner):
+            return False
+
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
