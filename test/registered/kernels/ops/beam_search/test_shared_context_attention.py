@@ -34,65 +34,42 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestSharedContextAttentionMetadata(CustomTestCase):
-    def test_missing_metadata_preserves_normal_attention_fallback(self):
-        self.assertIsNone(
-            forward(
-                torch.empty(0),
-                SimpleNamespace(),
-                SimpleNamespace(beam_attention_metadata=None),
-                SimpleNamespace(),
-            )
+    def setUp(self):
+        self.enterContext(
+            envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.override(True)
         )
+
+    @staticmethod
+    def model_runner(**overrides):
+        options = dict(
+            decode_attention_backend_str="flashinfer",
+            sliding_window_size=None,
+            model_config=SimpleNamespace(
+                is_encoder_decoder=False, attention_arch=AttentionArch.MHA
+            ),
+            kv_cache_dtype=torch.bfloat16,
+        )
+        return SimpleNamespace(**(options | overrides))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_native_kernel_matches_fp32_reference(self):
         torch.manual_seed(0)
-        device = torch.device("cuda")
-        beam_width = 8
-        q_heads = 4
-        kv_heads = 2
-        head_dim = 64
-        context_len = 5
-        decode_len = 2
+        beam_width, q_heads, kv_heads, head_dim = 8, 4, 2, 64
+        context_len, decode_len = 5, 2
         num_slots = context_len + decode_len * beam_width
-
-        q = torch.randn(
-            beam_width,
-            q_heads,
-            head_dim,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        k_buffer = torch.randn(
-            num_slots,
-            kv_heads,
-            head_dim,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        v_buffer = torch.randn_like(k_buffer)
-        row_indices = torch.arange(
-            beam_width,
-            dtype=torch.int32,
-            device=device,
-        ).view(1, beam_width)
-        context_slots = torch.arange(
-            context_len,
-            dtype=torch.int32,
-            device=device,
-        )
-        context_cu_seqlens = torch.tensor(
-            [0, context_len],
-            dtype=torch.int32,
-            device=device,
-        )
-        decode_slots = torch.arange(
-            context_len,
-            num_slots,
-            dtype=torch.int32,
-            device=device,
-        ).view(1, decode_len * beam_width)
-        decode_lens = torch.tensor([decode_len], dtype=torch.int32, device=device)
+        with torch.device("cuda"):
+            q = torch.randn((beam_width, q_heads, head_dim), dtype=torch.bfloat16)
+            k_buffer = torch.randn(
+                (num_slots, kv_heads, head_dim), dtype=torch.bfloat16
+            )
+            v_buffer = torch.randn_like(k_buffer)
+            row_indices = torch.arange(beam_width, dtype=torch.int32).view(1, -1)
+            context_slots = torch.arange(context_len, dtype=torch.int32)
+            context_cu_seqlens = torch.tensor([0, context_len], dtype=torch.int32)
+            decode_slots = torch.arange(context_len, num_slots, dtype=torch.int32).view(
+                1, -1
+            )
+            decode_lens = torch.tensor([decode_len], dtype=torch.int32)
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
         output = shared_context_attention(
@@ -107,23 +84,17 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             softmax_scale=softmax_scale,
         )
 
-        reference = torch.empty_like(output)
-        for beam_index in range(beam_width):
-            slot_ids = torch.cat(
-                (
-                    context_slots,
-                    decode_slots[0, beam_index::beam_width],
-                )
-            ).long()
-            for q_head in range(q_heads):
-                kv_head = q_head // (q_heads // kv_heads)
-                keys = k_buffer[slot_ids, kv_head].float()
-                values = v_buffer[slot_ids, kv_head].float()
-                scores = keys @ q[beam_index, q_head].float()
-                probabilities = torch.softmax(scores * softmax_scale, dim=0)
-                reference[beam_index, q_head] = (probabilities[:, None] * values).sum(
-                    dim=0
-                )
+        slots = torch.cat(
+            (
+                context_slots.expand(beam_width, -1),
+                decode_slots.view(decode_len, beam_width).T,
+            ),
+            dim=1,
+        ).long()
+        keys = k_buffer[slots].repeat_interleave(q_heads // kv_heads, dim=2).float()
+        values = v_buffer[slots].repeat_interleave(q_heads // kv_heads, dim=2).float()
+        scores = torch.einsum("bhd,bthd->bht", q.float(), keys) * softmax_scale
+        reference = torch.einsum("bht,bthd->bhd", scores.softmax(dim=-1), values)
 
         torch.testing.assert_close(
             output.float(),
@@ -133,9 +104,6 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
         )
 
     def test_mixed_width_metadata_and_dispatch(self):
-        self.enterContext(
-            envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.override(True)
-        )
         entries = [
             SimpleNamespace(
                 leader_idx=leader,
@@ -153,13 +121,7 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             req_pool_indices=torch.tensor([10, 11, 12, 13, 14, 15, 16]),
             device=torch.device("cpu"),
         )
-        model_runner = SimpleNamespace(
-            decode_attention_backend_str="flashinfer",
-            sliding_window_size=None,
-            model_config=SimpleNamespace(
-                is_encoder_decoder=False, attention_arch=AttentionArch.MHA
-            ),
-            kv_cache_dtype=torch.bfloat16,
+        model_runner = self.model_runner(
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.arange(60, dtype=torch.int32).view(20, 3)
             ),
@@ -202,17 +164,14 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             all(call.args[0].is_contiguous() for call in kernel.call_args_list)
         )
 
-    def test_unsupported_attention_preserves_standard_backend(self):
-        options = dict(
-            decode_attention_backend_str="flashinfer",
-            sliding_window_size=None,
-            model_config=SimpleNamespace(
-                is_encoder_decoder=False, attention_arch=AttentionArch.MHA
-            ),
-            kv_cache_dtype=torch.bfloat16,
-        )
-        self.enterContext(
-            envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.override(True)
+    def test_standard_attention_fallbacks(self):
+        self.assertIsNone(
+            forward(
+                torch.empty(0),
+                SimpleNamespace(),
+                SimpleNamespace(beam_attention_metadata=None),
+                SimpleNamespace(),
+            )
         )
         for unsupported in (
             {"decode_attention_backend_str": "triton"},
@@ -233,7 +192,7 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
                 self.assertIsNone(
                     build_metadata(
                         SimpleNamespace(beam_tail=object()),
-                        SimpleNamespace(**(options | unsupported)),
+                        self.model_runner(**unsupported),
                     )
                 )
 

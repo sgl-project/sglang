@@ -18,6 +18,7 @@ from sglang.srt.beam_search.trie_output_head import (
     BeamTrieOutputHead,
     configure_model_trie_output_heads,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -75,57 +76,37 @@ class TestBeamTrieConstraint(CustomTestCase):
         processor.rl_on_policy_target = None
         return processor
 
-    def test_loads_artifact_and_valid_child_masks(self):
-        config, constraint = self.load()
+    def test_dense_and_sparse_child_masks(self):
+        config, dense = self.load()
         self.assertEqual(config.token_start_for_depth(2), 18)
-        self.assertEqual(constraint.level_cardinalities, (2, 3, 5))
-        self.assertEqual(
-            constraint.valid_child_mask(torch.empty((1, 0), dtype=torch.int64), 0)
-            .nonzero(as_tuple=True)[1]
-            .tolist(),
-            [0, 2],
-        )
-        self.assertEqual(
-            constraint.valid_child_mask(torch.tensor([[0], [2]]), 1).tolist(),
-            [
-                [False, True, False, True],
-                [True, False, False, False],
-            ],
-        )
-        self.assertEqual(
-            constraint.valid_child_mask(torch.tensor([[0, 1], [2, 0]]), 2).tolist(),
-            [
-                [True, False, True, False],
-                [False, False, True, True],
-            ],
-        )
-
-    def test_sparse_level2_matches_dense_masks(self):
-        config = load_trie_output_head_config(
-            str(self.root / TRIE_OUTPUT_HEAD_FILENAME)
-        )
         with mock.patch.object(
             trie_constraint_module,
             "_MAX_DENSE_LEVEL2_MASK_BYTES",
             0,
         ):
-            constraint = BeamTrieConstraint.load(config, "cpu")
-
-        self.assertIsNone(constraint.level2_masks)
-        self.assertIsNotNone(constraint.level2_sparse)
-        self.assertEqual(constraint.level_cardinalities, (2, 3, 5))
-        self.assertEqual(
-            constraint.valid_child_mask(
+            sparse = BeamTrieConstraint.load(config, "cpu")
+        self.assertIsNone(sparse.level2_masks)
+        self.assertIsNotNone(sparse.level2_sparse)
+        cases = (
+            (torch.empty((1, 0), dtype=torch.int64), [[True, False, True, False]]),
+            (
+                torch.tensor([[0], [2]]),
+                [[False, True, False, True], [True, False, False, False]],
+            ),
+            (
                 torch.tensor([[0, 1], [2, 0]]),
-                2,
-            ).tolist(),
-            [
-                [True, False, True, False],
-                [False, False, True, True],
-            ],
+                [[True, False, True, False], [False, False, True, True]],
+            ),
         )
+        for constraint in (dense, sparse):
+            self.assertEqual(constraint.level_cardinalities, (2, 3, 5))
+            for depth, (prefixes, expected) in enumerate(cases):
+                with self.subTest(sparse=constraint is sparse, depth=depth):
+                    self.assertEqual(
+                        constraint.valid_child_mask(prefixes, depth).tolist(), expected
+                    )
         with self.assertRaisesRegex(ValueError, "unknown AB pair"):
-            constraint.valid_child_mask(torch.tensor([[0, 0]]), 2)
+            sparse.valid_child_mask(torch.tensor([[0, 0]]), 2)
 
     def test_compact_signed_array_preserves_values_above_int32(self):
         maximum = np.iinfo(np.int32).max + 1
@@ -172,10 +153,7 @@ class TestBeamTrieConstraint(CustomTestCase):
             num_candidates=4,
             normalizers=[torch.zeros((2, 2))],
         )
-        with mock.patch(
-            "sglang.srt.beam_search.trie_output_head.use_topk_logprob",
-            return_value=True,
-        ):
+        with envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.override(True):
             values, tokens = constraint.topk_logprobs(
                 [compact],
                 prefixes,
@@ -212,7 +190,7 @@ class TestBeamTrieConstraint(CustomTestCase):
         )
         self.assertEqual(advanced.tolist(), [[2, 0], [0, 3]])
 
-    def test_mixed_compact_lm_head_selects_each_rows_codebook(self):
+    def test_mixed_compact_lm_head_preserves_dense_scores_and_transforms(self):
         config, _ = self.load()
         processor = self.processor(config)
         hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
@@ -223,20 +201,35 @@ class TestBeamTrieConstraint(CustomTestCase):
         lm_head.weight = torch.nn.Parameter(weight)
         lm_head.quant_method = None
 
-        actual = processor._compute_mixed_beam_trie_lm_head(hidden, lm_head, depths)
-        expected = torch.stack(
-            [
-                hidden[0] @ weight[10:14].T,
-                hidden[1] @ weight[18:22].T,
-                hidden[2] @ weight[14:18].T,
-            ]
-        )
         dense = hidden @ weight.T
-        torch.testing.assert_close(actual.logits, expected)
-        torch.testing.assert_close(
-            actual.normalizer[:, 0] + actual.normalizer[:, 1],
-            torch.logsumexp(dense, dim=-1),
+        indices = (
+            config.token_start
+            + depths[:, None] * config.codebook_size
+            + torch.arange(config.codebook_size)
         )
+        self.enterContext(
+            mock.patch(
+                "sglang.srt.layers.logits_processor.fused_softcap",
+                side_effect=lambda logits, cap: logits.copy_(
+                    cap * torch.tanh(logits / cap)
+                ),
+            )
+        )
+        for scale, softcap in ((None, None), (0.5, 3.0)):
+            with self.subTest(scale=scale, softcap=softcap):
+                processor.logit_scale = scale
+                processor.final_logit_softcapping = softcap
+                actual = processor._compute_mixed_beam_trie_lm_head(
+                    hidden, lm_head, depths
+                )
+                torch.testing.assert_close(actual.logits, dense.gather(1, indices))
+                expected = dense if scale is None else dense * scale
+                if softcap is not None:
+                    expected = softcap * torch.tanh(expected / softcap)
+                torch.testing.assert_close(
+                    actual.normalizer[:, 0] + actual.normalizer[:, 1],
+                    torch.logsumexp(expected, dim=-1),
+                )
 
         self.assertIsNone(
             processor._beam_trie_output_head_for(
@@ -244,33 +237,6 @@ class TestBeamTrieConstraint(CustomTestCase):
                 embedding_bias=torch.zeros(30),
             )
         )
-
-    def test_streamed_normalizer_applies_dense_logit_transforms(self):
-        config, _ = self.load()
-        output_head = BeamTrieOutputHead(config, vocab_size=30, chunk_size=7)
-        hidden = torch.tensor([[1.0, 2.0]])
-        weight = torch.arange(60, dtype=torch.float32).reshape(30, 2)
-
-        def project(states, rows):
-            return states @ rows.T
-
-        def transform(logits):
-            logits.mul_(0.5)
-            return 3.0 * torch.tanh(logits.float() / 3.0)
-
-        actual = output_head.project_mixed(
-            hidden,
-            weight,
-            depths=torch.tensor([1]),
-            project=project,
-            transform=transform,
-        )
-        dense = transform(project(hidden, weight))
-        torch.testing.assert_close(
-            actual.normalizer[:, 0] + actual.normalizer[:, 1],
-            torch.logsumexp(dense, dim=-1),
-        )
-        torch.testing.assert_close(transform(actual.logits), dense[:, 14:18])
 
     def test_compact_head_configuration_and_dense_fallback(self):
         config, _ = self.load()
@@ -314,13 +280,15 @@ class TestBeamTrieConstraint(CustomTestCase):
                 rl_on_policy_target=None,
             )
 
-    def test_discovers_model_bundled_trie_output_head(self):
+    def test_discovers_only_model_root_artifact(self):
         model_root = self.root / "model"
         model_root.mkdir()
-        (model_root / TRIE_OUTPUT_HEAD_FILENAME).write_bytes(
-            (self.root / TRIE_OUTPUT_HEAD_FILENAME).read_bytes()
-        )
-
+        self.assertIsNone(discover_trie_output_head_config(str(model_root)))
+        nested_root = model_root / "nested"
+        nested_root.mkdir()
+        self._write_artifact(nested_root)
+        self.assertIsNone(discover_trie_output_head_config(str(model_root)))
+        self._write_artifact(model_root)
         config = discover_trie_output_head_config(str(model_root))
         self.assertIsNotNone(config)
         self.assertEqual(config.token_start, 10)
@@ -328,16 +296,6 @@ class TestBeamTrieConstraint(CustomTestCase):
             config.tensor_path,
             str(model_root / TRIE_OUTPUT_HEAD_FILENAME),
         )
-        empty_model_root = self.root / "empty-model"
-        empty_model_root.mkdir()
-        self.assertIsNone(discover_trie_output_head_config(str(empty_model_root)))
-
-    def test_only_discovers_root_artifact(self):
-        model_root = self.root / "model-with-nested-artifact"
-        nested_root = model_root / "nested"
-        nested_root.mkdir(parents=True)
-        self._write_artifact(nested_root)
-        self.assertIsNone(discover_trie_output_head_config(str(model_root)))
 
     def test_rejects_unsupported_format_version(self):
         root = self.root / "unsupported"
