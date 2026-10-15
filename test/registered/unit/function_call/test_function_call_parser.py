@@ -2508,13 +2508,19 @@ class TestQwen3CoderDetector(unittest.TestCase):
 
     # ==================== Parameter Type Tests ====================
 
-    def _check_structured_union_value(self, schema, raw_value, expected):
+    def _check_structured_union_value(
+        self, schema, raw_value, expected, definitions=None
+    ):
         tools = [
             Tool(
                 type="function",
                 function=Function(
                     name="record",
-                    parameters={"type": "object", "properties": {"value": schema}},
+                    parameters={
+                        "type": "object",
+                        "properties": {"value": schema},
+                        "$defs": definitions or {},
+                    },
                 ),
             )
         ]
@@ -2645,6 +2651,25 @@ class TestQwen3CoderDetector(unittest.TestCase):
             ({"anyOf": [{"type": "string"}, {"$ref": "#/$defs/missing"}]}, "{}"),
         ):
             self._check_structured_union_value(schema, raw, raw)
+
+    def test_union_references_use_enclosing_schema(self):
+        """Root definitions must resolve without losing their validation constraints."""
+        definitions = {
+            "City": {"type": "string"},
+            "Location": {
+                "type": "object",
+                "properties": {"city": {"$ref": "#/$defs/City"}},
+                "required": ["city"],
+            },
+        }
+        for keyword in ("anyOf", "oneOf"):
+            schema = {keyword: [{"type": "string"}, {"$ref": "#/$defs/Location"}]}
+            for raw, expected in (
+                ('{"city":"Paris"}', {"city": "Paris"}),
+                ('{"city":123}', '{"city":123}'),
+                ('{"country":"France"}', '{"country":"France"}'),
+            ):
+                self._check_structured_union_value(schema, raw, expected, definitions)
 
     def test_union_schema_references_never_fetch(self):
         """Unresolved external references must not trigger network access."""
