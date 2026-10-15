@@ -314,10 +314,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.common import (
-    checkpoint_kv_cache,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -2413,8 +2410,7 @@ class Scheduler:
         req.to_finish = None
         if self.disagg_prefill is not None:
             self.disagg_prefill.release_aborted_chunked_req(req)
-        self.request_retirer.release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self.request_retirer.retire_aborted(req)
 
         self.lists.chunked_req = None
         self.lists._pending_chunked_abort_req = None

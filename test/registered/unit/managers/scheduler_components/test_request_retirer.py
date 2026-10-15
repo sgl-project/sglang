@@ -6,20 +6,29 @@ from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
+from sglang.srt.beam_search.beam_group import BeamGroup
+from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.disaggregation.req_state import DisaggReqState
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
     Req,
 )
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import prefill_owner_shell
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.scheduler_request_intake import make_request_intake
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
+
+_RETIRER = "sglang.srt.managers.scheduler_components.request_retirer"
+_SCHEDULER = "sglang.srt.managers.scheduler"
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -97,6 +106,100 @@ class TestBootstrapFailureReleasesMedia(CustomTestCase):
         self.assertIsNone(item.feature)
         self.assertTrue(torch.equal(history.feature, torch.ones(2)))
         self.assertFalse(session._inflight)
+
+
+def _beam_coordinator(core_lists) -> BeamCoordinator:
+    return BeamCoordinator(
+        model_config=None,
+        spec_algorithm=None,
+        max_req_len=0,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        tree_cache=None,
+        future_map=None,
+        core_lists=core_lists,
+    )
+
+
+def _beam_leader(beam: BeamCoordinator, rid: str, **attrs) -> Req:
+    """A request whose beam group validate_and_init has counted in."""
+    req = Req(rid, "", [1, 2], SamplingParams(), **attrs)
+    req.beam_group = BeamGroup(
+        beam_width=2,
+        stop_token_ids=[],
+        max_new_tokens=4,
+        num_return=1,
+        device="cpu",
+    )
+    req.beam_group.leader = req
+    beam._num_live_groups += 1
+    return req
+
+
+class TestBeamGroupLeavesWithItsLeader(CustomTestCase):
+    """A beam leader that leaves outside the beam commit retires its group, so
+    the live-group count returns to zero."""
+
+    def setUp(self):
+        enter_scope(self, published_topology())
+
+    def _intake(self, **deps):
+        core_lists = CoreLists()
+        beam = _beam_coordinator(core_lists)
+        intake = make_request_intake(
+            core_lists=core_lists,
+            beam_coordinator=beam,
+            request_retirer=_retirer(beam_coordinator=beam),
+            **deps,
+        )
+        return intake, beam
+
+    def test_queue_limit_rejection(self):
+        intake, beam = self._intake(max_queued_requests=1)
+        intake.lists.waiting_queue = [Req("queued", "", [1], SamplingParams())]
+        leader = _beam_leader(beam, "beam")
+
+        intake.add_request_to_queue(leader)
+
+        self.assertNotIn(leader, intake.lists.waiting_queue)
+        self.assertEqual(beam._num_live_groups, 0)
+
+    def test_priority_rejection(self):
+        get_context().override("test", enable_priority_scheduling=False)
+        get_context().override("test", abort_on_priority_when_disabled=True)
+        intake, beam = self._intake()
+        leader = _beam_leader(beam, "beam", priority=1)
+
+        intake.add_request_to_queue(leader)
+
+        self.assertEqual(intake.lists.waiting_queue, [])
+        self.assertEqual(beam._num_live_groups, 0)
+
+    def test_mid_chunk_abort(self):
+        sched = Scheduler.__new__(Scheduler)
+        sched.mode_owners = ModeOwners()
+        sched.lists = CoreLists()
+        beam = _beam_coordinator(sched.lists)
+        leader = _beam_leader(beam, "beam")
+        leader.kv.req_pool_idx = 1
+        sched.lists.chunked_req = leader
+        sched.lists._pending_chunked_abort_req = leader
+        sched.request_retirer = _retirer(beam_coordinator=beam)
+        sched.tree_cache = sched.request_retirer.tree_cache
+        sched.ipc_channels = Mock()
+
+        with (
+            patch(f"{_RETIRER}.release_kv_cache") as release,
+            # Where the scheduler released the KV itself.
+            patch(f"{_SCHEDULER}.release_kv_cache", release, create=True),
+        ):
+            sched.process_pending_chunked_abort()
+
+        release.assert_called_once_with(
+            leader, sched.request_retirer.tree_cache, checkpoint=False
+        )
+        self.assertIsNone(sched.lists.chunked_req)
+        self.assertEqual(beam._num_live_groups, 0)
 
 
 if __name__ == "__main__":

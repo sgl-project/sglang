@@ -88,33 +88,6 @@ _ALLOWED = {
         "DecodePreallocQueue.pop_preallocated",
         "release_kv_cache",
     ): 1,
-    # A beam leader aborted mid-chunk keeps its group live.
-    (
-        "managers/scheduler.py",
-        "Scheduler.process_pending_chunked_abort",
-        "release_kv_cache",
-    ): 1,
-    (
-        "managers/scheduler.py",
-        "Scheduler.process_pending_chunked_abort",
-        "request_retirer.release_aborted_request",
-    ): 1,
-    # A beam request rejected at the door keeps its group live.
-    (
-        "managers/scheduler_components/request_intake.py",
-        "RequestIntake.add_request_to_queue",
-        "request_retirer.release_aborted_request",
-    ): 2,
-    (
-        "managers/scheduler_components/request_intake.py",
-        "RequestIntake._abort_on_queued_limit",
-        "request_retirer.release_aborted_request",
-    ): 1,
-    (
-        "managers/scheduler_components/request_intake.py",
-        "RequestIntake._abort_on_queued_limit",
-        "retire_group",
-    ): 1,
 }
 
 

@@ -108,6 +108,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req.weight_version_events = []
         req.time_stats = MagicMock()
         req.time_stats.trace_ctx = MagicMock()
+        # At the door a request holds no KV or mamba state.
+        req.kv.holds_kv = req.kv.holds_mamba = False
         return req
 
     def test_prefill_mode_assigns_default_priority_before_bootstrap_queue(self):

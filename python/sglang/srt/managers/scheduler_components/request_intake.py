@@ -975,7 +975,7 @@ class RequestIntake:
         admitted: AbstractSet[Req] = frozenset(),
     ):
         if not self._set_or_validate_priority(req):
-            self.request_retirer.release_aborted_request(req)
+            self.request_retirer.retire_aborted_waiting(req)
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
@@ -988,7 +988,7 @@ class RequestIntake:
             self.mode_owners.disagg_decode.enqueue(req, is_retracted=is_retracted)
         else:
             if self._abort_on_queued_limit(req, admitted):
-                self.request_retirer.release_aborted_request(req)
+                self.request_retirer.retire_aborted_waiting(req)
                 return
             self._prefetch_kvcache(req)
             self.lists.waiting_queue.append(req)
@@ -1055,9 +1055,8 @@ class RequestIntake:
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self.request_retirer.release_aborted_request(candidate_req)
                 self.lists.waiting_queue.remove(candidate_req)
-                self.beam_coordinator.retire_group(candidate_req)
+                self.request_retirer.retire_aborted_waiting(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 

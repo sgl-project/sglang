@@ -45,6 +45,7 @@ class _FakeReq:
         self.beam_group = None
         self.session = None
         self.multimodal_inputs = None
+        self.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []
