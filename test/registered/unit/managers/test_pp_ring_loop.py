@@ -267,7 +267,7 @@ class TestPPSlotTag(CustomTestCase):
         owner.pop_reqs_to_admit(ScheduleSlot(index=0))
         next_slot = ScheduleSlot(index=1)
         owner.apply_retract_consensus([], next_slot)
-        owner.apply_prealloc_consensus([[], []], next_slot)
+        owner.apply_prealloc_consensus([[], []], next_slot, lora_ids_in_use=set)
         owner.apply_transfer_consensus([], next_slot)
 
         self.assertEqual(budgeted, [1, 1, 1])

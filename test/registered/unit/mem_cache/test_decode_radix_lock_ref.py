@@ -555,7 +555,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         # Admission rejection must release the matched-node lock, including
         # when the SWA lock was already released for fresh tail allocation.
-        preallocated, failed = queue.pop_preallocated(running_batch.reqs)
+        preallocated, failed = queue.pop_preallocated(
+            running_batch.reqs, lora_ids_in_use=set
+        )
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
@@ -639,7 +641,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             ),
         )
 
-        preallocated, failed = queue.pop_preallocated([])
+        preallocated, failed = queue.pop_preallocated([], lora_ids_in_use=set)
 
         self.assertEqual((preallocated, failed), ([], []))
         fits_budgets = queue._prealloc_reservation_fits.call_args.kwargs

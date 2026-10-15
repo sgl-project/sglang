@@ -474,8 +474,6 @@ class Scheduler:
         self.init_step_builder()
         self.init_dp_attn_adapter()
         self.init_pool_stats_observer()
-        self.init_invariant_checker()
-        self.init_watchdog_diagnostics()
         self.init_kv_events_publisher()
         self.init_load_publisher()
         self.init_services()
@@ -483,6 +481,8 @@ class Scheduler:
         self.init_request_retirer()
         self.init_batch_result_processor()
         self.init_request_registry()
+        self.init_invariant_checker()
+        self.init_watchdog_diagnostics()
         self.maybe_init_dllm()
         self.maybe_init_disagg_prefill()
         self.maybe_init_disagg_decode()
@@ -1000,7 +1000,6 @@ class Scheduler:
         self.metrics_reporter = SchedulerMetricsReporter(
             metrics_sink=self.metrics_sink,
             request_registry=self.request_registry,
-            core_lists=self.lists,
             counters=self.counters,
             pool_stats_observer=self.pool_stats_observer,
             grammar_manager=self.grammar_manager,
@@ -1154,7 +1153,6 @@ class Scheduler:
             request_retirer=self.request_retirer,
             flags=self.flags,
             core_lists=self.lists,
-            pending=self.pending,
             policy=self.policy,
             future_map=self.future_map,
             ngram_embedding_manager=self.ngram_embedding_manager,
@@ -1244,10 +1242,11 @@ class Scheduler:
                 ),
             )
         elif (owner := self.disagg_decode) is not None:
+            lora_ids_in_use = self.request_registry.lora_ids_in_use
             stages = dict(
                 schedule=self.get_next_disagg_decode_batch_to_run,
                 prefetch=owner.prefetch_prefill_dp_rank_queries,
-                intake=owner.intake,
+                intake=functools.partial(owner.intake, lora_ids_in_use=lora_ids_in_use),
                 hold_finished=(
                     owner.hold_finished
                     if self.decode_offload_manager is not None
@@ -1257,6 +1256,7 @@ class Scheduler:
                     _DisaggDecodeRing,
                     owner,
                     schedule=self.get_next_disagg_decode_batch_to_run,
+                    lora_ids_in_use=lora_ids_in_use,
                 ),
             )
         else:
@@ -2193,7 +2193,7 @@ class Scheduler:
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
             counters=self.counters,
-            core_lists=self.lists,
+            request_registry=self.request_registry,
             pending=self.pending,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -2823,7 +2823,7 @@ class Scheduler:
                 message=(
                     "Reject attach: scheduler is not idle. "
                     f"#queue-req={len(self.request_registry.queued_reqs())} "
-                    f"#running-req={len(self.lists.decoding)}"
+                    f"#running-req={len(self.request_registry.running_reqs())}"
                 ),
             )
 
@@ -2878,7 +2878,7 @@ class Scheduler:
                 message=(
                     "Reject detach: scheduler is not idle. "
                     f"#queue-req={len(self.request_registry.queued_reqs())} "
-                    f"#running-req={len(self.lists.decoding)}"
+                    f"#running-req={len(self.request_registry.running_reqs())}"
                 ),
             )
 

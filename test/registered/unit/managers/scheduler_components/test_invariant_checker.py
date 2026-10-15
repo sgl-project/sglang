@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
+from sglang.test.scheduler_request_lists import make_request_registry
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -13,6 +15,7 @@ maybe_stub_sgl_kernel()
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.request_lists import CoreLists, RequestList
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
@@ -20,6 +23,7 @@ from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
@@ -61,7 +65,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             req_to_token_pool=MagicMock(),
             pool_stats_observer=MagicMock(),
             counters=LaunchCounters(),
-            core_lists=CoreLists(),
+            request_registry=make_request_registry(),
             pending=PendingSteps(),
             scheduler_stage_metrics=None,
         )
@@ -175,6 +179,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             )
         self.counters = LaunchCounters(cur_batch_for_debug=SimpleNamespace(reqs=[]))
         self.core_lists = CoreLists()
+        self.mode_owners = ModeOwners()
         observer = SchedulerPoolStatsObserver(
             tree_cache=self.cache,
             token_to_kv_pool_allocator=self.allocator,
@@ -200,7 +205,9 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             req_to_token_pool=req_pool,
             pool_stats_observer=observer,
             counters=self.counters,
-            core_lists=self.core_lists,
+            request_registry=make_request_registry(
+                core_lists=self.core_lists, mode_owners=self.mode_owners
+            ),
             pending=PendingSteps(),
             scheduler_stage_metrics=None,
         )
@@ -312,6 +319,48 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 leak, msg = checker._check_full_pool(stats, uncached=uncached)
                 self.assertFalse(leak, msg)
                 self.assertNotIn("slack_allowed", msg)
+                with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
+                    checker.self_check_during_busy()
+
+    def test_mode_lists_holding_kv_own_their_rows(self):
+        """A request whose KV row a PD or HiSparse list holds is counted as
+        uncached by the busy check, not reported as a leak."""
+
+        def hisparse(req):
+            coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+            coordinator.staging = [req]
+            return dict(hisparse_coordinator=coordinator)
+
+        cases = {
+            "pd_decode_transfer": lambda req: dict(
+                disagg_decode=decode_owner_shell(
+                    transfer_queue=SimpleNamespace(queue=[SimpleNamespace(req=req)])
+                )
+            ),
+            "pd_decode_ready": lambda req: dict(
+                disagg_decode=decode_owner_shell(ready=[req])
+            ),
+            "pd_decode_releasing": lambda req: dict(
+                disagg_decode=decode_owner_shell(releasing=[req])
+            ),
+            "pd_prefill_prefilling": lambda req: dict(
+                disagg_prefill=prefill_owner_shell(prefilling=[req])
+            ),
+            "pd_prefill_transfer": lambda req: dict(
+                disagg_prefill=prefill_owner_shell(transfer=[req])
+            ),
+            "hisparse_staging": hisparse,
+        }
+        for name, owners in cases.items():
+            with self.subTest(name):
+                checker = self._make_checker()
+                req = self._active_partial_page(checker)
+                self.core_lists.decoding = []
+                for field, owner in owners(req).items():
+                    setattr(self.mode_owners, field, owner)
+                self.assertEqual(
+                    checker._get_total_uncached_sizes(), (self.PAGE_SIZE, 0)
+                )
                 with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
                     checker.self_check_during_busy()
 

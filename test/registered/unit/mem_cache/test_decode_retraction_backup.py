@@ -14,7 +14,6 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVManager
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator, TransferBackend
-from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
@@ -378,7 +377,6 @@ class TestDecodeRetractionBackup(CustomTestCase):
             num_reserved_decode_tokens=0,
             server_args=env.server_args,
             model_config=SimpleNamespace(num_hidden_layers=env.target_pool.layer_num),
-            core_lists=CoreLists(),
             get_ready=lambda: [],
             sliding_window_size=8 if hybrid_swa else None,
             enable_hisparse=False,
@@ -522,7 +520,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 receiver.poll.return_value = KVPoll.WaitingForInput
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
                 queue.queue = [decode_req]
-                self.assertEqual(queue.pop_preallocated([]), ([decode_req], []))
+                self.assertEqual(
+                    queue.pop_preallocated([], lora_ids_in_use=set), ([decode_req], [])
+                )
                 self.assertEqual(decode_req.host_staged, host_staged)
                 self.assertEqual(len(host_admissions), int(host_staged))
                 self.assertEqual(req.kv.req_pool_idx is None, host_staged)
@@ -568,7 +568,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 queue.queue = [decode_req]
                 host_free_before = cache.host_pool_group.available_size()
                 blocker = env.allocator.alloc(self.pool_size)
-                self.assertEqual(queue.pop_preallocated([]), ([], []))
+                self.assertEqual(
+                    queue.pop_preallocated([], lora_ids_in_use=set), ([], [])
+                )
                 receiver.send_metadata.assert_not_called()
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
@@ -576,7 +578,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 env.allocator.free(blocker)
                 pressure = env.allocator.alloc(num_slots)
                 receiver.supports_host_destination = True
-                self.assertEqual(queue.pop_preallocated([]), ([decode_req], []))
+                self.assertEqual(
+                    queue.pop_preallocated([], lora_ids_in_use=set), ([decode_req], [])
+                )
                 self.assertIsNone(req.kv.req_pool_idx)
                 self.assertEqual(
                     env.allocator.available_size(), self.pool_size - num_slots
@@ -630,7 +634,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 pending_req = _decode_req("pending", [1] * num_tokens)
                 pending = DecodeRequest(req=pending_req, kv_receiver=receiver)
                 queue.queue = [pending]
-                self.assertEqual(queue.pop_preallocated([]), ([], []))
+                self.assertEqual(
+                    queue.pop_preallocated([], lora_ids_in_use=set), ([], [])
+                )
                 self.assertEqual(queue.queue, [pending])
                 self.assertIsNone(pending_req.kv.req_pool_idx)
                 self.assertIsNone(pending_req.kv.retraction_backup)
@@ -674,7 +680,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     cache.host_pool_group.available_size(), host_free_before
                 )
                 # Abort cleanup uses the same descriptor, including sidecars.
-                self.assertEqual(queue.pop_preallocated([]), ([pending], []))
+                self.assertEqual(
+                    queue.pop_preallocated([], lora_ids_in_use=set), ([pending], [])
+                )
                 cache.discard_kv_cache_backup(pending_req.kv.retraction_backup)
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
@@ -707,7 +715,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
         decode_req = DecodeRequest(req=req, kv_receiver=receiver)
         queue.queue = [decode_req]
         host_free_before = cache.host_pool_group.available_size()
-        self.assertEqual(queue.pop_preallocated([]), ([decode_req], []))
+        self.assertEqual(
+            queue.pop_preallocated([], lora_ids_in_use=set), ([decode_req], [])
+        )
         self.assertIsNone(req.kv.req_pool_idx)
         self.assertEqual(cache.protected_size(), 4)
         env.allocator.free(pressure)

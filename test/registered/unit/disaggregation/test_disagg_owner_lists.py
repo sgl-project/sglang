@@ -226,7 +226,7 @@ class _PreallocQueue:
         self.retracted_queue = [r for r in self.retracted_queue if r not in resumed]
         return resumed
 
-    def pop_preallocated(self, decoding):
+    def pop_preallocated(self, decoding, *, lora_ids_in_use):
         ready = [
             r for r in self.queue if r.kv_receiver.poll() == KVPoll.WaitingForInput
         ]
@@ -291,16 +291,16 @@ class TestDisaggDecodeLists(CustomTestCase):
         req = decode_req.req
         self.assertEqual(_names(owner)["prealloc"], ["r"])
 
-        owner.intake()
+        owner.intake(lora_ids_in_use=set)
         self.assertEqual(_names(owner)["prealloc"], ["r"])
 
         decode_req.kv_receiver.poll.return_value = KVPoll.WaitingForInput
-        owner.intake()
+        owner.intake(lora_ids_in_use=set)
         self.assertEqual(_names(owner)["prealloc"], [])
         self.assertEqual(_names(owner)["transfer"], ["r"])
 
         decode_req.kv_receiver.poll.return_value = KVPoll.Success
-        owner.intake()
+        owner.intake(lora_ids_in_use=set)
         self.assertEqual(_names(owner)["transfer"], [])
         self.assertEqual(_names(owner)["ready"], ["r"])
 
@@ -323,7 +323,7 @@ class TestDisaggDecodeLists(CustomTestCase):
         owner.prealloc_queue.retracted_queue = [_decode_req("a"), _decode_req("b")]
         owner.prealloc_queue.resumable = ["a"]
 
-        owner.intake()
+        owner.intake(lora_ids_in_use=set)
 
         self.assertEqual(_names(owner)["retracted"], ["b"])
         self.assertEqual(_names(owner)["ready"], ["a"])

@@ -16,7 +16,8 @@ class RequestList:
     """One list that owns live requests, with what the readers ask of it.
     Each live request is in exactly one list."""
 
-    # Unique among the scheduler's lists; load and metrics look lists up by it.
+    # Unique among the scheduler's lists. Readers ask the flags below, never
+    # the name, which serves logs and tests.
     name: str
     # The members, in list order (the same on every rank).
     reqs: List[Req]
@@ -24,7 +25,7 @@ class RequestList:
     # running timeout and `collect_inflight_reqs` read them.
     inflight: bool = False
     # The members wait for admission: the waiting timeout, the queue length
-    # metrics and the load's waiting count read them.
+    # metrics and the load's queue length read them.
     queued: bool = False
     # A retract-mode pause retracts the unfinished members, which hold a row,
     # so that their KV is rebuilt under the new weights.
@@ -40,6 +41,24 @@ class RequestList:
     waiting: bool = False
     # - with ignore_releasing, all of them.
     releasing: bool = False
+    # The members may own a KV row (`req.kv.holds_kv`): the busy memory check
+    # counts their private KV, and the load leaves their tokens out of its
+    # pending tokens, as the pool counts them as used.
+    holds_kv: bool = False
+    # The members' adapters stay in use: LoRA admission fits a new adapter
+    # beside them.
+    pins_lora: bool = False
+    # The members are the running requests of the metrics, the logs and the
+    # load.
+    counts_running: bool = False
+    # The load counts the members among its waiting requests.
+    counts_queued: bool = False
+    # PD decode: the members' KV has not arrived from the prefill side; the
+    # load counts their tokens as awaited.
+    awaits_kv: bool = False
+    # The member stopped between two prefill chunks: the load counts its
+    # prompt tokens still to prefill.
+    partly_prefilled: bool = False
 
     def keeps_busy(
         self, *, for_health_check: bool, ignore_waiting: bool, ignore_releasing: bool

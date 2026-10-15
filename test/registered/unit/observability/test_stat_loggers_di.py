@@ -27,7 +27,6 @@ import prometheus_client
 
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     MetricsSink,
     SchedulerMetricsReporter,
@@ -48,6 +47,8 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_context, reset_context
+from sglang.test.disagg_owner_shells import decode_owner_shell
+from sglang.test.scheduler_request_lists import make_request_registry
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 
@@ -235,13 +236,6 @@ class TestHiCacheMetrics(unittest.TestCase):
         )
 
 
-def _empty_decode_lists():
-    return {
-        name: RequestList(name=name, reqs=[])
-        for name in ("prealloc", "retracted", "transfer")
-    }
-
-
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
@@ -294,13 +288,10 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
         reporter.mode_owners = ModeOwners(
-            disagg_decode=SimpleNamespace(
-                transfer_queue=queue, prealloc_queue=SimpleNamespace(queue=[])
-            )
+            disagg_decode=decode_owner_shell(transfer_queue=queue)
         )
-        reporter.core_lists = SimpleNamespace(decoding=[], waiting_queue=[])
-        reporter.request_registry = SimpleNamespace(
-            request_lists=_empty_decode_lists, queued_reqs=lambda: []
+        reporter.request_registry = make_request_registry(
+            mode_owners=reporter.mode_owners
         )
         reporter.grammar_manager = []
         reporter.pool_stats_observer = SimpleNamespace(
@@ -374,16 +365,18 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
         reporter.mode_owners = ModeOwners(
-            disagg_decode=SimpleNamespace(
+            disagg_decode=decode_owner_shell(
                 transfer_queue=queue,
                 prealloc_queue=SimpleNamespace(
-                    queue=[], retracted_queue=[], num_tokens_pre_allocated=0
+                    queue=[],
+                    retracted_queue=[],
+                    held_rebootstrap_reqs=[],
+                    num_tokens_pre_allocated=0,
                 ),
             )
         )
-        reporter.core_lists = SimpleNamespace(decoding=batch.reqs, waiting_queue=[])
-        reporter.request_registry = SimpleNamespace(
-            request_lists=_empty_decode_lists, queued_reqs=lambda: []
+        reporter.request_registry = make_request_registry(
+            mode_owners=reporter.mode_owners
         )
         reporter.grammar_manager = []
         reporter.capacity = SimpleNamespace(max_total_num_tokens=1)
@@ -458,6 +451,35 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         self.assertEqual(
             self.collector.num_decode_deferred_kv_release_reqs.sets,
             [(self.labels, 2)],
+        )
+
+
+class TestStatusLoggerQueuedRequests(CustomTestCase):
+    def test_pd_decode_ready_requests_are_dumped_as_queued(self):
+        """The status logger's queued requests are the registry's: on PD
+        decode the transferred requests waiting for a row."""
+        ready = SimpleNamespace(rid="ready")
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.metrics_sink = MetricsSink.__new__(MetricsSink)
+        reporter.mode_owners = ModeOwners(
+            disagg_decode=decode_owner_shell(ready=[ready])
+        )
+        reporter.request_registry = make_request_registry(
+            mode_owners=reporter.mode_owners
+        )
+        reporter.enable_mfu_metrics = False
+        reporter.metrics_sink.current_scheduler_metrics_enabled = True
+        reporter.metrics_sink.metrics_collector = MagicMock()
+        reporter.metrics_sink.scheduler_status_logger = MagicMock()
+        # Off the log interval: the report stops after the status dump.
+        reporter.metrics_sink.forward_ct_decode = 1
+        reporter.metrics_sink.decode_log_interval = 2
+        batch = SimpleNamespace(reqs=[], dp_cooperation_info=None)
+
+        reporter.report_decode_stats(False, batch=batch)
+
+        reporter.metrics_sink.scheduler_status_logger.maybe_dump.assert_called_once_with(
+            batch, [ready]
         )
 
 

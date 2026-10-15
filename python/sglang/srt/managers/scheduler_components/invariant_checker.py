@@ -40,13 +40,16 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.request_lists import CoreLists, RequestList
+    from sglang.srt.managers.request_lists import RequestList
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler_components.engine_state import (
         EngineFlags,
         LaunchCounters,
     )
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
+    from sglang.srt.managers.scheduler_components.request_registry import (
+        RequestRegistry,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -71,8 +74,8 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     # The step this iteration launched; None when it launched nothing.
     counters: LaunchCounters
-    # The decoding and the chunked request own their KV rows.
-    core_lists: CoreLists
+    # The requests of the lists that hold KV own their KV rows.
+    request_registry: RequestRegistry
     # Released requests' rows held for a pending step's commit.
     pending: PendingSteps
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
@@ -279,10 +282,7 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        reqs = list(self.core_lists.decoding)
-        chunked_req = self.core_lists.chunked_req
-        if chunked_req is not None:
-            reqs.append(chunked_req)
+        reqs = self.request_registry.reqs(lambda entry: entry.holds_kv)
 
         # A request running on a session's record does not own that row.
         session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}

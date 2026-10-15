@@ -114,6 +114,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
@@ -165,7 +166,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
-    from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.pool_stats_observer import (
         SchedulerPoolStatsObserver,
     )
@@ -174,6 +174,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.observability.metrics_collector import (
         SchedulerMetricsCollector,
+        SchedulerStats,
     )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -453,9 +454,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         output_streamer: SchedulerOutputStreamer,
         pool_stats_observer: SchedulerPoolStatsObserver,
         request_retirer: RequestRetirer,
-        core_lists: CoreLists,
         get_ready: Callable[[], List[Req]],
-        get_pending_lora_ids: Callable[[], Set[Optional[str]]],
     ):
         parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
@@ -486,9 +485,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.output_streamer = output_streamer
         self.pool_stats_observer = pool_stats_observer
         self.request_retirer = request_retirer
-        self.core_lists = core_lists
         self.get_ready = get_ready
-        self.get_pending_lora_ids = get_pending_lora_ids
         self.host_pool = None
         self.host_reserved_tokens = 0
         self.gloo_group = parallel.attn_tp_group.cpu_group
@@ -1375,8 +1372,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         rids_to_check: Optional[List[str]] = None,
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
+        *,
+        lora_ids_in_use: Callable[[], Set[Optional[str]]],
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Pop the preallocated requests from the pending queue (FIFO).
+        `lora_ids_in_use` gives the adapters the live requests keep."""
         is_pp_mode = self.pp_size > 1
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
             raise ValueError("PP consensus is required when pp_size > 1")
@@ -1458,12 +1458,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if self.enable_lora:
-            # The adapters of the decoding requests and of the steps in flight
-            # (a request finished at the last commit may still run in one).
-            running_loras = {req.lora_id for req in self.core_lists.decoding}
-            running_loras.update(self.get_pending_lora_ids())
-            running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
-            running_loras.update(req.lora_id for req in self.get_ready())
+            running_loras = lora_ids_in_use()
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -3108,7 +3103,6 @@ class DisaggDecode:
         request_retirer: RequestRetirer,
         flags: EngineFlags,
         core_lists: CoreLists,
-        pending: PendingSteps,
         policy: SchedulePolicy,
         future_map: Any,
         ngram_embedding_manager: Any,
@@ -3141,7 +3135,6 @@ class DisaggDecode:
             get_schedule().schedule_low_priority_values_first
         )
         enable_overlap = not get_schedule().disable_overlap_schedule
-        get_pending_lora_ids = pending.lora_ids
         self.model_config = model_config
         self.spec_algorithm = spec_algorithm
         self.req_to_token_pool = req_to_token_pool
@@ -3245,9 +3238,7 @@ class DisaggDecode:
             output_streamer=output_streamer,
             pool_stats_observer=pool_stats_observer,
             request_retirer=request_retirer,
-            core_lists=core_lists,
             get_ready=lambda: self.ready,
-            get_pending_lora_ids=get_pending_lora_ids,
         )
         self.transfer_queue.prealloc_queue = self.prealloc_queue
         self.kv_checksum_computer = self.prealloc_queue.kv_checksum_computer
@@ -3327,6 +3318,8 @@ class DisaggDecode:
                 name="prealloc",
                 reqs=[r.req for r in prealloc_queue.queue],
                 abort=self._abort_prealloc_reqs,
+                counts_queued=True,
+                awaits_kv=True,
             ),
             # Readmitted soon, they carry the health check, except while
             # generation is paused.
@@ -3335,6 +3328,7 @@ class DisaggDecode:
                 reqs=prealloc_queue.retracted_queue,
                 abort=self._abort_retracted_reqs,
                 health_check=not self.flags._engine_paused,
+                counts_queued=True,
             ),
             # Held for rebootstrap until resume. They own no KV, so the paused
             # flush, which ignores waiting requests, skips them.
@@ -3344,10 +3338,15 @@ class DisaggDecode:
                 abort=self._abort_held_reqs,
                 waiting=True,
             ),
+            # Their KV rows are preallocated; the KV is still arriving.
             RequestList(
                 name="transfer",
                 reqs=[r.req for r in self.transfer_queue.queue],
                 abort=self._abort_transfer_reqs,
+                holds_kv=True,
+                pins_lora=True,
+                counts_queued=True,
+                awaits_kv=True,
             ),
             # Owning their transferred KV, they wait for a row as the core
             # waiting list's requests wait for admission.
@@ -3359,9 +3358,68 @@ class DisaggDecode:
                 health_check=True,
                 waiting=True,
                 retract_on_pause=True,
+                holds_kv=True,
+                pins_lora=True,
+                counts_queued=True,
             ),
             # Finished already: abort leaves them to their release.
-            RequestList(name="releasing", reqs=self.releasing, releasing=True),
+            RequestList(
+                name="releasing",
+                reqs=self.releasing,
+                releasing=True,
+                holds_kv=True,
+            ),
+        ]
+
+    def report_queue_stats(self, stats: SchedulerStats, priority_enabled: bool) -> None:
+        """The PD decode queue gauges."""
+        transfer_queue = self.transfer_queue
+        stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+            [r.req for r in self.prealloc_queue.queue], priority_enabled
+        )
+        stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+            [r.req for r in transfer_queue.queue], priority_enabled
+        )
+        stats.num_decode_deferred_kv_release_reqs = (
+            transfer_queue.num_pending_deferred_releases()
+        )
+        host_reqs = (
+            [req for req in transfer_queue.queue if req.host_staged]
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1
+            else []
+        )
+        stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
+            host_reqs, priority_enabled
+        )
+
+    def queue_log_msg(self, stats: SchedulerStats, max_total_num_tokens: int) -> str:
+        """The PD decode part of the decode log line."""
+        prealloc_queue = self.prealloc_queue
+        msg = f"pre-allocated usage: {prealloc_queue.num_tokens_pre_allocated / max_total_num_tokens:.2f}, "
+        msg += f"#prealloc-req: {len(prealloc_queue.queue)}, "
+        msg += f"#transfer-req: {len(self.transfer_queue.queue)}, "
+        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            msg += (
+                f"#host-receive-req: {stats.num_decode_host_receive_queue_reqs.total}, "
+            )
+        msg += f"#retracted-req: {len(prealloc_queue.retracted_queue)}, "
+        return msg
+
+    def load_queue_metrics(self) -> Dict[str, int]:
+        """The PD decode queue lengths of the load."""
+        return dict(
+            decode_prealloc_queue_reqs=len(self.prealloc_queue.queue),
+            decode_transfer_queue_reqs=len(self.transfer_queue.queue),
+            decode_retracted_queue_reqs=len(self.prealloc_queue.retracted_queue),
+        )
+
+    def prealloc_ready_reqs(self) -> List[Req]:
+        """The preallocation requests whose peer waits for their KV
+        destinations."""
+        return [
+            decode_req.req
+            for decode_req in self.prealloc_queue.queue
+            if decode_req.waiting_for_input
         ]
 
     def _abort_prealloc_reqs(self, recv_req: AbortReq) -> None:
@@ -3470,7 +3528,8 @@ class DisaggDecode:
         self.prealloc_queue.prefetch_prefill_dp_rank_queries()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def intake(self):
+    def intake(self, *, lora_ids_in_use: Callable[[], Set[Optional[str]]]) -> None:
+        """`lora_ids_in_use` gives the adapters the live requests keep."""
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
@@ -3496,7 +3555,7 @@ class DisaggDecode:
         if self.polling_count % self.polling_interval == 0:
             if get_disagg().disaggregation_decode_host_receive_threshold == 1:
                 req_conns, _ = self.prealloc_queue.pop_preallocated(
-                    self.core_lists.decoding
+                    self.core_lists.decoding, lora_ids_in_use=lora_ids_in_use
                 )
                 self.transfer_queue.extend(req_conns)
             transferred_reqs = self.transfer_queue.pop_transferred(
@@ -3510,7 +3569,7 @@ class DisaggDecode:
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.prealloc_queue.pop_preallocated(
-                    self.core_lists.decoding
+                    self.core_lists.decoding, lora_ids_in_use=lora_ids_in_use
                 )
                 self.transfer_queue.extend(req_conns)
 
@@ -3584,10 +3643,15 @@ class DisaggDecode:
         return None
 
     def apply_prealloc_consensus(
-        self, prealloc_rids: Optional[List], slot: ScheduleSlot
+        self,
+        prealloc_rids: Optional[List],
+        slot: ScheduleSlot,
+        *,
+        lora_ids_in_use: Callable[[], Set[Optional[str]]],
     ):
         """Preallocate the agreed requests against slot; returns the good and
-        failed ids."""
+        failed ids. `lora_ids_in_use` gives the adapters the live requests
+        keep."""
         if len(self.prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return [[], []]
@@ -3601,6 +3665,7 @@ class DisaggDecode:
                 slot.filter_decoding(self.core_lists.decoding),
                 pp_good_rids=good_consensus_prealloc_rids,
                 pp_bad_rids=bad_consensus_prealloc_rids,
+                lora_ids_in_use=lora_ids_in_use,
             )
             self.transfer_queue.extend(good_reqs)
             return [

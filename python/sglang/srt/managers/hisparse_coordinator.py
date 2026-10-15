@@ -667,7 +667,16 @@ class HiSparseCoordinator:
     def lists(self) -> List[RequestList]:
         """Requests from the launch of their last prefill chunk until their
         host copy lands; abort marks them `to_finish`."""
-        return [RequestList(name="hisparse_staging", reqs=self.staging, inflight=True)]
+        return [
+            RequestList(
+                name="hisparse_staging",
+                reqs=self.staging,
+                inflight=True,
+                holds_kv=True,
+                pins_lora=True,
+                counts_running=True,
+            )
+        ]
 
     def on_launch(self, reqs: List[Req]) -> None:
         """Core stage at launch: the requests whose last prefill chunk

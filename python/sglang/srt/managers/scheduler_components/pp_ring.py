@@ -271,11 +271,11 @@ class PPRing:
 
                 self.pp_outputs = next_pp_outputs
 
-            # When the server is idle, self-check and re-init some states
+            # When the server is idle, self-check and re-init some states;
+            # on_idle checks the requests left in any list itself.
             if server_is_idle:
                 self.ops.mark_idle()
-                if pd is None or pd.is_drained():
-                    self.ops.on_idle()
+                self.ops.on_idle()
 
     def _commit_send_output_work_and_preprocess_output_tensors(
         self,

@@ -80,6 +80,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_PROCESS_QUEUE,
     SchedulerStageMetricsRecorder,
@@ -116,6 +117,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.observability.metrics_collector import SchedulerStats
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -727,19 +729,47 @@ class DisaggPrefill:
                 name="bootstrap",
                 reqs=self.bootstrap_queue.queue,
                 abort=self._abort_bootstrap_reqs,
+                counts_queued=True,
             ),
             RequestList(
                 name="prefilling",
                 reqs=self.prefilling,
                 inflight=True,
                 health_check=True,
+                holds_kv=True,
+                counts_running=True,
             ),
+            # Their KV is sent until the transfer concludes.
             RequestList(
                 name="transfer",
                 reqs=self.transfer,
                 abort=self._abort_transfer_reqs,
+                holds_kv=True,
             ),
         ]
+
+    def report_queue_stats(self, stats: SchedulerStats, priority_enabled: bool) -> None:
+        """The PD prefill queue gauges: bootstrapping, and sending the KV."""
+        stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
+            self.bootstrap_queue.queue, priority_enabled
+        )
+        stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
+            self.transfer, priority_enabled
+        )
+
+    def queue_log_msg(self) -> str:
+        """The PD prefill part of the prefill log line."""
+        return (
+            f"#bootstrap-req: {len(self.bootstrap_queue.queue)}, "
+            f"#inflight-req: {len(self.transfer)}, "
+        )
+
+    def load_queue_metrics(self) -> Dict[str, int]:
+        """The PD prefill queue lengths of the load."""
+        return dict(
+            prefill_bootstrap_queue_reqs=len(self.bootstrap_queue.queue),
+            prefill_inflight_queue_reqs=len(self.transfer),
+        )
 
     def _abort_bootstrap_reqs(self, recv_req: AbortReq) -> None:
         # Abort requests that have not yet been bootstrapped
