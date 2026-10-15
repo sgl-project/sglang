@@ -301,9 +301,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             raise ValueError(
                 "DFLASH with dp attention does not support context parallel."
             )
-        if cfg.moe_a2a_backend != "none":
+        if cfg.moe_a2a_backend not in ("none", "flashinfer_megamoe"):
             raise ValueError(
-                "DFLASH with dp attention requires moe_a2a_backend 'none'."
+                "DFLASH with dp attention requires moe_a2a_backend 'none' or "
+                "'flashinfer_megamoe'."
             )
 
     if cfg.pp_size != 1:
