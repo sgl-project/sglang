@@ -526,35 +526,24 @@ def _usp_input_all_to_all_qkv(
     b, s_local, h_global, d = q.shape
     h_local = h_global // world_size
     rows = b * s_local
-    if q.is_cuda:
-        packed = pack_qkv_destination_major(
-            q.view(rows, h_global, d),
-            k.view(rows, h_global, d),
-            v.view(rows, h_global, d),
-            world_size,
-            out=_a2a_staging_buffer(
-                "usp_packed_qkv_src",
-                (world_size, rows, h_local, 3 * d),
-                q.dtype,
-                q.device,
-            ),
-        )
-    elif q.device.type == "cpu":
-        packed = _a2a_staging_buffer(
+    pack_fn = (
+        torch.ops.sgl_kernel.pack_qkv_destination_major_cpu
+        if q.device.type == "cpu"
+        else pack_qkv_destination_major
+    )
+
+    packed = pack_fn(
+        q.view(rows, h_global, d),
+        k.view(rows, h_global, d),
+        v.view(rows, h_global, d),
+        world_size,
+        out=_a2a_staging_buffer(
             "usp_packed_qkv_src",
             (world_size, rows, h_local, 3 * d),
             q.dtype,
             q.device,
-        )
-        torch.ops.sgl_kernel.pack_qkv_destination_major_cpu(
-            q.view(rows, h_global, d),
-            k.view(rows, h_global, d),
-            v.view(rows, h_global, d),
-            world_size,
-            packed,
-        )
-    else:
-        raise RuntimeError(f"Unsupported device for packed QKV: {q.device}")
+        ),
+    )
     packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
     if b == 1:
         # Received chunks are already sequence-major: rank j's rows arrive at
