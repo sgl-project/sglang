@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! KVCM backend: a [`KvIndexerBackend`] whose placement state lives in a Tair
-//! KVCache Manager (KVCM) `MetaService` instead of this process.
+//! Tair KVCache backend: a [`KvIndexerBackend`] whose placement state lives in a Tair
+//! KVCache Manager (Tair KVCache) `MetaService` instead of this process.
 //!
 //! # Shape
 //!
 //! The ingestion side is unchanged: the same bridge turns each worker's ZMQ
 //! KV-event stream into [`ApplyExternalKvBatch`] RPCs. This backend translates
-//! those actions into KVCM `ReportEvent` mutations — REPORT becomes
+//! those actions into Tair KVCache `ReportEvent` mutations — REPORT becomes
 //! `BLOCK_ADD` (one component spec per resident component), REVOKE becomes
 //! `BLOCK_DELETE`, and the reporter identity is the indexer `worker_id`, so
 //! `GetHostCacheState` answers map straight back onto workers, and
-//! `CLEAR_ALL_AT_TIER` becomes an empty `BLOCK_SNAPSHOT` — KVCM's only
+//! `CLEAR_ALL_AT_TIER` becomes an empty `BLOCK_SNAPSHOT` — Tair KVCache's only
 //! synchronous "this reporter owns nothing" primitive, sent in action order.
 //!
 //! Query side: `MatchExternalKvPrefix` is answered by `GetHostCacheState`
@@ -20,19 +20,19 @@
 //! held blocks from block 0 — the *legacy whole-block* quantity. That is not
 //! the rule engine's answer for a component-aware worker, so a worker whose
 //! cache spec requires SWA or MAMBA rules, or that reports components without
-//! a spec, is excluded from the query answer (see [`batch_is_kvcm_eligible`]):
+//! a spec, is excluded from the query answer (see [`batch_is_tair_kvcache_eligible`]):
 //! the answer stays a lower bound, never an over-report — except that a
 //! dropped flush (see [`Inner::report_flush_snapshot`]) leaves placements
 //! behind on purpose, and a clear covers every medium of the channel rather
-//! than one tier. The per-block placement query (`MatchExternalKv`) has no KVCM
-//! equivalent -- KVCM answers hosts, not per-block location lists -- so it
+//! than one tier. The per-block placement query (`MatchExternalKv`) has no Tair KVCache
+//! equivalent -- Tair KVCache answers hosts, not per-block location lists -- so it
 //! fails `UNIMPLEMENTED` and the prefix query is the only routing signal.
 //!
 //! # Deliberate limitations
 //!
 //! Flushes are best-effort in three ways that the protocol imposes, not this
 //! backend: they cover the whole reporter × channel across every medium (no
-//! tier granularity), KVCM rate-limits them per reporter (a flush inside the
+//! tier granularity), Tair KVCache rate-limits them per reporter (a flush inside the
 //! cooldown is dropped with a warning instead of failing the batch), and the
 //! first one switches a delta-only reporter to strict visibility, so this
 //! indexer must be its only writer on that channel. Host-dram placements are
@@ -77,13 +77,13 @@ use crate::service::{
 /// budget here means the indexer keeps scanning after the router gave up.
 pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 50;
 /// Deadline for mutation and registration RPCs, shared by every chunk of one
-/// apply batch (see [`KvcmIndexerBackend::apply_external_kv_batch`]). Applies
-/// are never shed by the service layer, so this bounds a hung KVCM from
+/// apply batch (see [`TairKvcacheIndexerBackend::apply_external_kv_batch`]). Applies
+/// are never shed by the service layer, so this bounds a hung Tair KVCache from
 /// stalling a bridge.
 pub const DEFAULT_APPLY_TIMEOUT_MS: u64 = 5_000;
 /// Default heartbeat cadence. The backend heartbeats every worker it has seen
 /// for its own lifetime, so an idle worker's cache stays routable at the cost of
-/// KVCM liveness never reclaiming a dead reporter -- the Router's health
+/// Tair KVCache liveness never reclaiming a dead reporter -- the Router's health
 /// intersection is what keeps stale entries unroutable.
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 /// Events per `ReportEvent` RPC. A maximal apply batch (16,384 hashes) would
@@ -91,18 +91,18 @@ pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 /// RPC comfortably under transport ceilings while preserving event order.
 const MAX_EVENTS_PER_REPORT_EVENT: usize = 4_096;
 
-const ENV_ENDPOINT: &str = "KV_INDEXER_KVCM_ENDPOINT";
-const ENV_INSTANCE_ID: &str = "KV_INDEXER_KVCM_INSTANCE_ID";
-const ENV_STORAGE_TYPE: &str = "KV_INDEXER_KVCM_STORAGE_TYPE";
-const ENV_REPORT_TIERS: &str = "KV_INDEXER_KVCM_REPORT_TIERS";
-const ENV_AUTO_REGISTER: &str = "KV_INDEXER_KVCM_AUTO_REGISTER";
-const ENV_INSTANCE_GROUP: &str = "KV_INDEXER_KVCM_INSTANCE_GROUP";
-const ENV_BLOCK_SIZE: &str = "KV_INDEXER_KVCM_BLOCK_SIZE";
-const ENV_MODEL_NAME: &str = "KV_INDEXER_KVCM_MODEL_NAME";
-const ENV_MODEL_DTYPE: &str = "KV_INDEXER_KVCM_MODEL_DTYPE";
-const ENV_QUERY_TIMEOUT_MS: &str = "KV_INDEXER_KVCM_QUERY_TIMEOUT_MS";
-const ENV_APPLY_TIMEOUT_MS: &str = "KV_INDEXER_KVCM_APPLY_TIMEOUT_MS";
-const ENV_HEARTBEAT_INTERVAL_MS: &str = "KV_INDEXER_KVCM_HEARTBEAT_INTERVAL_MS";
+const ENV_ENDPOINT: &str = "KV_INDEXER_TAIR_KVCACHE_ENDPOINT";
+const ENV_INSTANCE_ID: &str = "KV_INDEXER_TAIR_KVCACHE_INSTANCE_ID";
+const ENV_STORAGE_TYPE: &str = "KV_INDEXER_TAIR_KVCACHE_STORAGE_TYPE";
+const ENV_REPORT_TIERS: &str = "KV_INDEXER_TAIR_KVCACHE_REPORT_TIERS";
+const ENV_AUTO_REGISTER: &str = "KV_INDEXER_TAIR_KVCACHE_AUTO_REGISTER";
+const ENV_INSTANCE_GROUP: &str = "KV_INDEXER_TAIR_KVCACHE_INSTANCE_GROUP";
+const ENV_BLOCK_SIZE: &str = "KV_INDEXER_TAIR_KVCACHE_BLOCK_SIZE";
+const ENV_MODEL_NAME: &str = "KV_INDEXER_TAIR_KVCACHE_MODEL_NAME";
+const ENV_MODEL_DTYPE: &str = "KV_INDEXER_TAIR_KVCACHE_MODEL_DTYPE";
+const ENV_QUERY_TIMEOUT_MS: &str = "KV_INDEXER_TAIR_KVCACHE_QUERY_TIMEOUT_MS";
+const ENV_APPLY_TIMEOUT_MS: &str = "KV_INDEXER_TAIR_KVCACHE_APPLY_TIMEOUT_MS";
+const ENV_HEARTBEAT_INTERVAL_MS: &str = "KV_INDEXER_TAIR_KVCACHE_HEARTBEAT_INTERVAL_MS";
 
 /// Location-spec names reported per component. They double as the
 /// `LocationSpecInfo` names an auto-registered instance declares, and as the
@@ -113,14 +113,14 @@ pub const SPEC_SWA: &str = "swa";
 pub const SPEC_MAMBA: &str = "mamba";
 const SPEC_NAMES: [&str; 3] = [SPEC_FULL, SPEC_SWA, SPEC_MAMBA];
 
-/// A misconfigured [`KvcmBackendConfig`].
+/// A misconfigured [`TairKvcacheBackendConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KvcmConfigError {
+pub enum TairKvcacheConfigError {
     Missing(&'static str),
     Invalid { key: &'static str, reason: String },
 }
 
-impl KvcmConfigError {
+impl TairKvcacheConfigError {
     fn invalid(key: &'static str, reason: impl Into<String>) -> Self {
         Self::Invalid {
             key,
@@ -129,7 +129,7 @@ impl KvcmConfigError {
     }
 }
 
-impl fmt::Display for KvcmConfigError {
+impl fmt::Display for TairKvcacheConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing(key) => write!(f, "{key} is required"),
@@ -138,48 +138,48 @@ impl fmt::Display for KvcmConfigError {
     }
 }
 
-impl std::error::Error for KvcmConfigError {}
+impl std::error::Error for TairKvcacheConfigError {}
 
-/// Instance registration for routing-only deployments (the KVCM connector
+/// Instance registration for routing-only deployments (the Tair KVCache connector
 /// registers the instance otherwise, and a second registration with different
 /// fields fails `DUPLICATE_ENTITY`).
 ///
-/// KVCM refuses a registration that omits the model deployment or a positive
+/// Tair KVCache refuses a registration that omits the model deployment or a positive
 /// block size (`MetaServiceImpl::RegisterInstance`), so both are required here.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KvcmAutoRegister {
+pub struct TairKvcacheAutoRegister {
     pub instance_group: String,
     pub block_size: u32,
-    /// The routed deployment's identity, as a KVCM `ModelDeployment`: the
+    /// The routed deployment's identity, as a Tair KVCache `ModelDeployment`: the
     /// indexer knows the fleet's workers, not their model, so the operator
-    /// states the name and dtype KVCM demands (a pre-registered instance
+    /// states the name and dtype Tair KVCache demands (a pre-registered instance
     /// accepts this registration only when its fields match; otherwise it
     /// fails `DUPLICATE_ENTITY`). Other `ModelDeployment` fields keep their
-    /// KVCM default.
+    /// Tair KVCache default.
     pub model_name: String,
     pub dtype: String,
 }
 
-/// KVCM backend configuration.
+/// Tair KVCache backend configuration.
 #[derive(Debug, Clone)]
-pub struct KvcmBackendConfig {
-    /// gRPC endpoint of the KVCM MetaService, e.g. `http://10.0.0.1:50052`.
+pub struct TairKvcacheBackendConfig {
+    /// gRPC endpoint of the Tair KVCache MetaService, e.g. `http://10.0.0.1:50052`.
     pub endpoint: String,
-    /// KVCM instance, one per model deployment across the routed fleet.
+    /// Tair KVCache instance, one per model deployment across the routed fleet.
     pub instance_id: String,
     /// Event-report channel the deployment provisioned (`l1p5` or `l2`).
     pub storage_type: StorageType,
-    /// Tiers whose events are forwarded to KVCM. Everything else is dropped.
+    /// Tiers whose events are forwarded to Tair KVCache. Everything else is dropped.
     pub report_tiers: Vec<TierType>,
     /// Opt-in `RegisterInstance` before the first apply batch or query.
-    pub auto_register: Option<KvcmAutoRegister>,
+    pub auto_register: Option<TairKvcacheAutoRegister>,
     pub query_timeout: Duration,
     pub apply_timeout: Duration,
-    /// `None` disables heartbeats (KVCM liveness then reclaims idle workers).
+    /// `None` disables heartbeats (Tair KVCache liveness then reclaims idle workers).
     pub heartbeat_interval: Option<Duration>,
 }
 
-impl KvcmBackendConfig {
+impl TairKvcacheBackendConfig {
     pub fn new(endpoint: impl Into<String>, instance_id: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -193,13 +193,14 @@ impl KvcmBackendConfig {
         }
     }
 
-    /// Builds the configuration from `KV_INDEXER_KVCM_*` environment
-    /// variables. `KV_INDEXER_KVCM_ENDPOINT` and
-    /// `KV_INDEXER_KVCM_INSTANCE_ID` are required.
-    pub fn from_env() -> Result<Self, KvcmConfigError> {
-        let endpoint = env_nonempty(ENV_ENDPOINT).ok_or(KvcmConfigError::Missing(ENV_ENDPOINT))?;
-        let instance_id =
-            env_nonempty(ENV_INSTANCE_ID).ok_or(KvcmConfigError::Missing(ENV_INSTANCE_ID))?;
+    /// Builds the configuration from `KV_INDEXER_TAIR_KVCACHE_*` environment
+    /// variables. `KV_INDEXER_TAIR_KVCACHE_ENDPOINT` and
+    /// `KV_INDEXER_TAIR_KVCACHE_INSTANCE_ID` are required.
+    pub fn from_env() -> Result<Self, TairKvcacheConfigError> {
+        let endpoint =
+            env_nonempty(ENV_ENDPOINT).ok_or(TairKvcacheConfigError::Missing(ENV_ENDPOINT))?;
+        let instance_id = env_nonempty(ENV_INSTANCE_ID)
+            .ok_or(TairKvcacheConfigError::Missing(ENV_INSTANCE_ID))?;
         let mut config = Self::new(endpoint, instance_id);
         config.storage_type = parse_storage_type(env_nonempty(ENV_STORAGE_TYPE).as_deref())?;
         config.report_tiers = parse_report_tiers(env_nonempty(ENV_REPORT_TIERS).as_deref())?;
@@ -217,26 +218,27 @@ impl KvcmBackendConfig {
         if let Some(flag) = env_nonempty(ENV_AUTO_REGISTER) {
             if flag == "1" || flag.eq_ignore_ascii_case("true") {
                 let instance_group = env_nonempty(ENV_INSTANCE_GROUP)
-                    .ok_or(KvcmConfigError::Missing(ENV_INSTANCE_GROUP))?;
+                    .ok_or(TairKvcacheConfigError::Missing(ENV_INSTANCE_GROUP))?;
                 let block_size = parse_u64(ENV_BLOCK_SIZE, 0)?;
-                let block_size = u32::try_from(block_size)
-                    .map_err(|_| KvcmConfigError::invalid(ENV_BLOCK_SIZE, "value exceeds u32"))?;
+                let block_size = u32::try_from(block_size).map_err(|_| {
+                    TairKvcacheConfigError::invalid(ENV_BLOCK_SIZE, "value exceeds u32")
+                })?;
                 if block_size == 0 {
-                    return Err(KvcmConfigError::invalid(
+                    return Err(TairKvcacheConfigError::invalid(
                         ENV_BLOCK_SIZE,
-                        "must be the fleet's block size; KVCM rejects a missing or zero value",
+                        "must be the fleet's block size; Tair KVCache rejects a missing or zero value",
                     ));
                 }
-                config.auto_register = Some(KvcmAutoRegister {
+                config.auto_register = Some(TairKvcacheAutoRegister {
                     instance_group,
                     block_size,
                     model_name: env_nonempty(ENV_MODEL_NAME)
-                        .ok_or(KvcmConfigError::Missing(ENV_MODEL_NAME))?,
+                        .ok_or(TairKvcacheConfigError::Missing(ENV_MODEL_NAME))?,
                     dtype: env_nonempty(ENV_MODEL_DTYPE)
-                        .ok_or(KvcmConfigError::Missing(ENV_MODEL_DTYPE))?,
+                        .ok_or(TairKvcacheConfigError::Missing(ENV_MODEL_DTYPE))?,
                 });
             } else if flag != "0" && !flag.eq_ignore_ascii_case("false") {
-                return Err(KvcmConfigError::invalid(
+                return Err(TairKvcacheConfigError::invalid(
                     ENV_AUTO_REGISTER,
                     format!("expected 0 or 1, got `{flag}`"),
                 ));
@@ -256,8 +258,8 @@ impl KvcmBackendConfig {
     }
 }
 
-/// Medium string a tier reports under. Free-form in the KVCM contract; these
-/// names match the vocabulary KVCM's own tools use (`hbm`/`mem`/`disk`).
+/// Medium string a tier reports under. Free-form in the Tair KVCache contract; these
+/// names match the vocabulary Tair KVCache's own tools use (`hbm`/`mem`/`disk`).
 fn tier_medium(tier: TierType) -> Option<&'static str> {
     match tier {
         TierType::TierHbm => Some("hbm"),
@@ -267,18 +269,18 @@ fn tier_medium(tier: TierType) -> Option<&'static str> {
     }
 }
 
-fn parse_storage_type(raw: Option<&str>) -> Result<StorageType, KvcmConfigError> {
+fn parse_storage_type(raw: Option<&str>) -> Result<StorageType, TairKvcacheConfigError> {
     match raw {
         None | Some("l1p5") => Ok(StorageType::StEventReportL1p5),
         Some("l2") => Ok(StorageType::StEventReportL2),
-        Some(other) => Err(KvcmConfigError::invalid(
+        Some(other) => Err(TairKvcacheConfigError::invalid(
             ENV_STORAGE_TYPE,
             format!("expected `l1p5` or `l2`, got `{other}`"),
         )),
     }
 }
 
-fn parse_report_tiers(raw: Option<&str>) -> Result<Vec<TierType>, KvcmConfigError> {
+fn parse_report_tiers(raw: Option<&str>) -> Result<Vec<TierType>, TairKvcacheConfigError> {
     let raw = raw.unwrap_or("HBM");
     let mut tiers = Vec::new();
     for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -287,7 +289,7 @@ fn parse_report_tiers(raw: Option<&str>) -> Result<Vec<TierType>, KvcmConfigErro
             "DRAM" => TierType::TierDram,
             "SSD" => TierType::TierSsd,
             other => {
-                return Err(KvcmConfigError::invalid(
+                return Err(TairKvcacheConfigError::invalid(
                     ENV_REPORT_TIERS,
                     format!("unknown tier `{other}`; expected HBM, DRAM or SSD"),
                 ))
@@ -298,7 +300,7 @@ fn parse_report_tiers(raw: Option<&str>) -> Result<Vec<TierType>, KvcmConfigErro
         }
     }
     if tiers.is_empty() {
-        return Err(KvcmConfigError::invalid(
+        return Err(TairKvcacheConfigError::invalid(
             ENV_REPORT_TIERS,
             "at least one tier is required",
         ));
@@ -308,10 +310,10 @@ fn parse_report_tiers(raw: Option<&str>) -> Result<Vec<TierType>, KvcmConfigErro
 
 /// Parses a millisecond timeout, `default` when unset, capped at one day:
 /// the apply path adds the value to an `Instant`, which panics on overflow.
-fn parse_timeout_ms(key: &'static str, default: u64) -> Result<u64, KvcmConfigError> {
+fn parse_timeout_ms(key: &'static str, default: u64) -> Result<u64, TairKvcacheConfigError> {
     let value = parse_u64(key, default)?;
     if value > 86_400_000 {
-        return Err(KvcmConfigError::invalid(
+        return Err(TairKvcacheConfigError::invalid(
             key,
             format!("must be at most 86400000 (one day), got {value}"),
         ));
@@ -321,12 +323,15 @@ fn parse_timeout_ms(key: &'static str, default: u64) -> Result<u64, KvcmConfigEr
 
 /// Parses a non-negative integer, `default` when unset; a `0` is meaningful
 /// rather than an error (it disables heartbeats and means "no block size").
-fn parse_u64(key: &'static str, default: u64) -> Result<u64, KvcmConfigError> {
+fn parse_u64(key: &'static str, default: u64) -> Result<u64, TairKvcacheConfigError> {
     let Some(raw) = env_nonempty(key) else {
         return Ok(default);
     };
     raw.parse::<u64>().map_err(|_| {
-        KvcmConfigError::invalid(key, format!("expected a non-negative integer, got `{raw}`"))
+        TairKvcacheConfigError::invalid(
+            key,
+            format!("expected a non-negative integer, got `{raw}`"),
+        )
     })
 }
 
@@ -343,7 +348,7 @@ fn env_nonempty(key: &str) -> Option<String> {
 /// Resident component-spec names for a reported bitmask. Legacy (mask 0) is an
 /// implicit whole-block store: the full component alone. A non-zero mask without
 /// FULL yields no specs at all -- such a block cannot serve full attention, and
-/// KVCM counts a held block by *any* spec present, so reporting it would
+/// Tair KVCache counts a held block by *any* spec present, so reporting it would
 /// over-report. The caller drops it, matching the rule engine's fail-closed
 /// rule that FULL is required on every matched block.
 fn component_spec_names(mask: u32) -> Vec<&'static str> {
@@ -363,7 +368,7 @@ fn component_spec_names(mask: u32) -> Vec<&'static str> {
     names
 }
 
-/// Whether one apply batch keeps its worker answerable by KVCM's whole-block
+/// Whether one apply batch keeps its worker answerable by Tair KVCache's whole-block
 /// prefix match *without over-reporting* relative to the rule engine in
 /// `service::compute_worker_prefix`.
 ///
@@ -373,7 +378,7 @@ fn component_spec_names(mask: u32) -> Vec<&'static str> {
 /// it, so a worker stays answerable only while every batch keeps it legacy
 /// whole-block, or FULL-only within servable reported tiers with component
 /// detail on every block.
-fn batch_is_kvcm_eligible(
+fn batch_is_tair_kvcache_eligible(
     request: &ApplyExternalKvBatchRequest,
     report_tiers: &[TierType],
 ) -> Result<bool, Status> {
@@ -453,7 +458,7 @@ fn node_register_event(mediums: &[String]) -> EventItem {
     }
 }
 
-/// URI scheme KVCM expects for a channel's spec URIs (l1p5 reports as
+/// URI scheme Tair KVCache expects for a channel's spec URIs (l1p5 reports as
 /// `event_report://`, l2 as `vineyard://`).
 fn storage_uri_scheme(storage_type: StorageType) -> &'static str {
     match storage_type {
@@ -463,7 +468,7 @@ fn storage_uri_scheme(storage_type: StorageType) -> &'static str {
 }
 
 /// The URI authority identifying the reporter: the worker address's
-/// `host:port` when one is restated, else the worker id. KVCM validates spec
+/// `host:port` when one is restated, else the worker id. Tair KVCache validates spec
 /// URIs structurally (scheme + non-empty rest); the data plane later resolves
 /// the authority when fetching.
 fn reporter_uri_authority<'a>(worker_address: &'a str, worker_id: &'a str) -> &'a str {
@@ -507,19 +512,19 @@ fn block_delete_event(hash: i64, medium: &str) -> EventItem {
                 block_key: hash.to_string(),
                 medium: medium.to_string(),
                 // A revoke drops the whole placement, so delete every spec this
-                // backend could have reported; KVCM treats missing names as no-ops.
+                // backend could have reported; Tair KVCache treats missing names as no-ops.
                 spec_names: SPEC_NAMES.iter().map(|name| name.to_string()).collect(),
             },
         )),
     }
 }
 
-/// `CLEAR_ALL_AT_TIER` as KVCM can express it: one complete snapshot with an
-/// empty block set. KVCM defines empty as "this reporter owns no blocks" for
+/// `CLEAR_ALL_AT_TIER` as Tair KVCache can express it: one complete snapshot with an
+/// empty block set. Tair KVCache defines empty as "this reporter owns no blocks" for
 /// the whole (instance, reporter, storage channel), commits it synchronously,
 /// and immediately fences every older location of that reporter behind strict
 /// visibility -- the closest thing to a clear the protocol has. It must travel
-/// alone in its request: KVCM rejects a snapshot mixed with deltas
+/// alone in its request: Tair KVCache rejects a snapshot mixed with deltas
 /// (`CacheManager::ReportEvent`).
 fn block_snapshot_event() -> EventItem {
     EventItem {
@@ -551,7 +556,7 @@ fn carries_node_register(events: &[EventItem]) -> bool {
         .any(|event| event.event_type == ReportEventType::EventNodeRegister as i32)
 }
 
-/// Whether an event list mutates placements. KVCM answers `snapshot_required`
+/// Whether an event list mutates placements. Tair KVCache answers `snapshot_required`
 /// for a reporter with no committed snapshot version, and the request that
 /// creates one is a delta request (see `CacheManager::refresh_snapshot_response`).
 fn carries_delta(events: &[EventItem]) -> bool {
@@ -580,7 +585,7 @@ enum TranslatedSegment {
 /// Pure translation of one validated apply batch into the requests it takes to
 /// apply it, in action order. Actions on tiers outside `report_tiers` are
 /// dropped before translation; `prepend_node_register` re-registers a reporter
-/// KVCM has forgotten (or never accepted), riding the batch's first request.
+/// Tair KVCache has forgotten (or never accepted), riding the batch's first request.
 fn translate_batch(
     request: &ApplyExternalKvBatchRequest,
     prepend_node_register: bool,
@@ -595,7 +600,7 @@ fn translate_batch(
     let mut register_pending = prepend_node_register;
     for action in &request.actions {
         // The service layer already rejects unknown tiers and action types;
-        // `batch_is_kvcm_eligible` re-checks both for direct callers.
+        // `batch_is_tair_kvcache_eligible` re-checks both for direct callers.
         let Ok(tier) = TierType::try_from(action.tier) else {
             continue;
         };
@@ -642,7 +647,7 @@ fn translate_batch(
                 } else {
                     // The registration has to ride the batch's *first* request,
                     // which is the delta segment below. Leaving it for the
-                    // snapshot would send it one request late: a reporter KVCM
+                    // snapshot would send it one request late: a reporter Tair KVCache
                     // has forgotten would fail that delta and lose the batch.
                     if register_pending {
                         events.insert(0, node_register_event(mediums));
@@ -660,7 +665,7 @@ fn translate_batch(
     }
     if register_pending {
         // Nothing in this batch is forwardable, but the reporter still has to
-        // be registered (the batch that discovered it owes KVCM that).
+        // be registered (the batch that discovered it owes Tair KVCache that).
         events.insert(0, node_register_event(mediums));
     }
     if !events.is_empty() {
@@ -669,7 +674,7 @@ fn translate_batch(
     TranslatedBatch { segments }
 }
 
-/// The outcome a KVCM response header carries.
+/// The outcome a Tair KVCache response header carries.
 enum HeaderOutcome {
     Ok,
     Failed { code: ErrorCode, message: String },
@@ -700,12 +705,12 @@ fn header_outcome(header: Option<&CommonResponseHeader>) -> HeaderOutcome {
     }
 }
 
-/// Maps a KVCM response header into a `Result`. `INVALID_ARGUMENT` and
+/// Maps a Tair KVCache response header into a `Result`. `INVALID_ARGUMENT` and
 /// `DUPLICATE_ENTITY` stay loud contract errors; permanent configuration
 /// faults (`INSTANCE_NOT_EXIST`, `UNSUPPORTED`, `REACH_MAX_ENTITY_CAPACITY`)
 /// become `FAILED_PRECONDITION`, which the bridge classifies as permanent
 /// instead of reconnecting forever on a typo'd instance id. Every other code
-/// — including `NODE_NOT_REGISTERED`, an expected event for a reporter KVCM
+/// — including `NODE_NOT_REGISTERED`, an expected event for a reporter Tair KVCache
 /// forgot and the next report re-registers — is a transient availability
 /// problem the caller retries or degrades on.
 fn check_header(header: Option<&CommonResponseHeader>, what: &str) -> Result<(), Status> {
@@ -713,31 +718,31 @@ fn check_header(header: Option<&CommonResponseHeader>, what: &str) -> Result<(),
         HeaderOutcome::Ok => Ok(()),
         HeaderOutcome::Failed { code, message } => Err(match code {
             ErrorCode::InvalidArgument => {
-                Status::invalid_argument(format!("KVCM rejected {what}: {message}"))
+                Status::invalid_argument(format!("Tair KVCache rejected {what}: {message}"))
             }
             ErrorCode::DuplicateEntity => Status::failed_precondition(format!(
-                "KVCM {what}: entity already registered with different configuration: {message}"
+                "Tair KVCache {what}: entity already registered with different configuration: {message}"
             )),
             ErrorCode::InstanceNotExist
             | ErrorCode::Unsupported
             | ErrorCode::ReachMaxEntityCapacity => Status::failed_precondition(format!(
-                "KVCM {what} failed on a permanent configuration fault: {code:?}: {message}"
+                "Tair KVCache {what} failed on a permanent configuration fault: {code:?}: {message}"
             )),
-            code => Status::unavailable(format!("KVCM {what} failed: {code:?}: {message}")),
+            code => Status::unavailable(format!("Tair KVCache {what} failed: {code:?}: {message}")),
         }),
     }
 }
 
-/// `(worker_id, address, matched blocks)` for one KVCM host match: the worker
-/// must be answerable (see [`batch_is_kvcm_eligible`]) with a non-empty
+/// `(worker_id, address, matched blocks)` for one Tair KVCache host match: the worker
+/// must be answerable (see [`batch_is_tair_kvcache_eligible`]) with a non-empty
 /// router-facing address, and the reported prefix is clamped to the query
-/// length so a KVCM over-report cannot exceed the ask.
+/// length so a Tair KVCache over-report cannot exceed the ask.
 fn prefix_entry(
     host: HostCacheMatch,
     blocks_read: u32,
     record: &WorkerRecord,
 ) -> Option<(String, String, u32)> {
-    if !record.kvcm_eligible || record.address.is_empty() {
+    if !record.tair_kvcache_eligible || record.address.is_empty() {
         return None;
     }
     let matched = u32::try_from(host.local).ok()?.min(blocks_read);
@@ -749,22 +754,22 @@ fn prefix_entry(
 struct WorkerRecord {
     address: String,
     /// Whether a `NODE_REGISTER` for this reporter has been accepted: a first
-    /// batch that fails must not burn the registration, and KVCM may forget the
+    /// batch that fails must not burn the registration, and Tair KVCache may forget the
     /// node after a liveness cleanup, so the flag flips only on a successful
     /// report carrying one.
     node_registered: bool,
     /// Sticky: once a batch makes the worker unanswerable by whole-block
-    /// matching (see [`batch_is_kvcm_eligible`]), it stays excluded — the
-    /// placements KVCM already holds cannot be un-reported.
-    kvcm_eligible: bool,
+    /// matching (see [`batch_is_tair_kvcache_eligible`]), it stays excluded — the
+    /// placements Tair KVCache already holds cannot be un-reported.
+    tair_kvcache_eligible: bool,
 }
 
 struct Inner {
     client: MetaServiceClient<Channel>,
-    config: KvcmBackendConfig,
+    config: TairKvcacheBackendConfig,
     mediums: Vec<String>,
     /// Router-facing record per worker, refreshed by every apply batch: the
-    /// query side resolves KVCM reporter ids back into addresses here.
+    /// query side resolves Tair KVCache reporter ids back into addresses here.
     workers: RwLock<HashMap<String, WorkerRecord>>,
     instance_registered: AtomicBool,
     trace: AtomicU64,
@@ -783,7 +788,7 @@ impl Inner {
     ) -> Result<std::sync::RwLockReadGuard<'_, HashMap<String, WorkerRecord>>, Status> {
         self.workers
             .read()
-            .map_err(|_| Status::internal("KVCM backend workers map lock poisoned"))
+            .map_err(|_| Status::internal("Tair KVCache backend workers map lock poisoned"))
     }
 
     fn set_node_registered(&self, host: &str, registered: bool) {
@@ -814,7 +819,7 @@ impl Inner {
         request.set_timeout(timeout);
         let response = tokio::time::timeout(timeout, client.report_event(request))
             .await
-            .map_err(|_| Status::deadline_exceeded("KVCM ReportEvent timed out"))??;
+            .map_err(|_| Status::deadline_exceeded("Tair KVCache ReportEvent timed out"))??;
         Ok(response.into_inner())
     }
 
@@ -853,18 +858,18 @@ impl Inner {
         }
         if response.snapshot_required {
             // A lifecycle start, not a fault: a request carrying deltas is
-            // what creates the version KVCM is asking about, while a beat from
+            // what creates the version Tair KVCache is asking about, while a beat from
             // a reporter that never wrote one is only worth a debug line. This
             // backend holds no placement state and cannot reconcile either way.
             if carried_delta {
                 tracing::info!(
                     host,
-                    "KVCM has no committed snapshot for this reporter; it stays delta-only"
+                    "Tair KVCache has no committed snapshot for this reporter; it stays delta-only"
                 );
             } else {
                 tracing::debug!(
                     host,
-                    "KVCM still has no committed snapshot for this reporter"
+                    "Tair KVCache still has no committed snapshot for this reporter"
                 );
             }
         }
@@ -881,7 +886,7 @@ impl Inner {
                 Status::new(
                     code,
                     format!(
-                        "KVCM ReportEvent partially failed ({what}): item results {:?}",
+                        "Tair KVCache ReportEvent partially failed ({what}): item results {:?}",
                         response.item_results
                     ),
                 )
@@ -899,7 +904,7 @@ impl Inner {
     }
 
     /// Applies one `CLEAR_ALL_AT_TIER` as an empty all-medium snapshot, in a
-    /// request of its own, and returns once KVCM has committed the fence.
+    /// request of its own, and returns once Tair KVCache has committed the fence.
     ///
     /// The retry policy is deliberately asymmetric:
     ///
@@ -907,18 +912,18 @@ impl Inner {
     ///   reporter, or a delta drain that timed out): the complete snapshot is
     ///   re-sent after a short backoff, bounded so the batch keeps its budget.
     /// * `SNAPSHOT_RATE_LIMITED` **drops the flush with a warning instead of
-    ///   failing the batch**. KVCM's cooldown (30s by default) cannot be waited
+    ///   failing the batch**. Tair KVCache's cooldown (30s by default) cannot be waited
     ///   out inside an apply budget, and a failed batch costs more than a missed
     ///   flush: the bridge sees the error, reconnects, and does not replay, so
     ///   every delta that rode in the same batch would be lost as well. The
     ///   placements simply stay until a later clear gets through.
-    /// * `NODE_NOT_REGISTERED` means KVCM forgot this reporter (a liveness
+    /// * `NODE_NOT_REGISTERED` means Tair KVCache forgot this reporter (a liveness
     ///   cleanup): the retry carries a fresh `NODE_REGISTER`, so a flush is
     ///   never lost just because the registration lapsed first.
     ///
     /// Anything else keeps the delta path's classification. A committed
     /// snapshot leaves no local state to drop -- this backend keeps none, the
-    /// answer comes from KVCM, whose visibility now fences the reporter.
+    /// answer comes from Tair KVCache, whose visibility now fences the reporter.
     async fn report_flush_snapshot(
         &self,
         host: &str,
@@ -937,12 +942,12 @@ impl Inner {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(Status::deadline_exceeded(
-                    "KVCM apply budget exhausted before the flush snapshot was sent",
+                    "Tair KVCache apply budget exhausted before the flush snapshot was sent",
                 ));
             }
             let response = self.report_event_response(host, events, remaining).await?;
             let outcome = header_outcome(response.header.as_ref());
-            // KVCM answers a request-level failure in the header alone, and a
+            // Tair KVCache answers a request-level failure in the header alone, and a
             // per-item failure in both the header (naming the same code) and
             // `item_results`. A header naming a different fault means this is
             // not our code, whatever the item list says.
@@ -970,12 +975,12 @@ impl Inner {
                     host,
                     retry_after_ms = response.retry_after_ms,
                     report_tiers = self.config.report_tiers.len(),
-                    "flush dropped, placements stay: KVCM rate-limited the snapshot; a later clear retries"
+                    "flush dropped, placements stay: Tair KVCache rate-limited the snapshot; a later clear retries"
                 );
                 return Ok(());
             }
             if failed_with(ErrorCode::NodeNotRegistered) {
-                // KVCM forgot the reporter: re-register on the retry rather
+                // Tair KVCache forgot the reporter: re-register on the retry rather
                 // than leaving the flush to the next batch.
                 self.set_node_registered(host, false);
                 register = true;
@@ -995,7 +1000,7 @@ impl Inner {
         // Every branch above returns on the final attempt; this keeps the
         // signature total without inventing a panic path.
         Err(Status::unavailable(
-            "KVCM reported a snapshot in progress on every flush attempt",
+            "Tair KVCache reported a snapshot in progress on every flush attempt",
         ))
     }
 
@@ -1018,7 +1023,7 @@ impl Inner {
             client.get_host_cache_state(request),
         )
         .await
-        .map_err(|_| Status::deadline_exceeded("KVCM GetHostCacheState timed out"))??;
+        .map_err(|_| Status::deadline_exceeded("Tair KVCache GetHostCacheState timed out"))??;
         let response = response.into_inner();
         check_header(response.header.as_ref(), "GetHostCacheState")?;
         Ok(response)
@@ -1028,7 +1033,7 @@ impl Inner {
     ///
     /// It runs on the apply budget, not a caller's: this is a setup call rather
     /// than a data-plane answer. Concurrent first calls (a cold start) may each
-    /// send one; KVCM is idempotent for identical fields, and after the first
+    /// send one; Tair KVCache is idempotent for identical fields, and after the first
     /// success the flag short-circuits the rest.
     async fn register_instance(&self) -> Result<(), Status> {
         let Some(auto) = &self.config.auto_register else {
@@ -1062,21 +1067,23 @@ impl Inner {
         let response =
             tokio::time::timeout(self.config.apply_timeout, client.register_instance(request))
                 .await
-                .map_err(|_| Status::deadline_exceeded("KVCM RegisterInstance timed out"))??;
+                .map_err(|_| {
+                    Status::deadline_exceeded("Tair KVCache RegisterInstance timed out")
+                })??;
         check_header(response.into_inner().header.as_ref(), "RegisterInstance")?;
         self.instance_registered.store(true, Ordering::Release);
         Ok(())
     }
 }
 
-/// A [`KvIndexerBackend`] backed by a KVCM MetaService.
-pub struct KvcmIndexerBackend {
+/// A [`KvIndexerBackend`] backed by a Tair KVCache MetaService.
+pub struct TairKvcacheIndexerBackend {
     inner: Arc<Inner>,
 }
 
-impl fmt::Debug for KvcmIndexerBackend {
+impl fmt::Debug for TairKvcacheIndexerBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KvcmIndexerBackend")
+        f.debug_struct("TairKvcacheIndexerBackend")
             .field("instance_id", &self.inner.config.instance_id)
             .field("storage_type", &self.inner.config.storage_type)
             .field("report_tiers", &self.inner.config.report_tiers)
@@ -1084,10 +1091,10 @@ impl fmt::Debug for KvcmIndexerBackend {
     }
 }
 
-impl KvcmIndexerBackend {
+impl TairKvcacheIndexerBackend {
     /// Connects lazily; a misconfigured endpoint is rejected up front (see
     /// [`parse_endpoint`]) rather than failing every RPC later.
-    pub fn new(config: KvcmBackendConfig) -> Result<Self, crate::InvalidEndpoint> {
+    pub fn new(config: TairKvcacheBackendConfig) -> Result<Self, crate::InvalidEndpoint> {
         let endpoint = parse_endpoint(&config.endpoint)?;
         // A non-servable report tier (SSD) silently excludes every
         // spec-declaring worker; legacy workers are unaffected. Warn at
@@ -1137,7 +1144,7 @@ impl KvcmIndexerBackend {
                     let Some(record) = workers.get(&worker_id) else {
                         break;
                     };
-                    (record.kvcm_eligible, record.node_registered)
+                    (record.tair_kvcache_eligible, record.node_registered)
                 };
                 if !eligible {
                     // Eligibility only narrows: an excluded worker never gets
@@ -1155,7 +1162,7 @@ impl KvcmIndexerBackend {
                     .report_event_checked(&worker_id, events, inner.config.apply_timeout)
                     .await
                 {
-                    tracing::warn!(worker = %worker_id, %error, "KVCM heartbeat failed");
+                    tracing::warn!(worker = %worker_id, %error, "Tair KVCache heartbeat failed");
                 }
             }
         });
@@ -1163,37 +1170,36 @@ impl KvcmIndexerBackend {
 }
 
 #[tonic::async_trait]
-impl KvIndexerBackend for KvcmIndexerBackend {
+impl KvIndexerBackend for TairKvcacheIndexerBackend {
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
-        // '#' is the KVCM location-id separator; a worker id carrying it would
+        // '#' is the Tair KVCache location-id separator; a worker id carrying it would
         // corrupt every placement the reporter ever sends.
         if request.worker_id.contains('#') {
             return Err(Status::invalid_argument(
-                "worker_id must not contain '#' (KVCM location-id component)",
+                "worker_id must not contain '#' (Tair KVCache location-id component)",
             ));
         }
-        let (first_seen, node_registered, kvcm_eligible) = {
-            let mut workers = self
-                .inner
-                .workers
-                .write()
-                .map_err(|_| Status::internal("KVCM backend workers map lock poisoned"))?;
+        let (first_seen, node_registered, tair_kvcache_eligible) = {
+            let mut workers =
+                self.inner.workers.write().map_err(|_| {
+                    Status::internal("Tair KVCache backend workers map lock poisoned")
+                })?;
             match workers.entry(request.worker_id.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let record = entry.get_mut();
                     // The address is restated on every batch, so record it even
                     // when the batch translates to no events at all.
                     record.address = request.worker_address.clone();
-                    (false, record.node_registered, record.kvcm_eligible)
+                    (false, record.node_registered, record.tair_kvcache_eligible)
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(WorkerRecord {
                         address: request.worker_address.clone(),
                         node_registered: false,
-                        kvcm_eligible: true,
+                        tair_kvcache_eligible: true,
                     });
                     (true, false, true)
                 }
@@ -1203,17 +1209,18 @@ impl KvIndexerBackend for KvcmIndexerBackend {
             self.spawn_heartbeat(request.worker_id.clone());
         }
         self.inner.register_instance().await?;
-        let batch_eligible = batch_is_kvcm_eligible(&request, &self.inner.config.report_tiers)?;
+        let batch_eligible =
+            batch_is_tair_kvcache_eligible(&request, &self.inner.config.report_tiers)?;
         // Eligibility only ever narrows: once a worker is excluded it stays
-        // excluded, because KVCM already holds its earlier placements.
-        if kvcm_eligible && !batch_eligible {
+        // excluded, because Tair KVCache already holds its earlier placements.
+        if tair_kvcache_eligible && !batch_eligible {
             tracing::warn!(
                 worker = %request.worker_id,
-                "cache spec or component detail requires prefix rules KVCM cannot evaluate; excluding the worker from prefix answers (fail closed)"
+                "cache spec or component detail requires prefix rules Tair KVCache cannot evaluate; excluding the worker from prefix answers (fail closed)"
             );
             if let Ok(mut workers) = self.inner.workers.write() {
                 if let Some(record) = workers.get_mut(&request.worker_id) {
-                    record.kvcm_eligible = false;
+                    record.tair_kvcache_eligible = false;
                 }
             }
         }
@@ -1233,7 +1240,7 @@ impl KvIndexerBackend for KvcmIndexerBackend {
                 reporter_uri_authority(&request.worker_address, &request.worker_id)
             ),
         );
-        // One deadline for the whole batch: a slow KVCM must not turn four
+        // One deadline for the whole batch: a slow Tair KVCache must not turn four
         // chunk RPCs into four full timeouts while the bridge's own channel
         // timeout expires underneath and drops the batch.
         let deadline = tokio::time::Instant::now() + self.inner.config.apply_timeout;
@@ -1241,7 +1248,7 @@ impl KvIndexerBackend for KvcmIndexerBackend {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(Status::deadline_exceeded(
-                    "KVCM apply budget exhausted before all events were forwarded",
+                    "Tair KVCache apply budget exhausted before all events were forwarded",
                 ));
             }
             match segment {
@@ -1251,7 +1258,7 @@ impl KvIndexerBackend for KvcmIndexerBackend {
                             deadline.saturating_duration_since(tokio::time::Instant::now());
                         if remaining.is_zero() {
                             return Err(Status::deadline_exceeded(
-                                "KVCM apply budget exhausted before all chunks were forwarded",
+                                "Tair KVCache apply budget exhausted before all chunks were forwarded",
                             ));
                         }
                         self.inner
@@ -1277,7 +1284,7 @@ impl KvIndexerBackend for KvcmIndexerBackend {
         _request: MatchExternalKvRequest,
     ) -> Result<MatchExternalKvResponse, Status> {
         Err(Status::unimplemented(
-            "the KVCM backend answers prefix queries only: KVCM has no per-worker per-block placement query (use MatchExternalKvPrefix)",
+            "the Tair KVCache backend answers prefix queries only: Tair KVCache has no per-worker per-block placement query (use MatchExternalKvPrefix)",
         ))
     }
 
@@ -1287,7 +1294,7 @@ impl KvIndexerBackend for KvcmIndexerBackend {
     /// windows or MAMBA boundaries are excluded rather than over-reported, so
     /// the answer stays a lower bound like the default implementation's. (The
     /// default path itself is unusable here: it derives placements from
-    /// `match_external_kv`, which has no KVCM equivalent.)
+    /// `match_external_kv`, which has no Tair KVCache equivalent.)
     async fn match_external_kv_prefix(
         &self,
         request: MatchExternalKvPrefixRequest,
@@ -1496,7 +1503,7 @@ mod tests {
         assert_eq!(add.medium, "hbm");
         assert_eq!(add.specs.len(), 1);
         assert_eq!(add.specs[0].name, SPEC_FULL);
-        // KVCM rejects spec URIs that are empty or lack the channel's scheme.
+        // Tair KVCache rejects spec URIs that are empty or lack the channel's scheme.
         assert_eq!(add.specs[0].uri, "event_report://worker-0/hbm");
         let EventItem {
             event_params: Some(event_item::EventParams::BlockAdd(add)),
@@ -1575,7 +1582,7 @@ mod tests {
     }
 
     /// The pending registration rides the batch's first request whatever it
-    /// is. A reporter KVCM has forgotten fails its very first delta when the
+    /// is. A reporter Tair KVCache has forgotten fails its very first delta when the
     /// registration was left behind on the clear's snapshot (one request too
     /// late), and the batch is lost.
     #[test]
@@ -1731,7 +1738,7 @@ mod tests {
 
     #[test]
     fn negative_hash_keys_round_trip_as_signed_decimal() {
-        // kv_indexer hashes are sfixed64 and may be negative; KVCM block keys
+        // kv_indexer hashes are sfixed64 and may be negative; Tair KVCache block keys
         // are int64 parsed from decimal, so -1 must stay -1 on both sides.
         let request = apply(
             "worker-0",
@@ -1770,7 +1777,7 @@ mod tests {
             None,
         );
         // DRAM is filtered from reporting but still validated as a tier.
-        assert!(batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
+        assert!(batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).unwrap());
     }
 
     #[test]
@@ -1783,7 +1790,7 @@ mod tests {
             vec![report_action(hbm(), &[1], &[COMPONENT_FULL])],
             None,
         );
-        assert!(!batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
+        assert!(!batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).unwrap());
     }
 
     #[test]
@@ -1798,7 +1805,7 @@ mod tests {
                 vec![report_action(hbm(), &[1], &[components])],
                 Some(spec(components, 1, 1 << hbm())),
             );
-            assert!(!batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
+            assert!(!batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).unwrap());
         }
     }
 
@@ -1811,14 +1818,14 @@ mod tests {
             vec![report_action(hbm(), &[1], &masks)],
             Some(spec(COMPONENT_FULL, 1, 1 << hbm())),
         );
-        assert!(batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
+        assert!(batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).unwrap());
         let request = apply(
             "worker-0",
             "http://w0:30000",
             vec![report_action(hbm(), &[1], &masks)],
             Some(spec(COMPONENT_FULL, 1, 1 << dram())),
         );
-        assert!(!batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
+        assert!(!batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).unwrap());
         // Future spec versions and empty component sets: ineligible.
         for bad in [spec(COMPONENT_FULL, 2, 1 << hbm()), spec(0, 1, 1 << hbm())] {
             let request = apply(
@@ -1827,7 +1834,7 @@ mod tests {
                 vec![report_action(hbm(), &[1], &masks)],
                 Some(bad),
             );
-            assert!(!batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
+            assert!(!batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).unwrap());
         }
         // Legacy (mask-less) reports under a spec: the rule engine cannot
         // confirm FULL, so neither can whole-block matching.
@@ -1837,7 +1844,7 @@ mod tests {
             vec![report_action(hbm(), &[1], &[])],
             Some(spec(COMPONENT_FULL, 1, 1 << hbm())),
         );
-        assert!(!batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
+        assert!(!batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).unwrap());
         // A zero mask inside a component batch is the same hole: the bridge
         // encodes mask-less blocks as 0 next to component blocks, and the
         // rule engine fails the unconfirmed block closed.
@@ -1847,7 +1854,7 @@ mod tests {
             vec![report_action(hbm(), &[1, 2], &[COMPONENT_FULL, 0])],
             Some(spec(COMPONENT_FULL, 1, 1 << hbm())),
         );
-        assert!(!batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).unwrap());
+        assert!(!batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).unwrap());
     }
 
     #[test]
@@ -1858,7 +1865,7 @@ mod tests {
         action.component_masks = vec![COMPONENT_FULL]; // misaligned
         let request = apply("worker-0", "", vec![action], None);
         assert_eq!(
-            batch_is_kvcm_eligible(&request, &[TierType::TierHbm])
+            batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm])
                 .unwrap_err()
                 .code(),
             tonic::Code::InvalidArgument
@@ -1866,7 +1873,7 @@ mod tests {
         let mut action = report_action(hbm(), &[1], &[COMPONENT_FULL]);
         action.r#type = 99;
         let request = apply("worker-0", "", vec![action], None);
-        assert!(batch_is_kvcm_eligible(&request, &[TierType::TierHbm]).is_err());
+        assert!(batch_is_tair_kvcache_eligible(&request, &[TierType::TierHbm]).is_err());
     }
 
     #[test]
@@ -1880,13 +1887,13 @@ mod tests {
         let record = |address: &str, eligible: bool| WorkerRecord {
             address: address.to_string(),
             node_registered: true,
-            kvcm_eligible: eligible,
+            tair_kvcache_eligible: eligible,
         };
         assert_eq!(
             prefix_entry(host("w0", 3), 10, &record("http://w0", true)),
             Some(("w0".into(), "http://w0".into(), 3))
         );
-        // A KVCM over-report cannot exceed the query length.
+        // A Tair KVCache over-report cannot exceed the query length.
         assert_eq!(
             prefix_entry(host("w0", 99), 10, &record("http://w0", true)).map(|e| e.2),
             Some(10)
@@ -1932,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn check_header_maps_kvcm_codes() {
+    fn check_header_maps_tair_kvcache_codes() {
         let header = |code: ErrorCode| CommonResponseHeader {
             status: Some(crate::kvcm_pb::Status {
                 code: code as i32,
@@ -1957,7 +1964,7 @@ mod tests {
             let status = check_header(Some(&header(code)), "rpc").unwrap_err();
             assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{code:?}");
         }
-        // A reporter KVCM forgot is an expected, self-healing event: the
+        // A reporter Tair KVCache forgot is an expected, self-healing event: the
         // bridge retries (transient), and the next report re-registers.
         let status = check_header(Some(&header(ErrorCode::NodeNotRegistered)), "rpc").unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unavailable);
@@ -1970,7 +1977,7 @@ mod tests {
     /// default tier set.
     #[test]
     fn config_defaults_report_hbm_only() {
-        let config = KvcmBackendConfig::new("http://kvcm:1", "inst");
+        let config = TairKvcacheBackendConfig::new("http://tair_kvcache:1", "inst");
         assert_eq!(config.storage_type, StorageType::StEventReportL1p5);
         assert_eq!(config.report_tiers, [TierType::TierHbm]);
         assert_eq!(config.auto_register, None);
@@ -1979,9 +1986,9 @@ mod tests {
 
     /// The environment variables are the operator's entry point, and the one
     /// place a mistake is silent: a renamed or unenforced variable means the
-    /// backend registers without the model deployment KVCM demands, and every
+    /// backend registers without the model deployment Tair KVCache demands, and every
     /// report then fails `INVALID_ARGUMENT` (the bridge exits). This is the
-    /// only test in the crate that touches `KV_INDEXER_KVCM_*`, and no other
+    /// only test in the crate that touches `KV_INDEXER_TAIR_KVCACHE_*`, and no other
     /// test reads them, so one sequential test keeps the global environment to
     /// itself.
     #[test]
@@ -2003,50 +2010,51 @@ mod tests {
         std::env::set_var(ENV_INSTANCE_ID, "inst-0");
         // Auto-registration is opt-in: without the flag the deployment identity
         // is not required, because the connector registered the instance.
-        let config = KvcmBackendConfig::from_env().expect("endpoint and instance are enough");
+        let config =
+            TairKvcacheBackendConfig::from_env().expect("endpoint and instance are enough");
         assert_eq!(config.endpoint, "http://127.0.0.1:50052");
         assert_eq!(config.instance_id, "inst-0");
         assert_eq!(config.auto_register, None);
 
         std::env::set_var(ENV_AUTO_REGISTER, "1");
         assert_eq!(
-            KvcmBackendConfig::from_env().unwrap_err(),
-            KvcmConfigError::Missing(ENV_INSTANCE_GROUP)
+            TairKvcacheBackendConfig::from_env().unwrap_err(),
+            TairKvcacheConfigError::Missing(ENV_INSTANCE_GROUP)
         );
         std::env::set_var(ENV_INSTANCE_GROUP, "group-a");
         assert!(matches!(
-            KvcmBackendConfig::from_env().unwrap_err(),
-            KvcmConfigError::Invalid {
+            TairKvcacheBackendConfig::from_env().unwrap_err(),
+            TairKvcacheConfigError::Invalid {
                 key: ENV_BLOCK_SIZE,
                 ..
             }
         ));
         std::env::set_var(ENV_BLOCK_SIZE, "0");
         assert!(matches!(
-            KvcmBackendConfig::from_env().unwrap_err(),
-            KvcmConfigError::Invalid {
+            TairKvcacheBackendConfig::from_env().unwrap_err(),
+            TairKvcacheConfigError::Invalid {
                 key: ENV_BLOCK_SIZE,
                 ..
             }
         ));
         std::env::set_var(ENV_BLOCK_SIZE, "128");
-        // KVCM rejects a registration without a model name, a dtype, or a
+        // Tair KVCache rejects a registration without a model name, a dtype, or a
         // positive block size, so each one has to be a hard requirement.
         assert_eq!(
-            KvcmBackendConfig::from_env().unwrap_err(),
-            KvcmConfigError::Missing(ENV_MODEL_NAME)
+            TairKvcacheBackendConfig::from_env().unwrap_err(),
+            TairKvcacheConfigError::Missing(ENV_MODEL_NAME)
         );
         std::env::set_var(ENV_MODEL_NAME, "qwen3-8b");
         assert_eq!(
-            KvcmBackendConfig::from_env().unwrap_err(),
-            KvcmConfigError::Missing(ENV_MODEL_DTYPE)
+            TairKvcacheBackendConfig::from_env().unwrap_err(),
+            TairKvcacheConfigError::Missing(ENV_MODEL_DTYPE)
         );
         std::env::set_var(ENV_MODEL_DTYPE, "FP8");
 
-        let config = KvcmBackendConfig::from_env().expect("complete environment");
+        let config = TairKvcacheBackendConfig::from_env().expect("complete environment");
         assert_eq!(
             config.auto_register,
-            Some(KvcmAutoRegister {
+            Some(TairKvcacheAutoRegister {
                 instance_group: "group-a".to_string(),
                 block_size: 128,
                 model_name: "qwen3-8b".to_string(),

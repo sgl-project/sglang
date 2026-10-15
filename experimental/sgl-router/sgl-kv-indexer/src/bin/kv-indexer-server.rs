@@ -7,8 +7,8 @@ use std::{env, io};
 
 use sgl_kv_indexer::{
     server_builder_with_max_concurrent_streams, shutdown_signal, stamp_arrival,
-    InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService, KvcmBackendConfig,
-    KvcmIndexerBackend, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
+    InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService, TairKvcacheBackendConfig,
+    TairKvcacheIndexerBackend, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
 };
 use tonic::service::interceptor::InterceptedService;
 use tracing::info;
@@ -61,15 +61,15 @@ enum BackendKind {
     /// restart.
     Memory,
     /// A Tair KVCache Manager MetaService, configured through
-    /// `KV_INDEXER_KVCM_*` environment variables.
-    Kvcm,
+    /// `KV_INDEXER_TAIR_KVCACHE_*` environment variables.
+    TairKvcache,
 }
 
 impl BackendKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Memory => "memory",
-            Self::Kvcm => "kvcm",
+            Self::TairKvcache => "tair_kvcache",
         }
     }
 }
@@ -77,9 +77,9 @@ impl BackendKind {
 fn parse_backend_kind(raw: &str) -> Result<BackendKind, String> {
     match raw.trim() {
         "" | "memory" => Ok(BackendKind::Memory),
-        "kvcm" => Ok(BackendKind::Kvcm),
+        "tair_kvcache" => Ok(BackendKind::TairKvcache),
         other => Err(format!(
-            "{BACKEND_ENV} must be `memory` or `kvcm`, got `{other}`"
+            "{BACKEND_ENV} must be `memory` or `tair_kvcache`, got `{other}`"
         )),
     }
 }
@@ -95,9 +95,9 @@ fn backend_from_env() -> Result<Arc<dyn KvIndexerBackend>, Box<dyn std::error::E
     };
     let backend: Arc<dyn KvIndexerBackend> = match kind {
         BackendKind::Memory => Arc::new(InMemoryKvIndexerBackend::new()),
-        BackendKind::Kvcm => {
-            let config = KvcmBackendConfig::from_env().map_err(io::Error::other)?;
-            Arc::new(KvcmIndexerBackend::new(config).map_err(io::Error::other)?)
+        BackendKind::TairKvcache => {
+            let config = TairKvcacheBackendConfig::from_env().map_err(io::Error::other)?;
+            Arc::new(TairKvcacheIndexerBackend::new(config).map_err(io::Error::other)?)
         }
     };
     info!(backend = kind.as_str(), "selected KV Indexer backend");
@@ -166,7 +166,10 @@ mod tests {
     fn parses_supported_backends() {
         assert_eq!(parse_backend_kind(""), Ok(BackendKind::Memory));
         assert_eq!(parse_backend_kind("memory"), Ok(BackendKind::Memory));
-        assert_eq!(parse_backend_kind(" kvcm "), Ok(BackendKind::Kvcm));
+        assert_eq!(
+            parse_backend_kind(" tair_kvcache "),
+            Ok(BackendKind::TairKvcache)
+        );
     }
 
     #[test]

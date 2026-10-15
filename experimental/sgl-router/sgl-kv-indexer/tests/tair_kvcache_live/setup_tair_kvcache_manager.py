@@ -2,22 +2,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bring up a real Tair KVCache Manager (KVCM) for `tests/kvcm_live.rs`.
+"""Bring up a real Tair KVCache Manager (KVCM) for `tests/tair_kvcache_live.rs`.
 
-The KVCM backend of the KV Indexer has no in-repo server to talk to; this
+The Tair KVCache backend of the KV Indexer has no in-repo server to talk to; this
 script starts one from a source build and provisions the event-report resources
 the backend needs (event-report storages, an instance group listing them, a
 registered instance). It is the reproducible half of the live integration:
-`tests/kvcm_live.rs` asserts behavior, this script only allocates processes and
+`tests/tair_kvcache_live.rs` asserts behavior, this script only allocates processes and
 configuration.
 
-    # once, in the KVCM checkout
+    # once, in the Tair KVCache checkout
     bazelisk build //kv_cache_manager:kv_cache_manager_bin
 
-    python3 tests/kvcm_live/setup_kvcm.py start --workdir /tmp/kvcm-live
-    source /tmp/kvcm-live/kvcm_live.env
-    cargo test -p sgl-kv-indexer --test kvcm_live -- --ignored
-    python3 tests/kvcm_live/setup_kvcm.py stop --workdir /tmp/kvcm-live
+    python3 tests/tair_kvcache_live/setup_tair_kvcache_manager.py start --workdir /tmp/tair_kvcache-live
+    source /tmp/tair_kvcache-live/tair_kvcache_live.env
+    cargo test -p sgl-kv-indexer --test tair_kvcache_live -- --ignored
+    python3 tests/tair_kvcache_live/setup_tair_kvcache_manager.py stop --workdir /tmp/tair_kvcache-live
 
 `start` is idempotent: an already running manager is left alone and the
 provisioning is re-applied. `config` re-applies provisioning only. `start`
@@ -58,13 +58,13 @@ STORAGE_L2 = "sgl_kv_indexer_live_event_report_l2"
 # instance that does not declare them fails every BLOCK_ADD.
 SPEC_NAMES = ("full", "swa", "mamba")
 BLOCK_SIZE = 128
-# KVCM requires a model deployment on every RegisterInstance. Every field but
-# the name and dtype keeps its KVCM default, which is what `KvcmAutoRegister`
+# Tair KVCache requires a model deployment on every RegisterInstance. Every field but
+# the name and dtype keeps its Tair KVCache default, which is what `TairKvcacheAutoRegister`
 # sends, so a backend that auto-registers this same instance is idempotent.
 MODEL_NAME = "sgl-kv-indexer-live"
 MODEL_DTYPE = "FP16"
-# Must match what `KvcmAutoRegister` sends, otherwise re-registration of this
-# instance fails with DUPLICATE_ENTITY (KVCM compares every field).
+# Must match what `TairKvcacheAutoRegister` sends, otherwise re-registration of this
+# instance fails with DUPLICATE_ENTITY (Tair KVCache compares every field).
 DEFAULT_QUERY_TYPE = "QT_PREFIX_MATCH"
 
 LIVENESS = {
@@ -74,9 +74,9 @@ LIVENESS = {
 }
 
 DEFAULT_BINARY = "bazel-bin/kv_cache_manager/kv_cache_manager_bin"
-DEFAULT_KVCM_REPO = "/root/ws/kv/tair-kvcache"
-STATE_FILE = "kvcm_live.json"
-ENV_FILE = "kvcm_live.env"
+DEFAULT_MANAGER_REPO = "/root/ws/kv/tair-kvcache"
+STATE_FILE = "tair_kvcache_live.json"
+ENV_FILE = "tair_kvcache_live.env"
 REGISTRY_FILE = "registry.json"
 
 
@@ -212,11 +212,11 @@ def pid_alive(pid: int) -> bool:
 def resolve_binary(args: argparse.Namespace) -> str:
     binary = args.binary
     if not os.path.isabs(binary):
-        binary = os.path.join(args.kvcm_repo, binary)
+        binary = os.path.join(args.manager_repo, binary)
     if not os.access(binary, os.X_OK):
         raise SetupError(
-            f"KVCM binary not found at {binary}; build it with "
-            f"`cd {args.kvcm_repo} && bazelisk build //kv_cache_manager:kv_cache_manager_bin`"
+            f"Tair KVCache binary not found at {binary}; build it with "
+            f"`cd {args.manager_repo} && bazelisk build //kv_cache_manager:kv_cache_manager_bin`"
         )
     return binary
 
@@ -267,7 +267,7 @@ def wait_ready(http_port: int, timeout: float) -> None:
         except SetupError as error:
             last_error = str(error)
         time.sleep(0.2)
-    raise SetupError(f"KVCM did not become ready within {timeout:.0f}s: {last_error}")
+    raise SetupError(f"Tair KVCache did not become ready within {timeout:.0f}s: {last_error}")
 
 
 def start_once(args: argparse.Namespace) -> Dict[str, Any]:
@@ -330,7 +330,7 @@ def start_once(args: argparse.Namespace) -> Dict[str, Any]:
             f"{error} (pid {process.pid} survived shutdown and still holds "
             f"ports {rpc_port}/{http_port}; `stop` will retry it)"
         ) from error
-    print(f"[setup] KVCM ready: grpc=127.0.0.1:{rpc_port} http=127.0.0.1:{http_port}")
+    print(f"[setup] Tair KVCache ready: grpc=127.0.0.1:{rpc_port} http=127.0.0.1:{http_port}")
     return state
 
 
@@ -340,7 +340,7 @@ def start_manager(args: argparse.Namespace) -> Dict[str, Any]:
     if existing and pid_alive(int(existing["pid"])):
         pid = int(existing["pid"])
         if is_our_manager(existing, pid):
-            print(f"[setup] KVCM already running (pid={pid}, grpc=127.0.0.1:{existing['rpc_port']})")
+            print(f"[setup] Tair KVCache already running (pid={pid}, grpc=127.0.0.1:{existing['rpc_port']})")
             return existing
         # A reused pid would otherwise make `start` report "already running"
         # and provision against ports this state file no longer owns.
@@ -367,7 +367,7 @@ def stop_manager(args: argparse.Namespace) -> int:
         return 0
     pid = int(state["pid"])
     if not pid_alive(pid):
-        print(f"[setup] KVCM (pid={pid}) is not running")
+        print(f"[setup] Tair KVCache (pid={pid}) is not running")
         os.remove(state_path(args.workdir))
         return 0
     if not is_our_manager(state, pid):
@@ -380,7 +380,7 @@ def stop_manager(args: argparse.Namespace) -> int:
         )
     if not terminate(pid, args.stop_timeout):
         raise SetupError(f"pid {pid} survived SIGKILL; check it manually")
-    print(f"[setup] KVCM (pid={pid}) stopped")
+    print(f"[setup] Tair KVCache (pid={pid}) stopped")
     os.remove(state_path(args.workdir))
     return 0
 
@@ -499,15 +499,15 @@ def provision(state: Dict[str, Any]) -> None:
 
 def write_env_file(workdir: str, state: Dict[str, Any]) -> str:
     lines = [
-        "# Generated by sgl-kv-indexer tests/kvcm_live/setup_kvcm.py",
-        f"export KVCM_LIVE_WORKDIR={workdir}",
-        f"export KVCM_LIVE_ENDPOINT=http://127.0.0.1:{state['rpc_port']}",
-        f"export KVCM_LIVE_INSTANCE_ID={state['instance_id']}",
-        f"export KVCM_LIVE_INSTANCE_GROUP={state['instance_group']}",
-        f"export KVCM_LIVE_MODEL_NAME={MODEL_NAME}",
-        f"export KVCM_LIVE_MODEL_DTYPE={MODEL_DTYPE}",
-        f"export KVCM_LIVE_HTTP_ENDPOINT=http://127.0.0.1:{state['http_port']}",
-        f"export KVCM_LIVE_ADMIN_ENDPOINT=http://127.0.0.1:{state['admin_http_port']}",
+        "# Generated by sgl-kv-indexer tests/tair_kvcache_live/setup_tair_kvcache_manager.py",
+        f"export TAIR_KVCACHE_LIVE_WORKDIR={workdir}",
+        f"export TAIR_KVCACHE_LIVE_ENDPOINT=http://127.0.0.1:{state['rpc_port']}",
+        f"export TAIR_KVCACHE_LIVE_INSTANCE_ID={state['instance_id']}",
+        f"export TAIR_KVCACHE_LIVE_INSTANCE_GROUP={state['instance_group']}",
+        f"export TAIR_KVCACHE_LIVE_MODEL_NAME={MODEL_NAME}",
+        f"export TAIR_KVCACHE_LIVE_MODEL_DTYPE={MODEL_DTYPE}",
+        f"export TAIR_KVCACHE_LIVE_HTTP_ENDPOINT=http://127.0.0.1:{state['http_port']}",
+        f"export TAIR_KVCACHE_LIVE_ADMIN_ENDPOINT=http://127.0.0.1:{state['admin_http_port']}",
     ]
     path = os.path.join(workdir, ENV_FILE)
     with open(path, "w") as handle:
@@ -520,15 +520,15 @@ def print_instructions(state: Dict[str, Any]) -> None:
     print(f"\n[setup] environment written to {path}\n")
     print(f"  source {path}")
     print("  cd experimental/sgl-router")
-    print("  cargo test -p sgl-kv-indexer --test kvcm_live -- --ignored")
+    print("  cargo test -p sgl-kv-indexer --test tair_kvcache_live -- --ignored")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("start", "config", "stop", "status"))
-    parser.add_argument("--workdir", default="/tmp/kvcm-live", help="state, registry and logs live here")
-    parser.add_argument("--kvcm-repo", default=DEFAULT_KVCM_REPO, help="Tair KVCache Manager checkout")
-    parser.add_argument("--binary", default=DEFAULT_BINARY, help="manager binary (relative to --kvcm-repo)")
+    parser.add_argument("--workdir", default="/tmp/tair_kvcache-live", help="state, registry and logs live here")
+    parser.add_argument("--manager-repo", default=DEFAULT_MANAGER_REPO, help="Tair KVCache Manager checkout")
+    parser.add_argument("--binary", default=DEFAULT_BINARY, help="manager binary (relative to --manager-repo)")
     parser.add_argument("--startup-timeout", type=float, default=60.0, help="seconds to wait for readiness")
     parser.add_argument("--stop-timeout", type=float, default=15.0, help="seconds to wait for SIGTERM")
     parser.add_argument(
@@ -548,7 +548,7 @@ def main() -> int:
         if args.command == "config":
             state = read_state(args.workdir)
             if not state or not pid_alive(int(state["pid"])):
-                raise SetupError(f"KVCM is not running in {args.workdir}; run `start` first")
+                raise SetupError(f"Tair KVCache is not running in {args.workdir}; run `start` first")
             provision(state)
             print_instructions(state)
             return 0
@@ -556,7 +556,7 @@ def main() -> int:
             return stop_manager(args)
         state = read_state(args.workdir)
         if not state:
-            print(f"[setup] no KVCM state in {args.workdir}")
+            print(f"[setup] no Tair KVCache state in {args.workdir}")
             return 1
         pid = int(state["pid"])
         alive = pid_alive(pid)

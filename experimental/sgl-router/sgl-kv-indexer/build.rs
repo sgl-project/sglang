@@ -12,7 +12,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .compile_with_config(
             config,
-            &["proto/kv_indexer.proto", "proto/kvcm_meta_service.proto"],
+            &[
+                "proto/kv_indexer.proto",
+                "proto/tair_kvcache_meta_service.proto",
+            ],
             &["proto"],
         )?;
     Ok(())

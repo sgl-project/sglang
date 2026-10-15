@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! KVCM backend contract tests: drive [`KvcmIndexerBackend`] (and, in one
+//! Tair KVCache backend contract tests: drive [`TairKvcacheIndexerBackend`] (and, in one
 //! case, the full `KVIndexer` service in front of it) against an in-process
-//! mock KVCM `MetaService` over real gRPC. The mock records every request, so
-//! these tests pin the translation layer — indexer actions to KVCM events,
-//! KVCM host answers to indexer prefix matches — not KVCM's own matching.
+//! mock Tair KVCache `MetaService` over real gRPC. The mock records every request, so
+//! these tests pin the translation layer — indexer actions to Tair KVCache events,
+//! Tair KVCache host answers to indexer prefix matches — not Tair KVCache's own matching.
 
 #[path = "common/kv.rs"]
 mod test_kv;
@@ -30,7 +30,7 @@ use sgl_kv_indexer::kvcm_pb::{
     GetHostCacheStateResponse, GetInstanceInfoRequest, GetInstanceInfoResponse, HostCacheMatch,
     QueryType, RegisterInstanceRequest, RegisterInstanceResponse, RemoveCacheRequest,
     ReportEventRequest, ReportEventResponse, StartWriteCacheRequest, StartWriteCacheResponse,
-    Status as KvcmStatus, StorageType, TrimCacheRequest,
+    Status as TairKvcacheStatus, StorageType, TrimCacheRequest,
 };
 use sgl_kv_indexer::pb::kv_indexer_client::KvIndexerClient;
 use sgl_kv_indexer::pb::{
@@ -38,13 +38,13 @@ use sgl_kv_indexer::pb::{
     MatchExternalKvPrefixRequest, MatchExternalKvRequest,
 };
 use sgl_kv_indexer::{
-    server_builder, KvIndexerBackend, KvIndexerService, KvcmBackendConfig, KvcmIndexerBackend,
-    COMPONENT_FULL,
+    server_builder, KvIndexerBackend, KvIndexerService, TairKvcacheBackendConfig,
+    TairKvcacheIndexerBackend, COMPONENT_FULL,
 };
 use test_kv::{action, apply_request, component_report, dram, hbm};
 use test_net::free_addr;
 
-/// Everything the mock KVCM observed, plus the canned answers it serves.
+/// Everything the mock Tair KVCache observed, plus the canned answers it serves.
 #[derive(Default)]
 struct MockState {
     registrations: Vec<RegisterInstanceRequest>,
@@ -59,11 +59,11 @@ struct MockState {
     report_item_results: Vec<i32>,
     report_snapshot_required: bool,
     /// Canned per-snapshot failures, one popped per snapshot request (empty
-    /// means "commit"). KVCM answers a failed snapshot with the code in both
+    /// means "commit"). Tair KVCache answers a failed snapshot with the code in both
     /// the header and `item_results`, plus `retry_after_ms` when rate-limited.
     snapshot_failures: Vec<ErrorCode>,
     /// Spec names per registered instance, as `RegisterInstance` declared
-    /// them: KVCM checks every reported name against this set.
+    /// them: Tair KVCache checks every reported name against this set.
     registered_specs: HashMap<String, Vec<String>>,
 }
 
@@ -72,7 +72,7 @@ impl MockState {
         state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    /// The spec names KVCM would accept for this instance: what its
+    /// The spec names Tair KVCache would accept for this instance: what its
     /// registration declared, or the connector's deployment for an instance
     /// the mock never saw registered (the backend reports into those).
     fn declared_specs(&self, instance_id: &str) -> Vec<String> {
@@ -90,7 +90,7 @@ impl MockState {
 
 fn ok_header() -> CommonResponseHeader {
     CommonResponseHeader {
-        status: Some(KvcmStatus {
+        status: Some(TairKvcacheStatus {
             code: ErrorCode::Ok as i32,
             message: String::new(),
         }),
@@ -101,7 +101,7 @@ fn ok_header() -> CommonResponseHeader {
 
 fn err_header(code: ErrorCode, message: &str) -> CommonResponseHeader {
     CommonResponseHeader {
-        status: Some(KvcmStatus {
+        status: Some(TairKvcacheStatus {
             code: code as i32,
             message: message.to_string(),
         }),
@@ -110,12 +110,12 @@ fn err_header(code: ErrorCode, message: &str) -> CommonResponseHeader {
     }
 }
 
-/// The spec names KVCM accepts for an instance the mock never saw registered:
+/// The spec names Tair KVCache accepts for an instance the mock never saw registered:
 /// the connector's deployment (see the live suite's `full`/`swa`/`mamba`
 /// instance). A registration replaces this set for that instance.
 const DEPLOYMENT_SPEC_NAMES: [&str; 3] = ["full", "swa", "mamba"];
 
-/// How KVCM answers a rejected request: the whole request or nothing, or a
+/// How Tair KVCache answers a rejected request: the whole request or nothing, or a
 /// per-event `item_results` entry.
 enum ReportViolation {
     /// Request-level checks run before any event is inspected and answer with
@@ -125,7 +125,7 @@ enum ReportViolation {
     Items(String),
 }
 
-/// The KVCM acceptance rules the backend's generated events must satisfy
+/// The Tair KVCache acceptance rules the backend's generated events must satisfy
 /// (mirrors cache_manager.cc: BLOCK_ADD specs carry a channel-scheme URI and
 /// name a spec the instance declared, BLOCK_DELETE names a declared spec,
 /// NODE_REGISTER declares mediums). Returns the first violation's reason.
@@ -224,13 +224,13 @@ fn validate_report_events(
     None
 }
 
-/// An in-process KVCM MetaService that records the three RPCs the backend
+/// An in-process Tair KVCache MetaService that records the three RPCs the backend
 /// uses and refuses everything else.
-struct MockKvcm {
+struct MockTairKvcacheManager {
     state: Arc<Mutex<MockState>>,
 }
 
-/// The registration fields KVCM requires of every `RegisterInstance`
+/// The registration fields Tair KVCache requires of every `RegisterInstance`
 /// (`MetaServiceImpl::RegisterInstance`), so that a registration the mock
 /// accepts is one a real manager accepts too.
 fn validate_registration(request: &RegisterInstanceRequest) -> Option<String> {
@@ -269,7 +269,7 @@ fn validate_registration(request: &RegisterInstanceRequest) -> Option<String> {
 }
 
 #[tonic::async_trait]
-impl MetaService for MockKvcm {
+impl MetaService for MockTairKvcacheManager {
     async fn register_instance(
         &self,
         request: Request<RegisterInstanceRequest>,
@@ -280,7 +280,7 @@ impl MetaService for MockKvcm {
             let mut state = MockState::lock(&self.state);
             let observed = state.register_error.clone();
             let rejected = observed.is_some() || violation.is_some();
-            // KVCM resolves reported spec names against the instance's
+            // Tair KVCache resolves reported spec names against the instance's
             // registration, so the mock has to remember them -- but only for a
             // registration it accepts: a rejected one leaves no instance behind,
             // and reporting into it must fail the way a real manager fails.
@@ -314,10 +314,10 @@ impl MetaService for MockKvcm {
         request: Request<ReportEventRequest>,
     ) -> Result<Response<ReportEventResponse>, Status> {
         let request = request.into_inner();
-        // KVCM's own acceptance rules, so a regression to structurally
+        // Tair KVCache's own acceptance rules, so a regression to structurally
         // invalid events fails loudly here instead of only against a real
         // server (see cache_manager.cc ValidateEventLocationSpec). The declared
-        // spec names come from the instance's registration, exactly as KVCM
+        // spec names come from the instance's registration, exactly as Tair KVCache
         // resolves them.
         let (violation, error, snapshot_failure, item_results, snapshot_required) = {
             let mut state = MockState::lock(&self.state);
@@ -484,20 +484,20 @@ impl MetaService for MockKvcm {
     }
 }
 
-async fn start_mock_kvcm(state: Arc<Mutex<MockState>>) -> SocketAddr {
+async fn start_mock_tair_kvcache_manager(state: Arc<Mutex<MockState>>) -> SocketAddr {
     let addr = free_addr();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(MetaServiceServer::new(MockKvcm { state }))
+            .add_service(MetaServiceServer::new(MockTairKvcacheManager { state }))
             .serve(addr)
             .await
-            .expect("mock KVCM serve");
+            .expect("mock Tair KVCache serve");
     });
     addr
 }
 
-fn backend_config(addr: SocketAddr) -> KvcmBackendConfig {
-    let mut config = KvcmBackendConfig::new(format!("http://{addr}"), "test-instance");
+fn backend_config(addr: SocketAddr) -> TairKvcacheBackendConfig {
+    let mut config = TairKvcacheBackendConfig::new(format!("http://{addr}"), "test-instance");
     // Generous timeouts: these tests assert translation, not scheduling.
     config.query_timeout = Duration::from_secs(2);
     config.apply_timeout = Duration::from_secs(2);
@@ -505,10 +505,10 @@ fn backend_config(addr: SocketAddr) -> KvcmBackendConfig {
     config
 }
 
-async fn start_backend() -> (KvcmIndexerBackend, Arc<Mutex<MockState>>) {
+async fn start_backend() -> (TairKvcacheIndexerBackend, Arc<Mutex<MockState>>) {
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
-    let backend = KvcmIndexerBackend::new(backend_config(addr)).expect("valid endpoint");
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
+    let backend = TairKvcacheIndexerBackend::new(backend_config(addr)).expect("valid endpoint");
     (backend, state)
 }
 
@@ -649,11 +649,11 @@ async fn apply_clears_with_an_empty_snapshot_of_its_own() {
 
 /// A pending registration rides the batch's *first* request. For a first-seen
 /// worker whose batch reports blocks and then clears, that is the delta: a
-/// reporter KVCM has forgotten would fail the unregistered delta and lose the
+/// reporter Tair KVCache has forgotten would fail the unregistered delta and lose the
 /// whole batch otherwise, and the registration on the snapshot would never be
 /// reached (the review's wire probe: `apply-1 node_register_count=0`, then
 /// `apply-2 node_register_count=1`).
-/// One request as the KVCM access log would phrase it.
+/// One request as the Tair KVCache access log would phrase it.
 fn wire_shape(request: &ReportEventRequest) -> String {
     use sgl_kv_indexer::kvcm_pb::ReportEventType as T;
     let count = |kind: T| {
@@ -709,7 +709,7 @@ async fn a_first_batch_that_reports_then_clears_registers_on_its_first_request()
     );
 }
 
-/// A flush is best-effort: KVCM's rate limit (30s by default) cannot be waited
+/// A flush is best-effort: Tair KVCache's rate limit (30s by default) cannot be waited
 /// out inside an apply budget, and failing the batch would cost more than a
 /// missed flush -- the bridge reconnects and does not replay, so every delta
 /// that rode in the same batch would be lost too.
@@ -746,7 +746,7 @@ async fn a_rate_limited_clear_succeeds_without_retrying() {
     assert_eq!(snapshots, 1, "the cooldown is not retried inside the batch");
 }
 
-/// KVCM forgets a reporter it has not heard from; the flush re-registers it in
+/// Tair KVCache forgets a reporter it has not heard from; the flush re-registers it in
 /// the retry rather than leaving the clear to the next batch.
 #[tokio::test]
 async fn a_clear_registers_a_forgotten_reporter_and_retries() {
@@ -840,7 +840,7 @@ async fn a_snapshot_in_progress_clear_is_retried_until_it_commits() {
     assert_eq!(snapshots, 3, "two in-progress answers, then a commit");
 }
 
-/// The mock's snapshot rules are KVCM's, so the empty snapshot the flush
+/// The mock's snapshot rules are Tair KVCache's, so the empty snapshot the flush
 /// relies on stays accepted and a mixed request fails loudly here instead of
 /// only against a real manager (`CacheManager::ReportEvent`).
 #[tokio::test]
@@ -852,8 +852,8 @@ async fn mock_snapshot_accepts_empty_and_rejects_mixed_requests() {
     };
 
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
-    // `start_mock_kvcm` hands back the address before its task binds, so the
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
+    // `start_mock_tair_kvcache_manager` hands back the address before its task binds, so the
     // first connect can race the listener (the backend's own client connects
     // lazily and never sees it).
     let mut client = None;
@@ -934,7 +934,7 @@ async fn mock_snapshot_accepts_empty_and_rejects_mixed_requests() {
 }
 
 #[tokio::test]
-async fn apply_maps_kvcm_error_to_unavailable() {
+async fn apply_maps_tair_kvcache_error_to_unavailable() {
     let (backend, state) = start_backend().await;
     MockState::lock(&state).report_error = Some((ErrorCode::InternalError, "boom".into()));
     let error = backend
@@ -945,7 +945,7 @@ async fn apply_maps_kvcm_error_to_unavailable() {
             vec![action(ExternalKvActionType::ActionReport, hbm(), &[1])],
         ))
         .await
-        .expect_err("KVCM error must surface");
+        .expect_err("Tair KVCache error must surface");
     assert_eq!(error.code(), Code::Unavailable);
     assert!(error.message().contains("boom"));
 }
@@ -961,7 +961,7 @@ async fn apply_rejects_worker_id_with_hash_char() {
             vec![action(ExternalKvActionType::ActionReport, hbm(), &[1])],
         ))
         .await
-        .expect_err("'#' corrupts KVCM location ids");
+        .expect_err("'#' corrupts Tair KVCache location ids");
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(MockState::lock(&state).reports.is_empty());
 }
@@ -998,31 +998,32 @@ impl Drop for EnvGuard {
 
 /// The environment is the entry point operators use, and the one place a
 /// mistake is silent: a renamed or unenforced variable produces a registration
-/// KVCM rejects, which makes the bridge exit rather than misbehave visibly.
-/// Drive the whole chain -- environment -> `KvcmBackendConfig::from_env` ->
+/// Tair KVCache rejects, which makes the bridge exit rather than misbehave visibly.
+/// Drive the whole chain -- environment -> `TairKvcacheBackendConfig::from_env` ->
 /// `RegisterInstance` -> wire -- so no link can drift unnoticed.
 #[tokio::test]
 async fn environment_configuration_reaches_the_wire() {
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
     // Spelled out rather than imported: a typo in the constant is what this
     // test exists to catch.
     let endpoint = format!("http://{addr}");
     let _guard = EnvGuard::set(&[
-        ("KV_INDEXER_KVCM_ENDPOINT", endpoint.as_str()),
-        ("KV_INDEXER_KVCM_INSTANCE_ID", "env-instance"),
-        ("KV_INDEXER_KVCM_AUTO_REGISTER", "1"),
-        ("KV_INDEXER_KVCM_INSTANCE_GROUP", "group-env"),
-        ("KV_INDEXER_KVCM_BLOCK_SIZE", "16"),
-        ("KV_INDEXER_KVCM_MODEL_NAME", "qwen3-8b"),
-        ("KV_INDEXER_KVCM_MODEL_DTYPE", "FP8"),
+        ("KV_INDEXER_TAIR_KVCACHE_ENDPOINT", endpoint.as_str()),
+        ("KV_INDEXER_TAIR_KVCACHE_INSTANCE_ID", "env-instance"),
+        ("KV_INDEXER_TAIR_KVCACHE_AUTO_REGISTER", "1"),
+        ("KV_INDEXER_TAIR_KVCACHE_INSTANCE_GROUP", "group-env"),
+        ("KV_INDEXER_TAIR_KVCACHE_BLOCK_SIZE", "16"),
+        ("KV_INDEXER_TAIR_KVCACHE_MODEL_NAME", "qwen3-8b"),
+        ("KV_INDEXER_TAIR_KVCACHE_MODEL_DTYPE", "FP8"),
     ]);
-    let mut config = sgl_kv_indexer::KvcmBackendConfig::from_env().expect("complete environment");
+    let mut config =
+        sgl_kv_indexer::TairKvcacheBackendConfig::from_env().expect("complete environment");
     // The tests assert translation, not scheduling.
     config.query_timeout = Duration::from_secs(2);
     config.apply_timeout = Duration::from_secs(2);
     config.heartbeat_interval = None;
-    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+    let backend = TairKvcacheIndexerBackend::new(config).expect("valid endpoint");
 
     backend
         .apply_external_kv_batch(apply_request(
@@ -1042,7 +1043,7 @@ async fn environment_configuration_reaches_the_wire() {
     let deployment = registration
         .model_deployment
         .as_ref()
-        .expect("KVCM rejects a registration without a model deployment");
+        .expect("Tair KVCache rejects a registration without a model deployment");
     assert_eq!(deployment.model_name, "qwen3-8b");
     assert_eq!(deployment.dtype, "FP8");
     assert_eq!(
@@ -1059,18 +1060,18 @@ async fn environment_configuration_reaches_the_wire() {
 async fn a_prefix_query_registers_an_auto_registering_instance_first() {
     // The Router's first request can be a prefix query on a deployment where no
     // KV event has arrived yet, so no apply batch has registered the instance.
-    // KVCM answers INSTANCE_NOT_EXIST for that, which is permanent: the query
+    // Tair KVCache answers INSTANCE_NOT_EXIST for that, which is permanent: the query
     // path has to register on its own, ahead of the query it is answering.
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
     let mut config = backend_config(addr);
-    config.auto_register = Some(sgl_kv_indexer::KvcmAutoRegister {
+    config.auto_register = Some(sgl_kv_indexer::TairKvcacheAutoRegister {
         instance_group: "group-a".into(),
         block_size: 16,
         model_name: "qwen3-8b".into(),
         dtype: "FP8".into(),
     });
-    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+    let backend = TairKvcacheIndexerBackend::new(config).expect("valid endpoint");
 
     backend
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
@@ -1101,13 +1102,14 @@ async fn a_prefix_query_registers_an_auto_registering_instance_first() {
     );
 
     // Without auto-registration the instance stays missing and the query keeps
-    // surfacing KVCM's verdict: a typo'd instance id is a configuration error,
+    // surfacing Tair KVCache's verdict: a typo'd instance id is a configuration error,
     // not a transient condition to paper over.
     let observer_state = Arc::new(Mutex::new(MockState::default()));
-    let observer_addr = start_mock_kvcm(Arc::clone(&observer_state)).await;
+    let observer_addr = start_mock_tair_kvcache_manager(Arc::clone(&observer_state)).await;
     MockState::lock(&observer_state).query_error =
         Some((ErrorCode::InstanceNotExist, "no such instance".into()));
-    let observer = KvcmIndexerBackend::new(backend_config(observer_addr)).expect("valid endpoint");
+    let observer =
+        TairKvcacheIndexerBackend::new(backend_config(observer_addr)).expect("valid endpoint");
     let error = observer
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
             hashes: vec![1],
@@ -1125,15 +1127,15 @@ async fn a_prefix_query_registers_an_auto_registering_instance_first() {
 #[tokio::test]
 async fn auto_register_registers_once_with_spec_names() {
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
     let mut config = backend_config(addr);
-    config.auto_register = Some(sgl_kv_indexer::KvcmAutoRegister {
+    config.auto_register = Some(sgl_kv_indexer::TairKvcacheAutoRegister {
         instance_group: "group-a".into(),
         block_size: 16,
         model_name: "qwen3-8b".into(),
         dtype: "FP8".into(),
     });
-    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+    let backend = TairKvcacheIndexerBackend::new(config).expect("valid endpoint");
 
     for seq in 1..=2 {
         backend
@@ -1168,12 +1170,12 @@ async fn auto_register_registers_once_with_spec_names() {
         registration.default_query_type,
         QueryType::QtPrefixMatch as i32
     );
-    // KVCM rejects a registration without a model deployment and a positive
+    // Tair KVCache rejects a registration without a model deployment and a positive
     // block size, so both must be on the wire.
     let deployment = registration
         .model_deployment
         .as_ref()
-        .expect("registration carries the model deployment KVCM requires");
+        .expect("registration carries the model deployment Tair KVCache requires");
     assert_eq!(deployment.model_name, "qwen3-8b");
     assert_eq!(deployment.dtype, "FP8");
     // Both batches were forwarded after the registration.
@@ -1275,12 +1277,12 @@ async fn prefix_clamps_oversized_local_answer() {
         })
         .await
         .expect("prefix query succeeds");
-    // A KVCM over-report cannot claim more blocks than the query carried.
+    // A Tair KVCache over-report cannot claim more blocks than the query carried.
     assert_eq!(response.matches[0].matched_prefix_blocks, 10);
 }
 
 #[tokio::test]
-async fn prefix_maps_kvcm_unready_to_unavailable() {
+async fn prefix_maps_tair_kvcache_unready_to_unavailable() {
     let (backend, state) = start_backend().await;
     MockState::lock(&state).query_error = Some((ErrorCode::ServiceNotReady, "starting".into()));
     let error = backend
@@ -1289,7 +1291,7 @@ async fn prefix_maps_kvcm_unready_to_unavailable() {
             max_blocks: 0,
         })
         .await
-        .expect_err("KVCM error must surface");
+        .expect_err("Tair KVCache error must surface");
     assert_eq!(error.code(), Code::Unavailable);
     assert!(error.message().contains("starting"));
 }
@@ -1303,7 +1305,7 @@ async fn match_external_kv_is_unimplemented() {
             count_as_hit: false,
         })
         .await
-        .expect_err("no KVCM equivalent exists");
+        .expect_err("no Tair KVCache equivalent exists");
     assert_eq!(error.code(), Code::Unimplemented);
 }
 
@@ -1320,10 +1322,10 @@ async fn hit_counts_stay_empty() {
 #[tokio::test]
 async fn heartbeats_keep_reporters_alive() {
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
     let mut config = backend_config(addr);
     config.heartbeat_interval = Some(Duration::from_millis(20));
-    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+    let backend = TairKvcacheIndexerBackend::new(config).expect("valid endpoint");
 
     backend
         .apply_external_kv_batch(apply_request(
@@ -1353,10 +1355,11 @@ async fn heartbeats_keep_reporters_alive() {
 /// The backend behind the real `KVIndexer` service: validation, admission, and
 /// the wire contract of the router-facing RPCs stay unchanged.
 #[tokio::test]
-async fn kvcm_backend_over_real_indexer_grpc() {
+async fn tair_kvcache_backend_over_real_indexer_grpc() {
     let mock_state = Arc::new(Mutex::new(MockState::default()));
-    let mock_addr = start_mock_kvcm(Arc::clone(&mock_state)).await;
-    let backend = KvcmIndexerBackend::new(backend_config(mock_addr)).expect("valid endpoint");
+    let mock_addr = start_mock_tair_kvcache_manager(Arc::clone(&mock_state)).await;
+    let backend =
+        TairKvcacheIndexerBackend::new(backend_config(mock_addr)).expect("valid endpoint");
 
     let svc = KvIndexerService::new(backend).into_server();
     let addr = free_addr();
@@ -1408,7 +1411,7 @@ async fn kvcm_backend_over_real_indexer_grpc() {
             count_as_hit: false,
         })
         .await
-        .expect_err("no KVCM equivalent exists");
+        .expect_err("no Tair KVCache equivalent exists");
     assert_eq!(error.code(), Code::Unimplemented);
 
     let counts = client
@@ -1526,7 +1529,7 @@ async fn zero_mask_inside_a_component_batch_excludes_the_worker() {
 
 /// Eligibility is sticky: a worker that was reported while eligible is
 /// excluded from answers the moment a later batch makes it ineligible, even
-/// though KVCM still holds its earlier placements.
+/// though Tair KVCache still holds its earlier placements.
 #[tokio::test]
 async fn eligibility_is_sticky_across_batches() {
     let (backend, state) = start_backend().await;
@@ -1563,7 +1566,7 @@ async fn eligibility_is_sticky_across_batches() {
         .expect("prefix query succeeds");
     assert!(
         response.matches.is_empty(),
-        "KVCM still holds the placements, but the worker must not be answered"
+        "Tair KVCache still holds the placements, but the worker must not be answered"
     );
 }
 
@@ -1572,12 +1575,12 @@ async fn eligibility_is_sticky_across_batches() {
 #[tokio::test]
 async fn heartbeats_re_register_forgotten_reporters() {
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
     let mut config = backend_config(addr);
     config.heartbeat_interval = Some(Duration::from_millis(20));
-    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+    let backend = TairKvcacheIndexerBackend::new(config).expect("valid endpoint");
 
-    // Register and report once, then make KVCM forget the reporter.
+    // Register and report once, then make Tair KVCache forget the reporter.
     backend
         .apply_external_kv_batch(apply_request(
             "worker-0",
@@ -1611,9 +1614,9 @@ async fn heartbeats_re_register_forgotten_reporters() {
 }
 
 /// B2 regression: a `NODE_REGISTER` is not consumed by a failed batch, and a
-/// reporter KVCM forgot is re-registered by the next successful one.
+/// reporter Tair KVCache forgot is re-registered by the next successful one.
 #[tokio::test]
-async fn node_register_is_resent_after_kvcm_forgets_the_reporter() {
+async fn node_register_is_resent_after_tair_kvcache_forgets_the_reporter() {
     let (backend, state) = start_backend().await;
     let batch = |seq: u64| {
         apply_request(
@@ -1633,7 +1636,7 @@ async fn node_register_is_resent_after_kvcm_forgets_the_reporter() {
         .apply_external_kv_batch(batch(1))
         .await
         .expect("first apply succeeds");
-    // Phase 2: KVCM forgot the node; the batch fails loudly.
+    // Phase 2: Tair KVCache forgot the node; the batch fails loudly.
     MockState::lock(&state).report_error = Some((ErrorCode::NodeNotRegistered, "forgotten".into()));
     assert!(backend.apply_external_kv_batch(batch(2)).await.is_err());
     // Phase 3: recovery — the reporter must be re-registered.
@@ -1660,7 +1663,7 @@ async fn node_register_is_resent_after_kvcm_forgets_the_reporter() {
     );
     assert!(
         has_register(&reports[2]),
-        "a reporter KVCM forgot is re-registered"
+        "a reporter Tair KVCache forgot is re-registered"
     );
 }
 
@@ -1712,10 +1715,10 @@ async fn large_batches_are_chunked_in_order_under_one_budget() {
 #[tokio::test]
 async fn spec_uris_follow_the_channel_and_reporter_identity() {
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
     let mut config = backend_config(addr);
     config.storage_type = StorageType::StEventReportL2;
-    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+    let backend = TairKvcacheIndexerBackend::new(config).expect("valid endpoint");
 
     // With an address: vineyard://<authority>/<medium>.
     backend
@@ -1762,7 +1765,7 @@ async fn spec_uris_follow_the_channel_and_reporter_identity() {
         reports
             .iter()
             .all(|report| validate_report_events(report, &declared).is_none()),
-        "generated events must satisfy KVCM acceptance rules"
+        "generated events must satisfy Tair KVCache acceptance rules"
     );
 }
 
@@ -1822,10 +1825,10 @@ async fn permanent_configuration_faults_are_failed_precondition() {
 #[tokio::test]
 async fn heartbeats_stop_when_the_backend_drops() {
     let state = Arc::new(Mutex::new(MockState::default()));
-    let addr = start_mock_kvcm(Arc::clone(&state)).await;
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
     let mut config = backend_config(addr);
     config.heartbeat_interval = Some(Duration::from_millis(20));
-    let backend = KvcmIndexerBackend::new(config).expect("valid endpoint");
+    let backend = TairKvcacheIndexerBackend::new(config).expect("valid endpoint");
     for worker in ["worker-0", "worker-1"] {
         backend
             .apply_external_kv_batch(apply_request(worker, "http://w", 1, Vec::new()))

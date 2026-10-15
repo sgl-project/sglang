@@ -14,25 +14,21 @@ pub mod pb {
 }
 
 /// Generated types for the vendored Tair KVCache Manager `MetaService`
-/// protocol (`proto/kvcm_meta_service.proto`), used by the KVCM backend.
+/// protocol (`proto/tair_kvcache_meta_service.proto`), used by the Tair KVCache backend.
 pub mod kvcm_pb {
     tonic::include_proto!("kv_cache_manager.proto.meta");
 }
 
 mod admission;
-mod kvcm_backend;
 mod memory_backend;
 mod service;
 mod shutdown;
+mod tair_kvcache_backend;
 
 pub use admission::stamp_arrival;
 pub use client::{
     GrpcPrefixIndex, InvalidEndpoint, PrefixIndex, PrefixIndexConfig, PrefixIndexError,
     PrefixMatch, PrefixOutcome, DEFAULT_QUERY_MAX_INFLIGHT,
-};
-pub use kvcm_backend::{
-    KvcmAutoRegister, KvcmBackendConfig, KvcmConfigError, KvcmIndexerBackend,
-    DEFAULT_APPLY_TIMEOUT_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_QUERY_TIMEOUT_MS,
 };
 pub use memory_backend::InMemoryKvIndexerBackend;
 pub use service::{
@@ -42,6 +38,11 @@ pub use service::{
     MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 pub use shutdown::shutdown_signal;
+pub use tair_kvcache_backend::{
+    TairKvcacheAutoRegister, TairKvcacheBackendConfig, TairKvcacheConfigError,
+    TairKvcacheIndexerBackend, DEFAULT_APPLY_TIMEOUT_MS, DEFAULT_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_QUERY_TIMEOUT_MS,
+};
 /// Re-exported because [`PrefixIndexError::Rejected`] carries it, so callers can
 /// match on a rejection without depending on tonic.
 pub use tonic::Code as RpcCode;
