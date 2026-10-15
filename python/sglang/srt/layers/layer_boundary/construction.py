@@ -32,6 +32,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
     CpMoves,
     EdgeContract,
     EntryPath,
+    ExitFacts,
     ProducerReduction,
     StageKind,
     StagePath,
@@ -50,6 +51,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
 )
+from sglang.srt.layers.layer_boundary.residual import takes_pending_update
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.runtime_context import (
     get_forward,
@@ -125,6 +127,7 @@ class StagePlan:
         is_branch=False,
         terminal=False,
         writes_at_handoff=False,
+        row_transport=None,
         finishes_directly=False,
         qkv_latent_func=None,
         fusions=None,
@@ -200,9 +203,15 @@ class StagePlan:
                 returns_over_dp=out.returns_over_dp,
                 writes_at_handoff=writes_at_handoff,
             )
-            self.paths[variant] = msgspec.structs.replace(
-                path, exit=exit_facts(kind, self, variant, path)
+            fixed_exit = (
+                ExitFacts(
+                    writes_residual=path.output.update.applied_at_exit
+                    or writes_at_handoff
+                )
+                if row_transport is not None
+                else exit_facts(kind, self, variant, path)
             )
+            self.paths[variant] = msgspec.structs.replace(path, exit=fixed_exit)
 
     @property
     def incoming_residual_rows(self):
@@ -269,6 +278,7 @@ def _bind_stage(
     *,
     final_read=None,
     capture_preserves_residual=None,
+    pipeline_handoff=False,
     **options,
 ):
     if incoming.consumer != declaration or outgoing.producer != declaration:
@@ -276,7 +286,25 @@ def _bind_stage(
     if incoming.entries.keys() != outgoing.exits.keys():
         raise ValueError("incoming and outgoing batch variants disagree")
     update = declaration.update
-    if declaration.terminal and not (update.is_plain_add or update.applied_at_exit):
+    if pipeline_handoff and not (
+        update.is_plain_add
+        or update.applied_at_exit
+        or (declaration.writes_at_handoff and declaration.row_transport is not None)
+    ):
+        raise NotImplementedError(
+            "pipeline boundaries require a producer-written residual"
+        )
+    if declaration.row_transport is not None and declaration.row_transport.bind is None:
+        raise ValueError("a local stage requires its compute transport")
+    if declaration.sum_impl is not None and declaration.sum_impl.run is None:
+        raise ValueError("a local stage requires its custom sum implementation")
+    if declaration.output_complete and declaration.sum_impl is not None:
+        raise ValueError("compute-completed output cannot also declare a custom sum")
+    if declaration.terminal and not (
+        update.is_plain_add
+        or update.applied_at_exit
+        or takes_pending_update(final_read, update)
+    ):
         # The final read adds the last output into the residual itself, as a
         # plain add, before its norm.
         raise NotImplementedError(
@@ -290,12 +318,17 @@ def _bind_stage(
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
             and not _cp_gathers_over_attn_cp()
+            # CP-TP group sharing is the MoE-CP gather MHC has been run with.
+            and not get_parallel().enable_cp_tp_group_sharing
         ):
             raise NotImplementedError(
                 "an update applied at the stage's exit with a gather over attention CP"
             )
         attn_input_adapter = None
-        if declaration.kind is StageKind.ATTENTION:
+        if (
+            declaration.kind is StageKind.ATTENTION
+            and declaration.row_transport is None
+        ):
             # On an input-scattered batch the step gathers the rows itself for
             # an attention whose QKV hook does not gather them after the
             # projection.
@@ -316,6 +349,7 @@ def _bind_stage(
         is_branch=declaration.prepared_from is not None,
         terminal=declaration.terminal,
         writes_at_handoff=declaration.writes_at_handoff,
+        row_transport=declaration.row_transport,
         attn_tp_gather=declaration.attn_tp_gather,
         # The exit runs its consumer's gather: the next stage's, or the
         # final read's.
