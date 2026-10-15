@@ -812,6 +812,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
         # Native fused checkpoints (MiniMax H3, etc.) store one concatenated 2D
         # lora_B matrix per logical layer; shard each section independently.
+        if B.dim() != 2:
+            raise ValueError(f"Expected a flat 2D lora_B, got shape {tuple(B.shape)}")
         shards: list[torch.Tensor] = []
         row_offset = 0
         for full_size, part_size in zip(
@@ -822,6 +824,10 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             local_end = (tp_rank + 1) * part_size
             shards.append(B[row_offset + local_start : row_offset + local_end, :])
             row_offset += full_size
+        if row_offset != B.shape[0]:
+            raise ValueError(
+                f"output_sizes sum to {row_offset} rows but lora_B has {B.shape[0]}"
+            )
         return torch.cat(shards, dim=0)
 
 
