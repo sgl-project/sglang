@@ -1007,6 +1007,20 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    # Opt-in deterministic HCCL buffer sizing before process-group creation:
+    # explicit env values always win, SGLANG_NPU_AUTOTUNE_DRY_RUN=1 only logs.
+    SGLANG_NPU_AUTO_HCCL_BUFFSIZE = EnvBool(False)
+    SGLANG_NPU_AUTO_DEEPEP_HCCL_BUFFSIZE = EnvBool(False)
+    # Headroom multiplier, rounding quantum and clamps for HCCL_BUFFSIZE.
+    SGLANG_NPU_HCCL_HEADROOM = EnvFloat(1.25)
+    SGLANG_NPU_HCCL_QUANTUM_MB = EnvInt(32)
+    SGLANG_NPU_HCCL_MIN_MB = EnvInt(64)
+    SGLANG_NPU_HCCL_MAX_MB = EnvInt(1024)
+    # Rounding and clamps for the documented DeepEP normal-mode minimum.
+    SGLANG_NPU_DEEPEP_HCCL_QUANTUM_MB = EnvInt(32)
+    SGLANG_NPU_DEEPEP_HCCL_MIN_MB = EnvInt(232)
+    SGLANG_NPU_DEEPEP_HCCL_MAX_MB = EnvInt(4096)
+    SGLANG_NPU_AUTOTUNE_DRY_RUN = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
