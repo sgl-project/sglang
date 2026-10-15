@@ -135,9 +135,9 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
     isa = device_isa()
     archs = hf_config.architectures
     spec, why = find_spec(backend=backend, architectures=archs, isa=isa)
-    observed = "_mono_copies" in model.__dict__
+    is_load_observed = "_mono_copies" in model.__dict__
     copies = model.__dict__.pop("_mono_copies", {})
-    # Ranks branch together; one that skipped the collectives below would hang its peers.
+    # Ranks branch together; one skipping the collectives below would hang its peers.
     lookups = _gather_tp(
         (
             spec is not None,
@@ -146,14 +146,14 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
             None if spec is None else (spec.name, spec.api),
         )
     )
-    if not any(registered for _, registered, _, _ in lookups):
+    if not any(is_registered for _, is_registered, _, _ in lookups):
         # A draft model may have no registered spec.
         logger.info("monokernel: %s: the normal forward", why)
         return
     reasons = [
         f"rank {rank}: {reason}"
-        for rank, (found, _, reason, _) in enumerate(lookups)
-        if not found
+        for rank, (is_found, _, reason, _) in enumerate(lookups)
+        if not is_found
     ]
     if reasons:
         raise ValueError(f"--monokernel-backend {backend}: " + "; ".join(reasons))
@@ -167,7 +167,7 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
         )
 
     reasons = list(spec.model_disable_reasons(model, hf_config, copies))
-    if spec.load_tensor is not None and not observed:
+    if spec.load_tensor is not None and not is_load_observed:
         # e.g. the layered, dummy, sharded-state and remote loaders
         reasons.append(
             f"{spec.name} keeps weight copies at load, and this load path does not "
@@ -192,16 +192,20 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
         tokens = spec.tokens_per_request(model)
     else:
         tokens = _tokens_per_request()
-    keys = _capture_keys(tokens)
-    rows = {k.rows for k in keys}
+    capture_keys = _capture_keys(tokens)
+    capture_rows = {k.rows for k in capture_keys}
     # Eager execution can use every supported width.
     widths = tuple(
-        w for w in spec.widths(isa) if w % tokens == 0 and (not keys or w in rows)
+        w
+        for w in spec.widths(isa)
+        if w % tokens == 0 and (not capture_keys or w in capture_rows)
     )
     served = _served_keys(widths=widths, tokens=tokens)
     # Different routes would leave ranks waiting in incompatible collectives.
     if any(other != served for other in _gather_tp(served)):
-        raise RuntimeError("monokernel: the ranks route different graph keys")
+        raise RuntimeError(
+            f"--monokernel-backend {backend}: the ranks route different graph keys"
+        )
     if not served:
         raise ValueError(
             f"--monokernel-backend {backend}: {spec.name} has no width for this "
@@ -233,7 +237,7 @@ def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) ->
         build_context.deadline_s,
         _format_weight_copies(copies),
     )
-    if keys:
+    if capture_keys:
         capture_tail_hooks.append(
             _CaptureCheck(spec=spec, backend=backend, isa=isa, served=served)
         )
@@ -258,15 +262,15 @@ class _CaptureCheck:
     def __init__(self, *, spec: MonoSpec, backend: str, isa: str, served: frozenset):
         self.spec, self.backend, self.isa, self.served = spec, backend, isa, served
         self.captured: dict[int, Optional[ShapeKey]] = {}
-        self.done = False
+        self.is_done = False
 
     def __call__(self, runner, out, forward_batch, num_tokens) -> None:
-        if self.done or not torch.cuda.is_current_stream_capturing():
+        if self.is_done or not torch.cuda.is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
         self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
         if not set(runner.capture_bs) <= set(self.captured):
             return
-        self.done = True
+        self.is_done = True
         attention = runner.model_runner.decode_attention_backend_str
         allowed = self.spec.requires.attention_backends
         if allowed and attention not in allowed:
@@ -330,6 +334,7 @@ def _install_forward(
     # Graph runners inspect the original parameters to select forward arguments.
     @functools.wraps(original)
     def forward(*args, **kwargs):
+        # model forwards take (input_ids, positions, forward_batch, ...)
         batch = kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         key = shape_key(batch)
         if key not in served:

@@ -45,7 +45,7 @@ def _provided(path: Path) -> frozenset:
 
 
 def _declared(path: Path) -> dict:
-    """The module's ``SGLANG_READS``, or {} without one."""
+    """The module's SGLANG_READS, or {} without one."""
     for node in _tree(path).body:
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == "SGLANG_READS" for t in node.targets

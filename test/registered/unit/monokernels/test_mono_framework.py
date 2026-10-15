@@ -113,8 +113,8 @@ def batch(mode, bs, rows):
 
 
 def install(*, archs, lookups=None):
-    """``install_monokernel_forward`` on an ``Lm``, as rank 0 of two whose gathered
-    lookups are ``lookups``, or as the only rank."""
+    """install_monokernel_forward on an Lm, as rank 0 of two whose gathered lookups
+    are lookups, or as the only rank."""
     lm = Lm()
     gather = {"return_value": lookups} if lookups else {"side_effect": lambda x: [x]}
     with (
@@ -144,7 +144,7 @@ class Lm(torch.nn.Module):
 
 
 def switched(tokens=1):
-    """Build a fake model at ``tokens`` per request with fixed routing keys."""
+    """Build a fake model at tokens per request with fixed routing keys."""
     lm, built = Lm(), FakeBuilt()
     served = runtime._served_keys(widths=WIDTHS, tokens=tokens)
     runtime._install_forward(model=lm, built=built, served=served)
@@ -153,9 +153,9 @@ def switched(tokens=1):
 
 class TestMonokernelFramework(CustomTestCase):
     def setUp(self):
-        registered = patch.dict(registry._REGISTRY, clear=True)
-        registered.start()
-        self.addCleanup(registered.stop)
+        registry_patch = patch.dict(registry._REGISTRY, clear=True)
+        registry_patch.start()
+        self.addCleanup(registry_patch.stop)
         registry.register(backend=BACKEND, architecture=ARCH, path=f"{__name__}:SPEC")
 
     def test_find_spec_refuses_with_a_reason(self):
@@ -385,7 +385,7 @@ class TestMonokernelFramework(CustomTestCase):
         with capturing:
             for bs in (2, 4):  # the check waits for every captured size
                 check(runner(capture_bs=[2, 4]), None, batch("decode", bs, bs), bs)
-        self.assertTrue(check.done)
+        self.assertTrue(check.is_done)
         # a step pads up to a captured graph that holds it: only a served key past
         # the largest graph of its mode runs eagerly
         eager = runtime._eager_keys(served=served, captured=check.captured.values())

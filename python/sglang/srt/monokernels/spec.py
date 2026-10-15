@@ -41,7 +41,7 @@ class Feature(enum.Enum):
 
 
 class DeviceLimits(msgspec.Struct, frozen=True):
-    """What a spec's kernels support on one ISA (e.g. ``gfx950``)."""
+    """What a spec's kernels support on one ISA, e.g. gfx950."""
 
     widths: tuple[int, ...]  # step rows, ascending
     tp_sizes: tuple[int, ...]
@@ -59,7 +59,7 @@ class Requirements(msgspec.Struct, frozen=True):
     server_args: Mapping[str, frozenset] = {}
     # an HF config field -> the value the kernels are built for
     hf_config: Mapping[str, Any] = {}
-    # an SGLang environment variable (``envs``) -> its required value
+    # an SGLang environment variable in envs -> its required value
     env: Mapping[str, Any] = {}
 
 
