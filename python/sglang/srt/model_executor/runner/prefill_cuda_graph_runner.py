@@ -2118,9 +2118,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         full_path = self._is_full_backend
 
         def replay_layer_forward(*args, **layer_kwargs):
-            prepared_ids = layer_kwargs.get("input_ids")
-            if prepared_ids is None and args:
-                prepared_ids = args[0]
+            prepared_ids = layer_kwargs.get("input_ids", args[0] if args else None)
             # TODO: Add general multimodal replay tests before enabling for other models.
             if self.is_dsv41_model and prepared_ids is not None:
                 static_forward_batch.input_ids[: prepared_ids.shape[0]].copy_(
