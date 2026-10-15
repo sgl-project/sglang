@@ -365,6 +365,7 @@ class HybridCacheController(BaseHiCacheController):
     @staticmethod
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
+        storage_backend: Optional[str] = None,
     ) -> tuple[dict, int, float, float, bool]:
         extra_config = {}
         if storage_backend_extra_config:
@@ -416,6 +417,12 @@ class HybridCacheController(BaseHiCacheController):
                 "hicache_storage_pass_prefix_keys must be bool, got "
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
+        if storage_backend == "radixshmem" and not hicache_storage_pass_prefix_keys:
+            logger.warning(
+                "radixshmem stores each prefix as one radix path and needs "
+                "hicache_storage_pass_prefix_keys; enabling it."
+            )
+            hicache_storage_pass_prefix_keys = True
 
         return (
             extra_config,

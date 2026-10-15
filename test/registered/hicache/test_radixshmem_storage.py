@@ -102,7 +102,7 @@ class _FakeIndex:
     def insert(self, chain, slots, start, auto_recycle, component):
         if self._hit(chain[:start]) < start:
             self.recycle_slots(slots, component)
-            return SimpleNamespace(error=_InsertError.FULL_PATH_MISSING)
+            return SimpleNamespace(error=_InsertError.OK, unused_slots=list(slots))
         unused = []
         for i in range(start, len(chain)):
             key = tuple(chain[: i + 1].tolist())
@@ -331,10 +331,12 @@ class TestRadixShmemStorage(CustomTestCase):
         self.assertEqual(storage.batch_exists(keys[4:], _info(keys[:4])), 2)
         self.assertEqual(storage.batch_exists(keys[4:], _info(_keys(4, "x"))), 0)
         self.assertEqual(storage.batch_exists(keys, _info([])), 6)
-        # Inserting under a missing prefix is refused, not stored.
         self.assertEqual(
             storage.batch_set_v1(_keys(1, "y"), _indices(1), _info(_keys(2, "z"))),
             [False],
+        )
+        self.assertEqual(
+            storage.batch_set_v1(keys[4:], _indices(2), _info(keys[:4])), [True] * 2
         )
 
     def test_prefix_none_means_root(self):
@@ -464,6 +466,46 @@ class TestRadixShmemStorage(CustomTestCase):
         side.buf.zero_()
         storage.batch_get_v2([transfer], _info([]))
         self.assertTrue(torch.all(side.page(1) == 5))
+
+
+class TestRadixShmemConfig(CustomTestCase):
+    def test_prefix_keys_forced_on(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        parse = HybridCacheController.parse_storage_backend_extra_config
+        self.assertFalse(parse("{}", "mooncake")[4])
+        with self.assertLogs(level="WARNING"):
+            self.assertTrue(parse("{}", "radixshmem")[4])
+        self.assertTrue(
+            parse('{"hicache_storage_pass_prefix_keys": true}', "radixshmem")[4]
+        )
+
+    def test_startup_guard(self):
+        from sglang.srt.arg_groups import hicache_hook
+
+        def check(**kw):
+            cfg = SimpleNamespace(
+                hicache_storage_backend="radixshmem",
+                enable_dsa_cache_layer_split=False,
+                tp_size=8,
+                pp_size=1,
+                attn_dp_size=1,
+                nnodes=1,
+            )
+            for k, v in kw.items():
+                setattr(cfg, k, v)
+            with mock.patch.object(hicache_hook, "resolving_view", lambda _: cfg):
+                hicache_hook.validate_radixshmem_storage(None)
+
+        check()
+        check(nnodes=2, attn_dp_size=2)
+        check(hicache_storage_backend="mooncake", enable_dsa_cache_layer_split=True)
+        with self.assertRaises(ValueError):
+            check(enable_dsa_cache_layer_split=True)
+        with self.assertRaises(ValueError):
+            check(nnodes=2)
 
 
 if __name__ == "__main__":

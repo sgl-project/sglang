@@ -262,6 +262,16 @@ class RadixShmemStorage(HiCacheStorage):
             finalize()
             time.sleep(0.005)
 
+    def _published(self, chain: np.ndarray, slots: np.ndarray, result) -> bool:
+        if result.error != self.insert_ok:
+            return False
+        if len(getattr(result, "unused_slots", ())) < len(slots):
+            return True
+        q = self.index.query(
+            chain, self.full_mask, local_only=True, lock=False, update_meta=False
+        )
+        return int(q.status) == 0 and int(q.common_hit) >= len(chain)
+
     def _allocate(self, n: int) -> Optional[np.ndarray]:
         slots = np.asarray(self.index.allocate_slots(n, self.full), dtype=np.int32)
         if len(slots) == n:
@@ -311,7 +321,7 @@ class RadixShmemStorage(HiCacheStorage):
             return [False] * n
         self._copy(pool.host_pool, host_indices, slots, to_slot=True)
         result = self.index.insert(chain, slots, start, True, component=self.full)
-        ok = result.error == self.insert_ok
+        ok = self._published(chain, slots, result)
         if ok and self.distributed:
             self.index.flush()
         return [ok] * n
@@ -356,13 +366,13 @@ class RadixShmemStorage(HiCacheStorage):
         if slots is None:
             return [False] * n
         self._copy(pool.host_pool, host_indices, slots, to_slot=True)
-        ok = [
-            self.index.insert(
-                self._single(pool, key), slots[i : i + 1], 0, True, component=self.full
-            ).error
-            == self.insert_ok
-            for i, key in enumerate(keys)
-        ]
+        ok = []
+        for i, key in enumerate(keys):
+            chain = self._single(pool, key)
+            result = self.index.insert(
+                chain, slots[i : i + 1], 0, True, component=self.full
+            )
+            ok.append(self._published(chain, slots[i : i + 1], result))
         if any(ok) and self.distributed:
             self.index.flush()
         return ok
