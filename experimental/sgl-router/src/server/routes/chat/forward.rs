@@ -126,7 +126,7 @@ pub(super) async fn forward_request(
         engine_rid.as_deref(),
     )?;
     let (prefill_headers, prefill_body) =
-        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank);
+        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank, None);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -159,7 +159,8 @@ pub(super) async fn forward_request(
                 ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
+            let (decode_headers, decode_body) =
+                with_dp_rank(dp_aware, headers, &body, decode_rank, prefill_rank);
             (
                 decode,
                 decode_headers,
@@ -276,11 +277,13 @@ fn prompt_dp_rank(
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
 /// the body, which `/generate` reads instead, carries it or null to unpin.
+/// Decode's body also names the pinned prefill rank, so decode need not look it up.
 fn with_dp_rank(
     dp_aware: bool,
     mut headers: HeaderMap,
     body: &Bytes,
     rank: Option<u32>,
+    prefill_rank: Option<u32>,
 ) -> (HeaderMap, Bytes) {
     if !dp_aware {
         return (headers, body.clone());
@@ -289,10 +292,11 @@ fn with_dp_rank(
         headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
     }
     let rank = rank.map_or_else(|| "null".to_owned(), |rank| rank.to_string());
-    let fields = [
+    let mut fields = vec![
         ("routed_dp_rank", rank),
         ("data_parallel_rank", "null".into()),
     ];
+    fields.extend(prefill_rank.map(|rank| ("disagg_prefill_dp_rank", rank.to_string())));
     let body = append_fields(body, &fields).unwrap_or_else(|| body.clone());
     (headers, body)
 }
