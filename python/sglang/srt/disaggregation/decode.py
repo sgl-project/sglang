@@ -1752,10 +1752,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     full_kv_indices,
                     page_size,
                 ).astype(np.int32)
-                if self.transfer_backend != TransferBackend.MOONCAKE:
+                nixl_draft_transfer = (
+                    self.transfer_backend == TransferBackend.NIXL
+                    and self.draft_token_to_kv_pool is not None
+                    and not isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and get_parallel().attn_dcp_size == 1
+                )
+                if (
+                    self.transfer_backend != TransferBackend.MOONCAKE
+                    and not nixl_draft_transfer
+                ):
                     raise NotImplementedError(
-                        "HiSparse device-only PD transfer currently requires the "
-                        "Mooncake backend"
+                        "HiSparse device-only PD transfer requires Mooncake, or "
+                        "NIXL with DSA draft KV and DCP1"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
             if device_page_indices is not None:

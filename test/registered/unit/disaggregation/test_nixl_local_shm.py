@@ -9,6 +9,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
+
 from sglang.srt.disaggregation.nixl.local_shm import (
     LocalShmExport,
     LocalShmMapping,
@@ -213,7 +215,11 @@ class TestLocalShm(CustomTestCase):
         manager.is_mla_backend = True
         manager.attn_tp_size = 4
         manager.kv_args = SimpleNamespace(
-            kv_data_ptrs=[10], kv_item_lens=[16], kv_layer_ids=[0], gpu_id=0
+            kv_data_ptrs=[10],
+            kv_item_lens=[16],
+            kv_layer_ids=[0],
+            gpu_id=0,
+            num_draft_entries=0,
         )
         info = SimpleNamespace(
             agent_name="peer",
@@ -226,6 +232,182 @@ class TestLocalShm(CustomTestCase):
             dst_kv_layer_ids=[0],
         )
         return manager, info
+
+    def test_mapping_exports_only_target_with_gpu_draft(self):
+        manager, info = self.mapping_manager()
+        manager.kv_args.num_draft_entries = 1
+        manager.kv_args.kv_data_ptrs += [20]
+        manager.kv_args.kv_item_lens += [32]
+        manager.kv_args.kv_layer_ids += [78]
+        info.dst_kv_mem_kinds += ["VRAM"]
+        info.dst_kv_item_lens += [32]
+        info.dst_kv_layer_ids += [78]
+        module = "sglang.srt.disaggregation.nixl.conn"
+        with (
+            patch(module + ".same_host", return_value=True),
+            patch(module + ".LocalShmMapping") as create,
+        ):
+            self.assertIs(manager._ensure_local_shm_mapping(info), create.return_value)
+            self.assertEqual(create.call_args.args[0]["items"], [16])
+
+    def mixed_manager(self, *, local_shm=True):
+        from sglang.srt.disaggregation.nixl.conn import (
+            NixlKVManager,
+            _KVXferPreparedSegment,
+        )
+
+        manager = NixlKVManager.__new__(NixlKVManager)
+        manager.local_shm_enabled = local_shm
+        manager.agent = Mock()
+        manager.agent.make_prepped_xfer.side_effect = ["gpu-handle", "second-handle"]
+        manager.agent.transfer.return_value = "PROC"
+        manager._num_slots_src = 32
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[100, 200, 300],
+            kv_data_lens=[512, 512, 1024],
+            num_draft_entries=1,
+        )
+        manager.decode_kv_args_table = {
+            "peer": SimpleNamespace(
+                kv_xfer_segments=[
+                    _KVXferPreparedSegment(
+                        0, 2, "src-target", "dst-target", 64, "DRAM"
+                    ),
+                    _KVXferPreparedSegment(2, 3, "src-draft", "dst-draft", 128, "VRAM"),
+                ]
+            )
+        }
+        manager._get_local_shm_peer = Mock(
+            return_value=SimpleNamespace(lock=threading.RLock())
+        )
+        mapping = Mock()
+        mapping.submit.return_value = "cpu-handle"
+        manager._ensure_local_shm_mapping = Mock(return_value=mapping)
+        return manager, mapping
+
+    def test_mixed_target_and_draft_use_independent_pages(self):
+        manager, mapping = self.mixed_manager()
+        handles = list(
+            manager.send_kvcache_mixed(
+                "peer",
+                np.array([3, 1]),
+                np.array([7, 8]),
+                "7_kv_0_1_0",
+                device_kv_indices=np.array([19, 11]),
+            )
+        )
+        self.assertEqual(handles, ["cpu-handle", "gpu-handle"])
+        args = mapping.submit.call_args.args
+        self.assertEqual(args[0], [100, 200])
+        self.assertEqual(args[1], [512, 512])
+        np.testing.assert_array_equal(args[3], [7, 8])
+        args[4]()
+        manager.agent.send_notif.assert_called_once_with("peer", b"7_kv_0_1_0_part_0_2")
+        transfer_args = manager.agent.make_prepped_xfer.call_args.args
+        np.testing.assert_array_equal(transfer_args[2], [3, 1])
+        np.testing.assert_array_equal(transfer_args[4], [19, 11])
+        self.assertEqual(transfer_args[5], b"7_kv_0_1_0_part_1_2")
+
+    def test_mixed_nixl_path_preserves_separate_device_indices(self):
+        manager, mapping = self.mixed_manager(local_shm=False)
+        handles = list(
+            manager.send_kvcache_mixed(
+                "peer",
+                np.array([3]),
+                np.array([7]),
+                "7_kv_0_1_0",
+                device_kv_indices=np.array([19]),
+            )
+        )
+        self.assertEqual(len(handles), 2)
+        mapping.submit.assert_not_called()
+        calls = manager.agent.make_prepped_xfer.call_args_list
+        np.testing.assert_array_equal(calls[0].args[4], [7, 71])
+        np.testing.assert_array_equal(calls[1].args[4], [19])
+
+    def test_mixed_bad_draft_pages_fail_before_target_submission(self):
+        for pages in (np.array([19, 20]), np.array([-1]), np.array([128])):
+            manager, mapping = self.mixed_manager()
+            with self.subTest(pages=pages), self.assertRaises(ValueError):
+                list(
+                    manager.send_kvcache_mixed(
+                        "peer",
+                        np.array([3]),
+                        np.array([7]),
+                        "7_kv_0_1_0",
+                        device_kv_indices=pages,
+                    )
+                )
+            mapping.submit.assert_not_called()
+            manager.agent.transfer.assert_not_called()
+
+    def test_mixed_draft_requires_device_pages(self):
+        manager, mapping = self.mixed_manager()
+        with self.assertRaisesRegex(ValueError, "device destination indices"):
+            list(
+                manager.send_kvcache_mixed(
+                    "peer", np.array([3]), np.array([7]), "7_kv_0_1_0"
+                )
+            )
+        mapping.submit.assert_not_called()
+        manager.agent.transfer.assert_not_called()
+
+    def test_mixed_chunk_waits_for_both_parts_in_either_order(self):
+        from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+
+        for order in ((0, 1), (1, 0)):
+            with self.subTest(order=order):
+                manager = NixlKVManager.__new__(NixlKVManager)
+                manager.transfer_statuses = {
+                    7: SimpleNamespace(
+                        received_kv_parts_per_pp=None, expected_kv_parts_per_pp=None
+                    )
+                }
+                manager._track_kv_arrival = Mock()
+                manager._track_kv_part_arrival(7, 0, True, 0, order[0], 2)
+                manager._track_kv_arrival.assert_not_called()
+                manager._track_kv_part_arrival(7, 0, True, 0, order[1], 2)
+                manager._track_kv_arrival.assert_called_once_with(7, 0, True, 0)
+
+    def test_mixed_submit_failure_retains_all_created_handles(self):
+        manager, _ = self.mixed_manager()
+        manager.agent.transfer.side_effect = RuntimeError("post failed")
+        handles = []
+        with self.assertRaisesRegex(RuntimeError, "post failed"):
+            handles.extend(
+                manager.send_kvcache_mixed(
+                    "peer",
+                    np.array([3]),
+                    np.array([7]),
+                    "7_kv_0_1_0",
+                    device_kv_indices=np.array([19]),
+                )
+            )
+        self.assertEqual(handles, ["cpu-handle", "gpu-handle"])
+
+    def test_device_page_metadata_roundtrip_and_legacy(self):
+        from sglang.srt.disaggregation.nixl.conn import TransferInfo
+
+        host = np.array([7, 8], dtype=np.int32)
+        device = np.array([19, 11], dtype=np.int32)
+        msg = [
+            b"7",
+            b"127.0.0.1",
+            b"30000",
+            b"peer",
+            host.tobytes(),
+            b"0",
+            b"1",
+            b"",
+            b"0",
+            b"0",
+        ]
+        self.assertIsNone(TransferInfo.from_zmq(msg).device_kv_indices)
+        info = TransferInfo.from_zmq(msg + [device.tobytes()])
+        np.testing.assert_array_equal(info.dst_kv_indices, host)
+        np.testing.assert_array_equal(info.device_kv_indices, device)
+        with self.assertRaises(ValueError):
+            TransferInfo.from_zmq(msg + [device[:1].tobytes()])
 
     def test_transient_mapping_failure_recovers_after_backoff(self):
         manager, info = self.mapping_manager()

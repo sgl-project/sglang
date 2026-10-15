@@ -175,6 +175,7 @@ class _KVXferPreparedSegment:
     src_handle: Any
     dst_handle: Any
     dst_num_slots: int
+    dst_mem_kind: str = "VRAM"
 
 
 @dataclasses.dataclass
@@ -191,9 +192,9 @@ class TransferInfo:
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     is_dummy: bool = False
-    # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
-    # end so positional construction in from_zmq() continues to work.
+    # Optional staging field, populated via STAGING_RSP.
     staging: Optional[StagingTransferInfo] = None
+    device_kv_indices: Optional[npt.NDArray[np.int32]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -201,6 +202,16 @@ class TransferInfo:
             unpack_int_lists(msg[7], "i") if len(msg) > 7 and msg[7] != b"" else []
         )
         dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
+        device_kv_indices = (
+            np.frombuffer(msg[10], dtype=np.int32)
+            if len(msg) > 10 and msg[10]
+            else None
+        )
+        if device_kv_indices is not None and (
+            len(device_kv_indices) != len(dst_kv_indices)
+            or np.any(device_kv_indices < 0)
+        ):
+            raise ValueError("Invalid device KV destination page indices")
         decode_prefix_len = (
             int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
         )  # hacky just add it into the message that will be sent
@@ -231,6 +242,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             decode_prefix_len=decode_prefix_len,
             is_dummy=is_dummy,
+            device_kv_indices=device_kv_indices,
         )
 
 
@@ -551,11 +563,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if disaggregation_mode == DisaggregationMode.DECODE:
                 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-                if not isinstance(pool, MLATokenToKVPoolHost) or any(
-                    kind != "DRAM" for kind in args.kv_data_mem_kinds
+                num_target = len(args.kv_data_ptrs) - args.num_draft_entries
+                if (
+                    not isinstance(pool, MLATokenToKVPoolHost)
+                    or num_target <= 0
+                    or args.num_draft_entries < 0
+                    or args.kv_data_mem_kinds
+                    != ["DRAM"] * num_target + ["VRAM"] * args.num_draft_entries
                 ):
                     raise ValueError(
-                        "Local SHM requires a HiSparse MLA host pool without draft KV"
+                        "Local SHM requires a HiSparse MLA host pool with optional GPU draft KV"
                     )
                 export = LocalShmExport(pool)
                 pool.register_host_resource_cleanup(export.close)
@@ -1164,6 +1181,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     src_handle=src_handle,
                     dst_handle=dst_handle,
                     dst_num_slots=dst_num_slots,
+                    dst_mem_kind=seg.dst_mem_kind,
                 )
             )
         peer_info.kv_xfer_segments = prepared_segments
@@ -1562,6 +1580,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                             src_prefill_kv_indices,
                                             chunked_dst_kv_indice,
                                             notif,
+                                            device_kv_indices=(
+                                                req.device_kv_indices[
+                                                    kv_chunk.index_slice
+                                                ]
+                                                if req.device_kv_indices is not None
+                                                else None
+                                            ),
                                         )
                                     )
                             else:
@@ -1787,15 +1812,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             try:
                 if not same_host(decode_kv_args.local_shm):
                     return None
+                num_draft = self.kv_args.num_draft_entries
+                num_target = len(self.kv_args.kv_data_ptrs) - num_draft
                 if (
-                    not (self.is_mla_backend or self.is_hybrid_mla_backend)
+                    num_target <= 0
+                    or num_draft < 0
+                    or not (self.is_mla_backend or self.is_hybrid_mla_backend)
                     or self.attn_tp_size != decode_kv_args.decode_tp_size
                     or decode_kv_args.dst_dcp_size != 1
                     or decode_kv_args.staging_base_ptr
                     or decode_kv_args.dst_kv_mem_kinds
-                    != ["DRAM"] * len(self.kv_args.kv_data_ptrs)
+                    != ["DRAM"] * num_target + ["VRAM"] * num_draft
                     or decode_kv_args.dst_kv_item_lens != self.kv_args.kv_item_lens
-                    or decode_kv_args.local_shm["items"] != self.kv_args.kv_item_lens
+                    or decode_kv_args.local_shm["items"]
+                    != self.kv_args.kv_item_lens[:num_target]
                     or decode_kv_args.dst_kv_layer_ids != self.kv_args.kv_layer_ids
                 ):
                     raise ValueError(
@@ -2254,24 +2284,78 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
         notif: str,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        """Yield submitted handles so a later failure cannot hide in-flight writes."""
         info = self.decode_kv_args_table[peer_name]
         segments = info.kv_xfer_segments
-        assert segments is not None
         if not segments:
             raise RuntimeError(f"Missing NIXL mixed KV transfer plan for {peer_name}")
 
+        if self.kv_args.num_draft_entries and device_kv_indices is None:
+            raise ValueError(
+                "Mixed target/draft KV requires device destination indices"
+            )
+        # Validate every destination before submitting the first component.
+        for seg in segments:
+            pages = (
+                device_kv_indices
+                if seg.dst_mem_kind == "VRAM" and device_kv_indices is not None
+                else dst_kv_indices
+            )
+            if (
+                len(pages) != len(prefill_kv_indices)
+                or np.any(pages < 0)
+                or np.any(pages >= seg.dst_num_slots)
+            ):
+                raise ValueError("Invalid mixed KV destination page indices")
+        if np.any(prefill_kv_indices < 0) or np.any(
+            prefill_kv_indices >= self._num_slots_src
+        ):
+            raise ValueError("Invalid mixed KV source page indices")
+
         num_parts = len(segments)
-        handles = []
         for part_idx, seg in enumerate(segments):
+            part_notif = f"{notif}_part_{part_idx}_{num_parts}"
+            local_handle = None
+            if self.local_shm_enabled and seg.dst_mem_kind == "DRAM":
+                peer = self._get_local_shm_peer(peer_name)
+                with peer.lock:
+                    mapping = self._ensure_local_shm_mapping(info)
+                    if mapping is not None:
+                        num_target = (
+                            len(self.kv_args.kv_data_ptrs)
+                            - self.kv_args.num_draft_entries
+                        )
+                        if seg.start != 0 or seg.end != num_target:
+                            raise ValueError(
+                                "Local SHM requires a contiguous target KV segment"
+                            )
+                        local_handle = mapping.submit(
+                            self.kv_args.kv_data_ptrs[:num_target],
+                            self.kv_args.kv_data_lens[:num_target],
+                            prefill_kv_indices,
+                            dst_kv_indices,
+                            lambda message=part_notif: self.agent.send_notif(
+                                peer_name, message.encode("ascii")
+                            ),
+                        )
+            if local_handle is not None:
+                yield local_handle
+                continue
+
             num_layers = seg.end - seg.start
             src_indices = repeat_indices_over_layers(
                 prefill_kv_indices, num_layers, self._num_slots_src
             )
-            dst_indices = repeat_indices_over_layers(
-                dst_kv_indices, num_layers, seg.dst_num_slots
+            dst_pages = (
+                device_kv_indices
+                if seg.dst_mem_kind == "VRAM" and device_kv_indices is not None
+                else dst_kv_indices
             )
-            part_notif = f"{notif}_part_{part_idx}_{num_parts}"
+            dst_indices = repeat_indices_over_layers(
+                dst_pages, num_layers, seg.dst_num_slots
+            )
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE",
                 seg.src_handle,
@@ -2282,11 +2366,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
+            # Publish the handle before transfer() can fail, so the worker's
+            # exception barrier also observes a partially submitted component.
+            yield xfer_handle
             state = self.agent.transfer(xfer_handle)
             if state == "ERR":
                 raise Exception("KVSender failed to post mixed prepped transfer")
-            handles.append(xfer_handle)
-        return handles
 
     def send_kvcache_slice(
         self,
@@ -3623,6 +3708,7 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -3672,6 +3758,11 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_state_indices,
                             str(decode_prefix_len or 0).encode("ascii"),
                             str(int(is_dummy)).encode("ascii"),
+                            (
+                                device_kv_indices.astype(np.int32, copy=False).tobytes()
+                                if device_kv_indices is not None and not is_dummy
+                                else b""
+                            ),
                         ]
                     )
             except zmq.ZMQError:
