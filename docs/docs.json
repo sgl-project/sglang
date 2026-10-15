@@ -10,6 +10,10 @@
   },
   "redirects": [
     {
+      "source": "/cookbook/autoregressive/Meta/MuseSpark",
+      "destination": "/cookbook/autoregressive/Meta/MuseSparkOpen"
+    },
+    {
       "source": "/docs/references/learn_more",
       "destination": "/"
     },
@@ -1315,6 +1319,7 @@
                   {
                     "group": "Meta",
                     "pages": [
+                      "cookbook/autoregressive/Meta/MuseSparkOpen",
                       "cookbook/autoregressive/Meta/MuseGlimmer",
                       "cookbook/autoregressive/Meta/Llama4",
                       "cookbook/autoregressive/Meta/Llama3.3-70B",
