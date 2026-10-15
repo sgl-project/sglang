@@ -294,12 +294,12 @@ def _h3_runtime_that_must_not_start() -> SGLDiffusionGenerator:
     "key, sgld_options, error",
     [
         # A FastH3 file loaded as base H3 died in the worker on to_gate_compress.
-        ("blocks.0.attn.to_gate_compress.weight", {}, "model_type fast_h3"),
-        # The H3 file loader builds no quant config, so this was silently ignored.
+        ("blocks.0.attn.to_gate_compress.weight", {}, "SGLDNativeModelLoader"),
+        # The single-file loader builds no quant config, so this was silently ignored.
         (
             "blocks.0.attn.to_q.weight",
             {"quantization": "convrot_int8"},
-            "cannot be quantized at load time",
+            "native model directories",
         ),
     ],
 )
@@ -331,16 +331,17 @@ def test_fasth3_runtime_dir_is_checked_before_worker_load(tmp_path) -> None:
     (tmp_path / "transformer").mkdir()
     index = tmp_path / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
     runtime = _h3_runtime_that_must_not_start()
-    options = {"model_type": "fast_h3", "runtime_model_path": str(tmp_path)}
     for dmd, weight_map, message in (
         (None, {}, "no trained DMD rungs"),
         ([999, 500], {"blocks.0.x": "a.safetensors"}, "raw FastH3 download"),
     ):
         meta = dict(release, **({"dmd_denoising_steps": dmd} if dmd else {}))
-        (tmp_path / "model_index.json").write_text(json.dumps({"_minimax_h3": meta}))
+        (tmp_path / "model_index.json").write_text(
+            json.dumps({"_class_name": "FastH3Pipeline", "_minimax_h3": meta})
+        )
         index.write_text(json.dumps({"weight_map": weight_map}))
         with pytest.raises(ValueError, match=message):
-            runtime.load_model(model_path="h3.safetensors", sgld_options=options)
+            runtime.load_model(model_path=str(tmp_path), sgld_options={})
 
 
 @pytest.mark.parametrize(
