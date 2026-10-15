@@ -68,7 +68,9 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
                 assert quick_all_reduce is not None
                 assert not quick_all_reduce.disabled
                 communicator = quick_all_reduce._communicator
-                if backend_name == "bundled":
+                # FP8 requests are served by the bundled INT8 codec.
+                uses_bundled = backend_name == "bundled" or quant_mode == "INT8"
+                if uses_bundled:
                     assert isinstance(communicator, QuickAllReduce)
                     assert communicator.use_fp16_kernels
                 else:
@@ -79,7 +81,7 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
                     # factory/kernel path within FP16 range, while retaining
                     # the full range regression coverage for the bundled
                     # implementation.
-                    backend_cases = cases if backend_name == "bundled" else cases[:2]
+                    backend_cases = cases if uses_bundled else cases[:2]
                     for case_name, value, mixed in backend_cases:
                         inp = torch.full(
                             (numel,), value, dtype=torch.bfloat16, device=device
@@ -108,7 +110,7 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
                                 f"{context} relative L2 error {relative_l2:.6f} "
                                 f"exceeds {relative_l2_limit:.6f}"
                             )
-                        if backend_name == "bundled" and (
+                        if uses_bundled and (
                             quant_mode == "FP" or case_name in ("low", "ordinary")
                         ):
                             torch.testing.assert_close(

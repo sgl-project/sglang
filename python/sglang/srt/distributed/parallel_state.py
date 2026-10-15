@@ -515,7 +515,9 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
+            # QuickReduce codecs are lossy, and whether a message uses one
+            # depends on its size, so deterministic runs must not use it.
+            if is_hip() and not self._deterministic_collectives_enabled():
                 # Prefer AITER QuickReduce when globally enabled and
                 # available; otherwise retain the bundled implementation.
                 # Constructor failures must propagate to prevent ranks from

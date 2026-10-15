@@ -299,24 +299,43 @@ class _QuickAllReduceAdapter:
             close()
 
 
+_QUICK_REDUCE_ENV_ALIASES = {
+    "ROCM_QUICK_REDUCE_QUANTIZATION": "AITER_QUICK_REDUCE_QUANTIZATION",
+    "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": "AITER_QUICK_REDUCE_CAST_BF16_TO_FP16",
+    "ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": "AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB",
+}
+
+# Codecs served by the bundled INT8 codec. AITER has no INT8 codec, and
+# released AITER FP8 returns NaN for near-zero blocks with FP16 kernels.
+_BUNDLED_INT8_CODECS = ("INT8", "FP8")
+
+
 def _configure_aiter_quickreduce_env() -> None:
     """Translate legacy SGLang QuickReduce settings for AITER.
 
     Explicit AITER settings always win. This keeps existing launch scripts
     working while allowing users to migrate one variable at a time.
     """
-    aliases = {
-        "ROCM_QUICK_REDUCE_QUANTIZATION": "AITER_QUICK_REDUCE_QUANTIZATION",
-        "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": ("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16"),
-        "ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": ("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB"),
-    }
-    for legacy_name, aiter_name in aliases.items():
+    for legacy_name, aiter_name in _QUICK_REDUCE_ENV_ALIASES.items():
         if aiter_name in os.environ or legacy_name not in os.environ:
             continue
-        value = os.environ[legacy_name]
-        if legacy_name == "ROCM_QUICK_REDUCE_QUANTIZATION" and value == "INT8":
-            value = "FP8"
-        os.environ[aiter_name] = value
+        os.environ[aiter_name] = os.environ[legacy_name]
+
+
+def _requested_codec() -> Optional[str]:
+    return os.environ.get(
+        "AITER_QUICK_REDUCE_QUANTIZATION",
+        os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION"),
+    )
+
+
+def _configure_bundled_int8_env() -> None:
+    """Select the bundled INT8 codec, keeping explicit AITER size and cast
+    settings unless the matching legacy setting is also given."""
+    os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = "INT8"
+    for legacy_name, aiter_name in _QUICK_REDUCE_ENV_ALIASES.items():
+        if aiter_name in os.environ:
+            os.environ.setdefault(legacy_name, os.environ[aiter_name])
 
 
 def create_quick_allreduce(
@@ -324,16 +343,25 @@ def create_quick_allreduce(
 ) -> Optional[_QuickAllReduceAdapter]:
     """Create the configured QuickReduce communicator.
 
-    AITER is opt-in through ``SGLANG_USE_AITER``. If its Python implementation
-    is not installed, retain the bundled communicator as a compatibility
-    fallback. Constructor failures intentionally propagate: distributed
-    initialization may already have exchanged resources, so silently creating
-    a second communicator is unsafe.
+    AITER is opt-in through ``SGLANG_USE_AITER``. INT8 and FP8 requests run
+    on the bundled INT8 codec, as does a missing AITER installation.
+    Constructor failures intentionally propagate: distributed initialization
+    may already have exchanged resources, so silently creating a second
+    communicator is unsafe.
     """
     if not qr_rocm_arch_available():
         return None
 
     if os.environ.get("SGLANG_USE_AITER", "0").lower() in ("1", "true"):
+        codec = _requested_codec()
+        if codec in _BUNDLED_INT8_CODECS:
+            logger.info(
+                "Using bundled QuickAllReduce INT8 codec for requested %s "
+                "QuickReduce quantization",
+                codec,
+            )
+            _configure_bundled_int8_env()
+            return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
         _configure_aiter_quickreduce_env()
         try:
             from aiter.dist.device_communicators.quick_all_reduce import (
