@@ -813,6 +813,86 @@ jobs:
           test -s "${MAP_FILE}"
           du -h "${MAP_FILE}"
 
+      - name: Generate HTML coverage report
+        # Best-effort add-on: failures here only warn and must never block
+        # the baseline publish steps (Archive/Publish) below.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          # Date tag derivation must match run_tests_with_coverage.sh.
+          if [ -n "${GITHUB_RUN_STARTED_AT:-}" ]; then
+            COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
+            COV_DATE_TAG="${COV_DATE_TAG//-/}"
+          else
+            COV_DATE_TAG="$(date +%Y%m%d)"
+          fi
+          COV_ROOT="${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
+          COVSTUB="${RUN_DIR}/outputs/covstub"
+          # Outside outputs/ so the published baseline tar.gz stays unchanged.
+          REPORT_DIR="${RUN_DIR}/htmlcov"
+
+          # Same skip conditions as map building: no data -> nothing to report.
+          if [ ! -d "${COV_ROOT}" ] \
+            || [ "$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)" -eq 0 ]; then
+            echo "::warning::No coverage data found, skip HTML report"
+            exit 0
+          fi
+
+          if ! (
+            set -e
+            # Alias runner-specific absolute paths onto the covstub copy so
+            # coverage can find the source to render. First entry must be a
+            # real local path (no wildcards).
+            {
+              echo "[run]"
+              echo "branch = True"
+              echo "[paths]"
+              echo "sglang ="
+              echo "    ${COVSTUB}/sglang/"
+              echo "    */python/sglang/"
+            } > /tmp/report-rc
+
+            # --keep preserves the per-test raw coverage files: the test
+            # case map and the published baseline read them directly.
+            COVERAGE_FILE=/tmp/.coverage-all \
+              python3 -m coverage combine --rcfile=/tmp/report-rc --keep \
+              $(find "${COV_ROOT}" -name 'coverage.*' -type f)
+
+            rm -rf "${REPORT_DIR}"
+            COVERAGE_FILE=/tmp/.coverage-all \
+              python3 -m coverage html --rcfile=/tmp/report-rc \
+              --directory="${REPORT_DIR}"
+
+            # Surface the total directly on the run page.
+            # GITHUB_STEP_SUMMARY may be unset on the k8s runner pool.
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### Coverage"
+                echo '```'
+                COVERAGE_FILE=/tmp/.coverage-all \
+                  python3 -m coverage report --rcfile=/tmp/report-rc | tail -n 1
+                echo '```'
+                echo "Full line-by-line report: download the \`coverage-html-report\` artifact and open \`index.html\`."
+              } >> "${GITHUB_STEP_SUMMARY}"
+            fi
+          ); then
+            echo "::warning::HTML coverage report generation failed, continuing"
+            exit 0
+          fi
+
+          echo "HTML coverage report: ${REPORT_DIR}"
+
+      - name: Upload HTML coverage report
+        # Report upload must never block the baseline publish pipeline.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html-report
+          path: /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/htmlcov
+          if-no-files-found: ignore
+
       - name: Archive outputs
         run: |
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
@@ -845,8 +925,16 @@ jobs:
           mv "${RUN_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/outputs.tar.gz"
           mv "${RUN_DIR}/test_case_map.json" "${PUBLISH_DIR}/test_case_map.json"
 
+          # Also keep the HTML report on the shared disk, one tar.gz per run
+          # (packaged to avoid flooding the disk with many small HTML files).
+          # Old copies accumulate; prune manually when needed.
+          if [ -d "${RUN_DIR}/htmlcov" ]; then
+            tar -czf "${PUBLISH_DIR}/htmlcov-${{ github.run_id }}-attempt-${{ github.run_attempt }}.tar.gz" \
+              -C "${RUN_DIR}" htmlcov
+          fi
+
           echo "Published baseline to ${PUBLISH_DIR}"
-          du -h "${PUBLISH_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/test_case_map.json"
+          ls -lh "${PUBLISH_DIR}" | tail -n +2
 
       - name: Clean up per-run directory
         # Skipped on publish failure, keeping RUN_DIR for manual recovery.
