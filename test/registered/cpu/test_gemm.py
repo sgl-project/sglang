@@ -9,6 +9,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import (
     MXFP4QuantizeUtil,
     convert_weight,
+    make_non_contiguous,
     native_w8a8_per_token_matmul,
     parametrize,
     per_token_quant_int8,
@@ -218,6 +219,41 @@ class TestGemm(CustomTestCase):
 
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(M=[1, 7, 64], K=[32, 96, 4096], non_contiguous=[False, True])
+    def test_per_token_quant_fp8(self, M, K, non_contiguous):
+        A = torch.randn(M, K)
+        # a quarter of the values land in the fp8 subnormal range
+        A[:, ::4] *= 1e-4
+        # an all-zero row exercises the eps floor of the scale
+        if M > 1:
+            A[0].zero_()
+        A = A.bfloat16()
+        if non_contiguous:
+            A = make_non_contiguous(A)
+
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        scales = (A.float().abs().amax(dim=1) / fp8_max).clamp_min(
+            torch.finfo(torch.float32).eps
+        )
+        scaled = (A.float() * scales.reciprocal().unsqueeze(1)).clamp(-fp8_max, fp8_max)
+        # the AVX10.2 converter rounds through fp16, which lands one fp8 ulp away
+        # from direct rounding next to a tie - mirror the path the machine dispatches to
+        if torch.ops.sgl_kernel.cpu_has_avx10_2():
+            ref = scaled.half().to(torch.float8_e4m3fn)
+        else:
+            ref = scaled.to(torch.float8_e4m3fn)
+
+        Aq, As = torch.ops.sgl_kernel.per_token_quant_fp8_cpu(A)
+        torch.testing.assert_close(As, scales, atol=0, rtol=0)
+        torch.testing.assert_close(
+            Aq.view(torch.uint8), ref.view(torch.uint8), atol=0, rtol=0
+        )
+
+    def test_per_token_quant_fp8_rejects_k_not_multiple_of_32(self):
+        A = torch.randn(2, 48, dtype=torch.bfloat16)
+        with self.assertRaises(RuntimeError):
+            torch.ops.sgl_kernel.per_token_quant_fp8_cpu(A)
 
     @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
     def test_mxfp4_gemm(self, M, N, K, has_bias):

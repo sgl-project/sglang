@@ -301,6 +301,92 @@ inline void quantize_row_int8<at::BFloat16>(
 }
 #endif
 
+#if defined(CPU_CAPABILITY_AVX512)
+constexpr float kFP8E4M3Max = 448.f;  // torch.finfo(torch.float8_e4m3fn).max
+
+inline bool avx10_2_available() {
+  static const bool available = __builtin_cpu_supports("avx10.2");
+  return available;
+}
+
+// The fp16 hop rounds twice, so an input within half an fp16 ulp of an fp8 tie
+// can land one fp8 ulp away from at::vec::cvtfp32_fp8e4m3
+__attribute__((target("avx10.2"))) inline __m128i cvtfp32_fp8e4m3_avx10_2(__m512 src) {
+  __m256i f16 = _mm512_cvtps_ph(src, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  return _mm256_cvtph_hf8(_mm256_castsi256_ph(f16));
+}
+
+// GCC does not inline an avx10.2 function into a caller without that target,
+// so the whole row loop carries the attribute instead of a call per vector
+__attribute__((target("avx10.2"))) inline void quantize_row_fp8e4m3_avx10_2(
+    at::Float8_e4m3fn* __restrict__ Aq, const at::BFloat16* __restrict__ A, int64_t K, float inv_scale) {
+  const __m512 vd = _mm512_set1_ps(inv_scale);
+  const __m512 vmax = _mm512_set1_ps(kFP8E4M3Max);
+  const __m512 vmin = _mm512_set1_ps(-kFP8E4M3Max);
+
+  // K is 32x, no remainder
+  for (int64_t k = 0; k < K; k += 32) {
+    __m512i va = _mm512_loadu_si512((void*)(A + k));
+    __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 0));
+    __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 1));
+    // max/min return the second operand when either is NaN, which keeps a NaN input NaN
+    va0 = _mm512_min_ps(vmax, _mm512_max_ps(vmin, _mm512_mul_ps(va0, vd)));
+    va1 = _mm512_min_ps(vmax, _mm512_max_ps(vmin, _mm512_mul_ps(va1, vd)));
+    __m128i q0 = cvtfp32_fp8e4m3_avx10_2(va0);
+    __m128i q1 = cvtfp32_fp8e4m3_avx10_2(va1);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(Aq + k), _mm256_set_m128i(q1, q0));
+  }
+}
+
+// quantize one row of bf16 to fp8 e4m3fn with a given scale
+inline void quantize_row_fp8e4m3(
+    at::Float8_e4m3fn* __restrict__ Aq, const at::BFloat16* __restrict__ A, int64_t K, float inv_scale) {
+  if (avx10_2_available()) {
+    quantize_row_fp8e4m3_avx10_2(Aq, A, K, inv_scale);
+    return;
+  }
+
+  const __m512 vd = _mm512_set1_ps(inv_scale);
+  const __m512 vmax = _mm512_set1_ps(kFP8E4M3Max);
+  const __m512 vmin = _mm512_set1_ps(-kFP8E4M3Max);
+
+  // K is 32x, no remainder
+  for (int64_t k = 0; k < K; k += 32) {
+    __m512i va = _mm512_loadu_si512((void*)(A + k));
+    __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 0));
+    __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 1));
+    // max/min return the second operand when either is NaN, which keeps a NaN input NaN
+    va0 = _mm512_min_ps(vmax, _mm512_max_ps(vmin, _mm512_mul_ps(va0, vd)));
+    va1 = _mm512_min_ps(vmax, _mm512_max_ps(vmin, _mm512_mul_ps(va1, vd)));
+    __m128i q0 = at::vec::cvtfp32_fp8e4m3(va0);
+    __m128i q1 = at::vec::cvtfp32_fp8e4m3(va1);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(Aq + k), _mm256_set_m128i(q1, q0));
+  }
+}
+
+// quantize one row of bf16 to fp8 e4m3fn with a dynamic symmetric scale
+inline void
+quantize_row_fp8e4m3(at::Float8_e4m3fn* __restrict__ Aq, float& As, const at::BFloat16* __restrict__ A, int64_t K) {
+  const __m512 signBit = _mm512_set1_ps(-0.0f);
+
+  // K is 32x, no remainder
+  __m512 vamax0 = _mm512_set1_ps(0.f);
+  __m512 vamax1 = _mm512_set1_ps(0.f);
+  for (int64_t k = 0; k < K; k += 32) {
+    __m512i va = _mm512_loadu_si512((void*)(A + k));
+    __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 0));
+    __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 1));
+    vamax0 = _mm512_max_ps(vamax0, _mm512_andnot_ps(signBit, va0));
+    vamax1 = _mm512_max_ps(vamax1, _mm512_andnot_ps(signBit, va1));
+  }
+  const float amax = _mm512_reduce_max_ps(_mm512_max_ps(vamax0, vamax1));
+
+  const float scale = std::max(amax / kFP8E4M3Max, std::numeric_limits<float>::epsilon());
+  As = scale;
+  quantize_row_fp8e4m3(Aq, A, K, 1.f / scale);
+}
+#endif
+
 // transpose utils
 // taken from my PR in ggml: https://github.com/ggml-org/llama.cpp/pull/8998
 #if defined(CPU_CAPABILITY_AVX512)
