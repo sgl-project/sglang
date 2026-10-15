@@ -14,7 +14,9 @@ reuse a slot only after every rank has published the next call, which a rank
 does only after it has finished reading the previous call.
 
 Enabled by SGLANG_Q35MF_EDGE_SHM_SYNC=1 (default off). Groups that span hosts
-keep the stock gloo path.
+keep the stock gloo path unless SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST=1 is also
+set: then each host exchanges through shared memory and only the host leaders
+meet in one small gloo all_gather (HierTagExchange).
 """
 
 from __future__ import annotations
@@ -22,11 +24,13 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import socket
 import time
 from multiprocessing import shared_memory
 from typing import Dict, List, Optional, Sequence
 from unittest.mock import patch
 
+import torch
 import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
@@ -41,19 +45,31 @@ def edge_shm_sync_enabled() -> bool:
     return os.environ.get("SGLANG_Q35MF_EDGE_SHM_SYNC", "0") == "1"
 
 
+def _multihost_enabled() -> bool:
+    return os.environ.get("SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST", "0") == "1"
+
+
 class ShmTagExchange:
-    def __init__(self, group: dist.ProcessGroup, kind: str, width: int = 8):
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        kind: str,
+        width: int = 8,
+        rows: Optional[int] = None,
+    ):
         from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
         self.group = group
         self.world = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
         self.width = width
+        # One row per rank for allgather; publish_rows / read_rows may use any row count.
+        self.rows = self.world if rows is None else rows
         self.seq = 0
         self.timeout_s = float(
             os.environ.get("TORCH_DISTRIBUTED_DEFAULT_TIMEOUT", "1800")
         )
-        nbytes = 2 * self.world * width * 8
+        nbytes = 2 * self.rows * width * 8
         ranks = dist.get_process_group_ranks(group)
         self._creator = self.rank == 0
         if self._creator:
@@ -70,7 +86,7 @@ class ShmTagExchange:
                 "multiprocessing.resource_tracker.register", lambda *a, **k: None
             ):
                 self.shm = shared_memory.SharedMemory(name=recv[0])
-        self.table = (ctypes.c_int64 * (2 * self.world * width)).from_buffer(
+        self.table = (ctypes.c_int64 * (2 * self.rows * width)).from_buffer(
             self.shm.buf
         )
         dist.barrier(group=group)
@@ -78,20 +94,38 @@ class ShmTagExchange:
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
         """Every rank passes the same number of values, each in [0, 2**40)."""
         n = len(values)
-        assert n <= self.width
+        assert n <= self.width and self.rows == self.world
         self.seq += 1
         tag = self.seq & _TAG_MASK
+        base = (self.seq & 1) * self.rows * self.width
+        self._store(base + self.rank * self.width, values, tag)
+        return self._wait_rows(base, n, tag)
+
+    def publish_rows(self, table: Sequence[Sequence[int]]) -> None:
+        """Single writer: stores every row of this call; the other ranks call read_rows."""
+        self.seq += 1
+        tag = self.seq & _TAG_MASK
+        base = (self.seq & 1) * self.rows * self.width
+        for r, row in enumerate(table):
+            self._store(base + r * self.width, row, tag)
+
+    def read_rows(self, n: int) -> List[List[int]]:
+        self.seq += 1
+        tag = self.seq & _TAG_MASK
+        return self._wait_rows((self.seq & 1) * self.rows * self.width, n, tag)
+
+    def _store(self, start: int, values: Sequence[int], tag: int) -> None:
         tagged = tag << _VAL_BITS
-        base = (self.seq & 1) * self.world * self.width
-        t = self.table
-        mine = base + self.rank * self.width
         for i, v in enumerate(values):
             if not 0 <= v <= _VAL_MASK:
                 raise ValueError(f"shm exchange value out of range: {v}")
-            t[mine + i] = tagged | v
+            self.table[start + i] = tagged | v
+
+    def _wait_rows(self, base: int, n: int, tag: int) -> List[List[int]]:
+        t = self.table
         out: List[List[int]] = []
         deadline = None
-        for r in range(self.world):
+        for r in range(self.rows):
             row = base + r * self.width
             vals = []
             for i in range(n):
@@ -120,14 +154,65 @@ class ShmTagExchange:
             pass
 
 
-_EXCHANGES: Dict[tuple, Optional[ShmTagExchange]] = {}
+class HierTagExchange:
+    """ShmTagExchange.allgather for a group that spans hosts: ranks exchange through
+    shared memory on their host, and only the host leaders run one gloo all_gather."""
+
+    def __init__(self, group: dist.ProcessGroup, kind: str, width: int = 8):
+        ranks = dist.get_process_group_ranks(group)
+        me = dist.get_rank(group)
+        hostnames: List[Optional[str]] = [None] * len(ranks)
+        dist.all_gather_object(hostnames, socket.gethostname(), group=group)
+        hosts = list(dict.fromkeys(hostnames))
+        # Group ranks per host, in group-rank order (new_group keeps that order).
+        self.members = [
+            [i for i, h in enumerate(hostnames) if h == host] for host in hosts
+        ]
+        # new_group is collective over the default group: every rank creates every subgroup.
+        local_groups = [
+            dist.new_group([ranks[i] for i in m], backend="gloo") for m in self.members
+        ]
+        self.leaders = dist.new_group(
+            [ranks[m[0]] for m in self.members], backend="gloo"
+        )
+        host = hosts.index(hostnames[me])
+        self.is_leader = me == self.members[host][0]
+        self.world = len(ranks)
+        self.local_max = max(len(m) for m in self.members)
+        self.local = ShmTagExchange(local_groups[host], kind + "l", width)
+        self.full = ShmTagExchange(
+            local_groups[host], kind + "f", width, rows=self.world
+        )
+
+    def allgather(self, values: Sequence[int]) -> List[List[int]]:
+        n = len(values)
+        rows_here = self.local.allgather(values)
+        if not self.is_leader:
+            return self.full.read_rows(n)
+        flat = torch.zeros(self.local_max * n, dtype=torch.int64)
+        flat[: len(rows_here) * n] = torch.tensor(
+            [v for row in rows_here for v in row], dtype=torch.int64
+        )
+        outs = [torch.empty_like(flat) for _ in self.members]
+        dist.all_gather(outs, flat, group=self.leaders)
+        table: List[List[int]] = [[] for _ in range(self.world)]
+        for m, out in zip(self.members, outs):
+            vals = out.tolist()
+            for j, g in enumerate(m):
+                table[g] = vals[j * n : (j + 1) * n]
+        self.full.publish_rows(table)
+        return table
+
+
+_EXCHANGES: Dict[tuple, object] = {}
 
 
 def get_shm_exchange(
-    group: Optional[dist.ProcessGroup], kind: str
-) -> Optional[ShmTagExchange]:
+    group: Optional[dist.ProcessGroup], kind: str, multihost: bool = False
+):
     """Collective on first call per (group, kind): every rank of the group must call it
-    at the same point. Returns None (stock path) when disabled or the group spans hosts."""
+    at the same point. Returns None (stock path) when disabled, or when the group spans
+    hosts and the caller did not opt in with multihost=True."""
     if group is None or not edge_shm_sync_enabled():
         return None
     key = (id(group), kind)
@@ -144,6 +229,20 @@ def get_shm_exchange(
                     "EDGE shm exchange '%s' enabled for a %d-rank group",
                     kind,
                     dist.get_world_size(group),
+                )
+            elif (
+                multihost
+                and _multihost_enabled()
+                and dist.get_world_size() == dist.get_world_size(group)
+            ):
+                # Only when this group is the whole default group, so the subgroup
+                # creation inside is collective over exactly these ranks.
+                _EXCHANGES[key] = HierTagExchange(group, kind)
+                logger.info(
+                    "EDGE hierarchical exchange '%s' enabled for a %d-rank group on %d hosts",
+                    kind,
+                    dist.get_world_size(group),
+                    len(_EXCHANGES[key].members),
                 )
             else:
                 _EXCHANGES[key] = None

@@ -3356,7 +3356,9 @@ class UnifiedRadixCache(BasePrefixCache):
         group = (
             groups[0] if groups else (self.tp_group if self.tp_world_size > 1 else None)
         )
-        return get_shm_exchange(group, "hicache")
+        # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
+        # the request broadcast stays on gloo there, a one-source broadcast does not gain.
+        return get_shm_exchange(group, "hicache", multihost=True)
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
