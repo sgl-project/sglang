@@ -54,7 +54,7 @@ RUN --mount=type=cache,id=sgl-deep-ep-pip-${CUDA_TAG}-${PYTHON_TAG}-${ARCHITECTU
     "${PYTHON_BIN}" -m pip install --upgrade pip; \
     "${PYTHON_BIN}" -m pip install --force-reinstall \
         "torch==${TORCH_VERSION}" \
-        --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"; \
+        --index-url "https://download.pytorch.org/whl/test/${CUDA_TAG}"; \
     "${PYTHON_BIN}" -m pip install --force-reinstall --no-deps \
         "nvidia-nccl-cu13==${NCCL_VERSION}"; \
     "${PYTHON_BIN}" -m pip install \
