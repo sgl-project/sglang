@@ -4,6 +4,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.request_window_copy import copy_packed_rows
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -135,10 +136,6 @@ def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout
         and src_loc.ndim == dst_loc.ndim == 1
         and src.untyped_storage().data_ptr() != dst.untyped_storage().data_ptr()
     ):
-        from sglang.kernels.ops.attention.dsv4.request_window_copy import (
-            copy_packed_rows,
-        )
-
         copy_packed_rows(src, dst, src_loc, dst_loc, page_size=page_size, layout=layout)
         return
     src_loc, dst_loc = src_loc.long(), dst_loc.long()
