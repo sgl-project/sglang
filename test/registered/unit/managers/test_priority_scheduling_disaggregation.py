@@ -48,7 +48,10 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 from sglang.test.scheduler_request_intake import make_request_intake
-from sglang.test.scheduler_request_lists import make_request_registry
+from sglang.test.scheduler_request_lists import (
+    make_request_registry,
+    make_request_retirer,
+)
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -77,6 +80,9 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             request_retirer=RequestRetirer(
                 kv=SimpleNamespace(tree_cache=tree_cache),
                 beam_coordinator=MagicMock(),
+                hisparse_coordinator=None,
+                decode_offload_manager=None,
+                pending=PendingSteps(),
                 output_streamer=MagicMock(),
                 ipc_channels=ipc_channels,
             ),
@@ -105,6 +111,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req.weight_version_events = []
         req.time_stats = MagicMock()
         req.time_stats.trace_ctx = MagicMock()
+        # At the door a request holds no KV or mamba state.
+        req.kv.holds_kv = req.kv.holds_mamba = False
         return req
 
     def test_prefill_mode_assigns_default_priority_before_bootstrap_queue(self):
@@ -367,9 +375,12 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req.cache_request_handle = object()
         req.kv.holds_kv = True
         req.kv.holds_mamba = False
+        req.session = None
+        req.release_mm_inputs_on_abort = MagicMock()
         cache.finish = MagicMock()
         owner = prefill_owner_shell(
             tree_cache=cache,
+            request_retirer=make_request_retirer(kv=SimpleNamespace(tree_cache=cache)),
             clear_pending_chunk_send=MagicMock(),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
             output_streamer=MagicMock(),
@@ -380,7 +391,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         with (
             envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True),
             patch(
-                "sglang.srt.disaggregation.prefill.release_kv_cache"
+                "sglang.srt.managers.scheduler_components.request_retirer."
+                "release_kv_cache"
             ) as release_kv_cache,
             patch("sglang.srt.disaggregation.prefill.prepare_abort"),
             patch(
@@ -432,7 +444,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         owner.bootstrap_queue.finalize_bootstrap.assert_called_once_with(req)
         owner.checkpoint.assert_called_once_with(req)
 
-    def test_waiting_abort_releases_without_insert(self):
+    def test_waiting_abort_tears_down_the_transfer_only(self):
         owner = prefill_owner_shell(
             tree_cache=MagicMock(),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
@@ -446,14 +458,10 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         owner.kv_senders[req.rid] = sender
 
-        with patch(
-            "sglang.srt.disaggregation.prefill.release_kv_cache"
-        ) as release_kv_cache:
-            owner.release_aborted_waiting_req(req)
+        owner.release_aborted_waiting_req(req)
 
-        release_kv_cache.assert_called_once_with(
-            req, owner.tree_cache, checkpoint=False
-        )
+        # The KV is the retirer's to release (without an insert).
+        owner.tree_cache.assert_not_called()
         sender.abort.assert_called_once()
         self.assertFalse(req.disagg.pending_bootstrap)
         self.assertNotIn(req.rid, owner.kv_senders)
@@ -470,6 +478,9 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             request_retirer=RequestRetirer(
                 kv=kv,
                 beam_coordinator=MagicMock(),
+                hisparse_coordinator=None,
+                decode_offload_manager=None,
+                pending=PendingSteps(),
                 output_streamer=MagicMock(),
                 ipc_channels=ipc_channels,
             ),
@@ -483,7 +494,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 "sglang.srt.managers.scheduler_components.request_retirer.get_serving"
             ) as get_serving,
             patch(
-                "sglang.srt.managers.scheduler_components.request_registry.release_kv_cache"
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
             ) as release,
         ):
             get_serving.return_value.weight_version = None
@@ -491,7 +502,8 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
         disagg_prefill.release_aborted_waiting_req.assert_called_once()
         kv.tree_cache.finish.assert_called_once()
-        release.assert_not_called()
+        (req,) = release.call_args.args[:1]
+        release.assert_called_once_with(req, kv.tree_cache, checkpoint=False)
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):
@@ -525,6 +537,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.request_retirer = MagicMock()
         queue.pp_size = 1
         queue.queue = list(decode_reqs)
         queue.pending_reqs = []
@@ -964,8 +977,6 @@ class TestDecodeAdmission(unittest.TestCase):
             max_running_requests=1,
             future_map=MagicMock(),
             policy=MagicMock(),
-            schedule_stream=MagicMock(),
-            forward_stream=MagicMock(),
             ngram_embedding_manager=MagicMock(),
             output_streamer=MagicMock(),
             device="cpu",
@@ -1035,7 +1046,9 @@ class TestDecodeAdmission(unittest.TestCase):
         self.assertEqual(scheduler.lists.decoding, [running, kept])
         self.assertEqual(owner.ready, [])
 
-    def test_overlap_waits_for_forward_before_seeding_admitted_reqs(self):
+    def test_overlap_seeds_admitted_reqs_without_waiting_on_the_forward(self):
+        # Their rows came from the pools, which get a released row back only
+        # at the commit of the last pending step that writes it.
         scheduler = self._new_scheduler(enable_overlap=True)
         req = MagicMock(
             rid="request",
@@ -1054,9 +1067,6 @@ class TestDecodeAdmission(unittest.TestCase):
 
         owner = scheduler.disagg_decode
         call_order = []
-        owner.schedule_stream.wait_stream.side_effect = lambda _: call_order.append(
-            "wait"
-        )
         owner.future_map.stash.side_effect = lambda *_: call_order.append("seed")
 
         with (
@@ -1067,8 +1077,7 @@ class TestDecodeAdmission(unittest.TestCase):
         ):
             owner.commit_prefill_handoff([req])
 
-        owner.schedule_stream.wait_stream.assert_called_once_with(owner.forward_stream)
-        self.assertEqual(call_order, ["wait", "seed"])
+        self.assertEqual(call_order, ["seed"])
         self.assertEqual(req.already_computed, 3)
         owner.penalty_store.alloc.assert_called_once_with(req)
         owner.output_streamer.stream_output.assert_called_once_with([req], False)

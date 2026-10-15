@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Deque,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -38,18 +40,21 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.request_lists import CoreLists
+    from sglang.srt.managers.request_lists import CoreLists, RequestList
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler_components.engine_state import (
         EngineFlags,
         LaunchCounters,
     )
+    from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 
 
 logger = logging.getLogger(__name__)
 
 # Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+# Read once: the check runs after every host commit.
+CHECK_REQUEST_LISTS = envs.SGLANG_CHECK_REQUEST_LIST_INVARIANTS.get()
 
 
 @dataclass(kw_only=True, slots=True)
@@ -68,6 +73,8 @@ class SchedulerInvariantChecker:
     counters: LaunchCounters
     # The decoding and the chunked request own their KV rows.
     core_lists: CoreLists
+    # Released requests' rows held for a pending step's commit.
+    pending: PendingSteps
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
@@ -301,6 +308,12 @@ class SchedulerInvariantChecker:
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
 
+        for held in self.pending.held():
+            kv = dataclasses.replace(held.kv, cache_protected_len=held.held_from)
+            full_uncached += kv_private_tokens(kv, self.page_size)
+            if self.is_hybrid_swa:
+                swa_uncached += kv_private_swa_tokens(kv, self.page_size)
+
         return full_uncached, swa_uncached
 
     @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
@@ -340,6 +353,19 @@ class SchedulerInvariantChecker:
 
         if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
             self._check_kv_page_invariants()
+
+    @staticmethod
+    def check_no_finished_reqs(lists: Dict[str, RequestList]) -> None:
+        """After a host commit no request list holds a finished request: the
+        commit moves each one out, except to a releasing list, which holds it
+        until its KV is released."""
+        for entry in lists.values():
+            if entry.releasing:
+                continue
+            finished = [req.rid for req in entry.reqs if req.finished()]
+            assert not finished, (
+                f"Finished requests left in the {entry.name!r} list: {finished}"
+            )
 
     def _check_kv_page_invariants(self):
         """committed<=allocated for every req/slot, and no double free:

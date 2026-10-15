@@ -19,6 +19,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -35,15 +36,16 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
     metrics_sink = Mock()
     metrics_sink.num_generated_tokens = 0
     metrics_sink.forward_ct_decode = 0
+    kv = SimpleNamespace(
+        token_to_kv_pool_allocator=Mock(),
+        tree_cache=None,
+        req_to_token_pool=None,
+    )
     return SchedulerBatchResultProcessor(
         is_generation=True,
         enable_overlap=False,
         model_config=SimpleNamespace(think_end_ids=None),
-        kv=SimpleNamespace(
-            token_to_kv_pool_allocator=Mock(),
-            tree_cache=None,
-            req_to_token_pool=None,
-        ),
+        kv=kv,
         services=SimpleNamespace(
             metrics_sink=metrics_sink,
             output_streamer=Mock(),
@@ -56,6 +58,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         logprob_result_processor=None,
         beam_coordinator=Mock(),
         pending=PendingSteps(),
+        request_retirer=make_request_retirer(kv=kv),
     )
 
 
@@ -363,7 +366,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             next_token_ids=torch.tensor([8]),
         )
         with patch(
-            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor.process_batch_result_decode(batch, result)
 

@@ -426,7 +426,7 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
 class TestLoadBackAdmission(_UnifiedHiCacheCase):
     """PrefillAdder load-back admission over the real cache and shared budget."""
 
-    def _adder(self, num_mixed_decode_tokens: int = 0):
+    def _adder(self, mixed_decode_kv_tokens: int = 0):
         return PrefillAdder(
             page_size=PAGE,
             tree_cache=self.cache,
@@ -435,8 +435,8 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
             new_token_ratio=1.0,
             rem_input_tokens=10_000,
             rem_chunk_tokens=None,
-            num_mixed_decode_tokens=num_mixed_decode_tokens,
             priority_scheduling_preemption_threshold=0,
+            mixed_decode_kv_tokens=mixed_decode_kv_tokens,
         )
 
     def _request(self, tokens):
@@ -553,7 +553,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         moves = []
         _record_moves(self.allocator, moves)
 
-        verdict = self._adder(num_mixed_decode_tokens=decode).add_one_req(
+        verdict = self._adder(mixed_decode_kv_tokens=decode).add_one_req(
             req, has_chunked_req=False, truncation_align_size=None
         )
 

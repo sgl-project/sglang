@@ -8,7 +8,6 @@ import torch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     MetricsSink,
 )
-from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
 from sglang.srt.managers.scheduler_components.step_counters import StepCounters
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -72,7 +71,6 @@ class TestUnoTokenAccounting(CustomTestCase):
             PendingStep(
                 step=batch,
                 result=self.result,
-                slot=ScheduleSlot(),
                 launch_ts=10.001,
                 after_idle_gap=False,
             )

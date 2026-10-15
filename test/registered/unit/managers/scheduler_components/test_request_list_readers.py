@@ -121,6 +121,11 @@ _LOOP_SCHEDULING = {
     # Prefill admission, decode selection and retraction.
     (
         "managers/scheduler_components/step_planner.py",
+        "StepPlanner.admission_skip_reason",
+    ),
+    ("managers/scheduler_components/step_planner.py", "StepPlanner._room_for_one"),
+    (
+        "managers/scheduler_components/step_planner.py",
         "StepPlanner._get_new_batch_prefill_raw",
     ),
     (
@@ -145,7 +150,7 @@ _DIRECT_READS = {
     # Admission budget: the rows the decoding beam groups still claim.
     (
         "beam_search/coordinator.py",
-        "BeamCoordinator.get_num_allocatable_reqs",
+        "BeamCoordinator.row_budget",
         "CoreLists.decoding",
     ): 1,
     # The PD+PP ring's drain gate before on_idle checks its own subset of the

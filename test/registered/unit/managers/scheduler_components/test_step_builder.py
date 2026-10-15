@@ -1,5 +1,5 @@
 """StepBuilder.build_decode_step reuses the previous decode step's rows only
-while its requests keep their slots and penalty rows."""
+while its requests keep their slots."""
 
 import unittest
 from types import SimpleNamespace
@@ -28,7 +28,7 @@ def _new_step_builder() -> StepBuilder:
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             tree_cache=None,
-            penalty_store=PenaltyStore(8, "cpu"),
+            penalty_store=PenaltyStore(8, 8, "cpu"),
         ),
         future_map=None,
         counters=LaunchCounters(),
@@ -38,7 +38,9 @@ def _new_step_builder() -> StepBuilder:
         spec_algorithm=SpeculativeAlgorithm.NONE,
         device="cpu",
     )
-    builder.build_sampling_info = MagicMock(side_effect=lambda reqs: object())
+    builder.build_sampling_info = MagicMock(
+        side_effect=lambda reqs, req_pool_indices: object()
+    )
     builder.new_decode_step = MagicMock(
         side_effect=lambda reqs, indices: SimpleNamespace(
             slots=indices[1].tolist(), sampling_info=None
@@ -84,26 +86,6 @@ class TestDecodeRowsReuse(CustomTestCase):
         step = builder.build_decode_step([req])
 
         self.assertEqual(step.slots, [4])
-        self.assertIsNot(step.sampling_info, first.sampling_info)
-
-    def test_readmitted_request_in_the_same_slot_with_a_new_penalty_row(self):
-        builder = _new_step_builder()
-        store = builder.penalty_store
-        req_a = _make_req("a", 1, frequency_penalty=0.5)
-        req_b = _make_req("b", 2, frequency_penalty=0.5)
-        store.alloc(req_a)
-        store.alloc(req_b)
-        first = builder.build_decode_step([req_a])
-
-        # Both are retracted, and req_a comes back to slot 1 but takes the row
-        # req_b freed last.
-        store.free(1)
-        store.free(2)
-        store.alloc(req_a)
-        self.assertNotEqual(store.row_of_slot[1], 0)
-        step = builder.build_decode_step([req_a])
-
-        self.assertEqual(step.slots, [1])
         self.assertIsNot(step.sampling_info, first.sampling_info)
 
 

@@ -76,7 +76,7 @@ class TestDisaggPrefillLists(CustomTestCase):
             attn_cp_cpu_group=None,
             attn_tp_cpu_group=None,
         )
-        for target in ("release_kv_cache", "checkpoint_kv_cache"):
+        for target in ("checkpoint_kv_cache",):
             patcher = patch(f"{PREFILL_MODULE}.{target}")
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -153,7 +153,7 @@ class TestDisaggPrefillLists(CustomTestCase):
 
         bootstrap.abort(AbortReq(rid="r"))
 
-        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
+        owner.request_retirer.abort_queued_attempt.assert_called_once_with(req)
         owner.kv_senders["r"].abort.assert_called_once_with()
         owner.kv_senders["other"].abort.assert_not_called()
 
@@ -275,8 +275,6 @@ class TestDisaggDecodeLists(CustomTestCase):
             core_lists=CoreLists(),
             tree_cache=Mock(),
             request_retirer=Mock(),
-            beam_coordinator=Mock(),
-            batch_result_processor=SimpleNamespace(release_finished_req=Mock()),
         )
 
     def preallocating(self, rid):
@@ -366,7 +364,7 @@ class TestDisaggDecodeLists(CustomTestCase):
         self.abort("held", "r")
 
         self.assertEqual(_names(owner)["held"], ["x"])
-        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
+        owner.request_retirer.retire_aborted.assert_called_once_with(req)
 
     def test_abort_from_transfer_aborts_the_receiver(self):
         owner = self.owner
@@ -387,8 +385,7 @@ class TestDisaggDecodeLists(CustomTestCase):
         self.abort("ready", "r")
 
         self.assertEqual(_names(owner)["ready"], ["x"])
-        owner.request_retirer.release_aborted_request.assert_called_once_with(req)
-        owner.batch_result_processor.release_finished_req.assert_called_once_with(
+        owner.request_retirer.retire_aborted.assert_called_once_with(
             req, checkpoint=True
         )
         self.assertIsNotNone(req.finished_reason)

@@ -66,7 +66,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.step_planner = Mock(spec=StepPlanner)
         s.enable_fpm = False
         self.running_batch = SimpleNamespace(
-            batch_is_full=False, is_prefill_only=False, is_empty=lambda: True
+            is_prefill_only=False, is_empty=lambda: True
         )
 
     def _override_flags(self):

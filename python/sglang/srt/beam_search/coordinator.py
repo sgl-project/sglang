@@ -225,24 +225,34 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         self._num_live_groups += 1
         return None
 
-    def get_num_allocatable_reqs(
-        self,
-        running_bs: int,
-        beam_width: Optional[int] = None,
-    ) -> int:
-        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        available = self.req_to_token_pool.available_size()
+    @staticmethod
+    def num_rows(req: Req) -> int:
+        """The request rows req takes from the free pool once admitted: none
+        for a row it already holds (a continuing chunk, a session borrow),
+        plus one per member of its beam group not yet spawned."""
+        rows = 0 if req.kv.holds_kv else 1
+        group = req.beam_group
+        if group is not None and group.member_rows is None:
+            rows += group.beam_width - 1
+        return rows
 
-        available = max(
-            available - self.pending_member_rows(self.core_lists.decoding),
+    def row_budget(self) -> int:
+        """The request rows admission may still hand out: the free rows minus
+        the rows promised to the members of decoding beam groups."""
+        return max(
+            self.req_to_token_pool.available_size()
+            - self.pending_member_rows(self.core_lists.decoding),
             0,
         )
-        res = min(pp_budget, available)
-        if beam_width is not None:
-            # A beam candidate owns beam_width rows once decoding.
-            res = min(res, available // beam_width)
 
-        return res
+    def has_room(self, num_reqs: int, num_rows: int) -> bool:
+        """Whether num_reqs requests in a micro-batch, num_rows of them new
+        request rows (see num_rows), fit the micro-batch request cap and the
+        row budget."""
+        return (
+            num_reqs <= get_parallel().pp_max_micro_batch_size
+            and num_rows <= self.row_budget()
+        )
 
     def pending_member_rows(self, reqs: List[Req]) -> int:
         """Rows admitted-but-not-yet-spawned groups will claim; the admission
@@ -354,7 +364,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         assert rows is not None, (
             f"Beam member spawn needs {group.beam_width - 1} req-to-token slots "
             f"but only {self.req_to_token_pool.available_size()} are free; the "
-            f"admission gate (get_num_allocatable_reqs) must reserve them."
+            f"admission gate (row_budget) must reserve them."
         )
         device = self.req_to_token_pool.device
         member_rows = torch.tensor(rows, dtype=torch.int64, device=device)

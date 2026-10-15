@@ -13,11 +13,28 @@ from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_registry import (
     RequestRegistry,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def make_request_retirer(**deps) -> RequestRetirer:
+    """A real retirer over a mocked tree cache, with no beam groups, HiSparse
+    or outputs; `deps` replaces any constructor argument."""
+    args = dict(
+        kv=SimpleNamespace(tree_cache=Mock()),
+        beam_coordinator=Mock(),
+        hisparse_coordinator=None,
+        decode_offload_manager=None,
+        pending=PendingSteps(),
+        output_streamer=Mock(),
+        ipc_channels=Mock(),
+    )
+    args.update(deps)
+    return RequestRetirer(**args)
 
 
 def make_request_registry(**deps) -> RequestRegistry:
@@ -27,7 +44,6 @@ def make_request_registry(**deps) -> RequestRegistry:
         core_lists=CoreLists(),
         grammar_manager=SimpleNamespace(grammar_queue=[], abort_requests=Mock()),
         request_retirer=Mock(),
-        beam_coordinator=Mock(),
         ipc_channels=Mock(),
         kv=SimpleNamespace(tree_cache=Mock()),
         mm_receiver=None,
@@ -44,7 +60,6 @@ _SCHEDULER_FIELDS = {
     "core_lists": "lists",
     "grammar_manager": "grammar_manager",
     "request_retirer": "request_retirer",
-    "beam_coordinator": "beam_coordinator",
     "ipc_channels": "ipc_channels",
     "mm_receiver": "mm_receiver",
     "pending": "pending",
@@ -84,6 +99,7 @@ _PLANNER_FIELDS = {
             "beam_coordinator",
             "step_builder",
             "hisparse_coordinator",
+            "request_retirer",
             "metrics_sink",
             "ipc_channels",
             "decode_offload_manager",

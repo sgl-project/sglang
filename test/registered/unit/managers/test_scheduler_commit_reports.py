@@ -42,7 +42,7 @@ def _scheduler(order: Mock, *, mode: str) -> Scheduler:
     s.leave_finished_reqs = order.leave_finished_reqs
     s.tree_cache = Mock()
     s.enable_fpm = False
-    s._maybe_clear_mm_inputs = Mock()
+    s.request_retirer = Mock()
     s.output_streamer = Mock()
     s.scripted_scheduler_hook = None
     return s
@@ -67,7 +67,7 @@ class TestCommitReports(CustomTestCase):
             patch.object(scheduler_mod, "flush_trace_batch"),
             patch.object(scheduler_mod, "commit_step_counters"),
         ):
-            s.process_batch_result(batch, result, "slot")
+            s.process_batch_result(batch, result)
         names = [c[0] for c in order.mock_calls]
         return s, batch, order, names
 

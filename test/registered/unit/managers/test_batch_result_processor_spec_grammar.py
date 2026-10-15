@@ -23,6 +23,7 @@ from sglang.srt.sampling.sampling_params import (
     SamplingParams,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -68,15 +69,16 @@ class _FakeBatch:
 
 
 def _make_processor() -> SchedulerBatchResultProcessor:
+    kv = SimpleNamespace(
+        token_to_kv_pool_allocator=None,
+        tree_cache=None,
+        req_to_token_pool=None,
+    )
     return SchedulerBatchResultProcessor(
         is_generation=True,
         enable_overlap=False,
         model_config=SimpleNamespace(think_end_ids=None),
-        kv=SimpleNamespace(
-            token_to_kv_pool_allocator=None,
-            tree_cache=None,
-            req_to_token_pool=None,
-        ),
+        kv=kv,
         services=SimpleNamespace(
             metrics_sink=SimpleNamespace(),
             output_streamer=SimpleNamespace(),
@@ -89,6 +91,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         beam_coordinator=SimpleNamespace(),
         pending=PendingSteps(),
+        request_retirer=make_request_retirer(kv=kv),
     )
 
 

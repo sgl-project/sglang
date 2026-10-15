@@ -58,10 +58,9 @@ class TestPrefillAdder(CustomTestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_token_allocator = self.create_token_allocator()
-        # Preemption releases a running request through this function.
-        release_patch = patch("sglang.srt.managers.schedule_policy.release_req")
-        self.release_req = release_patch.start()
-        self.addCleanup(release_patch.stop)
+        # Preemption releases a running request through the retirer.
+        self.request_retirer = MagicMock()
+        self.release_req = self.request_retirer.retract
 
     def create_tree_cache(
         self,
@@ -158,6 +157,7 @@ class TestPrefillAdder(CustomTestCase):
             rem_chunk_tokens=None,
             num_mixed_decode_tokens=0,
             priority_scheduling_preemption_threshold=0,
+            request_retirer=self.request_retirer,
         )
         defaults.update(kwargs)
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
@@ -194,6 +194,7 @@ class TestPrefillAdder(CustomTestCase):
             page_size=4,
             rem_chunk_tokens=16,
             num_mixed_decode_tokens=num_mixed_decode_tokens,
+            mixed_decode_kv_tokens=num_mixed_decode_tokens,
             token_to_kv_pool_allocator=allocator,
         )
 
@@ -359,6 +360,22 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.mock_tree_cache.inc_lock_ref.assert_called_once()
         self.assertEqual(adder.can_run_list, [])
+
+    def test_continuation_defers_when_decode_consumes_chunk_budget(self):
+        """Mixed decode rows that spend the chunk budget leave a continuing
+        chunk parked, not sliced to a non-positive length."""
+        self.mock_token_allocator.available_size.return_value = 1000
+        for decode_tokens in (16, 28):
+            with self.subTest(decode_tokens=decode_tokens):
+                adder = self.create_adder(
+                    self.create_running_reqs(),
+                    rem_chunk_tokens=16,
+                    num_mixed_decode_tokens=decode_tokens,
+                )
+                req = self.create_shared_req("continuation")
+                self.assertIs(adder.add_chunked_req(req), req)
+                self.assertEqual(adder.can_run_list, [])
+                self.assertIsNone(req.extend_end)
 
     def test_shared_continuation_defers_when_decode_consumes_chunk_budget(self):
         """Mixed decode must not commit an empty or negatively sliced prompt."""
@@ -711,6 +728,7 @@ class TestPrefillAdder(CustomTestCase):
             rem_input_tokens=200,
             rem_chunk_tokens=64,
             num_mixed_decode_tokens=len(decode_reqs),
+            mixed_decode_kv_tokens=len(decode_reqs),
         )
 
         self.assertEqual(adder.rem_input_tokens, 192)  # 200 - 8
@@ -740,6 +758,7 @@ class TestPrefillAdder(CustomTestCase):
             rem_input_tokens=200,
             rem_chunk_tokens=64,
             num_mixed_decode_tokens=len(remaining_decode_reqs),
+            mixed_decode_kv_tokens=len(remaining_decode_reqs),
         )
 
         self.assertEqual(adder2.rem_input_tokens, 195)  # 200 - 5

@@ -988,8 +988,11 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             request_intake as intake_module,
         )
         from sglang.test.scheduler_request_intake import make_request_intake
+        from sglang.test.scheduler_request_lists import make_request_retirer
 
-        intake = make_request_intake(tokenizer=object())
+        intake = make_request_intake(
+            tokenizer=object(), request_retirer=make_request_retirer()
+        )
         intake._maybe_namespace_elastic_radix_cache = MagicMock()
         intake.add_request_to_queue = MagicMock()
         intake._get_multimodal_inputs = MagicMock(

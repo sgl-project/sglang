@@ -1046,7 +1046,7 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
-        """Free the rows of a request that leaves; release_finished_req calls
+        """Free the rows of a request that leaves; the request retirer calls
         it only while holds_rows(req)."""
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
