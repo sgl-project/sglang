@@ -219,6 +219,20 @@ class NixlEPBuffer:
         state.recovery_connections_ready = False
 
     @classmethod
+    def abort_recovery(cls, operation_id: str, rank_offset: int) -> None:
+        """Fail closed after a recovery warmup failure."""
+        state = cls._state()
+        if state.recovery_operation_id != operation_id:
+            raise RuntimeError(
+                "NIXL recovery abort does not match the pending operation."
+            )
+        state.buffer.disconnect_ranks([rank_offset])
+        state.connected_ep_size = 0
+        state.scale_to = 0
+        state.dispatch_ep_size = 0
+        state.recovery_connections_ready = False
+
+    @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
         new_ranks = list(range(state.connected_ep_size, scale_to))
         cls._connect_ranks(state, new_ranks, tag="update")

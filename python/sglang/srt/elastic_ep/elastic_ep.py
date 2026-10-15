@@ -682,9 +682,7 @@ class ElasticEPStateManager:
         ):
             return False
         if not success:
-            inst.recovery_phase = "failed"
-            inst.recovery_succeeded = False
-            inst.recovery_error = "Replacement-including recovery warmup failed."
+            cls.fail_recovery("Replacement-including recovery warmup failed.")
             return True
         RecoveryLifecycle(inst.recovery_phase).advance("ready", warmup_succeeded=True)
         inst.recovery_phase = "ready"
