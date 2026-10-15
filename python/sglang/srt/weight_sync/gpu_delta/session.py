@@ -201,6 +201,8 @@ class DeltaSession:
     def resume(self, resume: Callable[[int], None], keep_pause: bool = False) -> dict:
         with self._lock:
             session = self._session
+            if session is None or session.state != "APPLIED":
+                raise ValueError("delta resume requires an applied session")
             self.version = session.request["target_version"]
             session.state = "RESUMING"
             resume(self.version)
@@ -424,7 +426,12 @@ class GpuDeltaSchedulerControl:
             elif isinstance(request, delta_io.ResumeGpuDeltaReqInput):
 
                 def resume(version):
-                    self.scheduler.record_weight_version_change(str(version))
+                    # Serving model identity can differ from the delta stream sequence.
+                    self.scheduler.record_weight_version_change(
+                        str(version)
+                        if request.weight_version is None
+                        else request.weight_version
+                    )
                     if not request.keep_pause:
                         self.scheduler.continue_generation(
                             io.ContinueGenerationReqInput(torch_empty_cache=False)

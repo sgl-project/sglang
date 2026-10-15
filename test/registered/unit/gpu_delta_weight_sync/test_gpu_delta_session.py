@@ -452,8 +452,9 @@ def test_clear_surfaces_failed_async_release_before_backend_close(make_session):
 
 @pytest.mark.parametrize("flush_cache", [True, False])
 @pytest.mark.parametrize("keep_pause", [True, False])
+@pytest.mark.parametrize("weight_version", [None, "0", "actor-42"])
 def test_update_owns_pause_fence_retract_and_resume_order(
-    monkeypatch, flush_cache, keep_pause
+    monkeypatch, flush_cache, keep_pause, weight_version
 ):
     from sglang.utils import TypeBasedDispatcher
 
@@ -530,16 +531,31 @@ def test_update_owns_pause_fence_retract_and_resume_order(
         expected = ["fence", "retract"] + (["flush"] if flush_cache else []) + ["apply"]
         assert result.success and events == expected
         result = wrapped(
-            delta_io.ResumeGpuDeltaReqInput(session_id="p", keep_pause=keep_pause)
+            delta_io.ResumeGpuDeltaReqInput(
+                session_id="p", keep_pause=keep_pause, weight_version=weight_version
+            )
         )
         assert result.success and result.participant["state"] == "RESUMED"
-        expected += [("version", "1")] + ([] if keep_pause else ["resume"])
+        expected += [("version", "1" if weight_version is None else weight_version)] + (
+            [] if keep_pause else ["resume"]
+        )
         assert events[: len(expected)] == expected
         assert scheduler._engine_paused is keep_pause
         assert result.participant["generation_paused"] is keep_pause
         timing = result.participant["scheduler_timing"]
         assert (timing["resumed_ns"] is None) is keep_pause
         assert (timing["blocked_s"] is None) is keep_pause
+        repeated = wrapped(
+            delta_io.ResumeGpuDeltaReqInput(
+                session_id="p", weight_version="conflicting-version"
+            )
+        )
+        assert (
+            not repeated.success and "requires an applied session" in repeated.message
+        )
+        assert events[: len(expected)] == expected
+        assert not any(event == ("version", "conflicting-version") for event in events)
+        assert scheduler._engine_paused is keep_pause
         cleared = wrapped(delta_io.ClearGpuDeltaStateReqInput())
         assert cleared.success and cleared.participant["version"] == 1
         assert events[len(expected) :] == ["release", "close"]

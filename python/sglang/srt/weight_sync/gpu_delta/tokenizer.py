@@ -54,6 +54,8 @@ class GpuDeltaTokenizerControl:
                 if result["success"]:
                     self.manager._update_weight_version_if_provided(
                         str(result["participants"][0]["target_version"])
+                        if obj.weight_version is None
+                        else obj.weight_version
                     )
                     if not obj.keep_pause:
                         self.manager.is_pause = False
@@ -128,7 +130,11 @@ class GpuDeltaTokenizerControl:
         if not result["success"]:
             return result
         result = await self.request(
-            ResumeGpuDeltaReqInput(session_id=session_id, keep_pause=was_paused)
+            ResumeGpuDeltaReqInput(
+                session_id=session_id,
+                keep_pause=was_paused,
+                weight_version=obj.weight_version,
+            )
         )
         if not result["success"]:
             return result

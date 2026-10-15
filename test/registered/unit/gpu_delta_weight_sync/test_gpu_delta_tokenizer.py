@@ -54,8 +54,9 @@ def reply(control, obj, state, success=True):
 @pytest.mark.parametrize("resume_success", [True, False])
 @pytest.mark.parametrize("flush_cache", [True, False])
 @pytest.mark.parametrize("abort_all_requests", [True, False])
+@pytest.mark.parametrize("weight_version", [None, "0", "actor-42"])
 def test_only_update_gates_admission_and_successful_resume_releases_it(
-    control, resume_success, flush_cache, abort_all_requests
+    control, resume_success, flush_cache, abort_all_requests, weight_version
 ):
     async def run():
         facade, sent, versions = control
@@ -87,7 +88,15 @@ def test_only_update_gates_admission_and_successful_resume_releases_it(
         reply(facade, update, "APPLIED")
         assert (await task)["success"] and facade.manager.is_pause
         assert cache_clears == (["clear"] if flush_cache else [])
-        resume = io.ResumeGpuDeltaReqInput(session_id="publication-1")
+
+        def record_version(version):
+            assert facade.manager.is_pause
+            versions.append(version)
+
+        facade.manager._update_weight_version_if_provided = record_version
+        resume = io.ResumeGpuDeltaReqInput(
+            session_id="publication-1", weight_version=weight_version
+        )
         task = asyncio.create_task(facade.request(resume))
         await asyncio.sleep(0)
         reply(
@@ -98,7 +107,11 @@ def test_only_update_gates_admission_and_successful_resume_releases_it(
         )
         assert (await task)["success"] is resume_success
         assert facade.manager.is_pause is not resume_success
-        assert versions == (["1"] if resume_success else [])
+        assert versions == (
+            ["1" if weight_version is None else weight_version]
+            if resume_success
+            else []
+        )
 
     asyncio.run(run())
 
@@ -139,6 +152,8 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
 
     import orjson
 
+    weight_version = None if release_state else "actor-42"
+    serving_version = "7" if weight_version is None else weight_version
     manifest = {
         "base_version": 0,
         "target_version": 7,
@@ -200,12 +215,13 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
             elif isinstance(obj, io.ResumeGpuDeltaReqInput):
                 assert facade.manager.is_pause
                 assert obj.keep_pause is (pause_at is not None)
+                assert obj.weight_version == weight_version
                 state, phase = "RESUMED", "resume"
             elif isinstance(obj, io.AbortGpuDeltaReqInput):
                 state, phase = "ABORTED", "abort"
             else:
                 assert facade.manager.is_pause is (pause_at is not None)
-                assert versions == ["7"]
+                assert versions == [serving_version]
                 state, phase = "CLEARED", "clear"
                 if isinstance(obj, io.ReleaseGpuDeltaCacheReqInput):
                     assert obj.owner_rank_ids == ["r0", "r2"]
@@ -227,6 +243,8 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
         facade._request = request
         # Omitting the option preserves the standalone path-only API.
         options = {} if release_state else {"release_state": False}
+        if weight_version is not None:
+            options["weight_version"] = weight_version
         if not flush_cache:
             options["flush_cache"] = False
         if abort_all_requests:
@@ -243,6 +261,7 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
             ["abort"] if abort_all_requests and failure != "prepare" else []
         )
         if failure is None:
+            assert versions == [serving_version]
             expected = [
                 io.GetGpuDeltaInfoReqInput,
                 io.PrepareGpuDeltaReqInput,

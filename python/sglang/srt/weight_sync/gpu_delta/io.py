@@ -10,6 +10,7 @@ class UpdateWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
     release_state: bool = True
     flush_cache: bool = True
     abort_all_requests: bool = False
+    weight_version: str | None = None
 
 
 class ClearGpuDeltaStateReqInput(BaseReq, kw_only=True):
@@ -53,6 +54,7 @@ class AbortGpuDeltaReqInput(BaseReq, kw_only=True):
 class ResumeGpuDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
     keep_pause: bool = False
+    weight_version: str | None = None
 
 
 class GpuDeltaReqOutput(BaseReq, kw_only=True):

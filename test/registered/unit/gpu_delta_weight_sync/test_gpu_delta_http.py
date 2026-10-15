@@ -80,6 +80,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
                 "release_state": False,
                 "flush_cache": False,
                 "abort_all_requests": True,
+                "weight_version": "actor-42",
             },
         ),
         ("clear_gpu_delta_state", ClearGpuDeltaStateReqInput, {}),
@@ -107,7 +108,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         (
             "resume_gpu_delta",
             ResumeGpuDeltaReqInput,
-            session | {"keep_pause": True},
+            session | {"keep_pause": True, "weight_version": "actor-42"},
         ),
         ("abort_gpu_delta", AbortGpuDeltaReqInput, session),
     ]
