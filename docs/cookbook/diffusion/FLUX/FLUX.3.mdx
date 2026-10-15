@@ -15,11 +15,10 @@ import { config } from "/src/snippets/configs/black-forest-labs/flux3.jsx";
 ## 1. Quick start
 
 Use a [SGLang Diffusion Docker environment](/docs/sglang-diffusion/installation).
-Until your image contains this integration and its serving fixes, install the
-follow-up PR (which includes the model-support PR) inside it:
+For the latest model support, install from `main` inside the container:
 
 ```bash
-pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@refs/pull/44493/head#subdirectory=python'
+pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@main#subdirectory=python'
 ```
 
 <Deployment config={config} />
