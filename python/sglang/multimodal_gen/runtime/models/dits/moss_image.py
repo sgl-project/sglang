@@ -117,11 +117,21 @@ def validate_skip_layers(skip_layers, num_layers):
     return skip_layers
 
 
+class _ConditioningGroup(msgspec.Struct, frozen=True):
+    indices: torch.Tensor | None
+    text: torch.Tensor
+    rope: tuple[torch.Tensor, torch.Tensor]
+
+
 class MOSSImageConditioning(msgspec.Struct, frozen=True):
     """Refined text and RoPE owned by one request and one CFG branch."""
 
     spatial_shape: tuple[int, int]
-    samples: tuple[tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]], ...]
+    groups: tuple[_ConditioningGroup, ...]
+
+    @property
+    def batch_size(self):
+        return sum(group.text.shape[0] for group in self.groups)
 
 
 class _RMSNorm(nn.Module):
@@ -465,6 +475,9 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         rope = _prepare_rope(
             self.rope(height, width, context.shape[1], context.device).to(dtype)
         )
+        rope = tuple(
+            part.expand(context.shape[0], -1, -1).contiguous() for part in rope
+        )
         text = self.text_embedder(
             context, tuple(part[:, height * width :] for part in rope)
         )
@@ -475,12 +488,29 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
     ):
         # Neither the text refinement blocks nor RoPE depend on the timestep.
         contexts = self._unpad_text(encoder_hidden_states, encoder_attention_mask)
+        by_length = {}
+        for index, context in enumerate(contexts):
+            by_length.setdefault(context.shape[1], []).append(index)
+        groups = []
+        for indices in by_length.values():
+            context = torch.cat([contexts[index] for index in indices])
+            text, rope = self._prepare_sample_conditioning(
+                context, height, width, dtype
+            )
+            groups.append(
+                _ConditioningGroup(
+                    indices=(
+                        torch.as_tensor(indices, device=context.device)
+                        if len(by_length) > 1
+                        else None
+                    ),
+                    text=text,
+                    rope=rope,
+                )
+            )
         return MOSSImageConditioning(
             spatial_shape=(height, width),
-            samples=tuple(
-                self._prepare_sample_conditioning(context, height, width, dtype)
-                for context in contexts
-            ),
+            groups=tuple(groups),
         )
 
     def forward(
@@ -501,11 +531,9 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         batch, _, height, width = hidden_states.shape
         if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[0] != batch:
             raise ValueError("encoder_hidden_states must be [B, S, text_dim].")
-        if prepared_conditioning is None:
-            contexts = self._unpad_text(encoder_hidden_states, encoder_attention_mask)
-        elif (
+        if prepared_conditioning is not None and (
             prepared_conditioning.spatial_shape != (height, width)
-            or len(prepared_conditioning.samples) != batch
+            or prepared_conditioning.batch_size != batch
         ):
             raise ValueError(
                 "Prepared conditioning must match the latent batch and size."
@@ -530,42 +558,57 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         head = self.video_head_modulation(
             time.to(self.video_head_modulation.weight.dtype)
         ).view(batch, 2, -1)
-        outputs = []
-        for index in range(batch):
-            video = hidden_states[index : index + 1].flatten(2).transpose(1, 2)
-            video = self.video_embedder(
-                video.to(self.video_embedder.weight.dtype).contiguous()
+        video = self.video_embedder(
+            hidden_states.flatten(2)
+            .transpose(1, 2)
+            .to(self.video_embedder.weight.dtype)
+            .contiguous()
+        )
+        if prepared_conditioning is None:
+            prepared_conditioning = self.prepare_conditioning(
+                encoder_hidden_states,
+                encoder_attention_mask,
+                height,
+                width,
+                video.dtype,
             )
-            if prepared_conditioning is None:
-                # Match the activation dtype under fp32 weights + autocast.
-                text, rope = self._prepare_sample_conditioning(
-                    contexts[index], height, width, video.dtype
-                )
+        outputs = (
+            torch.empty_like(hidden_states, dtype=torch.float32)
+            if len(prepared_conditioning.groups) > 1
+            else None
+        )
+        for group in prepared_conditioning.groups:
+            indices = group.indices
+            if indices is None:
+                group_video, group_mod, group_head = video, mod, head
             else:
-                text, rope = prepared_conditioning.samples[index]
-            x = torch.cat((video, text), 1)
+                group_video, group_mod, group_head = (
+                    tensor.index_select(0, indices) for tensor in (video, mod, head)
+                )
+            x = torch.cat((group_video, group.text), 1)
+            rope = group.rope
             layer_kwargs = {}
             if self._sequence_parallel:
                 x, shard = shard_seq(x)
                 rope = tuple(shard_like(part, shard) for part in rope)
-                layer_kwargs["attn_mask_meta"] = tail_attn_meta(shard, 1, x.device)
+                layer_kwargs["attn_mask_meta"] = tail_attn_meta(
+                    shard, x.shape[0], x.device
+                )
             for layer_index, layer in enumerate(self.layers):
                 if layer_index not in skip_layers:
-                    x = layer(x, rope, mod[index : index + 1], **layer_kwargs)
+                    x = layer(x, rope, group_mod, **layer_kwargs)
             if self._sequence_parallel:
                 x = gather_seq(x, shard.orig_len)
             x = self.final_norm_video(
                 x[:, : height * width].to(self.final_norm_video.weight.dtype)
             )
-            x = (
-                x * (1 + head[index : index + 1, 1, None])
-                + head[index : index + 1, 0, None]
-            )
+            x = x * (1 + group_head[:, 1, None]) + group_head[:, 0, None]
             x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))
-            outputs.append(x.transpose(1, 2).reshape(1, -1, height, width))
-        sample = torch.cat(outputs)
-        # CFG combines predictions in fp32, before the Euler update.
-        return sample.float()
+            sample = x.transpose(1, 2).reshape(x.shape[0], -1, height, width).float()
+            if indices is None:
+                return sample
+            outputs.index_copy_(0, indices, sample)
+        return outputs
 
     def post_load_weights(self):
         self.rope.reset_bands()

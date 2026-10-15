@@ -468,8 +468,8 @@ def test_prepared_conditioning_matches_steps_and_requests(
             prepared = model.prepare_conditioning(text, mask, height, width, dtype)
             saved = [
                 tensor.clone()
-                for item in prepared.samples
-                for tensor in (item[0], *item[1])
+                for group in prepared.groups
+                for tensor in (group.text, *group.rope)
             ]
             for timestep in (938.0, 24.0):
                 latents = torch.randn(2, 8, height, width)
@@ -480,9 +480,44 @@ def test_prepared_conditioning_matches_steps_and_requests(
                     actual = model(latents, timestep, text, mask, prepared)
                 assert torch.equal(actual, expected)
             current = [
-                tensor for item in prepared.samples for tensor in (item[0], *item[1])
+                tensor
+                for group in prepared.groups
+                for tensor in (group.text, *group.rope)
             ]
             assert all(torch.equal(a, b) for a, b in zip(saved, current))
+
+
+@pytest.mark.parametrize("skip", [(), (1,)])
+def test_batch_groups_true_lengths_and_restores_sample_order(small_model, skip):
+    torch.manual_seed(42)
+    x, text = torch.randn(4, 8, 2, 3), torch.randn(4, 5, 32)
+    mask = torch.tensor(
+        [[1, 0, 1, 0, 0], [1, 1, 1, 1, 0], [0, 1, 0, 1, 0], [1, 1, 1, 0, 0]]
+    )
+    times = torch.tensor([1000.0, 630.0, 24.0, 835.0])
+    with torch.no_grad(), set_forward_context(0, None):
+        expected = torch.cat(
+            [
+                small_model(
+                    x[i : i + 1],
+                    times[i],
+                    text[i : i + 1],
+                    mask[i : i + 1],
+                    skip_layers=skip,
+                )
+                for i in range(4)
+            ]
+        )
+        calls = []
+        hook = small_model.layers[0].register_forward_pre_hook(
+            lambda _, args: calls.append(args[0].shape[0])
+        )
+        try:
+            actual = small_model(x, times, text, mask, skip_layers=skip)
+        finally:
+            hook.remove()
+    assert calls == [2, 1, 1]
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize(
