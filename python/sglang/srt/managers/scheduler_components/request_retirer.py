@@ -132,6 +132,19 @@ class RequestRetirer:
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
 
+    def reject_at_door(
+        self,
+        req: Req,
+        error_msg: str,
+        *,
+        status_code: int = HTTPStatus.BAD_REQUEST,
+        err_type: str = "BadRequestError",
+    ) -> None:
+        """A request the intake rejects before it is queued: its media goes
+        now and it is marked aborted; it then runs as a one-token stub whose
+        commit finishes it (the beam commit retires a beam group)."""
+        req.set_finish_with_abort(error_msg, status_code=status_code, err_type=err_type)
+
     def abandon_attempt(self, req: Req, *, release_kv: bool) -> None:
         """End this attempt's cache request; the request stays, in a queue its
         owner drains, or is requeued for another attempt (``release_kv``

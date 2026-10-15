@@ -39,8 +39,9 @@ _ALLOWED = {
         "Req.release_mm_inputs_on_abort",
         "release_features",
     ): 1,
-    # A request rejected at creation drops its media before it is queued; the
-    # stub then finishes through the retirer.
+    # Marks a request aborted while it still runs as a stub (the retirer's door
+    # rejection, the grammar manager, a session); the stub's commit then
+    # retires it.
     (
         "managers/schedule_batch.py",
         "Req.set_finish_with_abort",

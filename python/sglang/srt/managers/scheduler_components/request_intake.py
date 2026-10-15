@@ -637,9 +637,7 @@ class RequestIntake:
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self.add_request_to_queue(req)
+            self._reject(req, error_msg, init_max_new_tokens=True)
             return
 
         if recv_req.pp_prefetch_ticketed is True:
@@ -647,13 +645,13 @@ class RequestIntake:
         self._maybe_namespace_elastic_radix_cache(req)
 
         if mm_input_error is not None:
-            req.set_finish_with_abort(
+            self._reject(
+                req,
                 mm_input_error,
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 err_type="InternalServerError",
+                init_max_new_tokens=True,
             )
-            self.init_req_max_new_tokens(req)
-            self.add_request_to_queue(req)
             return
 
         if self.mode_owners.dllm is not None and (
@@ -676,17 +674,13 @@ class RequestIntake:
                 req, (not get_schedule().disable_overlap_schedule)
             )
             if error_msg is not None:
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self.add_request_to_queue(req)
+                self._reject(req, error_msg, init_max_new_tokens=True)
                 return
 
         if self.spec_algorithm.is_uno():
             error_msg = validate_uno_request(req)
             if error_msg is not None:
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self.add_request_to_queue(req)
+                self._reject(req, error_msg, init_max_new_tokens=True)
                 return
 
         if req.return_sampling_mask:
@@ -736,13 +730,13 @@ class RequestIntake:
             try:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
             except _MultimodalInputProcessingError as error:
-                req.set_finish_with_abort(
+                self._reject(
+                    req,
                     str(error),
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                     err_type="InternalServerError",
+                    init_max_new_tokens=True,
                 )
-                self.init_req_max_new_tokens(req)
-                self.add_request_to_queue(req)
                 return
 
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
@@ -763,14 +757,14 @@ class RequestIntake:
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
+                self._reject(
+                    req,
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
                         f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
+                    ),
+                    init_max_new_tokens=True,
                 )
-                self.init_req_max_new_tokens(req)
-                self.add_request_to_queue(req)
                 return
 
         # initialize before returning
@@ -783,8 +777,7 @@ class RequestIntake:
             get_serving().allow_auto_truncate,
         )
         if error_msg:
-            req.set_finish_with_abort(error_msg)
-            self.add_request_to_queue(req)
+            self._reject(req, error_msg)
             return
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
@@ -809,8 +802,7 @@ class RequestIntake:
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = -1
-            req.set_finish_with_abort(error_msg)
-            self.add_request_to_queue(req)
+            self._reject(req, error_msg)
             return
 
         if recv_req.return_routed_experts:
@@ -830,8 +822,7 @@ class RequestIntake:
 
             if error_msg is not None:
                 req.routed_experts_start_len = 0
-                req.set_finish_with_abort(error_msg)
-                self.add_request_to_queue(req)
+                self._reject(req, error_msg)
                 return
 
         if get_parallel().pp_rank == 0 and getattr(
@@ -967,6 +958,22 @@ class RequestIntake:
         )
         self._retry_storage_prefetch(req)
         return True
+
+    def _reject(
+        self,
+        req: Req,
+        error_msg: str,
+        *,
+        init_max_new_tokens: bool = False,
+        **abort_kwargs,
+    ) -> None:
+        """Reject a request at the door: it is queued as a one-token stub
+        whose commit finishes it with the abort. ``init_max_new_tokens`` sizes
+        a generate stub the validation rejected before sizing it."""
+        self.request_retirer.reject_at_door(req, error_msg, **abort_kwargs)
+        if init_max_new_tokens:
+            self.init_req_max_new_tokens(req)
+        self.add_request_to_queue(req)
 
     def add_request_to_queue(
         self,
@@ -1119,12 +1126,12 @@ class RequestIntake:
         self._maybe_namespace_elastic_radix_cache(req)
 
         if mm_input_error is not None:
-            req.set_finish_with_abort(
+            self._reject(
+                req,
                 mm_input_error,
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 err_type="InternalServerError",
             )
-            self.add_request_to_queue(req)
             return
 
         # Handle multimodal inputs
@@ -1132,12 +1139,12 @@ class RequestIntake:
             try:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
             except _MultimodalInputProcessingError as error:
-                req.set_finish_with_abort(
+                self._reject(
+                    req,
                     str(error),
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                     err_type="InternalServerError",
                 )
-                self.add_request_to_queue(req)
                 return
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             # The `pad_input_ids_func` is model-specific and may be None for
@@ -1156,13 +1163,13 @@ class RequestIntake:
             self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
+                self._reject(
+                    req,
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
                         f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
+                    ),
                 )
-                self.add_request_to_queue(req)
                 return
 
         # Validate prompts length
