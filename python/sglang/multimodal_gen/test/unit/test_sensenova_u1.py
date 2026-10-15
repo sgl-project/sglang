@@ -381,7 +381,7 @@ def test_sensenova_u1_npu_fia_checks_operator_availability(monkeypatch, availabl
     assert npu_fia_available() is available
 
 
-def test_sensenova_u1_npu_rotary_mul_opt_in_uses_half_layout(monkeypatch):
+def test_sensenova_u1_npu_rotary_mul_uses_half_layout(monkeypatch):
     from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
         modeling_qwen3,
     )
@@ -407,8 +407,6 @@ def test_sensenova_u1_npu_rotary_mul_opt_in_uses_half_layout(monkeypatch):
     monkeypatch.setattr(
         modeling_qwen3, "_can_use_sensenova_npu_fused_rope", lambda *_: True
     )
-    monkeypatch.setenv("SGLANG_SENSENOVA_NPU_FUSED_ROPE", "rotary_mul")
-
     actual = modeling_qwen3.apply_rotary_pos_emb(q, k, cos, sin)
     expected = (
         q * cos.unsqueeze(1) + modeling_qwen3.rotate_half(q) * sin.unsqueeze(1),
