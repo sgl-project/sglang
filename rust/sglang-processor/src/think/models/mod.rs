@@ -4,6 +4,7 @@
 mod deepseek_v4;
 mod glm45;
 mod kimi_k3;
+mod qwen3;
 
 pub(crate) use self::kimi_k3::KimiK3Detector;
 use super::ThinkConfig;
@@ -15,6 +16,7 @@ pub(crate) fn think_config(reasoning_parser: &str) -> Option<ThinkConfig> {
         "deepseek-v41" => Some(ThinkConfig::Tags(deepseek_v4::THINK_V41)),
         "glm45" => Some(ThinkConfig::Tags(glm45::THINK)),
         "kimi_k3" => Some(ThinkConfig::KimiK3),
+        "qwen3" => Some(ThinkConfig::Tags(qwen3::THINK)),
         _ => None,
     }
 }
