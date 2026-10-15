@@ -24,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.post_verify_graph import PostVerifyGraph
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
@@ -578,6 +579,7 @@ def run_eagle_verify(
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
+    post_verify_graph: Optional[PostVerifyGraph] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -676,6 +678,35 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+
+    fused = (
+        post_verify_graph.try_run(
+            batch=batch,
+            verify_input=verify_input,
+            logits_output=logits_output,
+            num_draft_tokens=num_draft_tokens,
+            topk=topk,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        if post_verify_graph is not None and uno_target_max_top_k is None
+        else None
+    )
+    if fused is not None:
+        predict, accept_lens, accept_index, new_seq_lens, bonus_tokens, prepared_draft_inputs = fused
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=predict,
+            can_run_cuda_graph=can_run_cuda_graph,
+            speculative_num_draft_tokens=num_draft_tokens,
+            next_draft_input=EagleDraftInput(bonus_tokens=bonus_tokens),
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            new_seq_lens=new_seq_lens,
+            routed_experts_output=forward_batch_output.routed_experts_output,
+            indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
+            prepared_draft_extend_inputs=prepared_draft_inputs,
+        )
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None

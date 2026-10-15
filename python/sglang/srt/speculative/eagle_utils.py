@@ -747,6 +747,7 @@ def eagle_sample(
     *,
     watermark_state: Optional[WatermarkState] = None,
     watermark_full_mask: bool = True,
+    simulated_acc_len: Optional[torch.Tensor] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -763,6 +764,7 @@ def eagle_sample(
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
+        generate_simulated_accept_index_device,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 
@@ -1082,17 +1084,31 @@ def eagle_sample(
                 target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
                     bs, verify_input.draft_token_num
                 )
-        accept_index = generate_simulated_accept_index(
-            accept_index=accept_index,
-            predict=predict,  # mutable
-            num_correct_drafts=num_correct_drafts,  # mutable
-            candidates=candidates,
-            target_predict=target_predict,
-            simulate_acc_len=SIMULATE_ACC_LEN,
-            simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-            bs=bs,
-            spec_steps=verify_input.max_tree_depth - 1,
-        )
+        if simulated_acc_len is not None:
+            # Length already sampled on the host; graph-replayable form.
+            accept_index = generate_simulated_accept_index_device(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
+                candidates=candidates,
+                target_predict=target_predict,
+                bs=bs,
+                spec_steps=verify_input.max_tree_depth - 1,
+                simulate_acc_len=simulated_acc_len,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
+        else:
+            accept_index = generate_simulated_accept_index(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
+                candidates=candidates,
+                target_predict=target_predict,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                bs=bs,
+                spec_steps=verify_input.max_tree_depth - 1,
+            )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the

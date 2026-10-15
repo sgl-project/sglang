@@ -103,6 +103,10 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.post_verify_graph import (
+    PostVerifyGraph,
+    post_verify_graph_enabled,
+)
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -1295,6 +1299,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self._post_verify_graph = (
+            PostVerifyGraph(device=self.device, target_worker=target_worker)
+            if post_verify_graph_enabled() and self._hosts_draft
+            else None
+        )
 
     @property
     def last_shared_read_runner(self):
@@ -1919,4 +1928,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            post_verify_graph=self._post_verify_graph,
         )

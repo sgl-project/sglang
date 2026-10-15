@@ -517,6 +517,45 @@ def generate_simulated_accept_index(
     return sim_accept_index
 
 
+def generate_simulated_accept_index_device(
+    accept_index: torch.Tensor,
+    predict: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    bs: int,
+    spec_steps: int,
+    simulate_acc_len: torch.Tensor,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+) -> torch.Tensor:
+    """generate_simulated_accept_index with the sampled length already on the
+    device (int64 [1]); static shapes, so it can run inside a CUDA graph.
+    Writes the same values as the host-length version for the same length."""
+    width = spec_steps + 1
+    steps = torch.arange(width, device=accept_index.device, dtype=accept_index.dtype)
+    accepted = steps.view(1, width) < simulate_acc_len
+    sim_accept_index = torch.where(
+        accepted,
+        accept_index[:, :1] + steps.view(1, width),
+        torch.full_like(steps, -1).view(1, width),
+    )
+    num_correct_drafts.copy_((simulate_acc_len - 1).expand(bs))
+    if simulate_acc_token_mode != "real-draft-token":
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+    # Chain drafts (topk=1): node b*width + j sits at row b, column j of predict.
+    rows = predict.view(bs, width)
+    drafted = torch.cat([candidates[:, 1:], candidates[:, -1:]], dim=1).to(rows.dtype)
+    rows.copy_(
+        torch.where(
+            steps < simulate_acc_len - 1,
+            drafted,
+            torch.where(steps == simulate_acc_len - 1, target_predict.to(rows.dtype), rows),
+        )
+    )
+    return sim_accept_index
+
+
 def traverse_tree(
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
