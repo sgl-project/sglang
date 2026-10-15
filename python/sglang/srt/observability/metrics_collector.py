@@ -2254,7 +2254,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["kind"],
             multiprocess_mode="mostrecent",
         )
-        for kind in ("query", "get", "set"):
+        for kind in ("query", "probe", "get", "set"):
             self.storage_call_timeouts_total.labels(**self.labels, kind=kind)
             self.storage_call_errors_total.labels(**self.labels, kind=kind)
             self.storage_orphaned_calls.labels(**self.labels, kind=kind)

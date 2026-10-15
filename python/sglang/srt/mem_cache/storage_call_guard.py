@@ -41,7 +41,11 @@ _WARN_INTERVAL_S = 5.0
 
 
 class StorageCallKind(Enum):
+    # Existence queries issued by the prefetch worker.
     QUERY = "query"
+    # Existence probes issued by the scheduler thread (the PD-decode hit probe,
+    # PP0's ticket submission), which may overlap a QUERY; same deadline key.
+    PROBE = "probe"
     GET = "get"
     SET = "set"
 
@@ -101,7 +105,7 @@ class StorageCallTimeouts(msgspec.Struct, frozen=True):
         return cls(**values)
 
     def for_kind(self, kind: StorageCallKind) -> Optional[float]:
-        if kind is StorageCallKind.QUERY:
+        if kind in (StorageCallKind.QUERY, StorageCallKind.PROBE):
             return self.query_s
         if kind is StorageCallKind.GET:
             return self.get_s
@@ -186,10 +190,10 @@ class _Lane:
 class StorageCallGuard:
     """Runs backend calls under per-kind deadlines; see the module docstring.
 
-    Each kind has exactly one calling thread at a time (the controller's query,
-    transfer and backup workers; in PP ticket mode the scheduler thread issues
-    the query), so calls of one kind run strictly FIFO with one in flight,
-    unless that one was orphaned.
+    Each kind has exactly one calling thread (the controller's query, transfer
+    and backup workers for QUERY, GET and SET; the scheduler thread for PROBE),
+    so calls of one kind run strictly one at a time unless the one in flight
+    was orphaned. A second caller on a kind is a programming error and raises.
     """
 
     def __init__(
@@ -314,6 +318,9 @@ class StorageCallGuard:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                # A call that completed between the last poll and this check is
+                # still orphaned and reported as a miss (its pins are released
+                # by the done callback at once): a late result is never trusted.
                 raise _GuardTimeout()
             try:
                 return future.result(timeout=min(remaining, _STOP_POLL_INTERVAL_S))
@@ -335,7 +342,10 @@ class StorageCallGuard:
         op: str,
         started_at: float,
     ) -> None:
-        held = tuple(spans()) if spans is not None else ()
+        # Retire the worker and free the lane before pinning: a failure while
+        # pinning must not leave the lane busy, which would turn every later
+        # call of this kind into the one-caller error.
+        orphan = _Orphan(kind, (), op, started_at, worker.thread.ident)
         with self._lock:
             lane.busy = False
             lane.timeouts += 1
@@ -345,11 +355,27 @@ class StorageCallGuard:
             worker.inbox.put(None)
             orphan_id = lane.next_orphan_id
             lane.next_orphan_id += 1
-            lane.orphans[orphan_id] = _Orphan(
-                kind, held, op, started_at, worker.thread.ident
-            )
-            for span in held:
+            lane.orphans[orphan_id] = orphan
+        held: list[HostSpan] = []
+        pool_name = None
+        try:
+            for span in spans() if spans is not None else ():
+                pool_name = type(span.pool).__name__
                 span.pool.quarantine(span.indices)
+                held.append(span)
+        except Exception:  # noqa: BLE001 - an unprotected orphan is loud, not fatal
+            logger.exception(
+                "%sHiCache storage %s call %s timed out but its host span could "
+                "not be quarantined (%s, %d spans pinned): the orphaned call may "
+                "still write slots that are handed out again",
+                self._log_prefix(),
+                kind.value,
+                op,
+                pool_name,
+                len(held),
+            )
+        with self._lock:
+            orphan.spans = tuple(held)
         future.add_done_callback(
             lambda done: self._orphan_returned(lane, orphan_id, done)
         )

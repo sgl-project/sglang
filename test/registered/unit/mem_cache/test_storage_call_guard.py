@@ -219,6 +219,8 @@ class TestStorageCallTimeouts(CustomTestCase):
         self.assertEqual(
             (defaults.query_s, defaults.get_s, defaults.set_s), (5.0, 20.0, 60.0)
         )
+        # Scheduler-thread probes share the query deadline.
+        self.assertEqual(timeouts.for_kind(StorageCallKind.PROBE), 3.0)
         for bad in ("5", True, -1, float("nan"), float("inf")):
             with self.assertRaises(ValueError):
                 StorageCallTimeouts.pop_from_extra_config(
@@ -328,6 +330,53 @@ class TestBoundedControllerCalls(CustomTestCase):
                 self.assertTrue(worker.is_alive())
                 backend.gate.set()
                 self.assertTrue(_wait_until(lambda: _orphans(cc, "query") == 0))
+                _stop(cc, worker, cc.prefetch_queue)
+
+    def test_scheduler_probe_runs_on_its_own_lane(self):
+        """The scheduler thread probes L3 (the PD-decode hit probe, PP0's
+        ticket submission) while the prefetch thread's query for an earlier
+        request may be in flight. The probe must have its own lane: a hung
+        probe is a miss within the query bound and a healthy one is answered,
+        never the one-caller error out of the scheduler loop."""
+        for kind in ("base", "hybrid"):
+            with self.subTest(kind=kind):
+                backend = _Backend(hang={("batch_exists", 0), ("batch_exists", 1)})
+                cc, pool = _controller(kind, backend)
+                worker = _start(cc.prefetch_thread_func, f"query-{kind}")
+                queued = _prefetch_op(kind, "queued", pool)
+                queued.host_indices = None
+                cc.prefetch_queue.put(queued)
+                self.assertTrue(backend.hung.wait(5))
+                probes = [_prefetch_op(kind, f"probe{i}", pool) for i in range(2)]
+                started = time.monotonic()
+                _, hit = cc._storage_hit_query(
+                    probes[0], call_kind=StorageCallKind.PROBE
+                )
+                self.assertEqual(hit, 0)
+                self.assertLess(time.monotonic() - started, 5 * BOUND_S)
+                _, hit = cc._storage_hit_query(
+                    probes[1], call_kind=StorageCallKind.PROBE
+                )
+                self.assertEqual(hit, 2 * PAGE_SIZE)
+                self.assertEqual(
+                    backend.threads["batch_exists"],
+                    ["hicache-storage-query"] + ["hicache-storage-probe"] * 2,
+                )
+                stats = cc.storage_call_guard.take_stats()
+                self.assertEqual(
+                    (stats.orphaned["query"], stats.orphaned["probe"]), (1, 1)
+                )
+                self.assertEqual((stats.errors["query"], stats.errors["probe"]), (0, 0))
+                self.assertFalse(backend.gate.is_set())
+                backend.gate.set()
+                self.assertTrue(
+                    _wait_until(
+                        lambda: (
+                            sum(cc.storage_call_guard.take_stats().orphaned.values())
+                            == 0
+                        )
+                    )
+                )
                 _stop(cc, worker, cc.prefetch_queue)
 
     def test_hung_transfer_quarantines_its_span_until_the_orphan_returns(self):
