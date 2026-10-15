@@ -124,7 +124,7 @@ def shape_key(forward_batch) -> Optional[ShapeKey]:
 
 
 def install_monokernel_forward(*, model, hf_config, capture_tail_hooks: list) -> None:
-    """Build the selected spec and install its forward after loading, before KV sizing."""
+    """Build the selected spec and install its forward; runs before KV cache sizing."""
     backend = _backend()
     if backend is None:
         return
@@ -313,7 +313,7 @@ def _eager_keys(*, served, captured) -> list[ShapeKey]:
 
 
 def _served_keys(*, widths, tokens: int) -> frozenset[ShapeKey]:
-    """Resolve the graph keys of the model's step at the built widths, once."""
+    """The graph keys of the model's step at each width that holds whole requests."""
     # A speculative target runs verify steps only; a plain server runs decode.
     mode = "decode" if tokens == 1 else "target_verify"
     return frozenset(

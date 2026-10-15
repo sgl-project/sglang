@@ -168,13 +168,13 @@ def register(*, backend: str, architecture: str, path: str) -> None:
 
 
 def spec_registered(*, backend: str, architectures) -> bool:
-    """Return whether the backend registers a spec for any architecture, usable or not."""
+    """Whether the backend registers a spec for any architecture, usable or not."""
     specs = _REGISTRY.get(backend, {})
     return any(arch in specs for arch in architectures or ())
 
 
 def find_spec(*, backend: str, architectures, isa: Optional[str]):
-    """Return the compatible spec and an empty reason, or None and a rejection reason."""
+    """The compatible spec and an empty reason, or None and a rejection reason."""
     if backend not in _REGISTRY:
         return None, (
             f"no monokernel backend {backend!r} is registered (registered: "

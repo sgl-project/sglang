@@ -170,7 +170,7 @@ def monokernel_disable_reasons(*, cfg, model_config, isa):
 
 
 def _requirement_reasons(*, spec, isa, cfg, model_config) -> list[str]:
-    """Check the spec's declared requirements, each kind the same way."""
+    """Return a reason for each declared requirement the server does not meet."""
     from sglang.srt.arg_groups.overrides import attention_backends_of
     from sglang.srt.environ import envs
 
@@ -202,7 +202,7 @@ def _requirement_reasons(*, spec, isa, cfg, model_config) -> list[str]:
 def covered_capture_sizes(
     *, widths, tokens_per_request: int, sizes: list[int]
 ) -> list[int]:
-    """Replace sizes through the largest covered batch with supported widths / tokens."""
+    """Capture each batch size the spec covers, plus the configured sizes above them."""
     covered = sorted(
         {w // tokens_per_request for w in widths if w % tokens_per_request == 0}
     )

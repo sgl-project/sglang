@@ -1,4 +1,4 @@
-"""Detect renamed SGLang dependencies before a vendor plugin reaches GPU startup."""
+"""A rename in SGLang that the monokernel framework reads fails here, not on a GPU."""
 
 import ast
 import unittest
@@ -21,7 +21,7 @@ def _tree(path: Path) -> ast.Module:
 
 @lru_cache(maxsize=None)
 def _provided(path: Path) -> frozenset:
-    """Collect definitions, attributes, imports, f(parameter) names, and string literals."""
+    """Names a file provides: definitions, attributes, imports, f(p), literals."""
     names = set()
     for node in ast.walk(_tree(path)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):

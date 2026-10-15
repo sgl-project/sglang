@@ -1,5 +1,4 @@
-"""CPU contracts for monokernel registration, validation, routing, capture coverage,
-and weight copies."""
+"""CPU contracts of the monokernel registry, checks, routing, coverage and copies."""
 
 import inspect
 import unittest
