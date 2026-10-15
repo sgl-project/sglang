@@ -3856,15 +3856,12 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
-        # For prefill-only batch, filter out finished requests since they
-        # won't go through the decode step. This keeps running_batch accurate
-        # for load reporting (num_running_reqs via /v1/loads).
-        # Runs outside the last_batch block so stale requests are cleaned
-        # even when no new batches arrive (e.g. traffic stops).
-        if running_batch.is_prefill_only:
-            running_batch.filter_batch()
-            if running_batch.is_empty():
-                running_batch.batch_is_full = False
+        # Every step, not only after a merge: overlap merges a prefill's requests
+        # before its result finishes them, and update_running_batch may never run.
+        running_bs = running_batch.batch_size()
+        running_batch.filter_batch()
+        if running_batch.batch_size() < running_bs:
+            running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
