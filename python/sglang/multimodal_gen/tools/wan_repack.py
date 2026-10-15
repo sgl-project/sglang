@@ -47,6 +47,9 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     "self_attn.o": "attn1.to_out.0",
     "self_attn.norm_q": "attn1.norm_q",
     "self_attn.norm_k": "attn1.norm_k",
+    "cross_attn.k_img": "attn2.add_k_proj",
+    "cross_attn.v_img": "attn2.add_v_proj",
+    "cross_attn.norm_k_img": "attn2.norm_added_k",
     "cross_attn.q": "attn2.to_q",
     "cross_attn.k": "attn2.to_k",
     "cross_attn.v": "attn2.to_v",
@@ -164,57 +167,6 @@ def load_quant_description(model_path: pathlib.Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def summarize_quant_description(
-    quant_config: Dict[str, Any], state_dict: Dict[str, torch.Tensor]
-) -> None:
-    """Log the per-expert quantization mix and warn about anomalies that the
-    runtime would otherwise reject mid-load."""
-    linear_counts: Dict[str, int] = {}
-    for key, quant_type in quant_config.items():
-        if key.endswith(".weight"):
-            linear_counts[quant_type] = linear_counts.get(quant_type, 0) + 1
-    logger.info("Linear quantization: %s", linear_counts)
-
-    attn_counts: Dict[str, int] = {}
-    for key, quant_type in quant_config.items():
-        if key.endswith(".self_attn.quant_type"):
-            attn_counts[quant_type] = attn_counts.get(quant_type, 0) + 1
-    logger.info("Self-attention quantization: %s", attn_counts)
-
-    rotation_blocks = sum(
-        1
-        for key in quant_config
-        if key.endswith(".self_attn.q_rot") or key.endswith(".self_attn.k_rot")
-    )
-    logger.info("Blocks with exported Q/K rotations: %d", rotation_blocks)
-
-    for key, quant_type in quant_config.items():
-        if not isinstance(quant_type, str):
-            continue
-        if quant_type.startswith("W4A4") and key not in state_dict:
-            logger.warning(
-                "%s is marked %s but missing from the weight checkpoint",
-                key,
-                quant_type,
-            )
-        prefix = key.removesuffix(".self_attn.quant_type")
-        if (
-            key.endswith(".self_attn.quant_type")
-            and quant_type == "FP8_DYNAMIC"
-            and "FLOAT"
-            not in (
-                quant_config.get(f"{prefix}.self_attn.q_rot"),
-                quant_config.get(f"{prefix}.self_attn.k_rot"),
-            )
-        ):
-            logger.warning(
-                "%s is FP8_DYNAMIC but %s lacks exported Q/K rotations; "
-                "the runtime rejects FP8 attention without them",
-                key,
-                prefix,
-            )
-
-
 def convert_transformer(
     model_type: str, model_dir: pathlib.Path, output_dir: pathlib.Path
 ) -> None:
@@ -227,10 +179,6 @@ def convert_transformer(
     state_dict = load_sharded_safetensors(model_path, "quant_model_weight*.safetensors")
 
     quant_config = load_quant_description(model_path)
-
-    # Reports export-side key names: run before the rename loop below rewrites
-    # both dicts to model-side names.
-    summarize_quant_description(quant_config, state_dict)
 
     # Attention descriptors need not have a corresponding checkpoint tensor.
     for mapping in (state_dict, quant_config):

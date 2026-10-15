@@ -136,16 +136,15 @@ class ModelSlimConfig(QuantizationConfig):
         else:
             return None
 
+    def _get_weight_name(self, prefix: str) -> str:
+        name = prefix + ".weight"
+        return self._name_mapper(name)[0] if self._name_mapper is not None else name
+
     def _get_scheme_from_parts(
         self,
         layer_name: str,
     ) -> ModelSlimLinearScheme:
-        full_weight_name = layer_name + ".weight"
-        if self._name_mapper is not None:
-            mapped_name, _, _ = self._name_mapper(full_weight_name)
-        else:
-            mapped_name = full_weight_name
-
+        mapped_name = self._get_weight_name(layer_name)
         quant_type = self.quant_description.get(mapped_name, "")
         prefix = mapped_name.removesuffix(".weight")
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
@@ -204,7 +203,8 @@ class ModelSlimConfig(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
+                    self.quant_description.get(self._get_weight_name(shard_prefix))
+                    == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -216,7 +216,9 @@ class ModelSlimConfig(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
+            is_skipped = (
+                self.quant_description.get(self._get_weight_name(prefix)) == "FLOAT"
+            )
 
         assert is_skipped is not None
         return is_skipped

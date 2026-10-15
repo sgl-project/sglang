@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     RowvLLMParameter,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 
 if current_platform.is_npu():
@@ -155,17 +156,28 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             layer.register_parameter("mul_scale", mul_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        if self.has_mul_scale:
+            mul_scale = layer.mul_scale.data
+            if not mul_scale.is_npu:
+                mul_scale = mul_scale.to(f"npu:{torch.npu.current_device()}")
+            layer.mul_scale = torch.nn.Parameter(mul_scale, requires_grad=False)
+            layer.use_mul_scale = not torch.all(mul_scale == 1.0).item()
+        else:
+            layer.use_mul_scale = False
+
         if not self.is_dual_scale:
+            use_nz = envs.SGLANG_NPU_ENABLE_MXFP4_NZ.get()
+            if use_nz:
+                self._prepare_nz_weights(layer)
             self.single_level_kernel.process_weights_after_loading(layer)
+            if use_nz:
+                for weight, expected in ((layer.weight, 29), (layer.weight_w4a8, 50)):
+                    actual = torch_npu.get_npu_format(weight)
+                    if actual != expected:
+                        raise RuntimeError(
+                            f"{self.prefix}: MXFP4 NZ format {actual}, expected {expected}"
+                        )
             layer.mxfp4_quant_kwargs = mxfp4_quant_kwargs(self.quant_config)
-            if self.has_mul_scale:
-                mul_scale = layer.mul_scale.data
-                if not mul_scale.is_npu:
-                    mul_scale = mul_scale.to(f"npu:{torch.npu.current_device()}")
-                layer.mul_scale = torch.nn.Parameter(mul_scale, requires_grad=False)
-                layer.use_mul_scale = not torch.all(mul_scale == 1.0).item()
-            else:
-                layer.use_mul_scale = False
             return
 
         # Preserve packed FP4 bytes when changing the storage format.
@@ -186,29 +198,39 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         weight_scale = weight_scale.reshape(weight_scale.shape[0], -1, 2)
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
-        if self.is_dual_scale:
-            # Transform weight_dual_scale: [out, in/512, 1] -> [in/512, out]
-            weight_dual_scale = layer.weight_dual_scale.data
-            if not weight_dual_scale.is_npu:
-                weight_dual_scale = weight_dual_scale.to(
-                    f"npu:{torch.npu.current_device()}"
-                )
-            weight_dual_scale = (
-                weight_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
+        # Transform weight_dual_scale: [out, in/512, 1] -> [in/512, out]
+        weight_dual_scale = layer.weight_dual_scale.data
+        if not weight_dual_scale.is_npu:
+            weight_dual_scale = weight_dual_scale.to(
+                f"npu:{torch.npu.current_device()}"
             )
-            layer.weight_dual_scale = torch.nn.Parameter(
-                weight_dual_scale, requires_grad=False
-            )
+        weight_dual_scale = weight_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
+        layer.weight_dual_scale = torch.nn.Parameter(
+            weight_dual_scale, requires_grad=False
+        )
 
-        if self.has_mul_scale:
-            # Move mul_scale to NPU if present and not already there
-            mul_scale = layer.mul_scale.data
-            if not mul_scale.is_npu:
-                mul_scale = mul_scale.to(f"npu:{torch.npu.current_device()}")
-            layer.mul_scale = torch.nn.Parameter(mul_scale, requires_grad=False)
-            layer.use_mul_scale = not torch.all(mul_scale == 1.0).item()
-        else:
-            layer.use_mul_scale = False
+    def _prepare_nz_weights(self, layer: torch.nn.Module):
+        if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
+            raise ValueError(
+                "MXFP4 NZ conflicts with SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"
+            )
+        weight = layer.weight.data
+        if not weight.is_npu:
+            weight = weight.to(f"npu:{torch.npu.current_device()}")
+        # W4A8 uses K0=32 logical FP4 values; W4A4 uses K0=64.
+        weight_w4a8 = torch_npu.npu_format_cast(
+            weight.view(torch.int8),
+            29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        )
+        layer.register_buffer(
+            "weight_w4a8", weight_w4a8.transpose(-1, -2), persistent=False
+        )
+        layer.weight = torch.nn.Parameter(
+            torch_npu.npu_format_cast(weight.view(torch.int8), 29),
+            requires_grad=False,
+        )
 
     def apply_weights(
         self,

@@ -577,21 +577,59 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
-    """Run offline ModelSlim W4A8 on Ascend 950 with FP4-capable torch_npu.
+    """NPU offline W4A8 (ModelSlim ``W4A8_MXFP``): packed-FP4 weights + MXFP8 activations.
 
-    SRT loads packed uint8 weights [out, in/2] and UE8M0 scales [out, in/32].
-    At load time, weights become FP4-aware NZ and scales become [in/64, out, 2].
-    Inference dynamically quantizes activations to MXFP8 with block size 32.
-    Older torch_npu builds can reject FP4 NZ weights; validate the installed
-    quantization/format-cast/matmul chain before serving.
+    Kernel for the offline ModelSlimMXFP4W4A8Scheme (delegated as ``self.kernel``).
+    The msmodelslim ``W4A8_MXFP`` checkpoint stores weights as *packed FP4*
+    (``pack_fp4_to_uint8`` → ``uint8`` shape ``[out, in//2]``) plus UE8M0 block
+    scales (``uint8`` shape ``[out, in//group_size]``):
 
-    Wan reuses only apply with its single-level ND weights. It opts into BF16
-    [1, out] bias via use_wan_bias; SRT retains FP32 bias and its original shape.
-    Keeping this option on the kernel instance preserves existing LLM behavior.
+      process_weights_after_loading:
+        weight (uint8 packed FP4 [out, in//2]) → npu_format_cast(29,
+            customize_dtype=float8_e4m3fn, input_dtype=float4_e2m1fn_x2) → FRACTAL_NZ
+            → transpose [in//2, out]
+        weight_scale [out, in/32] → reshape [out, in/64, 2] → transpose → [in/64, out, 2]
+
+      apply:
+        BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, MXFP8)
+        → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
+
+    The weight is cast to FRACTAL_NZ then transposed; ``npu_dynamic_mx_quant`` already
+    returns a 3D ``[tokens, in//64, 2]`` block scale so the matmul needs no extra
+    scale-layout normalization.
+
+    ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On the
+    A5 this device forces ``allow_internal_format=False`` (the NZ cast still produces
+    a ``FRACTAL_NZ_C0_16`` tensor, which is fine). Older torch_npu (e.g.
+    ``2.10.0.dev20260320``) had a broken FP4 matmul that rejected the NZ weight in
+    *prefill* with ``x2 should be in ... nz format, but it is 2``;
+    ``2.10.0.post1.dev20260624`` (and later) runs the FRACTAL_NZ path correctly.
+    If you hit ``it is 2``, update torch_npu — do NOT "fix" it by
+    switching the weight to ND.
+
+    ⚠️ A ``atb::OperationSetup`` *segfault during decode* (not prefill) is a
+    DIFFERENT, unrelated issue: it is the eager-decode ``ascend`` attention
+    backend, NOT this matmul (verified by stage-sync bisection — qkv's matmul
+    syncs clean, the fault surfaces at the entry-sync of the next layer, i.e. the
+    decode attention between qkv and o_proj). Run with the NPU decode graph (do
+    NOT pass ``--disable-cuda-graph``); graph mode is the NPU default. This
+    attention issue is model-agnostic and out of scope for W4A8.
+
+    This is a true W4(weight) A8(activation) single-level matmul. The *online*
+    ``NPUMXFP4W4A8LinearMethod`` now uses this exact apply path — the only
+    difference is that it quantizes BF16/FP16 weights to FP4 at load time instead
+    of loading them from a msmodelslim checkpoint. ``group_size`` is fixed at 32
+    by the ``W4A8_MXFP`` export format.
+
+    Wan reuses apply with ND weights by default, or a separate weight_w4a8
+    buffer when NZ is enabled. Its kernel instance opts into BF16 [1, N] bias.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # FP4-aware NZ packing must match the W4A8 matmul layout.
+        # Cast the packed-FP4 weight to FRACTAL_NZ then transpose. All NPU ops go
+        # through torch.ops.npu.* (no torch_npu). A recent torch_npu build is
+        # required (see class docstring): older builds reject the NZ weight
+        # ("x2 ... it is 2").
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
         # weight: packed-FP4 uint8 [out, in//2] -> FRACTAL_NZ (float8_e4m3fn view)
@@ -642,7 +680,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         # W4(weight)A8(activation) matmul.
         output = torch.ops.npu.npu_quant_matmul(
             quantized_x,
-            layer.weight,
+            getattr(layer, "weight_w4a8", layer.weight),
             layer.weight_scale,
             scale_dtype=e8m0_dtype,
             pertoken_scale=dynamic_scale,
@@ -797,8 +835,9 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
-    [out, in/32]). The weight remains ND and is transposed for matmul.
-    Wan selects MindIE's activation rounding on its kernel instance.
+    [out, in/32]). SRT weights remain ND and are transposed for matmul.
+    Wan can supply mode-specific NZ weights before this transpose and selects
+    MindIE's activation rounding on its kernel instance.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
