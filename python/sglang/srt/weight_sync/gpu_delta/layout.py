@@ -101,16 +101,17 @@ class GpuDeltaLayout:
         )
 
     def check_identity(self):
+        identities = {}
         for module, name, tensor, expected in self._parameter_roots:
             if (
                 module._parameters.get(name) is not tensor
-                or _tensor_identity(tensor) != expected
+                or _tensor_identity(tensor, identities) != expected
             ):
                 raise RuntimeError(
                     "GPU delta parameter identity changed; readmission required"
                 )
         for consumer in self._consumers:
-            consumer.check()
+            consumer.check(identities)
 
     def _reject_overlaps(self, model_aliases):
         # Gate/up intentionally share one interleaved weight/scale allocation;

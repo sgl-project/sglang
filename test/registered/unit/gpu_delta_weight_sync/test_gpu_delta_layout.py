@@ -482,6 +482,63 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "derived delta buffer geometry"):
                 byte_layout.DerivedImage("consumer", torch.zeros(2), source)
 
+    def test_identity_checks_share_geometry_but_preserve_each_live_binding(self):
+        root = torch.nn.Module()
+        root.weight = torch.nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+        root.tied = root.weight
+        root.view = root.weight.detach().view(3, 2)
+        root.wrapper = SimpleNamespace(config="unchanged")
+        plan = layout.GpuDeltaLayout.__new__(layout.GpuDeltaLayout)
+        plan._parameter_roots = [
+            (root, name, tensor, byte_layout._tensor_identity(tensor))
+            for name, tensor in root._parameters.items()
+        ]
+        plan._consumers = [
+            byte_layout.ConsumerSnapshot(
+                lambda: (root.weight, root.view, root.wrapper)
+            ),
+            byte_layout.ConsumerSnapshot(lambda: (root.tied, root.view)),
+        ]
+        storage = torch.Tensor.untyped_storage
+        reads = []
+
+        def read_storage(tensor):
+            reads.append(id(tensor))
+            return storage(tensor)
+
+        with patch.object(torch.Tensor, "untyped_storage", read_storage):
+            plan.check_identity()
+            plan.check_identity()
+        self.assertEqual(reads, [id(root.weight), id(root.view)] * 2)
+
+        # The tied parameter and consumer can be rebound to objects with exactly
+        # the same storage and geometry; every live field still has to match.
+        root.tied = torch.nn.Parameter(root.weight.detach(), requires_grad=False)
+        with self.assertRaisesRegex(RuntimeError, "parameter identity changed"):
+            plan.check_identity()
+        root.tied = root.weight
+        original = root.view
+        root.view = original.view_as(original)
+        with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
+            plan.check_identity()
+        root.view = original
+        wrapper = root.wrapper
+        root.wrapper = SimpleNamespace(config="unchanged")
+        with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
+            plan.check_identity()
+        root.wrapper = wrapper
+
+        # A shared storage pointer cannot hide distinct view geometry. Each new
+        # check must also observe in-place changes after an earlier success.
+        root.view.transpose_(0, 1)
+        with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
+            plan.check_identity()
+        root.view.transpose_(0, 1)
+        plan.check_identity()
+        root.weight.transpose_(0, 1)
+        with self.assertRaisesRegex(RuntimeError, "parameter identity changed"):
+            plan.check_identity()
+
     def test_w4a16_calibration_is_static_but_weight_scales_remain_mutable(self):
         prefix = "model.layers.0.mlp.experts"
         layer = SimpleNamespace(
