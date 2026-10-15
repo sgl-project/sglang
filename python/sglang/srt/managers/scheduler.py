@@ -359,6 +359,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.cuda_event_pool import wait_stream
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -1934,7 +1935,7 @@ class Scheduler(
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
-            self.schedule_stream.wait_stream(self.forward_stream)
+            wait_stream(self.schedule_stream, self.forward_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -4559,7 +4560,7 @@ class Scheduler(
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    wait_stream(self.forward_stream, self.schedule_stream)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
@@ -4630,7 +4631,7 @@ class Scheduler(
                                 # Result D2H on copy_stream overlaps the next forward
                                 # instead of serializing on forward_stream; it's a leaf
                                 # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
+                                wait_stream(self.copy_stream, self.forward_stream)
                                 with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
@@ -4795,7 +4796,7 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    wait_stream(self.forward_stream, self.schedule_stream)
                     resolve_forward_inputs(batch, self.future_map)
                     pooler_output, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_embedding(batch)
