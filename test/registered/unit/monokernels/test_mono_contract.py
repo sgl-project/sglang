@@ -1,10 +1,10 @@
 """The SGLang names the monokernel framework reads, pinned on CPU.
 
-The framework keeps its runtime integration out of srt, so it reads SGLang
-internals by name, mostly in calls no CPU test runs. Every framework module that
-imports from ``sglang.srt`` lists what it reads in ``SGLANG_READS``. A refactor
-that renames one fails here, naming the module to repair, instead of failing at a
-GPU server's startup. The checks are static (AST).
+The framework's runtime paths run only with a vendor plugin on its GPUs, so no
+CPU test executes them. Every framework module that imports from elsewhere in
+``sglang.srt`` lists what it reads in ``SGLANG_READS``. A refactor that renames
+one fails here, naming the module to repair, instead of failing at a GPU server's
+startup. The checks are static (AST).
 """
 
 import ast
@@ -12,7 +12,7 @@ import unittest
 from functools import lru_cache
 from pathlib import Path
 
-from sglang.experimental.monokernels import spec
+from sglang.srt.monokernels import spec
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -63,24 +63,27 @@ def _declared(path: Path) -> dict:
 
 
 def _srt_imports(path: Path) -> set:
+    """The names a module imports from sglang.srt, outside the framework itself."""
     return {
         a.asname or a.name
         for node in ast.walk(_tree(path))
         if isinstance(node, ast.ImportFrom)
         and (node.module or "").startswith("sglang.srt")
+        and not (node.module or "").startswith(spec.__package__)
         for a in node.names
     }
 
 
 READERS = [
     p
-    for p in sorted((ROOT / "experimental/monokernels").rglob("*.py"))
+    for p in sorted((ROOT / "srt/monokernels").rglob("*.py"))
     if _declared(p) or _srt_imports(p)
 ]
 
 
 class TestSglangReads(CustomTestCase):
     def test_every_srt_import_is_declared(self):
+        self.assertTrue(READERS, f"no framework module under {ROOT}")  # a moved root
         for path in READERS:
             with self.subTest(module=str(path.relative_to(ROOT))):
                 declared = {n for names in _declared(path).values() for n in names}

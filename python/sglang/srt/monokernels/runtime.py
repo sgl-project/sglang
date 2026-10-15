@@ -27,8 +27,8 @@ from typing import Any, Optional
 
 import msgspec
 
-from sglang.experimental.monokernels.guards import deadline_s, device_isa
-from sglang.experimental.monokernels.spec import (
+from sglang.srt.monokernels.guards import deadline_s, device_isa
+from sglang.srt.monokernels.spec import (
     BuildContext,
     Feature,
     ShapeKey,

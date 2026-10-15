@@ -25,7 +25,7 @@ from typing import Callable, List, Optional, Union
 import torch
 import torch.distributed as dist
 
-from sglang.experimental import monokernels as mono
+from sglang.srt import monokernels as mono
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,

@@ -40,7 +40,7 @@ import huggingface_hub
 import numpy as np
 import torch
 
-from sglang.experimental import monokernels as mono
+from sglang.srt import monokernels as mono
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (

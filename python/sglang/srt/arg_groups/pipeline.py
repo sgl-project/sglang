@@ -343,7 +343,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_model_capability_adjustments, server_args)
 
     # After the CUDA graph, memory, model, attention-backend and speculative hooks.
-    from sglang.experimental.monokernels import handle_monokernel
+    from sglang.srt.monokernels import handle_monokernel
 
     run_hook(handle_monokernel, server_args)
 

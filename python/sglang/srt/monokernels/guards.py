@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from sglang.experimental.monokernels.spec import Feature, NumericsKind, find_spec
+from sglang.srt.monokernels.spec import Feature, NumericsKind, find_spec
 
 logger = logging.getLogger(__name__)
 

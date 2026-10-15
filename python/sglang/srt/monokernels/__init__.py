@@ -1,5 +1,5 @@
 """Monokernels: persistent kernels that run most of a decoder layer, including
-its TP all-reduce, in one or two launches (RFC #43949). Experimental.
+its TP all-reduce, in one or two launches (RFC #43949).
 
 SGLang's runtime calls three hooks, for every model, each a no-op while
 ``--enable-monokernel`` is off: ``handle_monokernel`` in the config pipeline
@@ -21,8 +21,8 @@ every peer's data for it; no token of a failed step is sent and SGLang stops the
 process tree.
 """
 
-from sglang.experimental.monokernels.guards import handle_monokernel
-from sglang.experimental.monokernels.runtime import attach, watch_weights
-from sglang.experimental.monokernels.spec import API_VERSION, register
+from sglang.srt.monokernels.guards import handle_monokernel
+from sglang.srt.monokernels.runtime import attach, watch_weights
+from sglang.srt.monokernels.spec import API_VERSION, register
 
 __all__ = ["API_VERSION", "attach", "handle_monokernel", "register", "watch_weights"]

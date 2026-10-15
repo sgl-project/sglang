@@ -10,17 +10,17 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.experimental import monokernels as mono
-from sglang.experimental.monokernels import guards, runtime
-from sglang.experimental.monokernels import spec as registry
-from sglang.experimental.monokernels.guards import (
+from sglang.srt import monokernels as mono
+from sglang.srt.monokernels import guards, runtime
+from sglang.srt.monokernels import spec as registry
+from sglang.srt.monokernels.guards import (
     MAX_DEADLINE_S,
     covered_capture_sizes,
     deadline_s,
     features_in_use,
     monokernel_disable_reasons,
 )
-from sglang.experimental.monokernels.spec import (
+from sglang.srt.monokernels.spec import (
     DeviceLimits,
     Feature,
     MonoSpec,
