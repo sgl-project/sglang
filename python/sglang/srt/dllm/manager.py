@@ -113,6 +113,7 @@ class DllmManager:
                 inflight=True,
                 health_check=True,
                 holds_kv=True,
+                counts_running=True,
             ),
             # Started requests between two of their blocks: the running
             # timeout reads them. Abort pops them before the scheduler marks
@@ -124,6 +125,7 @@ class DllmManager:
                 abort=self.abort_between_blocks,
                 health_check=True,
                 holds_kv=True,
+                counts_running=True,
             ),
         ]
 

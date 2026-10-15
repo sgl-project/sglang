@@ -737,6 +737,7 @@ class DisaggPrefill:
                 inflight=True,
                 health_check=True,
                 holds_kv=True,
+                counts_running=True,
             ),
             # Their KV is sent until the transfer concludes.
             RequestList(

@@ -669,7 +669,11 @@ class HiSparseCoordinator:
         host copy lands; abort marks them `to_finish`."""
         return [
             RequestList(
-                name="hisparse_staging", reqs=self.staging, inflight=True, holds_kv=True
+                name="hisparse_staging",
+                reqs=self.staging,
+                inflight=True,
+                holds_kv=True,
+                counts_running=True,
             )
         ]
 
