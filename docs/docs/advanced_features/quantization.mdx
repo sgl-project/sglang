@@ -837,14 +837,14 @@ Our team is working on supporting more online quantization methods. SGLang will 
 
 ### `nvfp4_online` online quantization method
 
-Use `--quantization nvfp4_online` to convert eligible BF16, FP16, or FP8 MoE expert weights to NVFP4 at load time with per-token FP32 activation scales. Use `modelopt_fp4` for serialized NVFP4 checkpoints or the same load-time conversion with per-tensor FP32 activation scales.
+Use `--quantization nvfp4_online` to convert eligible BF16, FP16, or FP8 MoE expert weights, and the dense linear weights of BF16 or FP16 dense models, to NVFP4 at load time with per-token FP32 activation scales. Use `modelopt_fp4` for serialized NVFP4 checkpoints or the same load-time conversion with per-tensor FP32 activation scales.
 
 The design separates weight quantization from activation scaling:
 
 - **Weights:** SGLang quantizes each eligible MoE expert weight tensor as it is loaded, using standard 2D NVFP4 weight quantization. The generated NVFP4 weights use static E4M3 block scales plus static per-tensor FP32 scales derived from the weight amax. For gated MoE experts, the w1/w3 pair shares one per-tensor FP32 scale.
 - **Activations:** FlashInfer computes and propagates one FP32 scale per token at runtime. Backends that accept one per-tensor FP32 activation scale must use `modelopt_fp4`.
 - **FP8 checkpoints:** If an eligible expert weight is stored as FP8, SGLang first dequantizes that tensor with the checkpoint scale and then requantizes it to NVFP4 during loading.
-- **Other layers:** Dense linear layers stay in their source checkpoint precision or checkpoint quantization path.
+- **Dense linear layers:** In a BF16 or FP16 dense model, every linear layer is converted to NVFP4 and runs through the FlashInfer cute-dsl FP4 GEMM, which applies the per-token scale in its epilogue. In an MoE model, dense linear layers stay in their source precision unless `SGLANG_NVFP4_ONLINE_DENSE_LINEAR=1` is set. FP8 checkpoints keep dense linear layers in FP8.
 
 Only `--moe-runner-backend flashinfer_trtllm` and `--moe-runner-backend flashinfer_trtllm_routed` are supported. If `--moe-runner-backend` is omitted, SGLang selects `flashinfer_trtllm`. Tensor parallelism is supported; activation per-token scales are computed locally on each TP rank, while online weight quantization still uses the loaded expert tensor's per-tensor amax-derived FP32 scale.
 

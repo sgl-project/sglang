@@ -54,7 +54,8 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
     `--quantization nvfp4_online` exclusively means online per-token FP32
     activation scaling. Use `modelopt_fp4` for per-tensor FP32 activation scales
     or serialized NVFP4 checkpoints. This path converts BF16/FP16/FP8 MoE expert
-    weights and BF16/FP16 dense linear weights as they load.
+    weights as they load, and BF16/FP16 dense linear weights for dense models
+    (MoE models opt in with SGLANG_NVFP4_ONLINE_DENSE_LINEAR).
     """
 
     # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
@@ -85,6 +86,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         activation_scheme: str = "dynamic",
         weight_block_size: Optional[List[int]] = None,
         use_mxfp8: bool = False,
+        quantize_dense_linears: bool = True,
     ) -> None:
         source_ignored_layers = self._normalize_ignored_layers(exclude_modules)
         fp4_ignored_layers = (
@@ -112,6 +114,9 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         self.activation_scheme = activation_scheme
         self.weight_block_size = weight_block_size
         self.use_mxfp8 = use_mxfp8
+        self.quantize_dense_linears = (
+            quantize_dense_linears or envs.SGLANG_NVFP4_ONLINE_DENSE_LINEAR.get()
+        )
 
     @classmethod
     def get_name(cls) -> str:
@@ -166,7 +171,11 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
                 if self.is_checkpoint_fp8_serialized:
                     return Fp8LinearMethod(self)
                 return UnquantizedLinearMethod()
-            if self.use_per_token_activation and not self.is_checkpoint_fp8_serialized:
+            if (
+                self.use_per_token_activation
+                and self.quantize_dense_linears
+                and not self.is_checkpoint_fp8_serialized
+            ):
                 return NvFp4OnlineLinearMethod(self)
             if self.is_checkpoint_fp8_serialized:
                 return Fp8LinearMethod(self)

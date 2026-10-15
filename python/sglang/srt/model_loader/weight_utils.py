@@ -63,6 +63,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.model_loader.utils import _is_moe_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
@@ -371,6 +372,13 @@ def get_quant_config(
             return quant_cls(
                 online_scheme=model_config.quantization,
                 hf_config=model_config.hf_config,
+            )
+        if model_config.quantization == "nvfp4_online":
+            return quant_cls(
+                packed_modules_mapping=packed_modules_mapping,
+                quantize_dense_linears=not _is_moe_model(
+                    model_config, model_config.hf_config.architectures
+                ),
             )
         return quant_cls()
 

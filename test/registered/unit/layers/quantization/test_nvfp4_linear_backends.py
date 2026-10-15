@@ -11,10 +11,16 @@ from unittest import mock
 import torch
 from flashinfer import SfLayout, fp4_quantize, nvfp4_quantize
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.layers.quantization.nvfp4_online import NVFP4_MAX, NvFp4OnlineConfig
+from sglang.srt.layers.quantization.nvfp4_online import (
+    NVFP4_MAX,
+    NvFp4OnlineConfig,
+    NvFp4OnlineLinearMethod,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -213,6 +219,15 @@ class TestNvFp4LinearBackends(CustomTestCase):
                     assert_output_close(self, out, ref)
                     row_err = (out.float() - ref).norm(dim=1) / ref.norm(dim=1)
                     self.assertLess(row_err.max().item(), 0.02)
+
+    def test_online_moe_model_keeps_dense_linears(self):
+        config = NvFp4OnlineConfig(quantize_dense_linears=False)
+        layer = make_tp1_column_parallel_linear(config, 256, 512)
+        self.assertIsInstance(layer.quant_method, UnquantizedLinearMethod)
+        with envs.SGLANG_NVFP4_ONLINE_DENSE_LINEAR.override(True):
+            config = NvFp4OnlineConfig(quantize_dense_linears=False)
+        layer = make_tp1_column_parallel_linear(config, 256, 512)
+        self.assertIsInstance(layer.quant_method, NvFp4OnlineLinearMethod)
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
