@@ -1,6 +1,6 @@
 ---
-title: Muse Spark
-description: "Deploy Muse Spark with SGLang on B300, GB300, and B200 using NVFP4 or BF16 checkpoints, Dflash V2, and configurable prefill/decode disaggregation; For multi-platforms deployments, on MI355X using Quark MXFP4, the NVFP4 checkpoint requantized to MXFP4 at load, or BF16, with aiter attention, FlyDSL MoE and Dflash V2; and on Intel Xeon CPUs using INT4 checkpoints."
+title: Muse Spark Open
+description: "Deploy Muse Spark Open with SGLang on B300, GB300, and B200 using NVFP4 or BF16 checkpoints, Dflash V2, and configurable prefill/decode disaggregation; For multi-platforms deployments, on MI355X using Quark MXFP4, the NVFP4 checkpoint requantized to MXFP4 at load, or BF16, with aiter attention, FlyDSL MoE and Dflash V2; and on Intel Xeon CPUs using INT4 checkpoints."
 tag: NEW
 ---
 
@@ -11,7 +11,7 @@ tag: NEW
 <Accordion title="Install SGLang">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-muse-spark          # NVIDIA B300 / GB300 / B200
+docker pull lmsysorg/sglang:dev-muse-spark-open     # NVIDIA B300 / GB300 / B200
 docker pull lmsysorg/sglang-rocm:muse-spark-open    # AMD MI355X
 docker pull lmsysorg/sglang:dev-muse-spark-xeon     # Intel Xeon CPU
 ```
@@ -20,11 +20,7 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
-Choose your hardware and deployment options below. The default is **B300 / NVFP4 / TEP 4**. On AMD, pick **MI355X / MXFP4 / TEP 8**, or **MI355X / NVFP4** to load the NVIDIA checkpoint directly. **H200** is a placeholder; launch commands are not available yet.
-
-**TEP Size** sets both tensor and expert parallelism. BF16 requires TEP 8. On MI355X, MXFP4 and NVFP4 support TEP 4 and TEP 8; the NVFP4 checkpoint is requantized to MXFP4 when it loads (`--quantization quark_mxfp4`). On GB300, TEP 8 spans two nodes; replace `<node-rank>` and `<node0-ip>` for each node.
-
-**Dflash V2** is enabled by default on both NVIDIA and MI355X using `RadixArk/Muse-Spark-Open-DFlash2` as the draft checkpoint. Select **Off** to disable it. The default **fp8_e4m3** KV cache selection adds no override flag. With PD disaggregation enabled, **L1+L2(Host)** adds HiCache only to the prefill worker. PD disaggregation and HiCache are NVIDIA-only in this cookbook.
+Choose your **Hardware Platform** and **Quantization** below. The default is **B300 / NVFP4**. Each combination uses its default deployment recipe; use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation. **H200** is a placeholder; launch commands are not available yet.
 
 **Xeon CPU service configuration:**
 
@@ -39,11 +35,15 @@ import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
 
 ## Playground
 
-{/* TODO: Add Playground content in a follow-up. */}
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
 
 ## 1. Model introduction
 
-This cookbook provides deployment recipes for the Muse Spark 816B-A42B checkpoints:
+This cookbook provides deployment recipes for the Muse Spark Open 816B-A42B checkpoints:
 
 - **NVFP4:** `meta-models/Muse-Spark-Open-816B-A42B-NVFP4` (NVIDIA default).
 - **MXFP4:** `amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4` (MI355X default; Quark-quantized).
