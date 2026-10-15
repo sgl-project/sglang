@@ -30,9 +30,7 @@ def mega_args(model_type="deepseek_v41", **fields):
         hf_config=SimpleNamespace(
             architectures=["DeepseekV4ForCausalLM"], model_type=model_type
         ),
-        hf_text_config=SimpleNamespace(
-            model_type=model_type, num_attention_heads=64, o_groups=8
-        ),
+        hf_text_config=SimpleNamespace(model_type=model_type),
         is_multimodal=False,
     )
     parse_cuda_graph_config(args)
@@ -69,7 +67,6 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
             dict(model_type="deepseek_v4"),
             dict(cuda_graph_backend_prefill=Backend.FULL),
             dict(disaggregation_mode="prefill"),
-            dict(tp_size=16),
         ):
             with self.subTest(fields=fields):
                 self.assertEqual(resolved_backend(mega_args(**fields)), "flashmla")
@@ -78,7 +75,7 @@ class TestDSV41MegaAttentionPolicy(CustomTestCase):
         for message, fields in (
             ("DeepSeek-V4.1", dict(model_type="deepseek_v4")),
             ("prefill CUDA graphs", dict(cuda_graph_backend_prefill=Backend.FULL)),
-            ("WO-A group", dict(tp_size=16)),
+            ("context parallelism", dict(enable_prefill_cp=True)),
         ):
             with self.subTest(fields=fields):
                 with self.assertRaisesRegex(ValueError, message):

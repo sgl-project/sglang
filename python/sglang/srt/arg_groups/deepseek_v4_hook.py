@@ -35,21 +35,6 @@ def _mega_attention_blocker(server_args: ServerArgs) -> Optional[str]:
         return "requires DeepSeek-V4.1"
     if cfg.device != "cuda" or not is_sm100_supported():
         return "requires SM100/SM103"
-    text = model.hf_text_config
-    attn_tp_size = cfg.tp_size // cfg.attn_dp_size
-    if (
-        text.num_attention_heads != 8 * text.o_groups
-        or text.o_groups % attn_tp_size
-        or text.num_attention_heads // attn_tp_size > 128
-    ):
-        return "requires eight 512-dim heads per WO-A group on every attention rank"
-    quant = getattr(model.hf_config, "quantization_config", None) or {}
-    if (
-        envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-        and quant.get("quant_method") == "fp8"
-        and quant.get("weight_block_size") == [128, 128]
-    ):
-        return "requires BF16 WO-A weights"
     if cfg.cuda_graph_config.prefill.backend not in (
         Backend.DISABLED,
         Backend.BREAKABLE,
