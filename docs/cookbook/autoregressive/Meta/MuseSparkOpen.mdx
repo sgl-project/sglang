@@ -22,14 +22,6 @@ The deployment panel can render a complete `docker run` command for the selected
 
 Choose your **Hardware Platform** and **Quantization** below. The default is **B300 / NVFP4**. Each combination uses its default deployment recipe; use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
 
-**H200:** NVFP4 runs on one 8x H200 node with Marlin W4A16 experts (`--moe-runner-backend marlin`), since Hopper has no TRT-LLM FP4 MoE. The BF16 checkpoint does not fit on one node, so it runs TP16/EP16 across two nodes; replace `<node-rank>` and `<node0-ip>` for each node. Prefill sequence parallel and MegaMoE need SM100 kernels and are unavailable on H200.
-
-**Xeon CPU service configuration:**
-
-- Xeon serves the **INT4** checkpoint (quantized by Intel AutoRound, HF id: `intel-ai/Muse-Spark-Open-816B-A42B-INT4`) on the SGLang CPU engine. A typical Xeon 6 P-core platform (e.g., Xeon 6980P) is recommended.
-- Set `--page-size 1` for the `intel_amx` attention backend (the CPU default attention backend).
-- We recommend setting the TP size equal to the NUMA count. See the **Notes** under [Launch of the Serving Engine](/docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) in the SGLang CPU server document for how to configure the arguments, especially TP and NUMA binding.
-
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
 
@@ -55,4 +47,12 @@ This cookbook provides deployment recipes for the Muse Spark Open 816B-A42B chec
 
 ## 2. Configuration tips
 
-{/* TODO: Add configuration tips in a follow-up. */}
+### H200 configuration
+
+NVFP4 runs on one 8x H200 node with Marlin W4A16 experts (`--moe-runner-backend marlin`), since Hopper has no TRT-LLM FP4 MoE. The BF16 checkpoint does not fit on one node, so it runs TP16/EP16 across two nodes; replace `<node-rank>` and `<node0-ip>` for each node. Prefill sequence parallel and MegaMoE need SM100 kernels and are unavailable on H200.
+
+### Xeon CPU service configuration
+
+- Xeon serves the **INT4** checkpoint (quantized by Intel AutoRound, HF id: `intel-ai/Muse-Spark-Open-816B-A42B-INT4`) on the SGLang CPU engine. A typical Xeon 6 P-core platform (e.g., Xeon 6980P) is recommended.
+- Set `--page-size 1` for the `intel_amx` attention backend (the CPU default attention backend).
+- We recommend setting the TP size equal to the NUMA count. See the **Notes** under [Launch of the Serving Engine](/docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) in the SGLang CPU server document for how to configure the arguments, especially TP and NUMA binding.
