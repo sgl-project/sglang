@@ -59,6 +59,7 @@ from sglang.srt.utils.weight_checker import overall_checksum
 from sglang.srt.utils.weight_versions import record_weight_version_events
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.bundles import Workers
     from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
     from sglang.srt.managers.scheduler_components.request_registry import (
         RequestRegistry,
@@ -103,8 +104,7 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
-    tp_worker: Any
-    draft_worker: Any
+    workers: Workers
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     request_registry: RequestRegistry
@@ -199,7 +199,7 @@ class SchedulerWeightUpdaterManager:
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
-        success, message = self.tp_worker.init_weights_update_group(recv_req)
+        success, message = self.workers.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
@@ -207,16 +207,16 @@ class SchedulerWeightUpdaterManager:
         recv_req: DestroyWeightsUpdateGroupReqInput,
     ):
         """Destroy the online model parameter update group."""
-        success, message = self.tp_worker.destroy_weights_update_group(recv_req)
+        success, message = self.workers.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def _select_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
         roles = _parse_runner_selector(selector)
         runners: List[Tuple[str, Any]] = []
         if "target" in roles:
-            runners += self.tp_worker.weight_update_runners()
-        if "draft" in roles and self.draft_worker is not None:
-            runners += self.draft_worker.weight_update_runners()
+            runners += self.workers.tp_worker.weight_update_runners()
+        if "draft" in roles and self.workers.draft_worker is not None:
+            runners += self.workers.draft_worker.weight_update_runners()
         return runners
 
     def update_weights_from_distributed(
@@ -232,7 +232,7 @@ class SchedulerWeightUpdaterManager:
             )
         with self._observe_weight_load("distributed"):
             # only the target runner joined the update group; drafts load its receive
-            target = self.tp_worker.model_runner.weight_updater
+            target = self.workers.tp_worker.model_runner.weight_updater
             try:
                 weights = target.receive_weights_from_distributed(
                     names=recv_req.names,
@@ -273,7 +273,7 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("tensor"):
-            named_tensors = self.tp_worker.deserialize_own_rank(
+            named_tensors = self.workers.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
             success, message = True, "Success"
@@ -322,7 +322,7 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
-        parameter = self.tp_worker.get_weights_by_name(recv_req)
+        parameter = self.workers.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter=parameter)
 
     def _assert_weight_cache_inactive(self, op: str) -> None:
@@ -398,7 +398,7 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
             self.stashed_model_static_state = _export_static_state(
-                self.tp_worker.model_runner.model
+                self.workers.tp_worker.model_runner.model
             )
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
@@ -427,7 +427,7 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(
-                self.tp_worker.model_runner.model,
+                self.workers.tp_worker.model_runner.model,
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
@@ -480,17 +480,19 @@ class SchedulerWeightUpdaterManager:
     def save_remote_model(self, params):
         url = params["url"]
 
-        self.tp_worker.model_runner.weight_exporter.save_remote_model(url)
+        self.workers.tp_worker.model_runner.weight_exporter.save_remote_model(url)
 
-        if self.draft_worker is not None:
+        if self.workers.draft_worker is not None:
             draft_url = params.get("draft_url", None)
             assert draft_url is not None, (
                 "draft_url must be provided when draft model is enabled"
             )
-            self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
+            self.workers.draft_worker.model_runner.weight_exporter.save_remote_model(
+                draft_url
+            )
 
     def save_sharded_model(self, params):
-        self.tp_worker.model_runner.weight_exporter.save_sharded_model(
+        self.workers.tp_worker.model_runner.weight_exporter.save_sharded_model(
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],

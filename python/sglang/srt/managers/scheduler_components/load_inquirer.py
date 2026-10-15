@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import get_disagg, get_lora, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_policy import SchedulePolicy
+    from sglang.srt.managers.scheduler_components.bundles import Workers
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
     )
@@ -29,7 +30,6 @@ if TYPE_CHECKING:
         RequestRegistry,
     )
     from sglang.srt.managers.scheduler_components.step_counters import StepCounters
-    from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -42,7 +42,7 @@ class SchedulerLoadInquirer:
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
-    tp_worker: BaseTpWorker
+    workers: Workers
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
     policy: SchedulePolicy
@@ -106,11 +106,15 @@ class SchedulerLoadInquirer:
         memory = None
         try:
             memory = MemoryMetrics(
-                weight_gb=round(self.tp_worker.model_runner.weight_load_mem_usage, 3),
+                weight_gb=round(
+                    self.workers.tp_worker.model_runner.weight_load_mem_usage, 3
+                ),
                 kv_cache_gb=round(
                     self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3
                 ),
-                graph_gb=round(sum(self.tp_worker.graph_memory_usage.values()), 3),
+                graph_gb=round(
+                    sum(self.workers.tp_worker.graph_memory_usage.values()), 3
+                ),
                 token_capacity=int(self.max_total_num_tokens),
             )
         except (AttributeError, TypeError) as e:

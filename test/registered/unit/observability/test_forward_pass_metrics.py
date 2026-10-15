@@ -158,8 +158,9 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
         mode_owners=mode_owners,
         kv=None,
         capacity=None,
-        tp_worker=scheduler.tp_worker,
-        draft_worker=scheduler.draft_worker,
+        workers=types.SimpleNamespace(
+            tp_worker=scheduler.tp_worker, draft_worker=scheduler.draft_worker
+        ),
         model_config=None,
         spec_algorithm=None,
         device=getattr(scheduler, "device", ""),

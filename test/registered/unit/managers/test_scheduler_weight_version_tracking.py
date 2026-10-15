@@ -157,15 +157,19 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
 
     def _build_manager(self, target, draft):
         return SchedulerWeightUpdaterManager(
-            tp_worker=SimpleNamespace(
-                model_runner=target,
-                weight_update_runners=lambda: [("target", target)],
-                deserialize_own_rank=lambda payloads: [],
-            ),
-            draft_worker=(
-                None
-                if draft is None
-                else SimpleNamespace(weight_update_runners=lambda: [("draft", draft)])
+            workers=SimpleNamespace(
+                tp_worker=SimpleNamespace(
+                    model_runner=target,
+                    weight_update_runners=lambda: [("target", target)],
+                    deserialize_own_rank=lambda payloads: [],
+                ),
+                draft_worker=(
+                    None
+                    if draft is None
+                    else SimpleNamespace(
+                        weight_update_runners=lambda: [("draft", draft)]
+                    )
+                ),
             ),
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,

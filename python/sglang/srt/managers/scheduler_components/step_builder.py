@@ -18,11 +18,10 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.scheduler_components.bundles import KvResources
+    from sglang.srt.managers.scheduler_components.bundles import KvResources, Workers
     from sglang.srt.managers.scheduler_components.engine_state import (
         LaunchCounters,
     )
-    from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -36,8 +35,7 @@ class StepBuilder:
         kv: KvResources,
         future_map: FutureMap,
         counters: LaunchCounters,
-        tp_worker: TpModelWorker,
-        model_worker,
+        workers: Workers,
         model_config: ModelConfig,
         spec_algorithm: SpeculativeAlgorithm,
         device: str,
@@ -48,8 +46,8 @@ class StepBuilder:
         self.penalty_store = kv.penalty_store
         self.future_map = future_map
         self.counters = counters
-        self.tp_worker = tp_worker
-        self.model_worker = model_worker
+        self.tp_worker = workers.tp_worker
+        self.model_worker = workers.model_worker
         self.model_config = model_config
         self.spec_algorithm = spec_algorithm
         self.device = device

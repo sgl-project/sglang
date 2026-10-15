@@ -29,7 +29,11 @@ if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.managers.scheduler_components.bundles import KvResources, Streams
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvResources,
+        Streams,
+        Workers,
+    )
     from sglang.srt.managers.scheduler_components.engine_state import (
         EngineFlags,
         LaunchCounters,
@@ -79,8 +83,7 @@ class StepLauncher:
         pp_spec_forward: Optional[PPSpecForward],
         stages: ModeStages,
         scripted_scheduler_hook: Optional[ScriptedSchedulerHook],
-        tp_worker,
-        model_worker,
+        workers: Workers,
         spec_algorithm: SpeculativeAlgorithm,
         is_generation: bool,
         device_module,
@@ -105,8 +108,8 @@ class StepLauncher:
         self.pp_spec_forward = pp_spec_forward
         self.stages = stages
         self.scripted_scheduler_hook = scripted_scheduler_hook
-        self.tp_worker = tp_worker
-        self.model_worker = model_worker
+        self.tp_worker = workers.tp_worker
+        self.model_worker = workers.model_worker
         self.spec_algorithm = spec_algorithm
         self.is_generation = is_generation
         self.device_module = device_module

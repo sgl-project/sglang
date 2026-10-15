@@ -155,6 +155,7 @@ if TYPE_CHECKING:
         KvResources,
         SchedulerServices,
         Streams,
+        Workers,
     )
     from sglang.srt.managers.scheduler_components.engine_state import EngineFlags
     from sglang.srt.managers.scheduler_components.lora_admission import (
@@ -3096,8 +3097,7 @@ class DisaggDecode:
         capacity: KvCapacity,
         streams: Streams,
         services: SchedulerServices,
-        is_hybrid_swa: bool,
-        kv_cache_dtype_str: str,
+        workers: Workers,
         sliding_window_size: Optional[int],
         hisparse_coordinator: Optional[HiSparseCoordinator],
         lora_admission: LoraAdmission,
@@ -3124,6 +3124,8 @@ class DisaggDecode:
         output_streamer = services.output_streamer
         scheduler_stage_metrics = services.scheduler_stage_metrics
         metrics_collector = metrics_sink.metrics_collector
+        is_hybrid_swa = workers.tp_worker.is_hybrid_swa
+        kv_cache_dtype_str = workers.tp_worker.model_runner.kv_cache_dtype_str
         transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
         attn_cp_cpu_group = get_parallel().attn_cp_group.cpu_group
         attn_tp_cpu_group = get_parallel().attn_tp_group.cpu_group

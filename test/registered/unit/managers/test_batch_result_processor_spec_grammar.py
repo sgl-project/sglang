@@ -86,8 +86,10 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         hisparse_coordinator=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        draft_worker=None,
-        model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
+        workers=SimpleNamespace(
+            draft_worker=None,
+            model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
+        ),
         logprob_result_processor=None,
         beam_coordinator=SimpleNamespace(),
         pending=PendingSteps(),

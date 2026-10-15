@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.bundles import (
         KvCapacity,
         KvResources,
+        Workers,
     )
     from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
         DynamicChunkSizer,
@@ -81,7 +82,6 @@ if TYPE_CHECKING:
         RequestRetirer,
     )
     from sglang.srt.managers.scheduler_components.step_builder import StepBuilder
-    from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -194,8 +194,7 @@ class StepPlanner:
         grammar_manager: GrammarManager,
         metrics_sink: MetricsSink,
         ipc_channels: SchedulerIpcChannels,
-        tp_worker: TpModelWorker,
-        draft_worker,
+        workers: Workers,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         mode_owners: ModeOwners,
         request_intake: RequestIntake,
@@ -232,8 +231,8 @@ class StepPlanner:
         self.grammar_manager = grammar_manager
         self.metrics_sink = metrics_sink
         self.ipc_channels = ipc_channels
-        self.tp_worker = tp_worker
-        self.draft_worker = draft_worker
+        self.tp_worker = workers.tp_worker
+        self.draft_worker = workers.draft_worker
         self.decode_offload_manager = decode_offload_manager
         self.request_registry = request_registry
         # A PD role switch replaces the owners in place.

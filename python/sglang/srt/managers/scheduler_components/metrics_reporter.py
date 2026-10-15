@@ -7,7 +7,7 @@ import tempfile
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
 
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.bundles import (
         KvCapacity,
         KvResources,
+        Workers,
     )
     from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.kv_events_publisher import (
@@ -63,7 +64,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.request_registry import (
         RequestRegistry,
     )
-    from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import EmbeddingBatchResult
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -628,8 +628,7 @@ class SchedulerMetricsReporter:
     mode_owners: ModeOwners
     kv: KvResources
     capacity: KvCapacity
-    tp_worker: BaseTpWorker
-    draft_worker: Any
+    workers: Workers
     model_config: ModelConfig
     spec_algorithm: SpeculativeAlgorithm
     device: str
@@ -659,9 +658,9 @@ class SchedulerMetricsReporter:
         if self.metrics_sink.forward_pass_device_timer is None:
             return
         timer = self.metrics_sink.forward_pass_device_timer
-        self.tp_worker.model_runner.device_timer = timer
-        if self.draft_worker is not None:
-            dw = getattr(self.draft_worker, "draft_worker", None)
+        self.workers.tp_worker.model_runner.device_timer = timer
+        if self.workers.draft_worker is not None:
+            dw = getattr(self.workers.draft_worker, "draft_worker", None)
             if dw is not None:
                 if hasattr(dw, "draft_runner"):
                     dw.draft_runner.device_timer = timer
@@ -742,7 +741,7 @@ class SchedulerMetricsReporter:
 
     def _active_spec_config_snapshot(self) -> dict[str, int]:
         """Read the currently active speculative decoding configuration."""
-        draft_worker = self.draft_worker
+        draft_worker = self.workers.draft_worker
         if draft_worker is None:
             return {
                 "num_steps": 0,
@@ -1229,7 +1228,7 @@ class SchedulerMetricsReporter:
             if spec_block_accept_length > 0:
                 msg += f"block accept len: {spec_block_accept_length:.2f}, "
             if self.spec_algorithm.is_dspark():
-                draft_worker = self.draft_worker
+                draft_worker = self.workers.draft_worker
                 if draft_worker is not None:
                     estimate_suffix = draft_worker.block_accept_estimate_log_suffix()
                     if estimate_suffix:
@@ -1424,7 +1423,7 @@ class SchedulerMetricsReporter:
 
         try:
             # Get LoRA memory pool stats
-            lora_manager = self.tp_worker.model_runner.lora_manager
+            lora_manager = self.workers.tp_worker.model_runner.lora_manager
             if lora_manager is None or lora_manager.memory_pool is None:
                 return
 

@@ -102,6 +102,7 @@ _DECLARED = {
         "BatchResultProcessor",
         "LaunchCounters",
         "RequestRetirer",
+        "Workers",
     ],
     "DisaggDecode": [
         "KvResources",
@@ -117,6 +118,7 @@ _DECLARED = {
         "CoreLists",
         "FutureMap",
         "RequestRetirer",
+        "Workers",
     ],
     "DllmManager": [
         "KvResources",
@@ -141,6 +143,7 @@ _DECLARED = {
         "GrammarManager",
         "RequestRetirer",
         "ModeOwners",
+        "Workers",
     ],
     "RequestRegistry": [
         "CoreLists",
@@ -256,7 +259,7 @@ _PARAM = {
     "PendingSteps": ("pending",),
     "KvResources": ("kv",),
     "KvCapacity": ("capacity",),
-    "Workers": ("tp_worker", "model_worker"),
+    "Workers": ("workers",),
     "Streams": ("streams",),
     "SchedulerServices": ("services",),
     "IpcChannels": ("ipc_channels",),

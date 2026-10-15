@@ -11,15 +11,15 @@ from sglang.srt.runtime_context import get_lora
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.managers.scheduler_components.bundles import Workers
 
 
 class LoraAdmission:
     """Admits a LoRA request into a step; prefill admission and PD decode's
     preallocation both ask it."""
 
-    def __init__(self, *, tp_worker: TpModelWorker):
-        self.tp_worker = tp_worker
+    def __init__(self, *, workers: Workers):
+        self.tp_worker = workers.tp_worker
         if get_lora().lora_drain_wait_threshold > 0.0:
             self.lora_drainer = LoRADrainer(
                 get_lora().max_loras_per_batch,

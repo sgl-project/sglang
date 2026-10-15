@@ -20,13 +20,13 @@ from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.bundles import Workers
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         MetricsSink,
     )
     from sglang.srt.managers.scheduler_components.request_registry import (
         RequestRegistry,
     )
-    from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -42,8 +42,7 @@ class UpdateRejected(Exception):
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerInternalStateController:
-    tp_worker: BaseTpWorker
-    draft_worker: Any
+    workers: Workers
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
     max_running_requests: int
@@ -89,14 +88,14 @@ class SchedulerInternalStateController:
         state["last_gen_throughput"] = self.metrics_sink.last_gen_throughput
 
     def _add_memory_usage(self, state: Dict[str, Any]) -> None:
-        draft_worker = self.draft_worker
+        draft_worker = self.workers.draft_worker
         state["memory_usage"] = build_memory_usage(
-            weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
+            weight_gb=self.workers.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
             startup_available_gb=self.startup_available_gpu_memory_gb,
             token_capacity=self.max_total_num_tokens,
             token_capacity_swa=self.swa_tokens_per_layer,
-            target_graph_memory_usage=self.tp_worker.graph_memory_usage,
+            target_graph_memory_usage=self.workers.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=(
                 None if draft_worker is None else draft_worker.graph_memory_usage
             ),
@@ -109,7 +108,9 @@ class SchedulerInternalStateController:
         mode = DisaggregationMode(get_disagg().disaggregation_mode)
         graph_memory = state["memory_usage"]["graph"]
         state["disaggregation_mode"] = mode.value
-        state["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
+        state["decode_cuda_graph_bs"] = (
+            self.workers.tp_worker.get_decode_cuda_graph_bs()
+        )
         state["decode_cuda_graph_memory_gb"] = round(
             sum(graph_memory[phase] for phase in _DECODE_GRAPH_PHASES), 3
         )
@@ -131,8 +132,8 @@ class SchedulerInternalStateController:
         accept_length = self._average_accept_length()
         if accept_length is not None:
             state["avg_spec_accept_length"] = accept_length
-        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
-            info_record = self.draft_worker.dump_info_records()
+        if self.spec_algorithm.is_dspark() and self.workers.draft_worker is not None:
+            info_record = self.workers.draft_worker.dump_info_records()
             if info_record is not None:
                 state["dspark_info_record"] = info_record
 
@@ -228,7 +229,7 @@ class SchedulerInternalStateController:
 
     def _apply_dspark_budget_frac(self, key: str, value: Any) -> None:
         # A worker command, not a server arg: keep it out of the override.
-        self.draft_worker.set_dspark_forced_budget_frac(
+        self.workers.draft_worker.set_dspark_forced_budget_frac(
             None if value is None else float(value)
         )
 
@@ -237,11 +238,11 @@ class SchedulerInternalStateController:
 
     def _apply_dspark_clear_records(self, key: str, value: Any) -> None:
         if value:
-            self.draft_worker.clear_info_records()
+            self.workers.draft_worker.clear_info_records()
 
     def _require_dspark_worker(self, key: str, command: str) -> None:
         if not self.spec_algorithm.is_dspark() or not hasattr(
-            self.draft_worker, command
+            self.workers.draft_worker, command
         ):
             raise UpdateRejected(f"{key} requires a DSpark draft worker.")
 

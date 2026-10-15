@@ -10,7 +10,11 @@ from sglang.srt.speculative.pp_spec_relay import PPSpecRelay
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.managers.scheduler_components.bundles import KvResources, Streams
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvResources,
+        Streams,
+        Workers,
+    )
     from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -26,16 +30,15 @@ class PPSpecForward:
         kv: KvResources,
         streams: Streams,
         future_map,
-        tp_worker,
-        model_worker,
+        workers: Workers,
         pp_group,
         spec_algorithm,
     ):
         self.req_to_token_pool = kv.req_to_token_pool
         self.device = streams.device
         self.future_map = future_map
-        self.tp_worker = tp_worker
-        self.model_worker = model_worker
+        self.tp_worker = workers.tp_worker
+        self.model_worker = workers.model_worker
         self.pp_group = pp_group
         self.spec_algorithm = spec_algorithm
         # The gated PP+spec relay flow's trees, per request slot; None without it.

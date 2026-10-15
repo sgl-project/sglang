@@ -38,7 +38,11 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler_components.bundles import KvResources, Streams
+    from sglang.srt.managers.scheduler_components.bundles import (
+        KvResources,
+        Streams,
+        Workers,
+    )
     from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.mode_stages import (
         DriverOps,
@@ -116,7 +120,7 @@ class PPRing:
         device_module,
         kv: KvResources,
         streams: Streams,
-        tp_worker,
+        workers: Workers,
         future_map,
     ):
         device = streams.device
@@ -137,7 +141,7 @@ class PPRing:
         self.device = device
         self.device_module = device_module
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.tp_worker = tp_worker
+        self.tp_worker = workers.tp_worker
         self.future_map = future_map
         self.schedule_stream = schedule_stream
         self.copy_stream = copy_stream

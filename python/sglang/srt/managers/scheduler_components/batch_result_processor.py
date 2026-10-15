@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.bundles import (
         KvResources,
         SchedulerServices,
+        Workers,
     )
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
@@ -69,7 +70,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
-    from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
         GenerationBatchResult,
@@ -221,8 +221,7 @@ class SchedulerBatchResultProcessor:
     hisparse_coordinator: Optional[HiSparseCoordinator]
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
-    draft_worker: BaseTpWorker
-    model_worker: BaseTpWorker
+    workers: Workers
     logprob_result_processor: SchedulerLogprobResultProcessor
     beam_coordinator: BeamCoordinator
     pending: PendingSteps
@@ -875,7 +874,7 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(
+        self.workers.model_worker.on_verify_complete_cpu(
             num_correct_drafts_per_req, batch_size=len(batch.reqs)
         )
 
@@ -1358,8 +1357,8 @@ class SchedulerBatchResultProcessor:
         if req.finished():
             # isinstance narrowing: create_worker may also return plain
             # TpModelWorker-based drafts, which carry no spec-worker hooks.
-            if isinstance(self.draft_worker, BaseSpecWorker):
-                self.draft_worker.note_request_finished(
+            if isinstance(self.workers.draft_worker, BaseSpecWorker):
+                self.workers.draft_worker.note_request_finished(
                     rid=req.rid,
                     natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
                 )

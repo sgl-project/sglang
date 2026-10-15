@@ -638,8 +638,7 @@ def assemble_scheduler(
             kv=kv,
             streams=streams,
             future_map=future_map,
-            tp_worker=tp_worker,
-            model_worker=model_worker,
+            workers=workers,
             pp_group=pp_group,
             spec_algorithm=spec_algorithm,
         )
@@ -654,7 +653,7 @@ def assemble_scheduler(
     )
 
     # Components, each built after the ones it takes
-    lora_admission = LoraAdmission(tp_worker=tp_worker)
+    lora_admission = LoraAdmission(workers=workers)
     grammar_manager = GrammarManager(
         server_args=server_args,
         tokenizer=tokenizer,
@@ -700,8 +699,7 @@ def assemble_scheduler(
         kv=kv,
         future_map=future_map,
         counters=counters,
-        tp_worker=tp_worker,
-        model_worker=model_worker,
+        workers=workers,
         model_config=model_config,
         spec_algorithm=spec_algorithm,
         device=device,
@@ -782,8 +780,7 @@ def assemble_scheduler(
         hisparse_coordinator=mode_owners.hisparse_coordinator,
         decode_offload_manager=decode_offload_manager,
         metrics_collector=metrics_collector,
-        draft_worker=draft_worker,
-        model_worker=model_worker,
+        workers=workers,
         logprob_result_processor=SchedulerLogprobResultProcessor(
             model_config=model_config
         ),
@@ -927,7 +924,7 @@ def assemble_scheduler(
         transfer_backend=transfer_backend,
         tokenizer=tokenizer,
         mm_processor=mm_processor,
-        pad_input_ids_func=tp_worker.get_pad_input_ids_func(),
+        workers=workers,
         dp_tp_group=dp_tp_group,
         max_req_len=max_req_len,
         max_req_input_len=max_req_input_len,
@@ -955,8 +952,7 @@ def assemble_scheduler(
         grammar_manager=grammar_manager,
         metrics_sink=metrics_sink,
         ipc_channels=ipc_channels,
-        tp_worker=tp_worker,
-        draft_worker=draft_worker,
+        workers=workers,
         decode_offload_manager=decode_offload_manager,
         mode_owners=mode_owners,
         request_intake=request_intake,
@@ -984,8 +980,7 @@ def assemble_scheduler(
     )
     # Built after the request registry and the mode owners, which they read.
     weight_updater = SchedulerWeightUpdaterManager(
-        tp_worker=tp_worker,
-        draft_worker=draft_worker,
+        workers=workers,
         memory_saver_adapter=memory_saver_adapter,
         flush_cache=step_planner.flush_cache,
         request_registry=request_registry,
@@ -1003,7 +998,7 @@ def assemble_scheduler(
         max_total_num_tokens=capacity.widened_max_total_num_tokens,
         max_running_requests=max_running_requests,
         pool_stats_observer=pool_stats_observer,
-        tp_worker=tp_worker,
+        workers=workers,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         spec_algorithm=spec_algorithm,
         policy=policy,
@@ -1023,8 +1018,7 @@ def assemble_scheduler(
         mode_owners=mode_owners,
         kv=kv,
         capacity=capacity,
-        tp_worker=tp_worker,
-        draft_worker=draft_worker,
+        workers=workers,
         model_config=model_config,
         spec_algorithm=spec_algorithm,
         device=device,
@@ -1053,8 +1047,7 @@ def assemble_scheduler(
     )
     # Reads the startup time.
     internal_state = SchedulerInternalStateController(
-        tp_worker=tp_worker,
-        draft_worker=draft_worker,
+        workers=workers,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         spec_algorithm=spec_algorithm,
         max_running_requests=max_running_requests,
@@ -1145,7 +1138,7 @@ def build_pp_ring(parts: SchedulerParts, stages: ModeStages, ops: DriverOps) -> 
         device_module=parts.device_module,
         kv=parts.kv,
         streams=parts.streams,
-        tp_worker=parts.workers.tp_worker,
+        workers=parts.workers,
         future_map=parts.future_map,
     )
 
@@ -1312,7 +1305,7 @@ def maybe_init_disagg_prefill(
         capacity=parts.capacity,
         streams=parts.streams,
         services=parts.services,
-        kv_cache_dtype_str=parts.workers.tp_worker.model_runner.kv_cache_dtype_str,
+        workers=parts.workers,
         rust_http_port=(
             parts.rust_server.http_port if parts.rust_server is not None else None
         ),
@@ -1344,8 +1337,7 @@ def maybe_init_disagg_decode(
         capacity=parts.capacity,
         streams=parts.streams,
         services=parts.services,
-        is_hybrid_swa=parts.workers.tp_worker.is_hybrid_swa,
-        kv_cache_dtype_str=parts.workers.tp_worker.model_runner.kv_cache_dtype_str,
+        workers=parts.workers,
         sliding_window_size=parts.sliding_window_size,
         hisparse_coordinator=parts.mode_owners.hisparse_coordinator,
         lora_admission=parts.lora_admission,
@@ -1478,8 +1470,7 @@ def init_step_launcher(parts: SchedulerParts, stages: ModeStages) -> StepLaunche
         pp_spec_forward=parts.pp_spec_forward,
         stages=stages,
         scripted_scheduler_hook=parts.scripted_scheduler_hook,
-        tp_worker=parts.workers.tp_worker,
-        model_worker=parts.workers.model_worker,
+        workers=parts.workers,
         spec_algorithm=parts.spec_algorithm,
         is_generation=parts.is_generation,
         device_module=parts.device_module,

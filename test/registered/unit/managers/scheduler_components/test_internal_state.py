@@ -30,8 +30,7 @@ def _prefill_registry(transfer) -> RequestRegistry:
 
 def _controller(registry: RequestRegistry) -> SchedulerInternalStateController:
     return SchedulerInternalStateController(
-        tp_worker=None,
-        draft_worker=None,
+        workers=SimpleNamespace(tp_worker=None, draft_worker=None),
         token_to_kv_pool_allocator=None,
         spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
         max_running_requests=0,

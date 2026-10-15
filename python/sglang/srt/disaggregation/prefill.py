@@ -106,6 +106,7 @@ if TYPE_CHECKING:
         KvResources,
         SchedulerServices,
         Streams,
+        Workers,
     )
     from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
     from sglang.srt.managers.scheduler_components.output_streamer import (
@@ -605,7 +606,7 @@ class DisaggPrefill:
         capacity: KvCapacity,
         streams: Streams,
         services: SchedulerServices,
-        kv_cache_dtype_str: str,
+        workers: Workers,
         rust_http_port: Optional[int],
         transfer_backend: TransferBackend,
         attn_cp_cpu_group: Any,
@@ -630,6 +631,7 @@ class DisaggPrefill:
         output_streamer = services.output_streamer
         metrics_sink = services.metrics_sink
         metrics_collector = metrics_sink.metrics_collector
+        kv_cache_dtype_str = workers.tp_worker.model_runner.kv_cache_dtype_str
         self.num_kv_heads = model_config.num_key_value_heads
         self.spec_algorithm = spec_algorithm
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator

@@ -34,7 +34,9 @@ def make_request_intake(**deps) -> RequestIntake:
         transfer_backend=TransferBackend.MOONCAKE,
         tokenizer=None,
         mm_processor=None,
-        pad_input_ids_func=None,
+        workers=SimpleNamespace(
+            tp_worker=SimpleNamespace(get_pad_input_ids_func=lambda: None)
+        ),
         dp_tp_group=SimpleNamespace(cpu_group=None, rank_in_group=0, first_rank=0),
         max_req_len=4096,
         max_req_input_len=4095,

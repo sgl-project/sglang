@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.bundles import (
         KvCapacity,
         KvResources,
+        Workers,
     )
     from sglang.srt.managers.scheduler_components.engine_state import (
         LaunchCounters,
@@ -115,7 +116,7 @@ class RequestIntake:
         transfer_backend: TransferBackend,
         tokenizer: Any,
         mm_processor: Any,
-        pad_input_ids_func: Any,
+        workers: Workers,
         dp_tp_group: Any,
         max_req_len: int,
         max_req_input_len: int,
@@ -144,7 +145,7 @@ class RequestIntake:
         self.transfer_backend = transfer_backend
         self.tokenizer = tokenizer
         self._mm_processor = mm_processor
-        self.pad_input_ids_func = pad_input_ids_func
+        self.pad_input_ids_func = workers.tp_worker.get_pad_input_ids_func()
         self.dp_tp_group = dp_tp_group
         self.dp_tp_cpu_group = dp_tp_group.cpu_group
         self.max_req_len = max_req_len
