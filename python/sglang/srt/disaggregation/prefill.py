@@ -747,7 +747,7 @@ class DisaggPrefill:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                 # The bootstrap failure the abort causes retires it.
-                self.request_retirer.abandon_attempt(req, release_kv=False)
+                self.request_retirer.abort_queued_attempt(req)
 
                 if hasattr(self.kv_senders[req.rid], "abort"):
                     self.kv_senders[req.rid].abort()
@@ -1699,7 +1699,7 @@ class DisaggPrefill:
         )
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
-        self.request_retirer.abandon_attempt(req, release_kv=True)
+        self.request_retirer.requeue_attempt(req)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.disagg.start_send_idx = 0

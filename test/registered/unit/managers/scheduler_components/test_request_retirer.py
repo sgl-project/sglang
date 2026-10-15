@@ -19,8 +19,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
@@ -288,6 +290,46 @@ class TestOverLengthEmbeddingIsRejected(CustomTestCase):
         self.assertIsInstance(req.to_finish, FINISH_ABORT)
         self.assertEqual(req.to_finish.status_code, HTTPStatus.BAD_REQUEST)
         self.assertIn("exceeds the maximum allowed length", req.to_finish.message)
+
+
+class TestOptimisticRequeueKeepsMedia(CustomTestCase):
+    """A PD prefill request requeued for another optimistic attempt ends this
+    attempt's cache request and frees its KV, but keeps its media for the
+    retry."""
+
+    def test_requeued_request_keeps_its_media(self):
+        enter_scope(self, published_topology(optimistic_prefill_attempts=4))
+        retirer = _retirer()
+        owner = prefill_owner_shell(
+            tree_cache=retirer.tree_cache,
+            request_retirer=retirer,
+            req_to_metadata_buffer_idx_allocator=Mock(),
+            metrics_sink=SimpleNamespace(enable_metrics=False),
+            counters=LaunchCounters(),
+        )
+        item = _image_item()
+        req = Req("retry", "", [1, 2, 3], SamplingParams())
+        req.disagg = DisaggReqState(metadata_buffer_index=0)
+        req.multimodal_inputs = MultimodalInputs(mm_items=[item])
+        req.kv.req_pool_idx = 1
+        handle = req.cache_request_handle
+
+        def release_kv(req, tree_cache, *, checkpoint):
+            self.assertFalse(checkpoint)
+            req.kv.req_pool_idx = None
+
+        with (
+            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
+            patch(f"{_RETIRER}.release_kv_cache", side_effect=release_kv),
+        ):
+            waiting = owner.optimistic_release_and_requeue(req, [])
+
+        self.assertEqual(waiting, [req])
+        retirer.tree_cache.finish.assert_called_once_with(
+            handle, CacheRequestOutcome.ABORT
+        )
+        self.assertIs(req.multimodal_inputs.mm_items[0], item)
+        self.assertTrue(torch.equal(item.feature, torch.ones(2)))
 
 
 if __name__ == "__main__":

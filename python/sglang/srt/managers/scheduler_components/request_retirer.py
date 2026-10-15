@@ -145,13 +145,18 @@ class RequestRetirer:
         commit finishes it (the beam commit retires a beam group)."""
         req.set_finish_with_abort(error_msg, status_code=status_code, err_type=err_type)
 
-    def abandon_attempt(self, req: Req, *, release_kv: bool) -> None:
-        """End this attempt's cache request; the request stays, in a queue its
-        owner drains, or is requeued for another attempt (``release_kv``
-        frees the KV the attempt holds, without inserting it)."""
+    def abort_queued_attempt(self, req: Req) -> None:
+        """An abort of a request still in a PD queue that owns its exit: its
+        media and session go and its cache request ends now; the queue retires
+        it when the abort reaches its transfer."""
         self.release_aborted_request(req)
-        if release_kv:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+
+    def requeue_attempt(self, req: Req) -> None:
+        """A PD prefill request requeued for another attempt: this attempt's
+        cache request ends and its KV goes back without an insert; its media
+        and session stay for the retry."""
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
 
     def retract(
         self, req: Req, *, num_remaining_reqs: int, offload_kv: bool = True

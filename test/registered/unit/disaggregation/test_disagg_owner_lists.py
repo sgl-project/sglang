@@ -153,9 +153,7 @@ class TestDisaggPrefillLists(CustomTestCase):
 
         bootstrap.abort(AbortReq(rid="r"))
 
-        owner.request_retirer.abandon_attempt.assert_called_once_with(
-            req, release_kv=False
-        )
+        owner.request_retirer.abort_queued_attempt.assert_called_once_with(req)
         owner.kv_senders["r"].abort.assert_called_once_with()
         owner.kv_senders["other"].abort.assert_not_called()
 
