@@ -73,13 +73,6 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
-register_kernel(
-    KernelSpec(
-        op="layernorm.rms_normalize_triton",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.layernorm.rms_normalize_hip:rms_normalize_triton",
-    )
-)
 
 register_kernel(
     KernelSpec(
