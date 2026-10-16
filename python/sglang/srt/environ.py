@@ -1675,6 +1675,12 @@ class Envs:
     # LSA pulls, so with an fp8 gather it widens on the way in rather than in a
     # second kernel. Only read when the fused path is on.
     SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT = EnvStr("lsa")
+    # Seconds the fused wo_b's self-test may spend in its device phases. They end
+    # in cross-rank barriers with no timeout of their own, so a stack whose SDMA
+    # queues exist but never complete wedges every rank there; past this the path
+    # is turned off instead. A healthy self-test is well under a second -- the
+    # compile already happened in warmup -- so this is a loose upper bound.
+    SGLANG_OPT_FUSED_WO_B_AR_SELF_TEST_TIMEOUT_S = EnvFloat(60.0)
     # Debug: log the distribution of M the fused wo_b is offered. M is the token
     # count of one forward, not of one request, so this is the only way to see
     # what the scheduler actually batches.

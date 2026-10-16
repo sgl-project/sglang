@@ -10,7 +10,10 @@ all-gather still run as their own kernels.
 A mori built with ``BUILD_CCO_SDMA=OFF`` compiles the puts out, and then the
 all-reduce returns mostly the local slice while the model still answers -- and
 measures *faster*, having moved no bytes. ``GemmAllReduceOp.self_test()`` is
-what catches that; the flag has been ON by default since ROCm/mori#710.
+what catches that; the flag has been ON by default since ROCm/mori#710. That
+check is run under a deadline here, because a stack whose SDMA queues accept
+puts without ever completing them wedges it in a cross-rank barrier instead --
+see ``_FusedWoB.self_test``.
 
 Needs ``MORI_ENABLE_SDMA=1`` at process start and a layer one of the two gfx950
 mxfp8 routes prepared -- see ``mxfp8_route``.
@@ -527,8 +530,51 @@ class _FusedWoB:
         Outside ``__init__`` because it is a *device-side* collective, and so
         may only run once every rank is known to hold an op. See
         ``_construct_collectively``.
+
+        Bounded, because mori's own check ends in ``synchronize()`` on phases
+        that end in cross-rank barriers: a stack whose SDMA queues exist but
+        whose copies never land spins there with no timeout and no error, and
+        the server never opens its port. Running it on a side thread leaves
+        this one free to give up -- ``synchronize()`` releases the GIL.
+
+        **A timeout does not make the process healthy.** The device stream
+        stays wedged and the thread stays stuck; what this buys is a named
+        failure and a fused path that every rank agrees to turn off, instead of
+        a silent hang. The thread is left to leak on purpose: it holds the
+        stream this would otherwise free.
         """
-        self.op.self_test()
+        import threading
+
+        timeout = envs.SGLANG_OPT_FUSED_WO_B_AR_SELF_TEST_TIMEOUT_S.get()
+        failure: list[BaseException] = []
+        # Both are thread-local in torch, and a fresh thread gets device 0 and
+        # its default stream. Carry this rank's over, or every rank but 0 runs
+        # its phases against the wrong GPU.
+        device = torch.cuda.current_device()
+        stream = torch.cuda.current_stream()
+
+        def run():
+            try:
+                torch.cuda.set_device(device)
+                with torch.cuda.stream(stream):
+                    self.op.self_test()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                failure.append(exc)
+
+        thread = threading.Thread(target=run, daemon=True, name="mori-wo-b-selftest")
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            raise TimeoutError(
+                f"mori fused wo_b self-test did not finish in {timeout:g}s. Its "
+                "device phases end in cross-rank barriers, so this is what an "
+                "SDMA queue that accepts puts but never completes them looks "
+                "like. Check MORI_ENABLE_SDMA=1, that mori was built with "
+                "BUILD_CCO_SDMA=ON, and the driver's SDMA support. This GPU "
+                "stream is wedged whatever happens next."
+            )
+        if failure:
+            raise failure[0]
 
     def pad_rows(self, x: torch.Tensor, m_pad: int) -> torch.Tensor:
         return self.op.pad_rows(x, m_pad)
@@ -566,12 +612,14 @@ def _construct_collectively(m_max: int, n: int, k: int) -> bool:
     before launching its phases left the peers that did launch spinning in
     ``synchronize()``, never reaching the CPU agreement at all.
 
-    What this cannot cover is a failure *inside* the device phases, once the
-    peers are already in the barrier -- no host-side agreement around a
+    What this cannot *recover* from is a failure inside the device phases, once
+    the peers are already in the barrier -- no host-side agreement around a
     collective can. Both failures the review named happen before that point
     (``create_dev_comm`` losing an SDMA queue, the FlyDSL compile raising), and
-    the stages are cut so that each lands in a window that agrees. Beyond them
-    a watchdog is the only recourse.
+    the stages are cut so that each lands in a window that agrees. The one that
+    does not, an SDMA queue that accepts puts and never completes them, is at
+    least reported rather than hung: ``self_test`` is bounded, and a rank that
+    gives up there still reaches this agreement over the CPU group.
 
     Construction is attempted once per process. A failure disables the path for
     good rather than being retried: every retry is another broadcast, another
@@ -602,12 +650,17 @@ def _construct_collectively(m_max: int, n: int, k: int) -> bool:
         return False
 
     # Every rank holds a compiled op, so the device phases are safe to launch.
+    # A timeout here means they are still running, so the window stays.
+    wedged = False
     try:
         state.self_test()
+    except TimeoutError as exc:
+        err = exc
+        wedged = True
     except Exception as exc:  # noqa: BLE001 - reported below, then disabled
         err = exc
     if not _agreed(tp, err is None):
-        _disable(tp, state, err, "self-tested")
+        _disable(tp, state, err, "self-tested", release=not wedged)
         return False
 
     _state = state
@@ -623,21 +676,29 @@ def _agreed(tp, ok: bool) -> bool:
     return bool(flag.item())
 
 
-def _disable(tp, state, err, stage: str) -> None:
+def _disable(tp, state, err, stage: str, release: bool = True) -> None:
     """Turn the path off here because some rank could not get this far.
 
     Releases this rank's op even when it built one, and every weight copy any
     model prepared: holding the window's reservation and ~840 MiB of copies for
     a path nothing may call costs the process that memory for nothing.
+
+    ``release=False`` leaks the window on purpose, for the one caller whose
+    phases may still be running: freeing memory a live kernel addresses faults
+    the process. The prepared copies go either way -- the stranded phases read
+    the window and the dev-comm, never a weight.
     """
     global _disabled
 
     _disabled = True
-    if state is not None:
+    if state is not None and release:
         state.close()
     release_all_prepared()
     if err is not None:
-        logger.warning(
+        # Not holding the window means its phases never ended, which outranks a
+        # fallback: nothing else on this stream will run either.
+        log = logger.warning if release else logger.error
+        log(
             "mori fused wo_b could not be %s on rank %d; the fused path is off "
             "for this process on every rank: %s",
             stage,
