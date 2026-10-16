@@ -6,15 +6,17 @@ import json
 import logging
 import os
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.environ import envs
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
     get_mm,
     get_model,
     get_observability,
+    get_schedule,
     get_serving,
 )
 from sglang.version import __version__
@@ -27,7 +29,10 @@ logger = logging.getLogger(__name__)
 
 
 def _build_server_args(
-    scheduler: Scheduler, *, extension: Optional[ModuleType] = None
+    scheduler: Scheduler,
+    *,
+    extension: Optional[ModuleType] = None,
+    health_generate_headers: Optional[Dict[str, str]] = None,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -74,6 +79,13 @@ def _build_server_args(
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        health_generate_headers=dict(health_generate_headers or {}),
+        default_priority_value=(
+            get_schedule().default_priority_value
+            if get_schedule().enable_priority_scheduling
+            else None
+        ),
+        enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(
@@ -106,6 +118,13 @@ def _build_server_args(
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        # Every process writes its prometheus_client samples under this
+        # directory (set before the schedulers start); `/metrics` merges them.
+        metrics=(
+            ext.MetricsConfig(multiproc_dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+            if get_observability().enable_metrics
+            else None
+        ),
     )
 
 

@@ -1,17 +1,21 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
-//! (+ `/model_info` alias), backed by typed operations on
+//! (+ `/model_info` alias), `/weights_checker`, backed by typed operations on
 //! [`crate::api_server::core::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
 
 use axum::{
-    Router,
+    Json, Router,
+    body::Bytes,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
+use serde::Deserialize;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use super::app::AppState;
@@ -29,6 +33,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // alias).
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
+        .route("/weights_checker", get(check_weights).post(check_weights))
 }
 
 /// Await the core's complete semantic server-info result. HTTP status and
@@ -92,6 +97,116 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
                 .into_response()
         }
     }
+}
+
+/// Python's `CheckWeightsReqInput` body, every field optional.
+#[derive(Deserialize)]
+#[serde(default)]
+struct CheckWeightsBody {
+    action: String,
+    allow_quant_error: bool,
+    skip_tensor_list: Option<Vec<String>>,
+    selector: CheckWeightsSelector,
+}
+
+impl Default for CheckWeightsBody {
+    fn default() -> Self {
+        Self {
+            action: "checksum".into(),
+            allow_quant_error: false,
+            skip_tensor_list: None,
+            selector: CheckWeightsSelector::All,
+        }
+    }
+}
+
+/// Which runners the check applies to (Python's `selector` literal).
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CheckWeightsSelector {
+    Target,
+    Draft,
+    All,
+}
+
+impl CheckWeightsSelector {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Target => "target",
+            Self::Draft => "draft",
+            Self::All => "all",
+        }
+    }
+}
+
+/// `GET|POST /weights_checker` — every scheduler rank runs the weight
+/// checker's `action` (default `checksum`) on the `selector` runners. Python's
+/// body: `success` and `message`, plus each rank's record as `ranks` and the
+/// SHA-256 of their `per_gpu_checksum`s, in rank order, as
+/// `per_engine_checksum` when the ranks returned records. 200 on success,
+/// else 400. An absent or `null` body checks with every default.
+async fn check_weights(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let body = if body.is_empty() {
+        CheckWeightsBody::default()
+    } else {
+        match serde_json::from_slice::<Option<CheckWeightsBody>>(&body) {
+            Ok(body) => body.unwrap_or_default(),
+            Err(error) => {
+                return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false);
+            }
+        }
+    };
+    let outcome = match state
+        .core
+        .check_weights(
+            body.action,
+            body.allow_quant_error,
+            body.skip_tensor_list,
+            body.selector.as_str().to_owned(),
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(CoreError::Unavailable) => {
+            return native_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable",
+                false,
+            );
+        }
+        Err(error) => return native_error(error.http_status(), &error.to_string(), false),
+    };
+    let status = if outcome.success {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    let mut response = Map::new();
+    response.insert("success".into(), outcome.success.into());
+    response.insert("message".into(), outcome.message.into());
+    if let Some(ranks) = outcome.payload {
+        let mut digest = Sha256::new();
+        for rank in &ranks {
+            let Some(checksum) = rank.get("per_gpu_checksum").and_then(Value::as_str) else {
+                tracing::error!("weights_checker: a rank record has no per_gpu_checksum");
+                return native_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "bad weights_checker response",
+                    false,
+                );
+            };
+            digest.update(checksum.as_bytes());
+        }
+        response.insert(
+            "ranks".into(),
+            Value::Array(ranks.into_iter().map(Value::Object).collect()),
+        );
+        response.insert(
+            "per_engine_checksum".into(),
+            format!("{:x}", digest.finalize()).into(),
+        );
+    }
+    (status, Json(Value::Object(response))).into_response()
 }
 
 #[cfg(test)]
@@ -319,6 +434,163 @@ mod tests {
             "uncontracted scheduler fields must not silently become public API"
         );
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// `/weights_checker` relays one `CheckWeightsReqInput` carrying the body's
+    /// fields (Python's defaults for a missing body) and answers with Python's
+    /// JSON: the rank records as sent, in order, with the SHA-256 of their
+    /// `per_gpu_checksum`s; no `ranks` when no rank sent one; 400 on failure.
+    /// A malformed body is refused before anything reaches the scheduler.
+    #[tokio::test]
+    async fn weights_checker_relays_the_scheduler_outcome() {
+        fn rank(checksum: &str, tp_rank: i64) -> rmpv::Value {
+            let info = rmpv::Value::Map(
+                [
+                    ("role", rmpv::Value::from("target")),
+                    ("tp_rank", rmpv::Value::from(tp_rank)),
+                    ("tp_size", rmpv::Value::from(2)),
+                ]
+                .into_iter()
+                .map(|(key, value)| (rmpv::Value::from(key), value))
+                .collect(),
+            );
+            rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::from("checksums"),
+                    rmpv::Value::Map(vec![(
+                        rmpv::Value::from("model.w"),
+                        rmpv::Value::from(checksum),
+                    )]),
+                ),
+                (
+                    rmpv::Value::from("per_gpu_checksum"),
+                    rmpv::Value::from(checksum),
+                ),
+                (
+                    rmpv::Value::from("parallelism_info"),
+                    rmpv::Value::Array(vec![info]),
+                ),
+            ])
+        }
+        let ranks = rmpv::Value::Array(vec![rank("a", 0), rank("b", 1)]);
+        let ranks_json = serde_json::json!([
+            {"checksums": {"model.w": "a"}, "per_gpu_checksum": "a",
+             "parallelism_info": [{"role": "target", "tp_rank": 0, "tp_size": 2}]},
+            {"checksums": {"model.w": "b"}, "per_gpu_checksum": "b",
+             "parallelism_info": [{"role": "target", "tp_rank": 1, "tp_size": 2}]},
+        ]);
+        for (method, body, request, outcome, status, response_body) in [
+            (
+                "POST",
+                r#"{"action": "fingerprint", "allow_quant_error": true,
+                    "skip_tensor_list": ["lm_head"], "selector": "target", "rid": "x"}"#,
+                ("fingerprint", true, Some("lm_head"), "target"),
+                (true, "Success.", ranks.clone()),
+                StatusCode::OK,
+                serde_json::json!({
+                    "success": true,
+                    "message": "Success.",
+                    "ranks": ranks_json,
+                    "per_engine_checksum":
+                        "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603",
+                }),
+            ),
+            (
+                "GET",
+                "",
+                ("checksum", false, None, "all"),
+                (false, "rank 1 failed", rmpv::Value::Nil),
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"success": false, "message": "rank 1 failed"}),
+            ),
+            (
+                "POST",
+                "null",
+                ("checksum", false, None, "all"),
+                (true, "Success.", rmpv::Value::Array(vec![])),
+                StatusCode::OK,
+                serde_json::json!({
+                    "success": true,
+                    "message": "Success.",
+                    "ranks": [],
+                    "per_engine_checksum":
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                }),
+            ),
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let response = tokio::spawn(
+                routes().with_state(state).oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri("/weights_checker")
+                        .body(Body::from(body))
+                        .unwrap(),
+                ),
+            );
+            let TmEvent::Intake {
+                request: runtime_request,
+                admission,
+            } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("weights_checker must submit one control request");
+            };
+            assert!(admission.try_accept());
+            let RequestKind::Control(control) = &runtime_request.kind else {
+                panic!("weights_checker must submit a control request");
+            };
+            let header = control.encode().unwrap();
+            let header = rmpv::decode::read_value(&mut &header[..]).unwrap();
+            assert_eq!(header[0].as_str(), Some("CheckWeightsReqInput"));
+            assert_eq!(header[3].as_str(), Some(request.0), "{body}");
+            assert_eq!(header[4].as_bool(), Some(request.1), "{body}");
+            assert_eq!(header[5][0].as_str(), request.2, "{body}");
+            assert_eq!(header[6].as_str(), Some(request.3), "{body}");
+
+            let mut payload = Vec::new();
+            rmpv::encode::write_value(
+                &mut payload,
+                &rmpv::Value::Map(vec![
+                    (rmpv::Value::from("rid"), rmpv::Value::from("x")),
+                    (rmpv::Value::from("http_worker_ipc"), rmpv::Value::Nil),
+                    (rmpv::Value::from("success"), rmpv::Value::from(outcome.0)),
+                    (rmpv::Value::from("message"), rmpv::Value::from(outcome.1)),
+                    (rmpv::Value::from("payload"), outcome.2),
+                ]),
+            )
+            .unwrap();
+            runtime_request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(payload)))
+                .unwrap();
+
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), status, "{body}");
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            // Field order too: Python's response is an ordered dict.
+            assert_eq!(
+                std::str::from_utf8(&bytes).unwrap(),
+                response_body.to_string(),
+                "{body}"
+            );
+        }
+
+        for body in [r#"{"selector": "both"}"#, r#"{"action": null}"#, "{"] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let response = routes()
+                .with_state(state)
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/weights_checker")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert!(intake_rx.try_recv().is_err(), "{body}");
+        }
     }
 
     #[tokio::test]

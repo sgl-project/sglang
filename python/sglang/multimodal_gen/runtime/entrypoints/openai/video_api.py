@@ -360,6 +360,14 @@ async def _save_first_input_image(
     )
 
 
+async def _upload_and_cleanup_videos(paths: list[str]) -> list[str | None]:
+    return list(
+        await asyncio.gather(
+            *(cloud_storage.upload_and_cleanup(path) for path in paths)
+        )
+    )
+
+
 async def _dispatch_job_async(
     job_id: str,
     batch: Req,
@@ -397,19 +405,31 @@ async def _dispatch_job_async(
                     )
             raise
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        cloud_urls = await _upload_and_cleanup_videos(save_file_path_list)
+        if not output_persistent and not all(cloud_urls):
+            # The temp output dir is removed in `finally`, so an output that was
+            # not uploaded would be unretrievable once the job reports completed.
+            raise RuntimeError(
+                "Video output could not be published: no output_path is configured "
+                "and cloud storage upload is disabled or failed."
+            )
 
-        persistent_path = (
-            save_file_path if not cloud_url and output_persistent else None
-        )
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
-            "url": cloud_url,
-            "file_path": persistent_path,
+            "url": cloud_urls[0],
+            "urls": cloud_urls,
+            "file_path": (
+                os.path.abspath(save_file_path)
+                if not cloud_urls[0] and output_persistent
+                else None
+            ),
             "file_paths": (
-                [os.path.abspath(path) for path in save_file_path_list]
+                [
+                    None if url else os.path.abspath(path)
+                    for path, url in zip(save_file_path_list, cloud_urls)
+                ]
                 if output_persistent
                 else None
             ),
@@ -428,6 +448,7 @@ async def _dispatch_job_async(
                 "status": "failed",
                 "error": {"message": str(e)},
                 "url": None,
+                "urls": None,
                 "file_path": None,
                 "file_paths": None,
                 "num_outputs": None,
@@ -829,17 +850,33 @@ async def delete_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
+def _parse_video_variant_index(variant: str | None) -> int | None:
+    try:
+        return 0 if variant is None else int(variant)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_video_variant_url(job: dict, variant: str | None) -> str | None:
+    urls = job.get("urls")
+    if urls:
+        variant_index = _parse_video_variant_index(variant)
+        if variant_index is not None and 0 <= variant_index < len(urls):
+            return urls[variant_index]
+        return None
+    if _parse_video_variant_index(variant) != 0:
+        return None
+    return job.get("url")
+
+
 def _select_video_variant_path(job: dict, variant: str | None) -> str | None:
     file_paths = job.get("file_paths")
     if file_paths:
-        try:
-            variant_index = 0 if variant is None else int(variant)
-        except (TypeError, ValueError):
-            return None
-        if 0 <= variant_index < len(file_paths):
+        variant_index = _parse_video_variant_index(variant)
+        if variant_index is not None and 0 <= variant_index < len(file_paths):
             return file_paths[variant_index]
         return None
-    if variant not in (None, "0", 0):
+    if _parse_video_variant_index(variant) != 0:
         return None
     return job.get("file_path")
 
@@ -852,10 +889,11 @@ async def download_video_content(
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    if job.get("url"):
+    cloud_url = _select_video_variant_url(job, variant)
+    if cloud_url:
         raise HTTPException(
             status_code=400,
-            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
+            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {cloud_url}",
         )
 
     file_path = _select_video_variant_path(job, variant)

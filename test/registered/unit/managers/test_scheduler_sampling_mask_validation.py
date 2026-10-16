@@ -34,6 +34,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.tokenizer = None
                 scheduler.dllm_config = None
                 scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+                scheduler._record_kv_event_lora_name = MagicMock()
                 scheduler.spec_algorithm = SimpleNamespace(
                     is_dflash_family=lambda: False,
                     is_uno=lambda: False,

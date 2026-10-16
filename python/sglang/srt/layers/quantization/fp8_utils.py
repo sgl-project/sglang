@@ -54,6 +54,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.utils import LazyImport
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -252,7 +253,9 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module.
+    _raw_bmm_fp8_batched = LazyImport("flashinfer", "bmm_fp8")
 
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
     def _bmm_fp8_batched_op(
@@ -1449,6 +1452,11 @@ def aiter_w8a8_block_fp8_linear(
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    # DP-attention idle ranks run zero-token forwards (eager has no padded graph
+    # bucket); CK blockscale GEMM fails M == 0 with invalid configuration argument.
+    if input_2d.shape[0] == 0:
+        return input.new_empty(output_shape, dtype=output_dtype)
 
     # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
     # beats the block-fp8 GEMMs at decode-sized M
@@ -1524,15 +1532,13 @@ def aiter_w8a8_block_fp8_linear(
         weight,
         x_scale,
         weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        dtype=output_dtype,
     )
 
     if bias is not None:
         output += bias
 
-    return output.to(
-        dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
-    ).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(
