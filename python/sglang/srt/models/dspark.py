@@ -19,12 +19,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    builds_confidence_head,
+    falls_back_without_confidence_weights,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
-)
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
 )
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
@@ -353,13 +351,8 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if not builds_confidence_head(config):
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
     hidden_size = int(config.hidden_size)
     markov_rank = int(getattr(config, "markov_rank", 0))
     with_markov = bool(getattr(config, "confidence_head_with_markov", markov_rank > 0))
@@ -510,6 +503,13 @@ class DSparkDraftMixin:
         params_dict: dict,
     ) -> None:
         if self.confidence_head is None:
+            return
+        if not confidence_weights and falls_back_without_confidence_weights():
+            logger.warning(
+                "DSpark draft checkpoint ships no confidence-head weights; the "
+                "ragged-verify scheduler uses the online acceptance estimator."
+            )
+            self.confidence_head = None
             return
         loaded_names = set()
         for name, loaded_weight in confidence_weights:

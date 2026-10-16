@@ -29,6 +29,7 @@ _TRITON_KERNELS = [
     ("lilicorr", "lilicorr_topk_lse"),
     ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
+    ("acceptance_estimator", "draft_top_log_odds"),
     ("row_argmax", "row_argmax"),
     ("reconstruct_tree", "reconstruct_indices_from_tree_mask_triton"),
 ]

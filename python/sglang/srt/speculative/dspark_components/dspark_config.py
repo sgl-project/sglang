@@ -31,6 +31,38 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
 
 
+def builds_confidence_head(draft_hf_config: Any) -> bool:
+    """Whether the draft builds its trained confidence head; without one, the
+    ragged-verify scheduler runs on the online acceptance estimator."""
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+        return False
+    source = get_spec().speculative_dspark_confidence_source
+    if source == "online":
+        return False
+    if (
+        source == "auto"
+        and _cfg_get(draft_hf_config, "enable_confidence_head") is False
+    ):
+        return False
+    if _cfg_get(draft_hf_config, "enable_confidence_head") is None:
+        logger.warning(
+            "DSpark draft config has no enable_confidence_head field; treating the "
+            "confidence head as enabled."
+        )
+    return True
+
+
+def falls_back_without_confidence_weights() -> bool:
+    """A checkpoint with no confidence weights at all drops its head under
+    --speculative-dspark-confidence-source auto instead of failing to load."""
+    return get_spec().speculative_dspark_confidence_source == "auto"
+
+
 def draft_is_deepseek_v4() -> bool:
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.utils.hf_transformers_utils import get_config
