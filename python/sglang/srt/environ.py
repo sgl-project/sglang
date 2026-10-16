@@ -1745,7 +1745,7 @@ class Envs:
     # DCP prefill: attend owned slots + LSE merge once the cached prefix reaches
     # ratio * gathered heads * extend tokens, else all-gather the prefix KV.
     # 0 always takes the owned path; negative never does.
-    SGLANG_DCP_DSA_OWNED_PREFILL_RATIO = EnvFloat(3.0)
+    SGLANG_DSA_DCP_OWNED_PREFILL_RATIO = EnvFloat(3.0)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)

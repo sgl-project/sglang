@@ -134,7 +134,7 @@ def dcp_use_gathered_prefill(
     w = get_parallel().dcp_group.world_size
     if any(p % w for p in extend_prefix_lens_cpu):
         return False
-    ratio = envs.SGLANG_DCP_DSA_OWNED_PREFILL_RATIO.get()
+    ratio = envs.SGLANG_DSA_DCP_OWNED_PREFILL_RATIO.get()
     if ratio < 0:
         return True
     return sum(extend_prefix_lens_cpu) < ratio * gathered_heads * extend_num_tokens
