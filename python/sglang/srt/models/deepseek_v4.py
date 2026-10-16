@@ -2872,7 +2872,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             return
         self._next_layer = None
         if isinstance(next_layer, DeepseekV4DecoderLayer) and next_layer.engram is None:
-            self._next_layer = next_layer
+            # Plain reference, not a submodule: registering it renames the next layer's
+            # parameters to `layers.{i}._next_layer.*`, which weight updates then miss.
+            object.__setattr__(self, "_next_layer", next_layer)
 
     def _init_hyper_connections(self) -> None:
         """(Re)bind the two hyper-connections to the current mixing weights."""
