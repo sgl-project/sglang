@@ -353,6 +353,7 @@ POSITIONAL_FIELD_ORDER = (
     "linear_attn_decode_backend",
     "linear_attn_prefill_backend",
     "linear_attn_verify_backend",
+    "kimi_kda_fused_layer_backend",
     "enable_linear_replayssm",
     "linear_replayssm_cache_len",
     "enable_linear_replayssm_spec",
