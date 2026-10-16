@@ -834,6 +834,12 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
+def _monokernel_skips(model, name, forward_batch, key, source) -> bool:
+    from sglang.srt.monokernels.runtime import skips_metadata
+
+    return skips_metadata(model, name, forward_batch, key, source)
+
+
 class DeepseekV4HipRadixBackend(
     AttentionBackend,
     C4IndexerBackendMixin,
@@ -876,6 +882,7 @@ class DeepseekV4HipRadixBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
@@ -1689,9 +1696,17 @@ class DeepseekV4HipRadixBackend(
                         for ratio, indexer_metadata in (
                             metadata.low_ratio_indexer_metadata_by_ratio().items()
                         )
-                        # Identity rows are not scored, so they need no schedule.
+                        # Identity rows are not scored, so they need no schedule;
+                        # nor does a ratio a monokernel forward scores itself.
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
+                        )
+                        and not _monokernel_skips(
+                            self.model_runner.model,
+                            "low_ratio_decode_schedule",
+                            forward_batch,
+                            ratio,
+                            indexer_metadata,
                         )
                     }
                 )

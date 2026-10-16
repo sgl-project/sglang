@@ -132,6 +132,11 @@ class BuiltMonokernels(Protocol):
         shapes fixed by plan.key.
         """
 
+    # Optional: skips_metadata(name, forward_batch, key, source) -> bool, True when
+    # this forward never reads the per-step attention metadata ``name`` (``key``,
+    # built from ``source``) of a routed step, so the backend need not build it
+    # (``runtime.skips_metadata``). Without it every metadata is built.
+
 
 class MonoSpec(msgspec.Struct, frozen=True):
     """A model-specific plugin contract; build returns its BuiltMonokernels."""

@@ -339,6 +339,22 @@ def _install_forward(
         return built.forward(Plan(key=key), *args, **kwargs)
 
     model.forward = forward
+    model._monokernel_routes = (built, served)
+
+
+def skips_metadata(model, name: str, forward_batch, key, source) -> bool:
+    """True when ``model``'s monokernel forward runs this step and never reads the
+    per-step attention metadata ``name`` (``key``, built from ``source``), so the
+    attention backend need not build it. False without a backend, for a step the
+    standard path runs, and for a plugin without ``skips_metadata``."""
+    routes = getattr(model, "_monokernel_routes", None)
+    if routes is None:
+        return False
+    built, served = routes
+    skip = getattr(built, "skips_metadata", None)
+    if skip is None or shape_key(forward_batch) not in served:
+        return False
+    return bool(skip(name, forward_batch, key, source))
 
 
 def _format_steps(keys: Iterable[ShapeKey]) -> str:

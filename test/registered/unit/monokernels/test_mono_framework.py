@@ -453,6 +453,24 @@ class TestMonokernelFramework(CustomTestCase):
             ],
         )
 
+    def test_metadata_skips_only_on_routed_steps(self):
+        name = "low_ratio_decode_schedule"
+        served = frozenset(
+            {ShapeKey(forward_mode="decode", batch_size=2, tokens_per_request=1)}
+        )
+        skipper = SimpleNamespace(skips_metadata=lambda n, *_: n == name)
+        model = SimpleNamespace(_monokernel_routes=(skipper, served))
+        routed, other = batch("decode", 2, 2), batch("decode", 4, 4)
+        self.assertTrue(runtime.skips_metadata(model, name, routed, 1, None))
+        self.assertFalse(runtime.skips_metadata(model, "other", routed, 1, None))
+        self.assertFalse(runtime.skips_metadata(model, name, other, 1, None))
+        # no backend, or a plugin that builds every metadata
+        self.assertFalse(
+            runtime.skips_metadata(SimpleNamespace(), name, routed, 1, None)
+        )
+        plain = SimpleNamespace(_monokernel_routes=(SimpleNamespace(), served))
+        self.assertFalse(runtime.skips_metadata(plain, name, routed, 1, None))
+
     def test_deadlines_stay_below_the_watchdog(self):
         self.assertEqual(deadline_s(None), MAX_DEADLINE_S)
         self.assertEqual(deadline_s(3600), MAX_DEADLINE_S)
