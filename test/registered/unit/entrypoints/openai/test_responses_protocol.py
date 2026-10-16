@@ -360,26 +360,35 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         self.assertNotIn("prompt_tokens", usage)
         self.assertNotIn("completion_tokens", usage)
 
-    def test_only_sdk_known_efforts_echoed_so_streaming_event_validates(self):
+    def test_effort_echoed_verbatim_and_masked_only_for_typed_stream_events(self):
         import openai.types.responses as ort
 
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            _sanitize_response_dict,
+        )
+
         # OpenAI's Reasoning.effort literal is narrower than our tier list:
-        # "none" is a request-side extension and xhigh/max postdate it. Echoing
-        # one of those raises a ValidationError in the typed event below, which
-        # the stream generator builds before its try block -- the connection
-        # then dies without a single SSE byte.
+        # "none" is a request-side extension and xhigh/max postdate it. The
+        # response body echoes the requested tier verbatim; masking to None
+        # happens only where a typed SDK stream event would validate it.
+        # Echoing one of the unechoable tiers into such an event raises a
+        # ValidationError, which the stream generator builds before its try
+        # block -- the connection then dies without a single SSE byte.
         for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
             resp = _in_progress_response(
                 ResponsesRequest(
                     model="x", input="hi", store=False, reasoning={"effort": effort}
                 )
             )
-            expected = (
-                effort if effort in ("minimal", "low", "medium", "high") else None
-            )
-            self.assertEqual(resp.reasoning["effort"], expected, effort)
+            self.assertEqual(resp.reasoning["effort"], effort, effort)
+
+            payload = _sanitize_response_dict(resp.model_dump())
+            if effort in ("minimal", "low", "medium", "high"):
+                self.assertEqual(payload["reasoning"]["effort"], effort, effort)
+            else:
+                self.assertIsNone(payload["reasoning"]["effort"], effort)
             ort.ResponseCreatedEvent(
-                type="response.created", sequence_number=0, response=resp.model_dump()
+                type="response.created", sequence_number=0, response=payload
             )
 
 
