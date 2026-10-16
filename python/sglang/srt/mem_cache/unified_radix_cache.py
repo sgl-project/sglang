@@ -2904,8 +2904,8 @@ class UnifiedRadixCache(BasePrefixCache):
             request = operation.handle
             info = self.ongoing_prefetch.get(request)
             hit_tokens = operation.storage_hit_count
-            if info is None:
-                return True  # aborted/cleaned; nothing to retry
+            if info is None or info.operation is not operation:
+                return True  # aborted/reissued; nothing to retry for this operation
             if operation.is_terminated():
                 self.revoke_pending_prefetch(request)
                 return True
@@ -3023,6 +3023,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 if info is None:
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
+                    continue
+                # A reissued prefetch can reuse the handle before this query returns.
+                if info.operation is not operation:
                     continue
                 if hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)

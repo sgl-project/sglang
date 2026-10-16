@@ -176,6 +176,26 @@ def _terminated_query(cache, rid, hit_tokens):
     cache.cache_controller.prefetch_hit_queue.put(operation)
 
 
+def _query_fixture():
+    cache, pipeline, req = _staged_fixture()
+    pipeline.release_staged_hold(req.cache_request_handle)
+    cc = cache.cache_controller
+    cc.prefetch_hit_queue = Queue()
+    cc.ack_prefetch_queue = Queue()
+    cc.ack_backup_queue = Queue()
+    cc.host_mem_release_queue = Queue()
+    cc.extra_host_mem_release_queues = {}
+    cc.prefetch_rate_limited = lambda: True
+    cache.prefetch_from_storage(
+        req.cache_request_handle,
+        0,
+        list(range(4, 12)),
+        matched_prefix_tokens=list(range(4)),
+    )
+    operation = cache.ongoing_prefetch[req.cache_request_handle].operation
+    return cache, pipeline, req, operation
+
+
 def _two_rank_retry_trace(rank, rendezvous):
     torch.distributed.init_process_group(
         "gloo",
@@ -563,6 +583,54 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
+
+    def test_late_query_preserves_reissued_prefetch(self):
+        for hit_tokens in (0, 4):
+            with self.subTest(hit_tokens=hit_tokens):
+                cache, pipeline, req, old = _query_fixture()
+                handle = req.cache_request_handle
+                cache.release_aborted_request(handle)
+                cache.prefetch_from_storage(handle, 0, list(range(12)))
+                current = cache.ongoing_prefetch[handle]
+                prefix_ctx = pipeline._prefetch_prefix_ctx[handle]
+                old.storage_hit_count = hit_tokens
+                cc = cache.cache_controller
+                cc.prefetch_hit_queue.put(old)
+                stats = cache.prefetch_outcome_stats_snapshot()
+
+                cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+
+                self.assertIs(cache.ongoing_prefetch[handle], current)
+                self.assertIs(pipeline._prefetch_prefix_ctx[handle], prefix_ctx)
+                self.assertEqual(cache.prefetch_outcome_stats_snapshot(), stats)
+                self.assertFalse(current.operation.is_terminated())
+                self.assertEqual(
+                    cache.storage_prefetch_retries.pop_ready([req], 0, 8), []
+                )
+
+                current.operation.storage_hit_count = 4
+                cc.prefetch_hit_queue.put(current.operation)
+                cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+                self.assertEqual(list(pipeline.pending_hit_allocs), [current.operation])
+
+    def test_parked_query_preserves_reissued_prefetch(self):
+        cache, pipeline, req, old = _query_fixture()
+        handle = req.cache_request_handle
+        old.storage_hit_count = 4
+        cache.cache_controller.prefetch_hit_queue.put(old)
+        cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+        self.assertEqual(list(pipeline.pending_hit_allocs), [old])
+
+        cache.release_aborted_request(handle)
+        cache.prefetch_from_storage(handle, 0, list(range(12)))
+        current = cache.ongoing_prefetch[handle]
+        prefix_ctx = pipeline._prefetch_prefix_ctx[handle]
+        cache._drain_storage_control_queues_impl(0, 0, 0, 0, {}, False)
+
+        self.assertIs(cache.ongoing_prefetch[handle], current)
+        self.assertIs(pipeline._prefetch_prefix_ctx[handle], prefix_ctx)
+        self.assertFalse(current.operation.is_terminated())
+        self.assertFalse(pipeline.pending_hit_allocs)
 
     def test_unservable_anchor_declines_before_any_staging(self):
         """A resident but unreadable device prefix must decline the fetch
