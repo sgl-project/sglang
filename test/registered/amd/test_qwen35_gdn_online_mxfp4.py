@@ -9,7 +9,7 @@ from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 # Qwen3.8-2.4T TP8: in_proj_qkvz and out_proj.
 SHAPES = ((4608, 8192), (8192, 2048))

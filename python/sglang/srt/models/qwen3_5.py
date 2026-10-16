@@ -186,7 +186,10 @@ _gdn_decode_fused_proj_conv = (
 _gdn_online_mxfp4 = tuple(
     p for p in envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get().split(",") if p
 )
-assert set(_gdn_online_mxfp4) <= {"in_proj_qkvz", "out_proj"}, _gdn_online_mxfp4
+if not set(_gdn_online_mxfp4) <= {"in_proj_qkvz", "out_proj"}:
+    raise ValueError(
+        f"SGLANG_ROCM_GDN_ONLINE_MXFP4 takes in_proj_qkvz, out_proj; got {_gdn_online_mxfp4}"
+    )
 if _gdn_online_mxfp4 and not (_use_aiter and _is_gfx95):
     logger.warning("SGLANG_ROCM_GDN_ONLINE_MXFP4 needs gfx95x and SGLANG_USE_AITER=1")
     _gdn_online_mxfp4 = ()
