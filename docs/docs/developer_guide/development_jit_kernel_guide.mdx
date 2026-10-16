@@ -35,7 +35,7 @@ Typically, `tvm::ffi::TensorView` is sufficient for passing PyTorch Tensors from
 ### Python Interface
 
 Python interfaces are defined in `python/sglang/kernels/jit`.
-The `load_jit` utility function in `python/sglang/kernels/jit/utils/compile.py` loads and returns the compiled module.
+The `load_jit` utility function in `python/sglang/kernels/jit/utils/compile/loader.py` loads and returns the compiled module.
 To export a C++ function (e.g., `cpp_func`), pass `cuda_wrappers=[("func", "cpp_func")]` to `load_jit`.
 The function can then be called in Python as `module.func`.
 `load_jit` emits the export wrapper inside `namespace sglang`, so write `cpp_func` without a
