@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::Request;
 use serde_json::json;
-use sgl_router::config::{Config, PolicyKind, StickyConfig, StickyFallbackKind};
+use sgl_router::config::{Config, DpRankPolicy, PolicyKind, StickyConfig, StickyFallbackKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::request_tokens_for;
@@ -168,6 +168,26 @@ async fn pd_room_maps_decode_to_the_prefill_rank() {
 }
 
 #[tokio::test]
+async fn round_robin_gives_decode_ranks_turns() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 4),
+        (&decode, WorkerMode::Decode, 4),
+    ];
+    let mut cfg = sticky_config();
+    cfg.model.dp_rank_policy = DpRankPolicy::RoundRobin;
+    let app = router(cfg, &workers, Default::default());
+    let mut ranks = Vec::new();
+    for _ in 0..8 {
+        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
+    }
+    assert_eq!(ranks, ["0", "1", "2", "3", "0", "1", "2", "3"]);
+}
+
+#[tokio::test]
 async fn any_policy_picks_the_rank_with_the_deepest_prefix() {
     let worker = MockWorker::start(vec![]).await;
     let mut cfg = config();
@@ -219,6 +239,7 @@ async fn pd_generate_carries_each_rank_in_its_body() {
         p["bootstrap_room"].as_u64().unwrap() % 4
     );
     assert!(d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2));
+    assert_eq!(d["disagg_prefill_dp_rank"], p["routed_dp_rank"]);
 }
 
 /// The engine gives fan-out item i the room `room + i`, so one pinned prefill rank would break decode.
@@ -243,7 +264,8 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
             "{path}"
         );
         assert!(
-            d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2),
+            d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2)
+                && d.get("disagg_prefill_dp_rank").is_none(),
             "{path}"
         );
     }
