@@ -140,9 +140,15 @@ class PrefillBudget:
         return paged_input <= min(self.remaining_current, self.remaining_total)
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
-        available = min(chunk_limit, int(self.remaining_total))
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        # Cap by the KV alloc_extend can really get (it over-asks one page).
+        free = self._available_and_evictable() - self.current_offset - self.page_size
+        free = free // self.page_size * self.page_size
+        available = min(chunk_limit, int(self.remaining_total), free)
+        if available > 0:
+            return available
+        # Decode headroom is an estimate: progress with the free KV, else defer.
+        available = min(chunk_limit, free)
+        return available if available > 0 else None
 
     def fit_chunk(
         self,

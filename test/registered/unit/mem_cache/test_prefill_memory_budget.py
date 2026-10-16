@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget, SWAPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
@@ -276,6 +276,21 @@ class TestRunningDecodeReservation(CustomTestCase):
                 self.assertEqual(bool(adder.can_run_list), should_admit)
                 if not should_admit:
                     self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+
+class TestContinuingChunkCap(CustomTestCase):
+    def _budget(self, free_tokens):
+        allocator = SimpleNamespace(page_size=16, available_size=lambda: free_tokens)
+        tree_cache = SimpleNamespace(
+            supports_mamba=lambda: False, evictable_size=lambda: 0
+        )
+        return PrefillBudget(allocator, tree_cache)
+
+    def test_chunk_leaves_the_page_alloc_extend_over_asks(self):
+        self.assertEqual(self._budget(64).available_chunk_tokens(1024), 48)
+
+    def test_chunk_is_deferred_without_free_kv(self):
+        self.assertIsNone(self._budget(16).available_chunk_tokens(1024))
 
 
 class TestFixedPrefillMemoryBudget(unittest.TestCase):
