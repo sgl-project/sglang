@@ -17,6 +17,7 @@ import torch.distributed as dist
 from sglang.srt.debug_utils.dumper import (
     DumperConfig,
     _collect_parallel_rank_tags,
+    _evaluate_filter,
     _collective_with_timeout,
     _compare_tensors_quick,
     _deepcopy_or_clone,
@@ -967,6 +968,26 @@ class TestKvFilter:
         d = _make_test_dumper(tmp_path, filter="layer_id ===")
         with pytest.raises(SyntaxError):
             d.dump("tensor", torch.randn(3))
+
+    def test_filter_blocks_regex_globals_escape(self):
+        # search/match used to be raw function objects; True.__class__ chains
+        # and __globals__ must not be reachable from filter expressions.
+        tags = {"name": "attn"}
+        dangerous = [
+            "search.__globals__",
+            "match.__globals__",
+            "search.__globals__['__builtins__']['__import__']('os')",
+            "(search.__globals__['__builtins__']['__import__']('pathlib').Path('/tmp/x').write_text('x') > 0)",
+        ]
+        for expr in dangerous:
+            with pytest.raises((ValueError, AttributeError, TypeError)):
+                _evaluate_filter(expr, tags)
+
+        # Legitimate helpers still work.
+        assert _evaluate_filter("search(r'attn|mlp', name)", tags) is True
+        assert _evaluate_filter("search(r'norm', name)", tags) is False
+        assert _evaluate_filter("layer_id is None", tags) is True
+        assert _evaluate_filter("layer_id == 0", {"layer_id": 0}) is True
 
     def test_no_filter_dumps_all(self, tmp_path):
         d = _make_test_dumper(tmp_path)
