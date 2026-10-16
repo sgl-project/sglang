@@ -47,6 +47,7 @@ class _FakeReq:
 
 def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = partial_scheduler()
+    sched.scheduler_stage_metrics = None
     sched.parts.mode_owners = ModeOwners()
     sched.parts.lists = CoreLists()
     sched.parts.lists.chunked_req = chunked_req
