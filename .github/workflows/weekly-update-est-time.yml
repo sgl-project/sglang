@@ -74,7 +74,7 @@ jobs:
           } > /tmp/pr_body.md
 
           gh pr create \
-            --title "chore: update CI test est_time values" \
+            --title "[Chore] ci: Update test est_time values" \
             --body-file /tmp/pr_body.md \
             --base main \
             --head "$BRANCH_NAME"
