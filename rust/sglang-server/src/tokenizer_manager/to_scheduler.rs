@@ -359,7 +359,10 @@ impl Intake {
             ),
             RequestKind::Control(_)
             | RequestKind::Detokenize { .. }
-            | RequestKind::Tokenize { .. } => (false, false),
+            | RequestKind::Tokenize { .. } => (
+                false, /* decode_logprob_text */
+                false, /* no_stop_trim */
+            ),
         };
         self.senders
             .detok_for(&req.rid)
@@ -415,7 +418,7 @@ impl Intake {
             self.fail(
                 &mut req,
                 Error::Internal("tokenizer pool gone".into()),
-                false,
+                false, /* registered */
             );
         }
     }

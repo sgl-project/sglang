@@ -108,7 +108,7 @@ async fn tokenize(
         // The rendered template owns its special tokens, as on the chat path
         // (Python encodes it with `add_special_tokens=False`).
         (None, Some(messages)) => match render_chat_prompt(&state, messages, body.rest) {
-            Ok(prompt) => (OneOrMany::One(prompt), false),
+            Ok(prompt) => (OneOrMany::One(prompt), false /* add_special_tokens */),
             Err((error_type, message)) => {
                 return error_body(StatusCode::BAD_REQUEST, error_type, message);
             }
@@ -274,7 +274,15 @@ mod tests {
                 },
             ),
             server_args,
-            chat_formatter: Some(load_chat_formatter(None, None, None, Some("chatml")).unwrap()),
+            chat_formatter: Some(
+                load_chat_formatter(
+                    None,           /* config_file */
+                    None,           /* model_path */
+                    None,           /* model_type */
+                    Some("chatml"), /* chat_template_arg */
+                )
+                .unwrap(),
+            ),
         })
     }
 
