@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::app::AppState;
+use super::request_headers::apply_header_overrides;
 use crate::api_server::core::{
     CoreCall, CoreError, CoreEvent, CoreOutput, HealthStatus, recv_indexed,
 };
@@ -26,7 +27,7 @@ use axum::{
     Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
-    http::{HeaderName, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -176,6 +177,7 @@ async fn health_generate(
 /// message, instead of axum's default 422.
 async fn generate(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     let mut body = match body {
@@ -187,6 +189,11 @@ async fn generate(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
+    if state.server_args.enable_request_header_overrides
+        && let Err(error) = apply_header_overrides(&mut body, &headers)
+    {
+        return native_error(StatusCode::BAD_REQUEST, &error, false);
+    }
     // Launch-time preferred sampling params fill in beneath the request's own
     // keys before decoding, so an explicit request value (even a default or
     // null) wins: Python TokenizerManager's precedence.
