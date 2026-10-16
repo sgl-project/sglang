@@ -60,8 +60,6 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 pub struct GenerationPolicy {
     lora_ids: BTreeMap<String, String>,
     enable_strict_thinking: bool,
-    enable_priority_scheduling: bool,
-    default_priority_value: Option<i64>,
 }
 
 impl From<&ServerArgs> for GenerationPolicy {
@@ -69,8 +67,6 @@ impl From<&ServerArgs> for GenerationPolicy {
         Self {
             lora_ids: args.lora_ids.clone(),
             enable_strict_thinking: args.enable_strict_thinking,
-            enable_priority_scheduling: args.enable_priority_scheduling,
-            default_priority_value: args.default_priority_value,
         }
     }
 }
@@ -142,12 +138,6 @@ pub fn into_requests(
                 .into(),
         ));
     }
-    let priority = priority.or_else(|| {
-        policy
-            .enable_priority_scheduling
-            .then_some(policy.default_priority_value)
-            .flatten()
-    });
 
     // Cap the batch BEFORE the columns below allocate anything. Reading the
     // declared length off the input costs nothing; the previous placement (after
@@ -940,8 +930,6 @@ mod tests {
         let policy = GenerationPolicy {
             lora_ids,
             enable_strict_thinking: true,
-            enable_priority_scheduling: true,
-            default_priority_value: Some(17),
         };
         let (requests, _) = requests_with_policy(
             r#"{"text":"hi","lora_path":"adapter","max_thinking_tokens":23}"#,
@@ -949,7 +937,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(requests[0].lora_id.as_deref(), Some("stable-id"));
-        assert_eq!(requests[0].priority, Some(17));
         assert!(matches!(
             requests[0]
                 .sampling_params

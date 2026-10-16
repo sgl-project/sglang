@@ -353,6 +353,7 @@ mod tests {
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
             extra_key: Some("salt".into()),
+            priority: Some(-2),
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -373,7 +374,7 @@ mod tests {
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
         assert!(arr[32].is_nil(), "routing_key at 32");
         assert_eq!(arr[33].as_bool(), Some(false), "require_reasoning at 33");
-        assert!(arr[34].is_nil(), "priority at 34");
+        assert_eq!(arr[34].as_i64(), Some(-2), "priority at 34");
         assert_eq!(arr[35].as_str(), Some("salt"), "extra_key at 35");
     }
 }

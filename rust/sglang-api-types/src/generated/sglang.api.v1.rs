@@ -383,15 +383,17 @@ pub struct GenerateRequest {
     /// none.
     #[prost(message, optional, tag = "23")]
     pub extra_key: ::core::option::Option<StringOrList>,
+    /// Scheduling priority, one value for every batch item; the scheduler
+    /// validates it against its priority-scheduling mode.
+    #[prost(int64, optional, tag = "24")]
+    pub priority: ::core::option::Option<i64>,
     /// Orchestrator controls used by native gRPC clients such as Dynamo.
     /// `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
     /// applies to every prompt, a list carries one (nullable) value per prompt.
     #[prost(message, optional, tag = "30")]
     pub lora_path: ::core::option::Option<OptionalStringOrList>,
-    #[prost(string, optional, tag = "24")]
+    #[prost(string, optional, tag = "26")]
     pub routing_key: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(int64, optional, tag = "26")]
-    pub priority: ::core::option::Option<i64>,
     #[prost(bool, optional, tag = "27")]
     pub require_reasoning: ::core::option::Option<bool>,
     #[prost(uint64, optional, tag = "28")]
@@ -535,11 +537,12 @@ pub struct GenerateMetaInfo {
     /// on the terminal frame.
     #[prost(double, optional, tag = "12")]
     pub e2e_latency: ::core::option::Option<f64>,
-    /// Prompt tokens served from the prefix cache. Present on scheduler frames,
-    /// including zero, so callers can distinguish "no cache hit" from an older
-    /// server that does not report the metric.
-    #[prost(uint64, optional, tag = "13")]
-    pub cached_tokens: ::core::option::Option<u64>,
+    /// Prompt tokens served from the prefix cache, and output tokens spent
+    /// reasoning so far; reported on every frame.
+    #[prost(uint32, tag = "13")]
+    pub cached_tokens: u32,
+    #[prost(uint64, tag = "14")]
+    pub reasoning_tokens: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {

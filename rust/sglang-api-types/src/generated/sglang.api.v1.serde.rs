@@ -1608,11 +1608,11 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.extra_key {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
         }
-        if let Some(v) = &self.routing_key {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "routing_key", v)?;
-        }
         if let Some(v) = &self.priority {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", v)?;
+        }
+        if let Some(v) = &self.routing_key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "routing_key", v)?;
         }
         if let Some(v) = &self.require_reasoning {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "require_reasoning", v)?;
@@ -1665,8 +1665,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_video_data = None;
                 let mut f_audio_data = None;
                 let mut f_extra_key = None;
-                let mut f_routing_key = None;
                 let mut f_priority = None;
+                let mut f_routing_key = None;
                 let mut f_require_reasoning = None;
                 let mut f_max_thinking_tokens = None;
                 let mut f_kv_hints = None;
@@ -1833,18 +1833,18 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_extra_key = Some(map.next_value::<Option<StringOrList>>()?);
                         }
+                        "priority" => {
+                            if f_priority.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("priority"));
+                            }
+                            f_priority = Some(map.next_value::<Option<i64>>()?);
+                        }
                         "routing_key" => {
                             if f_routing_key.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("routing_key"));
                             }
                             f_routing_key =
                                 Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "priority" => {
-                            if f_priority.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("priority"));
-                            }
-                            f_priority = Some(map.next_value::<Option<i64>>()?);
                         }
                         "require_reasoning" => {
                             if f_require_reasoning.is_some() {
@@ -1903,8 +1903,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     video_data: f_video_data.flatten(),
                     audio_data: f_audio_data.flatten(),
                     extra_key: f_extra_key.flatten(),
-                    routing_key: f_routing_key.flatten(),
                     priority: f_priority.flatten(),
+                    routing_key: f_routing_key.flatten(),
                     require_reasoning: f_require_reasoning.flatten(),
                     max_thinking_tokens: f_max_thinking_tokens.flatten(),
                     kv_hints: f_kv_hints.flatten(),
@@ -2392,9 +2392,16 @@ impl ::serde::Serialize for GenerateMetaInfo {
         if let Some(v) = &self.e2e_latency {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "e2e_latency", v)?;
         }
-        if let Some(v) = &self.cached_tokens {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "cached_tokens", v)?;
-        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "cached_tokens",
+            &self.cached_tokens,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "reasoning_tokens",
+            &self.reasoning_tokens,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2424,6 +2431,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_hidden_states = None;
                 let mut f_e2e_latency = None;
                 let mut f_cached_tokens = None;
+                let mut f_reasoning_tokens = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2533,7 +2541,15 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             if f_cached_tokens.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("cached_tokens"));
                             }
-                            f_cached_tokens = Some(map.next_value::<Option<u64>>()?);
+                            f_cached_tokens = Some(map.next_value::<u32>()?);
+                        }
+                        "reasoning_tokens" => {
+                            if f_reasoning_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "reasoning_tokens",
+                                ));
+                            }
+                            f_reasoning_tokens = Some(map.next_value::<u64>()?);
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
@@ -2553,7 +2569,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     input_token_ids_logprobs: f_input_token_ids_logprobs.unwrap_or_default(),
                     hidden_states: f_hidden_states.unwrap_or_default(),
                     e2e_latency: f_e2e_latency.flatten(),
-                    cached_tokens: f_cached_tokens.flatten(),
+                    cached_tokens: f_cached_tokens.unwrap_or_default(),
+                    reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
                 })
             }
         }

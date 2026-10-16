@@ -39,11 +39,27 @@ def _scheduler_for_typed_config():
 
 
 @pytest.mark.parametrize(
-    "legacy_args,expected",
-    [({}, 50051), ({"smg_grpc_mode": True}, None), ({"grpc_mode": True}, None)],
-    ids=["native", "legacy-smg", "deprecated-legacy-smg"],
+    "overrides,kwarg,expected",
+    [
+        ({}, "grpc_port", 50051),
+        ({"smg_grpc_mode": True}, "grpc_port", None),
+        ({"grpc_mode": True}, "grpc_port", None),
+        ({"default_priority_value": 5}, "default_priority_value", None),
+        (
+            {"enable_priority_scheduling": True, "default_priority_value": 5},
+            "default_priority_value",
+            5,
+        ),
+    ],
+    ids=[
+        "native-grpc",
+        "legacy-smg",
+        "deprecated-legacy-smg",
+        "priority-off",
+        "priority-on",
+    ],
 )
-def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
+def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
     extension = SimpleNamespace(
         DisaggregationMode=SimpleNamespace(
             Null="null", Prefill="prefill", Decode="decode"
@@ -54,14 +70,14 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
     )
     scheduler = _scheduler_for_typed_config()
     with (
-        get_context().override_server_args(grpc_port=50051, **legacy_args),
+        get_context().override_server_args(grpc_port=50051, **overrides),
         get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
     ):
         assert rust_config._build_server_args(scheduler) == "server-args"
 
-    assert extension.ServerArgs.call_args.kwargs["grpc_port"] == expected
+    assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
     scheduler.get_init_info.assert_not_called()
     scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
     deployment_info = json.loads(

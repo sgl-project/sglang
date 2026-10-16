@@ -57,14 +57,16 @@ message GenerateRequest {
   // key. One key for every batch item, or one per item; an empty key means
   // none.
   StringOrList extra_key = 23;
+  // Scheduling priority, one value for every batch item; the scheduler
+  // validates it against its priority-scheduling mode.
+  optional int64 priority = 24;
 
   // Orchestrator controls used by native gRPC clients such as Dynamo.
   // `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
   // applies to every prompt, a list carries one (nullable) value per prompt.
   OptionalStringOrList lora_path = 30;
-  optional string routing_key = 24;
+  optional string routing_key = 26;
   reserved 25; // Trace-parent extraction is not implemented by the Rust frontend yet.
-  optional int64 priority = 26;
   optional bool require_reasoning = 27;
   optional uint64 max_thinking_tokens = 28;
   KvHintsEnvelopeOrList kv_hints = 29;
@@ -170,10 +172,10 @@ message GenerateMetaInfo {
   // Seconds from normalized-request acceptance to the terminal output; only
   // on the terminal frame.
   optional double e2e_latency = 12;
-  // Prompt tokens served from the prefix cache. Present on scheduler frames,
-  // including zero, so callers can distinguish "no cache hit" from an older
-  // server that does not report the metric.
-  optional uint64 cached_tokens = 13;
+  // Prompt tokens served from the prefix cache, and output tokens spent
+  // reasoning so far; reported on every frame.
+  uint32 cached_tokens = 13;
+  uint64 reasoning_tokens = 14;
 }
 
 message GenerateResponse {
