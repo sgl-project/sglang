@@ -1,6 +1,6 @@
 """DeepSeek-V4.1-Flash accuracy with DSPARK on four GB300 GPUs.
 
-Run GSM8K and MMMU-Pro in TP4+EP4 and DP-attention4 + EP4 configurations,
+Run GSM8K and MMMU-Pro in TP4+EP4, TP2+EP2 and DP-attention4 + EP4 configurations,
 plus decoder SWA bounded replay inside breakable prefill graphs with the
 default and TRT-LLM attention backends.
 The DP+EP recipe is intentionally exercised rather than skipped: startup or
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=2400, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=2800, stage="base-c", runner_config="4-gpu-gb300")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
@@ -40,6 +40,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
     mmmu_pro_max_tokens = 32768
     mmmu_pro_load_preset_from_model_id = MODEL
 
+    tp_size = 4
     mem_fraction_static = "0.8"
     max_running_requests = "64"
     graph_args = []
@@ -57,7 +58,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                str(cls.tp_size),
                 "--speculative-algorithm",
                 "DSPARK",
                 "--speculative-dspark-block-size",
@@ -113,6 +114,18 @@ class TestDSV41FlashTP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
     """Tensor-parallel attention and expert-parallel MoE, without DP attention."""
 
     parallel_args = ["--attn-dp-size", "1", "--ep-size", "4"]
+
+
+class TestDSV41FlashTP2EP2DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
+    """TP2 exercises the fused all-reduce + mHC, WO-A and swap-AB decode paths."""
+
+    tp_size = 2
+    parallel_args = ["--attn-dp-size", "1", "--ep-size", "2"]
+    # Engram tables on the GPU leave no KV cache at TP2 under mem-fraction 0.8.
+    server_env = {
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1",
+        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": "per_rank",
+    }
 
 
 class TestDSV41FlashDP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
