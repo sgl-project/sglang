@@ -311,7 +311,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
                 s = DecodeStatus(
-                    decoded_text=recv_obj.decoded_texts[i],
+                    decoded_text="",
                     decode_ids=self._clamp_decode_ids(
                         recv_obj.decode_ids[i], vocab_size
                     ),
