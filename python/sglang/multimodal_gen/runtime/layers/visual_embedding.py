@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
+_is_cpu = current_platform.is_cpu()
 
 
 class PatchEmbed(nn.Module):
@@ -174,6 +175,15 @@ class Timesteps(_Timesteps):
                 downscale_freq_shift=self.downscale_freq_shift,
                 scale=self.scale,
             )
+        elif _is_cpu:
+            return torch.ops.sgl_kernel.timestep_embedding_cpu(
+                timesteps,
+                self.num_channels,
+                self.flip_sin_to_cos,
+                self.downscale_freq_shift,
+                self.scale,
+                10000,
+            )
         else:
             return timestep_embedding_diffusers(
                 timesteps,
@@ -285,6 +295,15 @@ def timestep_embedding(
     Returns:
         Tensor of shape [B, dim] with embeddings
     """
+    if current_platform.is_cpu():
+        return torch.ops.sgl_kernel.timestep_embedding_cpu(
+            t,
+            dim,
+            True,
+            0.0,
+            1.0,
+            max_period,
+        )
     half = dim // 2
     freqs = torch.exp(
         -math.log(max_period)

@@ -180,5 +180,113 @@ class TestDiffusionNorm:
         )
 
 
+TIMESTEP_BATCHES = [1, 8, 128]
+TIMESTEP_DIMS = [31, 32, 128, 257, 512]
+TIMESTEP_DTYPES = [
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+]
+
+
+def timestep_embedding_reference(
+    timesteps,
+    dim,
+    *,
+    flip_sin_to_cos=False,
+    downscale_freq_shift=1,
+    scale=1,
+    max_period=10000,
+):
+
+    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
+    timesteps = timesteps.to(torch.float32)
+
+    half_dim = dim // 2
+
+    exponent = -torch.log(
+        torch.tensor(max_period, dtype=torch.float32, device=timesteps.device)
+    ) * torch.arange(
+        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
+    )
+
+    exponent = exponent / (half_dim - downscale_freq_shift)
+
+    emb = torch.exp(exponent)
+
+    emb = timesteps[:, None].float() * emb[None, :]
+
+    emb = scale * emb
+
+    emb = torch.cat(
+        [
+            torch.sin(emb),
+            torch.cos(emb),
+        ],
+        dim=-1,
+    )
+
+    if flip_sin_to_cos:
+        emb = torch.cat(
+            [
+                emb[:, half_dim:],
+                emb[:, :half_dim],
+            ],
+            dim=-1,
+        )
+
+    if dim % 2 == 1:
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+
+    return emb
+
+
+@pytest.mark.parametrize("batch_size", TIMESTEP_BATCHES)
+@pytest.mark.parametrize("dim", TIMESTEP_DIMS)
+@pytest.mark.parametrize("dtype", TIMESTEP_DTYPES)
+@pytest.mark.parametrize(
+    "flip_sin_to_cos,downscale_freq_shift,scale",
+    [
+        (True, 0, 1),
+        (False, 1, 1),
+        (True, 1, 0.01),
+    ],
+)
+def test_timestep_embedding_cpu_matches_diffusers(
+    batch_size,
+    dim,
+    dtype,
+    flip_sin_to_cos,
+    downscale_freq_shift,
+    scale,
+):
+    timesteps = torch.randint(low=0, high=1000, size=(batch_size,), device="cpu").to(
+        dtype
+    )
+
+    kwargs = dict(
+        flip_sin_to_cos=flip_sin_to_cos,
+        downscale_freq_shift=downscale_freq_shift,
+        scale=scale,
+        max_period=10000,
+    )
+
+    actual = torch.ops.sgl_kernel.timestep_embedding_cpu(
+        timesteps,
+        dim,
+        kwargs["flip_sin_to_cos"],
+        kwargs["downscale_freq_shift"],
+        kwargs["scale"],
+        kwargs["max_period"],
+    )
+
+    expected = timestep_embedding_reference(timesteps, dim, **kwargs)
+
+    assert actual.dtype == torch.float32
+    assert actual.shape == expected.shape
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
