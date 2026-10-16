@@ -330,7 +330,7 @@ MLA page-size constraints:
 - Cutlass MLA: page_size = 128.
 - TRTLLM MLA: page_size ∈ &#123;32, 64&#125;.
 - CuteDSL MLA: page_size ∈ &#123;32, 64&#125; (decode-only; prefill falls back to `trtllm_mla` when unset).
-- TokenSpeed MLA: page_size ∈ &#123;32, 64&#125; (Blackwell SM100/SM12x only; requires `--kv-cache-dtype fp8_e4m3`).
+- TokenSpeed MLA: page_size ∈ &#123;32, 64&#125; (Blackwell SM100/SM12x only; requires `--kv-cache-dtype fp8_e4m3`; install with `pip install "sglang[tokenspeed]"`).
 
 ### GDN Attention Backends
 

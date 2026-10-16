@@ -119,6 +119,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
+        if not is_tokenspeed_mla_available():
+            raise ImportError(
+                'tokenspeed_mla backend requires `pip install "sglang[tokenspeed]"`.'
+            )
         super().__init__(
             model_runner,
             skip_prefill,
@@ -137,50 +141,48 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 f"got page_size={self.page_size}."
             )
 
-        self._tokenspeed_workspace: Optional[torch.Tensor] = None
-        if is_tokenspeed_mla_available():
-            self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device,
-                self.num_q_heads,
-                self.kv_lora_rank,
-                max_q_len=(max_speculative_num_draft_tokens() or 1),
-            )
+        self._tokenspeed_workspace = _get_tokenspeed_workspace(
+            self.device,
+            self.num_q_heads,
+            self.kv_lora_rank,
+            max_q_len=(max_speculative_num_draft_tokens() or 1),
+        )
 
-            # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
-            # min; without warm-up the first request trips the 300 s scheduler
-            # watchdog.
-            _compile_prefill_kernel = tokenspeed_mla.mla_prefill._compile_prefill_kernel
-            _compiled_kernels = tokenspeed_mla.mla_prefill._compiled_kernels
-            head_dim_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
-            enable_ex2_emulation = tokenspeed_mla.mla_prefill._enable_ex2_emulation()
-            use_pdl = is_arch_support_pdl()
-            for is_causal in (True, False):
-                for return_lse in (True, False):
-                    # Non-causal is only entered from the chunked-prefix
-                    # branch, which always asks for the LSE.
-                    if is_causal is False and return_lse is False:
-                        continue
-                    # Runtime feeds fp8_e4m3fn q/k/v
-                    config = (
-                        torch.float8_e4m3fn,
-                        head_dim_qk,
-                        self.v_head_dim,
-                        is_causal,
-                        return_lse,
-                        use_pdl,
-                        enable_ex2_emulation,
-                    )
-                    if config in _compiled_kernels:
-                        continue
-                    _compiled_kernels[config] = _compile_prefill_kernel(
-                        torch.float8_e4m3fn,
-                        head_dim_qk,
-                        self.v_head_dim,
-                        is_causal,
-                        return_lse,
-                        use_pdl=use_pdl,
-                        enable_ex2_emulation=enable_ex2_emulation,
-                    )
+        # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
+        # min; without warm-up the first request trips the 300 s scheduler
+        # watchdog.
+        _compile_prefill_kernel = tokenspeed_mla.mla_prefill._compile_prefill_kernel
+        _compiled_kernels = tokenspeed_mla.mla_prefill._compiled_kernels
+        head_dim_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
+        enable_ex2_emulation = tokenspeed_mla.mla_prefill._enable_ex2_emulation()
+        use_pdl = is_arch_support_pdl()
+        for is_causal in (True, False):
+            for return_lse in (True, False):
+                # Non-causal is only entered from the chunked-prefix
+                # branch, which always asks for the LSE.
+                if is_causal is False and return_lse is False:
+                    continue
+                # Runtime feeds fp8_e4m3fn q/k/v
+                config = (
+                    torch.float8_e4m3fn,
+                    head_dim_qk,
+                    self.v_head_dim,
+                    is_causal,
+                    return_lse,
+                    use_pdl,
+                    enable_ex2_emulation,
+                )
+                if config in _compiled_kernels:
+                    continue
+                _compiled_kernels[config] = _compile_prefill_kernel(
+                    torch.float8_e4m3fn,
+                    head_dim_qk,
+                    self.v_head_dim,
+                    is_causal,
+                    return_lse,
+                    use_pdl=use_pdl,
+                    enable_ex2_emulation=enable_ex2_emulation,
+                )
 
     @staticmethod
     def _fused_rope_fp8_quantize(
