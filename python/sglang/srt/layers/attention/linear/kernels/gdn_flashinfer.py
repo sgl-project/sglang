@@ -189,6 +189,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """
 
     uses_state_checkpoints = True
+    extend_honors_slot_pitch = True
 
     def __init__(self):
         (
