@@ -954,6 +954,7 @@ def build_post_attn_kernel(
                 store_q8(qvs)
                 gpu.barrier()
                 key0 = t * SPLIT_KEYS + wave * (PPW * PAGE16)
+
                 # The thread map below covers H_SUB heads: a lane holds heads
                 # 4 g4 + e of the pass, and the partial reduction walks O_K_SUB.
                 # SPLIT_PASSES is 1 at TP4, where h0 is 0, the selection and the
@@ -974,6 +975,7 @@ def build_post_attn_kernel(
                     if const_expr(SPLIT_ROWS_WHOLE):
                         return cond
                     return cond & (r < H_SUB)
+
                 for p in range_constexpr(SPLIT_PASSES):
                     h0 = p * H_SUB  # this pass' first head, in the rank's H
                     if const_expr(SPLIT_PASSES > 1):
@@ -1104,6 +1106,7 @@ def build_post_attn_kernel(
                         cv = mfma_fp8(
                             pw, vw[jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
                         )
+
                         def store_pv(cv=cv, jd=jd):
                             for e in range_constexpr(4):
                                 fx.ptr_store(
@@ -1126,6 +1129,7 @@ def build_post_attn_kernel(
                         elif g4 < SPLIT_LIVE_G4:
                             store_pv()
                     gpu.barrier()
+
                     # sum the waves' partials: acc = prob_scale * PV, then * (1 / exp_sum), bf16
                     def reduce_pass(p=p, h0=h0, pscale=pscale):
                         e0 = tid * 4

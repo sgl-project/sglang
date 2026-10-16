@@ -251,9 +251,7 @@ class TestMonoM3PerTP(CustomTestCase):
             msg = f"TP{tp}"
             self.assertEqual(v["SPLIT_ROWS"], 16, msg)
             self.assertLessEqual(v["H_SUB"], v["SPLIT_ROWS"], f"{msg} group > map")
-            self.assertEqual(
-                v["SPLIT_ROWS_WHOLE"], v["H_SUB"] == v["SPLIT_ROWS"], msg
-            )
+            self.assertEqual(v["SPLIT_ROWS_WHOLE"], v["H_SUB"] == v["SPLIT_ROWS"], msg)
             # the C-row guard is on the lane group alone, so H_SUB must be a
             # whole number of them
             self.assertEqual(v["H_SUB"] % 4, 0, f"{msg} partial C-row group")
