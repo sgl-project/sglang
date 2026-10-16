@@ -320,6 +320,25 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             pool.preallocate("d_c128_lens", max_decode_rows, fill=SWA_WINDOW)
             pool.preallocate("p_c128_lens", max_prefill_rows, fill=SWA_WINDOW)
 
+    def _build_late_layer_tail_metadata(self, *args, **kwargs):
+        # The tail's p_* tables share the pool parents with the full metadata's;
+        # building them now would overwrite tables that layers before the switch read.
+        self.trtllm_defer_tables = True
+        try:
+            return super()._build_late_layer_tail_metadata(*args, **kwargs)
+        finally:
+            self.trtllm_defer_tables = False
+
+    def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
+        saved = super().enter_late_layer_tail(forward_batch)
+        # The full metadata's tables are dead after the switch; reuse the parents.
+        tail_core = self.forward_metadata.core_attn_metadata
+        tail_core.init_trtllm_prefill_sparse_buffers(
+            sum(self.forward_metadata.late_layer_tail.extend_seq_lens_cpu)
+        )
+        tail_core.trtllm_tail_needs_pack = True
+        return saved
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         super().init_cuda_graph_state(max_bs, max_num_tokens)
         num_heads = (
@@ -637,7 +656,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sparse_indices = core.trtllm_prefill_c4_indices
             sparse_topk_lens = core.trtllm_prefill_c4_lens
             assert sparse_indices is not None and sparse_topk_lens is not None
-            if self._refreshes_tail(layer.layer_id):
+            if self._refreshes_tail(layer.layer_id) or core.trtllm_tail_needs_pack:
                 _refresh_indexed_tail(
                     core,
                     compress_ratio,
@@ -645,6 +664,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                     sparse_indices,
                     sparse_topk_lens,
                 )
+                core.trtllm_tail_needs_pack = False
 
         assert sparse_topk_lens is not None
 

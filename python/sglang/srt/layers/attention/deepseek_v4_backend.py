@@ -420,6 +420,8 @@ class DSV4AttnMetadata:
     trtllm_table_pool: Optional[object] = None
     # trtllm topk_v2 path: c4_sparse_page_indices aliases the combined table's tail.
     trtllm_topk_writes_table: bool = False
+    # Late-layer tail: the first indexed layer packs the table even if not an index source.
+    trtllm_tail_needs_pack: bool = False
 
     c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c1_flashmla_metadata: Optional[FlashMLASchedMeta] = field(
@@ -774,6 +776,8 @@ class DSV4AttnMetadata:
                 "trtllm_table_pool",
                 # Plain config flag (same value on both sides).
                 "trtllm_topk_writes_table",
+                # Eager-prefill tail flag; decode metadata never sets it.
+                "trtllm_tail_needs_pack",
             ],
         )
 
@@ -1265,6 +1269,8 @@ class DeepseekV4AttnBackend(
     # Set by the trtllm backend; FlashMLA leaves the defaults.
     trtllm_table_pool: Optional[object] = None
     trtllm_topk_writes_table: bool = False
+    # Set while building the late-layer tail; its tables are built at the switch.
+    trtllm_defer_tables: bool = False
     mega_attn: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
@@ -4573,6 +4579,8 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.c128_flashmla_metadata = None
         # trtllm combined tables (SWA-only capacity when compression is skipped,
         # e.g. draft-extend metadata).
+        if self.trtllm_defer_tables:
+            return core_attn_metadata
         if trtllm_prefill_num_tokens is not None:
             assert self.trtllm_attn
             core_attn_metadata.init_trtllm_prefill_sparse_buffers(
