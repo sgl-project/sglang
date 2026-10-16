@@ -1476,6 +1476,15 @@ def aiter_w8a8_block_fp8_linear(
 
     n, k = weight.shape
 
+    if _use_aiter_bpreshuffle_gfx95 and input_scale is None and bias is None:
+        from sglang.kernels.ops.gemm.mimo_fused_qkv_gfx950 import (
+            try_smallm_fp8_bs_linear,
+        )
+
+        mono_output = try_smallm_fp8_bs_linear(input_2d, weight, weight_scale)
+        if mono_output is not None:
+            return mono_output.view(*output_shape)
+
     if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     elif _use_aiter_gfx95:
