@@ -4,13 +4,14 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
 import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.moe import tp_fusion
 from sglang.srt.hardware_backend.npu.moe.contracts import (
+    INT4,
     INT8,
     MXFP4,
     MXFP8,
@@ -39,6 +40,265 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestAscendTPOptimizations(CustomTestCase):
+    def test_quantized_operand_rejects_wrong_scale_order_and_storage(self):
+        data = torch.zeros(2, 128, dtype=torch.float8_e4m3fn)
+        for scale in (
+            torch.zeros(4, 2, dtype=torch.uint8),
+            torch.zeros(2, 2, 2, dtype=torch.int8),
+            torch.zeros(2, 2, 2, dtype=torch.float8_e4m3fn),
+            torch.zeros(2, 2, 2, dtype=torch.uint8).transpose(1, 2),
+        ):
+            with (
+                self.subTest(shape=scale.shape, dtype=scale.dtype),
+                self.assertRaises(ValueError),
+            ):
+                QuantizedOperand(data, scale, MXFP8, (2, 128)).validate(MXFP8)
+        QuantizedOperand(
+            data, torch.zeros(2, 2, 2, dtype=torch.uint8), MXFP8, (2, 128)
+        ).validate(MXFP8)
+        for contract, dtype, width in (
+            (INT4, torch.int32, 16),
+            (MXFP4, torch.uint8, 64),
+        ):
+            scale = (
+                torch.ones(2)
+                if contract == INT4
+                else torch.ones(2, 2, 2, dtype=torch.uint8)
+            )
+            QuantizedOperand(
+                torch.zeros(2, width, dtype=dtype), scale, contract, (2, 128)
+            ).validate(contract)
+            with self.assertRaisesRegex(ValueError, "Packed operand storage"):
+                QuantizedOperand(
+                    torch.zeros(2, 64, dtype=torch.int8), scale, contract, (2, 128)
+                ).validate(contract)
+
+    def test_quantized_operand_waits_for_producer_before_recording_consumers(self):
+        device = Mock()
+        data = Mock(device=SimpleNamespace(type="npu"))
+        scale = Mock()
+        events = Mock()
+        events.attach_mock(device.Event, "new_event")
+        events.attach_mock(device.current_stream, "stream")
+        events.attach_mock(data.record_stream, "data")
+        events.attach_mock(scale.record_stream, "scale")
+        with patch.object(torch, "get_device_module", return_value=device):
+            operand = QuantizedOperand(data, scale, INT8, (2, 64))
+            operand.record_stream()
+        self.assertEqual(
+            events.mock_calls,
+            [
+                call.new_event(),
+                call.stream(),
+                call.new_event().record(device.current_stream.return_value),
+                call.stream(),
+                call.stream().wait_event(device.Event.return_value),
+                call.data(device.current_stream.return_value),
+                call.scale(device.current_stream.return_value),
+            ],
+        )
+
+    def test_separate_shared_precision_is_checked_before_allocation(self):
+        parent = "model.layers.0.mlp.shared_expert"
+        description = {
+            f"{parent}.{proj}.weight": "W4A8_DYNAMIC"
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        }
+        quant = ModelSlimConfig(description)
+        config = SimpleNamespace(shared_expert_intermediate_size=64)
+        with (
+            patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_none=lambda: True),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=1),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "has no dense NPU method"):
+                tp_fusion.npu_tp_shared_expert_count(config, quant, 0)
+            quant.quant_description[parent + ".gate_proj.weight"] = "FLOAT"
+            with self.assertRaisesRegex(ValueError, "mismatched shared W13"):
+                tp_fusion.npu_tp_shared_expert_count(config, quant, 0)
+            for key in quant.quant_description:
+                quant.quant_description[key] = "W8A8_DYNAMIC"
+            self.assertEqual(tp_fusion.npu_tp_shared_expert_count(config, quant, 0), 0)
+
+    def test_shared_fusion_requires_plain_silu(self):
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            NPUW8A8Int8DynamicLinearMethod,
+        )
+        from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
+
+        mlp = SimpleNamespace(
+            down_proj=SimpleNamespace(quant_method=NPUW8A8Int8DynamicLinearMethod()),
+            act_fn=GeluAndMul(),
+        )
+        with (
+            patch.object(tp_fusion, "supports_npu_op", return_value=True),
+            patch.object(tp_fusion, "supports_cann_symbol", return_value=True),
+        ):
+            self.assertEqual(tp_fusion.shared_gmm1_mode(mlp), "baseline")
+            mlp.act_fn = SiluAndMul()
+            self.assertEqual(tp_fusion.shared_gmm1_mode(mlp), "activation_quant")
+            with patch(
+                "sglang.srt.model_executor.runner.get_is_capture_mode",
+                return_value=True,
+            ):
+                self.assertEqual(tp_fusion.shared_gmm1_mode(mlp), "baseline")
+            mlp.gemm1_clamp_limit = 2
+            self.assertEqual(tp_fusion.shared_gmm1_mode(mlp), "baseline")
+
+    def test_fused_mxfp_layout_rejects_contiguous_transpose_and_wrong_scale_axis(self):
+        with patch.object(torch.ops.npu, "npu_dynamic_mx_quant", create=True):
+            kernel = NPUMXFP8MoEMethod("w13")
+        weight = torch.empty(2, 128, 64, dtype=torch.float8_e4m3fn).transpose(1, 2)
+        scale = torch.empty(2, 128, 1, 2, dtype=torch.uint8).transpose(1, 2)
+        self.assertTrue(tp_fusion.fused_mxfp_layout(kernel, weight, scale))
+        self.assertFalse(
+            tp_fusion.fused_mxfp_layout(kernel, weight.contiguous(), scale)
+        )
+        self.assertFalse(
+            tp_fusion.fused_mxfp_layout(kernel, weight, scale.transpose(1, 2))
+        )
+
+    def test_fused_mxfp_abi_depends_on_weight_format(self):
+        device = SimpleNamespace(type="npu")
+        weight = torch.empty(2, 128, 64, dtype=torch.float8_e4m3fn).transpose(1, 2)
+        scale = torch.empty(2, 128, 1, 2, dtype=torch.uint8).transpose(1, 2)
+
+        def on_npu(tensor):
+            return SimpleNamespace(
+                device=device,
+                ndim=tensor.ndim,
+                shape=tensor.shape,
+                dtype=tensor.dtype,
+                stride=tensor.stride,
+            )
+
+        with patch.object(torch.ops.npu, "npu_dynamic_mx_quant", create=True):
+            kernel = NPUMXFP8MoEMethod("w13")
+        for fmt, suffix in ((2, "V2"), (29, "WeightNzV2"), (50, "WeightNzV2")):
+            with (
+                self.subTest(format=fmt),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "torch_npu": SimpleNamespace(
+                            get_npu_format=lambda w, fmt=fmt: fmt
+                        )
+                    },
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                    return_value=True,
+                ),
+                patch.object(tp_fusion, "supports_npu_op", return_value=True),
+                patch.object(
+                    tp_fusion,
+                    "supports_cann_symbol",
+                    side_effect=lambda s, suffix=suffix: (
+                        s == "aclnnGroupedMatmulSwigluQuant" + suffix
+                    ),
+                ),
+            ):
+                self.assertTrue(
+                    tp_fusion.supports_fused_mxfp_gmm(
+                        kernel, on_npu(weight), on_npu(scale)
+                    )
+                )
+
+    def test_overlap_does_not_require_shared_finalization(self):
+        experts = SimpleNamespace(
+            dispatcher=AscendTPDispatcher(MoeRunnerConfig(num_experts=2, top_k=1)),
+            moe_ep_size=1,
+            num_fused_shared_experts=0,
+            reduce_results=False,
+        )
+        with patch.object(tp_fusion, "supports_npu_op", return_value=False):
+            self.assertTrue(tp_fusion.can_overlap_tp_shared(experts))
+        experts.num_fused_shared_experts = 1
+        self.assertFalse(tp_fusion.can_overlap_tp_shared(experts))
+
+    def test_unsupported_activation_parameters_fail_before_execution(self):
+        layer = SimpleNamespace(
+            w13_kernel=NPUUnquantMoEMethod(), w2_kernel=NPUUnquantMoEMethod()
+        )
+        for settings in (
+            {"is_gated": False},
+            {"gemm1_alpha": 1.7},
+            {"gemm1_beta": 1.0},
+        ):
+            with (
+                self.subTest(settings=settings),
+                self.assertRaisesRegex(ValueError, "Native Ascend MoE"),
+            ):
+                AscendRunnerCore(MoeRunnerConfig(layer=layer, **settings))
+
+    def test_appended_and_separate_shared_outputs_cannot_be_combined(self):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        layer = SimpleNamespace(
+            dispatcher=AscendTPDispatcher(MoeRunnerConfig(num_experts=2, top_k=1)),
+            moe_ep_size=1,
+            num_fused_shared_experts=1,
+            reduce_results=False,
+        )
+        hidden = torch.zeros(2, 64, dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "unreduced TP"):
+            FusedMoE.forward_impl(layer, hidden, None, shared_output=hidden)
+        layer.num_fused_shared_experts = 0
+        with self.assertRaisesRegex(ValueError, "matching rank-local"):
+            FusedMoE.forward_impl(layer, hidden, None, shared_output=hidden.float())
+
+    def test_prepared_shared_weight_geometry_must_match_logical_projections(self):
+        layer = torch.nn.Module()
+        layer.dispatcher = AscendTPDispatcher(MoeRunnerConfig(num_experts=3, top_k=2))
+        layer.moe_ep_size = 1
+        layer.num_fused_shared_experts = 1
+        layer.num_local_experts = 3
+        layer.hidden_size = 64
+        layer.intermediate_size_per_partition = 32
+        layer.w13_kernel = layer.w2_kernel = NPUUnquantMoEMethod()
+        layer.w13_weight = torch.nn.Parameter(torch.ones(3, 64, 64))
+        layer.w2_weight = torch.nn.Parameter(torch.ones(3, 64, 32))
+        tp_fusion.validate_tp_expert_weights(layer)
+        layer.w13_weight = torch.nn.Parameter(torch.ones(3, 64, 65))
+        with self.assertRaisesRegex(ValueError, "w13 weight shape"):
+            tp_fusion.validate_tp_expert_weights(layer)
+
+    def test_qwen_shared_slot_keeps_fp32_sigmoid_and_routed_weights(self):
+        from sglang.srt.models import qwen2_moe
+
+        layer = qwen2_moe.Qwen2MoeSparseMoeBlock.__new__(
+            qwen2_moe.Qwen2MoeSparseMoeBlock
+        )
+        torch.nn.Module.__init__(layer)
+        logits = torch.tensor([[-2.015625], [1.0078125]], dtype=torch.bfloat16)
+        layer.shared_expert_gate = lambda x: logits
+        layer.enable_shared_expert_fusion = True
+        layer.num_experts = 2
+        hidden = torch.zeros(2, 64, dtype=torch.bfloat16)
+        weights = torch.tensor([[0.1234567], [0.0001001]])
+        topk = StandardTopKOutput(
+            weights, torch.tensor([[0], [1]], dtype=torch.int32), hidden
+        )
+        with (
+            patch.object(qwen2_moe, "_is_npu", True),
+            patch.object(qwen2_moe, "_use_aiter", False),
+            patch.object(
+                qwen2_moe, "get_parallel", return_value=SimpleNamespace(moe_ep_size=1)
+            ),
+        ):
+            result = layer._append_shared_to_topk_output(topk, hidden)
+        torch.testing.assert_close(result.topk_weights[:, :1], weights, atol=0, rtol=0)
+        torch.testing.assert_close(
+            result.topk_weights[:, 1:], logits.float().sigmoid(), atol=0, rtol=0
+        )
+        self.assertEqual(result.topk_weights.dtype, torch.float32)
+        self.assertTrue(torch.all(result.topk_ids[:, 1] == 2))
+
     def test_mxfp4_dense_and_moe_agree_at_rounding_ties(self):
         from sglang.srt.hardware_backend.npu.quantization import linear_method_npu
 
@@ -342,6 +602,8 @@ class TestAscendTPOptimizations(CustomTestCase):
         for _, param in layer.named_parameters():
             param._npu_shared_loaded_shards = {"w1", "w3", "w2"}
         tp_fusion.validate_tp_expert_weights(layer, prepared=False)
+        with self.assertRaisesRegex(ValueError, "missing checkpoint shards"):
+            tp_fusion.validate_tp_expert_weights(layer, prepared=False)
 
     def test_int8_reuse_routes_scales_without_mxfp_reinterpretation(self):
         from sglang.srt.hardware_backend.npu.moe.init_routing import (

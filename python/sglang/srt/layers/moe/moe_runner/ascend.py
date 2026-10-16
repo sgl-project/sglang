@@ -123,26 +123,20 @@ class AscendRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
-        kernel = config.layer.w2_kernel
-        self.use_fused_gmm1 = _uses_fused_gmm1(config.layer.w13_kernel, config)
-        if self.use_fused_gmm1:
-            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                supports_fused_mxfp_gmm,
+        if get_moe_a2a_backend().is_none() and (
+            not config.is_gated
+            or config.gemm1_beta is not None
+            or (config.activation == "silu" and config.gemm1_alpha is not None)
+        ):
+            raise ValueError(
+                "Native Ascend MoE requires gated activations without gemm1_beta; "
+                "scaled SiLU must use the explicit situ or npu_swiglu_oai method"
             )
-
-            self.use_fused_gmm1 = supports_fused_mxfp_gmm(config.layer.w13_kernel)
-
-        if self.use_fused_gmm1:
-            # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
-            # gate/up + swiglu + requant into gmm1, so there is no separate
-            # activation step — run() skips it. Left None on purpose so that
-            # reaching for it fails loudly instead of silently applying an
-            # unfused swiglu to already-requantised activations. This holds
-            # for both dispatchers: ascend_tp gets its activation quant fused
-            # into routing, DeepEP dispatches bf16 and gmm1 quantises it
-            # itself.
-            self.activation = None
-        elif (
+        kernel = config.layer.w2_kernel
+        # Weight preparation decides layout eligibility; retain the ordinary path.
+        self.use_fused_gmm1 = False
+        self._fused_gmm1_prepared = False
+        if (
             isinstance(kernel, (NPUW4A8MXFP4MoEMethod, NPUMXFP8MoEMethod))
             and config.swiglu_limit is not None
             and config.swiglu_limit > 0
@@ -230,6 +224,19 @@ class AscendRunnerCore(MoeRunnerCore):
             else:
                 self.activation = inner
 
+    def prepare_fused_gmm1(self):
+        from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+            supports_fused_mxfp_gmm,
+        )
+
+        layer = self.config.layer
+        self.use_fused_gmm1 = _uses_fused_gmm1(layer.w13_kernel, self.config) and (
+            supports_fused_mxfp_gmm(
+                layer.w13_kernel, layer.w13_weight, layer.w13_weight_scale
+            )
+        )
+        self._fused_gmm1_prepared = True
+
     def run(
         self,
         runner_input: AscendRunnerInput,
@@ -247,7 +254,12 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if self.use_fused_gmm1:
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        capture = get_is_capture_mode() or torch.compiler.is_compiling()
+        if not self._fused_gmm1_prepared and not capture:
+            self.prepare_fused_gmm1()
+        if self.use_fused_gmm1 and not capture:
             # --- w13 projection + activation, fused into one kernel ---
             # The fused gmm1 returns activations already requantised for gmm2,
             # so there is no separate activation step to run.

@@ -1,6 +1,6 @@
 """Activation contracts at native MoE compute and routing boundaries."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -62,6 +62,14 @@ class QuantizedOperand:
     contract: ActivationContract
     source_shape: tuple
     source_dtype: torch.dtype = torch.bfloat16
+    _ready: object = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        if self.data.device.type == "npu":
+            device = torch.get_device_module(self.data.device)
+            ready = device.Event()
+            ready.record(device.current_stream())
+            object.__setattr__(self, "_ready", ready)
 
     def __iter__(self):
         return iter((self.data, self.scale))
@@ -80,34 +88,52 @@ class QuantizedOperand:
             raise ValueError("INT8 operand requires integer INT8 data")
         if expected == MXFP8 and self.data.dtype != torch.float8_e4m3fn:
             raise ValueError("MXFP8 operand requires E4M3 data")
-        if len(self.source_shape) != 2 or self.data.shape[0] != self.source_shape[0]:
+        if (
+            len(self.source_shape) != 2
+            or self.data.ndim != 2
+            or self.data.shape[0] != self.source_shape[0]
+            or not self.data.is_contiguous()
+            or not self.scale.is_contiguous()
+        ):
             raise ValueError("NPU operand must preserve its logical token rows")
         if expected.packing == 1 and tuple(self.data.shape) != self.source_shape:
             raise ValueError("NPU operand shape differs from its source")
         if expected.packing > 1:
-            if self.data.dtype not in (torch.int32, torch.uint8, torch.int8):
-                raise ValueError("Packed operand requires integer storage")
-            logical_elements = self.source_shape[0] * self.source_shape[1]
-            if self.data.numel() * self.data.element_size() * 2 != logical_elements:
-                raise ValueError(
-                    "Packed operand must store exactly two 4-bit values per byte"
-                )
+            dtype = torch.int32 if expected == INT4 else torch.uint8
+            rows, width = self.source_shape
+            if (
+                self.data.dtype != dtype
+                or width % expected.packing
+                or tuple(self.data.shape) != (rows, width // expected.packing)
+            ):
+                raise ValueError("Packed operand storage differs from its row contract")
         if expected.block_size:
             expected_scales = (
                 self.source_shape[0] * self.source_shape[1] // expected.block_size
             )
             if self.source_shape[-1] % 64 or self.scale.numel() != expected_scales:
                 raise ValueError("MX operand requires paired block32 scales")
-            if self.scale.element_size() != 1:
-                raise ValueError("MX operand requires byte-sized E8M0 scales")
+            scale_shapes = (
+                (self.source_shape[0], self.source_shape[1] // 32),
+                (self.source_shape[0], self.source_shape[1] // 64, 2),
+            )
+            e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+            if self.scale.dtype not in (torch.uint8, e8m0):
+                raise ValueError("MX operand requires E8M0 scales")
+            if tuple(self.scale.shape) not in scale_shapes:
+                raise ValueError("MX operand requires token-major paired block scales")
         elif (
             self.scale.numel() != self.source_shape[0]
             or self.scale.dtype != torch.float32
+            or tuple(self.scale.shape)
+            not in ((self.source_shape[0],), (self.source_shape[0], 1))
         ):
             raise ValueError("Integer operand requires FP32 per-token scales")
 
     def record_stream(self):
         stream = torch.get_device_module(self.data.device).current_stream()
+        if self._ready is not None:
+            stream.wait_event(self._ready)
         self.data.record_stream(stream)
         self.scale.record_stream(stream)
 

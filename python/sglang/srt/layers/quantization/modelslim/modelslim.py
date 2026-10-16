@@ -353,19 +353,10 @@ class ModelSlimConfig(QuantizationConfig):
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
         """
 
-        linear_quant_schemes = [
-            ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
-            ("W8A8", ModelSlimW8A8Int8),
-            ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
-            ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
-            ("W4A8_MXFP", ModelSlimMXFP4W4A8Scheme),
-            ("W4A4_MXFP4", ModelSlimMXFP4Scheme),
-        ]
-
         prefix = self._resolve_quant_prefix(prefix)
         quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
 
-        for scheme_name, scheme_class in linear_quant_schemes:
+        for scheme_name, scheme_class in self.linear_scheme_types().items():
             if any(s == scheme_name for s in quant_schemes):
                 logger.info_once(f"Using {scheme_class.__name__}")
                 return scheme_class(quant_config=self.quant_description, prefix=prefix)
@@ -374,6 +365,17 @@ class ModelSlimConfig(QuantizationConfig):
             f"Unsupported Linear modelslim scheme: {quant_schemes} in layer: {prefix}"
         )
         return None
+
+    @staticmethod
+    def linear_scheme_types():
+        return {
+            "W4A4_DYNAMIC": ModelSlimW4A4Int4,
+            "W8A8": ModelSlimW8A8Int8,
+            "W8A8_DYNAMIC": ModelSlimW8A8Int8,
+            "W8A8_MXFP8": ModelSlimMXFP8Scheme,
+            "W4A8_MXFP": ModelSlimMXFP4W4A8Scheme,
+            "W4A4_MXFP4": ModelSlimMXFP4Scheme,
+        }
 
     def get_moe_scheme(
         self,
@@ -561,6 +563,13 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         layer.w13_scheme.process_weights_after_loading(layer)
         layer.w2_scheme.process_weights_after_loading(layer)
         validate_tp_expert_weights(layer)
+        core = getattr(
+            getattr(getattr(self, "runner", None), "runner_core", None),
+            "prepare_fused_gmm1",
+            None,
+        )
+        if core is not None:
+            core()
 
     def create_weights(
         self,
@@ -592,6 +601,14 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             weight_prefix="w2",
             **extra_weight_attrs,
         )
+        layer._npu_checkpoint_geometry = {
+            name: (tuple(param.shape), param.dtype)
+            for name, param in layer.named_parameters(recurse=False)
+            if name.startswith(("w13_", "w2_"))
+        }
+        for name, param in layer.named_parameters(recurse=False):
+            if name in layer._npu_checkpoint_geometry:
+                param._npu_shared_loaded_shards = set()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

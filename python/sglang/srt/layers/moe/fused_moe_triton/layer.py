@@ -1597,9 +1597,20 @@ class FusedMoE(torch.nn.Module):
         shared_output_ready: Optional[Callable[[], None]] = None,
     ):
         if shared_output is not None and (
-            not isinstance(self.dispatcher, AscendTPDispatcher) or self.reduce_results
+            not isinstance(self.dispatcher, AscendTPDispatcher)
+            or self.reduce_results
+            or self.moe_ep_size != 1
+            or self.num_fused_shared_experts
         ):
             raise ValueError("Shared finalization requires unreduced TP expert output")
+        if shared_output is not None and (
+            shared_output.shape != hidden_states.shape
+            or shared_output.dtype != hidden_states.dtype
+            or shared_output.device != hidden_states.device
+        ):
+            raise ValueError(
+                "Shared finalization requires a matching rank-local output"
+            )
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 

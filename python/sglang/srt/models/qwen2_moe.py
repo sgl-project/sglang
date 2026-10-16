@@ -326,6 +326,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                npu_tp_shared_expert_count,
+            )
+
+            self.num_fused_shared_experts = npu_tp_shared_expert_count(
+                config, quant_config, self.num_fused_shared_experts
+            )
+            self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -370,7 +379,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else (False, False)
         )
         self._fuse_npu_tp_shared &= self.num_shared_experts > 0
-        if _is_npu and self._fuse_npu_tp_shared and self.alt_stream is None:
+        self._npu_tp_shared_overlap = False
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                can_overlap_tp_shared,
+            )
+
+            self._npu_tp_shared_overlap = can_overlap_tp_shared(self.experts) and (
+                self.num_shared_experts > 0
+            )
+        if _is_npu and self._npu_tp_shared_overlap and self.alt_stream is None:
             self.alt_stream = get_stream("npu_moe")
 
         self.gate = ReplicatedLinear(
@@ -887,17 +905,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_output = self._forward_router_experts(
                 hidden_states,
                 pre_quant_input=pre_quant_input,
-                shared_output=shared_output if self._fuse_npu_tp_shared else None,
+                shared_output=shared_output
+                if (self._fuse_npu_tp_shared and not get_is_capture_mode())
+                else None,
                 shared_output_ready=(
                     lambda: self.alt_stream.wait_stream(current_stream)
                 )
-                if self._fuse_npu_tp_shared
+                if (self._fuse_npu_tp_shared and not get_is_capture_mode())
                 else None,
             )
-            if self._fuse_npu_tp_shared:
+            if self._fuse_npu_tp_shared and not get_is_capture_mode():
                 shared_output = None
 
         current_stream.wait_stream(self.alt_stream)
+        if _is_npu:
+            router_output.record_stream(current_stream)
 
         if staged and unstage_shared_expert_add() is None:
             # The dispatch consumed the staging (add already enqueued); skip the caller's add.
@@ -941,7 +963,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
         elif (
             self.alt_stream is not None
-            and (get_is_capture_mode() or (_is_npu and self._fuse_npu_tp_shared))
+            and (get_is_capture_mode() or self._npu_tp_shared_overlap)
             and not torch.compiler.is_compiling()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
@@ -972,9 +994,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 defer_finalize=defer_finalize,
                 pre_quant_input=pre_quant_input,
-                shared_output=shared_output if self._fuse_npu_tp_shared else None,
+                shared_output=shared_output
+                if (self._fuse_npu_tp_shared and not get_is_capture_mode())
+                else None,
             )
-            if self._fuse_npu_tp_shared:
+            if self._fuse_npu_tp_shared and not get_is_capture_mode():
                 shared_output = None
 
         if defer_finalize:

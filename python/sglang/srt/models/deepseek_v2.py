@@ -667,6 +667,14 @@ class DeepseekV2MoE(nn.Module):
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
         self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                npu_tp_shared_expert_count,
+            )
+
+            self.num_fused_shared_experts = npu_tp_shared_expert_count(
+                config, quant_config, self.num_fused_shared_experts
+            )
 
         # DeepEP and MegaMOE shared expert fusion: shared expert is fused into
         # the same MoE kernel as a local expert at each EP rank. Expert layout
@@ -962,7 +970,19 @@ class DeepseekV2MoE(nn.Module):
         self._fuse_npu_tp_shared &= hasattr(self, "shared_experts") and not (
             self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
         )
-        if _is_npu and self._fuse_npu_tp_shared and self.alt_stream is None:
+        self._npu_tp_shared_overlap = False
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                can_overlap_tp_shared,
+            )
+
+            self._npu_tp_shared_overlap = can_overlap_tp_shared(self.experts) and (
+                hasattr(self, "shared_experts")
+                and not (
+                    self._shared_expert_tp1 or self._fuse_shared_experts_inside_sbo
+                )
+            )
+        if _is_npu and self._npu_tp_shared_overlap and self.alt_stream is None:
             self.alt_stream = get_stream("npu_moe")
         if _is_npu and hasattr(self, "shared_experts"):
             self.shared_experts._npu_tp_shared = (
@@ -1065,7 +1085,8 @@ class DeepseekV2MoE(nn.Module):
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
-                and (get_is_capture_mode() or (_is_npu and self._fuse_npu_tp_shared))
+                and (get_is_capture_mode() or self._npu_tp_shared_overlap)
+                and not torch.compiler.is_compiling()
                 and not is_in_breakable_cuda_graph()
             ):
                 return self.forward_normal_dual_stream(
@@ -1215,7 +1236,7 @@ class DeepseekV2MoE(nn.Module):
         )
         shared_output = npu_shared_output
         shared_fused = (
-            self._fuse_npu_tp_shared
+            (self._fuse_npu_tp_shared and not get_is_capture_mode())
             and shared_output is not None
             and not (return_moe_output or leave_output_sum)
         )
@@ -1335,8 +1356,8 @@ class DeepseekV2MoE(nn.Module):
             if get_exec().moe.enable_eplb and not self.is_nextn
             else None
         )
-        defer_shared = (
-            not self.experts.moe_runner_config.inplace and not self._fuse_npu_tp_shared
+        defer_shared = not self.experts.moe_runner_config.inplace and not (
+            self._fuse_npu_tp_shared and not get_is_capture_mode()
         )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
@@ -1430,7 +1451,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if (
-            self._fuse_npu_tp_shared
+            (self._fuse_npu_tp_shared and not get_is_capture_mode())
             and shared_output is not None
             and not (return_moe_output or leave_output_sum)
         ):
@@ -3467,6 +3488,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                npu_tp_shared_expert_count,
+            )
+
+            self.num_fused_shared_experts = npu_tp_shared_expert_count(
+                self.config, self.quant_config, self.num_fused_shared_experts
+            )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
