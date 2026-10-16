@@ -1688,7 +1688,7 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
-def _eplb_remap_enabled() -> bool:
+def is_expert_remapping_enabled() -> bool:
     # A real logical->physical mapping only exists when EPLB is enabled, the
     # initial expert placement is non-trivial, or there are redundant physical
     # experts. Otherwise the map is identity and the remap must be skipped (it is
@@ -2393,7 +2393,7 @@ def _post_process_topk_ids(
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         #
         # Let append kernels materialize padded ids when remapping is disabled.
-        eplb_remap_enabled = _eplb_remap_enabled()
+        eplb_remap_enabled = is_expert_remapping_enabled()
         _fold_pad_into_append = (
             _aiter_append
             and not eplb_remap_enabled
@@ -2597,7 +2597,7 @@ def select_experts(
         and (
             num_fused_shared_experts == 0
             or has_per_rank_fused_shared_slots(num_fused_shared_experts)
-            or not _eplb_remap_enabled()
+            or not is_expert_remapping_enabled()
         )
     ):
         # only the aiter sqrtsoftplus gate takes the partials; every other route reads router_logits

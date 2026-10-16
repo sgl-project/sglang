@@ -60,6 +60,9 @@ def fused_mhc_tp_ok(tp_size: int) -> bool:
 HcTriplet = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
+MHC_POST_MULT_VALUE = 2.0
+
+
 class HcConfig(NamedTuple):
     """Everything about a layer's mHC that is fixed for the model's lifetime."""
 
@@ -611,6 +614,7 @@ def _post_fusion(
         and next.norm_fusable
         and next.hc is not None
         and _can_use_mega_mhc(cfg)
+        and y.shape[0] > 0
     ):
         next_hc = next.hc
         updated, normalized, stats = mhc_mega_boundary(
