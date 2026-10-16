@@ -26,7 +26,15 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, set_weight_attrs
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -39,6 +47,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import moe_align_block_size, moe_sum
@@ -64,6 +73,8 @@ elif _is_musa:
     )
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
+elif _is_cpu:
+    import sgl_kernel  # noqa: F401
 else:
     if not _is_hip:
         warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
@@ -203,6 +214,10 @@ def fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    if _is_cpu:
+        return torch.ops.sgl_kernel.gguf_mul_mat_cpu(
+            x.contiguous(), qweight.contiguous(), qweight_type
+        )
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])

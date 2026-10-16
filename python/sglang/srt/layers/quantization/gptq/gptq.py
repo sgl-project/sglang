@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
 )
+from sglang.srt.utils import is_cpu
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _, scalar_types = get_scalar_types()
+_is_cpu = is_cpu()
 
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
@@ -349,6 +351,15 @@ class GPTQMarlinConfig(QuantizationConfig):
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
         self.full_config = full_config
+        self.checkpoint_format = self.get_from_keys_or(
+            full_config, ["checkpoint_format"], default=""
+        )
+        self.true_sequential = self.get_from_keys_or(
+            full_config, ["true_sequential"], default=False
+        )
+        self.static_groups = self.get_from_keys_or(
+            full_config, ["static_groups"], default=False
+        )
 
         if (weight_bits, is_sym) not in self.TYPE_MAP:
             raise ValueError(
@@ -450,9 +461,13 @@ class GPTQMarlinConfig(QuantizationConfig):
         )
 
     def get_linear_scheme(self, layer: torch.nn.Module):
+        if _is_cpu:
+            return GPTQIntelAMXLinearScheme(self)
         return GPTQMarlinLinearScheme(self)
 
     def get_moe_scheme(self, layer: torch.nn.Module):
+        if _is_cpu:
+            return GPTQIntelAMXMoEScheme(self)
         return GPTQMarlinMoEScheme(self)
 
     @classmethod
