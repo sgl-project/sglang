@@ -587,6 +587,40 @@ def register_fake_ops(tp_size: int):
 
         return output, final_state
 
+    @register_cpu_compile_fake("chunk_kda_cpu")
+    def _(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+        cu_seqlens,
+        initial_state_indices,
+        A_log=None,
+        dt_bias=None,
+        lower_bound=None,
+        beta_is_raw=False,
+        use_qk_l2norm_in_kernel=True,
+        output_intermediate_states=False,
+        track_state=None,
+        track_chunk_idx=None,
+        eps=1e-6,
+        scale=None,
+    ):
+        output = torch.empty_like(value)
+        final_state = initial_state.to(torch.float32)
+        h = None
+        if output_intermediate_states:
+            num_chunks = 0
+            if cu_seqlens.numel() > 1:
+                lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                num_chunks = int(((lens + 63) // 64).sum().item())
+            h = query.new_empty(
+                (1, num_chunks, value.shape[2], value.shape[3], query.shape[3])
+            )
+        return output, final_state, h
+
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.

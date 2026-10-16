@@ -120,3 +120,47 @@ def chunk_gated_delta_rule_cpu(
     )
     h = None  # Todo: add return h support
     return core_attn_out, last_recurrent_state, h
+
+
+def chunk_kda_cpu(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale=None,
+    initial_state=None,
+    initial_state_indices=None,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    A_log=None,
+    dt_bias=None,
+    lower_bound=None,
+    output_intermediate_states=False,
+    track_state=None,
+    track_chunk_idx=None,
+    beta_is_raw=False,
+    **kwargs,
+):
+    output, _final_state, h = torch.ops.sgl_kernel.chunk_kda_cpu(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        cu_seqlens,
+        initial_state_indices,
+        A_log,
+        dt_bias,
+        lower_bound,
+        beta_is_raw,
+        use_qk_l2norm_in_kernel,
+        output_intermediate_states,
+        track_state,
+        track_chunk_idx,
+        scale=scale,
+    )
+    if output_intermediate_states:
+        return output, h
+    return output

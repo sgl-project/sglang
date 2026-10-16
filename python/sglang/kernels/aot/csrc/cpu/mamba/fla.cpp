@@ -1597,6 +1597,567 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   return std::make_tuple(output, final_state);
 }
 
+namespace {
+
+constexpr int KDA_CHUNK_SIZE = 64;
+inline float sigmoid_fp32(float x) {
+  if (x >= 0.f) {
+    float z = std::exp(-x);
+    return 1.f / (1.f + z);
+  }
+  float z = std::exp(x);
+  return z / (1.f + z);
+}
+
+inline float softplus_fp32(float x) {
+  if (x > 20.f) {
+    return x;
+  }
+  if (x < -20.f) {
+    return std::exp(x);
+  }
+  return std::log1p(std::exp(x));
+}
+
+template <int D>
+inline float dot_product_fp32(const float* a, const float* b) {
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = Vec::size();
+  static_assert(D % kVecSize == 0);
+  Vec sum(0.f);
+  for (int d = 0; d < D; d += kVecSize) {
+    sum = sum + Vec::loadu(a + d) * Vec::loadu(b + d);
+  }
+  alignas(64) float tmp[kVecSize];
+  sum.store(tmp);
+  float out = 0.f;
+  for (int i = 0; i < kVecSize; ++i) {
+    out += tmp[i];
+  }
+  return out;
+}
+
+template <int D>
+inline void scale_state_columns(float* state_ptr, const float* decay, int64_t num_rows, int64_t row_stride) {
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = Vec::size();
+  static_assert(D % kVecSize == 0);
+  for (int64_t row = 0; row < num_rows; ++row) {
+    float* row_ptr = state_ptr + row * row_stride;
+    for (int d = 0; d < D; d += kVecSize) {
+      auto row_vec = Vec::loadu(row_ptr + d);
+      auto decay_vec = Vec::loadu(decay + d);
+      (row_vec * decay_vec).store(row_ptr + d);
+    }
+  }
+}
+
+template <int D>
+inline void matvec_fp32(const float* state_ptr, int64_t num_rows, int64_t row_stride, const float* vec, float* out) {
+  for (int64_t row = 0; row < num_rows; ++row) {
+    out[row] = dot_product_fp32<D>(state_ptr + row * row_stride, vec);
+  }
+}
+
+template <int D>
+inline void
+rank1_update_fp32(float* state_ptr, int64_t num_rows, int64_t row_stride, const float* residual, const float* key) {
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = Vec::size();
+  static_assert(D % kVecSize == 0);
+  for (int64_t row = 0; row < num_rows; ++row) {
+    float* row_ptr = state_ptr + row * row_stride;
+    Vec residual_vec(residual[row]);
+    for (int d = 0; d < D; d += kVecSize) {
+      auto state_vec = Vec::loadu(row_ptr + d);
+      auto key_vec = Vec::loadu(key + d);
+      (state_vec + residual_vec * key_vec).store(row_ptr + d);
+    }
+  }
+}
+
+template <typename scalar_t, int D>
+void prepare_qk_tensors(
+    float* q_out,
+    float* k_out,
+    const scalar_t* query,
+    const scalar_t* key,
+    int64_t T,
+    int64_t H,
+    int64_t q_strideT,
+    int64_t q_strideH,
+    int64_t k_strideT,
+    int64_t k_strideH,
+    bool use_qk_l2norm_in_kernel,
+    float scale,
+    float eps) {
+  at::parallel_for(0, T * H, 0, [&](int64_t begin, int64_t end) {
+    int64_t t{0}, h{0};
+    data_index_init(begin, t, T, h, H);
+    for (int64_t idx = begin; idx < end; ++idx) {
+      const scalar_t* q_ptr = query + t * q_strideT + h * q_strideH;
+      const scalar_t* k_ptr = key + t * k_strideT + h * k_strideH;
+      float* q_dst = q_out + idx * D;
+      float* k_dst = k_out + idx * D;
+      float q_norm = 0.f;
+      float k_norm = 0.f;
+      if (use_qk_l2norm_in_kernel) {
+        for (int d = 0; d < D; ++d) {
+          float qv = static_cast<float>(q_ptr[d]);
+          float kv = static_cast<float>(k_ptr[d]);
+          q_norm += qv * qv;
+          k_norm += kv * kv;
+        }
+        q_norm = 1.f / std::sqrt(q_norm + eps);
+        k_norm = 1.f / std::sqrt(k_norm + eps);
+      }
+      for (int d = 0; d < D; ++d) {
+        float qv = static_cast<float>(q_ptr[d]);
+        float kv = static_cast<float>(k_ptr[d]);
+        q_dst[d] = use_qk_l2norm_in_kernel ? qv * q_norm * scale : qv * scale;
+        k_dst[d] = use_qk_l2norm_in_kernel ? kv * k_norm : kv;
+      }
+      data_index_step(t, T, h, H);
+    }
+  });
+}
+
+template <typename scalar_t, int D>
+void prepare_value_tensor(
+    float* v_out, const scalar_t* value, int64_t T, int64_t Hv, int64_t v_strideT, int64_t v_strideH) {
+  at::parallel_for(0, T * Hv, 0, [&](int64_t begin, int64_t end) {
+    int64_t t{0}, hv{0};
+    data_index_init(begin, t, T, hv, Hv);
+    for (int64_t idx = begin; idx < end; ++idx) {
+      const scalar_t* src = value + t * v_strideT + hv * v_strideH;
+      float* dst = v_out + idx * D;
+      for (int d = 0; d < D; ++d) {
+        dst[d] = static_cast<float>(src[d]);
+      }
+      data_index_step(t, T, hv, Hv);
+    }
+  });
+}
+
+template <typename scalar_t>
+void prepare_beta_tensor(
+    float* beta_out, const scalar_t* beta, int64_t T, int64_t Hv, int64_t beta_strideT, bool beta_is_raw) {
+  at::parallel_for(0, T * Hv, 0, [&](int64_t begin, int64_t end) {
+    int64_t t{0}, hv{0};
+    data_index_init(begin, t, T, hv, Hv);
+    for (int64_t idx = begin; idx < end; ++idx) {
+      float val = static_cast<float>(beta[t * beta_strideT + hv]);
+      beta_out[idx] = beta_is_raw ? sigmoid_fp32(val) : val;
+      data_index_step(t, T, hv, Hv);
+    }
+  });
+}
+
+template <typename scalar_t, int D>
+void prepare_gate_tensor(
+    float* gate_out,
+    const scalar_t* gate,
+    int64_t T,
+    int64_t Hv,
+    int64_t g_strideT,
+    int64_t g_strideH,
+    const float* A_log,
+    const float* dt_bias,
+    std::optional<double> lower_bound) {
+  const bool has_activation = A_log != nullptr;
+  const bool use_safe_gate = lower_bound.has_value();
+  at::parallel_for(0, T * Hv, 0, [&](int64_t begin, int64_t end) {
+    int64_t t{0}, hv{0};
+    data_index_init(begin, t, T, hv, Hv);
+    for (int64_t idx = begin; idx < end; ++idx) {
+      const scalar_t* src = gate + t * g_strideT + hv * g_strideH;
+      float* dst = gate_out + idx * D;
+      float a = has_activation ? std::exp(A_log[hv]) : 0.f;
+      const float* bias_ptr = has_activation ? (dt_bias + hv * D) : nullptr;
+      for (int d = 0; d < D; ++d) {
+        float val = static_cast<float>(src[d]);
+        if (has_activation) {
+          val += bias_ptr[d];
+          if (use_safe_gate) {
+            val = static_cast<float>(lower_bound.value()) * sigmoid_fp32(a * val);
+          } else {
+            val = -a * softplus_fp32(val);
+          }
+        }
+        dst[d] = val;
+      }
+      data_index_step(t, T, hv, Hv);
+    }
+  });
+}
+
+template <typename scalar_t, int D>
+void copy_state_to_tensor(
+    scalar_t* dst, int64_t dst_row_stride, const float* src, int64_t src_row_stride, int64_t num_rows) {
+  for (int64_t row = 0; row < num_rows; ++row) {
+    const float* src_row = src + row * src_row_stride;
+    scalar_t* dst_row = dst + row * dst_row_stride;
+    for (int d = 0; d < D; ++d) {
+      dst_row[d] = static_cast<scalar_t>(src_row[d]);
+    }
+  }
+}
+
+template <int D>
+void copy_state_to_tensor(
+    float* dst, int64_t dst_row_stride, const float* src, int64_t src_row_stride, int64_t num_rows) {
+  for (int64_t row = 0; row < num_rows; ++row) {
+    std::memcpy(dst + row * dst_row_stride, src + row * src_row_stride, sizeof(float) * D);
+  }
+}
+
+template <typename scalar_t, int D>
+void chunk_kda_cpu_kernel(
+    scalar_t* output,
+    scalar_t* intermediate_states,
+    float* track_state,
+    float* initial_state,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* gate,
+    const float* beta,
+    const int32_t* cu_seqlens,
+    const int32_t* chunk_offsets,
+    const int32_t* initial_state_indices,
+    const int32_t* track_chunk_idx,
+    int64_t num_seqs,
+    int64_t T,
+    int64_t H,
+    int64_t Hv,
+    int64_t NT,
+    int64_t state_stride0,
+    int64_t state_stride1,
+    int64_t state_stride2,
+    int64_t output_strideT,
+    int64_t output_strideH,
+    int64_t intermediate_strideNT,
+    int64_t intermediate_strideH,
+    int64_t intermediate_strideV,
+    int64_t track_stride0,
+    int64_t track_stride1,
+    int64_t track_stride2) {
+  UNUSED(NT);
+  const int64_t HG = Hv / H;
+  at::parallel_for(0, num_seqs * Hv, 0, [&](int64_t begin, int64_t end) {
+    int64_t seq_idx{0}, hv{0};
+    data_index_init(begin, seq_idx, num_seqs, hv, Hv);
+    for (int64_t linear_idx = begin; linear_idx < end; ++linear_idx) {
+      const int32_t state_index = initial_state_indices[seq_idx];
+      if (state_index < 0) {
+        data_index_step(seq_idx, num_seqs, hv, Hv);
+        continue;
+      }
+      const int64_t q_head = hv / HG;
+      const int32_t seq_start = cu_seqlens[seq_idx];
+      const int32_t seq_end = cu_seqlens[seq_idx + 1];
+      const int32_t seqlen = seq_end - seq_start;
+      float* state_ptr = initial_state + state_index * state_stride0 + hv * state_stride1;
+      alignas(64) float decay[D];
+      alignas(64) float residual[D];
+      alignas(64) float out_buf[D];
+
+      for (int32_t chunk_idx = 0; chunk_idx < div_up(seqlen, KDA_CHUNK_SIZE); ++chunk_idx) {
+        const int64_t global_chunk = chunk_offsets[seq_idx] + chunk_idx;
+        if (intermediate_states != nullptr) {
+          scalar_t* h_ptr = intermediate_states + global_chunk * intermediate_strideNT + hv * intermediate_strideH;
+          copy_state_to_tensor<scalar_t, D>(h_ptr, intermediate_strideV, state_ptr, state_stride2, D);
+        }
+        if (track_state != nullptr && track_chunk_idx != nullptr && track_chunk_idx[seq_idx] == chunk_idx) {
+          float* track_ptr = track_state + seq_idx * track_stride0 + hv * track_stride1;
+          copy_state_to_tensor<D>(track_ptr, track_stride2, state_ptr, state_stride2, D);
+        }
+
+        const int32_t chunk_start = seq_start + chunk_idx * KDA_CHUNK_SIZE;
+        const int32_t chunk_end = std::min(seq_end, chunk_start + KDA_CHUNK_SIZE);
+        for (int32_t token = chunk_start; token < chunk_end; ++token) {
+          const float* q_ptr = q + (token * H + q_head) * D;
+          const float* k_ptr = k + (token * H + q_head) * D;
+          const float* v_ptr = v + (token * Hv + hv) * D;
+          const float* g_ptr = gate + (token * Hv + hv) * D;
+          const float beta_val = beta[token * Hv + hv];
+          for (int d = 0; d < D; ++d) {
+            decay[d] = std::exp(g_ptr[d]);
+          }
+          scale_state_columns<D>(state_ptr, decay, D, state_stride2);
+          matvec_fp32<D>(state_ptr, D, state_stride2, k_ptr, residual);
+          for (int d = 0; d < D; ++d) {
+            residual[d] = (v_ptr[d] - residual[d]) * beta_val;
+          }
+          rank1_update_fp32<D>(state_ptr, D, state_stride2, residual, k_ptr);
+          matvec_fp32<D>(state_ptr, D, state_stride2, q_ptr, out_buf);
+          scalar_t* out_ptr = output + token * output_strideT + hv * output_strideH;
+          for (int d = 0; d < D; ++d) {
+            out_ptr[d] = static_cast<scalar_t>(out_buf[d]);
+          }
+        }
+      }
+      data_index_step(seq_idx, num_seqs, hv, Hv);
+    }
+  });
+}
+
+}  // anonymous namespace
+
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    at::Tensor& initial_state,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& initial_state_indices,
+    const std::optional<at::Tensor>& A_log,
+    const std::optional<at::Tensor>& dt_bias,
+    std::optional<double> lower_bound,
+    bool beta_is_raw,
+    bool use_qk_l2norm_in_kernel,
+    bool output_intermediate_states,
+    const std::optional<at::Tensor>& track_state,
+    const std::optional<at::Tensor>& track_chunk_idx,
+    double eps,
+    std::optional<double> scale) {
+  TORCH_CHECK(query.dim() == 4, __func__, ": query must be [1, T, H, K]");
+  TORCH_CHECK(key.dim() == 4, __func__, ": key must be [1, T, H, K]");
+  TORCH_CHECK(value.dim() == 4, __func__, ": value must be [1, T, Hv, V]");
+  TORCH_CHECK(g.dim() == 4, __func__, ": g must be [1, T, Hv, K]");
+  TORCH_CHECK(beta.dim() == 3, __func__, ": beta must be [1, T, Hv]");
+  TORCH_CHECK(query.size(0) == 1, __func__, ": packed varlen mode requires batch size 1");
+  TORCH_CHECK(key.sizes() == query.sizes(), __func__, ": key shape must match query");
+  TORCH_CHECK(value.size(0) == 1 && value.size(1) == query.size(1), __func__, ": value time shape mismatch");
+  TORCH_CHECK(g.size(0) == 1 && g.size(1) == query.size(1), __func__, ": gate time shape mismatch");
+  TORCH_CHECK(beta.size(0) == 1 && beta.size(1) == query.size(1), __func__, ": beta time shape mismatch");
+  TORCH_CHECK(
+      query.scalar_type() == at::kBFloat16 || query.scalar_type() == at::kHalf,
+      __func__,
+      ": only BF16/FP16 are supported");
+  TORCH_CHECK(key.scalar_type() == query.scalar_type(), __func__, ": key dtype mismatch");
+  TORCH_CHECK(value.scalar_type() == query.scalar_type(), __func__, ": value dtype mismatch");
+  TORCH_CHECK(g.scalar_type() == query.scalar_type(), __func__, ": gate dtype mismatch");
+  TORCH_CHECK(beta.scalar_type() == query.scalar_type(), __func__, ": beta dtype mismatch");
+  TORCH_CHECK(
+      !lower_bound.has_value() || lower_bound.value() < 0.0, __func__, ": lower_bound must be negative when provided");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(value);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(g);
+  CHECK_INPUT(beta);
+  CHECK_INPUT(cu_seqlens);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(initial_state);
+  CHECK_INPUT(initial_state_indices);
+
+  const int64_t B = query.size(0);
+  const int64_t T = query.size(1);
+  const int64_t H = query.size(2);
+  const int64_t D = query.size(3);
+  const int64_t Hv = value.size(2);
+  const int64_t Dv = value.size(3);
+  const int64_t num_seqs = initial_state_indices.size(0);
+
+  TORCH_CHECK(B == 1, __func__, ": expect batch size 1");
+  TORCH_CHECK(Hv % H == 0, __func__, ": expect num value heads to be a multiple of key heads");
+  TORCH_CHECK(D == Dv, __func__, ": head_k_dim and head_v_dim must match");
+  TORCH_CHECK(D == 64 || D == 128, __func__, ": only head dims 64 and 128 are supported");
+  TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt, __func__, ": cu_seqlens must be int32");
+  TORCH_CHECK(initial_state.scalar_type() == at::kFloat, __func__, ": initial_state must be float32");
+  TORCH_CHECK(initial_state.dim() == 4, __func__, ": initial_state must be [num_slots, Hv, V, K]");
+  TORCH_CHECK(
+      initial_state.size(1) == Hv && initial_state.size(2) == Dv && initial_state.size(3) == D,
+      __func__,
+      ": initial_state shape mismatch");
+  TORCH_CHECK(initial_state_indices.scalar_type() == at::kInt, __func__, ": initial_state_indices must be int32");
+  TORCH_CHECK(cu_seqlens.size(0) == num_seqs + 1, __func__, ": cu_seqlens shape mismatch");
+  TORCH_CHECK(
+      cu_seqlens.data_ptr<int32_t>()[num_seqs] == T,
+      __func__,
+      ": cu_seqlens final offset must equal packed token count");
+
+  if (A_log.has_value()) {
+    CHECK_INPUT(A_log.value());
+    TORCH_CHECK(A_log.value().numel() == Hv, __func__, ": A_log must have one value per value head");
+    TORCH_CHECK(dt_bias.has_value(), __func__, ": dt_bias is required when A_log is provided");
+    CHECK_INPUT(dt_bias.value());
+    TORCH_CHECK(dt_bias.value().numel() == Hv * D, __func__, ": dt_bias must have shape [Hv, K]");
+  } else {
+    TORCH_CHECK(!dt_bias.has_value(), __func__, ": dt_bias requires A_log");
+    TORCH_CHECK(!lower_bound.has_value(), __func__, ": lower_bound requires A_log");
+  }
+
+  const at::Tensor track_state_tensor = track_state.has_value() ? track_state.value() : at::Tensor();
+  const at::Tensor track_chunk_idx_tensor = track_chunk_idx.has_value() ? track_chunk_idx.value() : at::Tensor();
+  if (track_state_tensor.defined()) {
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(track_state_tensor);
+    TORCH_CHECK(track_state_tensor.scalar_type() == at::kFloat, __func__, ": track_state must be float32");
+    TORCH_CHECK(
+        track_state_tensor.sizes() == at::IntArrayRef({num_seqs, Hv, Dv, D}), __func__, ": track_state shape mismatch");
+    TORCH_CHECK(
+        track_chunk_idx_tensor.defined(), __func__, ": track_chunk_idx is required when track_state is provided");
+    CHECK_INPUT(track_chunk_idx_tensor);
+    TORCH_CHECK(track_chunk_idx_tensor.scalar_type() == at::kInt, __func__, ": track_chunk_idx must be int32");
+    TORCH_CHECK(
+        track_chunk_idx_tensor.sizes() == at::IntArrayRef({num_seqs}), __func__, ": track_chunk_idx shape mismatch");
+  } else {
+    TORCH_CHECK(!track_chunk_idx_tensor.defined(), __func__, ": track_chunk_idx requires track_state");
+  }
+
+  auto [chunk_indices, chunk_offsets] = prepare_chunk_indices<KDA_CHUNK_SIZE>(cu_seqlens);
+  const int64_t NT = chunk_indices.size(0);
+
+  at::Tensor q_prepared = at::empty({T, H, D}, query.options().dtype(at::kFloat));
+  at::Tensor k_prepared = at::empty({T, H, D}, key.options().dtype(at::kFloat));
+  at::Tensor v_prepared = at::empty({T, Hv, D}, value.options().dtype(at::kFloat));
+  at::Tensor gate_prepared = at::empty({T, Hv, D}, query.options().dtype(at::kFloat));
+  at::Tensor beta_prepared = at::empty({T, Hv}, query.options().dtype(at::kFloat));
+  at::Tensor output = at::empty({1, T, Hv, Dv}, query.options());
+  std::optional<at::Tensor> intermediate_states = std::nullopt;
+  if (output_intermediate_states) {
+    intermediate_states = at::empty({1, NT, Hv, Dv, D}, query.options());
+  }
+
+  at::Tensor A_log_f;
+  at::Tensor dt_bias_f;
+  const float* A_log_ptr = nullptr;
+  const float* dt_bias_ptr = nullptr;
+  if (A_log.has_value()) {
+    A_log_f = A_log.value().contiguous().to(at::kFloat);
+    dt_bias_f = dt_bias.value().contiguous().to(at::kFloat).view({Hv, D});
+    A_log_ptr = A_log_f.data_ptr<float>();
+    dt_bias_ptr = dt_bias_f.data_ptr<float>();
+  }
+
+  const float q_scale = scale.has_value() ? static_cast<float>(scale.value()) : 1.f / std::sqrt(static_cast<float>(D));
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "chunk_kda_cpu_prepare", [&] {
+    if (D == 64) {
+      prepare_qk_tensors<scalar_t, 64>(
+          q_prepared.data_ptr<float>(),
+          k_prepared.data_ptr<float>(),
+          query.data_ptr<scalar_t>(),
+          key.data_ptr<scalar_t>(),
+          T,
+          H,
+          query.stride(1),
+          query.stride(2),
+          key.stride(1),
+          key.stride(2),
+          use_qk_l2norm_in_kernel,
+          q_scale,
+          static_cast<float>(eps));
+      prepare_value_tensor<scalar_t, 64>(
+          v_prepared.data_ptr<float>(), value.data_ptr<scalar_t>(), T, Hv, value.stride(1), value.stride(2));
+      prepare_gate_tensor<scalar_t, 64>(
+          gate_prepared.data_ptr<float>(),
+          g.data_ptr<scalar_t>(),
+          T,
+          Hv,
+          g.stride(1),
+          g.stride(2),
+          A_log_ptr,
+          dt_bias_ptr,
+          lower_bound);
+    } else {
+      prepare_qk_tensors<scalar_t, 128>(
+          q_prepared.data_ptr<float>(),
+          k_prepared.data_ptr<float>(),
+          query.data_ptr<scalar_t>(),
+          key.data_ptr<scalar_t>(),
+          T,
+          H,
+          query.stride(1),
+          query.stride(2),
+          key.stride(1),
+          key.stride(2),
+          use_qk_l2norm_in_kernel,
+          q_scale,
+          static_cast<float>(eps));
+      prepare_value_tensor<scalar_t, 128>(
+          v_prepared.data_ptr<float>(), value.data_ptr<scalar_t>(), T, Hv, value.stride(1), value.stride(2));
+      prepare_gate_tensor<scalar_t, 128>(
+          gate_prepared.data_ptr<float>(),
+          g.data_ptr<scalar_t>(),
+          T,
+          Hv,
+          g.stride(1),
+          g.stride(2),
+          A_log_ptr,
+          dt_bias_ptr,
+          lower_bound);
+    }
+    prepare_beta_tensor<scalar_t>(
+        beta_prepared.data_ptr<float>(), beta.data_ptr<scalar_t>(), T, Hv, beta.stride(1), beta_is_raw);
+    if (D == 64) {
+      chunk_kda_cpu_kernel<scalar_t, 64>(
+          output.data_ptr<scalar_t>(),
+          intermediate_states.has_value() ? intermediate_states->data_ptr<scalar_t>() : nullptr,
+          track_state_tensor.defined() ? track_state_tensor.data_ptr<float>() : nullptr,
+          initial_state.data_ptr<float>(),
+          q_prepared.data_ptr<float>(),
+          k_prepared.data_ptr<float>(),
+          v_prepared.data_ptr<float>(),
+          gate_prepared.data_ptr<float>(),
+          beta_prepared.data_ptr<float>(),
+          cu_seqlens.data_ptr<int32_t>(),
+          chunk_offsets.data_ptr<int32_t>(),
+          initial_state_indices.data_ptr<int32_t>(),
+          track_chunk_idx_tensor.defined() ? track_chunk_idx_tensor.data_ptr<int32_t>() : nullptr,
+          num_seqs,
+          T,
+          H,
+          Hv,
+          NT,
+          initial_state.stride(0),
+          initial_state.stride(1),
+          initial_state.stride(2),
+          output.stride(1),
+          output.stride(2),
+          intermediate_states.has_value() ? intermediate_states->stride(1) : 0,
+          intermediate_states.has_value() ? intermediate_states->stride(2) : 0,
+          intermediate_states.has_value() ? intermediate_states->stride(3) : 0,
+          track_state_tensor.defined() ? track_state_tensor.stride(0) : 0,
+          track_state_tensor.defined() ? track_state_tensor.stride(1) : 0,
+          track_state_tensor.defined() ? track_state_tensor.stride(2) : 0);
+    } else {
+      chunk_kda_cpu_kernel<scalar_t, 128>(
+          output.data_ptr<scalar_t>(),
+          intermediate_states.has_value() ? intermediate_states->data_ptr<scalar_t>() : nullptr,
+          track_state_tensor.defined() ? track_state_tensor.data_ptr<float>() : nullptr,
+          initial_state.data_ptr<float>(),
+          q_prepared.data_ptr<float>(),
+          k_prepared.data_ptr<float>(),
+          v_prepared.data_ptr<float>(),
+          gate_prepared.data_ptr<float>(),
+          beta_prepared.data_ptr<float>(),
+          cu_seqlens.data_ptr<int32_t>(),
+          chunk_offsets.data_ptr<int32_t>(),
+          initial_state_indices.data_ptr<int32_t>(),
+          track_chunk_idx_tensor.defined() ? track_chunk_idx_tensor.data_ptr<int32_t>() : nullptr,
+          num_seqs,
+          T,
+          H,
+          Hv,
+          NT,
+          initial_state.stride(0),
+          initial_state.stride(1),
+          initial_state.stride(2),
+          output.stride(1),
+          output.stride(2),
+          intermediate_states.has_value() ? intermediate_states->stride(1) : 0,
+          intermediate_states.has_value() ? intermediate_states->stride(2) : 0,
+          intermediate_states.has_value() ? intermediate_states->stride(3) : 0,
+          track_state_tensor.defined() ? track_state_tensor.stride(0) : 0,
+          track_state_tensor.defined() ? track_state_tensor.stride(1) : 0,
+          track_state_tensor.defined() ? track_state_tensor.stride(2) : 0);
+    }
+  });
+
+  return std::make_tuple(output, initial_state, intermediate_states);
+}
+
 // A_log: [v_num_heads]
 // dt_bias: [v_num_heads]
 // query: [seq_len, batch_size, num_heads, head_dim]
