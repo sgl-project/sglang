@@ -96,12 +96,22 @@ def _to_oss_messages(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     media_kinds: list[str] = []
     oss_messages = []
+    call_names: dict[str, str] = {}
     for message in messages:
         oss_message = {
             key: value for key, value in message.items() if value is not None
         }
         if oss_message.get("role") == "developer":
             oss_message["role"] = "system"
+        for call in oss_message.get("tool_calls") or ():
+            if call.get("id") and call["function"].get("name"):
+                call_names[call["id"]] = call["function"]["name"]
+        # The library takes a tool author only from ``name``; spec Chat clients and the
+        # Responses/Anthropic adapters send just ``tool_call_id``.
+        if oss_message.get("role") == "tool" and not oss_message.get("name"):
+            name = call_names.get(oss_message.get("tool_call_id"))
+            if name:
+                oss_message["name"] = name
         content = oss_message.get("content")
         if isinstance(content, Sequence) and not isinstance(
             content, (str, bytes, bytearray)
