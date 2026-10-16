@@ -294,6 +294,18 @@ def _moe_sorting_small_kernel_distributed(
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
 
 
+def _mx_quant_chunk(n_cols: int):
+    """Widest verified quant step (2048 or 1024) dividing `n_cols`; None skips the fused quant."""
+    for chunk in (2048, 1024):
+        if n_cols % chunk == 0:
+            return chunk
+    return None
+
+
+# measured at DeepSeek-V4's E=385 top-7: past it the distributed sort + quant loses to aiter
+_DISTRIBUTED_MAX_PAIRS_UP_TO_385_EXPERTS = 112
+
+
 def _small_sort_supported(
     topk_ids, block_size, expert_mask, num_local_tokens, num_experts
 ):
@@ -304,8 +316,12 @@ def _small_sort_supported(
         and num_local_tokens is None
         and p <= 256
         # ponytail: the distributed variant scans every 64-expert chunk per pair, so it beats
-        # aiter at E=129 but loses at E=513; cutoff untuned in between
-        and ((p <= 64 and p <= 2 * block_size) or num_experts <= 256)
+        # aiter at E=129 but loses at E=513; E=257..385 shares the cutoff measured at 385
+        and (
+            (p <= 64 and p <= 2 * block_size)
+            or num_experts <= 256
+            or (num_experts <= 385 and p <= _DISTRIBUTED_MAX_PAIRS_UP_TO_385_EXPERTS)
+        )
         and topk < 128
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()
@@ -342,10 +358,11 @@ def _run_small_sort(
     else:
         n_cols, scalen_pad = 32, 8
         qout = qscale = moe_buf  # unused placeholder pointers
+    qchunk = _mx_quant_chunk(n_cols) if emit_mx else 32  # unused without the quant
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
     if p <= 64 and p <= 2 * block_size:
         # compact variant: one sort CTA does the P x P rank compare
-        num_quant = (p * (n_cols // min(2048, n_cols))) if emit_mx else 0
+        num_quant = (p * (n_cols // qchunk)) if emit_mx else 0
         grid = (1 + num_buf + num_quant,)
         _moe_sorting_small_kernel[grid](
             topk_ids,
@@ -368,7 +385,7 @@ def _run_small_sort(
             num_buf=num_buf,
             EMIT_MX=emit_mx,
             N_COLS=n_cols,
-            QCHUNK=min(2048, n_cols),
+            QCHUNK=qchunk,
             SCALEN_PAD=scalen_pad,
             num_warps=4,
         )
@@ -404,7 +421,7 @@ def _run_small_sort(
         num_buf=num_buf,
         EMIT_MX=emit_mx,
         N_COLS=n_cols,
-        QCHUNK=min(2048, n_cols),
+        QCHUNK=qchunk,
         SCALEN_PAD=scalen_pad,
         num_warps=8,
     )
@@ -450,7 +467,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
             and hidden_states.dtype in (torch.bfloat16, torch.float16)
             and hidden_states.is_contiguous()
-            and hidden_states.shape[-1] % 2048 == 0
+            and _mx_quant_chunk(hidden_states.shape[-1]) is not None
             and topk_ids.numel() <= 256
         )
         input_token = _pending_quant_input.set(hidden_states if emit else None)
