@@ -131,7 +131,7 @@ class DeepseekMLAForwardMixin:
         return (
             mode.is_decode()
             or mode.is_target_verify()
-            or (self.use_dsa and mode.is_extend())
+            or (self.use_dsa and mode.is_extend(include_draft_extend_v2=True))
         )
 
     def is_dcp_q_replicate_phase(

@@ -398,9 +398,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Boot guard: every backend a draft forward reaches must carry its
         # runner's translator or the index builders emit virtual ids.
         translator = self.draft_runner.kv_index_translator
-        if translator.is_translating:
-            backends = [self.draft_attn_backend, self.draft_extend_attn_backend]
+        # DCP read production (e.g. a gathered draft prefill) needs it too.
+        if translator.needs_read_translate:
+            backends = [self.draft_extend_attn_backend]
             if self.draft_attn_backend is not None:
+                if translator.is_translating:
+                    backends.append(self.draft_attn_backend)
                 backends += self.draft_attn_backend.attn_backends
             translator.bind_and_verify_backends(backends)
 
