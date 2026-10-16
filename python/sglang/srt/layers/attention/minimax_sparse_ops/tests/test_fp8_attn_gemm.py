@@ -14,16 +14,16 @@ indexer, non-unit k_scale/v_scale semantics, and bf16-path regression.
 import pytest
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
 
