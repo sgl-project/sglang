@@ -3993,8 +3993,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
+        owned_floor = None
+        components = getattr(self.tree_cache, "components", None)
+        if components is not None and req.last_node is not None:
+            from sglang.srt.mem_cache.unified_cache.component_type import (
+                ComponentType,
+            )
+
+            component = components.get(ComponentType.SWA)
+            if component is not None:
+                hi_pos = pre_len + (
+                    1
+                    if self.forward_mode is not None
+                    and self.forward_mode.is_decode()
+                    else 0
+                )
+                owned_floor = component.tree_owned_swa_floor(req.last_node, hi_pos)
         self.tree_cache.evict_sliding_windows(
-            req, pre_len, eviction_interval=eviction_interval
+            req,
+            pre_len,
+            eviction_interval=eviction_interval,
+            owned_floor=owned_floor,
         )
 
     def __str__(self):

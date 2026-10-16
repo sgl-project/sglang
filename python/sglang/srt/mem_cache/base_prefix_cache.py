@@ -652,7 +652,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     def evict_sliding_windows(
-        self, req: Req, pre_len: int, *, eviction_interval: int = 1
+        self,
+        req: Req,
+        pre_len: int,
+        *,
+        eviction_interval: int = 1,
+        owned_floor: int | None = None,
     ) -> None:
         """Slide request-owned windows at the scheduler's safe eviction frontier."""
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
@@ -667,6 +672,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             supports_prefix_sharing=self.supports_prefix_sharing(),
             retain_floor=self.swa_retain_floor(req),
             eviction_interval=eviction_interval,
+            owned_floor=owned_floor,
         )
 
     def swa_retain_floor(self, req) -> int | None:
