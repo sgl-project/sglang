@@ -315,6 +315,34 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
+    # --- stop_token_ids ---
+    def test_stop_token_ids_exceeds_vocab_raises(self):
+        """Test that verify() rejects stop_token_ids >= vocab_size.
+
+        An out-of-range stop id otherwise reaches the min_new_tokens penalizer,
+        which scatters it into a [batch, vocab_size + 1] tensor and trips a
+        device-side assert that kills the whole server (issue #44535).
+        """
+        sp = self._make(stop_token_ids=[1000000])
+        with self.assertRaisesRegex(ValueError, "stop_token_ids"):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_negative_raises(self):
+        """Test that verify() rejects negative stop_token_ids."""
+        sp = self._make(stop_token_ids=[-1])
+        with self.assertRaisesRegex(ValueError, "stop_token_ids"):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_boundary_valid(self):
+        """Test that the [0, vocab_size - 1] boundaries are accepted."""
+        sp = self._make(stop_token_ids=[0, self.VOCAB_SIZE - 1])
+        sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_none_valid(self):
+        """Test that unset stop_token_ids (the default) skips the check."""
+        sp = self._make()
+        sp.verify(self.VOCAB_SIZE)
+
     # --- sampling_seed ---
     def test_sampling_seed_valid(self):
         """Test that None (the default) and the int64 min/max boundaries are accepted."""
