@@ -197,40 +197,6 @@
             "expected_avg_denoise_ms": 2200.8,
             "expected_median_denoise_ms": 2200.8,
             "estimated_full_test_time_s": 90.0
-        },
-        "minimax_h3_t2va_consumer_budget_1gpu_5090": {
-            "expected_load_ms": 47708.93,
-            "stages_ms": {
-                "InputValidationStage": 0.06,
-                "MiniMaxH3PartitionAdmissionStage": 0.03,
-                "MiniMaxH3TextEncodingStage": 1825.86,
-                "MiniMaxH3VisualEncodingStage": 0.09,
-                "MiniMaxH3AudioEncodingStage": 0.06,
-                "MiniMaxH3LatentPreparationStage": 6.56,
-                "MiniMaxH3TimestepPreparationStage": 0.28,
-                "MiniMaxH3DenoisingStage": 34839.69,
-                "MiniMaxH3DecodingStage": 5257.87
-            },
-            "denoise_step_ms": {
-                "0": 4941.69,
-                "1": 4863.02,
-                "2": 4223.75,
-                "3": 4384.88,
-                "4": 6182.67,
-                "5": 5068.86,
-                "6": 4579.34
-            },
-            "expected_e2e_ms": 42763.29,
-            "expected_avg_denoise_ms": 4892.03,
-            "expected_median_denoise_ms": 4863.02,
-            "load_peak_vram_mb": 5052.0,
-            "runtime_peak_vram_mb": 12278.0,
-            "load_peak_allocated_mb": 4995.0,
-            "runtime_peak_allocated_mb": 11483.0,
-            "load_peak_host_anon_mb": 32768.0,
-            "runtime_peak_host_anon_mb": 32768.0,
-            "estimated_full_test_time_s": 283.0,
-            "timing_tolerance": 0.9
         }
     }
 }

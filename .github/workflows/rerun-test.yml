@@ -162,6 +162,9 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
+        env:
+          # 5090 hosts keep a host-local HF cache, so the install may evict from it.
+          SGLANG_CI_DISK_GUARD: ${{ inputs.runs_on == '1-gpu-5090' && 'strict' || 'report' }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
