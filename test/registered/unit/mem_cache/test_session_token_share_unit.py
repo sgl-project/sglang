@@ -44,6 +44,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
         return_hidden_states=False,
         return_routed_experts=False,
         routed_experts_start_len=0,
+        return_indexer_topk=False,
         bootstrap_host=None,
         bootstrap_port=None,
         bootstrap_room=None,
