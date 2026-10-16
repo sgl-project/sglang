@@ -335,6 +335,8 @@ class Envs:
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Emit SSE comments while /v1/messages is silent; 0 disables streaming keepalives.
+    SGLANG_SSE_KEEPALIVE_S = EnvFloat(0)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
