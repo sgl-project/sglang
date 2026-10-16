@@ -58,6 +58,19 @@ class DllmAlgorithm:
     @classmethod
     def validate_request(cls, req: Req) -> Optional[str]:
         """Return an error for unsupported request features, if any."""
+        # dLLM steps apply no vocab mask and never drain the grammar queue.
+        sp = req.sampling_params
+        grammars = [
+            name
+            for name in ("json_schema", "regex", "ebnf", "structural_tag")
+            if getattr(sp, name) is not None
+        ]
+        if grammars:
+            return (
+                "dLLM does not support constrained decoding (request-level "
+                + ", ".join(grammars)
+                + ")."
+            )
         return None
 
     def prepare_inputs(

@@ -1,4 +1,5 @@
-"""The dLLM owner's request lists: which list holds a request at each stage."""
+"""The dLLM owner's request lists: which list holds a request at each stage,
+and the requests it rejects at intake."""
 
 import time
 import unittest
@@ -114,6 +115,15 @@ class _NoTokenAdder(_Adder):
 
     def _admit(self, req):
         return AddReqResult.NO_TOKEN
+
+
+class _DecodeOnlyAdder(_Adder):
+    """Finds no KV for a prefill block; a decode block fits."""
+
+    def _admit(self, req):
+        if req.dllm.is_prefill():
+            return AddReqResult.NO_TOKEN
+        return super()._admit(req)
 
 
 class _Step:
@@ -324,6 +334,24 @@ class TestDllmManagerLists(unittest.TestCase):
 
         self.assertEqual([r.rid for r in step.reqs], ["b"])
 
+    def test_a_prefill_that_does_not_fit_lets_a_started_request_run(self):
+        # The started request holds the KV between its blocks; the new
+        # request's prefill finds no room until the started one finishes.
+        manager = _manager()
+        started, new = _req("started"), _req("new")
+        self._run_one_block(manager, [started])
+        self._patch(
+            "sglang.srt.dllm.manager.DllmManager._create_dllm_prefill_adder",
+            side_effect=_DecodeOnlyAdder,
+        )
+
+        step, rest = manager.schedule([new])
+
+        self.assertEqual(rest, [])
+        self.assertEqual([r.rid for r in step.reqs], ["started"])
+        self.assertTrue(step.forward_mode.is_dllm_extend())
+        self._assert_lists(manager, waiting=[new], staging=[], between_blocks=[started])
+
     def test_abort_pops_and_releases_the_waiting_requests_it_names(self):
         manager = _manager()
         named, holding_kv, kept = _req("abort-1"), _req("abort-2"), _req("keep")
@@ -392,6 +420,34 @@ class TestDllmManagerLists(unittest.TestCase):
         self._assert_lists(manager, waiting=[taken], staging=[])
         manager.request_retirer.send_abort_output.assert_called_once_with(started)
         self.assertIsNone(started.to_finish)
+
+
+class TestDllmRequestValidation(unittest.TestCase):
+    def setUp(self):
+        enter_scope(
+            self,
+            published_topology(page_size=1, priority_scheduling_preemption_threshold=0),
+        )
+
+    def test_a_grammar_request_is_rejected(self):
+        # A dLLM step applies no vocab mask and never takes a request back
+        # from the grammar queue.
+        manager = _manager()
+        self.assertIsNone(manager.validate_request(_req("plain")))
+        for name, value in (
+            ("json_schema", '{"type": "object"}'),
+            ("regex", "a+"),
+            ("ebnf", 'root ::= "a"'),
+            ("structural_tag", "{}"),
+        ):
+            with self.subTest(name=name):
+                req = _req(name)
+                setattr(req.sampling_params, name, value)
+
+                error = manager.validate_request(req)
+
+                self.assertIsNotNone(error)
+                self.assertIn(name, error)
 
 
 if __name__ == "__main__":

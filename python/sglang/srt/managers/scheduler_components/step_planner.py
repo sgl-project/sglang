@@ -37,6 +37,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_serving,
     get_spec,
     hicache_storage_enabled,
 )
@@ -332,8 +333,12 @@ class StepPlanner:
         num_reqs = len(running_reqs) + 1
         if self.beam_coordinator.has_room(num_reqs, 1):
             return True
-        return self.beam_coordinator.has_room(num_reqs, 0) and any(
-            req.kv.holds_kv for req in self.core_lists.waiting_queue
+        # Only a streaming session lends a waiting request its row (at the
+        # request's match); without them no waiting request holds one.
+        return (
+            get_serving().enable_streaming_session
+            and self.beam_coordinator.has_room(num_reqs, 0)
+            and any(req.kv.holds_kv for req in self.core_lists.waiting_queue)
         )
 
     def get_new_batch_prefill(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
@@ -555,12 +560,14 @@ class StepPlanner:
             if hicache_storage_enabled() and (
                 self.request_intake.prefetch_after_device_hit_loss(req)
             ):
+                self._revert_match(req)
                 continue
             if (
                 hicache_storage_enabled()
                 and buffer_pipeline is not None
                 and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
+                self._revert_match(req)
                 continue
             res = adder.add_one_req(
                 req,
@@ -600,14 +607,17 @@ class StepPlanner:
             and self.hisparse_coordinator is None
         ):
             # As the launch leaves them: the admitted requests out of the
-            # queue, and those without a row holding a new one. An admission
-            # that used up the budget may have taken the last waiting request;
-            # the next pass then skips on the empty queue.
+            # queue, and the new rows they take (see num_rows) gone from the
+            # free ones. An admission that used up the budget may have taken
+            # the last waiting request; the next pass then skips on the empty
+            # queue.
             admitted = set(adder.can_run_list)
             waiting_queue = self.core_lists.waiting_queue
             head = next((r for r in waiting_queue if r not in admitted), None)
             if head is not None:
-                num_new_rows = sum(not r.kv.holds_kv for r in adder.can_run_list)
+                num_new_rows = sum(
+                    map(self.beam_coordinator.num_rows, adder.can_run_list)
+                )
                 self._no_kv_room[slot.index] = _NoKvRoom(
                     running=tuple(running_reqs),
                     num_free_req_slots=(

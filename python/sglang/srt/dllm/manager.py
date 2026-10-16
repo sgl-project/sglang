@@ -448,21 +448,22 @@ class DllmManager:
                 DllmReqPhase.STAGING_PREFILL,
                 DllmReqPhase.INCOMING_PREFILL,
             )
-            return (
-                ForwardMode.EXTEND
-                if self.dllm_config.requires_separate_context_encoding
-                else ForwardMode.DLLM_EXTEND
-            )
-        else:
-            # Fall back to decode batch
-            decode_reqs = self.get_decode_requests()
-            self._process_batch_by_phase(
-                adder,
-                decode_reqs,
-                DllmReqPhase.STAGING_DECODE,
-                DllmReqPhase.INCOMING_DECODE,
-            )
-            return ForwardMode.DLLM_EXTEND
+            if adder.can_run_list:
+                return (
+                    ForwardMode.EXTEND
+                    if self.dllm_config.requires_separate_context_encoding
+                    else ForwardMode.DLLM_EXTEND
+                )
+        # Fall back to decode batch: also when no prefill fits, since the
+        # requests between blocks hold the KV it waits for until they finish.
+        decode_reqs = self.get_decode_requests()
+        self._process_batch_by_phase(
+            adder,
+            decode_reqs,
+            DllmReqPhase.STAGING_DECODE,
+            DllmReqPhase.INCOMING_DECODE,
+        )
+        return ForwardMode.DLLM_EXTEND
 
     def _process_batch_by_phase(
         self,

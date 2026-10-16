@@ -3532,11 +3532,16 @@ class DisaggDecode:
         """Start the pending rooms' prefill DP-rank lookups ahead of intake."""
         self.prealloc_queue.prefetch_prefill_dp_rank_queries()
 
+    def check_hicache_events(self) -> None:
+        """Poll the decode HiCache's async events: a finished load-back unpins
+        the nodes it locked. Every decode iteration runs it before intake."""
+        if self.enable_decode_hicache:
+            self.tree_cache.check_hicache_events()
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def intake(self, *, lora_ids_in_use: Callable[[], Set[Optional[str]]]) -> None:
         """`lora_ids_in_use` gives the adapters the live requests keep."""
-        if self.enable_decode_hicache:
-            self.tree_cache.check_hicache_events()
+        self.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.check_offload_progress()

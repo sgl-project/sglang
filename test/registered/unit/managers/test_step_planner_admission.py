@@ -1,13 +1,15 @@
 """What one StepPlanner admission pass admits: preemption sizes a request by
 its current prefix match, the row budget counts the new request rows the
 admitted requests take, not the requests, a spent pass budget stops the pass
-before its first candidate, and a mixed step reserves its decode part before
-admission."""
+before its first candidate, a request HiCache keeps waiting gives back its
+match, and a mixed step reserves its decode part before admission."""
 
 import unittest
 from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -280,6 +282,12 @@ class TestHeldRowAdmission(_PlannerCase):
                 self.assertEqual(adder.can_run_list, [final_chunk, waiting])
 
     def test_a_session_request_holding_a_row_runs_without_a_free_one(self):
+        enter_scope(
+            self,
+            published_topology(
+                pp_max_micro_batch_size=64, enable_streaming_session=True
+            ),
+        )
         self.planner.core_lists.decoding = [_req("r", holds_row=True)]
         self.planner.core_lists.waiting_queue = [_req("s", holds_row=True)]
         self.free_rows = 0
@@ -317,6 +325,70 @@ class TestSpentBudget(_PlannerCase):
         self.assertEqual([r.rid for r in adder.can_run_list], ["chunk"])
         head.init_next_round_input.assert_not_called()
         self.assertEqual(self.planner._no_kv_room, {})
+
+
+class TestHiCacheSkipRevertsTheMatch(_PlannerCase):
+    """A request HiCache keeps waiting after its match gives back the mamba
+    slot and copy source the match staged, as any request the pass does not
+    admit does."""
+
+    def _skipped_req(self):
+        mamba_allocator = Mock()
+        self.planner.tree_cache = SimpleNamespace(
+            buffer_pipeline=None,
+            req_to_token_pool=SimpleNamespace(mamba_allocator=mamba_allocator),
+            check_prefetch_progress=lambda handle: True,
+            pop_prefetch_loaded_span=lambda handle: (0, None),
+        )
+        req = _req("w")
+        req.cache_request_handle = None
+        req.kv = SimpleNamespace(
+            holds_kv=False,
+            kv_allocated_len=8,
+            mamba_pool_idx=None,
+            mamba_cow_src_index=None,
+            mamba_needs_clear=False,
+        )
+
+        def match(tree_cache=None):
+            # The match copies a cached state into a fresh slot.
+            req.kv.mamba_pool_idx = torch.tensor(7)
+            req.kv.mamba_cow_src_index = torch.tensor(3)
+            req.kv.holds_mamba = True
+
+        req.kv.holds_mamba = False
+        req.init_next_round_input.side_effect = match
+        self.planner.core_lists.waiting_queue = [req]
+        return req, mamba_allocator
+
+    def _assert_reverted(self, req, mamba_allocator, adder):
+        self.assertEqual(adder.can_run_list, [])
+        req.init_next_round_input.assert_called_once()
+        mamba_allocator.free.assert_called_once()
+        self.assertEqual(mamba_allocator.free.call_args.args[0].tolist(), [7])
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+
+    def test_device_hit_loss_reverts_the_match(self):
+        req, mamba_allocator = self._skipped_req()
+        self.planner.request_intake.prefetch_after_device_hit_loss.return_value = True
+
+        with patch(f"{_PLANNER}.hicache_storage_enabled", return_value=True):
+            adder = self._admit()
+
+        self._assert_reverted(req, mamba_allocator, adder)
+
+    def test_deferred_staged_prefetch_reverts_the_match(self):
+        req, mamba_allocator = self._skipped_req()
+        self.planner.request_intake.prefetch_after_device_hit_loss.return_value = False
+        self.planner.tree_cache.buffer_pipeline = SimpleNamespace(
+            prepare_staged_prefetch=lambda req: False
+        )
+
+        with patch(f"{_PLANNER}.hicache_storage_enabled", return_value=True):
+            adder = self._admit()
+
+        self._assert_reverted(req, mamba_allocator, adder)
 
 
 class TestMixedStep(_PlannerCase):

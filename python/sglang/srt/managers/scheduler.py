@@ -1085,6 +1085,7 @@ class Scheduler:
     def get_next_pp_disagg_prefill_batch_to_run(
         self, slot: ScheduleSlot
     ) -> Optional[ScheduleBatch]:
+        self.process_pending_chunked_abort()
         self.parts.lists.chunked_req, self.parts.lists.waiting_queue = (
             self.disagg_prefill.process_prefill_chunk(
                 self.parts.lists.chunked_req,
