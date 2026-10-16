@@ -3299,6 +3299,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("torch", "Size"),
         ("torch", "device"),
         ("torch", "dtype"),
+        ("torch", "bcomplex32"),
         ("torch", "bfloat16"),
         ("torch", "bit"),
         ("torch", "bits16"),
