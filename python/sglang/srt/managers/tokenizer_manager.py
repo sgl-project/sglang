@@ -541,13 +541,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             get_parallel().elastic_ep_runtime_instance_id or uuid.uuid4().hex
         )
         self.elastic_initial_ep_size = (
-            get_parallel().elastic_ep_initial_size
-            or self.elastic_worker_count * self.attn_replica_size
+            get_parallel().elastic_ep_initial_size or self.elastic_effective_ep_size
         )
         self.elastic_allocation_width = get_parallel().elastic_ep_allocation_width
-        self.elastic_max_committed_ep_size = (
-            self.elastic_worker_count * self.attn_replica_size
-        )
+        self.elastic_max_committed_ep_size = self.elastic_effective_ep_size
         self.elastic_operation_id = None
         self.elastic_operation_target = None
         self.elastic_operation_succeeded = None
@@ -3685,6 +3682,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self._dispatch_to_scheduler(ranks)
 
+    @property
+    def elastic_effective_ep_size(self) -> int:
+        return self.elastic_worker_count * self.attn_replica_size
+
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
         if not msg.operation_update:
             if msg.runtime_health is not None:
@@ -3742,7 +3743,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
             "initial_ep_size": self.elastic_initial_ep_size,
             "allocation_width": self.elastic_allocation_width,
-            "effective_ep_size": self.elastic_worker_count * self.attn_replica_size,
+            "effective_ep_size": self.elastic_effective_ep_size,
             "max_committed_ep_size": self.elastic_max_committed_ep_size,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
@@ -3775,12 +3776,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ),
             operation_id=operation_id,
             instance_id=self.elastic_instance_id,
-            old_ep_size=self.elastic_worker_count,
+            old_ep_size=self.elastic_effective_ep_size,
             new_ep_size=new_ep_size,
             pending_ep_size=self.elastic_pending_ep_size,
             scale_phase=self.elastic_scale_phase,
             terminal=self.elastic_operation_succeeded is not None,
-            effective_ep_size=self.elastic_worker_count,
+            effective_ep_size=self.elastic_effective_ep_size,
         )
 
     async def _scale_elastic_ep_locked(
@@ -3801,7 +3802,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 operation_id=operation_id,
                 instance_id=self.elastic_instance_id,
-                old_ep_size=self.elastic_worker_count * self.attn_replica_size,
+                old_ep_size=self.elastic_effective_ep_size,
                 new_ep_size=obj.new_ep_size,
                 pending_ep_size=self.elastic_pending_ep_size,
                 scale_phase=self.elastic_scale_phase,
@@ -3818,7 +3819,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ),
                     operation_id=operation_id,
                     instance_id=self.elastic_instance_id,
-                    old_ep_size=self.elastic_worker_count,
+                    old_ep_size=self.elastic_effective_ep_size,
                     new_ep_size=obj.new_ep_size,
                     pending_ep_size=self.elastic_pending_ep_size,
                     scale_phase=self.elastic_scale_phase,
@@ -3835,7 +3836,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ),
                     operation_id=operation_id,
                     instance_id=self.elastic_instance_id,
-                    old_ep_size=self.elastic_worker_count,
+                    old_ep_size=self.elastic_effective_ep_size,
                     new_ep_size=obj.new_ep_size,
                     pending_ep_size=self.elastic_pending_ep_size,
                     scale_phase=self.elastic_scale_phase,
@@ -3858,11 +3859,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ),
                     operation_id=operation_id,
                     instance_id=self.elastic_instance_id,
-                    old_ep_size=self.elastic_worker_count,
+                    old_ep_size=self.elastic_effective_ep_size,
                     new_ep_size=obj.new_ep_size,
                     pending_ep_size=self.elastic_pending_ep_size,
                     scale_phase=self.elastic_scale_phase,
-                    effective_ep_size=self.elastic_worker_count,
+                    effective_ep_size=self.elastic_effective_ep_size,
                 )
 
             self.elastic_operation_id = operation_id
@@ -3874,9 +3875,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_pending_ep_size = obj.new_ep_size
             self.elastic_scale_phase = "submitting"
             self.elastic_last_error = None
-            self.elastic_joining_rank_offset = self.elastic_worker_count
+            self.elastic_joining_rank_offset = self.elastic_effective_ep_size
             self.elastic_joining_rank_count = (
-                obj.new_ep_size - self.elastic_worker_count
+                obj.new_ep_size - self.elastic_effective_ep_size
             )
             self.elastic_ready_rank_count = 0
             self.elastic_joining_allocation_ids = list(
@@ -3939,7 +3940,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             None,
         )
         if pending_response is None:
-            self.elastic_worker_count = obj.new_ep_size
+            self.elastic_worker_count = physical_ep_size_to_dp_size(
+                obj.new_ep_size, self.attn_replica_size
+            )
             self.elastic_max_committed_ep_size = max(
                 self.elastic_max_committed_ep_size,
                 obj.new_ep_size,
@@ -3947,7 +3950,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_pending_ep_size = None
             self.elastic_scale_phase = "serving_expanded"
             self.elastic_operation_succeeded = True
-            self.update_control_communicator_fan_out(obj.new_ep_size)
+            self.update_control_communicator_fan_out(self.elastic_worker_count)
         else:
             self.elastic_pending_ep_size = pending_response.pending_ep_size
             self.elastic_scale_phase = pending_response.scale_phase
@@ -3957,7 +3960,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         responses[0].pending_ep_size = self.elastic_pending_ep_size
         responses[0].scale_phase = self.elastic_scale_phase
         responses[0].terminal = pending_response is None
-        responses[0].effective_ep_size = self.elastic_worker_count
+        responses[0].effective_ep_size = self.elastic_effective_ep_size
         return responses[0]
 
     def _handle_open_session_req_output(self, recv_obj):

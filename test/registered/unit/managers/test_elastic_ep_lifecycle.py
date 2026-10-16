@@ -14,6 +14,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     register_scale_cohort,
     register_scale_operation,
 )
+from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     ScaleElasticEPReqInput,
@@ -39,9 +40,10 @@ class _Store:
         return self.values[key]
 
 
-def _manager() -> TokenizerManager:
+def _manager(*, replica_size: int = 1) -> TokenizerManager:
     manager = TokenizerManager.__new__(TokenizerManager)
-    manager.elastic_worker_count = 4
+    manager.elastic_worker_count = 4 // replica_size
+    manager.attn_replica_size = replica_size
     manager.elastic_instance_id = "runtime-1"
     manager.elastic_initial_ep_size = 4
     manager.elastic_allocation_width = 4
@@ -80,6 +82,127 @@ def _manager() -> TokenizerManager:
 
 
 class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_submission_retry_preserves_ep_and_dp_units(self):
+        manager = _manager(replica_size=2)
+        control = FanOutCommunicator(send=MagicMock(), fan_out=2)
+        manager.update_control_communicator_fan_out.side_effect = control.set_fan_out
+        manager.scale_elastic_ep_communicator.side_effect = [
+            TimeoutError("response lost"),
+            [
+                ScaleElasticEPReqOutput(
+                    success=True,
+                    message="already completed",
+                    old_ep_size=4,
+                    new_ep_size=6,
+                    effective_ep_size=6,
+                    terminal=True,
+                    scale_phase="serving_expanded",
+                )
+            ],
+        ]
+        request = ScaleElasticEPReqInput(new_ep_size=6, operation_id="grow-1")
+
+        with self.assertRaisesRegex(TimeoutError, "response lost"):
+            await manager.scale_elastic_ep(request)
+
+        completed = await manager.scale_elastic_ep(request)
+        retry = await manager.scale_elastic_ep(request)
+
+        self.assertTrue(completed.success)
+        self.assertTrue(completed.terminal)
+        self.assertEqual(completed.old_ep_size, 4)
+        self.assertEqual(completed.effective_ep_size, 6)
+        self.assertEqual(retry.old_ep_size, 6)
+        self.assertEqual(retry.effective_ep_size, 6)
+        self.assertEqual(manager.elastic_worker_count, 3)
+        self.assertEqual(manager.elastic_joining_rank_offset, 4)
+        self.assertEqual(manager.elastic_joining_rank_count, 2)
+        self.assertEqual(manager.get_elastic_ep_state()["max_committed_ep_size"], 6)
+        self.assertEqual(manager.get_elastic_ep_state()["effective_ep_size"], 6)
+        self.assertEqual(manager.scale_elastic_ep_communicator.await_count, 2)
+        manager.update_control_communicator_fan_out.assert_called_once_with(3)
+
+        control_request = asyncio.create_task(control("health"))
+        await asyncio.sleep(0)
+        for worker in range(3):
+            control.handle_recv(f"worker-{worker}")
+        self.assertEqual(
+            await asyncio.wait_for(control_request, timeout=1),
+            ["worker-0", "worker-1", "worker-2"],
+        )
+
+    async def test_attention_tp_completion_and_conflicts_report_physical_ranks(self):
+        manager = _manager(replica_size=2)
+        manager.scale_elastic_ep_communicator.return_value = [
+            ScaleElasticEPReqOutput(
+                success=True,
+                message="accepted",
+                old_ep_size=4,
+                new_ep_size=6,
+                pending_ep_size=6,
+                scale_phase="waiting_for_cohort",
+            )
+        ]
+        request = ScaleElasticEPReqInput(new_ep_size=6, operation_id="grow-1")
+        accepted = await manager.scale_elastic_ep(request)
+        pending = await manager.scale_elastic_ep(request)
+        competing = await manager.scale_elastic_ep(
+            ScaleElasticEPReqInput(new_ep_size=8, operation_id="grow-2")
+        )
+        changed_target = await manager.scale_elastic_ep(
+            ScaleElasticEPReqInput(new_ep_size=8, operation_id="grow-1")
+        )
+        changed_allocation = await manager.scale_elastic_ep(
+            ScaleElasticEPReqInput(
+                new_ep_size=6,
+                operation_id="grow-1",
+                expected_joining_allocation_ids=["different-pod"],
+            )
+        )
+
+        for response in (
+            accepted,
+            pending,
+            competing,
+            changed_target,
+            changed_allocation,
+        ):
+            self.assertEqual(response.old_ep_size, 4)
+        self.assertEqual(accepted.effective_ep_size, 4)
+        self.assertEqual(pending.effective_ep_size, 4)
+        self.assertEqual(manager.elastic_joining_rank_offset, 4)
+        self.assertEqual(manager.elastic_joining_rank_count, 2)
+        self.assertTrue(competing.conflict)
+        self.assertTrue(changed_target.conflict)
+        self.assertTrue(changed_allocation.conflict)
+
+        update = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=6,
+            operation_id="grow-1",
+            scale_phase="serving_expanded",
+            joining_rank_offset=4,
+            joining_rank_count=2,
+            ready_rank_count=2,
+            slot_offset=2,
+            slot_count=1,
+        )
+        manager.forward_elastic_scale_update(update)
+        completed = await manager.scale_elastic_ep(request)
+        status = manager.get_elastic_ep_state()
+
+        self.assertEqual(manager.elastic_worker_count, 3)
+        self.assertEqual(completed.effective_ep_size, 6)
+        self.assertEqual(status["initial_ep_size"], 4)
+        self.assertEqual(status["effective_ep_size"], 6)
+        self.assertEqual(status["max_committed_ep_size"], 6)
+        self.assertEqual(status["joining_rank_offset"], 4)
+        self.assertEqual(status["joining_rank_count"], 2)
+        self.assertEqual(status["ready_rank_count"], 2)
+        manager._dispatch_to_scheduler.assert_called_once_with(update)
+        manager.update_control_communicator_fan_out.assert_called_once_with(3)
+        manager.scale_elastic_ep_communicator.assert_awaited_once()
+
     async def test_retry_returns_existing_operation_without_resubmitting(self):
         manager = _manager()
         request = ScaleElasticEPReqInput(
@@ -364,6 +487,14 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
 
 
 class TestElasticEPCohortBinding(unittest.TestCase):
+    def setUp(self):
+        parallel_patch = patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_parallel",
+            return_value=MagicMock(attn_tp_size=1, attn_cp_size=1),
+        )
+        parallel_patch.start()
+        self.addCleanup(parallel_patch.stop)
+
     def test_explicit_cohort_rejects_a_mismatched_operation_target(self):
         store = _Store()
         with patch(
@@ -457,10 +588,19 @@ class TestElasticEPCohortBinding(unittest.TestCase):
 
 
 class TestElasticEPSchedulerIdempotency(unittest.TestCase):
+    def setUp(self):
+        parallel_patch = patch(
+            "sglang.srt.elastic_ep.topology.get_parallel",
+            return_value=MagicMock(attn_tp_size=1, attn_cp_size=1),
+        )
+        self.attention_parallel = parallel_patch.start().return_value
+        self.addCleanup(parallel_patch.stop)
+
     def test_explicit_mode_accepts_a_different_joining_allocation_width(self):
         # Keep the TP4 primary geometry to catch a primary-width fallback.
-        for new_ep_size in (5, 6):
-            with self.subTest(new_ep_size=new_ep_size):
+        for replica_size, new_ep_size in ((1, 5), (1, 6), (2, 6)):
+            with self.subTest(replica_size=replica_size, new_ep_size=new_ep_size):
+                self.attention_parallel.attn_tp_size = replica_size
                 state = ElasticEPState(
                     active_ranks=None,
                     last_active_ranks=None,
