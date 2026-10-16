@@ -519,7 +519,6 @@ def seg_la_fwd(
     track_lens=None,
     track_state_indices=None,
     softmax_scale=None,
-    decouple=False,
 ):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
@@ -534,7 +533,6 @@ def seg_la_fwd(
 
     if MAX_LENGTH > 1:
         # prefill with partitioning q/k/v
-        # BLOCK should <= 64 with decouple
         K_SPLIT_DIM = 32
         V_SPLIT_DIM = 32 if bs <= 2 else 64
 
