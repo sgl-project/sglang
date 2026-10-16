@@ -2,6 +2,7 @@
 
 Compares the JIT custom all-reduce output against NCCL all-reduce for a sweep
 of tensor sizes, dtypes, and algorithms, in both eager and CUDA-graph modes.
+Also guards the legacy (v1) CustomAllreduce on an empty input.
 
 Usage::
 
@@ -34,6 +35,9 @@ from sglang.kernels.ops.communication.all_reduce import (
     get_all_reduce_module,
 )
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+    CustomAllreduce,
+)
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -173,6 +177,15 @@ def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+    register_comm_cleanup(comm)
+    return comm
+
+
+@cache_once
+def _init_legacy_comm_once() -> CustomAllreduce:
+    cpu_group = _init_cpu_group_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    comm = CustomAllreduce(group=cpu_group, device=device)
     register_comm_cleanup(comm)
     return comm
 
@@ -318,6 +331,22 @@ def test_custom_all_reduce_eager_plan_follows_config() -> None:
     out_ref = inp.clone()
     dist.all_reduce(out_ref, group=nccl_group)
     torch.testing.assert_close(out_ref, _eager_all_reduce(comm, inp), atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_legacy_custom_all_reduce_empty_input() -> None:
+    """An idle DP-attention rank all-reduces zero rows over its attention TP group;
+    the legacy communicator must return them without failing the next kernel launch."""
+    comm = _init_legacy_comm_once()
+    if comm.disabled:
+        pytest.skip("legacy CustomAllreduce does not support this world size")
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    inp = torch.empty((0, 2048), dtype=torch.bfloat16, device=device)
+    assert comm.should_custom_ar(inp)
+    out = comm.custom_all_reduce(inp)
+    assert out is not None and out.shape == inp.shape
+    torch.zeros(1, device=device)
+    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
