@@ -1,7 +1,7 @@
 # Unit Tests
 
-CPU-only component tests that do **not** launch a server, load model weights,
-or require an accelerator. GPU operator correctness belongs under
+Component-level tests that do **not** launch a server or load model weights.
+They may use CPU or GPU. GPU operator correctness belongs under
 `test/registered/kernels/ops/<group>/`.
 
 ## Quick Start
