@@ -169,6 +169,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_overlap = True
+        self.enable_async_d2h_copy = False
         self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
             pop_bootstrapped=lambda: []
@@ -558,7 +559,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,
                     supports_fast_match_prefix=lambda: True,
-                    swa_reprefill_tail_tokens=lambda: 0,
+                    swa_reprefill_tail_tokens=lambda req=None: 0,
                     match_prefix=match_prefix,
                 )
                 scheduler.policy = SchedulePolicy(
