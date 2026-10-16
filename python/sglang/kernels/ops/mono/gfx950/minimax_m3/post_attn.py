@@ -117,7 +117,9 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.index_score import (
 from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     AG_RS_FROM,
     DN_ROWS,
+    H_SUB,
     ISCORE_BLOCKS,
+    KV_PAGE_BYTES,
     MERGE_PASSES,
     MERGE_ROUNDS_WHOLE,
     MERGE_SLOTS,
@@ -129,7 +131,6 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     N_DN,
     N_O,
     N_ROUTER,
-    KV_PAGE_BYTES,
     N_SPLIT,
     O_K,
     O_K_SUB,
@@ -147,7 +148,6 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     XN8_ROW,
     XSC_ROW,
     H,
-    H_SUB,
     pool_words,
     shared_after_routing,
     stage_bases,
@@ -168,7 +168,9 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.pre_attn import (
 from sglang.kernels.ops.mono.gfx950.minimax_m3.pre_attn import (
     SCRATCH_RDONE as K1_SCRATCH_RDONE,
 )
-from sglang.kernels.ops.mono.gfx950.minimax_m3.pre_attn import emit_k1
+from sglang.kernels.ops.mono.gfx950.minimax_m3.pre_attn import (
+    emit_k1,
+)
 
 FP8_MAX = 448.0
 NEG = -3.4e38  # the paged decode's masked-score value
@@ -321,9 +323,9 @@ def build_post_attn_kernel(
     # index heads go in as ints (a shared cache otherwise serves one rank's build
     # to every rank)
     ih_count, ih_own, ih_cp = heads.count, heads.own, heads.cp
-    # scored heads of the rank's own index heads, 1 unless own mode holds several
-    # (TP2). Under CP the several heads go through the CP path instead.
-    OWN_HEADS = 1 if ih_cp else ih_count  # noqa: N806
+    # the per-head stride into ``iscore``. How MANY heads a step selects for is
+    # not this: it is SPLIT_PASSES (one pass per KV head, layout.py), which at
+    # TP2 coincides with the index head count without being the same quantity.
     SCORE_BLOCKS = heads.score_blocks  # noqa: N806
     # with every index head: K1's index q of every head (qs) after its x8 rows in
     # the pool (K1 is done with the pool before K4's stages use it)
@@ -802,9 +804,7 @@ def build_post_attn_kernel(
             kv = j - H
             return (j < H).select(
                 tok * K1_HEAD_TASKS + j,
-                fx.min(kv // KV_TASKS, tokens - 1) * K1_HEAD_TASKS
-                + H
-                + kv % KV_TASKS,
+                fx.min(kv // KV_TASKS, tokens - 1) * K1_HEAD_TASKS + H + kv % KV_TASKS,
             )
 
         def stage_split():
@@ -946,12 +946,7 @@ def build_post_attn_kernel(
                             qw = fx.Vector(
                                 fx.ptr_load(
                                     q8
-                                    + (
-                                        p * (O_K_SUB // 4)
-                                        + l16 * 32
-                                        + 8 * s
-                                        + 2 * g4
-                                    ),
+                                    + (p * (O_K_SUB // 4) + l16 * 32 + 8 * s + 2 * g4),
                                     result_type=v2i,
                                 )
                             )
@@ -2565,13 +2560,16 @@ def build_post_attn_kernel(
                     ms = tid + mr * THREADS
                     if ms < MID8_SLOTS:
                         w = fx.Vector(
-                            fx.ptr_load(xs + (k * MID16_WORDS + ms * 4), result_type=v4f)
+                            fx.ptr_load(
+                                xs + (k * MID16_WORDS + ms * 4), result_type=v4f
+                            )
                         ).bitcast(fx.Int32)
                         f = [v for j in range(4) for v in bf2_f32(w[j])]
                         sc, inv = mx8_scale(f, (1, 2))
                         qv = [mx8_q(v, inv) for v in f]
                         fx.ptr_store(
-                            fp8_pack4(*qv[:4]), xs + (MID8_LDS + k * MID8_WORDS + ms * 2)
+                            fp8_pack4(*qv[:4]),
+                            xs + (MID8_LDS + k * MID8_WORDS + ms * 2),
                         )
                         fx.ptr_store(
                             fp8_pack4(*qv[4:]),

@@ -307,9 +307,7 @@ def emit_index_scores(
                     if (lane < 16) & (f < n_cols):
                         mb_put(
                             iscore,
-                            col * ISCORE_BLOCKS
-                            + head * heads.score_blocks
-                            + b // TP,
+                            col * ISCORE_BLOCKS + head * heads.score_blocks + b // TP,
                             v * scale,
                         )
 

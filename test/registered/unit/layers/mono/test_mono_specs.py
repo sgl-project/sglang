@@ -88,7 +88,7 @@ class TestSpecs(CustomTestCase):
         self.assertEqual(sorted(self.m3.layers(dense3)), list(range(3, 60)))
         # The widest step is the LDS budget's, which scales with TP (config's
         # MAX_WIDTH): 16 at the TP4 these tests import under, 12 at TP2.
-        from sglang.kernels.ops.mono.gfx950.minimax_m3.config import TP, MAX_WIDTH
+        from sglang.kernels.ops.mono.gfx950.minimax_m3.config import MAX_WIDTH, TP
 
         self.assertEqual(max(self.m3.widths), MAX_WIDTH)
         if TP == 4:

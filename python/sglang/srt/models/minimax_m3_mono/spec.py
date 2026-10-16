@@ -249,7 +249,9 @@ class Packed:
         from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
             SCRATCH_BYTES as K4_SCRATCH_BYTES,
         )
-        from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import sym_layout
+        from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
+            sym_layout,
+        )
         from sglang.kernels.ops.mono.gfx950.minimax_m3.pre_attn import (
             K1_ARGS,
         )

@@ -447,6 +447,7 @@ def emit_pre_attn(
                         x8 + v * 4,
                     )
             gpu.barrier()
+
         def run_gemv_row_group(rg):
             """One row group: its weight and scale streams, the MFMA, and the
             qkv rows it publishes. ``red`` is reused across a folded CTA's row

@@ -51,7 +51,9 @@ O_K = H * HEAD_DIM
 H_SUB = H // LOCAL_KV_HEADS  # q heads sharing one KV head
 O_K_SUB = H_SUB * HEAD_DIM
 SPLIT_PASSES = LOCAL_KV_HEADS
-assert H % LOCAL_KV_HEADS == 0, f"{H} q heads do not divide over {LOCAL_KV_HEADS} KV heads"
+assert H % LOCAL_KV_HEADS == 0, (
+    f"{H} q heads do not divide over {LOCAL_KV_HEADS} KV heads"
+)
 assert H_SUB <= 16, f"GQA group {H_SUB} exceeds the split stage's 16-row thread map"
 
 # A page-16 of ONE KV head (``pre_attn.PAGE_BYTES``). The cache is
