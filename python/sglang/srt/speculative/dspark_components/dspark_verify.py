@@ -6,9 +6,6 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -22,7 +19,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildRaggedVerifyWindow,
     RaggedVerifyWindow,
     ScatterCompactToStrided,
-    build_unified_commit_inject_layout,
+    build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
@@ -369,8 +366,8 @@ class TargetVerifyExecutor:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
         state_slot = None
-        if is_unified_kv_triton():
-            # unified_kv needs the per-token draft req slot to address the SWA ring
+        if self.kv_injector.swa_ring_size is not None:
+            # A SWA ring needs the per-token draft req slot to address it
             # (state_slot * ring + pos % ring). Verify tokens are the latest in each
             # req so they always fall in the window; the commit gate (via commit_lens
             # + cache_loc_2d) drops rejected tokens, so no final_pos skip is needed.
@@ -659,7 +656,7 @@ class DsparkVerifyEpilogue:
         )
         cache_loc = forward_batch.out_cache_loc
         state_slot = None
-        if is_unified_kv_triton():
+        if self.commit_ctx.kv_injector.swa_ring_size is not None:
             state_slot = (
                 forward_batch.req_pool_indices.view(-1, 1)
                 .expand(bs, self.stride)
@@ -812,14 +809,14 @@ class DsparkVerifyEpilogue:
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
         )
-        if is_unified_kv_triton():
-            inject_layout = build_unified_commit_inject_layout(
+        if pool.swa_req_ring_size is not None:
+            inject_layout = build_ring_commit_inject_layout(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=seq_lens[:bs],
                 block_pos_offsets=ctx.block_pos_offsets[: self.stride],
                 commit_lens=gated_commit_lens,
                 stride=self.stride,
-                ring_stride=pool.unified_swa_ring_size,
+                ring_stride=pool.swa_req_ring_size,
             )
         else:
             inject_layout = BuildCommitInjectLayout.execute(
