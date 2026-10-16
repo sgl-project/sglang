@@ -16,7 +16,11 @@
 namespace sglang {
 
 #ifdef USE_ROCM
-constexpr int WARP_SIZE = 64;
+// The JIT passes the device's wave size (32 on gfx1250) so host and device agree.
+#ifndef SGL_ROCM_WARP_SIZE
+#define SGL_ROCM_WARP_SIZE 64
+#endif
+constexpr int WARP_SIZE = SGL_ROCM_WARP_SIZE;
 using BallotMask = uint64_t;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
 #else

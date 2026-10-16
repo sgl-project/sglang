@@ -118,11 +118,13 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
         # Detect FP8 type based on GPU architecture
         try:
             device = torch.cuda.current_device()
-            gcn_arch = torch.cuda.get_device_properties(device).gcnArchName
+            props = torch.cuda.get_device_properties(device)
+            gcn_arch, warp_size = props.gcnArchName, props.warp_size
             if "gfx942" in gcn_arch:
                 flags.append("-DHIP_FP8_TYPE_FNUZ=1")
             else:
                 flags.append("-DHIP_FP8_TYPE_E4M3=1")
+            flags.append(f"-DSGL_ROCM_WARP_SIZE={warp_size}")
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
