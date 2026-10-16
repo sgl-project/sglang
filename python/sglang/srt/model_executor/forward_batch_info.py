@@ -2155,7 +2155,7 @@ def enable_num_token_non_padded():
         return True
     # DP attention + TP MoE gathers each rank's whole padded chunk into the MoE,
     # so the model needs the real count to zero the pad rows (see
-    # deepseek_v4 _run_moe_ffn_dp_sync).
+    # deepseek_common.moe_transport).
     return _dp_tp_moe_masks_pad_rows()
 
 

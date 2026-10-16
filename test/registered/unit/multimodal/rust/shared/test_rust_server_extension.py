@@ -81,7 +81,9 @@ class TestRustServerExtension(CustomTestCase):
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(scheduler)
 
-        build_args.assert_called_once_with(scheduler, extension=extension)
+        build_args.assert_called_once_with(
+            scheduler, extension=extension, health_generate_headers={}
+        )
         extension.Server.assert_called_once_with(
             sentinel.args, cores=None, port_offset=1
         )
