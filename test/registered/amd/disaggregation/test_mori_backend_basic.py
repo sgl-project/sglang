@@ -7,7 +7,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from sglang.srt.disaggregation.mori import conn as mori_conn
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_shard_rank,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
@@ -89,6 +92,50 @@ class TestMoriDCP(unittest.TestCase):
         self.assertIs(args[2], dst_indices)
         self.assertEqual(kwargs["src_page_offset"], 2)
         self.assertEqual(kwargs["num_kv_tokens"], 13)
+
+    def test_sharded_send_uses_destinations_at_owned_positions(self):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.request_status = {7: mori_conn.KVPoll.WaitingForInput}
+        manager.transfer_lock = threading.Lock()
+        manager.transfer_infos = {
+            7: {
+                "peer": mori_conn.TransferInfo(
+                    room=7,
+                    endpoint="127.0.0.1",
+                    dst_port=1,
+                    engine_key="peer",
+                    dst_kv_indices=np.arange(100, 110, dtype=np.int32),
+                    dst_aux_index=-1,
+                    dst_state_indices=[],
+                    required_dst_info_num=1,
+                    is_dummy=False,
+                )
+            }
+        }
+        manager.decode_kv_args_table = {
+            "peer": SimpleNamespace(requires_dcp_relayout=False)
+        }
+        manager.update_status = Mock()
+        manager.send_kvcache = Mock(return_value=[])
+        pages = np.array([11, 12, 13, 14, 15], dtype=np.int32)
+
+        for rank, local_pages, dst_pages in (
+            (0, [6, 7], [105, 107]),
+            (1, [5, 6, 7], [104, 106, 108]),
+        ):
+            with self.subTest(rank=rank):
+                kv_indices, index_slice = filter_kv_indices_for_shard_rank(
+                    kv_indices=pages,
+                    index_slice=slice(4, 9),
+                    shard_rank=rank,
+                    shard_size=2,
+                )
+                manager._submit_kv_transfer(7, kv_indices, index_slice, False)
+
+                _, src, dst = manager.send_kvcache.call_args.args
+                np.testing.assert_array_equal(src, local_pages)
+                np.testing.assert_array_equal(dst, dst_pages)
 
     def test_pp_local_descriptors_map_by_layer(self):
         manager = object.__new__(mori_conn.MoriKVManager)

@@ -3811,6 +3811,20 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
 
         self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
 
+    def test_aiter_accepts_plain_tp_regardless_of_chunked_prefix_cache(self):
+        for disabled in (False, True):
+            with self.subTest(disable_chunked_prefix_cache=disabled):
+                args = self._rounding_args(
+                    raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                )
+                args.attention_backend = "aiter"
+                args.disable_chunked_prefix_cache = disabled
+
+                with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+                    handle_kv_cache_sharding(args, 80 * 1024)
+
+                self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
+
     def test_mla_without_cp_rejects_attention_dp(self):
         for backend in ("fa3", "trtllm_mla"):
             with self.subTest(backend=backend):
@@ -3854,16 +3868,18 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
 
         self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
 
-    def test_trtllm_mla_rejects_unsupported_shard_topologies(self):
+    def test_plain_tp_mla_backends_reject_unsupported_shard_topologies(self):
         cases = (
-            (False, 1, False, "requires an MLA model"),
-            (True, 2, False, "only supports plain-TP MLA"),
-            (True, 1, True, "requires chunked prefix caching"),
+            ("trtllm_mla", False, 1, False, "requires an MLA model"),
+            ("trtllm_mla", True, 2, False, "only supports plain-TP MLA"),
+            ("trtllm_mla", True, 1, True, "requires chunked prefix caching"),
+            ("aiter", False, 1, False, "requires an MLA model"),
+            ("aiter", True, 2, False, "only supports plain-TP MLA"),
         )
-        for is_mla, attn_cp_size, disable_chunked_prefix_cache, error in cases:
-            with self.subTest(error=error):
+        for backend, is_mla, attn_cp_size, disable_chunked_prefix_cache, error in cases:
+            with self.subTest(backend=backend, error=error):
                 args = self._args()
-                args.attention_backend = "trtllm_mla"
+                args.attention_backend = backend
                 args._model_config.attention_arch = (
                     AttentionArch.MLA if is_mla else AttentionArch.MHA
                 )
@@ -3872,8 +3888,24 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                     disable_chunked_prefix_cache=disable_chunked_prefix_cache,
                 )
 
-                with self.assertRaisesRegex(ValueError, error):
+                with self.assertRaisesRegex(ValueError, f"with {backend} {error}"):
                     validate_kv_shard_attention_backend(args, view)
+
+    def test_only_mooncake_nixl_and_mori_transfer_backends_are_allowed(self):
+        for backend in ("mooncake", "nixl", "mori", "fake"):
+            with self.subTest(backend=backend):
+                args = self._rounding_args(
+                    raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                )
+                args.disaggregation_transfer_backend = backend
+                with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+                    if backend == "fake":
+                        with self.assertRaisesRegex(
+                            ValueError, "only supports the mooncake, nixl and mori"
+                        ):
+                            handle_kv_cache_sharding(args, 80 * 1024)
+                    else:
+                        handle_kv_cache_sharding(args, 80 * 1024)
 
     def test_hisparse_allocator_is_rejected(self):
         args = self._args(enable_hisparse=True)

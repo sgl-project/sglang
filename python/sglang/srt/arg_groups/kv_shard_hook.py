@@ -28,20 +28,20 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
     if prefill_backend == "fa3":
         return
-    if prefill_backend != "trtllm_mla":
+    if prefill_backend not in ("trtllm_mla", "aiter"):
         raise ValueError(
             "--enable-kv-cache-sharding currently requires the fa3 prefill "
-            "attention backend, or trtllm_mla for plain-TP MLA; "
+            "attention backend, or trtllm_mla / aiter for plain-TP MLA; "
             f"got {prefill_backend!r}."
         )
     if not use_mla_backend(server_args):
-        raise ValueError("KV sharding with trtllm_mla requires an MLA model.")
+        raise ValueError(f"KV sharding with {prefill_backend} requires an MLA model.")
     if cfg.attn_cp_size > 1:
         raise ValueError(
-            "KV sharding with trtllm_mla only supports plain-TP MLA "
+            f"KV sharding with {prefill_backend} only supports plain-TP MLA "
             "(attn_cp_size must be 1)."
         )
-    if cfg.disable_chunked_prefix_cache:
+    if prefill_backend == "trtllm_mla" and cfg.disable_chunked_prefix_cache:
         raise ValueError("KV sharding with trtllm_mla requires chunked prefix caching.")
 
 
@@ -168,10 +168,10 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     validate_kv_shard_attention_backend(server_args, cfg)
-    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori"):
         raise ValueError(
-            "--enable-kv-cache-sharding currently only supports the mooncake "
-            "and nixl transfer backends: both route sends through "
+            "--enable-kv-cache-sharding currently only supports the mooncake, "
+            "nixl and mori transfer backends: they route sends through "
             "CommonKVSender._prepare_send_indices and pair destinations by "
             "fancy index. Got --disaggregation-transfer-backend "
             f"{cfg.disaggregation_transfer_backend!r}."

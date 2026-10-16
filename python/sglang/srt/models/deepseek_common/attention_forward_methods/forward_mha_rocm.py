@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
@@ -348,15 +349,14 @@ class DeepseekMHARocmForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
-            )
+        pool = get_token_to_kv_pool()
+        # A KV-sharded pool holds only this rank's stripe; only its
+        # get_mla_kv_buffer maps logical locations to the assembled scratch.
+        if _use_aiter_gfx95 or isinstance(pool, PageInterleaveKVPoolMixin):
+            kv_a, k_pe = pool.get_mla_kv_buffer(self.attn_mha, kv_indices, dst_dtype)
             kv_a = kv_a.squeeze(1)
         else:
-            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
-                self.attn_mha.layer_id
-            )
+            latent_cache_buf = pool.get_key_buffer(self.attn_mha.layer_id)
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
