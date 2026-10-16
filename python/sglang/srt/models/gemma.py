@@ -26,6 +26,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -67,10 +68,16 @@ class GemmaMLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = GeluAndMul("none")
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj, self.down_proj, hidden_size, activation="gelu"
+        )
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.dual_gemm.can_run(x, self.gate_up_proj):
+            x = self.dual_gemm(x, self.gate_up_proj)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -189,6 +196,8 @@ class GemmaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.post_attention_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
 
     def forward(
         self,

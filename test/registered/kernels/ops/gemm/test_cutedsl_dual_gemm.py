@@ -6,9 +6,16 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
-from sglang.kernels.ops.activation import silu_and_mul
+from sglang.kernels.ops.activation import (
+    gelu_and_mul,
+    gelu_tanh_and_mul,
+    silu_and_mul,
+)
 from sglang.kernels.ops.gemm import fp8_scaled_mm
-from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
+from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+    DualGemmActivationType,
+    DualGemmQuantMode,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -62,6 +69,7 @@ def _reference(
     gate_up_weight_scale,
     output_scale,
     use_per_token_if_dynamic,
+    activation_type=DualGemmActivationType.SILU,
 ):
     gate_up = fp8_scaled_mm(
         x,
@@ -70,7 +78,11 @@ def _reference(
         gate_up_weight_scale,
         torch.bfloat16,
     )
-    activation = silu_and_mul(gate_up)
+    activation = {
+        DualGemmActivationType.SILU: silu_and_mul,
+        DualGemmActivationType.GELU: gelu_and_mul,
+        DualGemmActivationType.GELU_TANH: gelu_tanh_and_mul,
+    }[activation_type](gate_up)
     if output_scale is None:
         return scaled_fp8_quant(
             activation,
@@ -108,8 +120,17 @@ def _make_float_inputs(
     )
 
 
-def _float_reference(x, gate_up_weight):
-    return silu_and_mul(torch.nn.functional.linear(x, gate_up_weight))
+def _float_reference(
+    x,
+    gate_up_weight,
+    activation_type=DualGemmActivationType.SILU,
+):
+    gate_up = torch.nn.functional.linear(x, gate_up_weight)
+    return {
+        DualGemmActivationType.SILU: silu_and_mul,
+        DualGemmActivationType.GELU: gelu_and_mul,
+        DualGemmActivationType.GELU_TANH: gelu_tanh_and_mul,
+    }[activation_type](gate_up)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -127,6 +148,7 @@ class TestCuteDSLDualGemm(CustomTestCase):
         tactic=-1,
         hidden_size=_HIDDEN_SIZE,
         intermediate_size=_INTERMEDIATE_SIZE,
+        activation_type=DualGemmActivationType.SILU,
     ):
         if tactic < 0:
             from sglang.kernels.ops.gemm import dual_gemm_swiglu_fp8
@@ -150,6 +172,7 @@ class TestCuteDSLDualGemm(CustomTestCase):
                 gate_up_weight_scale,
                 None,
                 quant_mode.is_per_token,
+                activation_type,
             )
             output_scale = calibrated_scale
 
@@ -158,11 +181,13 @@ class TestCuteDSLDualGemm(CustomTestCase):
             dual_gemm_swiglu_fp8(
                 *args,
                 quant_mode=quant_mode,
+                activation_type=activation_type,
             )
             if tactic < 0
             else _dual_gemm_swiglu_fp8_with_tactic(
                 *args,
                 quant_mode,
+                activation_type,
                 tactic,
             )
         )
@@ -173,6 +198,7 @@ class TestCuteDSLDualGemm(CustomTestCase):
             gate_up_weight_scale,
             output_scale,
             quant_mode.is_per_token,
+            activation_type,
         )
         expected_scale_shape = (
             (num_tokens, 1) if quant_mode.is_per_token and num_tokens > 1 else (1,)
@@ -203,6 +229,7 @@ class TestCuteDSLDualGemm(CustomTestCase):
         seed,
         hidden_size=_HIDDEN_SIZE,
         intermediate_size=_INTERMEDIATE_SIZE,
+        activation_type=DualGemmActivationType.SILU,
     ):
         from sglang.kernels.ops.gemm import dual_gemm_swiglu
 
@@ -213,8 +240,8 @@ class TestCuteDSLDualGemm(CustomTestCase):
             hidden_size,
             intermediate_size,
         )
-        actual = dual_gemm_swiglu(x, gate_up_weight)
-        expected = _float_reference(x, gate_up_weight)
+        actual = dual_gemm_swiglu(x, gate_up_weight, activation_type=activation_type)
+        expected = _float_reference(x, gate_up_weight, activation_type)
         self.assertEqual(actual.dtype, dtype)
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2.5e-1)
 
@@ -223,6 +250,24 @@ class TestCuteDSLDualGemm(CustomTestCase):
 
     def test_fp16(self):
         self._check_float(16, torch.float16, seed=20261007)
+
+    def test_gelu_activations(self):
+        for index, activation_type in enumerate(
+            (DualGemmActivationType.GELU, DualGemmActivationType.GELU_TANH)
+        ):
+            with self.subTest(activation_type=activation_type):
+                self._check_float(
+                    4,
+                    torch.bfloat16,
+                    seed=20261019 + index,
+                    activation_type=activation_type,
+                )
+                self._check(
+                    DualGemmQuantMode.STATIC_PER_TENSOR,
+                    4,
+                    seed=20261021 + index,
+                    activation_type=activation_type,
+                )
 
     def test_fp8_dynamic_per_tensor(self):
         for num_tokens in (4, 16):

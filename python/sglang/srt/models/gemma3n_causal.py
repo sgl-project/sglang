@@ -6,6 +6,7 @@ from torch import nn
 from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
 
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -51,12 +52,14 @@ class Gemma3nRMSNorm(RMSNorm):
                 persistent=False,
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         original_shape = x.shape
         x_2d = x.contiguous().reshape(-1, original_shape[-1])
-        x_2d = super().forward(x_2d)
-        x = x_2d.reshape(original_shape)
-        return x
+        output = super().forward(x_2d)
+        if isinstance(output, tuple):
+            quantized, scale, output_dtype = output
+            return quantized.reshape(original_shape), scale, output_dtype
+        return output.reshape(original_shape)
 
 
 class Gemma3nTextScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
@@ -96,6 +99,9 @@ class Gemma3nTextMLP(nn.Module):
             )
         # Use proper GELU with tanh approximation as specified
         self.act_fn = GeluAndMul()
+        self.dual_gemm = DualGemm(
+            self.gate_up_proj, self.down_proj, hidden_size, activation="gelu_tanh"
+        )
         self.activation_sparsity = activation_sparsity
         self.register_buffer(
             "target_sparsity_tensor",
@@ -104,6 +110,13 @@ class Gemma3nTextMLP(nn.Module):
         )  # moved from _gaussian_topk for cuda graph
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation_sparsity == 0.0 and self.dual_gemm.can_run(
+            x, self.gate_up_proj
+        ):
+            x = self.dual_gemm(x, self.gate_up_proj)
+            x, _ = self.down_proj(x)
+            return x
+
         gate_up, _ = self.gate_up_proj(x)
 
         # Split gate and up projections
@@ -541,6 +554,7 @@ class Gemma3nDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = Gemma3nRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
+        self.pre_feedforward_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
