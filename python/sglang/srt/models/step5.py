@@ -1544,6 +1544,7 @@ class Step5ForCausalLM(nn.Module):
         # Only the first load_weights call (the checkpoint) must cover every target weight;
         # later calls are weight updates and, as for other models, may stream any subset.
         self._checkpoint_loaded = False
+        self._checkpoint_duplicate_names = frozenset()
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -1571,19 +1572,16 @@ class Step5ForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     @staticmethod
-    def _indexed_duplicate_weights(weights, expected, model_path):
-        # Native iterators do not retain shard provenance. For duplicate names,
-        # read the indexed owner explicitly rather than depend on arrival order.
+    def _checkpoint_duplicate_owners(expected, model_path) -> dict[str, str]:
+        # names stored in more than one shard -> the shard the index names
         from safetensors import safe_open
 
         if not model_path:
-            yield from weights
-            return
+            return {}
         root = Path(model_path)
         index_path = root / "model.safetensors.index.json"
         if not index_path.is_file():
-            yield from weights
-            return
+            return {}
         owners = json.loads(index_path.read_text())["weight_map"]
         occurrences = {}
         for filename in set(owners.values()):
@@ -1606,6 +1604,15 @@ class Step5ForCausalLM(nn.Module):
                 if owners.get(name) not in files:
                     raise ValueError(f"Step5 duplicate has no indexed owner: {name}")
                 duplicates[name] = owners[name]
+        return duplicates
+
+    @staticmethod
+    def _indexed_duplicate_weights(weights, duplicates, model_path):
+        # Native iterators do not retain shard provenance. For duplicate names,
+        # read the indexed owner explicitly rather than depend on arrival order.
+        from safetensors import safe_open
+
+        root = Path(model_path) if model_path else None
         emitted = set()
         for name, weight in weights:
             if name not in duplicates:
@@ -1713,9 +1720,15 @@ class Step5ForCausalLM(nn.Module):
         checkpoint_depth = config.num_hidden_layers + config.num_nextn_predict_layers
         checkpoint_load = not self._checkpoint_loaded
         if checkpoint_load:
-            weights = self._indexed_duplicate_weights(
-                weights, expected, getattr(self, "checkpoint_path", None)
+            duplicates = self._checkpoint_duplicate_owners(
+                expected, self.checkpoint_path
             )
+            # a disk reload streams both copies again, with no shard provenance
+            self._checkpoint_duplicate_names = frozenset(duplicates)
+            weights = self._indexed_duplicate_weights(
+                weights, duplicates, self.checkpoint_path
+            )
+        first_copies = {}
         for original_name, loaded_weight in weights:
             name = original_name
             if name.startswith("vision_model.") or name == "vit_large_projector.weight":
@@ -1741,6 +1754,14 @@ class Step5ForCausalLM(nn.Module):
                     loaded_weight = loaded_weight.unsqueeze(0)
             if name not in expected:
                 raise ValueError(f"Unknown Step5 target weight: {name}")
+            if not checkpoint_load and name in self._checkpoint_duplicate_names:
+                if name in first_copies:
+                    if not torch.equal(first_copies[name], loaded_weight):
+                        raise ValueError(
+                            f"Step5 duplicate copies differ: {original_name}"
+                        )
+                    continue
+                first_copies[name] = loaded_weight
             if seen_key in seen:
                 raise ValueError(f"Duplicate Step5 target weight: {original_name}")
             seen.add(seen_key)
