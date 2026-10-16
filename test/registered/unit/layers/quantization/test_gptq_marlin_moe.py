@@ -1,4 +1,4 @@
-"""Regression tests for GPTQ Marlin MoE scale allocation and TP loading."""
+"""Regression tests for GPTQ MoE scale allocation and TP loading."""
 
 import unittest
 from types import SimpleNamespace
@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.gptq.gptq import GPTQMarlinConfig
+from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.gptq.schemes.gptq_cpu import (
+    GPTQIntelAMXMoEScheme,
+)
 from sglang.srt.layers.quantization.gptq.schemes.gptq_moe import GPTQMarlinMoEScheme
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -62,6 +65,31 @@ class TestGPTQMarlinMoE(CustomTestCase):
                 )
                 self.assertEqual(layer.w2_scales.shape, (2, expected_groups, 256))
                 self.assertEqual(layer.w2_scales.load_full_w2, desc_act)
+
+    def test_intel_amx_static_act_order_keeps_w2_tp_sharded(self):
+        quant_config = GPTQConfig(
+            weight_bits=4,
+            group_size=128,
+            desc_act=True,
+            lm_head_quantized=False,
+            dynamic={},
+            true_sequential=True,
+            static_groups=True,
+        )
+        layer = torch.nn.Module()
+        layer.moe_tp_size = 2
+        GPTQIntelAMXMoEScheme(quant_config).create_weights(
+            layer=layer,
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size_per_partition=128,
+            params_dtype=torch.float16,
+        )
+
+        self.assertEqual(layer.w2_scales.shape, (2, 1, 256))
+        self.assertEqual(layer.w2_qzeros.shape, (2, 1, 32))
+        self.assertFalse(hasattr(layer.w2_scales, "load_full_w2"))
+        self.assertFalse(hasattr(layer.w2_qzeros, "load_full_w2"))
 
     def test_fused_moe_w2_loader_honors_load_full(self):
         loader = SimpleNamespace(

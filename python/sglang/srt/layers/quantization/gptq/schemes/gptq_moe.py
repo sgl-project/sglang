@@ -238,8 +238,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition,
-                # Marlin specializes scale loads for the activation dtype.
-                # Keep them aligned for both FP16 and BF16 model execution.
+                # Marlin requires scale dtype == activation dtype.
                 dtype=params_dtype,
             ),
             requires_grad=False,
