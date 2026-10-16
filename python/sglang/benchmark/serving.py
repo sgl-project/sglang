@@ -2298,6 +2298,7 @@ def cli_main():
             "openai",
             "random",
             "random-ids",
+            "random-ids-shared-prefix",
             "generated-shared-prefix",
             "mmmu",
             "image",
@@ -2389,6 +2390,15 @@ def cli_main():
         default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
+    )
+    parser.add_argument(
+        "--random-shared-prefix-len",
+        type=int,
+        default=0,
+        help=(
+            "Number of leading token ids shared by every "
+            "random-ids-shared-prefix request."
+        ),
     )
     # image dataset args
     parser.add_argument(
