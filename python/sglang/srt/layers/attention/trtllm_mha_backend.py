@@ -1765,6 +1765,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
+        kv_pool_is_hnd = False
         if uses_native_fp4:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
             k_cache, v_cache = kv_cache
@@ -1772,16 +1773,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-            # Same test as paged_kv_view: SGLANG_USE_HND_KVCACHE pools are
-            # [pages, heads, page, dim]; NHD pools are per-slot rows.
-            kv_pool_is_hnd = k_cache_raw.dim() == 4
             if not self.use_fmha_v2 or uses_decode_kernel:
                 # Decode and SM100 batch_context kernels require HND layout.
                 k_cache, v_cache = self._reshape_paged_kv_cache(
                     k_cache_raw, v_cache_raw, layer, layer.head_dim
                 )
-            elif kv_pool_is_hnd:
+            elif k_cache_raw.dim() == 4:
+                # Same test as paged_kv_view: SGLANG_USE_HND_KVCACHE pools are
+                # [pages, heads, page, dim]; NHD pools are per-slot rows.
                 # fmha_v2 reads HND pool buffers as-is; they are already contiguous.
+                kv_pool_is_hnd = True
                 hnd_shape = (layer.tp_k_head_num, self.page_size, layer.head_dim)
                 assert k_cache_raw.shape[1:] == v_cache_raw.shape[1:] == hnd_shape, (
                     f"expected HND buffers [pages, *{hnd_shape}], got "
