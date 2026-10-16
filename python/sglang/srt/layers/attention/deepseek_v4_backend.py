@@ -3676,14 +3676,28 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
         freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
-        kv_cache = pool.get_extra_key_buffer(layer_id)
-        page_size = pool.get_extra_key_page_size(layer_id)
-        # The pool's page format: V4, or the V4.1 fp8 / fp4 layouts.
-        kv_layout = (
-            KVLayout.UNIFORM_FP8
-            if pool.uniform_fp8
-            else pool.get_extra_key_layout(layer_id)
-        )
+        if getattr(pool, "_unified_kv", False):
+            # fp8 two-pool unified_kv: this kv_source layer's view starts at its own
+            # SWA ring; its group's compressed region starts at row_base.
+            assert pool._unified_kv_fp8, "ratio 1 / 2 need the fp8 unified_kv layout"
+            kv_cache = pool.get_unified_kv(layer_id)
+            store_kwargs = dict(
+                fp8_2buff=True,
+                k_cache_rope=pool.get_unified_kv_rope(layer_id),
+                row_base=pool.get_unified_compress_row_base(layer_id),
+            )
+            page_size = 1
+            kv_layout = KVLayout.V4
+        else:
+            kv_cache = pool.get_extra_key_buffer(layer_id)
+            page_size = pool.get_extra_key_page_size(layer_id)
+            # The pool's page format: V4, or the V4.1 fp8 / fp4 layouts.
+            kv_layout = (
+                KVLayout.UNIFORM_FP8
+                if pool.uniform_fp8
+                else pool.get_extra_key_layout(layer_id)
+            )
+            store_kwargs = {}
         assert kv_cache is not None
 
         if layer.compress_ratio == 1:
@@ -3698,6 +3712,7 @@ class DeepseekV4AttnBackend(
                 kv_cache,
                 page_size=page_size,
                 layout=kv_layout,
+                **store_kwargs,
             )
             out_loc = core.c1_out_loc
         else:
@@ -3722,6 +3737,7 @@ class DeepseekV4AttnBackend(
                     ring_size=state.ring_size,
                     draft_len=draft_len,
                     layout=kv_layout,
+                    **store_kwargs,
                 )
             else:
                 latent = c2_prefill_norm_rope_store(
@@ -3730,6 +3746,7 @@ class DeepseekV4AttnBackend(
                     page_size=page_size,
                     ring_size=state.ring_size,
                     layout=kv_layout,
+                    **store_kwargs,
                 )
             out_loc = core.c2_out_loc
 
@@ -3761,6 +3778,12 @@ class DeepseekV4AttnBackend(
     def _low_ratio_compress_torch(
         self, layer, x, req, pos, projected=None, *, fuse_index_store=False
     ) -> None:
+        if getattr(self.token_to_kv_pool, "_unified_kv", False):
+            # this path stores into the paged ratio-1/2 pools, which unified_kv lacks
+            raise NotImplementedError(
+                "the torch ratio-1/2 compressor has no unified_kv store; only the "
+                "fused (gfx950) decode / extend / static-verify paths do"
+            )
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
         kv, score = projected if projected is not None else layer.compressor.project(x)

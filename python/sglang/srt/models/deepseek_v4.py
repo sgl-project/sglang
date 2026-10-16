@@ -1926,10 +1926,14 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        q_rope_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``q_rope_out`` given: fp8 two-pool unified_kv decode -- Q packed into
+        ``q_out`` / ``q_rope_out``, K stored into this layer's SWA ring rows."""
         # Both side streams are joined before returning, and nothing they read is
         # released before the join.
         assert self.alt_streams is not None
+        unified_fp8 = q_rope_out is not None
         current_stream = torch.cuda.current_stream()
         stream_kv = self.alt_streams[0]
         stream_sources = self.alt_streams[-1]
@@ -1959,7 +1963,17 @@ class MQALayer(MqaAttentionBase):
         if self.indexer is not None:
             stream_sources.wait_stream(current_stream)
 
-        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        if unified_fp8:
+            from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
+                pack_q_fp8_2buff,
+            )
+
+            # V4.1 has no query head norm: the paged path's RoPE'd bf16 Q, packed
+            q = pack_q_fp8_2buff(
+                self._compute_q_b(q_for_wqb, positions, None), q_out, q_rope_out
+            )
+        else:
+            q = self._compute_q_b(q_for_wqb, positions, q_out)
         if self.indexer is not None:
             # Forked above, right after q_lora; recorded here, after the Q chain.
             with torch.cuda.stream(stream_sources):
@@ -1973,9 +1987,32 @@ class MQALayer(MqaAttentionBase):
                 )
 
         with torch.cuda.stream(stream_kv):
-            self._compute_kv_to_cache(
-                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
-            )
+            if unified_fp8:
+                from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
+                    store_k_fp8_2buff,
+                )
+
+                kv = (
+                    qkv_a[..., self.q_lora_rank :]
+                    if qkv_a is not None
+                    else self.wkv(x_linear)[0]
+                )
+                pool = get_token_to_kv_pool()
+                store_k_fp8_2buff(
+                    kv,
+                    self.kv_norm.weight,
+                    self.eps,
+                    positions,
+                    self.cos_cache,
+                    self.sin_cache,
+                    pool.get_unified_kv(self.layer_id),
+                    pool.get_unified_kv_rope(self.layer_id),
+                    attn_backend.get_unified_swa_loc(forward_batch).to(torch.int64),
+                )
+            else:
+                self._compute_kv_to_cache(
+                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                )
 
         current_stream.wait_stream(stream_kv)
         if self.compressor is not None or self.indexer is not None:
@@ -2268,8 +2305,16 @@ class MQALayer(MqaAttentionBase):
 
         # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
         q_lora_quant = None
+        # DeepSeek-V4.1 has no query head norm: its query is computed exactly as
+        # on the paged path (RoPE'd bf16) and the fp8 store only packs it.
+        unified_no_q_norm = unified and fp8_2buff and not self.q_head_norm
         if do_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
+            if unified_no_q_norm:
+                q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+                q, q_lora, _ = _hip.compute_q_b(
+                    self, q_lora, q_for_wqb, positions, None, True, use_cp
+                )
+            elif _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -2373,6 +2418,7 @@ class MQALayer(MqaAttentionBase):
                 k_nope_out=k_nope_out if fuse_prefill else None,
                 k_rope_out=k_rope_out if fuse_prefill else None,
                 q_rope_out=q_rope_out,
+                q_head_norm=not unified_no_q_norm,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
             # nothing, so hand it back: the caller feeds it to attention as the
@@ -2607,10 +2653,22 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_fp8,
+        )
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton as _is_unified_kv_triton,
+        )
+
         low_ratio_multi_stream = (
             ((_is_cuda and get_platform().is_blackwell) or _is_gfx95_supported)
             and self.compress_ratio in (1, 2)
             and self.alt_streams is not None
+            # its unified_kv arm is fp8 decode only (packed Q + SWA ring store)
+            and (
+                not _is_unified_kv_triton()
+                or (is_unified_kv_fp8() and forward_batch.forward_mode.is_decode())
+            )
             and (
                 forward_batch.forward_mode.is_decode()
                 or (
@@ -2761,6 +2819,7 @@ class MQALayer(MqaAttentionBase):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
+                q_rope_out=q_rope if unified else None,
             )
             kv = None
         else:

@@ -269,6 +269,7 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_fp8,
         is_unified_kv_triton,
     )
 
@@ -337,7 +338,31 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and str(cfg.speculative_algorithm).upper() != "DSPARK",
         ),
         ("HiSparse", cfg.enable_hisparse),
-        ("the unified KV layout", is_unified_kv_triton()),
+        # The fp8 two-pool layout covers ratios 1 / 2 (kv_source groups); the
+        # bf16 rows, the replay windows, spec, PD and HiCache are not wired for them.
+        (
+            "the bf16 unified KV layout (set SGLANG_DSV4_UNIFIED_KV_FP8=1)",
+            is_unified_kv_triton() and not is_unified_kv_fp8(),
+        ),
+        (
+            "the unified KV layout with SWA bounded replay",
+            is_unified_kv_triton()
+            and (
+                cfg.enable_encoder_swa_bounded_replay
+                or cfg.enable_decoder_swa_bounded_replay
+            ),
+        ),
+        (
+            "the unified KV layout with speculative decoding",
+            is_unified_kv_triton() and cfg.speculative_algorithm is not None,
+        ),
+        (
+            "the unified KV layout with PD disaggregation or HiCache",
+            is_unified_kv_triton()
+            and (
+                str(cfg.disaggregation_mode) != "null" or cfg.enable_hierarchical_cache
+            ),
+        ),
         (
             "TRT-LLM with encoder SWA bounded replay",
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,

@@ -301,6 +301,24 @@ class UnifiedKvMetadata:
     c4_out_loc: Optional[torch.Tensor] = None
     c128_out_loc: Optional[torch.Tensor] = None
 
+    # DeepSeek-V4.1 ratio-1/2 decode streams: SWA-ring prefix built once per step,
+    # compressed tail filled per layer at that layer's compressed-row base.
+    c1_indices: Optional[torch.Tensor] = None
+    c1_indptr: Optional[torch.Tensor] = None
+    c1_len: Optional[torch.Tensor] = None
+    c2_indices: Optional[torch.Tensor] = None
+    c2_indptr: Optional[torch.Tensor] = None
+    c2_len: Optional[torch.Tensor] = None
+
+    _LOW_RATIO_FIELDS = (
+        "c1_indices",
+        "c1_indptr",
+        "c1_len",
+        "c2_indices",
+        "c2_indptr",
+        "c2_len",
+    )
+
     def copy_(self, other: UnifiedKvMetadata) -> None:
         copy_metadata(
             src=other,
@@ -333,7 +351,8 @@ class UnifiedKvMetadata:
                 # Captured store_cache reads swa_loc by address, and the eager
                 # target-verify path builds it outside the graph.
                 "swa_loc",
-            ],
+            ]
+            + [f for f in self._LOW_RATIO_FIELDS if getattr(other, f) is not None],
             assign_fields=[],
         )
 
@@ -369,7 +388,8 @@ class UnifiedKvMetadata:
                 "verify_store_state_slot",
                 "c4_out_loc",
                 "c128_out_loc",
-            ],
+            ]
+            + [f for f in self._LOW_RATIO_FIELDS if getattr(other, f) is not None],
         )
 
 
@@ -2687,6 +2707,27 @@ class DeepseekV4HipRadixBackend(
                     u.grp_swa_bounds,
                 ) = grouped(None, None)
 
+        for ratio in core.low_ratios:
+            page_indices = core.sparse_page_indices(ratio)
+            # Unclamped, unlike c{R}_sparse_topk_lengths (>= 1 for the flashmla
+            # length fold): a request with no compressed row yet has a -1 there,
+            # and the asm reader would load row -1.
+            low_len = torch.clamp(
+                core.seq_lens_casual[:N].to(torch.int32) // ratio, max=core.index_topk
+            )
+            low_indices, low_indptr = runtime.build_low_ratio_decode_stream(
+                state_slot=state_slot,
+                positions=core.positions_casual[:N],
+                swa_len=swa_len,
+                compress_len=low_len,
+                width=page_indices.shape[1],
+                win=pool.unified_swa_window,
+                ring_stride=pool.unified_swa_ring_size,
+            )
+            setattr(core.unified, f"c{ratio}_indices", low_indices)
+            setattr(core.unified, f"c{ratio}_indptr", low_indptr)
+            setattr(core.unified, f"c{ratio}_len", low_len)
+
         # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
         core.unified.swa_loc = (
@@ -2762,7 +2803,7 @@ class DeepseekV4HipRadixBackend(
         kv: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         attn_sink: torch.Tensor,
         core_attn_metadata: DSV4AttnMetadata,
         save_kv_cache: bool = True,
@@ -2793,6 +2834,13 @@ class DeepseekV4HipRadixBackend(
 
         c128_pi = getattr(core_attn_metadata, "c128_page_indices", None)
         c4_pi = getattr(core_attn_metadata, "c4_sparse_page_indices", None)
+        low_pi = None
+        compress_base = swa_pages
+        if compress_ratio in (1, 2):
+            # kv_source groups: this layer's compressed rows start past the rings
+            # of the group members that follow it (see DeepSeekV4UnifiedKVPool)
+            low_pi = core_attn_metadata.sparse_page_indices(compress_ratio)
+            compress_base = pool.get_unified_compress_row_base(layer_id)
 
         # Target-verify runs through the unified_kv DECODE kernel, same path as
         # decode; its per-token decode streams were built in metadata.
@@ -2838,6 +2886,17 @@ class DeepseekV4HipRadixBackend(
                     page_indices=c4_pi[:T],
                     valid_len=core_attn_metadata.c4_sparse_topk_lengths_raw[:T],
                     swa_pages=swa_pages,
+                )
+            elif compress_ratio in (1, 2):
+                kv_indices = getattr(unified_metadata, f"c{compress_ratio}_indices")
+                kv_indptr = getattr(unified_metadata, f"c{compress_ratio}_indptr")
+                runtime.fill_compress_tail(
+                    indices=kv_indices,
+                    indptr=kv_indptr,
+                    prefix_len=core_attn_metadata.swa_topk_lengths[:T],
+                    page_indices=low_pi[:T],
+                    valid_len=getattr(unified_metadata, f"c{compress_ratio}_len")[:T],
+                    swa_pages=compress_base,
                 )
             else:
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
@@ -2969,9 +3028,10 @@ class DeepseekV4HipRadixBackend(
             cu_q=cu_q,
             win=win,
             ring_stride=ring_stride,
-            swa_pages=swa_pages,
+            swa_pages=compress_base,
             c128_page_indices=c128_pi,
             c4_sparse_page_indices=c4_pi,
+            low_ratio_page_indices=low_pi,
         )
 
         if kpre_p.shape[0] < T + 1:
