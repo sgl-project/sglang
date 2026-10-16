@@ -91,18 +91,12 @@ _OWNER_SITES = {
         "SchedulerBatchResultProcessor.process_batch_result_prefill",
         "kv_committed_len",
     ): 1,
-    # disaggregation decode prealloc: both lengths are settled on the host in
-    # _plan_prealloc before the batched device allocation; the per-request
-    # paths (alloc_for_decode_prealloc(_hisparse)) restate kv_allocated_len.
+    # disaggregation decode prealloc: kv_allocated_len is settled inside the
+    # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
     (
         "disaggregation/decode.py",
-        "DecodePreallocQueue._plan_prealloc",
+        "DecodePreallocQueue._pre_alloc",
         "kv_committed_len",
-    ): 1,
-    (
-        "disaggregation/decode.py",
-        "DecodePreallocQueue._plan_prealloc",
-        "kv_allocated_len",
     ): 1,
     ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
     (

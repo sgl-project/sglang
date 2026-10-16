@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import weakref
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -479,7 +479,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
-        swa_tail_lens: Sequence[int],
+        swa_tail_len: int,
     ):
         return self.logical_attn_allocator.alloc_extend_swa_tail(
             prefix_lens=prefix_lens,
@@ -488,7 +488,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu=seq_lens_cpu,
             last_loc=last_loc,
             extend_num_tokens=extend_num_tokens,
-            swa_tail_lens=swa_tail_lens,
+            swa_tail_len=swa_tail_len,
         )
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):

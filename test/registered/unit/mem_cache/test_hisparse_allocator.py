@@ -174,7 +174,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             seq_lens_cpu=seq_lens_cpu,
             last_loc=last_loc,
             extend_num_tokens=512,
-            swa_tail_lens=[128],
+            swa_tail_len=128,
         )
 
         self.assertIs(result, expected)
@@ -186,7 +186,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertIs(kwargs["seq_lens_cpu"], seq_lens_cpu)
         self.assertIs(kwargs["last_loc"], last_loc)
         self.assertEqual(kwargs["extend_num_tokens"], 512)
-        self.assertEqual(kwargs["swa_tail_lens"], [128])
+        self.assertEqual(kwargs["swa_tail_len"], 128)
 
     def test_forwards_prealloc_reclaim_to_logical_allocator(self):
         """PD decode preallocation must not crash on the HiSparse composite."""
@@ -300,7 +300,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator.alloc_logical_only.assert_not_called()
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
         self.assertEqual(kwargs["extend_num_tokens"], fill_len)
-        self.assertEqual(kwargs["swa_tail_lens"], [swa_tail_len])
+        self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
         self.assertEqual(
             req.kv.get_evicted_seqlen(ComponentType.SWA), fill_len - swa_tail_len
         )

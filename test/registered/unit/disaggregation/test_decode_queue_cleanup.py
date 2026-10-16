@@ -9,7 +9,6 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
-    _PreallocPlan,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
@@ -99,41 +98,19 @@ class TestDecodeQueueCleanup(CustomTestCase):
             side_effect=lambda **_: physical_available
         )
 
-        # Planning reserves on the host; the pool only drops when the batch is
-        # allocated, so the budget mock stays flat until `_alloc_planned`.
-        def plan_prealloc(req, **_):
-            return _PreallocPlan(
-                req=req,
-                prefix_indices=None,
-                prefix_len=0,
-                total_prefix_len=0,
-                fill_len=fill_len,
-                delta_len=fill_len,
-                uses_swa_tail=True,
-                swa_tail_len=fill_len,
-                full_tokens=physical_tokens_per_req,
-                swa_tokens=physical_tokens_per_req,
-            )
-
-        def alloc_planned(plans):
+        def pre_alloc(_req):
             nonlocal physical_available
-            self.assertGreaterEqual(
-                physical_available, physical_tokens_per_req * len(plans)
-            )
-            physical_available -= physical_tokens_per_req * len(plans)
+            self.assertGreaterEqual(physical_available, physical_tokens_per_req)
+            physical_available -= physical_tokens_per_req
 
-        queue._plan_prealloc = MagicMock(side_effect=plan_prealloc)
-        queue._alloc_planned = MagicMock(side_effect=alloc_planned)
+        queue._pre_alloc = MagicMock(side_effect=pre_alloc)
 
         resumed = queue.resume_retracted_reqs()
 
         self.assertEqual(resumed, reqs[:3])
         self.assertEqual(queue.retracted_queue, reqs[3:])
         self.assertEqual(physical_available, 3 * page_size)
-        self.assertEqual(queue._plan_prealloc.call_count, 3)
-        # One device allocation for the whole resumed batch.
-        queue._alloc_planned.assert_called_once()
-        self.assertEqual(len(queue._alloc_planned.call_args.args[0]), 3)
+        self.assertEqual(queue._pre_alloc.call_count, 3)
 
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
@@ -280,7 +257,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             )
         )
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
-        queue._plan_prealloc = MagicMock()
+        queue._pre_alloc = MagicMock()
         # SWA tail pre-allocation runs on a paged pool.
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
@@ -312,7 +289,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
-        queue._plan_prealloc.assert_not_called()
+        queue._pre_alloc.assert_not_called()
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )

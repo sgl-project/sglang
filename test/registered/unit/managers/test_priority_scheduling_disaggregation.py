@@ -12,7 +12,6 @@ from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
-    _PreallocPlan,
 )
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
@@ -499,28 +498,12 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue._update_handshake_waiters = MagicMock()
         queue._allocatable_tokens = MagicMock(return_value=1000)
 
-        def plan_prealloc_mock(
-            req, prefix_indices=None, prefix_len=0, total_prefix_len=0, **_
-        ):
-            fill_len = len(req.origin_input_ids)
-            loc = torch.arange(fill_len - (prefix_len or 0), dtype=torch.int64)
-            return _PreallocPlan(
-                req=req,
-                prefix_indices=prefix_indices,
-                prefix_len=prefix_len or 0,
-                total_prefix_len=total_prefix_len or 0,
-                fill_len=fill_len,
-                delta_len=fill_len - (total_prefix_len or 0),
-                uses_swa_tail=False,
-                swa_tail_len=fill_len,
-                full_tokens=fill_len - (prefix_len or 0),
-                swa_tokens=fill_len - (prefix_len or 0),
-                kv_loc=loc,
-                host_indices=loc,
+        def pre_alloc_mock(req, prefix_indices=None, prefix_len=0, total_prefix_len=0):
+            return torch.arange(
+                len(req.origin_input_ids) - prefix_len, dtype=torch.int64
             )
 
-        queue._plan_prealloc = MagicMock(side_effect=plan_prealloc_mock)
-        queue._alloc_planned = MagicMock()
+        queue._pre_alloc = MagicMock(side_effect=pre_alloc_mock)
 
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 100
@@ -646,7 +629,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         self.assertEqual(failed, [])
         self.assertEqual(queue.queue, [reqs[1]])
         self.assertEqual(
-            [call.args[0] for call in queue._plan_prealloc.call_args_list],
+            [call.args[0] for call in queue._pre_alloc.call_args_list],
             [reqs[0].req, reqs[2].req],
         )
 
