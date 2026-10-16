@@ -500,10 +500,21 @@ def create_scheduler_watchdog(
         _, messages = scheduler.invariant_checker._check_all_pools(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
-        return (
-            f"{scheduler.cur_batch_for_debug.batch_size()=}\n"
-            f"{scheduler.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
+        parts = [
+            f"{scheduler.cur_batch_for_debug.batch_size()=}",
+            f"{scheduler.cur_batch_for_debug.reqs=}",
+        ]
+        # Name the stall when it is the symmetric-memory registration, whose
+        # collective has no timeout of its own and would otherwise be reported
+        # as a generic watchdog timeout.
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            describe_registration_in_progress,
         )
+
+        if (registration := describe_registration_in_progress()) is not None:
+            parts.append(f"symmetric-memory registration in progress: {registration}")
+        parts.extend(messages)
+        return "\n".join(parts)
 
     return WatchdogRaw(
         debug_name="Scheduler",
