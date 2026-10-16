@@ -757,6 +757,10 @@ jobs:
           COVSTUB="${RUN_DIR}/outputs/covstub"
           mkdir -p "${COVSTUB}"
           cp -r python/sglang "${COVSTUB}/"
+          # _version.py is generated at build time and git-ignored, so it is
+          # missing from the copied tree; coverage html exits non-zero when a
+          # recorded source file has no source on disk. Provide a placeholder.
+          echo '__version__ = "0.0.0"' > "${COVSTUB}/sglang/_version.py"
 
       - name: Build test case map
         shell: bash
@@ -814,8 +818,11 @@ jobs:
           du -h "${MAP_FILE}"
 
       - name: Generate HTML coverage report
-        # Best-effort add-on: failures here only warn and must never block
-        # the baseline publish steps (Archive/Publish) below.
+        # Best-effort add-on: failures must never block the baseline publish
+        # steps (Archive/Publish) below. continue-on-error keeps the job
+        # green and later steps running, while the step itself still shows
+        # a red ✗ in the UI when generation fails — visible, non-blocking.
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -840,46 +847,59 @@ jobs:
             exit 0
           fi
 
-          if ! (
-            set -e
-            # Alias runner-specific absolute paths onto the covstub copy so
-            # coverage can find the source to render. First entry must be a
-            # real local path (no wildcards).
+          # Any failure below exits non-zero (parent errexit propagates it),
+          # so this step shows a red ✗ in the UI — while continue-on-error
+          # on the step keeps the job green and the Archive/Publish/Cleanup
+          # steps running. Do NOT convert failures to exit 0 behind an
+          # `if ! ( set -e; ... )` guard: bash ignores -e inside a subshell
+          # running in a condition context, which silently swallowed three
+          # "No module named coverage" failures in run 38713909169.
+
+          # The CANN image python has no coverage package (the test jobs
+          # install it via "pip install coverage==7.8.*"); keep the same pin
+          # so combine can read the SQLite data written by the test runners.
+          if ! python3 -c "import coverage" 2>/dev/null; then
+            pip install coverage==7.8.* \
+              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+              --retries 3 --timeout 60 \
+              || pip install coverage==7.8.* -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+          fi
+
+          # Alias runner-specific absolute paths onto the covstub copy so
+          # coverage can find the source to render. First entry must be a
+          # real local path (no wildcards).
+          {
+            echo "[run]"
+            echo "branch = True"
+            echo "[paths]"
+            echo "sglang ="
+            echo "    ${COVSTUB}/sglang/"
+            echo "    */python/sglang/"
+          } > /tmp/report-rc
+
+          # --keep preserves the per-test raw coverage files: the test
+          # case map and the published baseline read them directly.
+          COVERAGE_FILE=/tmp/.coverage-all \
+            python3 -m coverage combine --rcfile=/tmp/report-rc --keep \
+            $(find "${COV_ROOT}" -name 'coverage.*' -type f)
+
+          rm -rf "${REPORT_DIR}"
+          COVERAGE_FILE=/tmp/.coverage-all \
+            python3 -m coverage html --rcfile=/tmp/report-rc \
+            --directory="${REPORT_DIR}"
+
+          # Surface the total directly on the run page.
+          # GITHUB_STEP_SUMMARY may be unset on the k8s runner pool.
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             {
-              echo "[run]"
-              echo "branch = True"
-              echo "[paths]"
-              echo "sglang ="
-              echo "    ${COVSTUB}/sglang/"
-              echo "    */python/sglang/"
-            } > /tmp/report-rc
-
-            # --keep preserves the per-test raw coverage files: the test
-            # case map and the published baseline read them directly.
-            COVERAGE_FILE=/tmp/.coverage-all \
-              python3 -m coverage combine --rcfile=/tmp/report-rc --keep \
-              $(find "${COV_ROOT}" -name 'coverage.*' -type f)
-
-            rm -rf "${REPORT_DIR}"
-            COVERAGE_FILE=/tmp/.coverage-all \
-              python3 -m coverage html --rcfile=/tmp/report-rc \
-              --directory="${REPORT_DIR}"
-
-            # Surface the total directly on the run page.
-            # GITHUB_STEP_SUMMARY may be unset on the k8s runner pool.
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              {
-                echo "### Coverage"
-                echo '```'
-                COVERAGE_FILE=/tmp/.coverage-all \
-                  python3 -m coverage report --rcfile=/tmp/report-rc | tail -n 1
-                echo '```'
-                echo "Full line-by-line report: download the \`coverage-html-report\` artifact and open \`index.html\`."
-              } >> "${GITHUB_STEP_SUMMARY}"
-            fi
-          ); then
-            echo "::warning::HTML coverage report generation failed, continuing"
-            exit 0
+              echo "### Coverage"
+              echo '```'
+              COVERAGE_FILE=/tmp/.coverage-all \
+                python3 -m coverage report --rcfile=/tmp/report-rc | tail -n 1
+              echo '```'
+              echo "Full line-by-line report: download the \`coverage-html-report\` artifact and open \`index.html\`."
+            } >> "${GITHUB_STEP_SUMMARY}"
           fi
 
           echo "HTML coverage report: ${REPORT_DIR}"
