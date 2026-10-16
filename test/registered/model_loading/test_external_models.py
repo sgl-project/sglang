@@ -24,7 +24,8 @@ class TestExternalModels(CustomTestCase):
         engine = sgl.Engine(
             model_path=model_path,
             cuda_graph_max_bs_decode=1,
-            max_total_tokens=64,
+            # A few pages even where the default page size is 32.
+            max_total_tokens=256,
             enable_multimodal=True,
         )
         out = engine.generate(prompt)["text"]
