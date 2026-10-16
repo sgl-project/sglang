@@ -68,6 +68,7 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
+    moe_local_token_count: Optional[torch.Tensor] = None
 
     # Per-sequence FlashAttention tensors (shape [bs] or [bs + 1]).
     kv_len_prev_tensor: Optional[Any] = None
@@ -105,6 +106,18 @@ ContextParallelMetadata = ZigzagContextParallelMetadata
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
+
+    def moe_num_token_non_padded(self, forward_batch):
+        """Local MoE dispatch consumes the logical prefix of a padded shard."""
+        metadata = forward_batch.attn_cp_metadata
+        if metadata.moe_local_token_count is None:
+            lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            metadata.moe_local_token_count = torch.tensor(
+                lengths[self.cp_rank],
+                dtype=torch.int32,
+                device=forward_batch.input_ids.device,
+            )
+        return metadata.moe_local_token_count
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
@@ -353,10 +366,39 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             return torch.empty(0, device=device, dtype=torch.long)
         return torch.cat(pieces, dim=0)
 
+    def shard_per_request(self, extend_seqs_cpu: List[int], extend_seqs: Any):
+        # Q is early-all-requests followed by late-all-requests, not the two
+        # blocks of each request together. Keep repeated request IDs explicit.
+        q_lens, request_ids = [], []
+        for block in (self.cp_rank, 2 * self.cp_size - 1 - self.cp_rank):
+            for request, length in enumerate(extend_seqs_cpu):
+                base, remainder = divmod(int(length), 2 * self.cp_size)
+                count = base + int(block < remainder)
+                if count:
+                    q_lens.append(count)
+                    request_ids.append(request)
+        return (
+            q_lens,
+            extend_seqs.new_tensor(q_lens),
+            request_ids,
+            torch.tensor(request_ids, device=extend_seqs.device, dtype=torch.int32),
+        )
+
+    def materialize_full_indexer_k_cache(self, key: Any, forward_batch) -> Any:
+        return self.gather_kv_cache(key.contiguous(), forward_batch)
+
+    def all_gather_dsa_trtllm_fp8_kv(self, forward_batch, k: Any, k_rope: Any):
+        # Collectives must transport FP8 as bytes, preserving the packed payload.
+        widths = (k.shape[-1], k_rope.shape[-1])
+        payload = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
+        full = self.gather_kv_cache(payload.contiguous(), forward_batch).view(k.dtype)
+        return full.split(widths, dim=-1)
+
     def get_supported_attention_backend(self):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,
             CPAttentionBackendKind.TRTLLM_MHA,
+            CPAttentionBackendKind.DSA,
         ]
 
     def run_attention(

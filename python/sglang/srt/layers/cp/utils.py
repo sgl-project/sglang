@@ -230,7 +230,27 @@ def cp_interleave_input_ids(input_ids: Any, forward_batch):
     if not get_moe_a2a_backend().is_none():
         return cp_shard_hidden_states(input_ids, forward_batch)
 
-    physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    strategy = get_cp_strategy()
+    metadata = forward_batch.attn_cp_metadata
+    if strategy.kind == ContextParallelStrategyKind.ZIGZAG:
+        # The FFN gather keeps padded rank-major local rows. Input IDs used
+        # for routing must use that exact order rather than interleave strides.
+        import torch
+
+        chunks = torch.split(input_ids[: metadata.total_seq_lens], metadata.split_list)
+        rank_rows = []
+        block_count = 2 * strategy.cp_size
+        for rank, physical_len in enumerate(metadata.per_rank_actual_token):
+            chunk_ids = list(range(rank, len(chunks), block_count)) + list(
+                range(block_count - rank - 1, len(chunks), block_count)
+            )
+            rows = torch.cat([chunks[i] for i in chunk_ids])
+            rank_rows.append(
+                torch.cat((rows, rows.new_zeros(physical_len - len(rows))))
+            )
+        return torch.cat(rank_rows)
+
+    physical_tokens = sum(metadata.per_rank_actual_token)
     padded_input_ids = input_ids.new_zeros(physical_tokens)
     padded_input_ids[: input_ids.shape[0]] = input_ids
     return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
