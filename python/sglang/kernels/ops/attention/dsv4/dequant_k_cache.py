@@ -569,26 +569,3 @@ def dequantize_k_cache_paged_ref(
     out[:, 0, :DIM_NOPE] = nope.to(torch.bfloat16)
     out[:, 0, DIM_NOPE:] = rope
     return out
-
-
-def gather_dequant_requant_fp8_paged_ref(
-    quant_k_cache: torch.Tensor,
-    page_table_1_flattened: torch.Tensor,
-    page_size: int,
-    extra_rows: int = 0,
-) -> torch.Tensor:
-    """Torch reference for :func:`gather_dequant_requant_fp8_paged`."""
-    active = dequantize_k_cache_paged_ref(
-        quant_k_cache,
-        page_table_1_flattened,
-        page_size,
-    ).to(fp8_dtype)
-    if extra_rows == 0:
-        return active
-    out = torch.zeros(
-        (active.shape[0] + extra_rows, 1, DIM_NOPE + DIM_ROPE),
-        dtype=fp8_dtype,
-        device=active.device,
-    )
-    out[: active.shape[0]] = active
-    return out
