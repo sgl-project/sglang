@@ -114,11 +114,39 @@ if _use_aiter:
 
     if is_gfx1250_supported():
         from aiter.ops.triton.normalization.rmsnorm import (
-            rms_norm,
+            rms_norm as _aiter_triton_rms_norm,
         )
         from aiter.ops.triton.normalization.rmsnorm import (
-            rmsnorm2d_fwd_with_add as fused_add_rms_norm,
+            rmsnorm2d_fwd_with_add as _aiter_triton_fused_add_rms_norm,
         )
+
+        from sglang.srt.utils.custom_op import register_custom_op
+
+        # These are Python-level Triton launchers. Traced by torch.compile they
+        # specialize on min(num_tokens, num_SMs), recompiling per token count and
+        # giving wrong results; as custom ops they stay opaque.
+        @register_custom_op(op_name="aiter_triton_rms_norm", out_shape=0)
+        def rms_norm(
+            x: torch.Tensor, weight: torch.Tensor, epsilon: float
+        ) -> torch.Tensor:
+            return _aiter_triton_rms_norm(x, weight, epsilon)
+
+        @register_custom_op(
+            op_name="aiter_triton_fused_add_rms_norm",
+            mutates_args=["out", "residual_out"],
+        )
+        def fused_add_rms_norm(
+            out: torch.Tensor,
+            x: torch.Tensor,
+            residual: torch.Tensor,
+            residual_out: torch.Tensor,
+            weight: torch.Tensor,
+            epsilon: float,
+        ) -> None:
+            _aiter_triton_fused_add_rms_norm(
+                out, x, residual, residual_out, weight, epsilon
+            )
+
     else:
         from aiter import rmsnorm2d_fwd as rms_norm
         from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
