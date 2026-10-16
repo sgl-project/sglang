@@ -166,9 +166,6 @@ class MambaAttnBackendBase(AttentionBackend):
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
-        # Build the metadata from the logical mode. This handles the case where
-        # DP may treat a decode batch as a 1-token extend batch but linear
-        # attention still needs to handle it as decode.
         logical_mode = forward_batch.logical_forward_mode
 
         retrieve_next_token = None
