@@ -6,6 +6,7 @@ compressed the body with zstd sets the `x-body-compressed: zstd` header.
 """
 
 import asyncio
+import functools
 import io
 import logging
 
@@ -15,9 +16,19 @@ from starlette.datastructures import Headers
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_DECOMPRESSED_BODY_SIZE = 64 * 1024 * 1024
 
-def _zstd_decompress(raw: bytes) -> bytes:
-    return zstandard.ZstdDecompressor().stream_reader(io.BytesIO(raw)).read()
+
+class DecompressedBodyTooLarge(Exception):
+    pass
+
+
+def _zstd_decompress(raw: bytes, max_output_size: int) -> bytes:
+    with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(raw)) as reader:
+        body = reader.read(max_output_size + 1)
+    if len(body) > max_output_size:
+        raise DecompressedBodyTooLarge
+    return body
 
 
 _DECOMPRESSORS = {"zstd": _zstd_decompress}
@@ -37,8 +48,11 @@ def _rewrite_headers(headers, new_len):
 class RequestDecompressionMiddleware:
     """Decompress request body per request header `x-body-compressed`."""
 
-    def __init__(self, app):
+    def __init__(
+        self, app, max_decompressed_body_size=DEFAULT_MAX_DECOMPRESSED_BODY_SIZE
+    ):
         self.app = app
+        self.max_decompressed_body_size = max_decompressed_body_size
 
     async def __call__(self, scope, receive, send):
         # No-op passthrough for any request without the compression header.
@@ -71,7 +85,14 @@ class RequestDecompressionMiddleware:
         # Decompress off the event loop by releasing the GIL around the C decompress.
         try:
             loop = asyncio.get_running_loop()
-            body = await loop.run_in_executor(None, decompress, body)
+            body = await loop.run_in_executor(
+                None,
+                functools.partial(decompress, body, self.max_decompressed_body_size),
+            )
+        except DecompressedBodyTooLarge:
+            return await Response(
+                "decompressed request body too large", status_code=413
+            )(scope, receive, send)
         except Exception as e:
             logger.warning("request body decompress failed: %s", e)
             return await Response("decompress failed", status_code=400)(
