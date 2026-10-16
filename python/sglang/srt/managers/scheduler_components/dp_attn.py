@@ -32,6 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
+from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
@@ -534,6 +535,11 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob = num_tokens
     else:
         num_tokens = local_batch.extend_num_tokens
+        if (
+            local_batch.encoder_swa_reset is not None
+            and model_runner.attn_backend.folds_encoder_swa_replay
+        ):
+            num_tokens += folded_replay_rows(local_batch)
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
