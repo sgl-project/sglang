@@ -55,7 +55,13 @@ def _tile_topk(
         other=-float("inf"),
     ).to(tl.float32)
     index = tl.where(column < COLS, column.to(tl.uint32), 0xFFFFFFFF).to(tl.uint32)
-    best = tl.topk(_keys(value, index), KP, descending=True)
+    keys = _keys(value, index)
+    # Triton's topk(k=1) can collapse to a scalar and fail its final reshape.
+    # The maximum ordered key is exactly Top-1, including our tie-ID ordering.
+    if KP == 1:
+        best = tl.max(keys, 0)[None]
+    else:
+        best = tl.topk(keys, KP, descending=True)
     slots = tl.arange(0, KP)
     tl.store(
         candidates + (row * TILES + tile) * KP + slots, best.to(tl.int64, bitcast=True)
@@ -82,7 +88,10 @@ def _merge_local(
         tl.uint64, bitcast=True
     )
     key = tl.where(lane < TILES * KP, key, sentinel)
-    best = tl.topk(key, KP, descending=True)
+    if KP == 1:
+        best = tl.max(key, 0)[None]
+    else:
+        best = tl.topk(key, KP, descending=True)
     slot = tl.arange(0, KP)
     tl.store(out_values + row * K + slot, _values(best), slot < K)
     ids = (0xFFFFFFFF - (best & 0xFFFFFFFF).to(tl.uint32)).to(tl.int64)

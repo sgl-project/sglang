@@ -47,14 +47,29 @@ def test_strides_ties_and_chunk_consistency():
 
 
 def test_resource_fallback():
+    assert not can_use_local_topk(torch.empty((1, 37984), device="cuda"), 33)
     assert not can_use_local_topk(torch.empty((1, 131073), device="cuda"), 32)
     assert not can_use_local_topk(torch.empty((1, 10), device="cuda"), 11)
     assert not can_use_local_topk(torch.empty((0, 10), device="cuda"), 5)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("rows,cols", [(128, 37984), (7, 2051), (1, 1)])
+def test_top_one(dtype, rows, cols):
+    torch.manual_seed(314159)
+    x = torch.randn((rows, cols), dtype=dtype, device="cuda")
+    maximum, log_sum, values, indices = local_logsumexp_topk(x, 1)
+    reference_max, reference_sum = compute_row_log_normalizer(x)
+    torch.testing.assert_close(maximum, reference_max, atol=0, rtol=0)
+    torch.testing.assert_close(log_sum, reference_sum, atol=0, rtol=0)
+    torch.testing.assert_close(values, x.topk(1, dim=-1).values.float(), atol=0, rtol=0)
+    torch.testing.assert_close(values, x.gather(1, indices).float(), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("cols", [4096, 37984])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_nonfinite_cuda_contract(cols, dtype):
+@pytest.mark.parametrize("k", [1, 20])
+def test_nonfinite_cuda_contract(cols, dtype, k):
     x = torch.zeros((7, cols), device="cuda", dtype=dtype)
     x[0].fill_(float("-inf"))
     x[1].fill_(float("inf"))
@@ -63,12 +78,12 @@ def test_nonfinite_cuda_contract(cols, dtype):
     x[4, -1] = float("nan")
     x[5, 0], x[5, 2050] = float("inf"), float("nan")
     x[6].fill_(float("nan"))
-    actual = local_logsumexp_topk(x, 20)
+    actual = local_logsumexp_topk(x, k)
     reference = compute_row_log_normalizer(x)
     for a, b in zip(actual[:2], reference):
         torch.testing.assert_close(a, b, atol=0, rtol=0, equal_nan=True)
     torch.testing.assert_close(
-        actual[2], x.topk(20, dim=-1).values.float(), atol=0, rtol=0, equal_nan=True
+        actual[2], x.topk(k, dim=-1).values.float(), atol=0, rtol=0, equal_nan=True
     )
     torch.testing.assert_close(
         actual[2], x.gather(1, actual[3]).float(), atol=0, rtol=0, equal_nan=True
