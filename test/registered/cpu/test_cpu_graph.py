@@ -118,6 +118,68 @@ class TestCPUGraph(CustomTestCase):
         mr.prefill_attention_backend_str = "torch_native"
         self.assertFalse(mr._uses_cpu_graph_attention_backend())
 
+    def test_cpu_graph_boundary_patch_is_reentrant_and_restores(self):
+        import msgspec.structs
+
+        import sglang.srt.layers.layer_boundary.residual.stream as stream_mod
+        from sglang.srt.layers.layer_boundary import exit as exit_mod
+        from sglang.srt.layers.layer_boundary import output as output_mod
+        from sglang.srt.layers.layer_boundary import prepare as prepare_mod
+        from sglang.srt.layers.layer_boundary import stage as stage_mod
+        from sglang.srt.layers.layer_boundary.fusions import allreduce as allreduce_mod
+        from sglang.srt.layers.layer_boundary.fusions import cutedsl as cutedsl_mod
+        from sglang.srt.layers.layer_boundary.residual import access as access_mod
+
+        patched_refs = [
+            (stream_mod, "Contribution", "_DynamoCompatibleContribution"),
+            (stream_mod, "DeclaredSum", "_DynamoCompatibleDeclaredSum"),
+            (prepare_mod, "DeclaredSum", "_DynamoCompatibleDeclaredSum"),
+            (stage_mod, "DeclaredSum", "_DynamoCompatibleDeclaredSum"),
+            (stream_mod, "OwedOutput", "_DynamoCompatibleOwedOutput"),
+            (access_mod, "OwedOutput", "_DynamoCompatibleOwedOutput"),
+            (exit_mod, "ExitDecision", "_DynamoCompatibleExitDecision"),
+            (stream_mod, "UnreducedOutput", "_DynamoCompatibleUnreducedOutput"),
+            (prepare_mod, "UnreducedOutput", "_DynamoCompatibleUnreducedOutput"),
+            (access_mod, "UnreducedOutput", "_DynamoCompatibleUnreducedOutput"),
+            (exit_mod, "UnreducedOutput", "_DynamoCompatibleUnreducedOutput"),
+            (output_mod, "UnreducedOutput", "_DynamoCompatibleUnreducedOutput"),
+            (allreduce_mod, "UnreducedOutput", "_DynamoCompatibleUnreducedOutput"),
+            (cutedsl_mod, "UnreducedOutput", "_DynamoCompatibleUnreducedOutput"),
+        ]
+        original_refs = [
+            (module, name, getattr(module, name)) for module, name, _ in patched_refs
+        ]
+        original_replace = msgspec.structs.replace
+
+        with cpu_graph_runner_module.cpu_graph_patch_boundary_classes():
+            capture_refs = [getattr(module, name) for module, name, _ in patched_refs]
+            for (module, name, expected_name), actual in zip(
+                patched_refs, capture_refs
+            ):
+                self.assertIs(
+                    actual,
+                    getattr(cpu_graph_runner_module, expected_name),
+                    f"unexpected patched class for {module.__name__}.{name}",
+                )
+
+            with cpu_graph_runner_module.cpu_graph_patch_boundary_classes():
+                nested_refs = [
+                    getattr(module, name) for module, name, _ in patched_refs
+                ]
+                self.assertEqual(capture_refs, nested_refs)
+
+        self.assertIs(msgspec.structs.replace, original_replace)
+        for module, name, original in original_refs:
+            self.assertIs(getattr(module, name), original)
+
+        with cpu_graph_runner_module.cpu_graph_patch_boundary_classes():
+            replay_refs = [getattr(module, name) for module, name, _ in patched_refs]
+            self.assertEqual(capture_refs, replay_refs)
+
+        self.assertIs(msgspec.structs.replace, original_replace)
+        for module, name, original in original_refs:
+            self.assertIs(getattr(module, name), original)
+
     def test_prefill_graph_dispatches_inner_language_model(self):
         class ToyLanguageModel(torch.nn.Module):
             def __init__(self):
