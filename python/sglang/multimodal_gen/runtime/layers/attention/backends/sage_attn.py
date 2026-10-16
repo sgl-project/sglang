@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+from functools import lru_cache
+
 import torch
-from sageattention import sageattn
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
@@ -14,8 +15,21 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
+
+
+@torch.compiler.disable
+@lru_cache(maxsize=4)
+def _trtllm_gen_workspace(device_index: int) -> torch.Tensor:
+    # The TRT-LLM Gen ragged FMHA API takes caller-owned workspace. Reuse one
+    # buffer because diffusion invokes the same attention shape many times.
+    # compiler.disable is required: Dynamo traces through lru_cache and would
+    # otherwise replay this memset on every compiled denoise step.
+    return torch.zeros(
+        256 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{device_index}"
+    )
 
 
 class SageAttentionBackend(AttentionBackend):
@@ -66,16 +80,114 @@ class SageAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
-        output = sageattn(
-            query,
-            key,
-            value,
-            # since input is (batch_size, seq_len, head_num, head_dim)
-            tensor_layout="NHD",
-            is_causal=self.causal,
-            sm_scale=self.softmax_scale,
-            return_lse=return_softmax_lse,
-        )
+        if envs.SGLANG_USE_SAGE_ATTENTION_IMPL.get().lower() in {
+            "trtllm_gen",
+            "trtllm-gen",
+        }:
+            if return_softmax_lse:
+                raise NotImplementedError(
+                    "TRT-LLM Gen Sage attention does not return the diffusion backend's LSE layout"
+                )
+            if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+                raise ValueError(
+                    "TRT-LLM Gen Sage attention expects dense [batch, sequence, heads, dim] Q/K/V"
+                )
+            batch, q_len, num_heads, head_dim = query.shape
+            kv_batch, kv_len, kv_heads, kv_dim = key.shape
+            if value.shape != key.shape or kv_batch != batch or kv_heads != num_heads:
+                raise ValueError(
+                    "TRT-LLM Gen Sage attention requires matching dense Q/K/V batches and heads"
+                )
+            if head_dim != kv_dim or query.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "TRT-LLM Gen Sage attention requires matching FP16/BF16 head dimensions"
+                )
+
+            from flashinfer.prefill import (
+                trtllm_ragged_attention_deepseek,
+                trtllm_sage_attention_quantize,
+            )
+
+            query_thd = query.contiguous().view(batch * q_len, num_heads, head_dim)
+            key_thd = key.contiguous().view(batch * kv_len, num_heads, head_dim)
+            value_thd = value.contiguous().view(batch * kv_len, num_heads, head_dim)
+            device_index = query.device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            from sglang.multimodal_gen.runtime.managers.forward_context import (
+                get_forward_context,
+            )
+
+            (
+                qo_indptr,
+                kv_indptr,
+                seq_lens,
+            ) = get_forward_context().get_trtllm_gen_sequence_metadata(
+                device_index, batch, q_len, kv_len
+            )
+            q_int8, k_int8, v_fp8, q_sf, k_sf, v_sf = trtllm_sage_attention_quantize(
+                query_thd,
+                key_thd,
+                value_thd,
+                q_block_size=1,
+                k_block_size=16,
+                qk_quant_dtype=torch.int8,
+                cum_seq_lens_q=qo_indptr,
+                cum_seq_lens_kv=kv_indptr,
+            )[:6]
+            output = trtllm_ragged_attention_deepseek(
+                q_int8,
+                k_int8,
+                v_fp8,
+                _trtllm_gen_workspace(device_index),
+                seq_lens,
+                q_len,
+                kv_len,
+                self.softmax_scale,
+                1.0,
+                -1.0,
+                batch,
+                -1,
+                qo_indptr,
+                kv_indptr,
+                False,
+                self.causal,
+                False,
+                sage_attn_sfs=(q_sf, k_sf, None, v_sf),
+                num_elts_per_sage_attn_blk=(1, 16, 0, 1),
+            )
+            logger.info_once("Using FlashInfer TRT-LLM Gen Sage attention")
+            return output.view(batch, q_len, num_heads, head_dim)
+
+        # SageAttention's public dispatcher does not yet select its FP8-PV
+        # kernel on sm100. The FP8 CUDA kernel is compiled for Blackwell and
+        # supports the same NHD layout used by this backend.
+        if query.is_cuda and torch.cuda.get_device_capability(query.device)[0] == 10:
+            from sageattention import sageattn_qk_int8_pv_fp8_cuda
+
+            output = sageattn_qk_int8_pv_fp8_cuda(
+                query,
+                key,
+                value,
+                tensor_layout="NHD",
+                is_causal=self.causal,
+                sm_scale=self.softmax_scale,
+                return_lse=return_softmax_lse,
+                pv_accum_dtype="fp32+fp16",
+            )
+        else:
+            from sageattention import sageattn
+
+            output = sageattn(
+                query,
+                key,
+                value,
+                # since input is (batch_size, seq_len, head_num, head_dim)
+                tensor_layout="NHD",
+                is_causal=self.causal,
+                sm_scale=self.softmax_scale,
+                return_lse=return_softmax_lse,
+            )
         if return_softmax_lse:
             output, softmax_lse = output
             return output, softmax_lse

@@ -36,7 +36,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NormQuantReadout,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.utils.common import make_layers
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -887,6 +887,52 @@ class TestUnpaddedBatches(CustomTestCase):
             with layer_stack():
                 return [s for _ in range(2) for s in layer(sparse=sparse)]
 
+    def test_explicit_full_row_ffn_does_not_bind_an_unused_unpadded_path(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1, attn_tp=2, disable_attn_tp_gather=True, moe_dense_tp_size=1
+        )
+        with fixture.planning(parallel):
+            with layer_stack():
+                attention, ffn = append_stages(
+                    (declare_attn(), fixture.Norm()),
+                    (declare_ffn(dense_tp_size=2), fixture.Norm()),
+                )
+            batch = SimpleNamespace(
+                input_ids=torch.ones(3),
+                forward_mode=ForwardMode.EXTEND,
+                attn_cp_metadata=None,
+            )
+            for stage in (attention, ffn):
+                self.assertEqual(set(stage.plan.paths), {BatchVariant.ORDINARY})
+                self.assertIs(stage.plan.variant_for(batch), BatchVariant.ORDINARY)
+        self.assertTrue(parallel.disable_attn_tp_gather)
+
+    def test_rank_row_pipeline_neighbour_keeps_the_unpadded_variant(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=2,
+            pp_size=2,
+            disable_attn_tp_gather=True,
+            moe_dense_tp_size=1,
+        )
+        for direction in ("previous_layers", "next_layers"):
+            with self.subTest(direction=direction), fixture.planning(parallel):
+                with layer_stack(
+                    **{direction: [lambda: (declare_ffn(dense_tp_size=1),)]}
+                ):
+                    attention, ffn = append_stages(
+                        (declare_attn(), fixture.Norm()),
+                        (declare_ffn(dense_tp_size=2), fixture.Norm()),
+                    )
+                batch = SimpleNamespace(
+                    input_ids=torch.ones(3),
+                    forward_mode=ForwardMode.EXTEND,
+                    attn_cp_metadata=None,
+                )
+                for stage in (attention, ffn):
+                    self.assertIn(BatchVariant.UNPADDED, stage.plan.paths)
+                    self.assertIs(stage.plan.variant_for(batch), BatchVariant.UNPADDED)
+
     def test_an_unpadded_batch_keeps_the_attention_rows(self):
         for sparse in (True, False):
             with self.subTest(sparse=sparse):
@@ -1032,6 +1078,9 @@ class TestRowsTheConsumerReads(CustomTestCase):
         class Scaled:
             """Neither a plain add nor applied at the producer's exit."""
 
+            bind = None
+            replay_update = None
+
             is_plain_add = False
             applied_at_exit = False
             outlives_layer = True
@@ -1119,6 +1168,10 @@ class TestReadKernels(CustomTestCase):
                 return "boundary", residual
 
         class Update:
+            bind = None
+            replay_update = None
+            is_plain_add = True
+
             def slice_residual_attn_tp(self, residual):
                 return residual[:2]
 
