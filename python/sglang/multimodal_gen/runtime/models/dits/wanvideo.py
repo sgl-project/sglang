@@ -77,6 +77,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
