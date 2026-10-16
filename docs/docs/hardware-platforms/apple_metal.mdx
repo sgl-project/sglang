@@ -34,6 +34,16 @@ Verify the compiler with `xcrun -sdk macosx metal --version`.
 
 You can install SGLang using one of the methods below.
 
+<Warning>
+Do **not** install from the default CUDA `python/pyproject.toml` on Apple Silicon.
+That file depends on Linux-only wheels such as `sgl-deep-ep`, so
+`uv pip install -e python/` fails to resolve on macOS ARM (or forces a
+hand-assembled environment that drifts off the pinned dependency set).
+
+Always swap in `python/pyproject_other.toml` and install an MPS extra
+(`srt_mps`, `all_mps`, or `dev_mps`).
+</Warning>
+
 ### Install from Source
 
 ```bash
@@ -41,18 +51,39 @@ You can install SGLang using one of the methods below.
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
-# Create and activate a virtual environment
+# Create and activate a virtual environment (Python 3.12; CI also uses 3.11)
+# Do not use bleeding-edge CPython (for example 3.14) for this install.
 uv venv -p 3.12 sglang-metal
 source sglang-metal/bin/activate
 
-# (Optional) Compile sgl-kernel
+# (Optional) Compile sgl-kernel — requires the full Xcode Metal toolchain
 uv pip install --upgrade pip
 uv run python/sglang/kernels/aot/setup_metal.py install
 
-# Install sglang python package along with diffusion support
+# Required: use the non-CUDA packaging file
 rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-uv pip install -e "python[all_mps]"
+
+# Runtime + MLX only (matches the MLX CI unit job):
+uv pip install -e "python[srt_mps,test]"
+
+# Or runtime + diffusion extras:
+# uv pip install -e "python[all_mps]"
 ```
+
+### Verify the install
+
+```bash
+python -c "import transformers, mlx.core as mx, torch, sglang; \
+print('transformers', transformers.__version__); \
+print('mlx', mx.__version__); \
+print('torch', torch.__version__)"
+```
+
+Expect `transformers==5.12.1`, stable `torch==2.13.x`, and `mlx>=0.32.0`.
+If `transformers` reports a `4.x` version, config imports fail with
+`ImportError: cannot import name 'PreTrainedConfig'` — reinstall from
+`pyproject_other.toml` with the `srt_mps` extra rather than upgrading
+individual packages ad hoc.
 
 ## Launch of the Serving Engine
 
