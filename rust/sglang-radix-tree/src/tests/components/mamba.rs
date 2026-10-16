@@ -64,6 +64,7 @@ fn insert_params_mamba<'k>(
         namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: mamba_slot.map(|slot| Tensor::from_slice(&[slot])),
+        mamba_host_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -643,6 +644,62 @@ fn tombstone_refill_moves_the_node_from_host_to_device_lru() {
 fn insert_without_a_mamba_value_panics() {
     let mut tc = mamba_core(/* page_size = */ 1);
     tc.insert(&insert_params_mamba(&vec![1], &[10], None));
+}
+
+#[test]
+fn insert_host_only_checkpoint_keeps_no_gpu_slot() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    let key = vec![1, 2];
+    let mut params = insert_params_mamba(&key, &[10, 11], None);
+    params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
+    let result = tc.insert(&params);
+    assert!(!result.mamba_exist);
+    let leaf = tc
+        .arena
+        .resolve(result.last_device_node_id.expect("inserted leaf"))
+        .expect("live leaf");
+    assert!(tc.arena.node(leaf).try_device_value(MAMBA).is_none());
+    assert!(
+        tc.arena
+            .node(leaf)
+            .try_host_value(MAMBA)
+            .expect("host checkpoint")
+            .equal(&Tensor::from_slice(&[42i64]))
+    );
+    assert!(tc.host_lru_list(MAMBA).in_list(Some(leaf)));
+    let matched = tc.match_prefix(&match_params(&key));
+    assert_eq!(matched.best_match_node_id, tc.arena.node(leaf).id);
+    assert_eq!(matched.last_device_node_id, tc.arena.node(tc.arena.root()).id);
+    assert_eq!(matched.mamba_host_hit_length, 1);
+}
+
+#[test]
+fn host_only_checkpoint_keeps_the_device_kv_prefix() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(1),
+            mamba_host_only_checkpoint: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![1, 2];
+    let mut params = insert_params_mamba(&key, &[10, 11], None);
+    params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
+    tc.insert(&params);
+    let matched = tc.match_prefix(&match_params(&key));
+    let leaf = tc
+        .arena
+        .resolve(matched.last_device_node_id)
+        .expect("device prefix leaf");
+    assert_eq!(matched.best_match_node_id, tc.arena.node(leaf).id);
+    assert_eq!(matched.device_prefix_len, key.len());
+    assert!(tc.arena.node(leaf).try_device_value(MAMBA).is_none());
+    assert!(tc.arena.node(leaf).has_host_value(MAMBA));
+    assert!(matched.mamba_host_hit_length >= 1);
 }
 
 #[test]
