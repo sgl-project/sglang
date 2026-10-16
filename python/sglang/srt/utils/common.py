@@ -911,11 +911,13 @@ def get_free_cpu_memory() -> int:
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+        logger.warning(
+            "SGLANG_CPU_OMP_THREADS_BIND is set for explicit control of CPU cores for each TP rank."
+            "Please beware that in this case the available memory amounts of the ranks cannot be determined in prior."
+            "You need to set proper --max-total-tokens to avoid the out-of-memory error."
+        )
         return None
-    n_numa_node: int = len(get_cpu_ids_by_node())
-    if n_numa_node == 0:
-        # Avoid ZeroDivisionError in case NUMA config cannot be determined
-        n_numa_node = 1
+    n_numa_node = len(get_cpu_ids_by_node()) or 1
     total_cpu_memory = psutil.virtual_memory().total
     instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
     if instance_max_cpu_memory is not None:
@@ -4604,12 +4606,12 @@ def get_physical_cpus_by_numa():
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index
-    cpu_ids = [
-        ",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)
-    ]
-
     # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
-    return cpu_ids
+    return [
+        ",".join(map(str, sorted(cpus)))
+        for _, cpus in sorted(node_to_cpus.items())
+        if cpus
+    ]
 
 
 def is_shm_available(dtype, world_size, local_size):
