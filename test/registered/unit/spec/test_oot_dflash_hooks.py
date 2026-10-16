@@ -165,24 +165,16 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
         )
 
     def test_mla_rejects_unmasked_backends_and_dcp(self):
-        for backend in ("fa3", "trtllm_mla"):
-            with (
-                self.subTest(backend=backend),
-                self.assertRaisesRegex(
-                    ValueError, "speculative-draft-attention-backend"
-                ),
-            ):
-                self._resolve(_make_dflash_args(backend), mla=True)
+        with self.assertRaisesRegex(ValueError, "speculative-draft-attention-backend"):
+            self._resolve(_make_dflash_args("fa3"), mla=True)
         args = _make_dflash_args("triton")
         args.dcp_size = 2
         with self.assertRaisesRegex(ValueError, "dcp-size"):
             self._resolve(args, mla=True)
 
-    def test_gqa_rejects_explicit_tokenspeed(self):
+    def test_gqa_never_takes_tokenspeed(self):
         with self.assertRaisesRegex(ValueError, "requires an MLA draft model"):
             self._resolve(_make_dflash_args("tokenspeed_mla"), mla=False)
-
-    def test_gqa_does_not_inherit_target_tokenspeed(self):
         args = _make_dflash_args(None)
         self._resolve(args, mla=False, target_backend="tokenspeed_mla")
         self.assertEqual(

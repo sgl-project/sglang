@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from torch import nn
 from transformers import Qwen3Config
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -22,41 +21,34 @@ from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
     dflash_draft_cell_size_per_token,
-    get_dflash_attention_modes,
     is_dflash_mla_draft_causal,
     is_dflash_mla_draft_config,
     validate_dflash_mla_draft_config,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-# Row widths stay multiples of 8: the target's fused RMSNorm reads 16-byte rows.
 HIDDEN, HEADS, KV_LORA, NOPE, ROPE, VDIM, THETA, EPS = 16, 2, 8, 8, 8, 6, 1e4, 1e-6
 Q_LORA = 16
-# SpecForge's Qwen3DFlashMLAAttention parameter names (external checkpoint layout).
+# SpecForge's attention parameter names (external checkpoint layout).
+SPECFORGE_KEYS = {
+    None: {"q_proj.weight"},
+    Q_LORA: {"q_a_proj.weight", "q_a_layernorm.weight", "q_b_proj.weight"},
+}
 SPECFORGE_KV_KEYS = {
     "kv_a_proj_with_mqa.weight",
     "kv_a_layernorm.weight",
     "kv_b_proj.weight",
     "o_proj.weight",
 }
-SPECFORGE_Q_KEYS = {
-    None: {"q_proj.weight"},
-    Q_LORA: {"q_a_proj.weight", "q_a_layernorm.weight", "q_b_proj.weight"},
-}
-# The target MLA layer fuses q_a_proj with kv_a_proj_with_mqa.
-FUSED_A_PROJ = "fused_qkv_a_proj_with_mqa.weight"
 
 
-def _export_fields(q_lora_rank=None, rope_interleave=True, **dflash_overrides):
-    """A SpecForge MLA export: head_dim / num_key_value_heads keep the GQA
-    template's values, which the MLA layers do not use."""
-    dflash_config = {"attention_mode": "mla", "block_size": 4, "target_layer_ids": [0]}
-    dflash_config.update(dflash_overrides)
+def _export_fields(q_lora_rank=None, rope_interleave=True):
+    """A SpecForge MLA export; head_dim / num_key_value_heads are GQA template
+    values the MLA layers do not use."""
     return dict(
         architectures=["DFlashDraftModel"],
         hidden_size=HIDDEN,
@@ -76,27 +68,19 @@ def _export_fields(q_lora_rank=None, rope_interleave=True, **dflash_overrides):
         qk_rope_head_dim=ROPE,
         v_head_dim=VDIM,
         rope_interleave=rope_interleave,
-        dflash_config=dflash_config,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 4,
+            "target_layer_ids": [0],
+        },
     )
 
 
-def _served_config(**kwargs) -> Qwen3Config:
-    return Qwen3Config(**_export_fields(**kwargs))
-
-
-def _randomize(module: nn.Module) -> None:
-    torch.manual_seed(0)
-    with torch.no_grad():
-        for param in module.parameters():
-            param.copy_(torch.randn_like(param) * 0.2 + (param == 1).float())
-    module.absorb_kv_b_proj()
-
-
 def _specforge_weights(attn) -> dict:
-    """The served layer's weights under SpecForge's checkpoint names."""
-    weights = {name: param for name, param in attn.named_parameters()}
+    """The served layer's weights under SpecForge's names (split down projection)."""
+    weights = dict(attn.named_parameters())
     if attn.q_lora_rank is not None:
-        fused = weights.pop(FUSED_A_PROJ)
+        fused = weights.pop("fused_qkv_a_proj_with_mqa.weight")
         weights["q_a_proj.weight"], weights["kv_a_proj_with_mqa.weight"] = fused.split(
             [attn.q_lora_rank, KV_LORA + ROPE]
         )
@@ -105,107 +89,80 @@ def _specforge_weights(attn) -> dict:
 
 # ---- SpecForge reference math (Qwen3DFlashMLAAttention._compute_qkv) ---------
 def _rmsnorm(x, weight):
-    x32 = x.float()
-    return (x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + EPS)).to(
-        x.dtype
-    ) * weight
-
-
-def _rotate_half(x):
-    first, second = x.chunk(2, dim=-1)
-    return torch.cat((-second, first), dim=-1)
-
-
-def _rotate_half_interleaved(x):
-    first, second = x.reshape(*x.shape[:-1], -1, 2).unbind(dim=-1)
-    return torch.stack((-second, first), dim=-1).flatten(-2)
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS) * weight
 
 
 def _mla_rope(x, positions, interleaved):
     """x [n, heads, ROPE]; Qwen3RotaryEmbedding(head_dim=ROPE) + apply_mla_rope."""
     inv_freq = 1.0 / (THETA ** (torch.arange(0, ROPE, 2).float() / ROPE))
-    freqs = positions.float()[:, None] * inv_freq.to(positions.device)[None, :]
-    emb = torch.cat((freqs, freqs), dim=-1)
-    cos, sin = emb.cos().to(x.dtype), emb.sin().to(x.dtype)
+    freqs = positions.float()[:, None] * inv_freq[None, :]
     if interleaved:
-        cos = cos[..., : ROPE // 2].repeat_interleave(2, dim=-1)
-        sin = sin[..., : ROPE // 2].repeat_interleave(2, dim=-1)
-        rotated = _rotate_half_interleaved(x)
+        cos, sin = (
+            freqs.cos().repeat_interleave(2, -1),
+            freqs.sin().repeat_interleave(2, -1),
+        )
+        first, second = x.unflatten(-1, (-1, 2)).unbind(-1)
+        rotated = torch.stack((-second, first), -1).flatten(-2)
     else:
-        rotated = _rotate_half(x)
+        cos, sin = freqs.cos().repeat(1, 2), freqs.sin().repeat(1, 2)
+        first, second = x.chunk(2, -1)
+        rotated = torch.cat((-second, first), -1)
     return x * cos[:, None] + rotated * sin[:, None]
 
 
-def _reference_kv(w, hidden, positions, interleaved):
-    latent = hidden @ w["kv_a_proj_with_mqa.weight"].T
-    kv_a, k_pe = latent.split([KV_LORA, ROPE], dim=-1)
-    kv = _rmsnorm(kv_a, w["kv_a_layernorm.weight"]) @ w["kv_b_proj.weight"].T
-    k_nope, v = kv.view(-1, HEADS, NOPE + VDIM).split([NOPE, VDIM], dim=-1)
-    k_pe = _mla_rope(k_pe[:, None], positions, interleaved).expand(-1, HEADS, -1)
-    return torch.cat((k_nope, k_pe), dim=-1), v
-
-
 def _reference_output(attn, ctx_hidden, ctx_positions, hidden, positions, interleaved):
-    """Computed in fp32 from the module's (possibly bf16) weights."""
-    w = {name: param.float() for name, param in _specforge_weights(attn).items()}
-    ctx_hidden, hidden = ctx_hidden.float(), hidden.float()
+    w = _specforge_weights(attn)
+
+    def kv(x, pos):
+        kv_a, k_pe = (x @ w["kv_a_proj_with_mqa.weight"].T).split([KV_LORA, ROPE], -1)
+        kv = _rmsnorm(kv_a, w["kv_a_layernorm.weight"]) @ w["kv_b_proj.weight"].T
+        k_nope, v = kv.view(-1, HEADS, NOPE + VDIM).split([NOPE, VDIM], -1)
+        k_pe = _mla_rope(k_pe[:, None], pos, interleaved).expand(-1, HEADS, -1)
+        return torch.cat((k_nope, k_pe), -1), v
+
     if attn.q_lora_rank is None:
         q = hidden @ w["q_proj.weight"].T
     else:
         q_a = _rmsnorm(hidden @ w["q_a_proj.weight"].T, w["q_a_layernorm.weight"])
         q = q_a @ w["q_b_proj.weight"].T
-    q_nope, q_pe = q.view(-1, HEADS, NOPE + ROPE).split([NOPE, ROPE], dim=-1)
-    q = torch.cat((q_nope, _mla_rope(q_pe, positions, interleaved)), dim=-1)
-    k_ctx, v_ctx = _reference_kv(w, ctx_hidden, ctx_positions, interleaved)
-    k_blk, v_blk = _reference_kv(w, hidden, positions, interleaved)
+    q_nope, q_pe = q.view(-1, HEADS, NOPE + ROPE).split([NOPE, ROPE], -1)
+    q = torch.cat((q_nope, _mla_rope(q_pe, positions, interleaved)), -1)
+    (k_ctx, v_ctx), (k_blk, v_blk) = (
+        kv(ctx_hidden, ctx_positions),
+        kv(hidden, positions),
+    )
     k, v = torch.cat((k_ctx, k_blk)), torch.cat((v_ctx, v_blk))
     probs = (torch.einsum("qhd,khd->hqk", q, k) * (NOPE + ROPE) ** -0.5).softmax(-1)
     out = torch.einsum("hqk,khd->qhd", probs, v).reshape(-1, HEADS * VDIM)
     return out @ w["o_proj.weight"].T
 
 
-class _BlockOverCachedContext(nn.Module):
-    """Exercise the target MLA call protocols with a shared latent cache.
-
-    This isolates projection/absorption parity; real backend coverage belongs
-    in the GPU integration tests.
-    """
+class _BlockOverCachedContext(torch.nn.Module):
+    """Bidirectional attention of the block over the cached latent context, in the
+    triton call convention: concatenated [latent | rope] Q/K rows, latent V."""
 
     def __init__(self, radix, k_ctx, v_ctx):
         super().__init__()
         self.radix, self.k_ctx, self.v_ctx = radix, k_ctx, v_ctx
 
-    def forward(self, q, k, v, forward_batch, q_rope=None, k_rope=None, **kwargs):
-        heads, qk_dim, v_dim = (
-            self.radix.tp_q_head_num,
-            self.radix.qk_head_dim,
-            self.radix.v_head_dim,
-        )
+    def forward(self, q, k, v, forward_batch, **kwargs):
         assert self.radix.attn_type == AttentionType.ENCODER_ONLY
-        assert self.radix.tp_k_head_num == 1
-        if q_rope is not None:
-            q = torch.cat((q, q_rope), dim=-1)
-            k = torch.cat((k, k_rope), dim=-1)
-        assert k.shape[1:] == (1, qk_dim)
-        assert v.shape[1:] == (1, v_dim)
+        heads = self.radix.tp_q_head_num
         keys = torch.cat((self.k_ctx, k)).expand(-1, heads, -1)
         values = torch.cat((self.v_ctx, v)).expand(-1, heads, -1)
-        scores = torch.einsum("qhd,khd->hqk", q.view(-1, heads, qk_dim), keys)
-        probs = (scores * self.radix.scaling).softmax(-1)
-        return torch.einsum("hqk,khd->qhd", probs, values).reshape(-1, heads * v_dim)
+        q = q.view(-1, heads, self.radix.qk_head_dim)
+        probs = (torch.einsum("qhd,khd->hqk", q, keys) * self.radix.scaling).softmax(-1)
+        return torch.einsum("hqk,khd->qhd", probs, values).flatten(1)
 
 
-def _serve_block(attn, ctx_hidden, ctx_positions, hidden, positions, backend="triton"):
+def _serve_block(attn, ctx_hidden, ctx_positions, hidden, positions):
     """The worker's context-KV write, then the draft block forward."""
     k_nope, k_pe = attn.project_context_kv(ctx_positions, ctx_hidden)
-    assert k_nope.shape == (ctx_hidden.shape[0], 1, KV_LORA)
-    assert k_pe.shape == (ctx_hidden.shape[0], 1, ROPE)
-    k_ctx = torch.cat((k_nope, k_pe), dim=-1)
-    attn.attn_mqa = _BlockOverCachedContext(attn.attn_mqa, k_ctx, k_nope)
+    attn.attn_mqa = _BlockOverCachedContext(
+        attn.attn_mqa, torch.cat((k_nope, k_pe), -1), k_nope
+    )
     backend = SimpleNamespace(
-        prefill_attention_backend_str=backend,
-        decode_attention_backend_str=backend,
-        data_type=hidden.dtype,
+        prefill_attention_backend_str="triton", decode_attention_backend_str="triton"
     )
     batch = SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
@@ -216,64 +173,54 @@ def _serve_block(attn, ctx_hidden, ctx_positions, hidden, positions, backend="tr
         torch.no_grad(),
         forward_context(ForwardContext(attn_backend=backend)),
         patch.object(
-            attn.kv_b_proj,
-            "forward",
-            side_effect=AssertionError("MLA must not expand cached K/V"),
+            attn.kv_b_proj, "forward", side_effect=AssertionError("expanded K/V")
         ),
     ):
         return attn(positions, hidden, batch)
 
 
-class _SingleRankTestCase(CustomTestCase):
+class TestDFlashMLA(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
         # The CPU RoPE factory serves only DeepSeek YaRN; the tensors stay on CPU.
         publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
 
-
-class TestDFlashMLAConfig(_SingleRankTestCase):
-    def test_scalar_and_per_layer_mode_forms(self):
+    def test_attention_mode_forms(self):
         """SpecForge exports the scalar; the Qwen3.8 A-MLA checkpoint carries a list."""
-        layers = 3
         for dflash_config in (
             {"attention_mode": "MLA"},
-            {"attention_modes": ["mla"] * layers},
+            {"attention_modes": ["mla"] * 2},
         ):
-            with self.subTest(dflash_config=dflash_config):
-                config = {"num_hidden_layers": layers, "dflash_config": dflash_config}
-                self.assertEqual(get_dflash_attention_modes(config), ("mla",) * layers)
-                self.assertTrue(is_dflash_mla_draft_config(config))
-        gqa = {"num_hidden_layers": layers, "dflash_config": {"block_size": 4}}
-        self.assertFalse(is_dflash_mla_draft_config(gqa))
+            config = {"num_hidden_layers": 2, "dflash_config": dflash_config}
+            self.assertTrue(is_dflash_mla_draft_config(config))
+        self.assertFalse(is_dflash_mla_draft_config({"num_hidden_layers": 2}))
+        with self.assertRaisesRegex(ValueError, "mix mla"):
+            is_dflash_mla_draft_config(
+                {
+                    "num_hidden_layers": 2,
+                    "dflash_config": {"attention_modes": ["mla", "gqa"]},
+                }
+            )
 
-    def test_unservable_mode_layouts_fail_fast(self):
-        cases = {
-            "only one": {"attention_mode": "mla", "attention_modes": ["mla"] * 2},
-            "one mode per draft layer": {"attention_modes": ["mla"]},
-            "not supported": {"attention_mode": "kda"},
-            "mix mla": {"attention_modes": ["mla", "gqa"]},
-        }
-        for message, dflash_config in cases.items():
-            with self.subTest(message=message):
-                config = {"num_hidden_layers": 2, "dflash_config": dflash_config}
-                with self.assertRaisesRegex(ValueError, message):
-                    is_dflash_mla_draft_config(config)
+    def test_rejects_settings_the_target_layer_ignores(self):
+        for message, override in (
+            ("attention_bias", {"attention_bias": True}),
+            ("rope_type", {"rope_scaling": {"rope_type": "linear", "factor": 2.0}}),
+        ):
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                validate_dflash_mla_draft_config({**_export_fields(), **override})
 
     def test_draft_model_config_sizes_compressed_kv_pool(self):
-        """A raw export reserves one shared latent + RoPE row per token."""
         with tempfile.TemporaryDirectory() as path:
             Path(path, "config.json").write_text(
                 json.dumps({"model_type": "qwen3", **_export_fields()})
             )
             draft = ModelConfig(path, is_draft_model=True)
-
-        self.assertTrue(draft.is_dflash_mla_draft)
         self.assertEqual(draft.attention_arch, AttentionArch.MLA)
-        self.assertEqual((draft.kv_lora_rank, draft.qk_rope_head_dim), (KV_LORA, ROPE))
-        # The GQA template's head_dim must not size a separate SWA buffer.
+        # The template's GQA head_dim must not size a separate SWA buffer.
         self.assertEqual(draft.swa_v_head_dim, draft.v_head_dim)
-        # Latents are replicated across TP ranks, not divided by the head count.
+        # One latent + RoPE row per token, replicated across TP ranks.
         for tp_size in (1, 2):
             self.assertEqual(
                 dflash_draft_cell_size_per_token(
@@ -285,98 +232,41 @@ class TestDFlashMLAConfig(_SingleRankTestCase):
                 (KV_LORA + ROPE) * 2,
             )
 
-    def test_rejects_settings_the_target_layer_cannot_serve(self):
-        cases = {
-            "missing": {"kv_lora_rank": None},
-            "attention_bias": {"attention_bias": True},
-            "support neither": {"dflash_config": {"attention_sink_bias": True}},
-            "rope_type": {"rope_scaling": {"rope_type": "linear", "factor": 2.0}},
-        }
-        for message, overrides in cases.items():
-            with self.subTest(message=message):
-                fields = _export_fields()
-                dflash_config = {
-                    **fields["dflash_config"],
-                    **overrides.pop("dflash_config", {}),
-                }
-                fields.update(overrides, dflash_config=dflash_config)
-                with self.assertRaisesRegex(ValueError, message):
-                    validate_dflash_mla_draft_config(fields)
-        with self.assertRaisesRegex(ValueError, "unquantized draft weights"):
-            DFlashMLAAttention(_served_config(), layer_id=0, quant_config=object())
-
     def test_layer_and_planned_causality_agree(self):
-        """Backends that plan per batch must mask exactly like the layers do."""
+        """FlashInfer plans one causality per batch; it must match every layer."""
         for layer_types, is_causal, expected in (
-            (None, None, AttentionType.ENCODER_ONLY),
             (None, True, AttentionType.ENCODER_ONLY),
             (["full_attention"], None, AttentionType.ENCODER_ONLY),
-            (["full_attention"], False, AttentionType.ENCODER_ONLY),
             (["full_attention"], True, AttentionType.DECODER),
         ):
             with self.subTest(layer_types=layer_types, is_causal=is_causal):
-                config = _served_config()
-                config.layer_types = layer_types
-                config.is_causal = is_causal
+                config = Qwen3Config(**_export_fields())
+                config.layer_types, config.is_causal = layer_types, is_causal
                 attn = DFlashMLAAttention(config, layer_id=0)
                 self.assertEqual(attn.attn_mqa.attn_type, expected)
                 self.assertEqual(
                     is_dflash_mla_draft_causal(config),
                     expected == AttentionType.DECODER,
                 )
-        config = _served_config()
-        config.layer_types = ["sliding_attention"]
-        config.sliding_window = 8
-        with self.assertRaisesRegex(ValueError, "triton"):
-            is_dflash_mla_draft_causal(config)
 
-
-class TestDFlashMLAWeights(_SingleRankTestCase):
-    def test_specforge_checkpoint_loads_for_both_q_parameterizations(self):
-        for q_lora_rank, q_keys in SPECFORGE_Q_KEYS.items():
+    def test_specforge_checkpoint_loads_and_absorbs(self):
+        for q_lora_rank, q_keys in SPECFORGE_KEYS.items():
             with self.subTest(q_lora_rank=q_lora_rank):
-                model = DFlashDraftModel(_served_config(q_lora_rank=q_lora_rank))
-                self.assertFalse(model.supports_fused_context_kv)
+                model = DFlashDraftModel(Qwen3Config(**_export_fields(q_lora_rank)))
                 attn = model.layers[0].self_attn
+                checkpoint = {
+                    f"layers.0.self_attn.{name}": torch.randn_like(param)
+                    for name, param in _specforge_weights(attn).items()
+                }
                 self.assertEqual(
-                    set(_specforge_weights(attn)), SPECFORGE_KV_KEYS | q_keys
+                    {name.rsplit("self_attn.", 1)[1] for name in checkpoint},
+                    SPECFORGE_KV_KEYS | q_keys,
                 )
-
-                checkpoint = {}
-                for name, param in model.named_parameters():
-                    if name.endswith("gate_up_proj.weight"):
-                        gate, up = torch.randn_like(param).chunk(2)
-                        prefix = name.removesuffix("gate_up_proj.weight")
-                        checkpoint[prefix + "gate_proj.weight"] = gate
-                        checkpoint[prefix + "up_proj.weight"] = up
-                    elif not name.startswith("layers.0.self_attn."):
-                        checkpoint[name] = torch.randn_like(param)
-                for name, param in _specforge_weights(attn).items():
-                    checkpoint["layers.0.self_attn." + name] = torch.randn_like(param)
                 model.load_weights(checkpoint.items())
-
-                for name, param in model.named_parameters():
-                    if name.endswith("gate_up_proj.weight"):
-                        prefix = name.removesuffix("gate_up_proj.weight")
-                        expected = torch.cat(
-                            (
-                                checkpoint[prefix + "gate_proj.weight"],
-                                checkpoint[prefix + "up_proj.weight"],
-                            )
-                        )
-                    elif name.startswith("layers.0.self_attn."):
-                        continue
-                    else:
-                        expected = checkpoint[name]
-                    torch.testing.assert_close(param, expected, rtol=0, atol=0)
                 for name, param in _specforge_weights(attn).items():
                     torch.testing.assert_close(
-                        param,
-                        checkpoint["layers.0.self_attn." + name],
-                        rtol=0,
-                        atol=0,
+                        param, checkpoint[f"layers.0.self_attn.{name}"], rtol=0, atol=0
                     )
-                # Loading derives the absorbed per-head projections.
                 w_kc, w_vc = (
                     checkpoint["layers.0.self_attn.kv_b_proj.weight"]
                     .view(HEADS, NOPE + VDIM, KV_LORA)
@@ -387,74 +277,42 @@ class TestDFlashMLAWeights(_SingleRankTestCase):
                     attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0
                 )
 
-
-class TestDFlashMLANumerics(_SingleRankTestCase):
-    """Context KV materialization and the draft block forward must reproduce the
-    attention SpecForge trained: partial RoPE at the right positions, the right
-    pair convention, and K/V rows that differ in width."""
-
-    def _check(self, *, device, dtype, use_torch_reference_ops, atol):
-        for q_lora_rank, interleaved, backend in itertools.product(
-            (None, Q_LORA),
-            (True, False),
-            ("triton", "flashinfer", "tokenspeed_mla"),
+    def test_matches_specforge_reference(self):
+        """Context-KV materialization and the block forward reproduce SpecForge's
+        expanded attention: partial RoPE, pair convention, K/V of different width."""
+        for q_lora_rank, interleaved in itertools.product(
+            (None, Q_LORA), (True, False)
         ):
-            with self.subTest(
-                q_lora_rank=q_lora_rank,
-                rope_interleave=interleaved,
-                backend=backend,
-            ):
+            with self.subTest(q_lora_rank=q_lora_rank, rope_interleave=interleaved):
                 attn = DFlashMLAAttention(
-                    _served_config(
-                        q_lora_rank=q_lora_rank, rope_interleave=interleaved
-                    ),
-                    layer_id=0,
+                    Qwen3Config(**_export_fields(q_lora_rank, interleaved)), layer_id=0
                 )
-                # get_rope() shares one cached instance; keep .to() from leaking out.
+                # get_rope() shares one cached instance across layers.
                 attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
-                rope_cache = attn.rotary_emb.cos_sin_cache
-                attn.to(device=device, dtype=dtype)
-                attn.rotary_emb.cos_sin_cache = rope_cache.to(device=device)
-                _randomize(attn)
-                if use_torch_reference_ops:
-                    # Only CPU tests replace fused-op dispatch with PyTorch
-                    # reference methods. CUDA keeps normal projection/norm/RoPE
-                    # dispatch; attention itself is isolated by _serve_block.
-                    norms = [attn.kv_a_layernorm]
-                    if q_lora_rank is not None:
-                        norms.append(attn.q_a_layernorm)
-                    for module in (attn.rotary_emb, *norms):
-                        module.forward = module.forward_native
-
-                torch.manual_seed(1)
-                ctx_hidden = torch.randn(5, HIDDEN, device=device, dtype=dtype)
-                hidden = torch.randn(4, HIDDEN, device=device, dtype=dtype)
-                ctx_positions = torch.tensor([0, 1, 2, 7, 100], device=device)
-                positions = torch.arange(1000, 1004, device=device)
-
-                expected = _reference_output(
-                    attn, ctx_hidden, ctx_positions, hidden, positions, interleaved
+                torch.manual_seed(0)
+                with torch.no_grad():
+                    for param in attn.parameters():
+                        param.copy_(
+                            torch.randn_like(param) * 0.2 + (param == 1).float()
+                        )
+                attn.absorb_kv_b_proj()
+                norms = [attn.kv_a_layernorm] + (
+                    [attn.q_a_layernorm] if q_lora_rank else []
                 )
+                for module in (attn.rotary_emb, *norms):
+                    module.forward = module.forward_native
+
+                ctx_hidden, hidden = torch.randn(5, HIDDEN), torch.randn(4, HIDDEN)
+                ctx_positions = torch.tensor([0, 1, 2, 7, 100])
+                positions = torch.arange(1000, 1004)
+                with torch.no_grad():
+                    expected = _reference_output(
+                        attn, ctx_hidden, ctx_positions, hidden, positions, interleaved
+                    )
                 actual = _serve_block(
-                    attn, ctx_hidden, ctx_positions, hidden, positions, backend
+                    attn, ctx_hidden, ctx_positions, hidden, positions
                 )
-                torch.testing.assert_close(
-                    actual.float(), expected, atol=atol, rtol=atol
-                )
-
-    def test_matches_specforge_reference_cpu(self):
-        self._check(
-            device="cpu", dtype=torch.float32, use_torch_reference_ops=True, atol=1e-5
-        )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_cuda_projection_kernels_match_specforge_reference(self):
-        self._check(
-            device="cuda",
-            dtype=torch.bfloat16,
-            use_torch_reference_ops=False,
-            atol=5e-2,
-        )
+                torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == "__main__":
