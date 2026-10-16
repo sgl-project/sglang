@@ -38,13 +38,10 @@ SEED = 0
 TP_SIZE = 2
 
 BCG_CAPTURE_MARKER = "[Diffusion BCG] captured"
-# Printed by CustomAllreduce.register_graph_buffers(), i.e. only on exit of the
-# capture() context the fix enters. Its absence is the precise signature of the
+# Printed when the TP all-reduce registers its graph inputs, i.e. only on exit of
+# the capture() context the fix enters. Its absence is the precise signature of the
 # regression: capture ran, registration did not.
 GRAPH_BUFFER_REGISTRATION_MARKER = "cuda graph addresses"
-# CustomAllReduceV2 logs its setup but registers graph inputs silently, so the
-# registration marker only applies to the v1 communicator.
-CUSTOM_ALL_REDUCE_V2_MARKER = "All Reduce config:"
 ILLEGAL_MEMORY_MARKER = "illegal memory access"
 
 # The regression fails during warmup within ~1 min; the timeout only has to be
@@ -149,14 +146,13 @@ class TestDiffusionBCGTP2ZImageTurbo(CustomTestCase):
             f"BCG never captured, so this run did not exercise TP+BCG. "
             f"Log: {log_path}\n{tail}",
         )
-        if CUSTOM_ALL_REDUCE_V2_MARKER not in result.stdout:
-            self.assertIn(
-                GRAPH_BUFFER_REGISTRATION_MARKER,
-                result.stdout,
-                f"custom all-reduce graph buffers were never registered, so capture "
-                f"did not go through the TP group's graph_capture(). "
-                f"Log: {log_path}\n{tail}",
-            )
+        self.assertIn(
+            GRAPH_BUFFER_REGISTRATION_MARKER,
+            result.stdout,
+            f"custom all-reduce graph buffers were never registered, so capture "
+            f"did not go through the TP group's graph_capture(). "
+            f"Log: {log_path}\n{tail}",
+        )
         self.assertIn("Pixel data generated successfully", result.stdout)
 
 

@@ -1603,8 +1603,7 @@ STANDALONE_FILES = {
     ],
     "2-gpu": [
         "../single_test_file/test_disagg_server.py",
-        # Disabled: GLM-Image's RoPE write-back aliases its source (glm_image.py:654).
-        # "../single_test_file/test_ar_models.py",
+        "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
         "../single_test_file/test_ipc_a2a_multi_gpu.py",
         "../single_test_file/test_usp_pipelined_attention_multi_gpu.py",
