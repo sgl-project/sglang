@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
     MambaAttnBackendBase,
@@ -367,6 +368,17 @@ class TestDpDecodeRelabel(unittest.TestCase):
         self.assertEqual(metadata.num_decodes, 3)
         self.assertEqual(metadata.num_prefills, 0)
         self.assertIsNone(metadata.mixed_metadata)
+
+    def test_two_batch_overlap_rejects_relabeled_batches(self):
+        with self.assertRaisesRegex(AssertionError, "Two-batch overlap"):
+            TboForwardBatchPreparer.filter_batch(
+                make_relabeled_decode_batch([8, 8], num_tokens=4),
+                start_token_index=0,
+                end_token_index=1,
+                start_seq_index=0,
+                end_seq_index=1,
+                out_num_token_non_padded=torch.zeros(1, dtype=torch.int32),
+            )
 
     def test_prepare_mixed_keeps_real_extends_as_prefills(self):
         batch = make_forward_batch([4, 3], [0, 4], [4, 3])
