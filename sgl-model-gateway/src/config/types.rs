@@ -368,6 +368,28 @@ pub struct DiscoveryConfig {
     /// PD mode decode
     pub decode_selector: HashMap<String, String>,
     pub bootstrap_port_annotation: String,
+    /// Optional label-based fallback for the bootstrap port on prefill pods.
+    /// When both are set, the router computes
+    /// `bootstrap_port = bootstrap_port_label_base + int(pod.labels[bootstrap_port_label_key])`.
+    /// Empty key or zero base disables the fallback.
+    #[serde(default)]
+    pub bootstrap_port_label_key: String,
+    #[serde(default)]
+    pub bootstrap_port_label_base: u16,
+    /// Annotation key for a per-pod HTTP serving port override. Lets multiple
+    /// hostNetwork pods share one node by binding distinct ports.
+    #[serde(default = "default_http_port_annotation")]
+    pub http_port_annotation: String,
+    /// Optional label-based fallback for the HTTP port. When both are set,
+    /// the router computes
+    /// `http_port = http_port_label_base + int(pod.labels[http_port_label_key])`.
+    /// Useful for controllers such as LeaderWorkerSet that inject per-pod
+    /// index labels but not per-pod annotations. Empty key or zero base
+    /// disables the fallback.
+    #[serde(default)]
+    pub http_port_label_key: String,
+    #[serde(default)]
+    pub http_port_label_base: u16,
     /// Router node discovery for HA (Kubernetes label selector)
     #[serde(default)]
     pub router_selector: HashMap<String, String>,
@@ -378,6 +400,10 @@ pub struct DiscoveryConfig {
 
 fn default_router_mesh_port_annotation() -> String {
     "sglang.ai/mesh-port".to_string()
+}
+
+fn default_http_port_annotation() -> String {
+    "sglang.ai/http-port".to_string()
 }
 
 impl Default for DiscoveryConfig {
@@ -391,6 +417,11 @@ impl Default for DiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            bootstrap_port_label_key: String::new(),
+            bootstrap_port_label_base: 0,
+            http_port_annotation: default_http_port_annotation(),
+            http_port_label_key: String::new(),
+            http_port_label_base: 0,
             router_selector: HashMap::new(),
             router_mesh_port_annotation: default_router_mesh_port_annotation(),
         }
@@ -942,6 +973,11 @@ mod tests {
             prefill_selector: selector.clone(),
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
+            bootstrap_port_label_key: String::new(),
+            bootstrap_port_label_base: 0,
+            http_port_annotation: "sglang.ai/http-port".to_string(),
+            http_port_label_key: String::new(),
+            http_port_label_base: 0,
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
         };
@@ -1220,6 +1256,11 @@ mod tests {
                 prefill_selector: selectors.clone(),
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
+                bootstrap_port_label_key: String::new(),
+                bootstrap_port_label_base: 0,
+                http_port_annotation: "sglang.ai/http-port".to_string(),
+                http_port_label_key: String::new(),
+                http_port_label_base: 0,
                 router_selector: HashMap::new(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
