@@ -121,11 +121,12 @@ class _MHAHost:
 class _MambaHost:
     """temporal + one conv buffer laid out like MambaPoolHost (page_first)."""
 
-    def __init__(self, heads, conv_dim, slots=4):
-        self.layout, self.page_size = "page_first", 1
-        self.slot_state_device_tensors = ()
+    def __init__(self, heads, conv_dim, slots=4, side=0, layout="page_first"):
+        self.layout, self.page_size = layout, 1
         self.temporal_buffer = torch.zeros(slots, 2, 1, heads, 2, 2)
         self.conv_buffer = [torch.zeros(slots, 2, 1, conv_dim, 3)]
+        self.slot_state_buffers = [torch.zeros(slots, side, 5)] if side else []
+        self.slot_state_device_tensors = list(self.slot_state_buffers)
 
 
 def _global_kv():
@@ -354,6 +355,46 @@ class TestRadixShmemLayout(CustomTestCase):
         self.assertEqual(got, {PoolName.MAMBA: [True]})
         self.assertTrue(torch.equal(rmambas[0].temporal_buffer[2], temporal))
         self.assertTrue(torch.equal(rmambas[0].conv_buffer[0][2], conv))
+
+    def test_mamba_side_state_is_replicated(self):
+        keys = _keys(2)
+        ranks = self._ranks(2, lambda _: _MHAHost("page_first", KV_HEADS // 2))
+        mambas = [_MambaHost(2, 8, side=3) for _ in ranks]
+        for r, ((s, _), m) in enumerate(zip(ranks, mambas)):
+            s.describe_pool(PoolName.MAMBA, SimpleNamespace(conv_shard_groups=None))
+            s.register_mem_host_pool_v2(m, PoolName.MAMBA)
+            m.temporal_buffer[1].fill_(r + 1)
+            m.slot_state_buffers[0][1].fill_(7 if r == 0 else -1)
+        idx = torch.arange(2 * PAGE)
+        _run([lambda s=s: s.batch_set_v1(keys, idx, _info()) for s, _ in ranks])
+        state = lambda: PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.tensor([1]),
+            keys=keys[1:],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        got = _run(
+            [lambda s=s: s.batch_set_v2([state()], _info(keys[:1])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [{PoolName.MAMBA: [True]}] * 2)
+        for m in mambas:
+            m.temporal_buffer.zero_()
+            m.slot_state_buffers[0].zero_()
+        got = _run(
+            [lambda s=s: s.batch_get_v2([state()], _info(keys[:1])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [{PoolName.MAMBA: [True]}] * 2)
+        for r, m in enumerate(mambas):
+            self.assertTrue(torch.all(m.temporal_buffer[1] == r + 1))
+            self.assertTrue(torch.all(m.slot_state_buffers[0][1] == 7))
+
+    def test_mamba_side_state_unplaceable_layout_rejected(self):
+        tp1 = self._ranks(1, lambda _: _MHAHost("page_first", KV_HEADS))
+        bad = _MambaHost(4, 16, side=3)
+        bad.slot_state_buffers = []
+        tp1[0][0].register_mem_host_pool_v2(bad, PoolName.MAMBA)
+        with self.assertRaises(ValueError):
+            tp1[0][0].batch_exists(_keys(1), _info())
 
     def test_unknown_shape_keeps_rank_parts(self):
         tp2 = self._ranks(

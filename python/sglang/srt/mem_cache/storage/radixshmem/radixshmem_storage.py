@@ -334,7 +334,8 @@ class RadixShmemStorage(HiCacheStorage):
 
         if not isinstance(host_pool, MambaPoolHost):
             return None
-        if getattr(host_pool, "slot_state_device_tensors", None):
+        side = list(getattr(host_pool, "slot_state_buffers", None) or ())
+        if len(side) != len(getattr(host_pool, "slot_state_device_tensors", ())):
             return None
         device = self.device_pools.get(name)
         groups = getattr(device, "conv_shard_groups", None)
@@ -347,13 +348,15 @@ class RadixShmemStorage(HiCacheStorage):
             return lambda t: buf[:, t].unsqueeze(1)
 
         parts, local_bytes = [], 0
-        tensors = [(host_pool.temporal_buffer, 0, None)] + [
-            (buf, conv_axis, groups) for buf in host_pool.conv_buffer
-        ]
-        for buf, axis, subs in tensors:
+        tensors = (
+            [(host_pool.temporal_buffer, 0, None, at)]
+            + [(buf, conv_axis, groups, at) for buf in host_pool.conv_buffer]
+            + [(buf, None, None, lambda b: lambda t: b[t]) for buf in side]
+        )
+        for buf, axis, subs, viewer in tensors:
             if buf is None or buf.numel() == 0:
                 continue
-            view = at(buf)
+            view = viewer(buf)
             local = tuple(view(0).shape)
             local_bytes += int(np.prod(local)) * buf.itemsize
             if axis is None:
@@ -377,6 +380,11 @@ class RadixShmemStorage(HiCacheStorage):
             )
         parts = self.tp_parts if sharded else 1
         part = self.tp_part if sharded else 0
+        if layout is None and getattr(host_pool, "slot_state_device_tensors", None):
+            raise ValueError(
+                f"radixshmem: pool {name} carries Mamba side state in a layout "
+                "the backend cannot place (use page_first or layer_first)"
+            )
         page_bytes = layout.local_bytes if layout else _page_bytes(host_pool)
         kind, mask = self.full, self.full_mask
         salt = _salt(
