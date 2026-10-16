@@ -90,7 +90,7 @@ else:
     amdgpu_targets = amdgpu_target_env.split(";")
 
 # Validate all target architectures
-supported_archs = ["gfx942", "gfx950", "gfx1250"]
+supported_archs = ["gfx942", "gfx950", "gfx1100", "gfx1151", "gfx1201", "gfx1250"]
 for amdgpu_arch in amdgpu_targets:
     if amdgpu_arch not in supported_archs:
         print(
@@ -101,10 +101,10 @@ for amdgpu_arch in amdgpu_targets:
 print(f"Building for architectures: {', '.join(amdgpu_targets)}")
 
 # Multi-arch build: Define both FP8 types so compile-time selection can work.
-# gfx942 uses E4M3FNUZ (max=224), gfx950 and gfx1250 use E4M3FN (max=448).
+# gfx942 uses E4M3FNUZ (max=224); every other target uses E4M3FN (max=448).
 fp8_macros = [
     "-DHIP_FP8_TYPE_FNUZ=1",  # For gfx942
-    "-DHIP_FP8_TYPE_E4M3=1",  # For gfx950 and gfx1250
+    "-DHIP_FP8_TYPE_E4M3=1",  # For every target except gfx942
 ]
 
 # Note: SMEM sizing for topk kernel uses runtime detection (see topk.cu).
