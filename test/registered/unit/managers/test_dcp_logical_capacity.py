@@ -32,6 +32,7 @@ def make_configurator(*, is_hybrid_swa=False, is_draft_worker=False):
     configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
     configurator.is_hybrid_swa = is_hybrid_swa
     configurator.is_draft_worker = is_draft_worker
+    configurator.model_config = NS(hf_config=NS(architectures=["LlamaForCausalLM"]))
     return configurator
 
 
