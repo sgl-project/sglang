@@ -57,10 +57,6 @@ class TestOOTDFlashHooks(CustomTestCase):
         with (
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(f"{HOOK_MODULE}.attention_backends_of", return_value=(None, None)),
-            patch(
-                "sglang.srt.utils.hf_transformers_utils.get_config",
-                side_effect=AssertionError("OOT dispatch must not load HF config"),
-            ),
         ):
             # Call the resolver directly: the full hook also resolves the
             # algorithm alias, which loads the draft HF config over the network.
@@ -127,11 +123,15 @@ class TestOOTDFlashHooks(CustomTestCase):
 
 
 class TestDFlashDraftBackendResolution(CustomTestCase):
-    def _resolve(self, args, *, mla: bool, target_backend="fa3"):
+    """Backends that serve one attention layout follow the draft's layout."""
+
+    def _resolve(self, draft_backend, *, mla, target_backend="fa3"):
+        args = _make_dflash_args(draft_backend)
         platform = Mock(spec=SRTPlatform)
         platform.is_out_of_tree.return_value = False
         config = SimpleNamespace(
             num_hidden_layers=1,
+            is_causal=True,
             dflash_config={"attention_mode": "mla" if mla else "gqa"},
         )
         with (
@@ -147,40 +147,21 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             patch(
                 "sglang.srt.utils.hf_transformers_utils.get_config",
                 return_value=config,
-            ) as get_config,
+            ),
         ):
             _resolve_dflash_draft_attention_backend(args)
-        return get_config
+        return resolution_result(args, "speculative_draft_attention_backend")
 
-    def test_mla_default_uses_decrypted_draft_config(self):
-        args = _make_dflash_args(None)
-        args.decrypted_draft_config_file = " /tmp/decrypted-draft.json "
-        get_config = self._resolve(args, mla=True)
+    def test_layout_specific_backends(self):
+        self.assertEqual(self._resolve("tokenspeed_mla", mla=True), "tokenspeed_mla")
+        self.assertEqual(self._resolve("tokenspeed_mla", mla=False), "flashinfer")
+        # A DeepSeek target's tokenspeed_mla must not reach a GQA draft.
         self.assertEqual(
-            get_config.call_args.kwargs["_configuration_file"],
-            "/tmp/decrypted-draft.json",
-        )
-        self.assertEqual(
-            resolution_result(args, "speculative_draft_attention_backend"), "triton"
-        )
-
-    def test_mla_rejects_unmasked_backends_and_dcp(self):
-        with self.assertRaisesRegex(ValueError, "speculative-draft-attention-backend"):
-            self._resolve(_make_dflash_args("fa3"), mla=True)
-        args = _make_dflash_args("triton")
-        args.dcp_size = 2
-        with self.assertRaisesRegex(ValueError, "dcp-size"):
-            self._resolve(args, mla=True)
-
-    def test_gqa_never_takes_tokenspeed(self):
-        with self.assertRaisesRegex(ValueError, "requires an MLA draft model"):
-            self._resolve(_make_dflash_args("tokenspeed_mla"), mla=False)
-        args = _make_dflash_args(None)
-        self._resolve(args, mla=False, target_backend="tokenspeed_mla")
-        self.assertEqual(
-            resolution_result(args, "speculative_draft_attention_backend"),
+            self._resolve(None, mla=False, target_backend="tokenspeed_mla"),
             "flashinfer",
         )
+        self.assertEqual(self._resolve("trtllm_mha", mla=False), "trtllm_mha")
+        self.assertEqual(self._resolve("trtllm_mha", mla=True), "flashinfer")
 
 
 if __name__ == "__main__":

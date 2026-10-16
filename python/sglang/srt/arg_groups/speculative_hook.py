@@ -827,59 +827,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
+    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+
     cfg = resolving_view(server_args)
 
-    from sglang.srt.speculative.dflash_utils import (
-        is_dflash_mla_draft_config,
-        resolve_dflash_mla_draft_attention_backend,
-    )
-    from sglang.srt.utils.hf_transformers_utils import get_config
-
-    def load_draft_config():
-        kwargs = {}
-        config_file = cfg.decrypted_draft_config_file
-        if config_file and config_file.strip():
-            kwargs["_configuration_file"] = config_file.strip()
-        return get_config(
-            cfg.speculative_draft_model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.speculative_draft_model_revision,
-            model_override_args=json.loads(cfg.json_model_override_args),
-            **kwargs,
-        )
-
-    # Out-of-tree platforms own their draft backend dispatch, including config
-    # loading, so they never take the MLA draft path.
-    draft_hf_config = None if current_platform.is_out_of_tree() else load_draft_config()
-    if draft_hf_config is not None and is_dflash_mla_draft_config(draft_hf_config):
-        if cfg.dcp_size > 1:
-            # The draft pool is not DCP-sharded, but the target MLA layer
-            # would gather across DCP ranks.
-            raise ValueError("DFLASH mla drafts do not support --dcp-size > 1.")
-        declare_resolution(
-            server_args,
-            "_resolve_dflash_draft_attention_backend",
-            speculative_draft_attention_backend=(
-                resolve_dflash_mla_draft_attention_backend(
-                    cfg.speculative_draft_attention_backend
-                )
-            ),
-        )
-        return
-
-    if (
-        not current_platform.is_out_of_tree()
-        and cfg.speculative_draft_attention_backend == "tokenspeed_mla"
-    ):
-        raise ValueError(
-            "DFLASH tokenspeed_mla requires an MLA draft model; "
-            "it cannot serve GQA/MHA draft attention."
-        )
-    supported_draft_backends = [
-        backend
-        for backend in DRAFT_ATTENTION_BACKEND_CHOICES
-        if backend != "tokenspeed_mla"
-    ]
+    supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
 
     def is_supported_backend(backend: str) -> bool:
         if current_platform.is_out_of_tree():
@@ -915,6 +867,16 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             else "flashinfer"
         )
 
+    def load_draft_config():
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        return get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+        )
+
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
@@ -933,8 +895,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     elif draft_backend == "trtllm_mha":
         from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
 
-        if draft_hf_config is None:
-            draft_hf_config = load_draft_config()
+        draft_hf_config = load_draft_config()
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )
@@ -946,11 +907,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if not (all_sliding or all_causal):
+        # trtllm_mha serves only MHA/GQA layers.
+        if is_dflash_mla_draft_config(draft_hf_config) or not (
+            all_sliding or all_causal
+        ):
             fallback_backend = get_fallback_backend()
             logger.warning(
-                "DFLASH only enables 'trtllm_mha' when all layers use sliding "
-                "attention or the draft is explicitly causal; got "
+                "DFLASH only enables 'trtllm_mha' for non-MLA drafts whose "
+                "layers all use sliding attention or are explicitly causal; got "
                 "layer_types=%r, is_causal=%r. "
                 "Falling back to '%s'.",
                 layer_types,
@@ -958,6 +922,16 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
+    elif draft_backend == "tokenspeed_mla" and not is_dflash_mla_draft_config(
+        load_draft_config()
+    ):
+        fallback_backend = get_fallback_backend()
+        logger.warning(
+            "DFLASH only enables 'tokenspeed_mla' for MLA drafts. "
+            "Falling back to '%s'.",
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(

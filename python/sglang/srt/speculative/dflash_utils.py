@@ -620,8 +620,6 @@ def is_dflash_mla_draft_config(draft_hf_config: Any) -> bool:
 
 # The served MLA layer reinterprets any RoPE scaling as DeepSeek YaRN.
 _DFLASH_MLA_ROPE_TYPES = frozenset({"default", "yarn", "deepseek_yarn"})
-# Backends whose MLA verify path also masks a bidirectional DFlash draft.
-DFLASH_MLA_DRAFT_ATTENTION_BACKENDS = ("triton", "flashinfer", "tokenspeed_mla")
 
 
 def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
@@ -650,18 +648,6 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
             f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
             f"got {rope_type!r}."
         )
-
-
-def resolve_dflash_mla_draft_attention_backend(backend: Optional[str]) -> str:
-    # The target's backend is not a safe default: it need not mask a
-    # bidirectional draft, and triton alone serves sliding MLA layers.
-    backend = backend or "triton"
-    if backend not in DFLASH_MLA_DRAFT_ATTENTION_BACKENDS:
-        raise ValueError(
-            "DFLASH mla drafts support --speculative-draft-attention-backend in "
-            f"{list(DFLASH_MLA_DRAFT_ATTENTION_BACKENDS)}, got {backend!r}."
-        )
-    return backend
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
