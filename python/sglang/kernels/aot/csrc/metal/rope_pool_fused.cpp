@@ -22,7 +22,8 @@ using namespace mlx::core;
 
 namespace {
 
-constexpr const char* kLibraryName = MLX_METAL_LIBRARY_NAME;
+// MLX caches libraries by name, independently of their file paths.
+constexpr const char* kLibraryName = "sgl_metal_kernels";
 
 MTL::Library* g_library = nullptr;
 

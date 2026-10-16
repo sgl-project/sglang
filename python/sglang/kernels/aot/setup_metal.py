@@ -25,7 +25,7 @@ root = Path(__file__).parent.resolve()
 
 _BUILD_REQUIRES = [
     "setuptools>=80",
-    "mlx>=0.32.4",
+    "mlx==0.32.4",
     "nanobind==3.1.0",
     "cmake>=3.25",
     "ninja",
