@@ -388,6 +388,77 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[3, 13]])
         self.assertEqual(offsets, [[0, 18]])
 
+    def test_deepseek_v41_request_window_drops_swa(self):
+        """Encoder replay leaves no target SWA pool: skip SWA and the draft SWA
+        rather than dereference them, and refuse pools that take SWA indices."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4LayerItem,
+            DeepSeekV4TokenToKVPool,
+        )
+
+        def state_pool():
+            return SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(kv_score=torch.zeros((4, 3))),
+            )
+
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.start_layer, pool.end_layer = 0, 2
+        pool.swa_page_size = 8
+        pool.swa_kv_pool = None
+        pool.c4_kv_pool = pool.c128_kv_pool = pool.c4_indexer_kv_pool = None
+        pool.sources_by_ratio = {1: [1]}
+        pool.kv_pools = {
+            1: SimpleNamespace(kv_buffer=[torch.zeros((3, 7), dtype=torch.uint8)])
+        }
+        pool.index_pools = {
+            1: SimpleNamespace(
+                page_size=2,
+                index_k_with_scale_buffer=[torch.zeros((9, 4), dtype=torch.uint8)],
+            )
+        }
+        pool.layer_mapping = [DeepSeekV4LayerItem(0, -1), DeepSeekV4LayerItem(1, 0)]
+        pool.compress_state_pools = [None, None]
+        pool.indexer_compress_state_pools = [None, None]
+        draft = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(
+                kv_buffer=[torch.zeros((3, 5), dtype=torch.uint8)]
+            )
+        )
+        params = SimpleNamespace(mtp_draft_device_pools=(draft,))
+        group = resolve_hybrid_device_pool_group(
+            kvcache=pool,
+            page_size=8,
+            params=params,
+            components={ComponentType.FULL, ComponentType.SWA},
+        )
+        self.assertEqual(
+            set(group.entry_map),
+            {PoolName.DEEPSEEK_V4_C1, PoolName.DEEPSEEK_V4_C1_INDEXER},
+        )
+        indexer = group.entry_map[PoolName.DEEPSEEK_V4_C1_INDEXER]
+        _, sizes = indexer.get_page_buffer_meta(torch.arange(8, 16))
+        self.assertEqual(sizes, [16])
+
+        pool.layer_mapping[0] = DeepSeekV4LayerItem(4, 0)
+        pool.c4_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((3, 5), dtype=torch.uint8)],
+            bytes_per_page_padded=5,
+        )
+        pool.c4_indexer_kv_pool = SimpleNamespace(
+            index_k_with_scale_buffer=[torch.zeros((3, 6), dtype=torch.uint8)]
+        )
+        pool.compress_state_pools[0] = state_pool()
+        pool.indexer_compress_state_pools[0] = state_pool()
+        with self.assertRaisesRegex(ValueError, "SWA page indices"):
+            resolve_hybrid_device_pool_group(
+                kvcache=pool,
+                page_size=8,
+                params=params,
+                components={ComponentType.FULL, ComponentType.SWA},
+            )
+
     def test_unified_deepseek_v4_uses_only_compressed_pools(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
 

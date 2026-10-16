@@ -285,7 +285,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             ("context parallelism", cfg.attn_cp_size > 1),
-            ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
             ("mixed prefill/decode", cfg.enable_mixed_chunk),
