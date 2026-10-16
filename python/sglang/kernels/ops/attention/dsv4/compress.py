@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
@@ -41,6 +42,29 @@ if _is_xpu:
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+# Pinned staging buffers whose host-to-device copy (a raw cudaMemcpyAsync inside the JIT
+# planner) may still be queued. torch's host caching allocator only tracks copies issued
+# through torch, so dropping a buffer together with its plan lets the next plan reuse the
+# block and overwrite it before the queued copy reads it: the kernel then runs on another
+# plan's offsets (TBO two-chunk halves get same-sized plans back to back and faulted in
+# flash_c128_prefill). Release a buffer only once an event recorded behind its copy is done.
+_pinned_in_flight: collections.deque = collections.deque()
+
+
+def _hold_pinned_until_copied(pin_buffer: torch.Tensor) -> None:
+    if _is_xpu or pin_buffer.numel() == 0 or not pin_buffer.is_pinned():
+        return
+    # Under graph capture the plan keeps its buffer for the graph's lifetime, and events
+    # cannot be queried here.
+    if torch.cuda.is_current_stream_capturing():
+        return
+    while _pinned_in_flight and _pinned_in_flight[0][0].query():
+        _pinned_in_flight.popleft()
+    event = torch.cuda.Event()
+    event.record()
+    _pinned_in_flight.append((event, pin_buffer))
 
 
 @cache_once
@@ -311,6 +335,7 @@ class CompressorPrefillPlan(NamedTuple):
             if _is_xpu
             else fn(*args, bool(use_req_ring), bool(use_cuda_graph))
         )
+        _hold_pinned_until_copied(pin_buffer)
         return CompressorPrefillPlan(
             compress_ratio,
             torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
@@ -348,6 +373,7 @@ class CompressorPrefillPlan(NamedTuple):
             int(compress_ratio),
             bool(use_cuda_graph),
         )
+        _hold_pinned_until_copied(pin_buffer)
         return CompressorPrefillPlan(
             compress_ratio,
             torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
@@ -389,6 +415,7 @@ class CompressorPrefillPlan(NamedTuple):
             int(state_slot_offset),
             bool(use_cuda_graph),
         )
+        _hold_pinned_until_copied(pin_buffer)
         return CompressorPrefillPlan(
             128,
             plan_c_dev[: int(num_c)],
