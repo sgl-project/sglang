@@ -986,6 +986,15 @@ class Scheduler:
             if hicache_storage_enabled() and should_retry_storage_prefetch:
                 self.hub.request_intake.process_storage_prefetch_retries()
 
+    def _begin_schedule(self, should_retry_storage_prefetch: bool = True) -> None:
+        """The head of a schedule: the deferred chunked abort, the HiCache
+        drain (a TP collective), then the forward pass metrics clock."""
+        self.process_pending_chunked_abort()
+        self._process_hicache_events(
+            should_retry_storage_prefetch=should_retry_storage_prefetch
+        )
+        self._start_fpm_clock()
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
         """Schedule this iteration and build its step for slot from the
@@ -993,9 +1002,7 @@ class Scheduler:
 
         The step is built fresh from the lists and the requests admitted now;
         launching it moves them (see ``join_launched_step``)."""
-        self.process_pending_chunked_abort()
-        self._process_hicache_events()
-        self._start_fpm_clock()
+        self._begin_schedule()
 
         if self.parts.lists.chunked_req is not None:
             # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
@@ -1057,11 +1064,7 @@ class Scheduler:
         should_retry_storage_prefetch: bool = True,
         process_chunk: bool = True,
     ) -> Optional[ScheduleBatch]:
-        self.process_pending_chunked_abort()
-        self._process_hicache_events(
-            should_retry_storage_prefetch=should_retry_storage_prefetch
-        )
-        self._start_fpm_clock()
+        self._begin_schedule(should_retry_storage_prefetch)
         self.parts.lists.waiting_queue = self.disagg_prefill.resolve_waiting_bootstrap(
             self.parts.lists.waiting_queue
         )
