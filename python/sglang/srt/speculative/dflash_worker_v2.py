@@ -41,6 +41,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -1918,15 +1919,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
                     )
-                    if getattr(attn, "is_mla", False):
-                        latent, k_pe = attn.kv_proj_only(layer_ctx_hidden)
-                        k_pe = attn.apply_k_rope(positions, k_pe)
+                    if isinstance(attn, DFlashMLAAttention):
+                        k_nope, k_pe = attn.project_context_kv(
+                            positions, layer_ctx_hidden
+                        )
                         self.draft_model_runner.token_to_kv_pool.set_mla_kv_buffer_prefix_valid(
-                            attn.attn,
-                            cache_loc_2d,
-                            commit_lens,
-                            latent.view(-1, 1, attn.kv_lora_rank),
-                            k_pe.view(-1, 1, attn.qk_rope_head_dim),
+                            attn.attn_mqa, cache_loc_2d, commit_lens, k_nope, k_pe
                         )
                         continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
@@ -1979,14 +1977,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
-            if getattr(attn, "is_mla", False):
-                latent, k_pe = attn.kv_proj_only(layer_ctx_hidden)
-                k_pe = attn.apply_k_rope(ctx_positions, k_pe)
+            if isinstance(attn, DFlashMLAAttention):
+                k_nope, k_pe = attn.project_context_kv(ctx_positions, layer_ctx_hidden)
                 self.draft_model_runner.token_to_kv_pool.set_mla_kv_buffer(
-                    attn.attn,
+                    attn.attn_mqa,
                     KVWriteLoc(ctx_cache_loc, physical=True),
-                    latent.view(-1, 1, attn.kv_lora_rank),
-                    k_pe.view(-1, 1, attn.qk_rope_head_dim),
+                    k_nope,
+                    k_pe,
                 )
                 continue
             if _is_npu:

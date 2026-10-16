@@ -1223,17 +1223,17 @@ class ModelConfig:
         from sglang.srt.configs.dots3 import Dots3Config
 
         self.is_dflash_mla_draft = False
-        dflash_mla_config = None
-        if self.is_draft_model and getattr(self.hf_config, "dflash_config", None):
+        # Only DFlash-family draft checkpoints carry a dflash_config.
+        if getattr(self.hf_config, "dflash_config", None):
             from sglang.srt.speculative.dflash_utils import (
                 is_dflash_mla_draft_config,
-                parse_dflash_mla_config,
+                validate_dflash_mla_draft_config,
             )
 
             self.is_dflash_mla_draft = is_dflash_mla_draft_config(self.hf_config)
             if self.is_dflash_mla_draft:
-                # Validate before the generic GQA defaults fill missing fields.
-                dflash_mla_config = parse_dflash_mla_config(self.hf_config)
+                # Validate before the generic defaults below fill missing fields.
+                validate_dflash_mla_draft_config(self.hf_config)
 
         # Pure SSM models have no attention heads; use head_dim == 0 so the
         # KV-cell size is 0 rather than a division on a missing head count.
@@ -1268,28 +1268,9 @@ class ModelConfig:
             self.swa_v_head_dim = self.swa_head_dim
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
-        if self.is_dflash_mla_draft:
-            mla = dflash_mla_config
-            self.attention_arch = AttentionArch.MLA
-            self.head_dim = mla.qk_head_dim
-            self.kv_lora_rank = mla.kv_lora_rank
-            self.qk_nope_head_dim = mla.qk_nope_head_dim
-            self.qk_rope_head_dim = mla.qk_rope_head_dim
-            self.v_head_dim = mla.v_head_dim
-            self.swa_head_dim = mla.qk_head_dim
-            self.swa_v_head_dim = mla.v_head_dim
-            self.swa_kv_lora_rank = mla.kv_lora_rank
-            self.swa_qk_rope_head_dim = mla.qk_rope_head_dim
-            self.index_head_dim = None
-            # The exported GQA template fields do not describe MLA storage.
-            # Each rank caches one shared latent and its shared RoPE key.
-            self.hf_text_config.num_key_value_heads = 1
-            rope_scaling = getattr(
-                self.hf_text_config, "rope_parameters", None
-            ) or getattr(self.hf_text_config, "rope_scaling", None)
-            self._init_mla_scaling(rope_scaling)
-        elif (
-            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+        if (
+            self.is_dflash_mla_draft
+            or "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
@@ -1329,6 +1310,10 @@ class ModelConfig:
             else:
                 self.swa_kv_lora_rank = self.kv_lora_rank
                 self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+            if self.is_dflash_mla_draft:
+                # Sliding draft layers share the full layers' latent rows; the
+                # template's GQA head_dim would size a separate triton buffer.
+                self.swa_v_head_dim = self.v_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
                 if is_deepseek_dsa(self.hf_text_config)

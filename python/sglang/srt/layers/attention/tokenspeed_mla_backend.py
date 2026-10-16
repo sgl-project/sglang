@@ -349,11 +349,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=int(max_seq_len),
             softmax_scale=softmax_scale,
             output_scale=output_scale,
-            causal_mask=not (
-                self.is_dflash_mla_draft
-                and layer.attn_type
-                in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
-            ),
+            causal_mask=layer.attn_type != AttentionType.ENCODER_ONLY,
             enable_pdl=is_arch_support_pdl(),
             return_lse=return_lse,
             causal_seqs=causal_seqs,

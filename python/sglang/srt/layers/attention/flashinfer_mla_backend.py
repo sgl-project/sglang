@@ -234,21 +234,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
-        self.is_dflash_mla_draft = getattr(
-            model_runner.model_config, "is_dflash_mla_draft", False
-        )
-        self.prefill_causal = True
+        self.is_dflash_mla_draft = model_runner.model_config.is_dflash_mla_draft
+        # Planned per batch, so every layer must share it: False only for a
+        # bidirectional DFlash MLA draft.
+        self.causal = True
         if self.is_dflash_mla_draft:
-            from sglang.srt.speculative.dflash_mla_backend import (
-                dflash_mla_prefill_causal,
-            )
-            from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+            from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_causal
 
-            self.prefill_causal = dflash_mla_prefill_causal(
-                layer_types=get_dflash_layer_types(model_runner.model_config.hf_config),
-                is_causal=getattr(
-                    model_runner.model_config.hf_text_config, "is_causal", None
-                ),
+            self.causal = is_dflash_mla_draft_causal(
+                model_runner.model_config.hf_config
             )
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
@@ -257,7 +251,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.kv_index_translator = model_runner.kv_index_translator
         self.enable_chunk_kv = (
             not skip_prefill
-            and not self.is_dflash_mla_draft
             and get_disagg().disaggregation_mode != "decode"
             and not get_schedule().disable_chunked_prefix_cache
             and not get_exec().kernel.flashinfer_mla_disable_ragged
@@ -466,7 +459,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
                 not get_exec().kernel.flashinfer_mla_disable_ragged
-                and not self.is_dflash_mla_draft
                 and extend_no_prefix
                 # Captured prefill (tc_piecewise or breakable) must use paged
                 # prefill: it stays compatible with prefix cache, and the ragged
@@ -764,7 +756,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
-                causal=self.prefill_causal,
+                causal=self.causal,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
@@ -1019,7 +1011,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.data_type = model_runner.dtype
         self.q_data_type = model_runner.dtype
         self.attn_backend = attn_backend
-        self.causal = attn_backend.prefill_causal
+        self.causal = attn_backend.causal
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr

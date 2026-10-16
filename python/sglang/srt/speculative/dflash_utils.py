@@ -6,13 +6,13 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
-import msgspec
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
@@ -167,9 +167,15 @@ def dflash_draft_cell_size_per_token(
 
     dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
     if getattr(draft_model_config, "attention_arch", None) == AttentionArch.MLA:
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
         # The compressed latent is replicated across TP ranks, not expanded
         # into per-head K/V or sharded with the query heads.
-        kv_dim = draft_model_config.kv_lora_rank + draft_model_config.qk_rope_head_dim
+        kv_dim = calculate_mla_kv_cache_dim(
+            model_config=draft_model_config, kv_cache_dtype=draft_kv_cache_dtype
+        )
         return int(kv_dim * int(draft_num_layers) * dtype_size)
     num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
     kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
@@ -612,57 +618,100 @@ def is_dflash_mla_draft_config(draft_hf_config: Any) -> bool:
     return True
 
 
-class DFlashMLAConfig(msgspec.Struct, frozen=True):
-    q_lora_rank: Optional[int]
-    kv_lora_rank: int
-    qk_nope_head_dim: int
-    qk_rope_head_dim: int
-    v_head_dim: int
-    # True: DeepSeek interleaved pairs; False: NeoX halves.
-    rope_interleave: bool
-
-    @property
-    def qk_head_dim(self) -> int:
-        return self.qk_nope_head_dim + self.qk_rope_head_dim
+# The served MLA layer reinterprets any RoPE scaling as DeepSeek YaRN.
+_DFLASH_MLA_ROPE_TYPES = frozenset({"default", "yarn", "deepseek_yarn"})
+# Backends whose MLA verify path also masks a bidirectional DFlash draft.
+DFLASH_MLA_DRAFT_ATTENTION_BACKENDS = ("triton", "flashinfer", "tokenspeed_mla")
 
 
-def parse_dflash_mla_config(draft_hf_config: Any) -> DFlashMLAConfig:
-    """Validate the MLA dimension fields the way SpecForge's
-    ``validate_dflash_mla_config`` does at training time."""
+def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
+    """Reject MLA draft settings the target's DeepSeek MLA layer cannot serve."""
     text_config = _get_text_config(draft_hf_config)
     required = ("kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
     missing = [name for name in required if _cfg_get(text_config, name) is None]
     if missing:
         raise ValueError(f"DFLASH mla draft config is missing {missing}.")
-
-    def _dim(name: str, min_value: int) -> int:
-        return _parse_optional_int(
-            _cfg_get(text_config, name),
-            field_name=f"DFLASH mla {name}",
-            min_value=min_value,
-        )
-
-    q_lora_rank = _cfg_get(text_config, "q_lora_rank")
-    if q_lora_rank is not None:
-        q_lora_rank = _dim("q_lora_rank", 1)
-    qk_rope_head_dim = _dim("qk_rope_head_dim", 1)
-    if qk_rope_head_dim % 2:
+    if _cfg_get(text_config, "attention_bias", False):
+        raise ValueError("DFLASH mla drafts do not support attention_bias.")
+    draft_cfg = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    if draft_cfg.attention_sink_bias or draft_cfg.attention_value_scale is not None:
         raise ValueError(
-            f"DFLASH mla qk_rope_head_dim must be even, got {qk_rope_head_dim}."
+            "DFLASH mla drafts support neither attention_sink_bias nor "
+            "attention_value_scale."
         )
-    rope_interleave = _cfg_get(text_config, "rope_interleave", True)
-    if not isinstance(rope_interleave, bool):
-        raise ValueError(
-            f"DFLASH mla rope_interleave must be a bool, got {rope_interleave!r}."
-        )
-    return DFlashMLAConfig(
-        q_lora_rank=q_lora_rank,
-        kv_lora_rank=_dim("kv_lora_rank", 1),
-        qk_nope_head_dim=_dim("qk_nope_head_dim", 0),
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=_dim("v_head_dim", 1),
-        rope_interleave=rope_interleave,
+    rope = (
+        _cfg_get(text_config, "rope_parameters")
+        or _cfg_get(text_config, "rope_scaling")
+        or {}
     )
+    rope_type = rope.get("rope_type", rope.get("type", "default"))
+    if rope_type not in _DFLASH_MLA_ROPE_TYPES:
+        raise ValueError(
+            f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
+            f"got {rope_type!r}."
+        )
+
+
+def resolve_dflash_mla_draft_attention_backend(backend: Optional[str]) -> str:
+    # The target's backend is not a safe default: it need not mask a
+    # bidirectional draft, and triton alone serves sliding MLA layers.
+    backend = backend or "triton"
+    if backend not in DFLASH_MLA_DRAFT_ATTENTION_BACKENDS:
+        raise ValueError(
+            "DFLASH mla drafts support --speculative-draft-attention-backend in "
+            f"{list(DFLASH_MLA_DRAFT_ATTENTION_BACKENDS)}, got {backend!r}."
+        )
+    return backend
+
+
+def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+    """Honor explicit causality while preserving legacy layer defaults."""
+    text_config = config.get_text_config()
+    is_causal = getattr(text_config, "is_causal", None)
+    if is_causal is None:
+        return default
+    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
+
+
+def get_dflash_layer_attention_params(
+    config, layer_id: int
+) -> Tuple[int, AttentionType]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return -1, AttentionType.ENCODER_ONLY
+    if layer_id >= len(layer_types):
+        raise ValueError(
+            "DFLASH config.layer_types must contain one entry per draft layer. "
+            f"Got {len(layer_types)} entries, layer_id={layer_id}."
+        )
+
+    layer_type = layer_types[layer_id]
+    if layer_type == "full_attention":
+        return -1, _get_dflash_attention_type(
+            config, default=AttentionType.ENCODER_ONLY
+        )
+    if layer_type == "sliding_attention":
+        sliding_window_size = get_dflash_attention_sliding_window_size(config)
+        assert sliding_window_size is not None
+        return sliding_window_size, _get_dflash_attention_type(
+            config, default=AttentionType.DECODER
+        )
+    raise ValueError(
+        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
+    )
+
+
+def is_dflash_mla_draft_causal(draft_hf_config: Any) -> bool:
+    """The one causality of a full-attention MLA draft, for backends that fix
+    it when they plan a batch."""
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if layer_types is not None and "sliding_attention" in layer_types:
+        raise ValueError(
+            "DFLASH mla sliding_attention layers require "
+            "--speculative-draft-attention-backend triton."
+        )
+    _, attn_type = get_dflash_layer_attention_params(draft_hf_config, layer_id=0)
+    return attn_type == AttentionType.DECODER
 
 
 @dataclass(frozen=True)

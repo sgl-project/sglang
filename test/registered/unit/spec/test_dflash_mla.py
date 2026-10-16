@@ -1,4 +1,4 @@
-"""Compressed DFlash MLA against SpecForge's expanded attention math."""
+"""DFlash MLA drafts on the target MLA layer against SpecForge's expanded math."""
 
 import copy
 import itertools
@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3Config
 
@@ -24,7 +23,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
     dflash_draft_cell_size_per_token,
     get_dflash_attention_modes,
+    is_dflash_mla_draft_causal,
     is_dflash_mla_draft_config,
+    validate_dflash_mla_draft_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.parallel_groups import publish
@@ -33,7 +34,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
-HIDDEN, HEADS, KV_LORA, NOPE, ROPE, VDIM, THETA, EPS = 16, 2, 8, 8, 4, 6, 1e4, 1e-6
+# Row widths stay multiples of 8: the target's fused RMSNorm reads 16-byte rows.
+HIDDEN, HEADS, KV_LORA, NOPE, ROPE, VDIM, THETA, EPS = 16, 2, 8, 8, 8, 6, 1e4, 1e-6
+Q_LORA = 16
 # SpecForge's Qwen3DFlashMLAAttention parameter names (external checkpoint layout).
 SPECFORGE_KV_KEYS = {
     "kv_a_proj_with_mqa.weight",
@@ -43,20 +46,19 @@ SPECFORGE_KV_KEYS = {
 }
 SPECFORGE_Q_KEYS = {
     None: {"q_proj.weight"},
-    12: {"q_a_proj.weight", "q_a_layernorm.weight", "q_b_proj.weight"},
+    Q_LORA: {"q_a_proj.weight", "q_a_layernorm.weight", "q_b_proj.weight"},
 }
+# The target MLA layer fuses q_a_proj with kv_a_proj_with_mqa.
+FUSED_A_PROJ = "fused_qkv_a_proj_with_mqa.weight"
 
 
-def _export_fields(
-    q_lora_rank=None, rope_interleave=True, attention_bias=False, **dflash_overrides
-):
+def _export_fields(q_lora_rank=None, rope_interleave=True, **dflash_overrides):
     """A SpecForge MLA export: head_dim / num_key_value_heads keep the GQA
     template's values, which the MLA layers do not use."""
     dflash_config = {"attention_mode": "mla", "block_size": 4, "target_layer_ids": [0]}
     dflash_config.update(dflash_overrides)
     return dict(
         architectures=["DFlashDraftModel"],
-        attention_bias=attention_bias,
         hidden_size=HIDDEN,
         intermediate_size=32,
         num_hidden_layers=1,
@@ -87,6 +89,18 @@ def _randomize(module: nn.Module) -> None:
     with torch.no_grad():
         for param in module.parameters():
             param.copy_(torch.randn_like(param) * 0.2 + (param == 1).float())
+    module.absorb_kv_b_proj()
+
+
+def _specforge_weights(attn) -> dict:
+    """The served layer's weights under SpecForge's checkpoint names."""
+    weights = {name: param for name, param in attn.named_parameters()}
+    if attn.q_lora_rank is not None:
+        fused = weights.pop(FUSED_A_PROJ)
+        weights["q_a_proj.weight"], weights["kv_a_proj_with_mqa.weight"] = fused.split(
+            [attn.q_lora_rank, KV_LORA + ROPE]
+        )
+    return weights
 
 
 # ---- SpecForge reference math (Qwen3DFlashMLAAttention._compute_qkv) ---------
@@ -123,9 +137,7 @@ def _mla_rope(x, positions, interleaved):
 
 
 def _reference_kv(w, hidden, positions, interleaved):
-    latent = F.linear(
-        hidden, w["kv_a_proj_with_mqa.weight"], w.get("kv_a_proj_with_mqa.bias")
-    )
+    latent = hidden @ w["kv_a_proj_with_mqa.weight"].T
     kv_a, k_pe = latent.split([KV_LORA, ROPE], dim=-1)
     kv = _rmsnorm(kv_a, w["kv_a_layernorm.weight"]) @ w["kv_b_proj.weight"].T
     k_nope, v = kv.view(-1, HEADS, NOPE + VDIM).split([NOPE, VDIM], dim=-1)
@@ -135,15 +147,12 @@ def _reference_kv(w, hidden, positions, interleaved):
 
 def _reference_output(attn, ctx_hidden, ctx_positions, hidden, positions, interleaved):
     """Computed in fp32 from the module's (possibly bf16) weights."""
-    w = {name: param.float() for name, param in attn.named_parameters()}
+    w = {name: param.float() for name, param in _specforge_weights(attn).items()}
     ctx_hidden, hidden = ctx_hidden.float(), hidden.float()
     if attn.q_lora_rank is None:
         q = hidden @ w["q_proj.weight"].T
     else:
-        q_a = _rmsnorm(
-            F.linear(hidden, w["q_a_proj.weight"], w.get("q_a_proj.bias")),
-            w["q_a_layernorm.weight"],
-        )
+        q_a = _rmsnorm(hidden @ w["q_a_proj.weight"].T, w["q_a_layernorm.weight"])
         q = q_a @ w["q_b_proj.weight"].T
     q_nope, q_pe = q.view(-1, HEADS, NOPE + ROPE).split([NOPE, ROPE], dim=-1)
     q = torch.cat((q_nope, _mla_rope(q_pe, positions, interleaved)), dim=-1)
@@ -152,7 +161,7 @@ def _reference_output(attn, ctx_hidden, ctx_positions, hidden, positions, interl
     k, v = torch.cat((k_ctx, k_blk)), torch.cat((v_ctx, v_blk))
     probs = (torch.einsum("qhd,khd->hqk", q, k) * (NOPE + ROPE) ** -0.5).softmax(-1)
     out = torch.einsum("hqk,khd->qhd", probs, v).reshape(-1, HEADS * VDIM)
-    return F.linear(out, w["o_proj.weight"], w.get("o_proj.bias"))
+    return out @ w["o_proj.weight"].T
 
 
 class _BlockOverCachedContext(nn.Module):
@@ -166,7 +175,7 @@ class _BlockOverCachedContext(nn.Module):
         super().__init__()
         self.radix, self.k_ctx, self.v_ctx = radix, k_ctx, v_ctx
 
-    def forward(self, q, k, v, forward_batch, q_rope=None, k_rope=None):
+    def forward(self, q, k, v, forward_batch, q_rope=None, k_rope=None, **kwargs):
         heads, qk_dim, v_dim = (
             self.radix.tp_q_head_num,
             self.radix.qk_head_dim,
@@ -187,18 +196,24 @@ class _BlockOverCachedContext(nn.Module):
 
 
 def _serve_block(attn, ctx_hidden, ctx_positions, hidden, positions, backend="triton"):
-    """The worker's context-KV hook order, then the draft block forward."""
-    latent, k_pe = attn.kv_proj_only(ctx_hidden)
-    assert latent.shape == (ctx_hidden.shape[0], KV_LORA)
-    assert k_pe.shape == (ctx_hidden.shape[0], ROPE)
-    k_pe = attn.apply_k_rope(ctx_positions, k_pe)
-    k_ctx = torch.cat((attn.apply_k_norm(latent), k_pe), dim=-1).unsqueeze(1)
-    attn.attn = _BlockOverCachedContext(attn.attn, k_ctx, latent.unsqueeze(1))
+    """The worker's context-KV write, then the draft block forward."""
+    k_nope, k_pe = attn.project_context_kv(ctx_positions, ctx_hidden)
+    assert k_nope.shape == (ctx_hidden.shape[0], 1, KV_LORA)
+    assert k_pe.shape == (ctx_hidden.shape[0], 1, ROPE)
+    k_ctx = torch.cat((k_nope, k_pe), dim=-1)
+    attn.attn_mqa = _BlockOverCachedContext(attn.attn_mqa, k_ctx, k_nope)
     backend = SimpleNamespace(
-        prefill_attention_backend_str=backend, decode_attention_backend_str=backend
+        prefill_attention_backend_str=backend,
+        decode_attention_backend_str=backend,
+        data_type=hidden.dtype,
     )
-    batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        extend_prefix_lens_cpu=None,
+        attn_cp_metadata=None,
+    )
     with (
+        torch.no_grad(),
         forward_context(ForwardContext(attn_backend=backend)),
         patch.object(
             attn.kv_b_proj,
@@ -213,7 +228,8 @@ class _SingleRankTestCase(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy", device="cpu", tp_size=1), role="test")
+        # The CPU RoPE factory serves only DeepSeek YaRN; the tensors stay on CPU.
+        publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
 
 
 class TestDFlashMLAConfig(_SingleRankTestCase):
@@ -252,9 +268,11 @@ class TestDFlashMLAConfig(_SingleRankTestCase):
             )
             draft = ModelConfig(path, is_draft_model=True)
 
-        self.assertEqual((draft.head_dim, draft.v_head_dim), (NOPE + ROPE, VDIM))
+        self.assertTrue(draft.is_dflash_mla_draft)
         self.assertEqual(draft.attention_arch, AttentionArch.MLA)
-        self.assertEqual(draft.get_num_kv_heads(1), 1)
+        self.assertEqual((draft.kv_lora_rank, draft.qk_rope_head_dim), (KV_LORA, ROPE))
+        # The GQA template's head_dim must not size a separate SWA buffer.
+        self.assertEqual(draft.swa_v_head_dim, draft.v_head_dim)
         # Latents are replicated across TP ranks, not divided by the head count.
         for tp_size in (1, 2):
             self.assertEqual(
@@ -267,39 +285,50 @@ class TestDFlashMLAConfig(_SingleRankTestCase):
                 (KV_LORA + ROPE) * 2,
             )
 
-    def test_raw_export_uses_absorbed_attention_dimensions(self):
-        attn = DFlashMLAAttention(_served_config(), layer_id=0)
-        self.assertEqual(attn.attn.qk_head_dim, KV_LORA + ROPE)
-        self.assertEqual(attn.attn.v_head_dim, KV_LORA)
-        self.assertEqual(attn.attn.tp_k_head_num, 1)
-        self.assertEqual(attn.attn.scaling, (NOPE + ROPE) ** -0.5)
-        self.assertEqual(attn.attn.attn_type, AttentionType.ENCODER_ONLY)
-
-    def test_rejects_quantized_draft_weights(self):
+    def test_rejects_settings_the_target_layer_cannot_serve(self):
+        cases = {
+            "missing": {"kv_lora_rank": None},
+            "attention_bias": {"attention_bias": True},
+            "support neither": {"dflash_config": {"attention_sink_bias": True}},
+            "rope_type": {"rope_scaling": {"rope_type": "linear", "factor": 2.0}},
+        }
+        for message, overrides in cases.items():
+            with self.subTest(message=message):
+                fields = _export_fields()
+                dflash_config = {
+                    **fields["dflash_config"],
+                    **overrides.pop("dflash_config", {}),
+                }
+                fields.update(overrides, dflash_config=dflash_config)
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_dflash_mla_draft_config(fields)
         with self.assertRaisesRegex(ValueError, "unquantized draft weights"):
             DFlashMLAAttention(_served_config(), layer_id=0, quant_config=object())
 
-    def test_rejects_unsupported_attention_modifiers(self):
-        for options in (
-            {"attention_sink_bias": True},
-            {"attention_value_scale": 0.0},
-            {"attention_value_scale": 2.0},
+    def test_layer_and_planned_causality_agree(self):
+        """Backends that plan per batch must mask exactly like the layers do."""
+        for layer_types, is_causal, expected in (
+            (None, None, AttentionType.ENCODER_ONLY),
+            (None, True, AttentionType.ENCODER_ONLY),
+            (["full_attention"], None, AttentionType.ENCODER_ONLY),
+            (["full_attention"], False, AttentionType.ENCODER_ONLY),
+            (["full_attention"], True, AttentionType.DECODER),
         ):
-            with (
-                self.subTest(options=options),
-                self.assertRaisesRegex(ValueError, "supports neither"),
-            ):
-                DFlashMLAAttention(_served_config(**options), layer_id=0)
-
-    def test_honors_explicit_causality(self):
+            with self.subTest(layer_types=layer_types, is_causal=is_causal):
+                config = _served_config()
+                config.layer_types = layer_types
+                config.is_causal = is_causal
+                attn = DFlashMLAAttention(config, layer_id=0)
+                self.assertEqual(attn.attn_mqa.attn_type, expected)
+                self.assertEqual(
+                    is_dflash_mla_draft_causal(config),
+                    expected == AttentionType.DECODER,
+                )
         config = _served_config()
-        config.layer_types = ["full_attention"]
-        config.is_causal = True
-        attn = DFlashMLAAttention(config, layer_id=0)
-        self.assertEqual(attn.attn.attn_type, AttentionType.DECODER)
-        config.is_causal = False
-        attn = DFlashMLAAttention(config, layer_id=0)
-        self.assertEqual(attn.attn.attn_type, AttentionType.ENCODER_ONLY)
+        config.layer_types = ["sliding_attention"]
+        config.sliding_window = 8
+        with self.assertRaisesRegex(ValueError, "triton"):
+            is_dflash_mla_draft_causal(config)
 
 
 class TestDFlashMLAWeights(_SingleRankTestCase):
@@ -308,12 +337,10 @@ class TestDFlashMLAWeights(_SingleRankTestCase):
             with self.subTest(q_lora_rank=q_lora_rank):
                 model = DFlashDraftModel(_served_config(q_lora_rank=q_lora_rank))
                 self.assertFalse(model.supports_fused_context_kv)
-                attn_keys = {
-                    name.removeprefix("layers.0.self_attn.")
-                    for name, _ in model.named_parameters()
-                    if name.startswith("layers.0.self_attn.")
-                }
-                self.assertEqual(attn_keys, SPECFORGE_KV_KEYS | q_keys)
+                attn = model.layers[0].self_attn
+                self.assertEqual(
+                    set(_specforge_weights(attn)), SPECFORGE_KV_KEYS | q_keys
+                )
 
                 checkpoint = {}
                 for name, param in model.named_parameters():
@@ -322,8 +349,10 @@ class TestDFlashMLAWeights(_SingleRankTestCase):
                         prefix = name.removesuffix("gate_up_proj.weight")
                         checkpoint[prefix + "gate_proj.weight"] = gate
                         checkpoint[prefix + "up_proj.weight"] = up
-                    else:
+                    elif not name.startswith("layers.0.self_attn."):
                         checkpoint[name] = torch.randn_like(param)
+                for name, param in _specforge_weights(attn).items():
+                    checkpoint["layers.0.self_attn." + name] = torch.randn_like(param)
                 model.load_weights(checkpoint.items())
 
                 for name, param in model.named_parameters():
@@ -335,9 +364,28 @@ class TestDFlashMLAWeights(_SingleRankTestCase):
                                 checkpoint[prefix + "up_proj.weight"],
                             )
                         )
+                    elif name.startswith("layers.0.self_attn."):
+                        continue
                     else:
                         expected = checkpoint[name]
                     torch.testing.assert_close(param, expected, rtol=0, atol=0)
+                for name, param in _specforge_weights(attn).items():
+                    torch.testing.assert_close(
+                        param,
+                        checkpoint["layers.0.self_attn." + name],
+                        rtol=0,
+                        atol=0,
+                    )
+                # Loading derives the absorbed per-head projections.
+                w_kc, w_vc = (
+                    checkpoint["layers.0.self_attn.kv_b_proj.weight"]
+                    .view(HEADS, NOPE + VDIM, KV_LORA)
+                    .split([NOPE, VDIM], dim=1)
+                )
+                torch.testing.assert_close(attn.w_kc, w_kc, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0
+                )
 
 
 class TestDFlashMLANumerics(_SingleRankTestCase):
@@ -346,32 +394,28 @@ class TestDFlashMLANumerics(_SingleRankTestCase):
     pair convention, and K/V rows that differ in width."""
 
     def _check(self, *, device, dtype, use_torch_reference_ops, atol):
-        for q_lora_rank, interleaved, bias, backend in itertools.product(
-            (None, 12),
+        for q_lora_rank, interleaved, backend in itertools.product(
+            (None, Q_LORA),
             (True, False),
-            (False, True),
             ("triton", "flashinfer", "tokenspeed_mla"),
         ):
             with self.subTest(
                 q_lora_rank=q_lora_rank,
                 rope_interleave=interleaved,
-                attention_bias=bias,
                 backend=backend,
             ):
                 attn = DFlashMLAAttention(
                     _served_config(
-                        q_lora_rank=q_lora_rank,
-                        rope_interleave=interleaved,
-                        attention_bias=bias,
+                        q_lora_rank=q_lora_rank, rope_interleave=interleaved
                     ),
                     layer_id=0,
                 )
-                _randomize(attn)
                 # get_rope() shares one cached instance; keep .to() from leaking out.
                 attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
                 rope_cache = attn.rotary_emb.cos_sin_cache
                 attn.to(device=device, dtype=dtype)
                 attn.rotary_emb.cos_sin_cache = rope_cache.to(device=device)
+                _randomize(attn)
                 if use_torch_reference_ops:
                     # Only CPU tests replace fused-op dispatch with PyTorch
                     # reference methods. CUDA keeps normal projection/norm/RoPE

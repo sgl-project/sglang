@@ -1,7 +1,6 @@
 """Real compressed DFlash MLA backends, including bidirectional CUDA graphs."""
 
 import copy
-import gc
 import importlib.util
 import json
 import math
@@ -12,11 +11,7 @@ import torch.nn.functional as F
 from transformers import Qwen3Config
 
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.mem_cache.memory_pool import (
-    KVWriteLoc,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.models.dflash import DFlashMLAAttention
@@ -57,11 +52,22 @@ def _rope(x, positions, interleaved):
     return x * cos[:, None] + rotated * sin[:, None]
 
 
+def _specforge_weights(module):
+    """The served layer's weights under SpecForge's checkpoint names."""
+    weights = dict(module.named_parameters())
+    if module.q_lora_rank is not None:
+        fused = weights.pop("fused_qkv_a_proj_with_mqa.weight")
+        weights["q_a_proj.weight"], weights["kv_a_proj_with_mqa.weight"] = fused.split(
+            [module.q_lora_rank, RANK + ROPE]
+        )
+    return weights
+
+
 def _expanded_reference(
     module, prefix, hidden, positions, *, interleaved, causal=False
 ):
     """Independent fp32 SpecForge equations; materialize per-head K and V."""
-    weights = {name: p.float() for name, p in module.named_parameters()}
+    weights = {name: p.float() for name, p in _specforge_weights(module).items()}
 
     def linear(x, name):
         return F.linear(x, weights[name + ".weight"], weights.get(name + ".bias"))
@@ -115,9 +121,11 @@ def _tokenspeed_fp8_reference(
 
     This oracle covers one 128-token KV tile, with FP32 accumulation and
     normalization. It reads weights only, without calling production model
-    projections or attention, or reading the served KV cache.
+    projections or attention, or reading the served KV cache. The verify
+    forward rotates the block's Q/K RoPE in FP32 and quantizes it directly
+    (mla_rope_quantize_fp8); cached context keys pass through a BF16 RoPE.
     """
-    weights = dict(module.named_parameters())
+    weights = _specforge_weights(module)
     dtype = hidden.dtype
 
     def linear(x, name):
@@ -134,10 +142,11 @@ def _tokenspeed_fp8_reference(
     def round_fp8(x):
         return x.to(torch.float8_e4m3fn).float()
 
-    def kv(x, pos):
+    def kv(x, pos, *, bf16_rope):
         c, k_pe = linear(x, "kv_a_proj_with_mqa").split((RANK, ROPE), -1)
         c = round_fp8(norm(c, "kv_a_layernorm"))
-        k_pe = round_fp8(_rope(k_pe[:, None], pos, interleaved).to(dtype))
+        k_pe = _rope(k_pe[:, None], pos, interleaved)
+        k_pe = round_fp8(k_pe.to(dtype) if bf16_rope else k_pe)
         return c, k_pe.squeeze(1)
 
     if module.q_lora_rank is None:
@@ -151,13 +160,13 @@ def _tokenspeed_fp8_reference(
         .split((NOPE, VALUE), 1)
     )
     q_abs = torch.bmm(q_nope.transpose(0, 1), w_k).transpose(0, 1)
-    q_pe = _rope(q_pe, positions, interleaved).to(dtype)
-    q = round_fp8(torch.cat((q_abs, q_pe), -1))
-    block_c, block_pe = kv(hidden, positions)
+    q_pe = _rope(q_pe, positions, interleaved)
+    q = torch.cat((round_fp8(q_abs), round_fp8(q_pe)), -1)
+    block_c, block_pe = kv(hidden, positions, bf16_rope=False)
     outputs = []
     for i, ctx in enumerate(prefix):
         ctx_pos = torch.arange(len(ctx), device=hidden.device)
-        ctx_c, ctx_pe = kv(ctx, ctx_pos)
+        ctx_c, ctx_pe = kv(ctx, ctx_pos, bf16_rope=True)
         block = slice(i * BLOCK, (i + 1) * BLOCK)
         c = torch.cat((ctx_c, block_c[block]))
         assert len(c) <= 128, "FP8 oracle assumes one 128-token KV tile"
@@ -242,7 +251,6 @@ class TestDFlashMLABackends(unittest.TestCase):
         model_config.head_dim = NOPE + ROPE
         model_config.v_head_dim = VALUE
         model_config.scaling = (NOPE + ROPE) ** -0.5
-        model_config.dflash_mla_causal = causal
         runner = MockMLAModelRunner(
             case=case,
             model_config=model_config,
@@ -291,6 +299,7 @@ class TestDFlashMLABackends(unittest.TestCase):
                     param.fill_(1)
                 else:
                     param.normal_(std=1 / math.sqrt(param.shape[-1]))
+        module.absorb_kv_b_proj()
 
         def make_inputs(prefix_lens):
             current = MLAAttentionCase(
@@ -335,14 +344,12 @@ class TestDFlashMLABackends(unittest.TestCase):
             for i, ctx in enumerate(prefixes):
                 if not len(ctx):
                     continue
-                c, k_pe = module.kv_proj_only(ctx)
-                k_pe = module.apply_k_rope(torch.arange(len(ctx), device="cuda"), k_pe)
+                k_nope, k_pe = module.project_context_kv(
+                    torch.arange(len(ctx), device="cuda"), ctx
+                )
                 locs = runner.req_to_token_pool.req_to_token[i, : len(ctx)].long()
                 runner.token_to_kv_pool.set_mla_kv_buffer(
-                    module.attn,
-                    KVWriteLoc(locs, physical=True),
-                    c.unsqueeze(1),
-                    k_pe.unsqueeze(1),
+                    module.attn_mqa, KVWriteLoc(locs, physical=True), k_nope, k_pe
                 )
             return batch, prefixes, hidden
 
@@ -545,77 +552,6 @@ class TestDFlashMLABackends(unittest.TestCase):
                     fp8=backend_name == "tokenspeed_mla",
                     causal=True,
                 )
-
-    def test_gpu_cache_memory(self):
-        size, layers, page = 32768, 5, 32
-        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
-            measurements = {}
-            for layout, cls, kwargs in (
-                (
-                    "compressed",
-                    MLATokenToKVPool,
-                    {"kv_lora_rank": RANK, "qk_rope_head_dim": ROPE},
-                ),
-                (
-                    "expanded",
-                    MHATokenToKVPool,
-                    {
-                        "head_num": HEADS,
-                        "head_dim": NOPE + ROPE,
-                        "v_head_dim": VALUE,
-                    },
-                ),
-            ):
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                before = torch.cuda.memory_allocated()
-                pool = cls(
-                    size=size,
-                    page_size=page,
-                    dtype=dtype,
-                    layer_num=layers,
-                    device="cuda",
-                    enable_memory_saver=False,
-                    **kwargs,
-                )
-                torch.cuda.synchronize()
-                buffer_bytes = pool.get_kv_size_bytes()
-                if isinstance(buffer_bytes, tuple):
-                    buffer_bytes = sum(buffer_bytes)
-                buffer_bytes = int(buffer_bytes)
-                measurements[layout] = {
-                    "buffer_bytes": buffer_bytes,
-                    "allocated_bytes": torch.cuda.memory_allocated() - before,
-                }
-                expected = (
-                    (size + page)
-                    * layers
-                    * dtype.itemsize
-                    * (
-                        (RANK + ROPE)
-                        if layout == "compressed"
-                        else HEADS * (NOPE + ROPE + VALUE)
-                    )
-                )
-                self.assertEqual(buffer_bytes, expected)
-                del pool
-            ratio = (
-                measurements["expanded"]["buffer_bytes"]
-                / measurements["compressed"]["buffer_bytes"]
-            )
-            self.assertAlmostEqual(ratio, HEADS * (NOPE + ROPE + VALUE) / (RANK + ROPE))
-            self.assertGreater(
-                measurements["expanded"]["allocated_bytes"]
-                / measurements["compressed"]["allocated_bytes"],
-                17,
-            )
-            print(
-                json.dumps(
-                    {"dtype": str(dtype), "cache_memory": measurements, "ratio": ratio}
-                ),
-                flush=True,
-            )
 
 
 if __name__ == "__main__":

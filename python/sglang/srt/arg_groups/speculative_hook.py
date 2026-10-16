@@ -829,12 +829,15 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     cfg = resolving_view(server_args)
 
-    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+    from sglang.srt.speculative.dflash_utils import (
+        is_dflash_mla_draft_config,
+        resolve_dflash_mla_draft_attention_backend,
+    )
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     def load_draft_config():
         kwargs = {}
-        config_file = getattr(cfg, "decrypted_draft_config_file", None)
+        config_file = cfg.decrypted_draft_config_file
         if config_file and config_file.strip():
             kwargs["_configuration_file"] = config_file.strip()
         return get_config(
@@ -846,18 +849,20 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
 
     # Out-of-tree platforms own their draft backend dispatch, including config
-    # loading. The compressed MLA implementation here is CUDA/HIP-only.
+    # loading, so they never take the MLA draft path.
     draft_hf_config = None if current_platform.is_out_of_tree() else load_draft_config()
     if draft_hf_config is not None and is_dflash_mla_draft_config(draft_hf_config):
-        from sglang.srt.speculative.dflash_mla_backend import (
-            resolve_dflash_mla_attention_backend,
-        )
-
+        if cfg.dcp_size > 1:
+            # The draft pool is not DCP-sharded, but the target MLA layer
+            # would gather across DCP ranks.
+            raise ValueError("DFLASH mla drafts do not support --dcp-size > 1.")
         declare_resolution(
             server_args,
             "_resolve_dflash_draft_attention_backend",
-            speculative_draft_attention_backend=resolve_dflash_mla_attention_backend(
-                cfg.speculative_draft_attention_backend
+            speculative_draft_attention_backend=(
+                resolve_dflash_mla_draft_attention_backend(
+                    cfg.speculative_draft_attention_backend
+                )
             ),
         )
         return

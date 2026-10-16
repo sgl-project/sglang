@@ -271,9 +271,6 @@ def _build_backend_from_str(
 def _build_full_attention_backend_from_str(
     *, model_runner: ModelRunner, backend_str: str, init_new_workspace: bool
 ) -> AttentionBackend:
-    from sglang.srt.speculative.dflash_mla_backend import validate_dflash_mla_runner
-
-    validate_dflash_mla_runner(model_runner, backend_str)
     if backend_str not in ATTENTION_BACKENDS:
         raise ValueError(f"Invalid attention backend: {backend_str}")
     model_runner.init_new_workspace = init_new_workspace

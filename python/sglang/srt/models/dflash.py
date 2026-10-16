@@ -14,9 +14,9 @@ from torch import nn
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.configs.model_config import compute_mla_mscale_scaling
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -29,28 +29,27 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
-from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
-    get_dflash_layer_types,
+    get_dflash_layer_attention_params,
     is_dense_head_weight,
     is_dflash_mla_draft_config,
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
-    parse_dflash_mla_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs
+from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -156,43 +155,6 @@ def candidate_topk(
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
 
 
-def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
-    """Honor explicit causality while preserving legacy layer defaults."""
-    text_config = config.get_text_config()
-    is_causal = getattr(text_config, "is_causal", None)
-    if is_causal is None:
-        return default
-    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
-
-
-def _get_dflash_layer_attention_params(
-    config, layer_id: int
-) -> Tuple[int, AttentionType]:
-    layer_types = get_dflash_layer_types(config)
-    if layer_types is None:
-        return -1, AttentionType.ENCODER_ONLY
-    if layer_id >= len(layer_types):
-        raise ValueError(
-            "DFLASH config.layer_types must contain one entry per draft layer. "
-            f"Got {len(layer_types)} entries, layer_id={layer_id}."
-        )
-
-    layer_type = layer_types[layer_id]
-    if layer_type == "full_attention":
-        return -1, _get_dflash_attention_type(
-            config, default=AttentionType.ENCODER_ONLY
-        )
-    if layer_type == "sliding_attention":
-        sliding_window_size = get_dflash_attention_sliding_window_size(config)
-        assert sliding_window_size is not None
-        return sliding_window_size, _get_dflash_attention_type(
-            config, default=AttentionType.DECODER
-        )
-    raise ValueError(
-        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
-    )
-
-
 _ROPE_DIM_SUPERSEDED_KEYS = frozenset(
     {"rope_dim", "partial_rotary_factor", "mrope_section", "mrope_interleaved"}
 )
@@ -287,7 +249,7 @@ class DFlashAttention(nn.Module):
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)
         )
-        self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
+        self.sliding_window_size, self.attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
         draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
@@ -448,191 +410,80 @@ class DFlashAttention(nn.Module):
         return k
 
 
-class DFlashMLAAttention(nn.Module):
-    """SpecForge MLA projections using SGLang's compressed MLA backends.
+class DFlashMLAAttention(DeepseekV2AttentionMLA):
+    """SpecForge MLA draft attention served by the target's absorbed MLA path.
 
-    Absorb the K projection into Q and apply the V projection after attention,
-    exactly as the target MLA path does. The cache holds one normalized latent
-    and one rotated RoPE slice per token, independent of the number of heads.
-    Keep the SpecForge projection names and bias policy for checkpoint loading.
+    SpecForge exports DeepSeek's MLA parameter names and RoPE conventions, so
+    only the DFlash layer causality, context-KV writes and loading differ.
     """
-
-    is_mla = True
 
     def __init__(
         self, config, layer_id: int, quant_config=None, prefix: str = ""
     ) -> None:
-        super().__init__()
-        if _is_npu:
-            raise NotImplementedError("DFLASH mla draft attention is CUDA/HIP only.")
         if quant_config is not None:
-            raise ValueError(
-                "Compressed DFLASH MLA requires unquantized draft weights. "
-                "Target-model quantization is independent and remains supported."
-            )
-        draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
-        if draft_cfg.attention_sink_bias or draft_cfg.attention_value_scale is not None:
-            raise ValueError(
-                "DFLASH mla draft attention supports neither attention_sink_bias "
-                "nor attention_value_scale."
-            )
-        mla = parse_dflash_mla_config(config)
-        hidden_size = int(config.hidden_size)
-        tp_size = int(get_parallel().tp_size)
-        self.total_num_heads = int(config.num_attention_heads)
-        assert self.total_num_heads % tp_size == 0, (
-            "DFlashMLAAttention requires num_attention_heads divisible by tp_size. "
-            f"num_attention_heads={self.total_num_heads}, tp_size={tp_size}."
-        )
-        self.num_heads = self.total_num_heads // tp_size
-        self.num_kv_heads = 1
-        self.q_lora_rank = mla.q_lora_rank
-        self.kv_lora_rank = mla.kv_lora_rank
-        self.qk_nope_head_dim = mla.qk_nope_head_dim
-        self.qk_rope_head_dim = mla.qk_rope_head_dim
-        self.head_dim = mla.qk_head_dim
-        self.v_head_dim = mla.v_head_dim
-
-        attention_bias = bool(getattr(config, "attention_bias", False))
-        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
-
-        def _prefix(name: str) -> str:
-            return f"{prefix}.{name}" if prefix else name
-
-        q_out = self.total_num_heads * self.head_dim
-        if self.q_lora_rank is None:
-            self.q_proj = ColumnParallelLinear(
-                hidden_size,
-                q_out,
-                bias=False,
-                quant_config=quant_config,
-                prefix=_prefix("q_proj"),
-            )
-        else:
-            self.q_a_proj = ReplicatedLinear(
-                hidden_size,
-                self.q_lora_rank,
-                bias=attention_bias,
-                quant_config=quant_config,
-                prefix=_prefix("q_a_proj"),
-            )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
-                self.q_lora_rank,
-                q_out,
-                bias=False,
-                quant_config=quant_config,
-                prefix=_prefix("q_b_proj"),
-            )
-        self.kv_a_proj_with_mqa = ReplicatedLinear(
-            hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=_prefix("kv_a_proj_with_mqa"),
-        )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=rms_norm_eps)
-        # Per-head [k_nope | v] rows, so column sharding splits whole heads.
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            quant_config=quant_config,
-            prefix=_prefix("kv_b_proj"),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.v_head_dim,
-            hidden_size,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=_prefix("o_proj"),
-        )
-
-        rope_theta, rope_scaling = get_rope_config(config)
-        self.rotary_emb = get_rope(
-            self.qk_rope_head_dim,
-            rotary_dim=self.qk_rope_head_dim,
-            max_position=int(getattr(config, "max_position_embeddings", 32768)),
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=not mla.rope_interleave,
-        )
-        self.scaling = self.head_dim**-0.5
-        if rope_scaling:
-            self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
-
-        self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
+            raise ValueError("DFLASH mla drafts require unquantized draft weights.")
+        sliding_window_size, attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
-        self.attn = RadixAttention(
-            num_heads=self.num_heads,
-            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
-            scaling=self.scaling,
-            num_kv_heads=self.num_kv_heads,
+        rope_theta, rope_scaling = get_rope_config(config)
+        if rope_scaling is not None and rope_scaling.get(
+            "rope_type", rope_scaling.get("type")
+        ) in (None, "default"):
+            rope_scaling = None
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            # SpecForge omits q_lora_rank when Q has no low-rank path.
+            q_lora_rank=getattr(config, "q_lora_rank", None),
+            kv_lora_rank=config.kv_lora_rank,
+            rope_theta=rope_theta,
+            # The base class rewrites rope_type in place.
+            rope_scaling=dict(rope_scaling) if rope_scaling else None,
+            max_position_embeddings=config.max_position_embeddings,
             layer_id=layer_id,
-            v_head_dim=self.kv_lora_rank,
-            sliding_window_size=self.sliding_window_size,
-            attn_type=self.attn_type,
-            quant_config=quant_config,
+            prefix=prefix,
+            attn_type=attn_type,
+            sliding_window_size=sliding_window_size,
         )
-
-    def _project_q(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.q_lora_rank is None:
-            q, _ = self.q_proj(hidden_states)
-        else:
-            q, _ = self.q_a_proj(hidden_states)
-            q, _ = self.q_b_proj(self.q_a_layernorm(q))
-        return q.view(-1, self.num_heads, self.head_dim)
-
-    def _project_kv(
-        self, hidden_states: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Normalized latent [n, rank] and shared unrotated k_pe [n, rope]."""
-        latent, _ = self.kv_a_proj_with_mqa(hidden_states)
-        kv_a, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        return self.kv_a_layernorm(kv_a.contiguous()), k_pe.contiguous()
-
-    def _absorbed_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # These are views, so dtype/device changes and weight reloads cannot leave
-        # stale copies. Column parallelism has already selected complete heads.
-        weight = self.kv_b_proj.weight.view(
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        w_k, w_v = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
-        return w_k, w_v.transpose(1, 2)
-
-    def _attention(
-        self, q_abs, q_pe, latent, k_pe, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        backend = get_attn_backend()
-        backend_name = (
-            backend.decode_attention_backend_str
-            if forward_batch.forward_mode.is_decode_or_idle()
-            else backend.prefill_attention_backend_str
-        )
-        if backend_name == "triton":
-            # Same combined-row interface as the target's absorbed MLA path.
-            return self.attn(
-                torch.cat((q_abs, q_pe), dim=-1),
-                torch.cat((latent, k_pe), dim=-1),
-                latent,
-                forward_batch,
+        if self.q_lora_rank is not None:
+            # SpecForge stores the two halves of the fused down projection.
+            self.fused_qkv_a_proj_with_mqa.weight.weight_loader = (
+                self._load_fused_a_proj_shard
             )
-        if backend_name in {"flashinfer", "tokenspeed_mla"}:
-            return self.attn(
-                q_abs,
-                latent,
-                latent,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
+        kv_b_proj_loader = self.kv_b_proj.weight.weight_loader
+
+        def load_kv_b_proj(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+            kv_b_proj_loader(param, loaded_weight)
+            self.absorb_kv_b_proj()
+
+        self.kv_b_proj.weight.weight_loader = load_kv_b_proj
+
+    def _load_fused_a_proj_shard(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int
+    ) -> None:
+        rows = param.data.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+        )[shard_id]
+        if rows.shape != loaded_weight.shape:
+            raise ValueError(
+                f"DFLASH mla fused a_proj shard {shard_id} expects "
+                f"{tuple(rows.shape)}, got {tuple(loaded_weight.shape)}."
             )
-        raise ValueError(
-            "Compressed DFLASH MLA supports only triton, flashinfer, and "
-            f"tokenspeed_mla draft attention backends, got {backend_name!r}."
+        rows.copy_(loaded_weight)
+
+    def absorb_kv_b_proj(self) -> None:
+        """Split kv_b_proj into the per-head w_kc / w_vc the absorbed forward reads."""
+        w_kc, w_vc = self.kv_b_proj.weight.unflatten(
+            0, (-1, self.qk_nope_head_dim + self.v_head_dim)
+        ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        self.w_kc = bind_or_assign(
+            self.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
         )
+        self.w_vc = bind_or_assign(self.w_vc, w_vc.contiguous().transpose(1, 2))
 
     def forward(
         self,
@@ -640,47 +491,38 @@ class DFlashMLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        q_nope, q_pe = self._project_q(hidden_states).split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        get_attn_tp_context().set_attn_inputs(
+            AttentionInputs(hidden_states, forward_batch, self.prepare_qkv_latent)
         )
-        latent, k_pe = self._project_kv(hidden_states)
-        q_pe, k_pe = self.rotary_emb(
-            positions,
-            q_pe.reshape(-1, self.num_heads * self.qk_rope_head_dim),
-            k_pe,
+        # Sized for the fp8 bmm scales, which unquantized drafts never take.
+        zero_allocator = BumpAllocator(
+            buffer_size=2, dtype=torch.float32, device=hidden_states.device
         )
-        w_k, w_v = self._absorbed_weights()
-        q_abs = torch.bmm(q_nope.transpose(0, 1), w_k).transpose(0, 1)
-        attn_output = self._attention(
-            q_abs,
-            q_pe.view(-1, self.num_heads, self.qk_rope_head_dim),
-            latent.unsqueeze(1),
-            k_pe.unsqueeze(1),
-            forward_batch,
+        output = super().forward(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
         )
-        attn_output = attn_output.view(-1, self.num_heads, self.kv_lora_rank)
-        attn_output = (
-            torch.bmm(attn_output.transpose(0, 1), w_v)
-            .transpose(0, 1)
-            .reshape(-1, self.num_heads * self.v_head_dim)
-        )
-        output, _ = self.o_proj(attn_output)
+        get_attn_tp_context().clear_attn_inputs()
         return output
 
-    def kv_proj_only(
-        self, hidden_states: torch.Tensor
+    def project_context_kv(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Context normalized latent and unrotated shared RoPE slice."""
-        return self._project_kv(hidden_states)
-
-    def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
-        # kv_a_layernorm already ran on the latent inside kv_proj_only.
-        return k
-
-    def apply_k_rope(self, positions: torch.Tensor, k_pe: torch.Tensor) -> torch.Tensor:
-        """Rotate only the shared context RoPE slice returned by kv_proj_only."""
+        """Cache rows of target-context tokens: normalized latent and rotated k_pe,
+        each [n, 1, dim]."""
+        if self.q_lora_rank is None:
+            latent, _ = self.kv_a_proj_with_mqa(hidden_states)
+        else:
+            latent = F.linear(
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight[self.q_lora_rank :],
+            )
+        k_nope = self.kv_a_layernorm(latent[..., : self.kv_lora_rank]).unsqueeze(1)
+        k_pe = latent[..., self.kv_lora_rank :].unsqueeze(1)
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
-        return k_pe
+        return k_nope, k_pe
 
 
 class DFlashMLP(nn.Module):
@@ -902,7 +744,7 @@ class DFlashDraftModel(nn.Module):
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.rms_norm_eps = rms_norm_eps
         if is_dflash_mla_draft_config(config):
-            # No fused qkv_proj to slice; context KV goes through kv_proj_only().
+            # No fused qkv_proj to slice; context KV goes through project_context_kv().
             self.supports_fused_context_kv = False
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
@@ -1098,11 +940,12 @@ class DFlashDraftModel(nn.Module):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+            ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
         ]
 
         params_dict = dict(self.named_parameters())
         loaded_params = set()
-        ignored_names = []
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -1151,7 +994,6 @@ class DFlashDraftModel(nn.Module):
                 resolved_name = resolve_param_name(name)
                 if resolved_name is None:
                     # Ignore unexpected weights (e.g., HF rotary caches).
-                    ignored_names.append(name)
                     continue
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight"):
@@ -1192,16 +1034,6 @@ class DFlashDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
-
-        missing_names = sorted(set(params_dict) - loaded_params)
-        logger.info(
-            "DFLASH draft load_weights: loaded=%d ignored=%d%s missing=%d%s",
-            len(loaded_params),
-            len(ignored_names),
-            f" {ignored_names[:6]}" if ignored_names else "",
-            len(missing_names),
-            f" {missing_names[:6]}" if missing_names else "",
-        )
 
         if self.projector_type == "domino":
             required = {
