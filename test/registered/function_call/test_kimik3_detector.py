@@ -123,7 +123,7 @@ def test_attr_unescaping_and_raw_string_args() -> None:
         "<|close|>call<|sep|>"
         f"{TOOLS_CLOSE}"
     )
-    result = detector.detect_and_parse(text, [_make_tool("python")])
+    result = detector.detect_and_parse(text, [_make_tool("a&b")])
     assert result.calls[0].name == "a&b"
     assert json.loads(result.calls[0].parameters) == {"q": "say &quot;hi&quot;"}
 
