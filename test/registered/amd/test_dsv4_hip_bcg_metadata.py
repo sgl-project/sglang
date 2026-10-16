@@ -364,6 +364,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 pf_chunk_start=torch.tensor([5, 5, 5, 0], dtype=torch.int64),
                 pf_cu_q=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
                 pf_final_pos=torch.tensor([7, 7, 7, 128], dtype=torch.int64),
+                pf_swa_floor=None,
             ),
             c128_page_indices=None,
             c4_sparse_page_indices=None,
@@ -376,6 +377,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 is_decode_or_idle=lambda: False,
             ),
             positions=torch.tensor([5, 6, 7], dtype=torch.int64),
+            attn_cp_metadata=None,
         )
         kv = torch.arange(12, dtype=torch.float32).view(3, 4)
         output = torch.zeros(2, 1, 4)

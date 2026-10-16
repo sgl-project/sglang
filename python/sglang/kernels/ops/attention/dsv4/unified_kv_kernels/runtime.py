@@ -1206,9 +1206,11 @@ def _prefill_lengths_kernel(
     page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
     prefix_len_ptr,  # [T] int32 out
     extend_len_ptr,  # [T] int32 out
+    floor_ptr,  # [T] int: lowest SWA position the token may see (HAS_FLOOR)
     win: tl.constexpr,
     Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
+    HAS_FLOOR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Per token: write extend/prefix segment lengths"""
@@ -1217,7 +1219,9 @@ def _prefill_lengths_kernel(
     cstart = tl.load(chunk_start_ptr + t).to(tl.int32)
     tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
-    extend_count = tl.minimum(tpic + 1, win)
+    if HAS_FLOOR:
+        swa_low = tl.maximum(swa_low, tl.load(floor_ptr + t).to(tl.int32))
+    extend_count = tl.maximum(tl.minimum(tpic + 1, pos - swa_low + 1), 0)
     prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
     tl.store(extend_len_ptr + t, extend_count)
     if HAS_COMPRESS:
@@ -1246,9 +1250,11 @@ def _build_prefill_indices_kernel(
     ext_out_ptr,
     swa_pages,
     ring_stride,  # SWA ring per-slot stride
+    floor_ptr,  # [T] int: lowest SWA position the token may see (HAS_FLOOR)
     win: tl.constexpr,
     Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
+    HAS_FLOOR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Per token: write extend rows + prefix (SWA ring slots ++ swa_pages+compressed slots) as two ragged segments"""
@@ -1260,7 +1266,9 @@ def _build_prefill_indices_kernel(
 
     tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
-    extend_count = tl.minimum(tpic + 1, win)
+    if HAS_FLOOR:
+        swa_low = tl.maximum(swa_low, tl.load(floor_ptr + t).to(tl.int32))
+    extend_count = tl.maximum(tl.minimum(tpic + 1, pos - swa_low + 1), 0)
     prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
 
     ebase = tl.load(ext_indptr_ptr + t)
@@ -1307,11 +1315,16 @@ def build_prefill_indices(
     c128_page_indices: Optional[torch.Tensor],
     c4_sparse_page_indices: Optional[torch.Tensor],
     low_ratio_page_indices: Optional[torch.Tensor] = None,
+    swa_floor: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr).
 
     ``swa_pages`` is only the compressed-row base: ratios 1 / 2 pass their layer's
-    ``get_unified_compress_row_base`` and their top-k in ``low_ratio_page_indices``."""
+    ``get_unified_compress_row_base`` and their top-k in ``low_ratio_page_indices``.
+    ``swa_floor`` ([T] absolute positions) floors each token's SWA window, as
+    ``swa_replay_start`` does for the paged layout (decoder SWA bounded replay:
+    the late layers never wrote ring rows before their tail); compressed rows are
+    not floored."""
     device = state_slot.device
     T = state_slot.shape[0]
     assert positions.is_contiguous() and chunk_start.is_contiguous()
@@ -1339,15 +1352,20 @@ def build_prefill_indices(
     block = min(1024, triton.next_power_of_2(max(win, Wc, 1)))
     prefix_len = torch.empty(T, dtype=torch.int32, device=device)
     extend_len = torch.empty(T, dtype=torch.int32, device=device)
+    has_floor = swa_floor is not None
+    if has_floor:
+        assert swa_floor.is_contiguous() and swa_floor.shape[0] >= T
     _prefill_lengths_kernel[(T,)](
         positions,
         chunk_start,
         page_idx if has_compress else positions,  # dummy ptr when no compress
         prefix_len,
         extend_len,
+        swa_floor if has_floor else positions,  # dummy ptr when no floor
         win=win,
         Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,
+        HAS_FLOOR=has_floor,
         BLOCK=block,
         num_warps=4,
     )
@@ -1369,9 +1387,11 @@ def build_prefill_indices(
         kv_indices_extend,
         swa_pages,
         ring_stride,
+        swa_floor if has_floor else positions,
         win=win,
         Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,
+        HAS_FLOOR=has_floor,
         BLOCK=block,
         num_warps=4,
     )
