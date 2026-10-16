@@ -55,6 +55,30 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
+def exchange_sync_rows(
+    global_flat: torch.Tensor,
+    local_row: torch.Tensor,
+    group: torch.distributed.ProcessGroup,
+) -> None:
+    """Fill ``global_flat`` with every rank's ``local_row`` in group-rank order,
+    like ``all_gather_single``. On gloo the all-gather is a ring of world_size - 1
+    serial hops; gather + broadcast is one hop plus a log-depth tree. At two
+    ranks the ring is the single hop, so it stays."""
+    world_size = torch.distributed.get_world_size(group)
+    if local_row.device.type != "cpu" or world_size <= 2:
+        all_gather_single(global_flat, local_row, group=group)
+        return
+    root = torch.distributed.get_global_rank(group, 0)
+    rows = global_flat.view(world_size, local_row.numel())
+    if torch.distributed.get_rank(group) == 0:
+        torch.distributed.gather(
+            local_row, gather_list=list(rows.unbind(0)), dst=root, group=group
+        )
+    else:
+        torch.distributed.gather(local_row, dst=root, group=group)
+    torch.distributed.broadcast(global_flat, src=root, group=group)
+
+
 def _spec_input_cuda_graph_compatible(
     local_batch: Optional[ScheduleBatch],
 ) -> bool:
@@ -232,7 +256,7 @@ class MLPSyncBatchInfo:
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            all_gather_single(
+            exchange_sync_rows(
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,

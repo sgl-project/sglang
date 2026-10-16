@@ -25,6 +25,7 @@ def _scheduler_for_typed_config():
         ),
         rust_server_tokenizer_path=lambda: "tokenizer",
         max_total_num_tokens=1024,
+        load_snapshot_writer=None,
     )
 
 

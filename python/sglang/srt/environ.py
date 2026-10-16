@@ -338,6 +338,9 @@ class Envs:
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+    # ASGI import string that multi-worker Uvicorn and Granian processes load;
+    # point it at an app that extends `http_server.app` with extra routes.
+    SGLANG_HTTP_SERVER_APP_PATH = EnvStr("sglang.srt.entrypoints.http_server:app")
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
@@ -519,6 +522,9 @@ class Envs:
     # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
     SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
+    # DSpark on HIP: apply the simulated correct_len / bonus inside the folded verify epilogue
+    # (hip graph) instead of falling back to the eager accept + commit path.
+    SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(True)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
@@ -888,6 +894,14 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
+    # pinned aiter still ships the pre-PR config (see
+    # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
+    # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
+    # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+    SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
+    # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
+    SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
@@ -961,6 +975,11 @@ class Envs:
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
     SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
+    # Smaller MegaMoEV2 capacity for decode steps; a step with an extend on any
+    # DP rank keeps SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR. Must hold one rank's
+    # largest decode forward (checked at startup). 0 disables it; otherwise a
+    # power of two no larger than SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.
+    SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR = EnvInt(0)
     SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")
     SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
@@ -1610,6 +1629,40 @@ class Envs:
     # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+    # ROCm gfx950, DeepSeek-V4 128x128 block-fp8 dense linears: run the GEMM as
+    # aiter's e8m0 mxscale bpreshuffle (flydsl) instead of the fp32-scale
+    # CK/asm/triton bpreshuffle. The weight bytes are shared; only an e8m0 copy
+    # of the (power-of-two) weight scale is added at load, and activations are
+    # quantized with power-of-two (ue8m0) scales. Restricted to the (N, K)
+    # shapes in SGLANG_DSV4_DENSE_MXSCALE_SHAPES ("N:K,N:K"; empty = built-in
+    # whitelist of shapes that win in the microbench, "all" = every shape).
+    SGLANG_DSV4_DENSE_MXSCALE = EnvBool(False)
+    SGLANG_DSV4_DENSE_MXSCALE_SHAPES = EnvStr("")
+    # fp8 unified_kv decode/verify on aiter's FlyDSL v4 nm decode when the
+    # installed aiter ships it; 0 keeps the asm kernel.
+    SGLANG_DSV4_FLYDSL_DECODE = EnvBool(True)
+    # ... which copy: "auto" = aiter's when the installed aiter ships it, else
+    # sglang's in-tree copy; "aiter" = aiter's only (asm without it); "intree" =
+    # the in-tree copy only.
+    # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+    SGLANG_DSV4_FLYDSL_DECODE_SOURCE = EnvStr("auto")
+    # ... also with 128 local heads (DP attention). Off: there the asm path
+    # below (split plan + HCA persistent, ROCm/aiter#6126) measured the same
+    # DP8 DSpark decode step on MI355X without depending on FlyDSL.
+    SGLANG_DSV4_FLYDSL_DECODE_H128 = EnvBool(False)
+    # fp8 unified_kv asm decode (when FlyDSL is off or absent): pick the KV
+    # split count from aiter's v4 nm latency model (ROCm/aiter#6126; ported
+    # when aiter predates it) with a constant split_indptr, per stream kind.
+    SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL = EnvBool(True)
+    # context the HCA split plan is sized for, capped at the server context
+    # length (0: the server context length). Sizing for 1M over-splits HCA at
+    # AgentX lengths (32k-200k).
+    SGLANG_DSV4_FP8_DECODE_SPLIT_CTX = EnvInt(200_000)
+    # fp8 unified_kv asm decode: HCA layers with 128 local heads (DP attention)
+    # take aiter's persistent mla_decode_fwd_v4_nm_ps (in-kernel split + merge)
+    # for MIN_ROWS..32768 rows; needs aiter >= ROCm/aiter#6126.
+    SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
+    SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
@@ -1660,6 +1713,16 @@ class Envs:
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
+    # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
+    # FP4 MQA logits kernel, a request's verify rows sharing each key load.
+    SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
+    # DeepSeek-V4 C4 decode / target-verify indexer: the same row-group kernel (aiter >= #6145),
+    # its workspace built in the graph without a schedule; a request's verify rows share each
+    # key load.
+    SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP = EnvBool(False)
+    # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
+    # 64-slot page), so a candidate consumer layer scores only its published blocks.
+    SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
