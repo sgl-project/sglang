@@ -31,7 +31,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.muse_spark import MuseSpark1xForCausalLM
+from sglang.srt.models.muse_spark import MuseSparkTextForCausalLM
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.mm_utils import (
     _pad_mrope_vision_embeddings_for_tp_gather,
@@ -137,7 +137,7 @@ class _NormalizedEmbedding(nn.Module):
         return self._embedding.num_embeddings
 
 
-class MuseSparkForConditionalGeneration(MuseSpark1xForCausalLM):
+class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
     """Muse 1.2 decoder with NaViT image/video and waveform audio inputs."""
 
     # Features are single tensors, eagerly reconstructed by the scheduler on

@@ -59,7 +59,7 @@ def _flashinfer_a2a_topology_is_supported(
     if attn_dp_enabled and attn_dp_size == tp_size:
         return True
     return (
-        architecture in ("MuseSpark1xForCausalLM", "MuseSparkForConditionalGeneration")
+        architecture == "MuseSparkForConditionalGeneration"
         and enable_layernorm_sp
         and not attn_dp_enabled
         and attn_dp_size == 1

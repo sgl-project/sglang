@@ -932,7 +932,7 @@ class EncoderPreprocessor:
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
         """Compatibility helper for callers that still provide patch grids."""
-        if self.model_type in ("musespark1x_omni", "muse_spark"):
+        if self.model_type == "muse_spark":
             # Muse's hook returns output grids, after spatial/temporal merging.
             return (
                 int(grid)

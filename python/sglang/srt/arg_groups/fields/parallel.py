@@ -254,8 +254,9 @@ class Parallel(msgspec.Struct):
         bool,
         "Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "
         "including BF16 excluded layers. Decode retains the FlashInfer TRT-LLM "
-        "MoE runner and all-reduce. Requires --enable-layernorm-sp, patched "
-        "DeepGEMM, NVLink/NVSwitch, and memory for both expert weight layouts. "
+        "MoE runner and all-reduce, sharing expert weights with prefill. "
+        "Requires --enable-layernorm-sp, DeepGEMM with post-expert normalization, "
+        "and NVLink/NVSwitch. "
         "No FlashInfer A2A backend is required when enabled.",
     ] = False
     disable_attn_tp_gather: A[

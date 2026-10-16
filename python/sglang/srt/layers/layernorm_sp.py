@@ -50,9 +50,7 @@ from sglang.srt.utils.common import ceil_align
 # layer boundaries with the standard participant linears, and for which SP
 # has been validated. Other models reject --enable-layernorm-sp at construction.
 # The mechanism is generic; extend the allowlist as families are validated.
-MUSE_SP_ARCHITECTURES = frozenset(
-    {"MuseSpark1xForCausalLM", "MuseSparkForConditionalGeneration"}
-)
+MUSE_SP_ARCHITECTURES = frozenset({"MuseSparkForConditionalGeneration"})
 SP_SUPPORTED_ARCHITECTURES = MUSE_SP_ARCHITECTURES | frozenset({"Qwen3ForCausalLM"})
 
 

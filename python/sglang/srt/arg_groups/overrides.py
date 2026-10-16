@@ -307,7 +307,6 @@ import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
 @_register_for(
-    "MuseSpark1xForCausalLM",
     "MuseSparkForConditionalGeneration",
 )
 def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:

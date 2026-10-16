@@ -3,8 +3,8 @@
 from transformers import CONFIG_MAPPING, PretrainedConfig
 
 
-class MuseSpark1xTextConfig(PretrainedConfig):
-    model_type = "musespark1x_omni_text"
+class MuseSparkTextConfig(PretrainedConfig):
+    model_type = "muse_spark_text"
 
     def __init__(
         self,
@@ -118,7 +118,7 @@ class MuseSpark1xTextConfig(PretrainedConfig):
 
 
 class MuseSparkVisionConfig(PretrainedConfig):
-    model_type = "musespark1x_omni_vision"
+    model_type = "muse_spark_vision"
 
     def __init__(
         self,
@@ -171,7 +171,7 @@ class MuseSparkVisionConfig(PretrainedConfig):
 
 
 class MuseSparkAudioConfig(PretrainedConfig):
-    model_type = "musespark1x_omni_audio"
+    model_type = "muse_spark_audio"
 
     def __init__(
         self,
@@ -202,10 +202,10 @@ class MuseSparkAudioConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-class MuseSpark1xOmniConfig(PretrainedConfig):
-    model_type = "musespark1x_omni"
+class MuseSparkConfig(PretrainedConfig):
+    model_type = "muse_spark"
     sub_configs = {
-        "text_config": MuseSpark1xTextConfig,
+        "text_config": MuseSparkTextConfig,
         "vision_config": MuseSparkVisionConfig,
         "audio_config": MuseSparkAudioConfig,
     }
@@ -251,16 +251,9 @@ def should_skip_weight_loading(name, config):
 
 
 for _config_class in (
-    MuseSpark1xTextConfig,
+    MuseSparkTextConfig,
     MuseSparkVisionConfig,
     MuseSparkAudioConfig,
-    MuseSpark1xOmniConfig,
+    MuseSparkConfig,
 ):
     CONFIG_MAPPING.register(_config_class.model_type, _config_class, exist_ok=True)
-    # Released checkpoints use muse_spark[_text|_vision|_audio]. Keep the
-    # original identifiers registered for existing native HF checkpoints.
-    CONFIG_MAPPING.register(
-        _config_class.model_type.replace("musespark1x_omni", "muse_spark"),
-        _config_class,
-        exist_ok=True,
-    )

@@ -40,7 +40,7 @@ from sglang.kernels.ops.muse_spark.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
 from sglang.srt.configs.muse_spark import (
-    MuseSpark1xTextConfig,
+    MuseSparkTextConfig,
     should_skip_weight_loading,
 )
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
@@ -216,7 +216,7 @@ class MuseSpark1xRouter(nn.Module):
 
 
 class MuseSpark1xAttention(nn.Module):
-    def __init__(self, config: MuseSpark1xTextConfig, layer_idx: int, prefix: str):
+    def __init__(self, config: MuseSparkTextConfig, layer_idx: int, prefix: str):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -398,7 +398,7 @@ class MuseSpark1xAttention(nn.Module):
 
 
 class MuseSpark1xMLP(nn.Module):
-    def __init__(self, config: MuseSpark1xTextConfig, prefix: str):
+    def __init__(self, config: MuseSparkTextConfig, prefix: str):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=config.hidden_size,
@@ -425,7 +425,7 @@ class MuseSpark1xMLP(nn.Module):
 class MuseSpark1xMoE(nn.Module):
     def __init__(
         self,
-        config: MuseSpark1xTextConfig,
+        config: MuseSparkTextConfig,
         layer_idx: int,
         nvfp4_checkpoint: bool,
         prefix: str,
@@ -881,7 +881,7 @@ class MuseSpark1xMoE(nn.Module):
 class MuseSpark1xDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: MuseSpark1xTextConfig,
+        config: MuseSparkTextConfig,
         layer_idx: int,
         nvfp4_checkpoint: bool,
         prefix: str,
@@ -950,7 +950,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         self._fused_ffn_boundary = None
 
     @staticmethod
-    def _is_moe_layer(config: MuseSpark1xTextConfig, layer_idx: int) -> bool:
+    def _is_moe_layer(config: MuseSparkTextConfig, layer_idx: int) -> bool:
         return config.mlp_layer_types[layer_idx] == "sparse"
 
     def bind_next_pre_attn_norm(self, next_pre_attn_norm: MuseSpark1xRMSNorm) -> None:
@@ -1009,7 +1009,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
 
 # Register the input norm at the decoder layer, as in the HF checkpoint.
 def _install_pre_attn_norm(
-    config: MuseSpark1xTextConfig, layer: MuseSpark1xDecoderLayer
+    config: MuseSparkTextConfig, layer: MuseSpark1xDecoderLayer
 ) -> None:
     layer.input_layernorm = MuseSpark1xRMSNorm(
         config.hidden_size,
@@ -1023,7 +1023,7 @@ def _install_pre_attn_norm(
 class MuseSpark1xModel(nn.Module):
     def __init__(
         self,
-        config: MuseSpark1xTextConfig,
+        config: MuseSparkTextConfig,
         quant_config: Optional[QuantizationConfig],
         prefix: str,
     ):
@@ -1203,7 +1203,7 @@ class MuseSparkModel(nn.Module):
         return self.language_model.layers
 
 
-class MuseSpark1xForCausalLM(nn.Module):
+class MuseSparkTextForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1211,7 +1211,7 @@ class MuseSpark1xForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: MuseSpark1xTextConfig,
+        config: MuseSparkTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -1594,9 +1594,7 @@ class MuseSpark1xForCausalLM(nn.Module):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
 
 
-EntryClass = [MuseSpark1xForCausalLM]
-
 __all__ = [
-    "MuseSpark1xForCausalLM",
-    "MuseSpark1xTextConfig",
+    "MuseSparkTextForCausalLM",
+    "MuseSparkTextConfig",
 ]

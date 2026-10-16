@@ -8,10 +8,11 @@ from types import SimpleNamespace
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     _wait_for_gpu_idle_in_ci,
     is_in_ci,
@@ -23,8 +24,8 @@ from sglang.test.test_utils import (
 # pass covers both NVLink PD transfer and the DFlash2 acceptance regression gate.
 register_cuda_ci(est_time=900, stage="base-c", runner_config="8-gpu-b300")
 
-MODEL_PATH = "meta-models/Muse-Spark-1.2-816B-A42B-NVFP4-open"
-DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-1.2-DFlash2-preview"
+MODEL_PATH = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
+DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-Open-DFlash2"
 SERVER_LAUNCH_TIMEOUT = 3600
 MOONCAKE_ENV = {
     "MC_INTRANODE_NVLINK": "true",
@@ -33,9 +34,13 @@ MOONCAKE_ENV = {
 }
 
 
-class TestMuseSpark12B300PD(PDDisaggregationServerBase):
+class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
     gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 3.5
+    gsm8k_accept_length_thres = 3.5
+    mmmu_pro_score_threshold = 0.7
+    mmmu_pro_num_examples = 50
+    accept_length_thres = 4.0
+    bs_1_speed_thres = 350
     prefill_tp_size = 4
     decode_tp_size = 4
     # CUDA_VISIBLE_DEVICES remaps decode GPUs 4-7 to local ordinals 0-3.
@@ -49,8 +54,6 @@ class TestMuseSpark12B300PD(PDDisaggregationServerBase):
         cls.model = try_cached_model(MODEL_PATH)
         cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
         common_args = [
-            # FlashInfer 0.6.18 autotuning uses unresized per-token FP4 scales.
-            "--disable-flashinfer-autotune",
             "--quantization",
             "modelopt_fp4",
             "--moe-runner-backend",
@@ -101,19 +104,18 @@ class TestMuseSpark12B300PD(PDDisaggregationServerBase):
         super().tearDownClass()
         _wait_for_gpu_idle_in_ci(timeout=120)
 
-    def test_gsm8k(self):
+    def _run_accuracy_eval(self, eval_name, num_examples=None):
         for url in (self.prefill_url, self.decode_url):
             requests.post(f"{url}/flush_cache", timeout=60).raise_for_status()
 
-        # The completion-style few-shot evaluator removes its prompt examples
-        # from the test split. Chat evaluation retains all 1,319 test questions.
-        metrics = run_eval(
+        # Muse Spark has no built-in sgl-eval model preset. Use explicit chat
+        # generation settings for both the full GSM8K and the MMMU-Pro smoke test.
+        metrics = run_sgl_eval(
             SimpleNamespace(
                 base_url=self.base_url,
                 model=self.model,
-                eval_name="gsm8k",
-                api="sgl_eval",
-                num_examples=None,
+                eval_name=eval_name,
+                num_examples=num_examples,
                 num_threads=64,
                 sgl_eval_thinking=True,
                 reasoning_effort="xhigh",
@@ -123,9 +125,23 @@ class TestMuseSpark12B300PD(PDDisaggregationServerBase):
             )
         )
         result = json.loads(Path(metrics["sgl_eval_metrics_path"]).read_text())
-        self.assertEqual(result["num_examples"], 1319)
+        self.assertEqual(result["num_examples"], num_examples or 1319)
         self.assertEqual(result["n_repeats"], 1)
         self.assertEqual(metrics["error_rate"], 0.0)
+        return metrics
+
+    def test_mmmu_pro(self):
+        metrics = self._run_accuracy_eval("mmmu_pro", self.mmmu_pro_num_examples)
+        if is_in_ci():
+            write_github_step_summary(
+                f"### Muse Spark MMMU-Pro ({self.mmmu_pro_num_examples})\n"
+                f"Accuracy: {metrics['score']:.4f}\n"
+            )
+        self.assertGreaterEqual(metrics["score"], self.mmmu_pro_score_threshold)
+
+    def test_gsm8k(self):
+        # Chat evaluation retains all 1,319 test questions.
+        metrics = self._run_accuracy_eval("gsm8k")
 
         # Read the decode endpoint explicitly; missing speculative metrics must
         # fail this test rather than silently bypass the acceptance threshold.
@@ -144,7 +160,7 @@ class TestMuseSpark12B300PD(PDDisaggregationServerBase):
                 f"avg_spec_accept_length: {accept_length:.4f}\n"
             )
         self.assertGreaterEqual(metrics["score"], self.gsm8k_accuracy_thres)
-        self.assertGreaterEqual(accept_length, self.accept_length_thres)
+        self.assertGreaterEqual(accept_length, self.gsm8k_accept_length_thres)
 
 
 if __name__ == "__main__":

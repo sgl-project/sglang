@@ -11,13 +11,9 @@ from sglang.srt.utils.hf_transformers_utils import get_config
 
 logger = logging.getLogger(__name__)
 
-MUSE_SPARK_ARCHITECTURES = (
-    "MuseSpark1xForCausalLM",
-    "MuseSparkForConditionalGeneration",
-)
+MUSE_SPARK_ARCHITECTURES = ("MuseSparkForConditionalGeneration",)
 
 MUSE_SPARK_CHAT_TEMPLATE_FILE = "chat_template.jinja"
-_LEGACY_CHAT_TEMPLATE_FILE = "muse_spark_1_2_oss.jinja"
 
 # Graph-pool and KV-sizing switches the reference launcher (sglang_meta) sets.
 MUSE_SPARK_ENV_DEFAULTS = (
@@ -85,16 +81,13 @@ def muse_spark_chat_template_default(server_args: Any) -> str | None:
     arch = _muse_spark_arch_of(model_config.hf_config)
     if arch is None:
         return None
-    # Prefer the standard HF filename even when an in-place update left the
-    # legacy template behind. Older checkpoints retain their original default.
-    for filename in (MUSE_SPARK_CHAT_TEMPLATE_FILE, _LEGACY_CHAT_TEMPLATE_FILE):
-        template = _checkpoint_file(model_config, filename)
-        if template is not None:
-            logger.info(f"Defaulting --chat-template to '{template}' for {arch}.")
-            return template
+    template = _checkpoint_file(model_config, MUSE_SPARK_CHAT_TEMPLATE_FILE)
+    if template is not None:
+        logger.info(f"Defaulting --chat-template to '{template}' for {arch}.")
+        return template
     logger.warning(
-        f"{arch} checkpoint has neither {MUSE_SPARK_CHAT_TEMPLATE_FILE} "
-        f"nor {_LEGACY_CHAT_TEMPLATE_FILE}; --chat-template stays unset."
+        f"{arch} checkpoint has no {MUSE_SPARK_CHAT_TEMPLATE_FILE}; "
+        "--chat-template stays unset."
     )
     return None
 
