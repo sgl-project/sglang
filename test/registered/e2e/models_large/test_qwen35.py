@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
@@ -13,6 +15,7 @@ register_cuda_ci(est_time=3000, stage="nightly", runner_config="8-gpu-b200")
 QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B-FP8"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35(unittest.TestCase):
     """Unified test class for Qwen3.5-397B-A17B performance and accuracy.
 

@@ -2,6 +2,8 @@
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.perf_bench_kit import at_most, check_perf
 from sglang.test.test_utils import (
@@ -14,6 +16,7 @@ register_cuda_ci(est_time=190, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=165, suite="stage-b-test-1-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestServingLatency(CustomTestCase):
     def test_online_latency_default(self):
         res = run_bench_serving(
