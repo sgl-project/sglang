@@ -1615,6 +1615,10 @@ STANDALONE_FILES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
+        "../unit/test_async_output_save.py",
+        "../unit/test_kandinsky6_sequence_parallel.py",
+        "../unit/test_kandinsky6_sr_sequence_parallel.py",
+        "../unit/test_qwen_image21_distributed.py",
     ],
 }
 
@@ -1629,6 +1633,10 @@ if current_platform.is_hip():
         f
         for f in STANDALONE_FILES["1-gpu"]
         if f != "../single_test_file/test_update_weights_from_disk.py"
+    ]
+    # The 2-GPU unit/ cases are only validated on CUDA.
+    STANDALONE_FILES["2-gpu"] = [
+        f for f in STANDALONE_FILES["2-gpu"] if not f.startswith("../unit/")
     ]
 
 # New standalone files may omit an estimate once to learn the real CI runtime.
@@ -1666,6 +1674,11 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
+        # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
+        "../unit/test_async_output_save.py": 30.0,
+        "../unit/test_kandinsky6_sequence_parallel.py": 150.0,
+        "../unit/test_kandinsky6_sr_sequence_parallel.py": 150.0,
+        "../unit/test_qwen_image21_distributed.py": 90.0,
     },
 }
 

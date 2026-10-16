@@ -311,17 +311,6 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run 2-GPU diffusion unit tests
-        if: matrix.part == 0
-        timeout-minutes: 15
-        working-directory: python
-        run: |
-          python3 -m pytest -v \
-            sglang/multimodal_gen/test/unit/test_async_output_save.py \
-            sglang/multimodal_gen/test/unit/test_kandinsky6_sequence_parallel.py \
-            sglang/multimodal_gen/test/unit/test_kandinsky6_sr_sequence_parallel.py \
-            sglang/multimodal_gen/test/unit/test_qwen_image21_distributed.py
-
       - name: Run diffusion server tests
         timeout-minutes: 55
         env:
