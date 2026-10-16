@@ -10,6 +10,10 @@
   },
   "redirects": [
     {
+      "source": "/cookbook/autoregressive/Meta/MuseSpark",
+      "destination": "/cookbook/autoregressive/Meta/MuseSparkOpen"
+    },
+    {
       "source": "/docs/references/learn_more",
       "destination": "/"
     },
@@ -1229,6 +1233,7 @@
                   {
                     "group": "IFM",
                     "pages": [
+                      "cookbook/autoregressive/IFM/Jais-3",
                       "cookbook/autoregressive/IFM/K2-Horizon"
                     ]
                   },
@@ -1314,6 +1319,7 @@
                   {
                     "group": "Meta",
                     "pages": [
+                      "cookbook/autoregressive/Meta/MuseSparkOpen",
                       "cookbook/autoregressive/Meta/MuseGlimmer",
                       "cookbook/autoregressive/Meta/Llama4",
                       "cookbook/autoregressive/Meta/Llama3.3-70B",
@@ -1371,6 +1377,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3.5-Super",
                       "cookbook/autoregressive/NVIDIA/Nemotron3.5-Lightning",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
@@ -1395,6 +1402,7 @@
                   {
                     "group": "StepFun",
                     "pages": [
+                      "cookbook/autoregressive/StepFun/Step-5-Preview",
                       "cookbook/autoregressive/StepFun/Step-3.7-Flash",
                       "cookbook/autoregressive/StepFun/Step3.5",
                       "cookbook/autoregressive/StepFun/Step3-VL-10B"
@@ -1403,6 +1411,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-3.1-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash-VL",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-tiny",
@@ -1514,7 +1523,9 @@
                   },
                   {
                     "group": "FLUX",
+                    "tag": "NEW",
                     "pages": [
+                      "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
                     ]
                   },
@@ -1606,6 +1617,12 @@
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
+                    ]
+                  },
+                  {
+                    "group": "MOSS-Image",
+                    "pages": [
+                      "cookbook/diffusion/OpenMOSS/MOSS-Image"
                     ]
                   },
                   {

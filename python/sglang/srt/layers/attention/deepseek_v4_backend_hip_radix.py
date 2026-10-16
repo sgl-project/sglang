@@ -2085,8 +2085,7 @@ class DeepseekV4HipRadixBackend(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
-        replay: each request's last SWA_WINDOW extend tokens, whose window is floored at the
-        tail start since no window KV before it is written at those layers."""
+        replay: each request's last SWA_WINDOW extend tokens."""
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
