@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -1317,6 +1317,10 @@ class HiCacheController:
             self.prefetch_hits_sync_groups,
         )
         return int(hit_count.item())
+
+    def extend_storage_prefix(self, prefix_keys: Any, hash_values: List[str]) -> Any:
+        """Advance the backend's prefix context past omitted pages."""
+        return prefix_keys + hash_values if prefix_keys is not None else None
 
     def write_storage(
         self,
