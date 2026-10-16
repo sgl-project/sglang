@@ -63,6 +63,7 @@ if TYPE_CHECKING:
         KvCapacity,
         KvResources,
         RequestLimits,
+        SchedulerServices,
         Workers,
     )
     from sglang.srt.managers.scheduler_components.engine_state import (
@@ -71,11 +72,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.ipc_channels import (
         SchedulerIpcChannels,
     )
-    from sglang.srt.managers.scheduler_components.metrics_reporter import MetricsSink
     from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
-    from sglang.srt.managers.scheduler_components.output_streamer import (
-        SchedulerOutputStreamer,
-    )
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -105,8 +102,7 @@ class RequestIntake:
         kv: KvResources,
         capacity: KvCapacity,
         ipc_channels: SchedulerIpcChannels,
-        metrics_sink: MetricsSink,
-        output_streamer: SchedulerOutputStreamer,
+        services: SchedulerServices,
         beam_coordinator: BeamCoordinator,
         session_controller: SessionController,
         grammar_manager: GrammarManager,
@@ -131,9 +127,9 @@ class RequestIntake:
         self.capacity = capacity
         self.sliding_window_size = capacity.sliding_window_size
         self.ipc_channels = ipc_channels
-        self.metrics_sink = metrics_sink
-        self.metrics_collector = metrics_sink.metrics_collector
-        self.output_streamer = output_streamer
+        self.metrics_sink = services.metrics_sink
+        self.metrics_collector = services.metrics_sink.metrics_collector
+        self.output_streamer = services.output_streamer
         self.beam_coordinator = beam_coordinator
         self.session_controller = session_controller
         self.grammar_manager = grammar_manager

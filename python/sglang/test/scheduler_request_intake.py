@@ -15,17 +15,15 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 def make_request_intake(**deps) -> RequestIntake:
     """An intake over empty core lists, with no mode owners and inert
-    collaborators; `deps` replaces any constructor argument, request limit, or
-    config value the intake reads (spec algorithm, transfer backend, sampling
-    mask cap)."""
+    collaborators; `deps` replaces any constructor argument, service, request
+    limit, or config value the intake reads (spec algorithm, transfer backend,
+    sampling mask cap)."""
     args = dict(
         core_lists=CoreLists(),
         counters=LaunchCounters(),
         kv=SimpleNamespace(tree_cache=MagicMock(), token_to_kv_pool_allocator=None),
         capacity=SimpleNamespace(sliding_window_size=None),
         ipc_channels=MagicMock(),
-        metrics_sink=SimpleNamespace(enable_metrics=False, metrics_collector=None),
-        output_streamer=MagicMock(),
         beam_coordinator=MagicMock(),
         session_controller=MagicMock(),
         grammar_manager=MagicMock(),
@@ -58,6 +56,16 @@ def make_request_intake(**deps) -> RequestIntake:
     for name in config:
         if name in deps:
             config[name] = deps.pop(name)
+    # The services the intake writes to; a test passes either one alone.
+    services = dict(
+        metrics_sink=SimpleNamespace(enable_metrics=False, metrics_collector=None),
+        output_streamer=MagicMock(),
+        scheduler_stage_metrics=None,
+    )
+    for name in services:
+        if name in deps:
+            services[name] = deps.pop(name)
+    args["services"] = SimpleNamespace(**services)
     args.update(deps)
     intake = RequestIntake(**args)
     for name, value in config.items():

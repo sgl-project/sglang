@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler_components.bundles import (
         KvResources,
+        SchedulerServices,
         Streams,
         Workers,
     )
@@ -43,7 +44,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.ipc_channels import (
         SchedulerIpcChannels,
     )
-    from sglang.srt.managers.scheduler_components.metrics_reporter import MetricsSink
     from sglang.srt.managers.scheduler_components.mode_stages import ModeStages
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.pp_spec_forward import (
@@ -53,9 +53,6 @@ if TYPE_CHECKING:
         SchedulerProfilerManager,
     )
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-    from sglang.srt.observability.scheduler_stage_metrics import (
-        SchedulerStageMetricsRecorder,
-    )
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
 _is_hip = is_hip()
 logger = logging.getLogger(__name__)
@@ -76,8 +73,7 @@ class StepLauncher:
         pending: PendingSteps,
         core_lists: CoreLists,
         ipc_channels: SchedulerIpcChannels,
-        metrics_sink: MetricsSink,
-        scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder],
+        services: SchedulerServices,
         profiler_manager: SchedulerProfilerManager,
         beam_coordinator: BeamCoordinator,
         pp_spec_forward: Optional[PPSpecForward],
@@ -103,8 +99,8 @@ class StepLauncher:
         self.pending = pending
         self.lists = core_lists
         self.ipc_channels = ipc_channels
-        self.metrics_sink = metrics_sink
-        self.scheduler_stage_metrics = scheduler_stage_metrics
+        self.metrics_sink = services.metrics_sink
+        self.scheduler_stage_metrics = services.scheduler_stage_metrics
         self.profiler_manager = profiler_manager
         self.beam_coordinator = beam_coordinator
         self.pp_spec_forward = pp_spec_forward
