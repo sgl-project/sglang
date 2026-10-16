@@ -633,8 +633,6 @@ class ServerArgs(DisaggServerArgsMixin):
     decoder_sp: int | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
-    pool_control_endpoint: str | None = None
-    pool_control_advertised_endpoint: str | None = None
 
     # Logging
     log_level: str = "info"
