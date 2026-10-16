@@ -670,9 +670,22 @@ def run_attn_post(
         from sglang.kernels.ops.communication.all_reduce_mhc import (
             all_reduce_mhc_post_combine_norm,
         )
+        from sglang.srt.models.dsv41_low_latency import wo_b_publish
 
         assert next is not None
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
+        if wo_b_publish.take(out.partial):
+            # wo_b's epilogue already stored these rows into the Lamport mailbox.
+            updated, normalized = wo_b_publish.reduce(
+                out.partial,
+                residual,
+                post_mix,
+                comb,
+                pre,
+                next.norm.weight,
+                next.norm.variance_epsilon,
+            )
+            return HcState(updated, pre, HcNormed(normalized))
         _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,

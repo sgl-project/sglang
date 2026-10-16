@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Protocol, TypeVar
+from typing import TYPE_CHECKING, List, Optional, Protocol, Tuple, TypeVar
 
 import msgspec
 import torch
@@ -84,6 +84,9 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
 
     # [rows, topk] int32 index-K pool slots of the selection, unordered, -1 padded.
     out_page_indices: torch.Tensor
+    # (q_fp4, q_sf, weights) of `index_q_rope_pack`, built on a side stream ahead of
+    # the scoring; None and the DeepGEMM scorers project from x and q_lora themselves.
+    prepared_q: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
     def reset_outputs(self) -> None:
         self.out_page_indices.fill_(-1)

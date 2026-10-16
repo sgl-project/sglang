@@ -11,8 +11,13 @@ from .kv_layout import KVLayout
 
 LAYOUT = KVLayout.V4
 MAX_BATCH = 8
+# Each (row, KV tile) is its own CTA, so rows past MAX_BATCH are a caller's dispatch choice.
+WIDE_MAX_BATCH = 64
 NUM_HEADS = 16
 HEAD_DIM = 512
+# With pdl, trigger the next kernel (wo_a_fused streams its weights before its wait) right
+# after the wait, not after the loads: faster in 7 of 9 GB300 micro-bench cases at 6-24 rows.
+COMBINE_EARLY_TRIGGER = True
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 
 
@@ -23,10 +28,11 @@ def can_use_swapab_attention(
     num_heads: int,
     head_dim_v: int,
     softmax_scale: float,
+    max_rows: int = MAX_BATCH,
 ) -> bool:
     """The caller adds the SM100 and single-query forward-mode gates."""
     return (
-        0 < q.shape[0] <= MAX_BATCH
+        0 < q.shape[0] <= max_rows
         and num_heads == NUM_HEADS
         and q.dtype == torch.bfloat16
         and q.shape[-1] == HEAD_DIM
@@ -69,9 +75,15 @@ def _combine(
     ST: tl.constexpr,
     H: tl.constexpr,
     BD: tl.constexpr,
+    USE_GDC: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ):
     b, h, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     t, d = tl.arange(0, ST), tile * BD + tl.arange(0, BD)
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        if EARLY_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
     den = tl.load(SUM + (b * NT + t) * H + h, t < NT, 0)
     mx = tl.load(MAX + (b * NT + t) * H + h, t < NT, 0)
     mx = tl.where(den > 0, mx, -float("inf"))
@@ -85,6 +97,8 @@ def _combine(
         t[:, None] < NT,
         0,
     )
+    if USE_GDC and not EARLY_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
     out = tl.sum(vals * factor[:, None], 0) / denominator
     out = tl.where((denominator > 0) & (sink != float("inf")), out, 0.0)
     out = out.to(OUT.dtype.element_ty)
@@ -105,17 +119,22 @@ def swapab_attention(
     extra_lengths=None,
     inv_rope=None,
     partial_gluon=None,
+    max_rows=MAX_BATCH,
+    pdl=False,
+    narrow_combine=False,
 ):
     """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once.
-    `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's)."""
+    `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's).
+    `pdl` launches both kernels as programmatic dependents; `narrow_combine` runs the
+    combine as one-warp programs over 128 columns."""
     if partial_gluon is None:
         from .decode_attention_sm100_gluon import partial_gluon
 
     block = 64
     b, h, d = q.shape[0], q.shape[-2], q.shape[-1]
     assert q.ndim in (3, 4) and (q.ndim == 3 or q.shape[1] == 1)
-    assert 0 < b <= MAX_BATCH and h == NUM_HEADS and d == HEAD_DIM
+    assert 0 < b <= min(max_rows, WIDE_MAX_BATCH) and h == NUM_HEADS and d == HEAD_DIM
     assert q.dtype == torch.bfloat16 and q.stride(-1) == 1
     assert kv.shape[-1] == LAYOUT.bytes_per_token
     assert kv.dtype in (torch.uint8, torch.float8_e4m3fn)
@@ -172,6 +191,8 @@ def swapab_attention(
         SCALE_BYTES=LAYOUT.scale_bytes,
         TILE=LAYOUT.tile_size,
         num_warps=4,
+        # launch_pdl is NVIDIA-only; the HIP partial kernel takes no USE_GDC.
+        **({"USE_GDC": True, "launch_pdl": True} if pdl else {}),
     )
     if inv_rope is not None:
         freqs, positions = inv_rope
@@ -183,6 +204,10 @@ def swapab_attention(
         freqs = positions = out
         rope_dim = 0
     bd = 64 if ne else 512
+    combine_warps = 4
+    if narrow_combine and ne:
+        # GB300, 10 KV tiles: 2.1 vs 3.1 us at 12 rows, 2.5 vs 4.6 at 24 (BD 64 / 4 warps).
+        bd, combine_warps = 128, 1
     _combine[(b, h, triton.cdiv(512, bd))](
         partial,
         maximum,
@@ -197,6 +222,9 @@ def swapab_attention(
         ST=triton.next_power_of_2(nt),
         H=h,
         BD=bd,
-        num_warps=4,
+        USE_GDC=pdl,
+        EARLY_TRIGGER=COMBINE_EARLY_TRIGGER,
+        num_warps=combine_warps,
+        **({"launch_pdl": True} if pdl else {}),
     )
     return out

@@ -20,6 +20,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
+    MAX_BATCH as SWAPAB_MAX_BATCH,
+)
+from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
@@ -89,6 +92,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     make_candidate_indexer,
     make_full_topk_indexer,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import index_q_rope_pack
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
@@ -108,6 +112,12 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.models.dsv41_low_latency.switch import (
+    SWAPAB_MAX_ROWS,
+)
+from sglang.srt.models.dsv41_low_latency.switch import (
+    enabled as dsv41_low_latency_enabled,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -1251,6 +1261,12 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+        # The low-latency switch also launches the swap-AB kernels with PDL and runs
+        # their combine as one-warp programs (GB300: 2.1 vs 3.1 us at 12 rows).
+        self.swapab_low_latency = _is_cuda and dsv41_low_latency_enabled()
+        self.swapab_max_rows = (
+            SWAPAB_MAX_ROWS if self.swapab_low_latency else SWAPAB_MAX_BATCH
+        )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -3014,8 +3030,12 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        prepared_index_q: Optional[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None,
     ) -> None:
-        """Runs on every ratio 1/2 layer before its attention."""
+        """Runs on every ratio 1/2 layer before its attention; ``prepared_index_q``
+        is `low_ratio_decode_index_q`'s output for this decode / verify step."""
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.encoder_swa_replay:
@@ -3031,20 +3051,7 @@ class DeepseekV4AttnBackend(
                 run_indexer=run_indexer,
             )
             return
-        meta = self.forward_metadata
-        hoisted_req = getattr(meta, "low_ratio_req_indices", None)
-        hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
-        if (
-            hoisted_req is not None
-            and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
-        ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
-            req, pos = hoisted_req, hoisted_pos
-        else:
-            req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
-            pos = positions
+        req, pos = self._low_ratio_req_pos(positions, forward_batch)
         if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()
@@ -3061,7 +3068,52 @@ class DeepseekV4AttnBackend(
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+            self._low_ratio_index_topk(
+                layer, x, q_lora, req, pos, forward_batch, prepared_q=prepared_index_q
+            )
+
+    def _low_ratio_req_pos(
+        self, positions: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        meta = self.forward_metadata
+        hoisted_req = getattr(meta, "low_ratio_req_indices", None)
+        hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
+        if (
+            hoisted_req is not None
+            and hoisted_pos is not None
+            and hoisted_pos.shape[0] == positions.shape[0]
+        ):
+            # Bucket-sized under the prefill graph; an eager break sees the
+            # live rows only and falls through.
+            return hoisted_req, hoisted_pos
+        return token_req_indices(
+            forward_batch, num_tokens=positions.shape[0]
+        ), positions
+
+    @property
+    def low_ratio_decode_reads_prepared_q(self) -> bool:
+        # On SM100+ every decode scorer (full top-k, candidate publish / consume) is DeepGEMM.
+        return self.full_topk_indexer.use_deep_gemm_decode
+
+    def low_ratio_decode_index_q(
+        self,
+        *,
+        layer,
+        q: torch.Tensor,
+        head_weights_raw: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The DeepGEMM index query of a decode / verify step from the projected
+        ``indexer.wq_b(q_lora)`` and raw head weights, for `forward_low_ratio_sources`."""
+        _, pos = self._low_ratio_req_pos(positions, forward_batch)
+        return index_q_rope_pack(
+            indexer=layer.indexer,
+            q=q,
+            head_weights_raw=head_weights_raw,
+            freqs_cis=layer.freqs_cis,
+            positions=pos,
+        )
 
     def _forward_low_ratio_sources_cp(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
@@ -3244,7 +3296,7 @@ class DeepseekV4AttnBackend(
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
-                compressor.wkv(x),
+                compressor.project_kv(x),
                 compressor.norm.weight.data,
                 pos,
                 core.raw_out_loc,
@@ -3449,6 +3501,7 @@ class DeepseekV4AttnBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        prepared_q=None,
     ) -> None:
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
@@ -3467,7 +3520,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, mode, prepared_q
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -3515,7 +3568,9 @@ class DeepseekV4AttnBackend(
         )
         self.full_topk_indexer.topk_prefill_captured(inputs)
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, mode, prepared_q=None
+    ):
         ratio = layer.compress_ratio
         metadata = (
             self.forward_metadata.c1_indexer_metadata
@@ -3537,6 +3592,7 @@ class DeepseekV4AttnBackend(
             out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
                 ratio
             ),
+            prepared_q=prepared_q,
         )
 
     def _make_low_ratio_prefill_indexer_inputs(
@@ -3830,6 +3886,7 @@ class DeepseekV4AttnBackend(
                     layer.tp_q_head_num,
                     self.head_dim_v,
                     self.softmax_scale,
+                    max_rows=self.swapab_max_rows,
                 )
                 and (
                     forward_batch.forward_mode.is_decode()
@@ -3850,6 +3907,9 @@ class DeepseekV4AttnBackend(
                     extra_k_cache,
                     extra_indices,
                     extra_topk_lengths,
+                    max_rows=self.swapab_max_rows,
+                    pdl=self.swapab_low_latency,
+                    narrow_combine=self.swapab_low_latency,
                 )
 
             if get_platform().is_sm120:

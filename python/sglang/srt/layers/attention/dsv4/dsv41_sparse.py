@@ -145,10 +145,13 @@ class DeepseekV41Compressor(nn.Module):
                 self.wgate = nn.Linear(
                     hidden_size, head_dim, bias=False, dtype=torch.bfloat16
                 )
+        # Small-batch GEMMs a model may set: (x, weight) -> output, or None to decline.
+        self.low_m_bf16_gemm = None
+        self.low_m_fp32_gemm = None
 
     def project(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.compress_ratio == 1:
-            return self.wkv(x), None
+            return self.project_kv(x), None
         if self.use_fused_gate:
             fused = self.project_fused(x)
             head_dim = fused.shape[-1] // 2
@@ -159,8 +162,20 @@ class DeepseekV41Compressor(nn.Module):
         score = linear_bf16_fp32(x, self.wgate.weight)
         return kv, score
 
+    def project_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """Ratio 1: `[n, D]` bf16."""
+        if self.low_m_bf16_gemm is not None:
+            kv = self.low_m_bf16_gemm(x, self.wkv.weight)
+            if kv is not None:
+                return kv
+        return self.wkv(x)
+
     def project_fused(self, x: torch.Tensor) -> torch.Tensor:
         """`[n, 2D]` fp32, `| kv | score |`."""
+        if self.low_m_fp32_gemm is not None:
+            fused = self.low_m_fp32_gemm(x, self.wkv_gate.weight)
+            if fused is not None:
+                return fused
         return linear_bf16_fp32(x, self.wkv_gate.weight)
 
     def finish(self, kv: torch.Tensor) -> torch.Tensor:
@@ -230,6 +245,9 @@ class DeepseekV41Indexer(nn.Module):
         self.weights_proj_small_max_m = _small_weights_proj_max_m(
             self.n_heads, config.hidden_size
         )
+        # A small-batch BF16 GEMM a model may set for weights_proj and wk:
+        # (x, weight) -> output, or None to decline.
+        self.low_m_gemm = None
         if self.owns_k:
             self.wk = nn.Linear(
                 head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
@@ -242,6 +260,10 @@ class DeepseekV41Indexer(nn.Module):
             n128k512_gemm_bf16,
         )
 
+        if self.low_m_gemm is not None:
+            k = self.low_m_gemm(latent, self.wk.weight)
+            if k is not None:
+                return k
         # The JIT kernel raises rather than falling back on an unsupported shape.
         if can_use_n128k512_gemm(
             self.index_head_dim, latent.shape[-1], latent.shape[0]
@@ -268,6 +290,10 @@ class DeepseekV41Indexer(nn.Module):
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
+        if self.low_m_gemm is not None:
+            w = self.low_m_gemm(x, self.weights_proj.weight)
+            if w is not None:
+                return w
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
             from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
 

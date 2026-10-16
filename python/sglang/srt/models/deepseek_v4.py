@@ -99,6 +99,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    can_fuse_all_reduce,
+)
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -1018,6 +1021,8 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             parallel_group="attn_tp",
         )
+        # (wo_b, x) -> partial rows also stored for the fused post, or None to decline.
+        self.wo_b_publish = None
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
@@ -1261,6 +1266,8 @@ class MQALayer(MqaAttentionBase):
             self.alt_streams_indexer = None
 
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        # Builds the decode index query on a side stream when a model sets it.
+        self.low_latency_index_q = None
 
         self.compressor = None
         self.indexer = None
@@ -1726,6 +1733,11 @@ class MQALayer(MqaAttentionBase):
         # NOTE: wait for x ready
         if self.compressor is not None:
             stream_sources.wait_stream(current_stream)
+        index_q = (
+            self.low_latency_index_q.begin(self, x, attn_backend)
+            if self.low_latency_index_q is not None
+            else None
+        )
         qkv_a: Optional[torch.Tensor] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -1743,8 +1755,18 @@ class MQALayer(MqaAttentionBase):
 
         stream_kv.wait_stream(current_stream)
         q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
-        # NOTE: wait for the q_lora ready
-        if self.indexer is not None:
+        prepared_index_q = None
+        if index_q is not None:
+            prepared_index_q = index_q.finish(
+                layer=self,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+                stream_sources=stream_sources,
+            )
+        elif self.indexer is not None:
+            # NOTE: wait for the q_lora ready
             stream_sources.wait_stream(current_stream)
 
         q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -1758,6 +1780,7 @@ class MQALayer(MqaAttentionBase):
                     positions=positions,
                     forward_batch=forward_batch,
                     run_compressor=False,
+                    prepared_index_q=prepared_index_q,
                 )
 
         with torch.cuda.stream(stream_kv):
@@ -1768,6 +1791,8 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         if self.compressor is not None or self.indexer is not None:
             current_stream.wait_stream(stream_sources)
+        if index_q is not None:
+            current_stream.wait_stream(index_q.stream)
         return q
 
     def _forward_prepare_multi_stream_npu(
@@ -2844,10 +2869,12 @@ class MQALayer(MqaAttentionBase):
             )
             and not should_skip_mlp_all_reduce()
         )
-        o, _ = self.wo_b(
-            o.flatten(1) if isinstance(o, torch.Tensor) else o,
-            skip_all_reduce=defer_all_reduce,
-        )
+        o = o.flatten(1) if isinstance(o, torch.Tensor) else o
+        if defer_all_reduce and self.wo_b_publish is not None:
+            published = self.wo_b_publish(self.wo_b, o)
+            if published is not None:
+                return mhc.AttnOutput(published)
+        o, _ = self.wo_b(o, skip_all_reduce=defer_all_reduce)
         if defer_all_reduce:
             return mhc.AttnOutput(o)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -3391,6 +3418,15 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             )
             return output.finish(hidden_states)
 
+    def defers_attn_sum(self, num_rows: int) -> bool:
+        """Whether the attention boundary leaves the TP sum to the fused mHC post."""
+        return (
+            self.boundary_mhc_fusions
+            and self.boundary_pre_from_prev
+            and self._can_fuse_attn_mhc
+            and can_fuse_all_reduce(num_rows, self.hc_cfg.hidden)
+        )
+
     @functools.cached_property
     def _can_fuse_attn_mhc(self) -> bool:
         """The static half of the attention fuse gate (dsv4.1 only); load-time
@@ -3593,6 +3629,12 @@ class DeepseekV4Model(nn.Module):
             if _is_cuda
             else None,
         )
+        if _is_cuda and get_exec().features.enable_dsv41_low_latency_decode:
+            from sglang.srt.models.dsv41_low_latency.install import (
+                install_decoder_layers,
+            )
+
+            install_decoder_layers(self)
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -4342,6 +4384,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                     prefix=add_prefix("lm_head", prefix),
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
+                if _is_cuda and get_exec().features.enable_dsv41_low_latency_decode:
+                    from sglang.srt.models.dsv41_low_latency.install import (
+                        install_lm_head,
+                    )
+
+                    install_lm_head(self.lm_head)
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
@@ -4377,6 +4425,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         request/KV/draft state is touched; the runner owns the autotune context."""
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
+        if _is_cuda and get_exec().features.enable_dsv41_low_latency_decode:
+            from sglang.srt.models.dsv41_low_latency.install import autotune
+
+            autotune(self.model, self.lm_head, dtype=dtype)
         seen = set()
         # The backbone excludes vision and lm_head, whose prefill shapes differ.
         for layer in self.model.modules():
