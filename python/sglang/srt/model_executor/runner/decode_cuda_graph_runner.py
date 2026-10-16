@@ -216,6 +216,20 @@ def build_replay_fb_view(
     )
 
 
+def _rank_consistent_attention_graph_variants(
+    variants: Optional[AttentionGraphVariants],
+) -> Optional[AttentionGraphVariants]:
+    # DP ranks replay decode graphs together but pick variants from their own batch,
+    # and mismatched replays corrupt tokens; keep the one graph valid for any length.
+    if variants is None or not get_parallel().attn_dp_enabled:
+        return variants
+    logger.info(
+        "DP attention: per-rank attention graph variants %s disabled",
+        variants.capture_labels,
+    )
+    return None
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -317,8 +331,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.dllm_attention.graph_variants(self.captured_req_width)
             if self.dllm_attention is not None and self.is_dllm
             else create_attention_graph_variants(model_runner.model_config.hf_config)
-            or create_dsv41_candidate_graph_variants(
-                model_runner, self.capture_forward_mode, self.captured_req_width
+            or _rank_consistent_attention_graph_variants(
+                create_dsv41_candidate_graph_variants(
+                    model_runner, self.capture_forward_mode, self.captured_req_width
+                )
             )
         )
 
