@@ -527,6 +527,7 @@ class Scheduler:
                 run_batch=self.mode.step_launcher.run_batch,
                 on_idle=self.on_idle,
                 mark_idle=self.mark_sched_idled,
+                paused_pass=self.paused_pass,
             ),
         )
 
@@ -568,9 +569,7 @@ class Scheduler:
                 # and the tail of the in-flight decode graph.
                 prefetch()
             received = self.ingest_requests(waiting_for_result)
-            if self.parts.flags._engine_paused:
-                self._record_scheduler_state_for_paused_engine()
-                self._yield_gil_if_needed()
+            if self.paused_pass():
                 continue
             joined = intake() if intake is not None else None
             if joined:
@@ -666,6 +665,16 @@ class Scheduler:
 
             if busy_self_check:
                 self.hub.invariant_checker.self_check_during_busy()
+
+    def paused_pass(self) -> bool:
+        """Whether the engine is paused; a paused pass runs nothing after
+        intake: it records the scheduler's state and yields the GIL. The flat
+        and the ring driver both ask it."""
+        if not self.parts.flags._engine_paused:
+            return False
+        self._record_scheduler_state_for_paused_engine()
+        self._yield_gil_if_needed()
+        return True
 
     def launch_step(
         self,

@@ -193,11 +193,20 @@ class _Shell:
     """A Scheduler built with __new__ whose leaves record into one log."""
 
     def __init__(
-        self, mode, iterations, prefill=(), decode=(), ready_at=None, shutdown_at=None
+        self,
+        mode,
+        iterations,
+        prefill=(),
+        decode=(),
+        ready_at=None,
+        shutdown_at=None,
+        paused=(),
     ):
         self.events = []
         self.groups = {}
         self.shutdown_at = shutdown_at
+        # The iterations whose intake leaves the engine paused.
+        self.paused = set(paused)
         self.iteration = -1
         self.iterations = iterations
         self.prefill = dict(prefill)
@@ -250,6 +259,7 @@ class _Shell:
 
         s.ingest_requests = self.ingest_requests
         s._record_scheduler_state_for_paused_engine = lambda: self.log("paused")
+        s._yield_gil_if_needed = lambda: None
         s.process_pending_chunked_abort = lambda: self.log("chunked_abort")
         s._process_hicache_events = self.hicache_events
         s.hub.step_planner = SimpleNamespace(
@@ -292,6 +302,7 @@ class _Shell:
         self.log("ingest", stop_at_pause) if stop_at_pause else self.log("ingest")
         if self.iteration == self.shutdown_at:
             self.s.parts.flags.gracefully_exit = True
+        self.s.parts.flags._engine_paused = self.iteration in self.paused
         return []
 
     def hicache_events(self, should_retry_storage_prefetch=True):
@@ -626,6 +637,33 @@ class TestRingDriverStageOrder(CustomTestCase):
         shell = _RingShell("prefill", 2)
         shell.s.parts.mode_owners.disagg_prefill.transfer.append(object())
         self.assertEqual(shell.run()[-1], (1, "idle"))
+
+    def test_pause_runs_only_intake(self):
+        """A paused pass receives and relays requests and nothing else, and a
+        paused round runs no idle checks; the pass that resumes schedules."""
+        for mode in ("normal", "prefill"):
+            with self.subTest(mode):
+                shell = _RingShell(mode, 4, prefill={2: _step("p2")}, paused=(0, 1))
+                events = [e for e in shell.run() if e[1] != "dp.intake"]
+                self.assertEqual(
+                    events[:6],
+                    _at(0, "ingest", "paused", "send")
+                    + _at(1, "ingest", "paused", "send")
+                    if mode == "prefill"
+                    else _at(0, "ingest", "send", "paused")
+                    + _at(1, "ingest", "send", "paused"),
+                )
+                self.assertIn((2, "run_batch", "p2"), events)
+                self.assertNotIn("idle", [e[1] for e in events])
+
+    def test_shutdown_ends_the_ring(self):
+        """The pass that receives the shutdown relays it and ends the loop."""
+        for mode in ("normal", "prefill"):
+            with self.subTest(mode):
+                shell = _RingShell(mode, 4, prefill={0: _step("p0")}, shutdown_at=1)
+                events = shell.run()
+                self.assertEqual(events[-2:], _at(1, "ingest", "send"))
+                self.assertEqual(shell.iteration, 1)
 
     def test_pd_decode(self):
         shell = _RingShell("decode", 2, decode={0: _decode_step("d0")})

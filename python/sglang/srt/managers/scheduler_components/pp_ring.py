@@ -43,7 +43,10 @@ if TYPE_CHECKING:
         Streams,
         Workers,
     )
-    from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
+    from sglang.srt.managers.scheduler_components.engine_state import (
+        EngineFlags,
+        LaunchCounters,
+    )
     from sglang.srt.managers.scheduler_components.mode_stages import (
         DriverOps,
         ModeStages,
@@ -115,6 +118,7 @@ class PPRing:
         recv_skipper,
         ops: DriverOps,
         counters: LaunchCounters,
+        flags: EngineFlags,
         pp_spec_forward: Optional[PPSpecForward],
         kv: KvResources,
         streams: Streams,
@@ -136,6 +140,7 @@ class PPRing:
         self.recv_skipper = recv_skipper
         self.ops = ops
         self.counters = counters
+        self.flags = flags
         # What the forward and the output relay read.
         self.pp_group = pp_group
         self.device = device
@@ -197,6 +202,24 @@ class PPRing:
                                 recv_reqs,
                                 async_send=True,
                             )
+
+                # A shutdown or a pause ends the pass after intake, on every
+                # rank at the same slot: the requests that carry it are
+                # relayed on first, so the next rank sees it there too.
+                exiting = self.flags.gracefully_exit
+                if exiting or self.ops.paused_pass():
+                    if pd is not None and not self.pp_group.is_last_rank:
+                        self.send_req_work = self.channel.send_pyobj(
+                            recv_reqs, async_send=True
+                        )
+                    if exiting:
+                        self.channel.commit(self.send_req_work)
+                        return
+                    # A paused round is not idle: the idle checks wait for
+                    # the resume, as in the flat loop.
+                    server_is_idle = False
+                    continue
+
                 if pd is not None:
                     pd.take_ids(mb_id)
 

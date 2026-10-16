@@ -16,7 +16,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler_assembly import init_mode_stages  # noqa: E402
 from sglang.srt.managers.scheduler_components.bundles import Streams
-from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
+from sglang.srt.managers.scheduler_components.engine_state import (
+    EngineFlags,
+    LaunchCounters,
+)
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
 from sglang.srt.managers.scheduler_components.step_planner import StepPlanner
@@ -187,6 +190,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.parts.pp_spec_forward = None
         s.mode.step_launcher = SimpleNamespace(run_batch=Mock())
         s.parts.recv_skipper = None
+        s.parts.flags = EngineFlags()
         s.ingest_requests = Mock(return_value=[])
         s.parts.lists.waiting_queue = []
         s.disagg_prefill.bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])

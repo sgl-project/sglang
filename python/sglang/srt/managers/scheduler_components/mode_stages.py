@@ -119,3 +119,5 @@ class DriverOps:
     on_idle: Callable[[], None]
     # Note a ring round that launched nothing.
     mark_idle: Callable[[], None]
+    # Whether the engine is paused; a paused pass runs nothing after intake.
+    paused_pass: Callable[[], bool]

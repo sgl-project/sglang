@@ -219,6 +219,7 @@ class _Scheduler:
     )
     _start_fpm_clock = Scheduler._start_fpm_clock
     _begin_schedule = Scheduler._begin_schedule
+    paused_pass = Scheduler.paused_pass
     _yield_gil_if_needed = Scheduler._yield_gil_if_needed
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation

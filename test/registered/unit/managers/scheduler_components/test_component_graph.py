@@ -251,6 +251,7 @@ _DECLARED = {
         "PendingSteps",
         "StepLauncher",
         "LaunchCounters",
+        "EngineFlags",
         "PPSpecForward",
         "Workers",
         "FutureMap",
@@ -414,6 +415,7 @@ _CALLBACK_SITES = {
     ("init_pp_ring", "DriverOps", "commit_step", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "on_idle", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "mark_idle", _BOUND): 1,
+    ("init_pp_ring", "DriverOps", "paused_pass", _BOUND): 1,
     # RPC dispatch and the PD role switch, which name the scheduler itself.
     ("handle_rpc_request", "getattr", "", _SELF): 1,
     ("handle_pd_role_switch", "role_switch.handle_pd_role_switch", "", _SELF): 1,

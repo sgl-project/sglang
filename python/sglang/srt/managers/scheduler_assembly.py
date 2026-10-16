@@ -1064,6 +1064,7 @@ def build_pp_ring(parts: SchedulerParts, stages: ModeStages, ops: DriverOps) -> 
         recv_skipper=parts.recv_skipper,
         ops=ops,
         counters=parts.counters,
+        flags=parts.flags,
         pp_spec_forward=parts.pp_spec_forward,
         kv=parts.kv,
         streams=parts.streams,
