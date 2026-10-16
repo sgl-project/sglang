@@ -38,6 +38,17 @@ class ValenEncodedPrompt(msgspec.Struct, frozen=True):
     questions: tuple[ValenQuestion, ...]
 
 
+def _control_tokens(tokenizer):
+    # HF's special-token map can omit controls that are registered as special
+    # only in tokenizer.json (including Qwen's im_start). Consult the added-token
+    # metadata as well, without rejecting ordinary, non-special added words.
+    tokens = set(tokenizer.all_special_tokens)
+    for token in getattr(tokenizer, "added_tokens_decoder", {}).values():
+        if token.special:
+            tokens.add(token.content)
+    return tokens
+
+
 def valen_options(question: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
     if not isinstance(question, Mapping):
         raise ValueError("Valen questions must be objects")
@@ -101,6 +112,7 @@ def encode_valen_schema(
         return start + indices[0], start + indices[-1] + 1
 
     metadata, layouts = [], []
+    control_tokens = _control_tokens(tokenizer)
     append("<|im_start|>user\n")
     for index, (qid, question) in enumerate(questions.items()):
         options = valen_options(question)
@@ -108,7 +120,7 @@ def encode_valen_schema(
             question["instructions"],
             *(v for option in options for v in option),
         ):
-            if any(token in value for token in tokenizer.all_special_tokens):
+            if any(token in value for token in control_tokens):
                 raise ValueError("Reserved tokenizer control token in Valen schema")
         prefix = f"Question {index + 1}\nTask: {question['type']}\nQuestion: "
         instruction = append(
@@ -160,6 +172,7 @@ def encode_valen_schema(
 
 def valen_messages(tokenizer, state, *, allow_media=False):
     """Normalize state without mutating it or accepting injected control tokens."""
+    control_tokens = _control_tokens(tokenizer)
     if isinstance(state, str):
         messages = [{"role": "user", "content": state}]
     else:
@@ -199,7 +212,7 @@ def valen_messages(tokenizer, state, *, allow_media=False):
             text = item.get("text")
             if not isinstance(text, str):
                 raise ValueError("Valen text content must be a string")
-            if any(token in text for token in tokenizer.all_special_tokens):
+            if any(token in text for token in control_tokens):
                 raise ValueError("Reserved tokenizer control token in Valen state")
     return messages
 

@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
 
-from sglang.srt.entrypoints.valen.encoding import encode_valen_schema, valen_options
+from tokenizers import AddedToken
+
+from sglang.srt.entrypoints.valen.encoding import (
+    encode_valen_schema,
+    valen_messages,
+    valen_options,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,6 +44,45 @@ def questions():
 
 
 class TestValenEncoding(CustomTestCase):
+    def test_controls_registered_only_in_tokenizer_json_are_rejected(self):
+        tokenizer = Tokenizer()
+        tokenizer.all_special_tokens = ["<|im_end|>"]
+        tokenizer.added_tokens_decoder = {
+            1: AddedToken("<|im_start|>", special=True),
+            2: AddedToken("ordinary", special=False),
+        }
+        with self.assertRaisesRegex(ValueError, "Reserved"):
+            valen_messages(tokenizer, "<|im_start|>user")
+        for field in ("instructions", "key", "description"):
+            q = {"type": "choice", "instructions": "Pick.", "criteria": {"a": "Alpha"}}
+            if field == "instructions":
+                q[field] = "<|im_start|>"
+            else:
+                q["criteria"] = (
+                    {"<|im_start|>": "Alpha"}
+                    if field == "key"
+                    else {"a": "<|im_start|>"}
+                )
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "Reserved"),
+            ):
+                encode_valen_schema(tokenizer, [1], {"q": q})
+        self.assertEqual(
+            valen_messages(tokenizer, "ordinary")[0]["content"][0]["text"], "ordinary"
+        )
+        encode_valen_schema(
+            tokenizer,
+            [1],
+            {
+                "q": {
+                    "type": "choice",
+                    "instructions": "ordinary",
+                    "criteria": {"a": "ordinary"},
+                }
+            },
+        )
+
     def test_preserves_choice_order_and_excludes_external_ids(self):
         result = encode_valen_schema(Tokenizer(), [1, 2, 3], questions())
         text = "".join(map(chr, result.input_ids[3:]))
