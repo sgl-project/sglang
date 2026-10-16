@@ -2,6 +2,7 @@
 
 import atexit
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -25,6 +26,8 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -50,6 +53,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -150,6 +154,7 @@ class CacheConfig:
 
     # SWA
     sliding_window_size: Optional[int] = None
+    decoder_swa_bounded_replay: bool = False
 
     # Mamba
     enable_mamba_extra_buffer: bool = False
@@ -601,6 +606,7 @@ def _aux_storage_key_transfers(cache, node_id):
 def build_fixture(
     cfg: CacheConfig,
     enable_kv_cache_events: bool = False,
+    dynamo_kv_event_format: bool = False,
     enable_session_radix_cache: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
@@ -608,6 +614,7 @@ def build_fixture(
         dict[ComponentType, type[TreeComponent]]
     ] = None,
     tree_core_backend: Optional[str] = None,
+    kv_event_lora_names: Optional[KvEventLoraNames] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
@@ -735,9 +742,12 @@ def build_fixture(
         page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
+        decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
+        dynamo_kv_event_format=dynamo_kv_event_format,
+        kv_event_lora_names=kv_event_lora_names or KvEventLoraNames(),
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
@@ -1295,6 +1305,23 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.sanity_check()
 
 
+class _LoraReq:
+    """The request fields KvEventLoraNames reads."""
+
+    def __init__(self, extra_key, lora_id="lora-id"):
+        self.extra_key = extra_key
+        self.lora_id = lora_id
+
+
+def _lora_names(**names_by_extra_key):
+    """A name table plus the requests that keep its entries alive."""
+    table = KvEventLoraNames()
+    reqs = [_LoraReq(key) for key in names_by_extra_key]
+    for req in reqs:
+        table.register(req, names_by_extra_key[req.extra_key])
+    return table, reqs
+
+
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
@@ -1520,6 +1547,159 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             stored_hashes(extra_key="adapter-a", cache_salt="tenant-a"),
             stored_hashes(extra_key="adapter-b", cache_salt="tenant-a"),
         )
+
+    def test_lora_external_ids_separate_adapter_loads(self):
+        """External IDs distinguish loads; routers match tokens and public names."""
+        lora_names, _reqs = _lora_names(
+            **{
+                "uuid-a": "adapter-a",
+                "user|uuid-a2": "adapter-a",
+                "uuid-b": "adapter-b",
+            }
+        )
+
+        def store_then_evict(extra_key):
+            cache, allocator, _ = build_fixture(
+                self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+            )
+            cache.take_events()
+            self._insert(cache, allocator, [1, 2, 3, 4], extra_key=extra_key)
+            stored = self._stored_events(cache, StorageMedium.GPU)
+            cache.evict(EvictParams(num_tokens=4))
+            removed = self._removed_events(cache, StorageMedium.GPU)
+            self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+            return stored
+
+        base = store_then_evict(None)
+        lora_a = store_then_evict("uuid-a")
+        self.assertIsNone(base[0].lora_name)
+        self.assertEqual(lora_a[0].lora_name, "adapter-a")
+        seed = kv_event_namespace_seed(extra_key="uuid-a", cache_salt=None)
+        self.assertEqual(
+            self._event_hashes(lora_a),
+            [
+                namespaced_block_hash(h, namespace_seed=seed)
+                for h in self._event_hashes(base)
+            ],
+        )
+        # Another load of the same public name has distinct external IDs.
+        self.assertNotEqual(
+            self._event_hashes(store_then_evict("user|uuid-a2")),
+            self._event_hashes(lora_a),
+        )
+        self.assertNotEqual(
+            self._event_hashes(store_then_evict("uuid-b")),
+            self._event_hashes(lora_a),
+        )
+
+    def test_dynamo_lora_hashes_keep_the_dynamo_namespace(self):
+        """The default LoRA mix must not be applied a second time to Dynamo hashes."""
+        extra_key = "0123456789abcdef0123456789abcdef"
+        names, reqs = _lora_names(**{extra_key: "adapter-a"})
+
+        def publish(*, dynamo_format, namespace):
+            cache, allocator, _ = build_fixture(
+                self.cfg,
+                enable_kv_cache_events=True,
+                dynamo_kv_event_format=dynamo_format,
+                kv_event_lora_names=names,
+            )
+            cache.take_events()
+            self._insert(
+                cache,
+                allocator,
+                [1, 2, 3, 4],
+                extra_key=namespace,
+                cache_salt="tenant-a",
+            )
+            stored = self._stored_events(cache, StorageMedium.GPU)
+            cache.evict(EvictParams(num_tokens=4))
+            removed = self._removed_events(cache, StorageMedium.GPU)
+            self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+            return stored
+
+        base = publish(dynamo_format=False, namespace=None)
+        lora = publish(dynamo_format=True, namespace=extra_key)
+        seed = kv_event_namespace_seed(extra_key=extra_key, cache_salt="tenant-a")
+        self.assertEqual(
+            self._event_hashes(lora),
+            [
+                namespaced_block_hash(h, namespace_seed=seed)
+                for h in self._event_hashes(base)
+            ],
+        )
+        self.assertEqual(lora[0].lora_name, "adapter-a")
+
+    def test_lora_request_without_optional_ipc_name_uses_loaded_adapter(self):
+        names = KvEventLoraNames()
+        names.register(lora_id="loaded-id", lora_name="adapter-a")
+        req = _LoraReq("user|loaded-id", lora_id="loaded-id")
+        names.register(req)
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key=req.extra_key)
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(stored[0].lora_name, "adapter-a")
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertEqual(
+            self._event_hashes(self._removed_events(cache, StorageMedium.GPU)),
+            self._event_hashes(stored),
+        )
+
+    def test_lora_name_survives_a_gap_before_a_delayed_store(self):
+        """Write-back can publish a store after the request and GPU blocks are gone."""
+        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        del reqs
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(lora_names.get("uuid-a"), "adapter-a")
+
+        cache.evict(EvictParams(num_tokens=4))
+        removed = self._removed_events(cache, StorageMedium.GPU)
+        self.assertEqual(self._event_hashes(removed), self._event_hashes(stored))
+        self.assertEqual(lora_names.get("uuid-a"), "adapter-a")
+        # A late background store needs no new request/name registration.
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        delayed = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(delayed[0].lora_name, "adapter-a")
+        self.assertEqual(self._event_hashes(delayed), self._event_hashes(stored))
+
+    def test_lora_name_survives_until_queued_stores_are_taken(self):
+        """A finished request's blocks still publish under its adapter when
+        other requests register before the events are taken."""
+        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        del reqs
+        for i in range(200):
+            lora_names.register(_LoraReq(f"other-{i}"), "adapter-b")
+
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual([e.lora_name for e in stored], ["adapter-a"])
+
+    def test_lora_event_parentage_survives_node_split(self):
+        lora_names, _reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        cache, allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
+        )
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
+        original = self._stored_events(cache, StorageMedium.GPU)
+        self._insert(cache, allocator, [1, 2, 5, 6], extra_key="uuid-a")
+        branch = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(branch), 1)
+        self.assertEqual(branch[0].lora_name, "adapter-a")
+        self.assertEqual(branch[0].parent_block_hash, original[0].block_hashes[0])
 
     def test_kv_events_split_preserves_block_hash_parentage(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -2101,6 +2281,67 @@ class UnifiedRadixCacheSuite:
 
         cache.unlock(req.lock)
         cache.sanity_check()
+
+    def test_swa_unfinished_req_repoints_whole_insert_below_window(self):
+        # A request whose live SWA tail inside the inserted range is shorter
+        # than the window must still end up protected for the whole insert:
+        # the tree owns those slots now, and a shorter protected length lets
+        # the request free tree-owned SWA pages and re-insert them at finish.
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        full_avail = allocator.full_attn_allocator.available_size()
+        swa_avail = allocator.swa_attn_allocator.available_size()
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 8)
+        # Live SWA is [6, 8): two tokens, below the window of four.
+        evicted_len = 6
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.extend_end = len(req.full_untruncated_fill_ids)
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.kv.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        # The window already slid past [0, 6): those SWA slots are freed.
+        allocator.free_swa(kv_indices[:evicted_len])
+        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
+
+        cache.checkpoint(req, up_to=req.extend_end)
+
+        inserted = len(tokens) - (1 if self.cfg.is_eagle else 0)
+        self.assertEqual(req.kv.cache_protected_len, inserted)
+        torch.testing.assert_close(
+            req_to_token_pool.req_to_token[req.kv.req_pool_idx, : len(tokens)],
+            kv_indices,
+            check_dtype=False,
+        )
+        # A fresh matcher still needs a full live window and gets nothing.
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(m.device_prefix_len, 0)
+
+        finish_req(cache, req, len(tokens))
+        req.kv.mark_kv_released()
+        cache.sanity_check()
+        # Everything the request held is now tree-owned exactly once.
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size()
+            + cache.full_evictable_size(),
+            full_avail,
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size() + cache.swa_evictable_size(),
+            swa_avail,
+        )
 
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
@@ -4114,6 +4355,160 @@ class UnifiedRadixCacheSuite:
             num_pages = max(num_pages, sw_pages + 1)
         return self._make_seq(1, num_pages)
 
+    def test_buffer_only_swa_tail_only_backups(self):
+        """Tail-only backups: SWA reaches storage as the window ending at
+        each node, a hit falls back to the last node end whose window is
+        stored, and a split makes its point restorable once the parent is
+        backed up again."""
+        self._skip_unsupported_hicache_test()
+        if not self.cfg.has_swa:
+            self.skipTest("requires an SWA component")
+        page = self.cfg.page_size
+        sw_pages = (self.cfg.sliding_window_size + page - 1) // page
+        # Nodes longer than two windows (the SWA component may split a leaf
+        # at the window boundary), shorter than the window, and one window.
+        node_pages = [2 * sw_pages + 3, max(sw_pages - 1, 1), sw_pages]
+        total_pages = sum(node_pages)
+        # Each growing insert allocates its whole sequence next to the
+        # resident prefix before the duplicate is released.
+        if 2 * total_pages * page > self.cfg.kv_size:
+            self.skipTest("chain does not fit the device pool")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        with envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.override(True):
+            self._init_buffer_hicache(cache, storage_dir)
+        seq = self._make_seq(1, total_pages)
+        end_pages = 0
+        for pages in node_pages:
+            end_pages += pages
+            self._insert(cache, allocator, req_to_token_pool, seq[: end_pages * page])
+
+        def chain_pages(key):
+            leaf = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", key)))
+            ).last_device_node
+            hashes: list[str] = []
+            ends: list[int] = []
+            for node in self._path_chain(cache, leaf):
+                hashes.extend(cache.tree_core.get_hash_values(node))
+                ends.append(len(hashes))
+            return leaf, hashes, ends
+
+        def window_pages(ends):
+            kept = set()
+            for end in ends:
+                kept.update(range(max(0, end - sw_pages), end))
+            return kept
+
+        def restorable(prefix, kept):
+            """Longest prefix of ``prefix`` pages whose window is stored."""
+            return next(
+                (
+                    length
+                    for length in range(prefix, 0, -1)
+                    if all(p in kept for p in range(max(0, length - sw_pages), length))
+                ),
+                0,
+            )
+
+        leaf, page_hashes, node_ends = chain_pages(seq)
+        self.assertEqual(len(page_hashes), total_pages)
+        controller = cache.cache_controller
+        with mock.patch.object(
+            controller, "write_storage", wraps=controller.write_storage
+        ) as write_storage:
+            self._buffer_backup_and_wait(cache, leaf)
+
+        kept = window_pages(node_ends)
+        self.assertLess(len(kept), total_pages)
+        backend = controller.storage_backend
+        swa_page_size = controller.mem_pool_host.entry_map[
+            PoolName.SWA
+        ].host_pool.page_size
+
+        def stored(pool, key):
+            return os.path.exists(
+                os.path.join(
+                    backend.file_path, backend._get_component_key(key, pool) + ".bin"
+                )
+            )
+
+        swa_beliefs = cache.storage_existence_cache.pool(PoolName.SWA)
+        for i, key in enumerate(page_hashes):
+            self.assertTrue(stored(PoolName.KV, key), f"KV page {i}")
+            self.assertEqual(stored(PoolName.SWA, key), i in kept, f"SWA page {i}")
+            self.assertEqual(swa_beliefs.contains(key), i in kept, f"SWA belief {i}")
+        # Each SWA write staged exactly the rows of the keys it stored.
+        written: list[str] = []
+        for call in write_storage.call_args_list:
+            for transfer in call.kwargs.get("extra_pools") or ():
+                if transfer.name == PoolName.SWA:
+                    self.assertEqual(
+                        transfer.host_indices.numel(),
+                        len(transfer.keys) * swa_page_size,
+                    )
+                    written.extend(transfer.keys)
+        self.assertEqual(sorted(written), sorted(page_hashes[i] for i in kept))
+
+        # A hit's usable prefix is the last node end whose window is stored.
+        swa_query = [
+            PoolTransfer(
+                name=PoolName.SWA,
+                keys=["_"] * sw_pages,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ]
+        for prefix in range(1, total_pages + 1):
+            self.assertEqual(
+                self._storage_exists_count(cache, page_hashes[:prefix], swa_query),
+                restorable(prefix, kept),
+                f"prefix {prefix}",
+            )
+
+        # The whole chain is still served end to end from the sparse store.
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        handle = CacheRequestHandle("tail-only-req", 0)
+        cons.prefetch_from_storage(
+            handle, cons.root_node_handle(), array("q", seq), None, None
+        )
+        self._run_prefetch_to_completion(cons, handle)
+        self.assertEqual(
+            cons.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).device_prefix_len,
+            len(seq),
+        )
+
+        # A partial match inside the first node splits it; the parent's next
+        # backup stores the window ending at the split, so a hit there is
+        # served exactly from storage.
+        split = max(
+            (
+                p
+                for p in range(1, node_ends[0])
+                if p not in node_ends and restorable(p, kept) < p
+            ),
+            default=None,
+        )
+        if split is None:
+            self.skipTest("the first node has no unrestorable interior page")
+        branch = seq[: split * page] + self._make_seq(10_000, 1)
+        self._insert(cache, allocator, req_to_token_pool, branch)
+        branch_leaf, branch_hashes, branch_ends = chain_pages(branch)
+        self.assertEqual(branch_hashes[:split], page_hashes[:split])
+        self.assertIn(split, branch_ends)
+        self._buffer_backup_and_wait(cache, branch_leaf)
+        for i in range(max(0, split - sw_pages), split):
+            self.assertTrue(stored(PoolName.SWA, page_hashes[i]), f"split page {i}")
+        self.assertEqual(
+            self._storage_exists_count(cache, page_hashes[:split], swa_query), split
+        )
+        cache.sanity_check()
+        cons.sanity_check()
+
     def test_buffer_only_write_path_roundtrip(self):
         """Write path end to end: admission -> D2H staging -> storage write
         -> free. Staging and locks fully released, pages stored under every
@@ -5190,7 +5585,7 @@ class UnifiedRadixCacheSuite:
         cons.sanity_check()
 
     def test_buffer_only_load_back_uses_full_behind_swa_tombstone(self):
-        """FULL-only rematch keeps resident FULL and loads the complete SWA window."""
+        """FULL-only rematch keeps resident FULL and repairs missing SWA rows."""
         self._skip_unsupported_hicache_test()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
@@ -5285,12 +5680,13 @@ class UnifiedRadixCacheSuite:
         dispatched = {}
 
         def capture_swa_mapping():
-            load = next(iter(cons.buffer_pipeline.ongoing_buffer_load_back.values()))
-            swa_xfer = next(t for t in load.aux_xfers if t.name == PoolName.SWA)
+            load = cons.cache_controller.load_queue[-1]
+            swa_xfer = next(t for t in load.pool_transfers if t.name == PoolName.SWA)
             dispatched["device"] = swa_xfer.device_indices.clone()
-            full_window = masked_full[-len(swa_xfer.device_indices) :]
-            old_window = mapping_before[-len(swa_xfer.device_indices) :]
-            expected = torch.where(old_window > 0, old_window, swa_xfer.device_indices)
+            full_window = masked_full[-window_tokens:]
+            old_window = mapping_before[-window_tokens:]
+            expected = old_window.clone()
+            expected[old_window <= 0] = swa_xfer.device_indices
             self.assertTrue(
                 torch.equal(
                     cons_alloc.full_to_swa_index_mapping[full_window],
@@ -5308,7 +5704,7 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(int(spliced.numel()), 0)
         self.assertEqual(req.prefix_len, len(seq), "FULL rematch was lost")
-        self.assertEqual(len(dispatched["device"]), window_tokens)
+        self.assertEqual(len(dispatched["device"]), window_tokens - live_tail)
         self.assertEqual(cons_alloc.full_available_size(), full_avail0)
         k, v = self._snapshot_full_kv(cons_alloc, masked_full)
         self.assertTrue(torch.equal(k, masked_kv[0]))
@@ -12033,6 +12429,64 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         release_kv_cache(req, cache, checkpoint=True)
         self.assertNotIn("s", cache.session.slots)
         cache.sanity_check()
+
+    def test_bounded_replay_turn_borrows_record_without_hold_back(self):
+        """A short turn borrows its whole record; holding back a window would end
+        the match inside the published prompt, which the slot cannot rewind."""
+        cache, allocator, pool = build_fixture(
+            replace(self.cfg, decoder_swa_bounded_replay=True)
+        )
+        session = self._session("s")
+        first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
+        cache.maybe_hand_to_session(first)
+        cache.checkpoint(first, up_to=8)
+        first.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(first))
+
+        req = self._turn(list(range(1, 11)), session)
+        req.init_next_round_input(cache)
+        self.assertIn("s", cache.session.slots)
+        self.assertEqual(req.prefix_len, 8)
+
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+
+class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
+    def _matched_len(self, cache, tokens) -> int:
+        req = Req(
+            rid="decoder-swa-bounded-replay",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.init_next_round_input(cache)
+        return req.prefix_len
+
+    def test_match_stops_one_window_short_under_bounded_replay(self):
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=128,
+        )
+        for bounded_replay, matched in ((False, 200), (True, 260 - 128)):
+            with self.subTest(decoder_swa_bounded_replay=bounded_replay):
+                cache, allocator, _ = build_fixture(
+                    replace(cfg, decoder_swa_bounded_replay=bounded_replay)
+                )
+                cached = list(range(1, 201))
+                value = allocator.alloc(len(cached))
+                self.assertIsNotNone(value)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", cached)), value=value[: len(cached)]
+                    )
+                )
+                # 200 of 260 cached: a plain hit would leave a 60-row extend
+                prompt = cached + list(range(1001, 1061))
+                self.assertEqual(
+                    cache.swa_reprefill_tail_tokens(), 128 if bounded_replay else 0
+                )
+                self.assertEqual(self._matched_len(cache, prompt), matched)
 
 
 if __name__ == "__main__":
