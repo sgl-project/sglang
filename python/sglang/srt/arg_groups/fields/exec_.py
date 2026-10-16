@@ -133,12 +133,12 @@ class ExecFeatures(msgspec.Struct):
         "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
         "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and gfx950.",
     ] = False
+    # Internal resolved state; the only public CLI control is the disable flag.
     enable_decoder_swa_bounded_replay: A[
         bool,
         Arg(
-            help="Enable DeepSeek-V4.1 decoder SWA bounded replay explicitly. "
-            "Defaults on for supported standalone CUDA configurations. "
-            "Not numerically equivalent to full prefill.",
+            help="Resolved DeepSeek-V4.1 decoder SWA bounded replay state.",
+            no_cli=True,
             resolvable=True,
         ),
     ] = False
