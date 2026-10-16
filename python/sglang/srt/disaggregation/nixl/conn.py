@@ -724,15 +724,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
     def _await_handles(
-        self, handles: List[Any], *, failure_seen: bool
+        self,
+        handles: List[Any],
+        *,
+        failure_seen: bool,
+        room: Optional[int] = None,
     ) -> Tuple[bool, bool]:
         """Poll until every handle settled. Returns ``(settled, any_failed)``.
 
         The wait is unbounded while every handle is still healthy, and bounded
         to NIXL_ERR_SETTLE_TIMEOUT_S from the moment the batch is known broken.
         ``failure_seen`` arms that deadline up front, for a batch that raised
-        before the barrier ran. A state that cannot be read counts as running,
-        since it does not prove the write into the decode's pages is over.
+        before the barrier ran. An aborted room arms it while waiting, so a
+        never-settling handle cannot park the worker forever. A state that
+        cannot be read counts as running, since it does not prove the write
+        into the decode's pages is over.
         """
         deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
         while True:
@@ -750,6 +756,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 return False, True
             if all_settled:
                 return True, any_failed
+            # An aborted room leaves its handles in PROC while the wait only
+            # polls the device; treat it like a lost batch so the deadline
+            # bounds the wait instead of parking the worker forever. A handle
+            # reading as running is still safe to revisit: the abort ack is
+            # only sent when every handle has settled.
+            if (
+                not any_failed
+                and room is not None
+                and self.check_status(room) == KVPoll.Failed
+            ):
+                any_failed = True
             if not any_failed:
                 time.sleep(0)
                 continue
@@ -1510,7 +1527,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
-                settled, any_failed = self._await_handles(handles, failure_seen=False)
+                settled, any_failed = self._await_handles(
+                    handles, failure_seen=False, room=room
+                )
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
@@ -1570,7 +1589,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # rather than only after the barrier.
                 notify = False
                 if not settle_timed_out:
-                    notify, _ = self._await_handles(handles, failure_seen=True)
+                    notify, _ = self._await_handles(
+                        handles, failure_seen=True, room=room
+                    )
                 if notify:
                     self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
                     # Every handle settled => the writes are done, but the
