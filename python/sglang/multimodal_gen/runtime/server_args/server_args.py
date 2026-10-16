@@ -717,6 +717,14 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
         self.pipeline_config.validate_server_args(self)
+        if self.pipeline_config.tiny_vae_path or self.pipeline_config.tiny_vae_model:
+            if self.backend == Backend.DIFFUSERS:
+                raise ValueError("TinyVAE decoding requires the native SGLang backend")
+            from sglang.multimodal_gen.runtime.models.vaes.tiny_vae import (
+                validate_tiny_vae_config,
+            )
+
+            validate_tiny_vae_config(self.pipeline_config)
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every

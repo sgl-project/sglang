@@ -178,6 +178,9 @@ class PipelineConfig:
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
     vae_decode_precision: str | None = None
+    # Optional approximate final decoder; the original encoder stays available.
+    tiny_vae_path: str | None = None
+    tiny_vae_model: str | None = None
     # Optional request-scoped override. The loader keeps the reference decode
     # dtype resident so lossless requests never consume pre-rounded weights.
     vae_decode_precision_high: str | None = None
@@ -884,6 +887,20 @@ class PipelineConfig:
         )
 
         # VAE configuration
+        parser.add_argument(
+            f"--{prefix_with_dot}tiny-vae-path",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}tiny_vae_path",
+            default=PipelineConfig.tiny_vae_path,
+            help="Optional TinyVAE checkpoint for approximate final image/video decoding",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}tiny-vae-model",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}tiny_vae_model",
+            default=PipelineConfig.tiny_vae_model,
+            help="TinyVAE architecture name, e.g. taesd, taef1, taew2_1 or taeh3",
+        )
         parser.add_argument(
             f"--{prefix_with_dot}vae-precision",
             type=str,

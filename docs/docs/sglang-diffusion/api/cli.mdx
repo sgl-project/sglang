@@ -464,6 +464,84 @@ export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 
 See [Environment Variables](/docs/sglang-diffusion/environment_variables) for the full set of storage options.
 
+## TinyVAE decoding
+
+You can use a Tiny AutoEncoder checkpoint for approximate final image or video
+decoding with the native SGLang Diffusion backend. Supply both
+`--tiny-vae-path` and `--tiny-vae-model`. The original VAE remains loaded for
+conditioning encodes and latent metadata; text encoders and audio VAEs keep their
+normal execution paths.
+
+Example for an existing Linux CUDA installation, one GPU, with locally downloaded
+FLUX.1 Tiny AutoEncoder decoder weights:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --prompt "A lighthouse beside a calm ocean" \
+  --tiny-vae-model taef1 \
+  --tiny-vae-path /path/to/taef1_decoder.pth \
+  --vae-decode-precision fp32 \
+  --num-gpus 1 \
+  --save-output
+```
+
+The same two options work with `sglang serve`. Python pipeline configurations
+accept `tiny_vae_model` and `tiny_vae_path` with the same meanings. Model downloads
+may require your normal Hugging Face access token and model license acceptance.
+
+Choose the architecture explicitly; several different VAEs have the same latent
+channel count. The checkpoint must match the model's latent space.
+
+| Architecture | Target latent space | Latent channels |
+| --- | --- | --- |
+| `taesd` | Stable Diffusion 1.x/2.x | 4 |
+| `taesdxl` | SDXL | 4 |
+| `taesd3` | Stable Diffusion 3/3.5 | 16 |
+| `taef1` | FLUX.1 | 16 |
+| `taef2` | FLUX.2 (patchified latents) | 128 |
+| `taeqi2_1` | Qwen Image 2.1 (RGBA) | 64 |
+| `taehv` | HunyuanVideo | 16 |
+| `taew2_1` | Wan2.1, Wan2.2 14B, Qwen Image with Wan VAE | 16 |
+| `taew2_2` | Wan2.2 5B | 48 |
+| `taehv1_5` | HunyuanVideo 1.5 | 32 |
+| `taeh3` | MiniMax-H3 | 24 |
+| `taeltx2` | LTX-2 | 128 |
+
+The ComfyUI checkpoint names `lighttaew2_1`, `lighttaew2_2`,
+`lighttaehy1_5`, and `taeltx_2` are accepted as aliases for the corresponding
+video architectures above. Architecture compatibility does not establish
+reconstruction quality for an independently trained checkpoint.
+
+Architecture availability does not add a generation pipeline for a model that
+SGLang does not already support. For example, SD1/SDXL and HunyuanVideo 1.5 weights
+are supported by the TinyVAE network implementation, but require a matching
+native generation pipeline. LTX-2.3/2.5 use different trained VAEs; `taeltx2`
+weights are rejected for those decoder variants. TinyVAE cannot be combined with
+the LTX diffusion decoder.
+
+Use checkpoints from [TAESD](https://github.com/madebyollin/taesd) or
+[TAEHV](https://github.com/madebyollin/taehv), or compatible checkpoints with the
+same architecture. Full and decoder-only tensor state dictionaries are supported
+in `.safetensors`, `.pth`, `.pt`, or `.bin` format. Decoder keys may be unprefixed,
+`decoder.*`, or `taesd_decoder.*`. Encoder weights and ComfyUI `vae_scale` /
+`vae_shift` metadata are ignored: SGLang supplies the original pipeline's latent
+normalization. Missing or unexpected decoder weights fail loading. A Hugging Face
+single-file weight reference can also be passed through SGLang's weight resolver.
+
+TinyVAE trades reconstruction fidelity for cheaper decoding. It does not preserve
+the original VAE's output. The original VAE still costs loading time and weight
+memory. Component residency and `--vae-cpu-offload` apply to the original VAE and
+TinyVAE together. TinyVAE uses sequential temporal processing with fresh memory
+for each request; original VAE spatial tiling and parallel decode settings do not
+tile or distribute the TinyVAE decoder. Frame callbacks receive the completed clip.
+Layerwise VAE offload is unsupported; use resident or component offload placement.
+Request-scoped decode precision changes are unsupported with TinyVAE. If you set
+`--vae-decode-precision-high`, it must resolve to the same precision as the default
+decode, including any component precision override; otherwise loading fails.
+Start with `--vae-decode-precision fp32` when checking a new checkpoint, then
+validate reduced precision and output quality on your target hardware.
+
 ## Component Path Overrides
 
 Override individual pipeline components such as `vae`, `transformer`, or `text_encoder` with `--<component>-path`.
