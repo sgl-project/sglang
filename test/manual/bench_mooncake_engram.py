@@ -1,0 +1,189 @@
+"""Measure warm Engine streaming latency and throughput for an Engram backend.
+
+Run each backend in its own process, sequentially on the same GPUs. Pass matching
+Engine arguments through --engine-args. This measures the Engine API (including
+IPC/scheduling/detokenization), without HTTP or input tokenization time.
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import statistics
+import subprocess
+import time
+from pathlib import Path
+
+
+def memory_snapshot():
+    import psutil
+
+    processes = [psutil.Process(), *psutil.Process().children(recursive=True)]
+    pss = 0
+    for process in processes:
+        try:
+            pss += process.memory_full_info().pss
+        except psutil.NoSuchProcess:
+            pass
+    return {
+        "process_tree_pss_bytes": pss,
+        "gpu": subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,temperature.gpu,clocks.sm,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        ).strip(),
+    }
+
+
+async def wave(engine, prompts, output_length):
+    async def request(ids):
+        started = time.perf_counter()
+        stream = await engine.async_generate(
+            input_ids=ids,
+            sampling_params={
+                "temperature": 0,
+                "max_new_tokens": output_length,
+                "ignore_eos": True,
+            },
+            stream=True,
+        )
+        first = None
+        first_count = None
+        last = None
+        async for chunk in stream:
+            now = time.perf_counter()
+            count = chunk["meta_info"]["completion_tokens"]
+            if count and first is None:
+                first, first_count = now, count
+            last = chunk
+        finished = time.perf_counter()
+        assert first is not None and last is not None
+        count = last["meta_info"]["completion_tokens"]
+        assert count == output_length, last["meta_info"]
+        assert last["meta_info"].get("cached_tokens", 0) == 0, last["meta_info"]
+        return {
+            "ttft_ms": (first - started) * 1000,
+            "latency_ms": (finished - started) * 1000,
+            "tpot_ms": (finished - first) * 1000 / (count - first_count),
+            "first_chunk_tokens": first_count,
+            "output_tokens": count,
+            "output_ids": last.get("output_ids"),
+        }
+
+    start = time.perf_counter()
+    requests = await asyncio.gather(*(request(ids) for ids in prompts))
+    duration = time.perf_counter() - start
+    return {
+        "seconds": duration,
+        "output_tokens_per_second": sum(r["output_tokens"] for r in requests)
+        / duration,
+        "requests": requests,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--backend", choices=["native", "mooncake"], required=True)
+    parser.add_argument(
+        "--engine-args", required=True, help="Engine arguments JSON file"
+    )
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--input-lengths", type=int, nargs="+", default=[128, 1024])
+    parser.add_argument("--concurrencies", type=int, nargs="+", default=[1, 4, 16])
+    parser.add_argument("--output-length", type=int, default=128)
+    parser.add_argument("--warmups", type=int, default=2)
+    parser.add_argument("--repeats", type=int, default=5)
+    args = parser.parse_args()
+    assert args.output_length > 1 and args.warmups >= 1 and args.repeats >= 3
+
+    from transformers import AutoTokenizer
+
+    import sglang as sgl
+
+    kwargs = json.loads(Path(args.engine_args).read_text())
+    kwargs.update(model_path=args.model_path, engram_backend=args.backend)
+    assert kwargs["disable_radix_cache"], "Prefix reuse invalidates cold-prefill timing"
+    assert kwargs["stream_interval"] == 1
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    sentence = tokenizer.encode(
+        "A memory table maps each integer index to a stored embedding row. "
+        "The model reads these values and combines them with the current context. ",
+        add_special_tokens=False,
+    )
+    cases = []
+    for length in args.input_lengths:
+        for concurrency in args.concurrencies:
+            prompts = []
+            for request_id in range(concurrency):
+                prefix = tokenizer.encode(
+                    f"Request {request_id}: ", add_special_tokens=False
+                )
+                ids = (prefix + sentence * (length // len(sentence) + 2))[:length]
+                assert len(ids) == length
+                prompts.append(ids)
+            cases.append((length, concurrency, prompts))
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    result = {
+        "engine_args": kwargs,
+        "benchmark_args": vars(args),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "host_table": os.environ.get("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"),
+        "host_table_layout": os.environ.get("SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT"),
+        "cases": [],
+        "complete": False,
+    }
+    started = time.perf_counter()
+    engine = sgl.Engine(**kwargs)
+    result["load_seconds"] = time.perf_counter() - started
+    try:
+        for length, concurrency, prompts in cases:
+            for _ in range(args.warmups):
+                engine.loop.run_until_complete(
+                    wave(engine, prompts, args.output_length)
+                )
+            before = memory_snapshot()
+            samples = [
+                engine.loop.run_until_complete(
+                    wave(engine, prompts, args.output_length)
+                )
+                for _ in range(args.repeats)
+            ]
+            summary = {
+                "input_length": length,
+                "output_length": args.output_length,
+                "concurrency": concurrency,
+                "median_output_tokens_per_second": statistics.median(
+                    s["output_tokens_per_second"] for s in samples
+                ),
+                **{
+                    "median_" + metric: statistics.median(
+                        r[metric] for s in samples for r in s["requests"]
+                    )
+                    for metric in ("ttft_ms", "tpot_ms", "latency_ms")
+                },
+            }
+            result["cases"].append(
+                dict(
+                    summary,
+                    samples=samples,
+                    memory_before=before,
+                    memory_after=memory_snapshot(),
+                )
+            )
+            output.write_text(json.dumps(result, indent=2) + "\n")
+            print("PERF_CASE", json.dumps(summary), flush=True)
+        result["complete"] = True
+        output.write_text(json.dumps(result, indent=2) + "\n")
+        print("PERF_COMPLETE", output, flush=True)
+    finally:
+        engine.shutdown()
+
+
+if __name__ == "__main__":
+    main()
