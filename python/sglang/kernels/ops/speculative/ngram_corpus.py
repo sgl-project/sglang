@@ -46,6 +46,7 @@ def get_ngram_corpus_cls():
             self,
             capacity: int,
             max_trie_depth: int,
+            max_sam_match_depth: int,
             min_bfs_breadth: int,
             max_bfs_breadth: int,
             draft_token_num: int,
@@ -61,6 +62,7 @@ def get_ngram_corpus_cls():
             self.__ffi_init__(
                 capacity,
                 max_trie_depth,
+                max_sam_match_depth,
                 min_bfs_breadth,
                 max_bfs_breadth,
                 draft_token_num,
