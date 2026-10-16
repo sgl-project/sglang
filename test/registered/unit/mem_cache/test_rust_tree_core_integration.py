@@ -824,7 +824,7 @@ def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
             [live_root, stale_root], live_root, True
         ),
         "evict_excess_path_states": lambda: core.evict_excess_path_states(
-            stale_root, {}, {}
+            stale_root, ComponentType.MAMBA, {}, {}
         ),
         "inc_host_lock_ref": lambda: core.inc_host_lock_ref(stale_root),
         "dec_host_lock_ref": lambda: core.dec_host_lock_ref(
@@ -4608,7 +4608,7 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
     from collections import defaultdict
 
     from sglang.srt.mem_cache.unified_cache.cache_action import (
-        MambaEvictExcessPathStates,
+        EvictExcessPathStates,
     )
 
     core = _mamba_tree_core_with_cap(1)
@@ -4616,10 +4616,12 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
     _mamba_insert(core, [1, 2], [10, 11], 8)
     result = _mamba_insert(core, [1, 2, 3], [10, 11, 12], 9)
     (action,) = [
-        a for a in result.cache_actions if isinstance(a, MambaEvictExcessPathStates)
+        a for a in result.cache_actions if isinstance(a, EvictExcessPathStates)
     ]
     device_frees, host_frees = defaultdict(list), defaultdict(list)
-    core.evict_excess_path_states(action.tail_node_id, device_frees, host_frees)
+    core.evict_excess_path_states(
+        action.tail_node_id, action.component_type, device_frees, host_frees
+    )
     # The two shallow states free; the tail's survives the soft cap.
     assert sorted(t.item() for t in device_frees[ComponentType.MAMBA]) == [7, 8]
     assert host_frees == {}
