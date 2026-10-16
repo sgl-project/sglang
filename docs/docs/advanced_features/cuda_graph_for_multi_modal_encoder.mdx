@@ -43,6 +43,7 @@ Attention backend arguments are fixed inside the graph:
 
 TritonAttn expects [cu_seqlens, cu_seqlens_kk, max_len]
 FA3 expects [cu_seqlens, max_len]
+FA4 and AiterAttn (`aiter_attn`, ROCm) take the same [cu_seqlens, max_len] as FA3
 
 max_len is frozen as an int constant.
 cu_seqlens is cached into a dict during create_graph(), and its contents are not updated during subsequent replays.
