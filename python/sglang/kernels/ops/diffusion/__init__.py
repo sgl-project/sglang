@@ -298,12 +298,6 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
-        "diffusion.h3_vae_qk_rmsnorm_rope",
-        KernelBackend.TRITON,
-        "norm.h3_vae_fused_norm:h3_vae_qk_rmsnorm_rope",
-        _CUDA,
-    ),
-    (
         "diffusion.flux2_layernorm_modulate_fp8_quant",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_layernorm_modulate_fp8_quant_raw",
@@ -693,7 +687,6 @@ _EXPORTS: dict[str, str] = {
     "rmsnorm_scale_shift_per_token": "norm.rmsnorm_scale_shift_triton",
     "h3_vae_rmsnorm": "norm.h3_vae_fused_norm",
     "h3_vae_scale_add_rmsnorm": "norm.h3_vae_fused_norm",
-    "h3_vae_qk_rmsnorm_rope": "norm.h3_vae_fused_norm",
     # adaLN modulation, gating and timestep conditioning
     "indexed_gate_bf16": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16_": "modulate.indexed_modulation_triton",
