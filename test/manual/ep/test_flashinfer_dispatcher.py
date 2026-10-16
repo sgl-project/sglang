@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatch
 from sglang.srt.layers.moe.utils import initialize_moe_config
 from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 
 class TestFlashinferDispatcher(CustomTestCase):
@@ -44,9 +44,8 @@ class TestFlashinferDispatcher(CustomTestCase):
         publish(server_args, role="scheduler")
         initialize_moe_config()
 
-        initialize_model_parallel(
-            tensor_model_parallel_size=world_size, expert_model_parallel_size=world_size
-        )
+        publish_build_topology(tp_size=world_size, ep_size=world_size, world_rank=rank)
+        initialize_model_parallel()
 
     @classmethod
     def tearDownClass(cls):

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
-from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.runtime_context import get_context, get_device, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
@@ -95,7 +95,7 @@ def handle_pd_role_switch(
             )
         try:
             available_graph_gb = get_available_gpu_memory(
-                scheduler.device, scheduler.ps.gpu_id
+                scheduler.device, get_device().gpu_id
             )
         except Exception as e:
             return _fail(
@@ -256,7 +256,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
 def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     """Release the prefix (radix/hicache) cache so a flip works with radix ON.
 
-    With radix disabled (ChunkCache) the flip needs nothing here: ChunkCache
+    With radix disabled the flip needs nothing here: the disabled cache
     keeps no persistent prefixes and, since the instance is idle before the
     switch, the allocator is already empty. This is the historical
     ``--disable-radix-cache`` path, left untouched by the guard below.

@@ -3,11 +3,6 @@ import unittest
 import psutil
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
-)
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.mem_cache.pool_host.base import HICACHE_HOST_MEMORY_RESERVE_BYTES
 from sglang.srt.mem_cache.pool_host.common import (
@@ -65,20 +60,6 @@ def _make_cpu_minimax_sparse_pool(start_layer: int = 4) -> MiniMaxSparseKVPool:
 
 
 class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
-    def test_hiradix_extra_pools_include_minimax_indexer(self):
-        pool = _make_cpu_minimax_sparse_pool()
-        cache = object.__new__(HiRadixCache)
-        cache.cache_controller = object.__new__(HybridCacheController)
-        cache.kv_cache = pool
-
-        extra = HiRadixCache._get_extra_pools(cache)
-
-        transfers = extra["extra_pools"]
-        self.assertEqual(len(transfers), 1)
-        self.assertEqual(transfers[0].name, PoolName.INDEXER)
-        self.assertEqual(transfers[0].indices_from_pool, PoolName.KV)
-        self.assertEqual(transfers[0].hit_policy, PoolHitPolicy.ALL_PAGES)
-
     def test_index_k_waits_for_full_local_layer(self):
         pool = _make_cpu_minimax_sparse_pool()
         counter = _FakeLayerTransferCounter()

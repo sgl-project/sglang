@@ -1,5 +1,5 @@
 name: Wait for Jobs
-description: Poll and wait for specified jobs in the current workflow run to complete. Returns success immediately when the PR carries the `bypass-fastfail` label, letting downstream stages dispatch in parallel (same effect as scheduled runs).
+description: Poll and wait for specified jobs in the current workflow run to complete. Returns success immediately when the PR carries the `parallel-stages` label (or `highest-priority`, which implies it), letting downstream stages dispatch in parallel (same effect as scheduled runs).
 
 inputs:
   stage-name:
@@ -12,13 +12,17 @@ inputs:
         - an object { "prefix": "...", "expected_count": N }: for matrix jobs
     required: true
   max-wait-minutes:
-    description: 'Maximum time to wait before timing out'
+    description: 'Maximum wall-clock time to wait before reporting `timeout`. On GitHub-hosted runners, whose jobs are hard-capped at 6h, keep it under 360 with room for job setup.'
     required: false
     default: '240'
   poll-interval-seconds:
     description: 'Seconds between polling attempts'
     required: false
     default: '60'
+  fail-on-timeout:
+    description: 'Fail when max-wait-minutes runs out, unless set to `false`, which reports `timeout` as a warning so later stages proceed.'
+    required: false
+    default: 'true'
   github-token:
     description: 'GitHub token for API calls'
     required: false
@@ -40,6 +44,7 @@ runs:
         INPUT_JOBS: ${{ inputs.jobs }}
         INPUT_MAX_WAIT_MINUTES: ${{ inputs.max-wait-minutes }}
         INPUT_POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+        INPUT_FAIL_ON_TIMEOUT: ${{ inputs.fail-on-timeout }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -47,30 +52,15 @@ runs:
           const jobSpecs = JSON.parse(process.env.INPUT_JOBS);
           const maxWaitMinutes = parseInt(process.env.INPUT_MAX_WAIT_MINUTES);
           const pollIntervalSeconds = parseInt(process.env.INPUT_POLL_INTERVAL_SECONDS);
-          const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
+          // Each poll also spends time on API calls, so only a deadline bounds the real wait.
+          const deadlineMs = Date.now() + maxWaitMinutes * 60 * 1000;
 
-          // bypass-fastfail label opts the PR out of stage-to-stage waiting,
-          // letting all stages dispatch in parallel like scheduled runs do.
-          let labels = [];
-          if (context.payload.pull_request?.labels) {
-            labels = context.payload.pull_request.labels.map(l => l.name);
-          } else {
-            const ref = context.payload.pull_request?.head?.sha || context.sha;
-            try {
-              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: ref,
-              });
-              if (prs.length > 0) {
-                labels = prs[0].labels.map(l => l.name);
-              }
-            } catch (e) {
-              console.log(`Could not fetch PR labels for ${ref}: ${e.message}`);
-            }
-          }
-          if (labels.includes('bypass-fastfail')) {
-            console.log(`Skipping ${stageName} wait (bypass-fastfail label present)`);
+          const { resolveCiLabels } = require(
+            `${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-labels.cjs`
+          );
+          const { parallelStages } = await resolveCiLabels(github, context);
+          if (parallelStages) {
+            console.log(`Skipping ${stageName} wait (parallel-stages label present)`);
             core.setOutput('result', 'success');
             return;
           }
@@ -152,7 +142,7 @@ runs:
             }
           }
 
-          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          for (let attempt = 0; ; attempt++) {
             const { jobs, cached } = await fetchJobs();
 
             let allCompleted = true;
@@ -221,9 +211,18 @@ runs:
               return;
             }
 
-            console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
-            await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
+            const remainingMs = deadlineMs - Date.now();
+            if (remainingMs <= 0) {
+              break;
+            }
+            const sleepMs = Math.min(pollIntervalSeconds * 1000, remainingMs);
+            console.log(`Waiting ${Math.ceil(sleepMs / 1000)}s... (attempt ${attempt + 1}, ${Math.ceil(remainingMs / 60000)} min left of ${maxWaitMinutes})`);
+            await new Promise(resolve => setTimeout(resolve, sleepMs));
           }
 
-          core.setFailed(`Timeout waiting for ${stageName} jobs`);
           core.setOutput('result', 'timeout');
+          if (process.env.INPUT_FAIL_ON_TIMEOUT !== 'false') {
+            core.setFailed(`Timeout waiting for ${stageName} jobs`);
+          } else {
+            core.warning(`Timeout waiting for ${stageName} jobs; proceeding without the stage gate`);
+          }

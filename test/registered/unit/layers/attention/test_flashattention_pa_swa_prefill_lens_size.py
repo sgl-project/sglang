@@ -68,7 +68,6 @@ def _make_prefill_aware_swa_runner(
         chunked_prefill_size=8192,
         disable_radix_cache=False,
         enable_prefill_cp=False,
-        enable_dp_attention=False,
     )
     token_to_kv_pool = token_to_kv_pool if token_to_kv_pool is not None else object()
     token_to_kv_pool_allocator = object()
@@ -91,7 +90,6 @@ def _make_prefill_aware_swa_runner(
         kv_cache_dtype=torch.float16,
         kv_cache_dtype_str="auto",
         page_size=1,
-        ps=SimpleNamespace(attn_cp_size=1, tp_size=1),
         is_draft_worker=False,
         server_args=server_args,
         attention_chunk_size=None,

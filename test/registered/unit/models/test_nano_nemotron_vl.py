@@ -1,19 +1,120 @@
 """Unit tests for native Nemotron-H Omni model integration."""
 
+import math
 import unittest
+from array import array
 from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 
+from sglang.srt.configs import NemotronHConfig
+from sglang.srt.configs.nemotron_h import MOE
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.nano_nemotron_vl import (
     NemotronH_Nano_VL_V2,
     NemotronH_Omni_Reasoning_V3,
 )
+from sglang.srt.multimodal.evs import EVS, EVSEmbeddingResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+TOKENS_PER_TUBELET = 4
+HIDDEN_SIZE = 8
+
+
+def _temporal_video_model(video_pruning_rate: float):
+    model = object.__new__(NemotronH_Omni_Reasoning_V3)
+    config = SimpleNamespace(
+        video_temporal_patch_size=2, video_pruning_rate=video_pruning_rate
+    )
+    EVS.__init__(model, config)
+    model.config = config
+    model.encoded_num_frames = []
+
+    def extract_video_feature_temporal(pixel_values, num_frames):
+        model.encoded_num_frames.append(num_frames)
+        num_tubelets = math.ceil(num_frames / 2)
+        return torch.randn(num_tubelets, TOKENS_PER_TUBELET, HIDDEN_SIZE)
+
+    model.extract_video_feature_temporal = extract_video_feature_temporal
+    return model
+
+
+def _video_item(frames_per_video: list[int], frame_hw=(4, 4), **model_specific_data):
+    return MultimodalDataItem(
+        modality=Modality.VIDEO,
+        feature=torch.zeros(sum(frames_per_video), 3, *frame_hw),
+        offsets=[],
+        model_specific_data={"frames_per_video": frames_per_video}
+        | model_specific_data,
+    )
+
+
+class TestNemotronHOmniVideo(CustomTestCase):
+    def test_temporal_tubelets_do_not_span_videos(self):
+        """Two odd-length videos in one request must be grouped into tubelets per video."""
+        model = _temporal_video_model(video_pruning_rate=0.0)
+
+        features = model.get_video_feature([_video_item([3, 1])])
+
+        self.assertEqual(model.encoded_num_frames, [3, 1])
+        self.assertEqual(features.shape, (3 * TOKENS_PER_TUBELET, HIDDEN_SIZE))
+
+    def test_batched_videos_with_different_frame_sizes(self):
+        """Single-tubelet videos from different requests are encoded in one call;
+        aspect-preserving resize gives them different frame sizes, which must not
+        crash the scheduler."""
+        for video_pruning_rate in (0.0, 0.7):
+            with self.subTest(video_pruning_rate=video_pruning_rate):
+                model = _temporal_video_model(video_pruning_rate)
+                rows = cols = int(math.sqrt(TOKENS_PER_TUBELET))
+                grids = {"thw_grids": [(1, rows, cols)]}
+                landscape = _video_item([1], frame_hw=(4, 6), **grids)
+                portrait = _video_item([1], frame_hw=(6, 4), **grids)
+
+                features = model.get_video_feature([landscape, portrait])
+
+                self.assertEqual(model.encoded_num_frames, [1, 1])
+                self.assertEqual(features.shape, (2 * TOKENS_PER_TUBELET, HIDDEN_SIZE))
+
+    def test_evs_prunes_temporal_tubelets_per_video(self):
+        """EVS on 2-frame tubelets keeps each video's first tubelet and prunes per video."""
+        model = _temporal_video_model(video_pruning_rate=0.25)
+        rows = cols = int(math.sqrt(TOKENS_PER_TUBELET))
+        item = _video_item([3, 1], thw_grids=[(2, rows, cols), (1, rows, cols)])
+
+        result = model.get_video_feature([item])
+
+        self.assertIsInstance(result, EVSEmbeddingResult)
+        self.assertEqual(result.num_tokens_per_frame, [4, 2, 4])
+        self.assertEqual(result.embedding.shape, (10, HIDDEN_SIZE))
+
+    def test_evs_keeps_image_pad_values_for_redistribution(self):
+        """EVS placeholder redistribution must not restore raw image tokens next to a video."""
+        start, end, image_token = 1, 2, 18
+        image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[], hash=11)
+        video = _video_item([2], pre_chunked_input_ids=[])
+        video.hash = 22
+        for item in (image, video):
+            item.set_pad_value()
+        input_ids = array("q", [7, start, image_token, end, start, image_token, end])
+        video.pre_chunked_input_ids = input_ids.tolist()
+        mm_inputs = MultimodalInputs(
+            mm_items=[image, video], im_start_id=start, im_end_id=end
+        )
+
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        padded = model.pad_input_ids(input_ids, mm_inputs)
+
+        self.assertEqual(list(video.pre_chunked_input_ids), list(padded))
+        self.assertIn(image.pad_value, video.pre_chunked_input_ids)
 
 
 class TestNemotronHOmniModel(CustomTestCase):
@@ -39,30 +140,35 @@ class TestNemotronHOmniModel(CustomTestCase):
         self.assertIs(model_class, NemotronH_Omni_Reasoning_V3)
         self.assertEqual(architecture, "NemotronH_Omni_Reasoning_V3")
 
-    def test_exposes_language_embed_and_head(self):
+    def test_lora_scope_excludes_the_vision_tower(self):
+        """RADIO qkv_proj under a layers.<i>. path is outside the LoRA scope."""
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)
-        embed = object()
-        head = object()
-        model.language_model = SimpleNamespace(
-            get_embed_and_head=lambda: (embed, head),
-            lm_head=head,
+
+        self.assertTrue(
+            model.should_apply_lora("language_model.model.layers.7.mixer.qkv_proj")
+        )
+        self.assertFalse(
+            model.should_apply_lora(
+                "vision_model.radio_model.model.encoder.layers.7.attn.attn.qkv_proj"
+            )
         )
 
-        self.assertEqual(model.get_embed_and_head(), (embed, head))
-        self.assertIs(model.lm_head, head)
-
-    def test_delegates_dflash_capture_to_language_model(self):
+    def test_lora_shape_hooks_reach_the_language_model(self):
+        """The LoRA shape hooks forward to the inner language model."""
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)
-        captured_layer_ids = []
         model.language_model = SimpleNamespace(
-            set_dflash_layers_to_capture=captured_layer_ids.extend
+            get_hidden_dim=lambda module_name, layer_idx: (module_name, layer_idx),
+            get_stacked_multiply=lambda module_name: (module_name, "mult"),
         )
 
-        model.set_dflash_layers_to_capture([1, 22, 43, 64, 85])
-
-        self.assertEqual(captured_layer_ids, [1, 22, 43, 64, 85])
+        self.assertEqual(model.get_hidden_dim("out_proj", 5), ("out_proj", 5))
+        self.assertEqual(
+            model.get_stacked_multiply("gate_up_proj_moe"),
+            ("gate_up_proj_moe", "mult"),
+        )
+        self.assertIn("in_proj", NemotronH_Omni_Reasoning_V3.supported_lora_modules)
 
     def test_vision_final_layernorm_is_loaded_and_applied(self):
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
@@ -176,6 +282,35 @@ class TestNemotronHOmniModel(CustomTestCase):
             [name for name, _ in loaded_sound_weights],
             ["sound_encoder.projection.weight"],
         )
+
+    def test_expert_location_config_spans_full_hybrid_stack(self):
+        """The VL wrapper exposes the full-stack expert-location config for EPLB."""
+        pattern = "ME*E-E"
+        llm_config = NemotronHConfig(
+            hybrid_override_pattern=pattern, n_routed_experts=8, n_group=1
+        )
+
+        expert_config = (
+            NemotronH_Omni_Reasoning_V3.get_model_config_for_expert_location(
+                SimpleNamespace(llm_config=llm_config)
+            )
+        )
+
+        self.assertEqual(expert_config.num_layers, len(pattern))
+        moe_layer_ids = [i for i, c in enumerate(pattern) if c == MOE]
+        self.assertLess(max(moe_layer_ids), expert_config.num_layers)
+        self.assertEqual(expert_config.num_logical_experts, 8)
+
+    def test_routed_expert_weights_come_from_language_model(self):
+        """The VL wrapper exposes the language model's expert weights for EPLB."""
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        weights_of_layer = {1: [torch.ones(1)]}
+        model.language_model = SimpleNamespace(
+            routed_experts_weights_of_layer=weights_of_layer
+        )
+
+        self.assertIs(model.routed_experts_weights_of_layer, weights_of_layer)
 
 
 if __name__ == "__main__":

@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use zeromq::SocketSend;
 
-use sgl_router::policies::kv_events::discovery::EventConfig;
-use sgl_router::policies::kv_events::{compute_block_hashes, KvEventIndex, KvWorkerId};
+use sgl_router::state::kv_events::discovery::EventConfig;
+use sgl_router::state::kv_events::{compute_block_hashes, KvEventIndex, KvWorkerId};
 
 use super::zmq_helpers::{
     build_multipart, encode_block_stored_event, encode_event_batch, make_pub_bound,
@@ -43,6 +43,7 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
         dp_size: 1,
         load_port_base: None,
         load_topic: None,
+        replay_port_base: None,
         is_bigram: false,
     };
 
@@ -178,6 +179,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         dp_size: 1,
         load_port_base: None,
         load_topic: None,
+        replay_port_base: None,
         is_bigram: false,
     };
     let cfg_y = EventConfig {
@@ -188,6 +190,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         dp_size: 1,
         load_port_base: None,
         load_topic: None,
+        replay_port_base: None,
         is_bigram: false,
     };
 

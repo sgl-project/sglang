@@ -17,6 +17,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.hy_v4 import HYV4Config
@@ -32,6 +33,10 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusVisionConfig,
 )
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
+from sglang.srt.configs.iquest_q1 import (
+    IQuestQ1Config,
+    IQuestQ1MTPConfig,
+)
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
@@ -124,6 +129,8 @@ __all__ = [
     "Qwen3_5TextConfig",
     "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
+    "IQuestQ1Config",
+    "IQuestQ1MTPConfig",
     "InternS2MobiusConfig",
     "InternS2MobiusTextConfig",
     "InternS2MobiusVisionConfig",
@@ -132,6 +139,7 @@ __all__ = [
     "Dots3Config",
     "FalconH1Config",
     "FalconMambaConfig",
+    "GigaChat35Config",
     "GraniteMoeHybridConfig",
     "HYV4Config",
     "MambaConfig",

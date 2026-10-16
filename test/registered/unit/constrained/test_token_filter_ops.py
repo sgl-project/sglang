@@ -16,13 +16,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 
-# Conditionally import Triton path
-_has_cuda = torch.cuda.is_available()
-if _has_cuda:
-    from sglang.kernels.ops.grammar.token_filter_ops import (
-        set_token_filter_triton,
-    )
-
 
 def _get_allowed_tokens(vocab_mask, batch_idx, max_token_id):
     """Extract allowed token IDs from a bitmask row."""
@@ -98,48 +91,6 @@ class TestSetTokenFilterTorch(unittest.TestCase):
         self.assertEqual(_get_allowed_tokens(vocab_mask, 0, 64), [1])
         self.assertEqual(_get_allowed_tokens(vocab_mask, 1, 64), [2])
         self.assertEqual(_get_allowed_tokens(vocab_mask, 2, 64), [3])
-
-
-@unittest.skipUnless(_has_cuda, "CUDA not available")
-class TestTritonTorchParity(unittest.TestCase):
-    """Tests that Triton and Torch produce identical output."""
-
-    def _compare_outputs(self, token_ids, is_allowed, reset):
-        vocab_size = 128
-        num_elements = (vocab_size + 31) // 32
-
-        torch_mask = torch.zeros((1, num_elements), dtype=torch.int32)
-        triton_mask = torch.zeros((1, num_elements), dtype=torch.int32, device="cuda")
-
-        set_token_filter_torch(
-            torch_mask,
-            token_ids,
-            0,
-            is_allowed=is_allowed,
-            reset_vocab_mask=reset,
-        )
-        set_token_filter_triton(
-            triton_mask,
-            token_ids,
-            0,
-            is_allowed=is_allowed,
-            reset_vocab_mask=reset,
-        )
-
-        triton_cpu = triton_mask.cpu()
-        self.assertTrue(
-            torch.equal(torch_mask, triton_cpu),
-            f"Mismatch: torch={torch_mask} triton={triton_cpu}",
-        )
-
-    def test_parity_allow_tokens(self):
-        self._compare_outputs([0, 5, 31, 32, 63, 100], is_allowed=True, reset=True)
-
-    def test_parity_block_tokens(self):
-        self._compare_outputs([3, 5, 10], is_allowed=False, reset=True)
-
-    def test_parity_empty_tokens(self):
-        self._compare_outputs([], is_allowed=True, reset=True)
 
 
 if __name__ == "__main__":

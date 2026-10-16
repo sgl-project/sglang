@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import grpc
 import openai
@@ -1522,23 +1523,28 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
         image_path = os.path.abspath("examples/assets/example_image.png")
 
         try:
-            stub.SchedulerReceiveUrl(
-                sglang_encoder_pb2.SchedulerReceiveUrlRequest(
-                    req_id=req_id,
-                    receive_url=f"{self.base_host}:{recv_port}",
-                    receive_count=1,
-                ),
-                timeout=60,
-            )
-            stub.Encode(
-                sglang_encoder_pb2.EncodeRequest(
-                    mm_items=[image_path],
-                    req_id=req_id,
-                    num_parts=1,
-                    part_idx=0,
-                ),
-                timeout=300,
-            )
+            # A scheduler registers concurrently with Encode, never before it:
+            # the request state only exists once Encode dispatches.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                registration = pool.submit(
+                    stub.SchedulerReceiveUrl,
+                    sglang_encoder_pb2.SchedulerReceiveUrlRequest(
+                        req_id=req_id,
+                        receive_url=f"{self.base_host}:{recv_port}",
+                        receive_count=1,
+                    ),
+                    timeout=60,
+                )
+                stub.Encode(
+                    sglang_encoder_pb2.EncodeRequest(
+                        mm_items=[image_path],
+                        req_id=req_id,
+                        num_parts=1,
+                        part_idx=0,
+                    ),
+                    timeout=300,
+                )
+                registration.result(timeout=60)
 
             poller = zmq.Poller()
             poller.register(recv_socket, zmq.POLLIN)

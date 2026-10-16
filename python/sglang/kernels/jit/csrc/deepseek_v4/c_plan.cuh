@@ -29,12 +29,12 @@ using F2S_T = int64_t;
 using IDX_T = int64_t;
 
 /// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
-SGL_DEVICE __host__ PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
+SGL_DEVICE_HOST PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
   return {static_cast<uint32_t>(ragged_id | batch_id << 16), seq_len};
 }
 
 /// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
-SGL_DEVICE uint2 unpack_w(PlanW plan) {
+SGL_DEVICE_HOST uint2 unpack_w(PlanW plan) {
   return {static_cast<uint16_t>(plan.ragged_id), static_cast<uint16_t>(plan.ragged_id >> 16)};
 }
 
@@ -106,20 +106,6 @@ struct DecodeParamsLegacy {
 };
 
 inline constexpr uint32_t kMaxPrefillBatchSize = 1024;
-
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-  static_assert(device::kWarpThreads == 32);
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-#ifndef USE_ROCM
-    uint32_t n = __shfl_up_sync(device::kFullMask, val, offset);
-#else
-    uint32_t n = __shfl_up(val, offset, 32);
-#endif
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
 
 __global__ __launch_bounds__(1024, 1)  //
     void plan_compress_prefill_kernel0(const Prefill0Params params) {

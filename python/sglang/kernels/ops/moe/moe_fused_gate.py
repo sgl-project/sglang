@@ -8,7 +8,12 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.jit.utils import (
+    cache_once,
+    get_jit_cuda_arch,
+    is_arch_support_pdl,
+    load_jit,
+)
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix
 
@@ -461,6 +466,12 @@ def moe_fused_gate(
     num_warps = 1 if BLOCK_N <= 512 else 4
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
+    if use_pdl and scoring_func_int == 1 and N == 384 and K == 6 and M <= 8:
+        # On SM103, early-launching the small DSV4.1 target router increases
+        # latency when it overlaps with mHC/shared-expert work. Use ordinary
+        # stream dependencies; keep PDL for the draft router and larger batches.
+        arch = get_jit_cuda_arch()
+        use_pdl = (arch.major, arch.minor) != (10, 3)
     extra = {"launch_pdl": True} if use_pdl else {}
     # Dynamo cannot analyze the kernel (PDL inline asm), so it writes back every
     # pointer arg; aliasing an output as an unused arg's fallback clobbers it.

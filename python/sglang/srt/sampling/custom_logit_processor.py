@@ -30,7 +30,11 @@ class CustomLogitProcessor(ABC):
         logits: torch.Tensor,
         custom_param_list: Optional[List[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
-        """Define the callable behavior."""
+        """Define the callable behavior.
+
+        The returned tensor must have the same shape as `logits`: the caller
+        writes it back row for row and does not broadcast a reduced result.
+        """
         raise NotImplementedError
 
     @classmethod
