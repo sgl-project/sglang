@@ -44,6 +44,8 @@ class CacheInitParams:
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
+    # PD decode shares KV prefixes but receives fresh request-local state.
+    mamba_state_from_prefill: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1
