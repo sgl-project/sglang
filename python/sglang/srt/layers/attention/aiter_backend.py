@@ -439,6 +439,8 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
+        # Lazily allocated (page_table, swa_page_table) for extend on gfx1250.
+        self._extend_page_table_bufs = None
 
         # unified_attention's tile width equals the page size, so a smaller page
         # produces wrong output rather than failing. On gfx1250 every non-MLA
@@ -973,15 +975,37 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         max_blocks = max((max_kv_len + page_size - 1) // page_size, 1)
 
-        page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
-
         swa_slot_mapping = None
         swa_page_table = None
         if self.use_sliding_window_kv_pool:
             swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
-            swa_page_table = torch.zeros(
-                bs, max_blocks, dtype=torch.int32, device=device
-            )
+
+        if is_gfx1250_supported():
+            # aiter's gfx1250 Gluon prefill kernel takes the block-table stride and
+            # the sequence count as compile-time constants, so a fresh table per
+            # batch recompiles it while serving. Hand out views of one table sized
+            # for every request slot (fixed stride), with the row count rounded up
+            # to a power of 2; _forward_extend_unified makes the extra rows empty
+            # sequences.
+            if self._extend_page_table_bufs is None:
+                shape = (
+                    self.req_to_token.shape[0],
+                    triton.cdiv(self.req_to_token.shape[1], page_size),
+                )
+                full = torch.zeros(shape, dtype=torch.int32, device=device)
+                swa = torch.zeros_like(full) if swa_slot_mapping is not None else None
+                self._extend_page_table_bufs = (full, swa)
+            full, swa = self._extend_page_table_bufs
+            num_rows = min(triton.next_power_of_2(bs), full.shape[0])
+            page_table = full[:num_rows, :max_blocks]
+            if swa is not None:
+                swa_page_table = swa[:num_rows, :max_blocks]
+        else:
+            page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
+            if swa_slot_mapping is not None:
+                swa_page_table = torch.zeros(
+                    bs, max_blocks, dtype=torch.int32, device=device
+                )
 
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max_blocks, BLOCK_SIZE))
@@ -1031,6 +1055,11 @@ class AiterAttnBackend(AttentionBackend):
         cu_seqlens_q[1:] = torch.cumsum(
             forward_batch.extend_seq_lens.to(torch.int32), dim=0
         )
+        seq_lens = forward_batch.seq_lens
+        if page_table.shape[0] > bs:
+            pad = page_table.shape[0] - bs
+            cu_seqlens_q = torch.cat([cu_seqlens_q, cu_seqlens_q[-1:].expand(pad)])
+            seq_lens = torch.cat([seq_lens, seq_lens.new_zeros(pad)])
 
         # unified_attention uses (left, right) window = (window-1, 0), NOT the
         # CK convention (window, -1). Match the decode path (`de_window`).
@@ -1053,7 +1082,7 @@ class AiterAttnBackend(AttentionBackend):
             v=v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
             out=o,
             cu_seqlens_q=cu_seqlens_q,
-            seqused_k=forward_batch.seq_lens,
+            seqused_k=seq_lens,
             max_seqlen_q=self.forward_metadata.max_q_len,
             max_seqlen_k=pt.shape[1] * self.page_size,
             softmax_scale=layer.scaling,
