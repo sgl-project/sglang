@@ -2571,7 +2571,7 @@ def _run_granian_server(
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
     target = (
-        app if tokenizer_worker_num == 1 else "sglang.srt.entrypoints.http_server:app"
+        app if tokenizer_worker_num == 1 else envs.SGLANG_HTTP_SERVER_APP_PATH.get()
     )
     granian_kwargs = dict(
         target=target,
@@ -2836,7 +2836,7 @@ def _setup_and_run_http_server(
                 )
             else:
                 uvicorn.run(
-                    "sglang.srt.entrypoints.http_server:app",
+                    envs.SGLANG_HTTP_SERVER_APP_PATH.get(),
                     host=get_serving().host,
                     port=get_serving().port,
                     root_path=get_serving().fastapi_root_path,
