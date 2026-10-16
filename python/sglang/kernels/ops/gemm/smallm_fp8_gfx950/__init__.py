@@ -5,6 +5,7 @@ Qwen3.5-397B AttnFP8 TP4 and TP2 projection shapes below; SGLANG_ROCM_SMALLM_FP8
 """
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
@@ -34,6 +35,7 @@ SHAPES = {
 }
 _mod = None
 _kernels = {}
+logger = logging.getLogger(__name__)
 
 
 class Args(ctypes.Structure):
@@ -59,7 +61,7 @@ def smallm_fp8_gemm_enabled() -> bool:
                 _check(_hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
                 _mod = mod
             except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
-                print(f"[smallm_fp8_gemm] disabled: {e}", flush=True)
+                logger.warning("smallm_fp8_gemm disabled: %s", e)
     return _mod is not False
 
 

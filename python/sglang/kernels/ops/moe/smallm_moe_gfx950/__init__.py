@@ -16,6 +16,7 @@ On by default; SGLANG_ROCM_SMALLM_MOE=0 turns it off. Any build/load failure dis
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
@@ -43,6 +44,7 @@ _available = None
 _disabled_reason = None
 _build_dir = None
 _ws: dict = {}
+logger = logging.getLogger(__name__)
 
 
 class SmallMMoeUnavailable(RuntimeError):
@@ -178,9 +180,11 @@ def smallm_moe_enabled() -> bool:
             and os.path.exists(_hipcc())
         )
         if not _available:
-            print(
-                f"[smallm_moe] not enabled (arch={arch!r}, hip={_hip_version()}, hipcc={os.path.exists(_hipcc())}); aiter fused_moe stays in use",
-                flush=True,
+            logger.info(
+                "smallm_moe not enabled (arch=%r, hip=%s, hipcc=%s); aiter fused_moe stays in use",
+                arch,
+                _hip_version(),
+                os.path.exists(_hipcc()),
             )
     return _available and _disabled_reason is None
 
@@ -188,9 +192,9 @@ def smallm_moe_enabled() -> bool:
 def _disable(reason):
     global _disabled_reason
     _disabled_reason = reason
-    print(
-        f"[smallm_moe] disabling the gfx950 small-M MoE kernel, falling back to aiter fused_moe: {reason}",
-        flush=True,
+    logger.warning(
+        "smallm_moe: disabling the gfx950 small-M MoE kernel, falling back to aiter fused_moe: %s",
+        reason,
     )
     raise SmallMMoeUnavailable(reason)
 
@@ -229,10 +233,7 @@ def _get_kernels(inter: int, pre: str):
             except RuntimeError as e:
                 _disable(str(e))
             _kernels["_mod"] = mod
-            print(
-                f"[smallm_moe] gfx950 small-M MoE kernels active (built {co})",
-                flush=True,
-            )
+            logger.info("smallm_moe: gfx950 small-M MoE kernels active (built %s)", co)
         mod = _kernels["_mod"]
         try:
             kk = {

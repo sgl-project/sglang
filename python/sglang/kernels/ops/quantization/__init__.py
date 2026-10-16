@@ -100,20 +100,15 @@ __all__ = [
 # srt/layers/quantization (RFC #29630, Phase 2.5); registered for inventory.
 # Import them from their modules.
 _TRITON_KERNELS = [
-    ("fp8_kernel", "per_token_group_quant_8bit"),
     ("fp8_kernel", "sglang_per_token_group_quant_fp8"),
-    ("fp8_kernel", "sglang_per_token_group_quant_8bit"),
     ("fp8_kernel", "sglang_per_token_quant_fp8"),
     ("fp8_kernel", "static_quant_fp8"),
     ("fp8_kernel", "dequant_group_fp8_to_bf16"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
-    ("fp8_kernel", "per_token_group_quant_fp8_hopper_moe_mn_major"),
-    ("fp8_kernel", "per_group_transpose"),
     ("int8_kernel", "per_token_quant_int8"),
     ("int8_kernel", "per_token_group_quant_int8"),
     ("awq_triton", "awq_dequantize_triton"),
-    ("awq_triton", "awq_gemm_triton"),
     ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize"),
     ("mxfp8_swizzled_triton", "swiglu_oai_mxfp8"),
     ("mxfp8_swizzled_triton", "swiglu_oai_mxfp8_deepgemm"),
