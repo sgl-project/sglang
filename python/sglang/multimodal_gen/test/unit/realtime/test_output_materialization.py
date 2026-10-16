@@ -1,15 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import pytest
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    MAX_FRAME_INTERPOLATION_EXP,
+    DataType,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.postprocess import FrameInterpolator
+from sglang.multimodal_gen.runtime.postprocess.rife_interpolator import (
+    Model as RIFEModel,
+)
 from sglang.multimodal_gen.runtime.realtime.video import build_raw_rgb_frame_batches
 
 
@@ -169,3 +177,44 @@ def test_raw_rgb_frame_batches_apply_realtime_upscaling(monkeypatch):
     }
     assert len(frame_batches) == 1
     assert frame_batches[0][0] == bytes([1, 2, 3] * 4)
+
+
+@pytest.mark.parametrize("exp", [0, MAX_FRAME_INTERPOLATION_EXP + 1, 1.5, 2.0, True])
+def test_materialize_output_sample_rejects_out_of_range_interpolation_exp(
+    monkeypatch, exp
+):
+    """Out-of-range or non-int exp must be rejected before loading weights."""
+
+    def fail_load(_self):
+        raise AssertionError("RIFE weights must not load for an invalid exp")
+
+    monkeypatch.setattr(FrameInterpolator, "_ensure_model_loaded", fail_load)
+
+    with pytest.raises(ValueError, match="frame_interpolation_exp must be an int in"):
+        materialize_output_sample(
+            torch.zeros(3, 2, 2, 2),
+            DataType.VIDEO,
+            fps=24,
+            enable_frame_interpolation=True,
+            frame_interpolation_exp=exp,
+        )
+
+
+@pytest.mark.parametrize(
+    "h, w",
+    [
+        (480, 832),  # 480p: old pad=480 not divisible by 64 at scale=0.5
+        (720, 1280),  # 720p: old pad=736 not divisible by 64 at scale=0.5
+    ],
+)
+def test_rife_inference_scale_half_pads_to_64_boundary(h, w):
+    """scale=0.5 requires padding to multiples of 64, not 32.
+
+    Regresses the bug where Model.inference always padded to 32, causing a
+    shape mismatch inside IFBlock at 480p and 720p with scale=0.5.
+    """
+    model = RIFEModel().eval()
+    img0 = torch.zeros(1, 3, h, w)
+    img1 = torch.zeros(1, 3, h, w)
+    out = model.inference(img0, img1, scale=0.5)
+    assert out.shape == (1, 3, h, w), f"expected (1,3,{h},{w}), got {out.shape}"

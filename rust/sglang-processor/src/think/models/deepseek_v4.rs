@@ -1,9 +1,9 @@
 //! DeepSeek-V4 and V4.1 (`DeepSeekV4Detector` and `DeepSeekV41ReasoningDetector`
 //! in `parser/reasoning_parser.py`).
 
-use crate::think::ThinkConfig;
+use crate::think::TagConfig;
 
-pub(super) const THINK: ThinkConfig = ThinkConfig {
+pub(super) const THINK: TagConfig = TagConfig {
     start: "<think>",
     end: "</think>",
     tool_start: Some("<｜DSML｜tool_calls>"),
@@ -11,7 +11,7 @@ pub(super) const THINK: ThinkConfig = ThinkConfig {
 };
 
 /// V4.1's tool-call anchor is the spaced `<｜DSML｜ calls>` tag.
-pub(super) const THINK_V41: ThinkConfig = ThinkConfig {
+pub(super) const THINK_V41: TagConfig = TagConfig {
     tool_start: Some("<｜DSML｜ calls>"),
     ..THINK
 };

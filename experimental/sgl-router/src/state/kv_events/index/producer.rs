@@ -1,6 +1,6 @@
 //! This replica as a snapshot source: the export, its cache and the cursors-only body.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +26,7 @@ pub(super) struct CachedSnapshot {
     /// snapshot covers.
     exported_at: Instant,
     body: SnapshotBody,
+    legacy_body: SnapshotBody,
 }
 
 /// One snapshot encoded for the wire: the JSON document and its gzip.
@@ -97,6 +98,34 @@ fn encode_snapshot(snap: &PeerSnapshot) -> SnapshotBody {
     }
 }
 
+/// A legacy consumer cannot apply removals to canonical LoRA keys. Retain its
+/// base-model view and watermark, rather than making a mixed snapshot unusable.
+fn strip_lora(snap: &mut PeerSnapshot) {
+    let hashes: HashSet<i64> = snap
+        .lora_blocks
+        .iter()
+        .flat_map(|(_, blocks)| blocks.iter().map(|block| block.lookup))
+        .collect();
+    let nodes = std::mem::take(&mut snap.nodes);
+    let mut remap = vec![None; nodes.len()];
+    for (i, mut node) in nodes.into_iter().enumerate() {
+        if hashes.contains(&node.block_hash) {
+            continue;
+        }
+        if let Some(parent) = node.parent {
+            let Some(parent) = remap[parent as usize] else {
+                continue;
+            };
+            node.parent = Some(parent);
+        }
+        remap[i] = Some(snap.nodes.len() as u32);
+        snap.nodes.push(node);
+    }
+    snap.format = SNAPSHOT_FORMAT;
+    snap.lora_blocks.clear();
+    snap.producer_ready &= !snap.nodes.is_empty();
+}
+
 impl KvEventIndex {
     /// This replica as a bootstrap source. `None` in metadata-only mode,
     /// where no subscription is opened and the tree is always empty, so there
@@ -112,11 +141,23 @@ impl KvEventIndex {
     /// [`meets_max_age`]. The build runs detached and owns the lock, so a
     /// caller that gives up mid-build does not cancel it.
     pub async fn peer_snapshot_body(self: &Arc<Self>, max_age: Duration) -> SnapshotBody {
+        self.peer_snapshot_body_for_client(max_age, true).await
+    }
+
+    pub async fn peer_snapshot_body_for_client(
+        self: &Arc<Self>,
+        max_age: Duration,
+        include_lora: bool,
+    ) -> SnapshotBody {
         let requested_at = Instant::now();
         let mut cache = Arc::clone(&self.snapshot_cache).lock_owned().await;
         if let Some(c) = cache.as_ref() {
             if meets_max_age(c.exported_at, requested_at, max_age) {
-                return c.body.clone();
+                return if include_lora {
+                    c.body.clone()
+                } else {
+                    c.legacy_body.clone()
+                };
             }
         }
         // Release the stale entry before building, so a fleet-sized body is
@@ -124,14 +165,19 @@ impl KvEventIndex {
         *cache = None;
         let this = Arc::clone(self);
         let build = tokio::spawn(async move {
-            let (body, sampled_at) = this.build_peer_snapshot().await;
+            let (body, legacy_body, sampled_at) = this.build_peer_snapshot().await;
             if let Some(exported_at) = sampled_at {
                 *cache = Some(CachedSnapshot {
                     exported_at,
                     body: body.clone(),
+                    legacy_body: legacy_body.clone(),
                 });
             }
-            body
+            if include_lora {
+                body
+            } else {
+                legacy_body
+            }
         });
         match build.await {
             Ok(body) => body,
@@ -150,7 +196,7 @@ impl KvEventIndex {
     /// contents were sampled. An empty body means the encode failed; it is
     /// never cacheable, so the route's non-success answer is not pinned for a
     /// whole TTL.
-    async fn build_peer_snapshot(&self) -> (SnapshotBody, Option<Instant>) {
+    async fn build_peer_snapshot(&self) -> (SnapshotBody, SnapshotBody, Option<Instant>) {
         // See `CachedSnapshot::exported_at`.
         let exported_at = Instant::now();
 
@@ -172,8 +218,8 @@ impl KvEventIndex {
             .map(|(w, seq)| (w.clone(), *seq))
             .collect();
         let tree = Arc::clone(&self.tree);
-        let walked = tokio::task::spawn_blocking(move || tree.export_snapshot()).await;
-        let (worker_table, nodes) = match walked {
+        let walked = tokio::task::spawn_blocking(move || tree.export_with_lora()).await;
+        let (worker_table, nodes, lora_blocks) = match walked {
             Ok(v) => v,
             Err(e) => {
                 // The walk panicked or the runtime is shutting down. Answer
@@ -181,7 +227,8 @@ impl KvEventIndex {
                 // not cache it, so the next request makes a real attempt.
                 // Encoding inline is fine: this body is a handful of bytes.
                 warn!(error = %e, "kv-bootstrap: snapshot walk failed; reporting not-ready to peers");
-                return (encode_snapshot(&self.not_ready_snapshot()), None);
+                let body = encode_snapshot(&self.not_ready_snapshot());
+                return (body.clone(), body, None);
             }
         };
         let index_of: HashMap<&KvWorkerId, u32> = worker_table
@@ -220,20 +267,34 @@ impl KvEventIndex {
         let workers = worker_table.iter().map(WireWorker::from).collect();
         let mut snap = self.wire_snapshot(has_nodes, workers, cursors, nodes);
         snap.empty_ranks = empty_ranks;
+        if !lora_blocks.is_empty() {
+            snap.format = super::super::bootstrap::LORA_SNAPSHOT_FORMAT;
+        }
+        snap.lora_blocks = lora_blocks;
         // Encode on the blocking pool for the same reason the walk goes there:
         // serialising and compressing a fleet-sized tree is CPU-bound with no
         // await point, and this runs on the runtime that is also proxying
         // requests.
-        match tokio::task::spawn_blocking(move || encode_snapshot(&snap)).await {
-            Ok(body) => {
-                let cacheable = (!body.is_empty()).then_some(exported_at);
-                (body, cacheable)
+        match tokio::task::spawn_blocking(move || {
+            let body = encode_snapshot(&snap);
+            let legacy_body = if snap.lora_blocks.is_empty() {
+                body.clone()
+            } else {
+                strip_lora(&mut snap);
+                encode_snapshot(&snap)
+            };
+            (body, legacy_body)
+        })
+        .await
+        {
+            Ok((body, legacy_body)) => {
+                let cacheable =
+                    (!body.is_empty() && !legacy_body.is_empty()).then_some(exported_at);
+                (body, legacy_body, cacheable)
             }
             Err(e) => {
-                // Runtime shutting down or the encode panicked. Answer this
-                // caller without caching, so a later request retries.
                 warn!(error = %e, "kv-bootstrap: snapshot encode failed");
-                (SnapshotBody::default(), None)
+                (SnapshotBody::default(), SnapshotBody::default(), None)
             }
         }
     }
@@ -282,6 +343,7 @@ impl KvEventIndex {
             workers,
             cursors,
             nodes,
+            lora_blocks: Vec::new(),
             empty_ranks: Vec::new(),
         }
     }

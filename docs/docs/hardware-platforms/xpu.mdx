@@ -283,7 +283,7 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Feature | Status |
 |---|---|
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Speculative decoding | Not yet implemented |
+| Speculative decoding | Supported |
 
 ## Decode Context Parallel (DCP) on Intel XPU [Experimental]
 

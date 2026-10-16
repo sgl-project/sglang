@@ -164,7 +164,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_AUTOTUNE_CACHE`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs. Set to `0` to force re-autotuning on every startup; the fresh result is written to a `runs/<rank>.<timestamp>.json` sibling file (the canonical cache is left untouched).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs, including MegaMoE capacity profiles. Set to `0` to disable disk-cache reuse; the fresh result is written to a `runs/<rank>.<timestamp>.<uuid>.json` sibling file (the canonical cache is left untouched). Target MegaMoE rank files include the physical GPU UUID. Use separate `SGLANG_CACHE_DIR` roots for engines sharing physical GPUs; a running process retains tactics for already-pooled workspaces.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
@@ -363,7 +363,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the CuTe DSL MegaMOE in-kernel FC2 reduction. This can reduce workspace size and improve large-batch performance, but BF16 atomic accumulation is nondeterministic. It is incompatible with quantized combine dtypes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Permit CuTe DSL MegaMOE in-kernel FC2 reduction for NVFP4 and MXFP8. FlashInfer's tuning profile may still select external reduction. BF16 atomic accumulation is nondeterministic; leave disabled for reproducibility. Requires BF16 combine.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
@@ -2251,7 +2251,7 @@ MPS and does not read them.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AUTO_NUMA_BIND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Without <code>CAP_SYS_NICE</code>, only CPU affinity is set. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>

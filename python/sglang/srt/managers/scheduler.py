@@ -298,7 +298,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.events import LoRANameTable
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -358,7 +358,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -1086,6 +1086,9 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
 
+    # Not DynamicGradMode: tensors created under inference mode here could not
+    # be written in place by the no_grad disagg event loops.
+    @torch.no_grad()
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
         self.tp_worker.init_cuda_graphs()
@@ -1645,6 +1648,11 @@ class Scheduler(
                 self.draft_worker.get_confidence_budget_prepare()
             )
 
+        # If enable async D2H copy when overlap is enabled
+        # Currently used by NVIDIA Confidential Computing (CC) only
+        self.enable_async_d2h_copy = False
+        self.async_d2h_worker = None
+
         if use_mlx():
             # MLX uses its own overlap loop and does not create CUDA streams,
             # but the normal non-overlap scheduler path still relays decode
@@ -1664,6 +1672,19 @@ class Scheduler(
 
         if not self.enable_overlap:
             return
+
+        # Under NVIDIA Confidential Computing (CC) the per-step D2H result readback is
+        # forced synchronous and blocks the scheduler thread at issue, serializing the
+        # overlap pipeline. Offload it to a worker thread (AsyncD2HCopyWorker).
+        self.enable_async_d2h_copy = is_confidential_compute()
+        if self.enable_async_d2h_copy:
+            from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
+
+            self.async_d2h_worker = AsyncD2HCopyWorker(self.device_module)
+            logger.info(
+                "NVIDIA Confidential Computing (CC) detected: "
+                "using async D2H copy worker to preserve overlap scheduling."
+            )
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -2137,6 +2158,13 @@ class Scheduler(
         self.session_controller.maybe_reap(now)
 
         for recv_req in recv_reqs:
+            # Before any early exit, so every request releases its CUDA IPC pool slot.
+            for tokenized_req in self._tokenized_requests(recv_req):
+                if tokenized_req.positional_embed_overrides is not None:
+                    tokenized_req.positional_embed_overrides.reconstruct(
+                        get_device().gpu_id
+                    )
+
             vmm_errors = None
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
@@ -2349,6 +2377,9 @@ class Scheduler(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
 
+    def get_prefill_adder_class(self) -> type[PrefillAdder]:
+        return PrefillAdder
+
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
 
@@ -2438,7 +2469,9 @@ class Scheduler(
 
     def init_kv_event_lora_names(self) -> None:
         """Init the table that maps lora_id to adapter name for KV events."""
-        self.kv_event_lora_names = LoRANameTable.from_lora_refs(get_lora().lora_paths)
+        self.kv_event_lora_names = KvEventLoraNames.from_lora_refs(
+            get_lora().lora_paths
+        )
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
@@ -2765,6 +2798,15 @@ class Scheduler(
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
 
+    def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
+        # Keyed by the final extra_key, so it must run after elastic namespacing.
+        # Only a cache whose events are taken prunes the table.
+        if (
+            self.kv_events_publisher.enable_kv_cache_events
+            and self.tree_cache.supports_prefix_sharing()
+        ):
+            self.kv_event_lora_names.register(req, lora_name)
+
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
             get_exec().moe.elastic_ep_backend is None
@@ -2803,6 +2845,12 @@ class Scheduler(
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()
             req.multimodal_inputs = None
+
+    def _create_generation_req(
+        self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
+    ) -> Req:
+        """Extension point for request-local state, including session requests."""
+        return Req(*args, **kwargs)
 
     def handle_generate_request(
         self,
@@ -2846,7 +2894,8 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = Req(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -2939,6 +2988,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
+                req_factory=partial(self._create_generation_req, recv_req),
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -2960,7 +3010,8 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = Req(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -2977,6 +3028,7 @@ class Scheduler(
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
@@ -3553,6 +3605,7 @@ class Scheduler(
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
@@ -3663,8 +3716,9 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        reason = req.discard_output_reason or FINISH_ABORT("Aborted")
+        prepare_abort(req, reason.message, reason.status_code)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
@@ -3678,7 +3732,11 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+        # A client abort leaves the message to the tokenizer.
+        finished_reason = req.discard_output_reason and reason.to_json()
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(req, finished_reason=finished_reason), req
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3713,6 +3771,11 @@ class Scheduler(
             batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
         )
         batch.input_ids = None
+
+        if not batch.spec_algorithm.is_none():
+            batch.spec_info = self.future_map.make_staged_spec_input(
+                batch.req_pool_indices
+            )
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -3811,15 +3874,12 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
-        # For prefill-only batch, filter out finished requests since they
-        # won't go through the decode step. This keeps running_batch accurate
-        # for load reporting (num_running_reqs via /v1/loads).
-        # Runs outside the last_batch block so stale requests are cleaned
-        # even when no new batches arrive (e.g. traffic stops).
-        if running_batch.is_prefill_only:
-            running_batch.filter_batch()
-            if running_batch.is_empty():
-                running_batch.batch_is_full = False
+        # Every step, not only after a merge: overlap merges a prefill's requests
+        # before its result finishes them, and update_running_batch may never run.
+        running_bs = running_batch.batch_size()
+        running_batch.filter_batch()
+        if running_batch.batch_size() < running_bs:
+            running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3886,18 +3946,23 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        num_held_rows: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
-        available = self.req_to_token_pool.available_size()
-
+        # Rows the counted requests may occupy: the free rows, plus the rows that
+        # counted requests already hold (a continuing chunk, a session borrow),
+        # minus the rows promised to beam members.
         active_batch = running_batch or self.running_batch
-        available = max(
-            available - self.beam_coordinator.pending_member_rows(active_batch), 0
+        row_budget = max(
+            self.req_to_token_pool.available_size()
+            + num_held_rows
+            - self.beam_coordinator.pending_member_rows(active_batch),
+            0,
         )
-        res = min(pp_budget, available)
+        res = min(pp_budget, row_budget)
         if beam_width is not None:
             # A beam candidate owns beam_width rows once decoding.
-            res = min(res, available // beam_width)
+            res = min(res, row_budget // beam_width)
 
         return res
 
@@ -3943,8 +4008,8 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
         if running_batch.is_empty():
-            # An empty batch never reaches update_running_batch, the only
-            # other place that clears the flag, so admission would stay shut.
+            # An empty batch has no request left to leave, and only a leaving
+            # request clears the flag elsewhere, so admission would stay shut.
             running_batch.batch_is_full = False
 
         if (
@@ -3966,11 +4031,9 @@ class Scheduler(
         ):
             return None, running_batch
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        # A chunked request skips this check: it keeps its req_to_token row across
+        # chunks, and under PP it (or a dllm request) may finish in another
+        # microbatch, so holding it back here would leak its memory.
         if (
             self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
             and self.chunked_req is None
@@ -4008,7 +4071,7 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
-        adder = PrefillAdder(
+        adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
@@ -4056,6 +4119,10 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # A spent pass budget admits no one, even before the first
+            # candidate: the resumed chunk or mixed decode rows can spend it.
+            if adder.budget_state() == AddReqResult.OTHER:
+                break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4072,17 +4139,14 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                num_held_rows=num_held_rows,
             ):
                 running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
@@ -4094,6 +4158,7 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
+                req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -4114,12 +4179,11 @@ class Scheduler(
                 self._prefetch_after_device_hit_loss(req)
             ):
                 continue
-            if (
-                self.enable_hicache_storage
-                and buffer_pipeline is not None
-                and not buffer_pipeline.prepare_staged_prefetch(req)
-            ):
-                continue
+            if self.enable_hicache_storage and buffer_pipeline is not None:
+                staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
+                req.time_stats.observe_storage_staging_ready(staging_ready)
+                if not staging_ready:
+                    continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4199,6 +4263,7 @@ class Scheduler(
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
+        new_batch.hisparse_coordinator = self.hisparse_coordinator
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -4580,15 +4645,7 @@ class Scheduler(
                                     return_hidden_states=batch.return_hidden_states,
                                 )
                             else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
-                                    batch_result.copy_to_cpu(
-                                        return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
-                                    )
+                                self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
 
@@ -4770,6 +4827,13 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        if self.enable_unified_cache_external_linker:
+            failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
+            if self.chunked_req in failed:
+                # Result processing finishes the others; a chunked one is
+                # released like a client abort so its next chunk never runs.
+                self._pending_chunked_abort_req = self.chunked_req
+
         self._maybe_report_active_ranks()
 
         return ret
@@ -4778,13 +4842,19 @@ class Scheduler(
         if not (self.attn_dp_enabled and get_exec().moe.elastic_ep_backend is not None):
             return
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        from sglang.srt.elastic_ep.topology import (
+            attn_replica_size,
+            collapse_physical_rank_status,
+        )
 
         inst = ElasticEPStateManager.instance()
         if inst is not None and inst.active_ranks_cpu is not None:
+            dp_status = collapse_physical_rank_status(
+                inst.active_ranks_cpu.tolist(),
+                attn_replica_size(),
+            )
             self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(
-                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()]
-                )
+                ActiveRanksOutput(status=dp_status)
             )
         else:
             logger.debug("[Elastic EP] active rank state is unavailable")
@@ -4849,6 +4919,32 @@ class Scheduler(
             return_hidden_states=batch.return_hidden_states,
         )
 
+    def _copy_result_to_cpu(
+        self, batch_result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        """Issue the result readback on copy_stream so it overlaps the next forward.
+
+        copy_stream is a leaf gated by copy_done that forward_stream never waits
+        for. Under Confidential Computing the copy would block this thread until
+        the forward is done, so the worker issues it from its own thread instead.
+        """
+        copy_fn = partial(
+            batch_result.copy_to_cpu,
+            return_logprob=batch.return_logprob,
+            return_hidden_states=batch.return_hidden_states,
+        )
+        self.copy_stream.wait_stream(self.forward_stream)
+        with self.copy_stream_ctx:
+            if not self.enable_async_d2h_copy:
+                copy_fn()
+            elif batch.return_hidden_states or batch.spec_algorithm.is_dspark():
+                # Hidden states and the DSpark accept lengths are views of CUDA
+                # graph buffers that the next replay rewrites; only a copy queued
+                # right behind this forward reads them in time.
+                copy_fn()
+            else:
+                batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
@@ -4866,15 +4962,7 @@ class Scheduler(
                 cur_batch, batch_result.future_indices, batch_result
             )
 
-        # Run device-to-host copy on a separate stream to avoid blocking the
-        # forward stream. The copy waits for the sampled result and can overlap
-        # with subsequent forward computation.
-        self.copy_stream.wait_stream(self.forward_stream)
-        with self.copy_stream_ctx:
-            batch_result.copy_to_cpu(
-                return_logprob=cur_batch.return_logprob,
-                return_hidden_states=cur_batch.return_hidden_states,
-            )
+        self._copy_result_to_cpu(batch_result, cur_batch)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -5178,6 +5266,7 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
@@ -5742,6 +5831,19 @@ class Scheduler(
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
             )
+        from sglang.srt.elastic_ep.topology import attn_replica_size
+
+        replica_size = attn_replica_size()
+        if new_ep_size % replica_size != 0:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) would admit an incomplete "
+                    f"attention replica with size {replica_size}."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
         if ElasticEPStateManager.is_scaling():
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -6118,6 +6220,10 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            # Stop the async D2H copy worker thread if any.
+            if scheduler.async_d2h_worker is not None:
+                scheduler.async_d2h_worker.shutdown()
+                scheduler.async_d2h_worker = None
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
