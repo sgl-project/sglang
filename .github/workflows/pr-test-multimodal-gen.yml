@@ -150,7 +150,8 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-5090
+    # performance baselines require calibrated GPU and host hardware
+    runs-on: [1-gpu-5090, diffusion-perf-qualified]
     timeout-minutes: 180
     steps:
       - name: Checkout code
