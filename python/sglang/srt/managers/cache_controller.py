@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     count_pool_hits,
@@ -234,6 +235,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        kv_hints=None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -241,6 +243,7 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.kv_hints = kv_hints
         # Full queried page-hash chain, set by _storage_hit_query before
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
@@ -562,13 +565,6 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
-
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
@@ -577,6 +573,13 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.storage_host_pool
             )
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            # Rank-local stores need every MLA writer. A backend that explicitly
+            # provides shared replicated storage can use the TP0-only path.
+            self.backup_skip = (
+                self.storage_config.is_mla_model
+                and self.storage_config.tp_rank != 0
+                and self.storage_backend.requires_rank_local_backup is not True
+            )
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -608,6 +611,7 @@ class HiCacheController:
                 in [
                     "hf3fs",
                     "mooncake",
+                    "kvcr",
                     "npu_memcache",
                     "eic",
                     "nixl",
@@ -1094,6 +1098,7 @@ class HiCacheController:
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
+        batch_pages = self.storage_backend.prefetch_batch_pages
         prefix_keys = operation.prefix_keys
         kv_derived_transfers = [
             transfer
@@ -1102,20 +1107,23 @@ class HiCacheController:
         ]
         all_success = True
         completed_pages = 0
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+        for i in range(0, len(operation.hash_value), batch_pages):
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
             if all_success and operation.is_terminated():
                 all_success = False
             if all_success:
-                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+                batch_hashes = operation.hash_value[i : i + batch_pages]
                 batch_host_indices = operation.host_indices[
                     i * self.page_size : (i + len(batch_hashes)) * self.page_size
                 ]
 
                 # Get one batch token, and update the completed_tokens if succeed
-                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                extra_info = HiCacheStorageExtraInfo(
+                    prefix_keys=prefix_keys,
+                    extra_info={"kv_hints": operation.kv_hints},
+                )
 
                 try:
                     hit_pages = self._page_transfer_kv_batch(
@@ -1160,6 +1168,55 @@ class HiCacheController:
 
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
+        if (
+            kv_derived_transfers
+            and getattr(self.storage_backend, "supports_combined_page_reads", False)
+            is True
+            and all(
+                transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+                for transfer in kv_derived_transfers
+            )
+        ):
+            transfers = [
+                PoolTransfer(
+                    name=name, host_indices=batch_host_indices, keys=batch_hashes
+                )
+                for name in [PoolName.KV, *(t.name for t in kv_derived_transfers)]
+            ]
+            required_names = {str(transfer.name) for transfer in transfers}
+            if len(required_names) != len(transfers):
+                logger.error(
+                    "Duplicate combined storage pools for request %s",
+                    operation.request_id,
+                )
+                return 0
+            results = self.storage_backend.batch_get_v2(
+                transfers, extra_info=extra_info
+            )
+            # Missing or truncated sidecar results must not silently drop a
+            # required pool from the prefix intersection. A malformed response
+            # is a miss; keep producing the normal number of cross-rank acks.
+            if not isinstance(results, dict) or any(
+                name not in results
+                or not isinstance(results[name], list)
+                or len(results[name]) != len(batch_hashes)
+                or any(type(value) is not bool for value in results[name])
+                for name in required_names
+            ):
+                logger.error(
+                    "Malformed combined storage result for request %s",
+                    operation.request_id,
+                )
+                return 0
+            hits = count_pool_hits({name: results[name] for name in required_names})
+            completed = min(hits.values())
+            if completed < len(batch_hashes):
+                logger.warning(
+                    "Prefetch operation %s failed to retrieve page %s.",
+                    operation.request_id,
+                    batch_hashes[completed],
+                )
+            return completed
         # Read from KV pool.
         kv_hits = self.page_get_func(
             operation, batch_hashes, batch_host_indices, extra_info
@@ -1258,7 +1315,9 @@ class HiCacheController:
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys, extra_info={"kv_hints": operation.kv_hints}
+            )
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size

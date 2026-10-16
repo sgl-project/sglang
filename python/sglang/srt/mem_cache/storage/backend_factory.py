@@ -162,7 +162,7 @@ class StorageBackendFactory:
             return backend_class(storage_config)
         elif backend_name == "nixl":
             return backend_class(storage_config)
-        elif backend_name == "mooncake":
+        elif backend_name in ("mooncake", "kvcr"):
             backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "npu_memcache":
@@ -219,6 +219,10 @@ StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
+)
+
+StorageBackendFactory.register_backend(
+    "kvcr", "sglang.srt.mem_cache.storage.kvcr.kvcr_store", "KVCRStore"
 )
 
 StorageBackendFactory.register_backend(

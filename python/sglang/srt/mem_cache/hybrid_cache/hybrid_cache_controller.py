@@ -28,6 +28,7 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
     PoolName,
@@ -88,6 +89,7 @@ class PPPrefetchTicket:
     matched_prefix_tokens: List[int]
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
     storage_hit_count: int = 0
+    kv_hints: Any = None
 
 
 class PPPrefetchDecision(Enum):
@@ -135,8 +137,11 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        kv_hints=None,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices, token_ids, last_hash, hash_value, prefix_keys, kv_hints
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -150,6 +155,7 @@ class PrefetchOperation(StorageOperation):
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        kv_hints=None,
     ):
         self.handle = handle
         self.request_id = handle.rid
@@ -170,6 +176,7 @@ class PrefetchOperation(StorageOperation):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
+            kv_hints=kv_hints,
         )
         self.pool_transfers_done = not bool(pool_transfers)
         # The hit query's verdict per pool, as the chain prefix length (in
@@ -1025,6 +1032,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        kv_hints=None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -1033,6 +1041,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
+            kv_hints=kv_hints,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1060,6 +1069,7 @@ class HybridCacheController(BaseHiCacheController):
         matched_prefix_tokens: Optional[List[int]],
         pool_transfers: Optional[list[PoolTransfer]],
         assume_stored: bool = False,
+        kv_hints=None,
     ) -> PrefetchSubmission:
         if self.pp_prefetch_command_group is None:
             return PrefetchSubmission(
@@ -1070,6 +1080,7 @@ class HybridCacheController(BaseHiCacheController):
                     prefix_keys,
                     extra_pools=pool_transfers,
                     assume_stored=assume_stored,
+                    kv_hints=kv_hints,
                 )
             )
 
@@ -1078,6 +1089,7 @@ class HybridCacheController(BaseHiCacheController):
 
         rid = handle.rid
         ticket = PPPrefetchTicket(
+            kv_hints=kv_hints,
             handle=handle,
             prefetch_key=RadixKey(
                 array("q", prefetch_key.token_ids),
@@ -1099,6 +1111,7 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=ticket.prefix_keys,
             pool_transfers=pool_transfers,
+            kv_hints=kv_hints,
         )
 
         storage_hit_count = len(ticket.prefetch_key.token_ids)
@@ -1298,6 +1311,7 @@ class HybridCacheController(BaseHiCacheController):
                             ticket.handle,
                             ticket.prefetch_key,
                             ticket.last_hash,
+                            kv_hints=ticket.kv_hints,
                             prefix_keys=ticket.prefix_keys,
                             # Keep sidecar ACKs aligned even if allocation fails.
                             pool_transfers=[
@@ -1384,7 +1398,7 @@ class HybridCacheController(BaseHiCacheController):
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info={"pp_rank": pp_rank} if pp_rank is not None else None,
+            extra_info={"kv_hints": operation.kv_hints, "pp_rank": pp_rank},
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1397,6 +1411,9 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        operation.pool_storage_result.restorable_prefix_pages = (
+            hit_result.restorable_prefix_pages
+        )
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
         # Each pool's own boundary (the KV pool's where the backend reports
         # it, else the folded cut); the beliefs heal pool by pool. A pool the
@@ -1415,13 +1432,20 @@ class HybridCacheController(BaseHiCacheController):
         )
 
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
-        """One MIN collective for the folded hit count and every pool's own
-        boundary, so per-pool beliefs stay rank-identical. A pool omitted
-        by any rank heals from the folded cut without learning presence."""
+        """Reduce pool verdicts, then intersect explicit legal resume boundaries.
+
+        The packed presence flags make the bitmap collective rank-identical.
+        Mixed explicit/legacy replies fail closed; a scalar maximum cannot
+        establish that another rank has a checkpoint at that boundary.
+        """
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
+        boundaries = operation.pool_storage_result.restorable_prefix_pages
+        explicit = boundaries is not None
         packed = torch.tensor(
-            [storage_hit_count] + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
+            [storage_hit_count]
+            + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
+            + [int(explicit), int(not explicit)],
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1432,10 +1456,28 @@ class HybridCacheController(BaseHiCacheController):
         reduced = packed.tolist()
         operation.query_pool_hit_pages = {
             pool: pages
-            for pool, pages in zip(pools, reduced[1:], strict=True)
+            for pool, pages in zip(pools, reduced[1 : 1 + len(pools)], strict=True)
             if pages != _NO_POOL_VERDICT
         }
-        return int(reduced[0])
+        if reduced[-1]:
+            return int(reduced[0])
+        if not reduced[-2]:
+            operation.pool_storage_result.restorable_prefix_pages = []
+            return 0
+        valid = set(boundaries)
+        pages = len(operation.all_hash_values)
+        if not pages:
+            operation.pool_storage_result.restorable_prefix_pages = []
+            return 0
+        mask = torch.tensor([int(page in valid) for page in range(1, pages + 1)])
+        self._all_reduce(
+            mask,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        common = [page for page, present in enumerate(mask.tolist(), 1) if present]
+        operation.pool_storage_result.restorable_prefix_pages = common
+        return max(common, default=0) * self.page_size
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool
@@ -1525,6 +1567,7 @@ class HybridCacheController(BaseHiCacheController):
                     sidecar_hashes,
                     transfers_nonkv,
                 ):
+                    extra_info.extra_info = {"kv_hints": operation.kv_hints}
                     results.update(
                         self.storage_backend.batch_get_v2(
                             transfers, extra_info=extra_info
@@ -1581,6 +1624,21 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            if (
+                not self.backup_skip
+                and self.mem_pool_host.kv_buffer is not None
+                and getattr(
+                    self.storage_backend, "supports_combined_page_writes", False
+                )
+                is True
+                and all(
+                    transfer.indices_from_pool == PoolName.KV
+                    and transfer.hit_policy == PoolHitPolicy.ALL_PAGES
+                    for transfer in backup_transfers
+                )
+            ):
+                self._page_backup_combined(operation, backup_transfers)
+                return
             results = {}
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys, operation.hash_value, backup_transfers
@@ -1613,6 +1671,60 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+
+    def _page_backup_combined(self, operation, sidecars):
+        """Persist aligned KV/sidecar batches before acknowledging any pages.
+
+        The caller holds the host layout lease and the queued operation keeps
+        every source slot protected. Trailing or independently indexed pools
+        deliberately retain their existing backup path.
+        """
+        names = [PoolName.KV, *(transfer.name for transfer in sidecars)]
+        if len(set(names)) != len(names):
+            logger.error("Duplicate combined storage backup pools")
+            return
+        accumulated = {str(name): [] for name in names}
+        prefix_keys = operation.prefix_keys
+        for start in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            keys = operation.hash_value[start : start + STORAGE_BATCH_SIZE]
+            indices = operation.host_indices[
+                start * self.page_size : (start + len(keys)) * self.page_size
+            ]
+            transfers = [
+                PoolTransfer(name=PoolName.KV, keys=keys, host_indices=indices),
+                *(
+                    replace(transfer, keys=keys, host_indices=indices)
+                    for transfer in sidecars
+                ),
+            ]
+            results = self.storage_backend.batch_set_v2(
+                transfers,
+                extra_info=HiCacheStorageExtraInfo(prefix_keys=prefix_keys),
+            )
+            if not isinstance(results, dict) or any(
+                name not in results
+                or not isinstance(results[name], list)
+                or len(results[name]) != len(keys)
+                or any(type(value) is not bool for value in results[name])
+                for name in accumulated
+            ):
+                logger.error("Malformed combined storage backup result")
+                break
+            for name in accumulated:
+                accumulated[name].extend(results[name])
+            if not all(all(results[name]) for name in accumulated):
+                logger.warning("Combined storage backup failed for %d pages", len(keys))
+                break
+            operation.completed_tokens += len(keys) * self.page_size
+            if prefix_keys is not None:
+                prefix_keys = prefix_keys + keys
+        operation.pool_storage_result.update_extra_pool_hit_pages(
+            {
+                name: hits
+                for name, hits in count_pool_hits(accumulated).items()
+                if name != str(PoolName.KV)
+            }
+        )
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:

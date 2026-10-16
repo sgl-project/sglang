@@ -23,7 +23,11 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         ongoing_prefetch = {}
 
         def register_prefetch(req_id, *_args, **_kwargs):
-            ongoing_prefetch[req_id] = object()
+            # Only the router-selected source can satisfy this request.
+            if _kwargs.get("kv_hints") == hint:
+                ongoing_prefetch[req_id] = object()
+
+        hint = {"protocol_version": "0.1", "message_id": "decode-peer"}
 
         tree_cache = SimpleNamespace(
             hicache_storage_pass_prefix_keys=True,
@@ -33,7 +37,11 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             is_root=Mock(return_value=False),
             get_last_hash_value=Mock(return_value="h2"),
             get_prefix_hash_values=Mock(return_value=["h0", "h1"]),
-            query_storage_hit_length=Mock(return_value=2),
+            query_storage_hit_length=Mock(
+                side_effect=lambda *_args, **kwargs: (
+                    2 if kwargs.get("kv_hints") == hint else 0
+                )
+            ),
             prefetch_from_storage=Mock(side_effect=register_prefetch),
             prefix_device_indices=Mock(return_value=torch.tensor([10, 11])),
         )
@@ -47,6 +55,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             origin_input_ids=[0, 1, 2, 3, 4, 5, 6, 7],
             extra_key="model",
             cache_salt="tenant-a",
+            kv_hints=hint,
         )
         result = SimpleNamespace(
             device_prefix_len=2,
@@ -67,6 +76,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             ["h0", "h1"],
             extra_key="model",
             cache_salt="tenant-a",
+            kv_hints=hint,
         )
 
         DecodeHiCachePreallocMixin._start_hicache_prefetch(harness, req, prefix_match)
@@ -80,6 +90,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             ["h0", "h1"],
             extra_key="model",
             cache_salt="tenant-a",
+            kv_hints=hint,
         )
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):

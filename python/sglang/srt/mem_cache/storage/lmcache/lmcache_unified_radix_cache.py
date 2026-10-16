@@ -185,6 +185,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        kv_hints=None,
     ) -> None:
         del last_hash, prefix_keys, storage_hit_end
         req_id = request.rid

@@ -3300,6 +3300,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    kv_hints=req.kv_hints,
                 )
 
     def _process_storage_prefetch_retries(self):
@@ -6011,6 +6012,13 @@ class Scheduler(
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
         freeze_gc("Scheduler")
+        logger.info(
+            "GC freeze completed: pid=%d tp=%d cp=%d pp=%d",
+            os.getpid(),
+            get_parallel().tp_rank,
+            get_parallel().attn_cp_rank,
+            get_parallel().pp_rank,
+        )
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 

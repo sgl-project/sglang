@@ -179,7 +179,7 @@ def resolve_layout_io_compatibility(server_args: Any):
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if (
-        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
+        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache", "kvcr")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return

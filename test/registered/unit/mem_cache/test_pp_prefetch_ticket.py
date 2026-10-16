@@ -6,6 +6,7 @@ import unittest
 from array import array
 from contextlib import nullcontext
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -30,11 +31,32 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
+    def test_decode_storage_query_delivers_hint_to_controller(self):
+        hint = {"protocol_version": "0.1", "message_id": "decode-query"}
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True, is_eagle=False)
+        cache.page_size = cache.prefetch_threshold = 4
+
+        def query(operation):
+            # Observable hit length changes only if the request envelope
+            # survives UnifiedRadixCache -> PrefetchOperation -> controller.
+            return [], 8 if operation.kv_hints == hint else 0
+
+        cache.cache_controller = SimpleNamespace(
+            prefetch_rate_limited=lambda: False, _storage_hit_query=query
+        )
+        cache._all_reduce_attn_groups = Mock()
+        self.assertEqual(
+            cache.query_storage_hit_length(0, list(range(8)), kv_hints=hint), 8
+        )
+        self.assertEqual(cache.query_storage_hit_length(0, list(range(8))), 0)
+
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
@@ -248,9 +270,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.mem_pool_host.free.assert_called_once_with(kv, pool=PoolName.KV)
         c.page_get_func = Mock(return_value=1)
         c.storage_backend = Mock()
+        c.storage_backend.prefetch_batch_pages = 1
         c.storage_backend.batch_get_v2.return_value = {"swa": [True]}
         with (
-            patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
             patch.object(
                 c.storage_stop_event, "is_set", side_effect=[False, False, True]
             ),
