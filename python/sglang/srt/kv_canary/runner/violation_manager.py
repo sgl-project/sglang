@@ -16,7 +16,7 @@ class ViolationManager:
         *,
         config: CanaryConfig,
         device_state: CanaryDeviceState,
-        d2h_stream: torch.cuda.Stream,
+        d2h_stream: torch.Stream,
         outer_step_counter_getter: Callable[[], int],
     ) -> None:
         self._device_state = device_state

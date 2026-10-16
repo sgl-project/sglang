@@ -21,6 +21,7 @@
 
 #include <sgl_kernel/type.cuh>   // For bf16_t, fp32_t, device::cast
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
+#include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -47,19 +48,6 @@ struct KdaPackedDecodeParams {
   fp32_t lower_bound;
   int32_t use_lower_bound;
 };
-
-__device__ __forceinline__ float warp_allreduce_sum(float v) {
-#if defined(__HIP_PLATFORM_AMD__)
-  constexpr uint64_t kFullMask = 0xffffffffffffffffull;
-#else
-  constexpr uint32_t kFullMask = 0xffffffffu;
-#endif
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    v += __shfl_xor_sync(kFullMask, v, off);
-  }
-  return v;
-}
 
 // K = V = 128 specialization: one lane owns 4 consecutive K-elements (16B).
 template <int kWarps, bool kUsePDL>
@@ -104,8 +92,8 @@ __launch_bounds__(kWarps * 32) void kda_packed_decode_kernel(const KdaPackedDeco
     k_sq += k[e] * k[e];
   }
   // tl: q / sqrt(sum(q*q) + 1e-6), then * scale
-  const float q_inv = 1.0f / sqrtf(warp_allreduce_sum(q_sq) + 1e-6f);
-  const float k_inv = 1.0f / sqrtf(warp_allreduce_sum(k_sq) + 1e-6f);
+  const float q_inv = 1.0f / sqrtf(warp::reduce_sum<32>(q_sq) + 1e-6f);
+  const float k_inv = 1.0f / sqrtf(warp::reduce_sum<32>(k_sq) + 1e-6f);
 #pragma unroll
   for (int e = 0; e < kElems; ++e) {
     q[e] = q[e] * q_inv * params.scale;
@@ -143,7 +131,7 @@ __launch_bounds__(kWarps * 32) void kda_packed_decode_kernel(const KdaPackedDeco
       h[e] *= decay[e];
       t += h[e] * k[e];
     }
-    t = warp_allreduce_sum(t);
+    t = warp::reduce_sum<32>(t);
     const float v_new = (cast<fp32_t>(v_ptr[r]) - t) * beta;
     float o_acc = 0.0f;
 #pragma unroll
@@ -151,7 +139,7 @@ __launch_bounds__(kWarps * 32) void kda_packed_decode_kernel(const KdaPackedDeco
       h[e] += v_new * k[e];
       o_acc += h[e] * q[e];
     }
-    o_acc = warp_allreduce_sum(o_acc);
+    o_acc = warp::reduce_sum<32>(o_acc);
     *reinterpret_cast<float4*>(h_base + r * K + e0) = make_float4(h[0], h[1], h[2], h[3]);
     if (lane == 0) {
       o_ptr[r] = cast<bf16_t>(o_acc);

@@ -17,7 +17,7 @@ fn worker(id: &str, mode: WorkerMode) -> Arc<Worker> {
         url: format!("http://{id}:30000"),
         mode,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }))
 }
 
@@ -154,6 +154,7 @@ fn cache_candidate_uses_bucket_metadata_without_extend_range_filtering() {
         worker: cached,
         matched_prefix_tokens: 128,
         uncached_tokens: 128,
+        matched_prefix_blocks: 8,
         candidate_range_id: "global".into(),
         max_pending_prefill_tokens: None,
     };

@@ -1,11 +1,4 @@
-"""Config fields of the ``observability`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``observability`` bag, which is what ``get_observability()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``observability`` namespace."""
 
 from __future__ import annotations
 
@@ -150,7 +143,7 @@ class Observability(msgspec.Struct):
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint. Set replay_endpoint (e.g. tcp://*:5558) to let routers re-fetch dropped batches; /server_info advertises its port.",
     ] = None
     load_publish_endpoint: A[
         Optional[str],
@@ -177,6 +170,11 @@ class Observability(msgspec.Struct):
         str,
         "Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
     ] = "localhost:4317"
+    otlp_service_name: A[
+        Optional[str],
+        "Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+        "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang'.",
+    ] = None
     # RequestMetricsExporter configuration
     export_metrics_to_file: A[
         bool,

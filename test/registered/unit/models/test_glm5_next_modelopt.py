@@ -1,15 +1,18 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import torch
 
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.models import glm5_next
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 NVIDIA_EXCLUDE_MODULES = [
     "model.language_model.embed_tokens",
@@ -98,6 +101,62 @@ class TestGlm5NextModelOpt(CustomTestCase):
             )
 
         self.assertIsNone(reason)
+
+    def test_nextn_mapper_routes_checkpoint_names_to_runtime_modules(self):
+        """Draft quant lookups miss unless checkpoint names reach NextN module paths."""
+        mapper = Glm5NextForConditionalGenerationNextN.get_hf_to_sglang_mapper(
+            self._hf_config()
+        )
+        cases = {
+            "model.language_model.layers.45.mlp.experts.7.up_proj": "model.decoder.mlp.experts.7.up_proj",
+            "model.language_model.layers.45.eh_proj.weight": "model.eh_proj.weight",
+            "model.layers.45.eh_proj.weight": "model.eh_proj.weight",
+            "model.language_model.layers.45.enorm.weight": "model.enorm.weight",
+            "model.language_model.layers.44.mlp.experts.3.up_proj": "model.layers.44.mlp.experts.3.up_proj",
+            "model.visual.blocks.0.attn.proj": "visual.blocks.0.attn.proj",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(mapper._map_name(source), expected)
+
+
+class TestGlm5NextNextNScaleLoading(CustomTestCase):
+    def _load(self, weights, params):
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                num_nextn_predict_layers=1, num_hidden_layers=45, n_routed_experts=2
+            ),
+            num_fused_shared_experts=0,
+            fuse_qkv_a_proj=False,
+            quant_config=None,
+            named_parameters=lambda: params.items(),
+            model=SimpleNamespace(decoder=SimpleNamespace(self_attn=None)),
+        )
+        weights = [(f"model.language_model.layers.45.{k}", v) for k, v in weights]
+        Glm5NextForConditionalGenerationNextN.load_weights(model, weights)
+
+    def _param(self):
+        param = torch.nn.Parameter(torch.full((1, 2), -1.0), requires_grad=False)
+        param.weight_loader = Mock(
+            side_effect=lambda p, w, *args, **kwargs: p.data.copy_(w)
+        )
+        return param
+
+    def test_existing_scale_parameter_takes_priority(self):
+        for source, target in (
+            ("self_attn.q_b_proj", "self_attn.q_b_proj."),
+            ("mlp.experts.0.gate_proj", "mlp.experts.w13_"),
+        ):
+            with self.subTest(source=source):
+                name = f"model.decoder.{target}weight_scale"
+                param, unused = self._param(), self._param()
+                scale = torch.tensor([[0.25, 0.5]])
+                self._load(
+                    [(f"{source}.weight_scale", scale)],
+                    {name: param, f"{name}_inv": unused},
+                )
+                torch.testing.assert_close(param, scale)
+                unused.weight_loader.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -117,10 +117,12 @@ class TestBatchInvariantOps(CustomTestCase):
                 if mode is not None:
                     deep_gemm.use_deterministic_algorithms(mode)
                 with self.subTest(deterministic=mode):
-                    ref = batch_invariant_ops._matmul_persistent_deepgemm(a[:1], b)
+                    ref = batch_invariant_ops._matmul_persistent_deepgemm(
+                        a[:1], b, out_dtype=torch.bfloat16
+                    )
                     for batch_size in (16, 64, 257):
                         out = batch_invariant_ops._matmul_persistent_deepgemm(
-                            a[:batch_size], b
+                            a[:batch_size], b, out_dtype=torch.bfloat16
                         )
                         torch.testing.assert_close(out[:1], ref, rtol=0, atol=0)
                     if get_deterministic:

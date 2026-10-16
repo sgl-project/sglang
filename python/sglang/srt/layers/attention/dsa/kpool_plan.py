@@ -17,7 +17,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -117,8 +117,8 @@ class KPoolWritePlan:
     effective_n_per_batch: Optional[torch.Tensor] = None
 
 
-def _is_kpool_layout_enabled(pool_size: int, real_page_size: int) -> bool:
-    return pool_size > 1 and real_page_size == 64 and real_page_size % pool_size == 0
+def _is_kpool_layout_enabled(kpool: int, physical_page_size: int) -> bool:
+    return kpool > 1 and physical_page_size == 64 and physical_page_size % kpool == 0
 
 
 @dataclass
@@ -149,11 +149,11 @@ class _KPoolDecompose(NamedTuple):
     tail_n_write: int
 
 
-def _decompose_compress(start: int, length: int, pool_size: int) -> _KPoolDecompose:
-    first_slot = start % pool_size
-    base_pool = start // pool_size
-    n_pool = (start + length) // pool_size - base_pool
-    consumed = max(0, n_pool * pool_size - first_slot)
+def _decompose_compress(start: int, length: int, kpool: int) -> _KPoolDecompose:
+    first_slot = start % kpool
+    base_pool = start // kpool
+    n_pool = (start + length) // kpool - base_pool
+    consumed = max(0, n_pool * kpool - first_slot)
     tail_n = length - consumed
     return _KPoolDecompose(
         first_slot=first_slot,
@@ -165,7 +165,7 @@ def _decompose_compress(start: int, length: int, pool_size: int) -> _KPoolDecomp
 
 def _append_compress_rows(
     plan: _KPoolCpuPlan,
-    pool_size: int,
+    kpool: int,
     batch_size: int,
     extend_seq_lens_cpu: List[int],
     seq_lens_cpu: List[int],
@@ -178,7 +178,7 @@ def _append_compress_rows(
 
         seq_len = seq_lens_cpu[i]
         req = req_pool_indices_cpu[i]
-        d = _decompose_compress(seq_len - q_len, q_len, pool_size)
+        d = _decompose_compress(seq_len - q_len, q_len, kpool)
 
         if d.n_pool > 0:
             plan.pool_batch_idx.extend([i] * d.n_pool)
@@ -186,16 +186,16 @@ def _append_compress_rows(
             plan.pool_pool_id.extend(range(d.base_pool, d.base_pool + d.n_pool))
             plan.pool_n_from_tail.append(d.first_slot)
             plan.pool_n_from_tail.extend([0] * (d.n_pool - 1))
-            bulk_start = q_offset + pool_size - d.first_slot
+            bulk_start = q_offset + kpool - d.first_slot
             plan.pool_chunk_src.append(q_offset)
             plan.pool_chunk_src.extend(
-                range(bulk_start, bulk_start + (d.n_pool - 1) * pool_size, pool_size)
+                range(bulk_start, bulk_start + (d.n_pool - 1) * kpool, kpool)
             )
             plan.pool_tail_logical_base.extend(
                 range(
-                    d.base_pool * pool_size,
-                    (d.base_pool + d.n_pool) * pool_size,
-                    pool_size,
+                    d.base_pool * kpool,
+                    (d.base_pool + d.n_pool) * kpool,
+                    kpool,
                 )
             )
 
@@ -211,8 +211,8 @@ def _append_compress_rows(
 
 def _append_local_rows(
     plan: _KPoolCpuPlan,
-    pool_size: int,
-    slots_per_page: int,
+    kpool: int,
+    index_page_size: int,
     local_extend_seq_lens_cpu: List[int],
     local_seq_lens_cpu: List[int],
 ) -> None:
@@ -222,8 +222,8 @@ def _append_local_rows(
     ):
         assert q_len > 0, f"local_extend_seq_lens_cpu has non-positive {q_len = }"
         plan.ragged_q_len.append(q_len)
-        pool_seq_len = seq_len // pool_size
-        pool_pages_i = (pool_seq_len + slots_per_page - 1) // slots_per_page
+        pool_seq_len = seq_len // kpool
+        pool_pages_i = (pool_seq_len + index_page_size - 1) // index_page_size
         plan.ragged_pool_pages.append(pool_pages_i)
         plan.cu_pages_excl.append(plan.total_pool_pages)
         plan.cu_q_len_excl.append(q_offset)
@@ -233,8 +233,8 @@ def _append_local_rows(
 
 def _kpool_cpu_plan(
     forward_batch: ForwardBatch,
-    pool_size: int,
-    slots_per_page: int,
+    kpool: int,
+    index_page_size: int,
     *,
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
     local_seq_lens_cpu: Optional[List[int]] = None,
@@ -245,11 +245,14 @@ def _kpool_cpu_plan(
     if isinstance(extend_seq_lens_cpu, torch.Tensor):
         extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
     seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
-    req_pool_indices_cpu = forward_batch.req_pool_indices.tolist()
+    req_pool_indices_cpu = getattr(forward_batch, "req_pool_indices_cpu", None)
+    if req_pool_indices_cpu is None:
+        req_pool_indices_cpu = forward_batch.req_pool_indices
+    req_pool_indices_cpu = req_pool_indices_cpu.tolist()
 
     _append_compress_rows(
         plan,
-        pool_size,
+        kpool,
         forward_batch.batch_size,
         extend_seq_lens_cpu,
         seq_lens_cpu,
@@ -262,8 +265,8 @@ def _kpool_cpu_plan(
 
     _append_local_rows(
         plan,
-        pool_size,
-        slots_per_page,
+        kpool,
+        index_page_size,
         local_extend_seq_lens_cpu,
         local_seq_lens_cpu,
     )
@@ -277,8 +280,8 @@ def _kpool_plan_to_gpu(
     local_real_page_table: torch.Tensor,
     local_seqlens_expanded: torch.Tensor,
     local_req_pool_indices: torch.Tensor,
-    pool_size: int,
-    slots_per_page: int,
+    kpool: int,
+    index_page_size: int,
     topk_transform_method: TopkTransformMethod,
 ) -> KPoolExtendPlan:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -289,7 +292,7 @@ def _kpool_plan_to_gpu(
     n_rag = len(cpu.ragged_q_len)
 
     total_pool_pages = cpu.total_pool_pages
-    ragged_total_k_rows = total_pool_pages * slots_per_page
+    ragged_total_k_rows = total_pool_pages * index_page_size
 
     need_paged = (
         topk_transform_method == TopkTransformMethod.PAGED
@@ -367,20 +370,21 @@ def _kpool_plan_to_gpu(
 
     if n_pool > 0:
         pool_page_group = torch.div(
-            pool_pool_id_t, slots_per_page, rounding_mode="floor"
+            pool_pool_id_t, index_page_size, rounding_mode="floor"
         )
-        token_page_row = pool_page_group * pool_size
-        packed_page = full_real_page_table[pool_batch_idx_t, token_page_row].to(
-            torch.int64
+        token_page_row = pool_page_group * kpool
+        packed_page = (
+            full_real_page_table[pool_batch_idx_t, token_page_row].to(torch.int64)
+            // kpool
         )
-        pool_write_locs = packed_page * slots_per_page + torch.remainder(
-            pool_pool_id_t, slots_per_page
+        pool_write_locs = packed_page * index_page_size + torch.remainder(
+            pool_pool_id_t, index_page_size
         )
     else:
         pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
 
     pooled_seq_lens_expanded = torch.div(
-        local_seqlens_expanded, pool_size, rounding_mode="floor"
+        local_seqlens_expanded, kpool, rounding_mode="floor"
     ).to(torch.int32)
 
     if n_rag > 0:
@@ -395,10 +399,10 @@ def _kpool_plan_to_gpu(
             cu_q_len_excl=cu_q_len_excl_t,
             ragged_q_len=ragged_q_len_t,
             pooled_seq_lens_expanded=pooled_seq_lens_expanded,
-            slots_per_page=slots_per_page,
+            index_page_size=index_page_size,
             total_pool_pages=total_pool_pages,
             total_q=pooled_seq_lens_expanded.shape[0],
-            pool_size=pool_size,
+            kpool=kpool,
         )
     else:
         empty_i32_dev = torch.empty((0,), dtype=torch.int32, device=device)
@@ -411,7 +415,9 @@ def _kpool_plan_to_gpu(
     if need_paged:
         req_to_token = get_req_to_token_pool().req_to_token
         ragged_paged_page_table_row_index = torch.repeat_interleave(
-            local_req_pool_indices.to(torch.int32), ragged_q_len_t
+            local_req_pool_indices.to(torch.int32),
+            ragged_q_len_t,
+            output_size=sum(cpu.ragged_q_len),
         )
         ragged_paged_page_table = req_to_token
 
@@ -481,9 +487,9 @@ def init_kpool_extend_metadata(
     metadata: DSAMetadata,
     forward_batch: ForwardBatch,
     *,
-    pool_size: int,
-    real_page_size: int,
-    slots_per_page: int,
+    kpool: int,
+    physical_page_size: int,
+    index_page_size: int,
     topk_transform_method: TopkTransformMethod,
     full_real_page_table: torch.Tensor,
     full_seqlens_expanded: torch.Tensor,
@@ -496,7 +502,7 @@ def init_kpool_extend_metadata(
     mode = forward_batch.forward_mode
     is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend_v2()
     if (
-        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        not _is_kpool_layout_enabled(kpool, physical_page_size)
         or not is_extend_like
         or forward_batch.extend_seq_lens_cpu is None
         or forward_batch.seq_lens_cpu is None
@@ -512,8 +518,8 @@ def init_kpool_extend_metadata(
 
     cpu = _kpool_cpu_plan(
         forward_batch,
-        pool_size,
-        slots_per_page,
+        kpool,
+        index_page_size,
         local_extend_seq_lens_cpu=local_extend_seq_lens_cpu,
         local_seq_lens_cpu=local_seq_lens_cpu,
     )
@@ -524,8 +530,8 @@ def init_kpool_extend_metadata(
         local_real_page_table,
         local_seqlens_expanded,
         local_req_pool_indices,
-        pool_size,
-        slots_per_page,
+        kpool,
+        index_page_size,
         topk_transform_method,
     )
     return dataclasses.replace(metadata, kpool_extend_plan=plan)
@@ -552,7 +558,7 @@ def _get_deep_gemm():
 def _compute_pool_schedule_metadata(
     pool_seqlens: torch.Tensor,
     *,
-    slots_per_page: int,
+    index_page_size: int,
 ) -> Optional[torch.Tensor]:
     if not is_cuda():
         return None
@@ -561,7 +567,7 @@ def _compute_pool_schedule_metadata(
         return None
     return deep_gemm.get_paged_mqa_logits_metadata(
         pool_seqlens.contiguous().view(-1, 1).clamp(min=1),
-        slots_per_page,
+        index_page_size,
         deep_gemm.get_num_sms(),
     )
 
@@ -571,35 +577,40 @@ def init_pooled_paged_mqa_metadata(
     seqlens_32: torch.Tensor,
     forward_mode: ForwardMode,
     *,
-    pool_size: int,
-    real_page_size: int,
-    slots_per_page: int,
+    kpool: int,
+    physical_page_size: int,
+    index_page_size: int,
     build_schedule_metadata: bool = True,
 ) -> DSAMetadata:
     if (
-        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        not _is_kpool_layout_enabled(kpool, physical_page_size)
         or not is_cuda()
-        or not forward_mode.is_decode_or_idle()
+        or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
         return metadata
 
-    pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
-        torch.int32
-    )
     pooled_page_table = build_pooled_page_table_64(
-        metadata.real_page_table, pool_size
+        metadata.real_page_table, kpool
     ).contiguous()
+    if forward_mode.is_target_verify():
+        return dataclasses.replace(
+            metadata,
+            pooled_index_kpool=kpool,
+            pooled_real_page_table=pooled_page_table,
+        )
+
+    pool_seqlens = torch.div(seqlens_32, kpool, rounding_mode="floor").to(torch.int32)
     schedule = (
         _compute_pool_schedule_metadata(
             pool_seqlens,
-            slots_per_page=slots_per_page,
+            index_page_size=index_page_size,
         )
         if build_schedule_metadata
         else None
     )
     return dataclasses.replace(
         metadata,
-        pooled_index_kpool=pool_size,
+        pooled_index_kpool=kpool,
         pooled_cache_seqlens_int32=pool_seqlens,
         pooled_real_page_table=pooled_page_table,
         pooled_paged_mqa_schedule_metadata=schedule,
@@ -611,31 +622,37 @@ def update_pooled_paged_mqa_metadata(
     seqlens_32: torch.Tensor,
     forward_mode: ForwardMode,
     *,
-    pool_size: int,
-    real_page_size: int,
-    slots_per_page: int,
+    kpool: int,
+    physical_page_size: int,
+    index_page_size: int,
     build_schedule_metadata: bool = True,
 ) -> None:
     if (
-        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        not _is_kpool_layout_enabled(kpool, physical_page_size)
         or not is_cuda()
-        or not forward_mode.is_decode_or_idle()
+        or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
         return
 
+    if forward_mode.is_target_verify():
+        torch.floor_divide(
+            metadata.real_page_table[:, ::kpool],
+            kpool,
+            out=metadata.pooled_real_page_table,
+        )
+        return
+
     if (
-        metadata.pooled_index_kpool != pool_size
+        metadata.pooled_index_kpool != kpool
         or metadata.pooled_cache_seqlens_int32 is None
         or metadata.pooled_real_page_table is None
     ):
         return
 
-    pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
-        torch.int32
-    )
+    pool_seqlens = torch.div(seqlens_32, kpool, rounding_mode="floor").to(torch.int32)
     metadata.pooled_cache_seqlens_int32[: pool_seqlens.shape[0]].copy_(pool_seqlens)
     pooled_page_table = build_pooled_page_table_64(
-        metadata.real_page_table, pool_size
+        metadata.real_page_table, kpool
     ).contiguous()
     metadata.pooled_real_page_table[
         : pooled_page_table.shape[0], : pooled_page_table.shape[1]
@@ -647,7 +664,7 @@ def update_pooled_paged_mqa_metadata(
     ):
         new_schedule = _compute_pool_schedule_metadata(
             metadata.pooled_cache_seqlens_int32,
-            slots_per_page=slots_per_page,
+            index_page_size=index_page_size,
         )
         if new_schedule is not None:
             metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
@@ -657,12 +674,12 @@ def _alloc_kpool_write_plan_buffers(
     *,
     max_bs: int,
     num_draft_tokens: int,
-    pool_size: int,
+    kpool: int,
     device: torch.device,
     is_verify: bool,
     is_v2: bool = False,
 ) -> KPoolWritePlan:
-    max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool_size)
+    max_closed_pools = kpool_max_closed_pools(num_draft_tokens, kpool)
     verify_extras = {}
     if is_verify:
         n_rows = max_bs * num_draft_tokens
@@ -690,22 +707,22 @@ def init_kpool_write_plan_capture(
     metadata: DSAMetadata,
     *,
     max_bs: int,
-    pool_size: int,
-    real_page_size: int,
+    kpool: int,
+    physical_page_size: int,
     num_draft_tokens: int,
     device: torch.device,
     is_verify: bool,
-    slots_per_page: int,
+    index_page_size: int,
     is_v2: bool = False,
     build_schedule_metadata: bool = True,
 ) -> DSAMetadata:
-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or num_draft_tokens == 0:
+    if not _is_kpool_layout_enabled(kpool, physical_page_size) or num_draft_tokens == 0:
         return metadata
 
     plan = _alloc_kpool_write_plan_buffers(
         max_bs=max_bs,
         num_draft_tokens=num_draft_tokens,
-        pool_size=pool_size,
+        kpool=kpool,
         device=device,
         is_verify=is_verify,
         is_v2=is_v2,
@@ -713,7 +730,7 @@ def init_kpool_write_plan_capture(
     if is_verify and build_schedule_metadata:
         schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
-            slots_per_page=slots_per_page,
+            index_page_size=index_page_size,
         )
         plan = dataclasses.replace(plan, pool_schedule_metadata=schedule)
     return dataclasses.replace(metadata, kpool_write_plan=plan)
@@ -725,14 +742,16 @@ def update_kpool_write_plan(
     write_start: torch.Tensor,
     req_pool_indices: torch.Tensor,
     real_page_table: torch.Tensor,
-    pool_size: int,
-    real_page_size: int,
+    kpool: int,
+    physical_page_size: int,
     num_draft_tokens: int,
     forward_mode: ForwardMode,
-    slots_per_page: int,
+    index_page_size: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
 ) -> None:
-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_cuda():
+    if not _is_kpool_layout_enabled(kpool, physical_page_size) or not (
+        is_cuda() or is_hip()
+    ):
         return
     is_verify = forward_mode.is_target_verify()
     is_decode = forward_mode.is_decode_or_idle()
@@ -752,9 +771,9 @@ def update_kpool_write_plan(
         write_loc_out=plan.write_loc,
         pool_seqlens_per_q_out=plan.pool_seqlens_per_q,
         seqlens_per_q_out=plan.seqlens_per_q,
-        pool_size=pool_size,
+        kpool=kpool,
         num_draft_tokens=num_draft_tokens,
-        slots_per_page=slots_per_page,
+        index_page_size=index_page_size,
     )
 
     if (
@@ -769,7 +788,7 @@ def update_kpool_write_plan(
     if plan.pool_schedule_metadata is not None:
         new_schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
-            slots_per_page=slots_per_page,
+            index_page_size=index_page_size,
         )
         if new_schedule is not None:
             plan.pool_schedule_metadata.copy_(new_schedule)
@@ -779,12 +798,12 @@ def init_kpool_write_plan(
     metadata: DSAMetadata,
     forward_batch: ForwardBatch,
     *,
-    pool_size: int,
-    real_page_size: int,
+    kpool: int,
+    physical_page_size: int,
     real_page_table: torch.Tensor,
     num_draft_tokens: int,
     write_start: torch.Tensor,
-    slots_per_page: int,
+    index_page_size: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
     build_schedule_metadata: bool = True,
 ) -> DSAMetadata:
@@ -793,7 +812,7 @@ def init_kpool_write_plan(
     is_decode = forward_mode.is_decode_or_idle()
     is_v2 = forward_mode.is_draft_extend_v2()
     is_ring_write = is_verify or is_decode or is_v2
-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_ring_write:
+    if not _is_kpool_layout_enabled(kpool, physical_page_size) or not is_ring_write:
         return metadata
 
     pool = getattr(forward_batch, "token_to_kv_pool", None)
@@ -806,12 +825,12 @@ def init_kpool_write_plan(
     metadata = init_kpool_write_plan_capture(
         metadata,
         max_bs=forward_batch.seq_lens.shape[0],
-        pool_size=pool_size,
-        real_page_size=real_page_size,
+        kpool=kpool,
+        physical_page_size=physical_page_size,
         num_draft_tokens=num_draft_tokens,
         device=forward_batch.seq_lens.device,
         is_verify=is_verify or is_v2,
-        slots_per_page=slots_per_page,
+        index_page_size=index_page_size,
         is_v2=is_v2,
         build_schedule_metadata=build_schedule_metadata,
     )
@@ -820,11 +839,11 @@ def init_kpool_write_plan(
         write_start=write_start,
         req_pool_indices=forward_batch.req_pool_indices,
         real_page_table=real_page_table,
-        pool_size=pool_size,
-        real_page_size=real_page_size,
+        kpool=kpool,
+        physical_page_size=physical_page_size,
         num_draft_tokens=num_draft_tokens,
         forward_mode=forward_mode,
-        slots_per_page=slots_per_page,
+        index_page_size=index_page_size,
         effective_n_per_batch=effective_n_per_batch,
     )
     return metadata

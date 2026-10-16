@@ -15,7 +15,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 
 # Import to register custom ops for torch.compile compatibility
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
     is_tensor_in_symmetric_mempool,
@@ -34,6 +33,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     is_flashinfer_available,
     next_power_of_2,
@@ -75,9 +75,13 @@ def flashinfer_trtllm_deferred_finalize_context(
         _deferred_finalize_enabled.reset(token)
 
 
+def is_deferred_finalize_enabled() -> bool:
+    return _deferred_finalize_enabled.get()
+
+
 def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
-    shared_output: torch.Tensor,
+    shared_output: Optional[torch.Tensor],
 ) -> torch.Tensor:
     from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
@@ -98,14 +102,11 @@ def _make_deferred_finalize_output(
 ) -> FlashInferTrtllmDeferredFinalizeOutput:
     """Validate and adapt FlashInfer's ``do_finalize=False`` output ABI."""
     gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-    # Some FlashInfer versions size this buffer from routing_logits dtype while
-    # writing BF16 weights into it. Reinterpret only the live BF16 prefix.
-    if expert_weights.dtype == torch.float32:
-        n, k = expert_weights.shape
-        expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
-    if expert_weights.dtype != torch.bfloat16:
+    # FlashInfer >= 0.6.18 types this buffer by content (flashinfer #3595):
+    # bf16 for packed routing, the caller's dtype for unpacked routing.
+    if expert_weights.dtype not in (torch.bfloat16, torch.float32):
         raise RuntimeError(
-            "FlashInfer deferred finalize must return BF16 expert weights, got "
+            "FlashInfer deferred finalize must return BF16 or FP32 expert weights, got "
             f"{expert_weights.dtype}"
         )
     if gemm2_out.dtype != torch.bfloat16:
@@ -515,46 +516,61 @@ def _align_fp4_moe_weights(
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     is_gated: bool,
-    min_alignment: int = 16,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Pad intermediate size so FlashInfer TRTLLM FP4 kernels' alignment holds.
+    intermediate_alignment: int = 16,
+    hidden_alignment: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Zero-pad intermediate and hidden sizes to the TRT-LLM FP4 kernel alignments.
 
-    Returns (w13, w13_scale, w2, w2_scale, padded_intermediate).
+    Intermediate padding is transparent to callers. Hidden padding (K of GEMM1,
+    N of GEMM2) also needs the activations padded and the output sliced at runtime.
+
+    Returns (w13, w13_scale, w2, w2_scale, padded_intermediate, padded_hidden).
     """
     num_experts, hidden_size, intermediate_packed = w2.shape
     intermediate = intermediate_packed * 2  # FP4 packs 2 values per byte
 
-    padded_intermediate = round_up_to_multiple(intermediate, min_alignment)
-    if padded_intermediate == intermediate:
-        return w13, w13_scale, w2, w2_scale, intermediate
+    padded_intermediate = round_up_to_multiple(intermediate, intermediate_alignment)
+    padded_hidden = round_up_to_multiple(hidden_size, hidden_alignment)
+    if padded_intermediate == intermediate and padded_hidden == hidden_size:
+        return w13, w13_scale, w2, w2_scale, intermediate, hidden_size
 
     logger.info(
-        "FP4 MoE: padding intermediate size from %d to %d (alignment=%d)",
+        "FP4 MoE: padding (intermediate, hidden) from (%d, %d) to (%d, %d)",
         intermediate,
+        hidden_size,
         padded_intermediate,
-        min_alignment,
+        padded_hidden,
     )
 
     up_mult = 2 if is_gated else 1
     padded_gate_up = up_mult * padded_intermediate
 
-    padded_w13 = w13.new_zeros((num_experts, padded_gate_up, w13.shape[2]))
-    padded_w13[:, : w13.shape[1], :] = w13
-
-    padded_w2 = w2.new_zeros((num_experts, hidden_size, padded_intermediate // 2))
-    padded_w2[:, :, : w2.shape[2]] = w2
+    # w13: [E, gate_up, hidden // 2], scale [E, gate_up, hidden // 16]
+    padded_w13 = w13.new_zeros((num_experts, padded_gate_up, padded_hidden // 2))
+    padded_w13[:, : w13.shape[1], : w13.shape[2]] = w13
 
     padded_w13_scale = w13_scale.new_zeros(
-        (num_experts, padded_gate_up, w13_scale.shape[2])
+        (num_experts, padded_gate_up, padded_hidden // 16)
     )
-    padded_w13_scale[:, : w13_scale.shape[1], :] = w13_scale
+    padded_w13_scale[:, : w13_scale.shape[1], : w13_scale.shape[2]] = w13_scale
+
+    # w2: [E, hidden, intermediate // 2], scale [E, hidden, intermediate // 16]
+    padded_w2 = w2.new_zeros((num_experts, padded_hidden, padded_intermediate // 2))
+    padded_w2[:, :hidden_size, : w2.shape[2]] = w2
 
     padded_w2_scale = w2_scale.new_zeros(
-        (num_experts, hidden_size, padded_intermediate // 16)
+        (num_experts, padded_hidden, padded_intermediate // 16)
     )
-    padded_w2_scale[:, :, : w2_scale.shape[2]] = w2_scale
+    padded_w2_scale[:, :hidden_size, : w2_scale.shape[2]] = w2_scale
 
-    return padded_w13, padded_w13_scale, padded_w2, padded_w2_scale, padded_intermediate
+    return (
+        padded_w13,
+        padded_w13_scale,
+        padded_w2,
+        padded_w2_scale,
+        padded_intermediate,
+        padded_hidden,
+    )
 
 
 def _compute_g1_scale_c(
@@ -583,11 +599,30 @@ def _compute_g1_scale_c(
     return w2_input_scale_quant.to(torch.float32).expand(num_experts).contiguous()
 
 
-def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
+def trtllm_nvfp4_hidden_alignment(
+    use_per_token_activation: bool, is_gated: bool
+) -> int:
+    """Hidden-dim alignment required by the TRT-LLM NVFP4 MoE cubins.
+
+    The per-token (dynamic activation scale) non-gated variant ships far fewer
+    tile configs than the static one. At Nemotron's hidden size 2688 it runs
+    but produces garbage (GSM8K ~0.02 on FlashInfer 0.7.0.post1), while a
+    512-aligned hidden size is correct. Every other variant runs unpadded.
+    """
+    if use_per_token_activation and not is_gated:
+        return 512
+    return 1
+
+
+def align_fp4_moe_weights_for_flashinfer_trtllm(
+    layer: Module, hidden_alignment: int = 1
+) -> None:
     """Prepare FP4 MoE weights/scales for FlashInfer TRT-LLM kernels.
 
     This function handles the weight transformation needed for FP4 TRTLLM MoE:
     - Pads intermediate dimension for kernel alignment constraints
+    - Pads hidden dimension to `hidden_alignment` and records the padded size
+      on `layer.trtllm_padded_hidden_size` (None when unpadded)
     - Reorders weights for gated activation GEMM
     - Shuffles weights and scales for transposed MMA output
     - Computes the output scale factors
@@ -602,18 +637,27 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     w2_weight_scale = cast(torch.Tensor, layer.w2_weight_scale)
 
     is_gated = layer.moe_runner_config.is_gated
-    min_alignment = 16 if is_gated else 128
+    hidden_size = w2_weight.shape[1]
 
     # Pad for kernel alignment before shuffle/reorder
-    w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, intermediate_size = (
-        _align_fp4_moe_weights(
-            w13_weight,
-            w13_weight_scale,
-            w2_weight,
-            w2_weight_scale,
-            is_gated,
-            min_alignment,
-        )
+    (
+        w13_weight,
+        w13_weight_scale,
+        w2_weight,
+        w2_weight_scale,
+        intermediate_size,
+        padded_hidden_size,
+    ) = _align_fp4_moe_weights(
+        w13_weight,
+        w13_weight_scale,
+        w2_weight,
+        w2_weight_scale,
+        is_gated=is_gated,
+        intermediate_alignment=16 if is_gated else 128,
+        hidden_alignment=hidden_alignment,
+    )
+    layer.trtllm_padded_hidden_size = (
+        padded_hidden_size if padded_hidden_size != hidden_size else None
     )
 
     (
@@ -816,7 +860,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             # The deferred path returns FlashInfer's permuted/padded GEMM2
             # materialization and must not allocate the ordinary final output.
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
                     hidden_states.shape[0],
@@ -942,7 +986,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             symm_output = torch.empty(
                 hidden_states.shape[0],
@@ -1082,7 +1126,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     )
     if symm_output is None:
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             symm_output = torch.empty(
                 num_tokens,
@@ -1248,6 +1292,8 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
 
     routing_method_type: int
     use_per_token_activation: bool = False
+    # Hidden size the weights were zero-padded to; None means unpadded.
+    padded_hidden_size: Optional[int] = None
 
     gemm1_alpha: Optional[torch.Tensor] = None
     gemm1_beta: Optional[torch.Tensor] = None
@@ -1285,6 +1331,34 @@ def quantize_hidden_states_fp4(
     return hs_fp4, hs_sf
 
 
+def _get_fp4_moe_output_buffer(
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    symmetric: bool,
+) -> torch.Tensor:
+    """Reuse the forward's MoE output buffer when it fits, else allocate one."""
+    from sglang.srt.runtime_context import get_forward
+
+    provided = get_forward().moe_output_buffer
+    symm_required = symmetric and is_allocation_symmetric()
+    if (
+        provided is not None
+        and provided.shape == (num_tokens, hidden_size)
+        and provided.dtype == dtype
+        and provided.device == device
+        and (
+            not symm_required
+            or not is_symmetric_memory_enabled()
+            or is_tensor_in_symmetric_mempool(provided)
+        )
+    ):
+        return provided
+    with use_symmetric_memory(get_parallel().tp_group, disabled=not symm_required):
+        return torch.empty(num_tokens, hidden_size, dtype=dtype, device=device)
+
+
 def fused_experts_none_to_flashinfer_trtllm_fp4(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp4MoeQuantInfo,
@@ -1317,6 +1391,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
     per_token_scale = None
+    unpadded_hidden_size = hidden_states.shape[-1]
+    hidden_pad = 0
+    if quant_info.padded_hidden_size is not None:
+        assert hidden_states_scale is None, (
+            "Hidden-dim padded TRTLLM NVFP4 MoE weights need unquantized "
+            "activations; FP4 dispatch is not supported."
+        )
+        hidden_pad = quant_info.padded_hidden_size - unpadded_hidden_size
+        hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
     if hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
@@ -1366,10 +1449,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
         use_routed_topk = True
 
+    # Deferred outputs keep the padded width, so padded weights always finalize.
     defer_finalize = (
         _deferred_finalize_enabled.get()
         and not use_routed_topk
         and TopKOutputChecker.format_is_bypassed(topk_output)
+        and hidden_pad == 0
     )
 
     symm_output = None
@@ -1383,30 +1468,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
-        from sglang.srt.runtime_context import get_forward
-
-        _provided = get_forward().moe_output_buffer
-        _symm_required = is_allocation_symmetric()
-        if (
-            _provided is not None
-            and _provided.shape == (num_tokens, hidden_size)
-            and _provided.dtype == output_dtype
-            and _provided.device == hs_fp4.device
-            and (
-                not _symm_required
-                or not is_symmetric_memory_enabled()
-                or is_tensor_in_symmetric_mempool(_provided)
-            )
-        ):
-            symm_output = _provided
-        else:
-            with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
-                symm_output = torch.empty(
-                    num_tokens,
-                    hidden_size,
-                    dtype=output_dtype,
-                    device=hs_fp4.device,
-                )
+        # A padded kernel output is a scratch buffer; the sliced copy is the
+        # tensor that reaches the all-reduce.
+        symm_output = _get_fp4_moe_output_buffer(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            dtype=output_dtype,
+            device=hs_fp4.device,
+            symmetric=hidden_pad == 0,
+        )
 
     if use_routed_topk:
         routing = _get_routing_for_flashinfer_routed(topk_output)
@@ -1492,15 +1562,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
-            gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-            result = FlashInferTrtllmDeferredFinalizeOutput(
-                gemm2_out=gemm2_out,
-                expert_weights=expert_weights,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                top_k=topk_config.top_k,
-            )
+            result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
         else:
             result = result[0]
+
+    if hidden_pad > 0:
+        unpadded_result = _get_fp4_moe_output_buffer(
+            num_tokens=result.shape[0],
+            hidden_size=unpadded_hidden_size,
+            dtype=result.dtype,
+            device=result.device,
+            symmetric=True,
+        )
+        unpadded_result.copy_(result[:, :unpadded_hidden_size])
+        result = unpadded_result
 
     return StandardCombineInput(hidden_states=result)
 
@@ -1565,8 +1640,13 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+    defer_finalize = _deferred_finalize_enabled.get()
+    if defer_finalize and use_routed_topk:
+        raise RuntimeError("BF16 deferred finalize requires bypassed TopK")
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
         if use_routed_topk:
             assert runner_config.top_k is not None, (
                 "runner_config.top_k is required for flashinfer_trtllm_routed."
@@ -1620,7 +1700,12 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 routed_scaling_factor=runner_config.routed_scaling_factor,
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
+                do_finalize=not defer_finalize,
             )
+            if defer_finalize:
+                final_hidden_states = _make_deferred_finalize_output(
+                    final_hidden_states, top_k=topk_config.top_k
+                )
 
     return StandardCombineInput(hidden_states=final_hidden_states)
 
@@ -1684,22 +1769,17 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
 @register_fused_func("flashinfer", "flashinfer_trtllm")
 @register_fused_func("flashinfer", "flashinfer_trtllm_routed")
 def fused_experts_flashinfer_to_flashinfer_trtllm(
-    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput | StandardCombineInput:
+) -> FlashinferCombineInput:
     """Fused function for FlashInfer A2A + TRT-LLM Gen MoE.
 
-    Both one-sided decode and AG+RS prefill materialize routing IDs and weights,
-    so the regular and explicitly-routed backend names enter TRT-LLM's routed
-    kernel. The dispatch formats share the fields consumed by the implementation;
-    only the combine wrapper differs.
+    A2A dispatch materializes routing IDs and weights, so the regular and
+    explicitly-routed backend names both enter TRT-LLM's routed kernel.
     """
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
-        StandardDispatchOutput,
     )
 
     if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
@@ -1710,16 +1790,27 @@ def fused_experts_flashinfer_to_flashinfer_trtllm(
             use_routed_topk=True,
         )
     elif isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
-        if dispatch_output.hidden_states.dtype != torch.bfloat16:
-            raise TypeError(
-                "FlashInfer A2A + TRT-LLM Gen FP8 MoE requires a BF16 "
-                f"dispatch payload, got {dispatch_output.hidden_states.dtype}."
-            )
-        if dispatch_output.hidden_states_scale is not None:
-            raise ValueError(
-                "FlashInfer A2A + TRT-LLM Gen FP8 MoE quantizes locally; "
-                "the BF16 dispatch payload must not carry activation scales."
-            )
+        mxfp8_dispatch = (
+            quant_info.use_mxfp8
+            and dispatch_output.hidden_states.dtype == torch.float8_e4m3fn
+        )
+        if mxfp8_dispatch:
+            if dispatch_output.hidden_states_scale is None:
+                raise ValueError(
+                    "FlashInfer A2A + TRT-LLM Gen MXFP8 MoE requires activation "
+                    "scales alongside the FP8 dispatch payload."
+                )
+        else:
+            if dispatch_output.hidden_states.dtype != torch.bfloat16:
+                raise TypeError(
+                    "FlashInfer A2A + TRT-LLM Gen FP8 MoE requires a BF16 "
+                    f"dispatch payload, got {dispatch_output.hidden_states.dtype}."
+                )
+            if dispatch_output.hidden_states_scale is not None:
+                raise ValueError(
+                    "FlashInfer A2A + TRT-LLM Gen FP8 MoE quantizes locally; "
+                    "the BF16 dispatch payload must not carry activation scales."
+                )
         result = fused_experts_none_to_flashinfer_trtllm_fp8(
             dispatch_output,
             quant_info,
@@ -1745,8 +1836,6 @@ def fused_experts_flashinfer_to_flashinfer_trtllm(
             "FlashInfer A2A + TRT-LLM Gen FP8 MoE must return a BF16 combine "
             f"payload, got {result.hidden_states.dtype}."
         )
-    if isinstance(dispatch_output, StandardDispatchOutput):
-        return result
     return FlashinferCombineInput(hidden_states=result.hidden_states)
 
 

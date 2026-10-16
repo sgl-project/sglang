@@ -12,9 +12,9 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_fused_rmsnorm_modulation,
     can_use_linear_gelu,
     can_use_ltx2_qknorm_split_rope_cuda,
-    can_use_ltx2_rms_norm_modulate,
     can_use_modulate_scale_shift_cuda,
     fused_gelu_active,
     fused_linear_gelu_tanh,
@@ -204,11 +204,11 @@ def _ltx2_rms_norm_modulate(
 
     Folds the weightless RMSNorm and the modulate into one kernel when the
     request-gated fusion is mounted on ``block`` and the per-call guard
-    passes; otherwise the verbatim eager reference chain (the ``lossless``
+    passes; otherwise the verbatim eager reference chain (the ``exact``
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
-    if ltx2_rms_norm_modulate_active(block) and can_use_ltx2_rms_norm_modulate(
+    if ltx2_rms_norm_modulate_active(block) and can_use_fused_rmsnorm_modulation(
         x, scale, shift
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
@@ -302,9 +302,12 @@ def _ltx2_build_batched_perturbation_states(
             cache_key = tuple(keep_values)
             mask = mask_cache.get(cache_key)
             if mask is None:
-                mask = torch.tensor(
-                    keep_values, device=values.device, dtype=values.dtype
-                ).view(len(keep_values), *([1] * (values.ndim - 1)))
+                # Build constants on-device: torch.tensor(list, device="cuda")
+                # copies unpinned host memory and fails during BCG capture.
+                mask = values.new_ones((len(keep_values), *([1] * (values.ndim - 1))))
+                for index, keep in enumerate(keep_values):
+                    if not keep:
+                        mask[index].zero_()
                 mask_cache[cache_key] = mask
             states[block_idx] = (mask, False)
     return states
@@ -520,11 +523,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         audio_coords = audio_coords.unsqueeze(1)
         return audio_coords
 
-    def prepare_coords(self, *args, **kwargs):
-        if self.modality == "video":
-            return self.prepare_video_coords(*args, **kwargs)
-        return self.prepare_audio_coords(*args, **kwargs)
-
     def forward(
         self,
         coords: torch.Tensor,
@@ -697,7 +695,6 @@ class LTX2TPRMSNormAcrossHeads(nn.Module):
     ) -> None:
         super().__init__()
         self.full_hidden_size = full_hidden_size
-        self.local_hidden_size = local_hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(local_hidden_size))
 
@@ -854,6 +851,7 @@ class LTX2Attention(nn.Module):
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
+                capture_dense_attention=True,
             )
         else:
             self.attn = USPAttention(
@@ -869,6 +867,7 @@ class LTX2Attention(nn.Module):
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
+                capture_dense_attention=True,
             )
 
     def forward(
@@ -1863,8 +1862,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             rope_type=rope_type,
             num_attention_heads=self.audio_num_attention_heads,
         )
-
-        self.cross_pe_max_pos = cross_attn_pos_embed_max_pos
 
         # 5. Transformer Blocks
         self.transformer_blocks = nn.ModuleList(
