@@ -39,6 +39,7 @@ import resource
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1872,6 +1873,65 @@ def get_mm_http_session() -> requests.Session:
     return session
 
 
+def _reject_oversized_local_media(max_bytes: int) -> None:
+    raise ValueError(f"Local media exceeds the {max_bytes} byte size limit")
+
+
+def _assert_local_media_file(path: str) -> os.stat_result:
+    # Same byte cap as download_remote_media; 0 disables it. Stat before open,
+    # because opening a FIFO blocks and a device read does not reach EOF.
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("Local media path is not a regular file")
+    max_bytes = _media_url_max_file_size_bytes
+    if max_bytes and st.st_size > max_bytes:
+        _reject_oversized_local_media(max_bytes)
+    return st
+
+
+def _checked_local_media_path(source: str) -> str:
+    # file://localhost/dev/zero is /dev/zero. Return that path, not the URL.
+    path = unquote(urlparse(source).path) if source.startswith("file://") else source
+    _assert_local_media_file(path)
+    return path
+
+
+def _open_local_media_fd(path: str) -> int:
+    # O_NONBLOCK: a FIFO swapped in after the name check must not block open.
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("Local media path is not a regular file")
+        max_bytes = _media_url_max_file_size_bytes
+        if max_bytes and st.st_size > max_bytes:
+            _reject_oversized_local_media(max_bytes)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _read_local_media_file(path: str) -> bytes:
+    max_bytes = _media_url_max_file_size_bytes
+    fd = _open_local_media_fd(path)
+    try:
+        content = bytearray()
+        while True:
+            chunk = os.read(fd, 64 * 1024)
+            if not chunk:
+                break
+            if max_bytes and len(content) + len(chunk) > max_bytes:
+                _reject_oversized_local_media(max_bytes)
+            content.extend(chunk)
+        return bytes(content)
+    finally:
+        os.close(fd)
+
+
 # Raised by the loaders below when client-supplied media cannot be fetched or
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
 CLIENT_MEDIA_EXCEPTIONS = (
@@ -1912,8 +1972,11 @@ def load_audio(
     if isinstance(source, bytes):
         header = source[:16]
     else:
-        with open(source, "rb") as audio_stream:
-            header = audio_stream.read(16)
+        fd = _open_local_media_fd(source)
+        try:
+            header = os.read(fd, 16)
+        finally:
+            os.close(fd)
 
     if is_audio_container(header):
         return decode_audio_container(
@@ -2164,9 +2227,12 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         return download_remote_media(image_file, timeout=timeout)
-    if image_file.startswith(("file://", "/")):
+    # file:// is not stripped here; the rust loader strips it on purpose.
+    if image_file.startswith("file://"):
         with open(image_file, "rb") as f:
             return f.read()
+    if image_file.startswith("/"):
+        return _read_local_media_file(image_file)
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
@@ -2177,12 +2243,11 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
 
 def _normalize_video_input(
     video_file: Union[str, bytes],
-) -> Union[str, bytes, None]:
-    """Normalize video input (URL, base64, file://, etc.) to a file path or bytes.
+) -> Union[bytes, None]:
+    """Normalize video input (URL, base64, file://, etc.) to bytes.
 
-    Returns a file path or bytes suitable for a decoder, or None on failure.
-    URLs and base64 are returned as bytes (no temp files needed since both
-    torchcodec and VideoDecoderWrapper accept bytes natively).
+    Local files are read under the media byte cap. The decoder must not
+    open the path again, or a replaced file would skip that check.
     """
     if isinstance(video_file, bytes):
         return video_file
@@ -2194,10 +2259,11 @@ def _normalize_video_input(
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
-            return unquote(urlparse(video_file).path)
-        elif os.path.isfile(unquote(urlparse(video_file).path)):
-            return video_file
+            return _read_local_media_file(_checked_local_media_path(video_file))
         else:
+            path = unquote(urlparse(video_file).path)
+            if os.path.isfile(path):
+                return _read_local_media_file(path)
             return pybase64.b64decode(video_file, validate=True)
     else:
         return None
@@ -2212,8 +2278,7 @@ def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
     if isinstance(source, bytes):
         return source
     if isinstance(source, str):
-        with open(source, "rb") as f:
-            return f.read()
+        return _read_local_media_file(source)
     raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
 

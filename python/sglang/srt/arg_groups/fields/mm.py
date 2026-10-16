@@ -87,8 +87,9 @@ class Mm(msgspec.Struct):
     ] = msgspec.field(default_factory=list)
     media_url_max_file_size_mb: A[
         int,
-        "Maximum size in MiB for one client-supplied remote media download. "
-        "The limit is enforced while streaming; set to 0 to disable it.",
+        "Maximum size in MiB for one client-supplied media object, remote or local. "
+        "Remote bodies are capped while streaming, and local reads are capped "
+        "before the file is loaded. Set to 0 to disable the limit.",
     ] = 64
     mm_preprocess_cache_size_mb: A[
         Optional[int],
