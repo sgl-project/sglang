@@ -3055,6 +3055,14 @@ class DeepseekV4AttnBackend(
             # Bucket-sized under the prefill graph; an eager break sees the
             # live rows only and falls through.
             req, pos = hoisted_req, hoisted_pos
+        elif (
+            hoisted_req is not None
+            and meta.late_layer_tail is not None
+            and hoisted_req.shape[0] > positions.shape[0]
+        ):
+            # Late layers in the prefill graph: the eager break sees the tail block's
+            # real rows, which lead it; the batch's extend lens would cover every row.
+            req, pos = hoisted_req[: positions.shape[0]], positions
         else:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
