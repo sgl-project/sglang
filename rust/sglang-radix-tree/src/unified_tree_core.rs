@@ -189,6 +189,9 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
+    /// Host-pool index for a checkpoint that keeps no GPU slot. Mutually
+    /// exclusive with `mamba_value`.
+    pub mamba_host_value: Option<Tensor>,
     /// The inserting request already inserted [0, here); only the nodes past it
     /// count a hit (and get threshold-checked), so a request counts each node once.
     pub inserted_len: usize,
@@ -291,6 +294,7 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
+    mamba_host_value: Option<Tensor>,
     inserted_len: usize,
     priority: i64,
     track_adopted_ranges: bool,
@@ -615,6 +619,9 @@ pub struct CacheInitParams {
     pub mamba_cache_chunk_size: Option<usize>,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
     pub mamba_max_states_per_path: Option<usize>,
+    /// Host-only mamba checkpoints never occupy a GPU slot. A host value then
+    /// still counts as a device-prefix match so Full KV indices stay reachable.
+    pub mamba_host_only_checkpoint: bool,
 }
 
 impl Default for CacheInitParams {
@@ -636,6 +643,7 @@ impl Default for CacheInitParams {
             dynamo_kv_event_format: false,
             mamba_cache_chunk_size: None,
             mamba_max_states_per_path: None,
+            mamba_host_only_checkpoint: false,
         }
     }
 }
@@ -1892,6 +1900,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: params
+                .mamba_host_value
+                .as_ref()
+                .map(Tensor::shallow_clone),
             inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
@@ -2058,6 +2070,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: state
+                .mamba_host_value
+                .as_ref()
+                .map(Tensor::shallow_clone),
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -2250,6 +2266,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: state
+                .mamba_host_value
+                .as_ref()
+                .map(Tensor::shallow_clone),
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
