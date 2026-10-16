@@ -674,6 +674,23 @@ class Envs:
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(False)
+    # Draft-extend read-done event recorded inside its CUDA graph right after the
+    # attention metadata kernel (srt/speculative/draft_extend_read_fence.py).
+    SGLANG_Q35MF_PDDEC_FENCE = EnvBool(False)
+    # Measurement only: publish the draft-extend read-done event before the
+    # replay; the in-graph metadata reads are not covered by it.
+    SGLANG_Q35MF_PDDEC_FENCE_PREREPLAY_UNSAFE = EnvBool(False)
+    # Control file selecting the draft-extend fence policy between rounds of one
+    # server: "stock", "in_graph" or "pre_replay". Implies the in-graph marker.
+    SGLANG_Q35MF_PDDEC_FENCE_AB_CTL = EnvStr("")
+    # PD decode admission overlap (srt/disaggregation/decode_admit_overlap.py):
+    # preallocate new requests right after the forward launch.
+    SGLANG_Q35MF_PDDEC_DEFER_PREALLOC = EnvBool(False)
+    # Seed admitted requests on the forward stream with non-blocking copies.
+    SGLANG_Q35MF_PDDEC_NONBLOCKING_ADMIT = EnvBool(False)
+    # Control file switching the admission overlap between iterations of one
+    # server: whitespace-separated switch names ("defer_prealloc", "nonblocking_admit").
+    SGLANG_Q35MF_PDDEC_ADMIT_AB_CTL = EnvStr("")
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -1156,6 +1173,9 @@ class Envs:
     # expert's FP8 gate/up projection in the same launch (fp32 accumulation order
     # differs from cuBLASLt).
     SGLANG_Q35MF_ROUTE_SHARED = EnvBool(False)
+    # CuTe DSL MoE behind the FlashInfer all-to-all writes its output straight into
+    # the a2a combine payload buffer (dispatcher and runner sides read the same switch).
+    SGLANG_Q35MF_EXPERT_ENABLE_A2A_DIRECT_OUTPUT = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1172,6 +1192,9 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # With splits above one: sort the requests and gather their block tables and
+    # seq lens once per forward instead of in every decode attention call.
+    SGLANG_Q35MF_PDDEC_SPLIT_HOIST = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
@@ -1528,6 +1551,12 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Tokens held back from a prompt's end when picking its cached mamba checkpoint,
+    # so a next prompt that re-renders those tokens still resumes; 0 = last full page.
+    SGLANG_Q35MF_PREFILL_TAIL_SNAPSHOT_OFFSET = EnvInt(0)
+    # GDN prefill conv runs once per q / k / v channel group when qkv_dim is above the
+    # fused split limit (TP1), so the chunk kernels' input guard copies nothing.
+    SGLANG_Q35MF_GDN_PREFILL_SPLIT_CONV = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

@@ -12,6 +12,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -46,17 +47,55 @@ def pd_first_draft_proposal(topk_index: torch.Tensor, vocab_size: int) -> torch.
     return probs
 
 
-def build_eagle_disagg_draft_input(
-    batch: ScheduleBatch,
-    last_tokens_tensor: torch.Tensor,
-    future_map: FutureMap,
-) -> EagleDraftInput:
+def _seed_num_states() -> int:
     # Adaptive spec moves the step count after publish, and this runs once per
     # prebuilt batch.
     spec = get_spec()
     num_states = spec.speculative_eagle_topk
     if spec.enable_multi_layer_eagle:
         num_states *= spec.speculative_num_steps
+    return num_states
+
+
+def stage_eagle_disagg_seed(batch: ScheduleBatch) -> None:
+    """Move every request's received draft seed (top-k and hidden state) to the
+    device with one pinned, non-blocking copy per field. The draft input built
+    afterwards then reads device tensors and does no blocking copy."""
+    reqs = batch.reqs
+    num_states = _seed_num_states()
+    pin = is_pin_memory_available(batch.device)
+    staged = [
+        torch.stack(
+            [
+                torch.as_tensor(r.output_topk_p[:num_states], dtype=torch.float32)
+                for r in reqs
+            ]
+        ),
+        torch.stack(
+            [
+                torch.as_tensor(r.output_topk_index[:num_states], dtype=torch.int64)
+                for r in reqs
+            ]
+        ),
+        torch.stack([r.hidden_states_tensor for r in reqs], dim=0),
+    ]
+    topk_p, topk_index, hidden_states = (
+        (t.pin_memory() if pin else t).to(batch.device, non_blocking=True)
+        for t in staged
+    )
+    for i, req in enumerate(reqs):
+        req.output_topk_p = topk_p[i]
+        req.output_topk_index = topk_index[i]
+        req.hidden_states_tensor = hidden_states[i]
+
+
+def build_eagle_disagg_draft_input(
+    batch: ScheduleBatch,
+    last_tokens_tensor: torch.Tensor,
+    future_map: FutureMap,
+) -> EagleDraftInput:
+    spec = get_spec()
+    num_states = _seed_num_states()
 
     topk_p = torch.stack(
         [

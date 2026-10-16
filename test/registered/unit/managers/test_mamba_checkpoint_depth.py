@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -39,6 +40,23 @@ def _track_seqlen(
 ) -> int | None:
     """Run one extend through the tracker and report the donated depth, or
     None when the extend donates no checkpoint."""
+    _, depth = _run_tracker(
+        tree_page=tree_page,
+        prefix_len=prefix_len,
+        extend_len=extend_len,
+        dcp_enabled=dcp_enabled,
+    )
+    return depth
+
+
+def _run_tracker(
+    *,
+    tree_page: int,
+    prefix_len: int,
+    extend_len: int,
+    dcp_enabled: bool = False,
+    prompt_len: int | None = None,
+):
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
@@ -49,7 +67,7 @@ def _track_seqlen(
     req = Req(
         rid="req",
         origin_input_text="",
-        origin_input_ids=array("q", [1] * (prefix_len + extend_len)),
+        origin_input_ids=array("q", [1] * (prompt_len or prefix_len + extend_len)),
         sampling_params=sampling_params,
         vocab_size=128,
     )
@@ -74,8 +92,8 @@ def _track_seqlen(
         entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
     if not entry.track_mask:
         assert req.kv.mamba_last_track_seqlen is None
-        return None
-    return req.kv.mamba_last_track_seqlen
+        return entry, None
+    return entry, req.kv.mamba_last_track_seqlen
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):
@@ -122,6 +140,41 @@ class TestMambaCheckpointDepth(unittest.TestCase):
             _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
             20637,
         )
+
+
+class TestPromptTailSnapshotOffset(unittest.TestCase):
+    """A next prompt that re-renders the last tokens of this one must still find a
+    checkpoint at or before the divergence, without moving checkpoints elsewhere."""
+
+    def _depth(self, tail: int, **kw):
+        with envs.SGLANG_Q35MF_PREFILL_TAIL_SNAPSHOT_OFFSET.override(tail):
+            return _run_tracker(tree_page=CHUNK, prefix_len=16384, **kw)
+
+    def test_off_by_default_keeps_the_last_full_page(self):
+        for extend_len in (4032, 4033, 4066):
+            with self.subTest(extend_len=extend_len):
+                self.assertEqual(self._depth(0, extend_len=extend_len)[1], 20416)
+
+    def test_prompt_end_on_or_just_past_a_page_moves_back_one_page(self):
+        for extend_len in (4032, 4033):
+            with self.subTest(extend_len=extend_len):
+                entry, depth = self._depth(2, extend_len=extend_len)
+                self.assertEqual(depth, 20352)
+                # Not the last position: the state comes from the chunk snapshots.
+                self.assertEqual(entry.track_seqlen, 20353)
+
+    def test_tail_inside_the_last_page_keeps_the_stock_checkpoint(self):
+        entry, depth = self._depth(2, extend_len=4066)
+        self.assertEqual(depth, 20416)
+        self.assertEqual(entry.track_seqlen, 16384 + 4066)
+
+    def test_non_final_chunk_is_unchanged(self):
+        _, depth = self._depth(2, extend_len=4032, prompt_len=16384 + 8192)
+        self.assertEqual(depth, 20416)
+
+    def test_short_final_extend_donates_nothing_when_the_tail_eats_the_page(self):
+        self.assertEqual(self._depth(0, extend_len=65)[1], 16384 + 64)
+        self.assertIsNone(self._depth(2, extend_len=65)[1])
 
 
 class TestMambaTrackGrid(unittest.TestCase):

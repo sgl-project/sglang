@@ -1,9 +1,14 @@
+import types
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import trtllm_mha_backend
+from sglang.srt.layers.attention.trtllm_mha_decode_groups import DecodeGroupPlans
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
     is_sm90_supported,
@@ -12,9 +17,20 @@ from sglang.srt.utils.common import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    DEFAULT_DEVICE,
+    DEFAULT_DTYPE,
+    DEFAULT_MAX_CONTEXT_LEN,
+    DENSE_ATOL,
+    DENSE_RTOL,
     DenseAttentionCase,
+    _make_forward_batch,
     build_dense_attention_fixture,
+    expected_dense_output_from_inputs,
+    make_dense_case_with_prefix_lens,
+    make_dense_random_inputs,
+    prepare_dense_runner_inputs,
     run_dense_attention_case,
+    run_dense_forward,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
@@ -242,6 +258,84 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                     hidden_size=self.HIDDEN_SIZE,
                 )
 
+    def _decode_forwards(self, case, later_prefix_lens, *, hoist):
+        # One backend, one forward per length set; the later sets reuse freed metadata
+        # buffers, so a plan kept from an earlier forward would be read stale.
+        torch.manual_seed(0)
+        with (
+            envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(4),
+            envs.SGLANG_Q35MF_PDDEC_SPLIT_HOIST.override(hoist),
+        ):
+            fixture = build_dense_attention_fixture(
+                self, case, head_dim=self.HEAD_DIM, hidden_size=self.HIDDEN_SIZE
+            )
+            outputs = []
+            for i, prefix_lens in enumerate((case.prefix_lens,) + later_prefix_lens):
+                step = make_dense_case_with_prefix_lens(
+                    case, f"{case.name}_{i}", prefix_lens
+                )
+                inputs = make_dense_random_inputs(
+                    step, fixture, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
+                )
+                batch = _make_forward_batch(
+                    step,
+                    fixture.runner,
+                    max_context_len=DEFAULT_MAX_CONTEXT_LEN,
+                    device=DEFAULT_DEVICE,
+                )
+                prepare_dense_runner_inputs(
+                    fixture,
+                    step,
+                    batch,
+                    inputs,
+                    max_context_len=DEFAULT_MAX_CONTEXT_LEN,
+                )
+                with (
+                    torch.no_grad(),
+                    forward_context(ForwardContext(attn_backend=fixture.backend)),
+                ):
+                    fixture.backend.init_forward_metadata(batch)
+                    actual = run_dense_forward(fixture, batch, inputs)
+                expected = expected_dense_output_from_inputs(
+                    fixture, step, inputs, None
+                )
+                torch.testing.assert_close(
+                    actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL
+                )
+                outputs.append(actual)
+        return outputs
+
+    def test_split_hoist_matches_per_call_groups(self):
+        """Length groups built once per forward give the per-call groups' output bit for
+        bit, on every forward of a backend and inside a CUDA graph."""
+        case = DenseAttentionCase(
+            name="trtllm_mha_decode_split_hoist",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(40, 7, 33, 7, 60, 2, 21),
+        )
+        later = ((5, 62, 12, 48, 9, 30, 17), (21, 2, 60, 7, 33, 7, 40))
+        stock = self._decode_forwards(case, later, hoist=False)
+        hoisted = self._decode_forwards(case, later, hoist=True)
+        for i, (a, b) in enumerate(zip(stock, hoisted)):
+            with self.subTest(forward=i):
+                self.assertTrue(torch.equal(a, b))
+        graph_case = self.CUDA_GRAPH_DECODE_CASES[0]
+        with (
+            self.subTest(case=graph_case.name, runner="cuda_graph"),
+            envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(2),
+            envs.SGLANG_Q35MF_PDDEC_SPLIT_HOIST.override(True),
+        ):
+            run_dense_cuda_graph_decode_case(
+                self,
+                graph_case,
+                head_dim=self.HEAD_DIM,
+                hidden_size=self.HIDDEN_SIZE,
+            )
+
     # XQA has native page-128 kernels (any head layout). max_context_len must
     # be a page multiple so the kit's per-request slot ranges stay page-aligned.
     def test_page128_decode(self):
@@ -383,6 +477,92 @@ class TestTRTLLMMHAPage128TrtllmGen(CustomTestCase):
                 hidden_size=self.HIDDEN_SIZE,
                 max_context_len=self.MAX_CONTEXT_LEN,
             )
+
+
+class TestTRTLLMMHADecodeGroupHoist(CustomTestCase):
+    """Per-call length groups vs groups built once per forward, with a fake FMHA whose
+    output depends on each request's inputs and on its group's size and slot."""
+
+    @staticmethod
+    def _fake_decode(
+        *, query, block_tables, seq_lens, out=None, out_dtype=None, **kwargs
+    ):
+        n = seq_lens.shape[0]
+        rows = query.float().view(n, -1, *query.shape[1:])
+        slot = torch.arange(n, dtype=torch.float32).view(n, 1, 1, 1)
+        value = (
+            rows * (n + 1)
+            + seq_lens.float().view(n, 1, 1, 1)
+            + block_tables[:, :1].float().view(n, 1, 1, 1) / 8
+            + slot / 4
+        )
+        if kwargs.get("mask") is not None:
+            value = value + kwargs["mask"].float().sum() / 16
+        value = value.view(query.shape)
+        if out is None:
+            return value.to(out_dtype)
+        out.copy_(value)
+        return out
+
+    def _run(self, *, hoist, query, block_tables, seq_lens, q_len, out, mask):
+        backend = types.SimpleNamespace(
+            q_data_type=torch.bfloat16,
+            workspace_buffer=None,
+            max_context_len=4096,
+            _multi_ctas_kv_counter_buffer=None,
+            decode_seq_len_splits=4,
+            decode_split_hoist=hoist,
+            _decode_group_plans=DecodeGroupPlans(),
+        )
+        fake_flashinfer = types.SimpleNamespace(
+            decode=types.SimpleNamespace(
+                trtllm_batch_decode_with_kv_cache=self._fake_decode
+            )
+        )
+        with mock.patch.object(
+            trtllm_mha_backend, "flashinfer", fake_flashinfer, create=True
+        ):
+            return trtllm_mha_backend.TRTLLMHAAttnBackend._run_fixed_q_len_decode(
+                backend,
+                query,
+                None,
+                block_tables,
+                seq_lens,
+                bmm1_scale=1.0,
+                bmm2_scale=1.0,
+                window_left=-1,
+                sinks=None,
+                q_len_per_req=q_len,
+                out=out,
+                mask=mask,
+            )
+
+    def test_hoisted_groups_match_per_call_groups(self):
+        # 7 requests in 4 groups (2, 2, 2, 1), with tied lengths across a group edge.
+        seq_lens = torch.tensor([5, 3, 5, 9, 1, 3, 7], dtype=torch.int32)
+        block_tables = torch.arange(7 * 3, dtype=torch.int32).view(7, 3) * 5 % 17
+        for q_len in (1, 7):
+            for use_out in (False, True):
+                for use_mask in (False, True):
+                    query = torch.randn(7 * q_len, 2, 8).to(torch.bfloat16)
+                    mask = torch.ones(7, q_len, dtype=torch.int32) if use_mask else None
+                    results = []
+                    for hoist in (False, True):
+                        out = torch.zeros_like(query) if use_out else None
+                        result = self._run(
+                            hoist=hoist,
+                            query=query,
+                            block_tables=block_tables,
+                            seq_lens=seq_lens,
+                            q_len=q_len,
+                            out=out,
+                            mask=mask,
+                        )
+                        if use_out:
+                            self.assertEqual(result.data_ptr(), out.data_ptr())
+                        results.append(result)
+                    with self.subTest(q_len=q_len, out=use_out, mask=use_mask):
+                        self.assertTrue(torch.equal(results[0], results[1]))
 
 
 if __name__ == "__main__":

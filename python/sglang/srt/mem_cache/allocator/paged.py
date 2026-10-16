@@ -15,7 +15,7 @@ limitations under the License.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -140,6 +140,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     TODO: fuse last_loc into the kernel.
     """
 
+    supports_reuse_guard = True
+
     def __init__(
         self,
         size: int,
@@ -152,6 +154,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self._reuse_guard_event: Optional[torch.cuda.Event] = None
         self.use_triton_kernels = current_platform.capabilities.supports_triton
 
         # Pre-warm the torch.unique used by free(): on ROCm the first call
@@ -171,9 +174,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_all_free_pages(self):
         return torch.cat((self.free_pages, *self.staged_pages))
 
+    def set_reuse_guard_event(self, event: Optional[torch.cuda.Event]) -> None:
+        """Pages freed from now on may still receive KV writes of the forward in
+        flight until ``event`` completes (None: no such writes). A PD transfer into a
+        reused page is not stream-ordered, so need_sort merges wait for the event."""
+        self._reuse_guard_event = event
+
     def merge_and_sort_free(self):
         if not self.staged_pages:
             return
+        if self._staged_guard_event is not None:
+            self._staged_guard_event.synchronize()
+            self._staged_guard_event = None
         self.free_pages, _ = torch.sort(self.get_all_free_pages())
         self.staged_pages = []
         self.num_staged_pages = 0
@@ -376,6 +388,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.need_sort:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
+            if self._reuse_guard_event is not None:
+                self._staged_guard_event = self._reuse_guard_event
         else:
             self.free_pages = torch.cat((*page_ids, self.free_pages))
 
@@ -402,6 +416,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # need_sort only: freed pages wait here, unsorted, until an alloc runs short.
         self.staged_pages: list[torch.Tensor] = []
         self.num_staged_pages = 0
+        self._staged_guard_event = None
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(

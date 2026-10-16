@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
+from sglang.srt.speculative.draft_extend_read_fence import DraftExtendReadFence
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -308,6 +309,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
 
+        self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        self.read_fence = DraftExtendReadFence.from_env(allocator=allocator)
+        # PD only: a KV transfer into a page freed during the replay is not
+        # stream-ordered against the replay's KV writes.
+        self.kv_reuse_guard = (
+            allocator if self.read_fence is not None and allocator.need_sort else None
+        )
+
         self.backend = resolve_decode_backend(self)
 
         try:
@@ -320,6 +330,28 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
+
+    def _draft_extend_shared_read_ends(self) -> SharedReadEnds:
+        if self.read_fence is None:
+            return self.draft_extend_attn_backend.shared_read_ends(self.forward_mode)
+        return self.read_fence.resolve(
+            backend_ends=self._resolve_shared_read_ends(
+                self.draft_extend_attn_backend, self.forward_mode
+            )
+        )
+
+    def _kv_writes_done_event(self, shared_read_ends: SharedReadEnds):
+        """An event after this replay when the published read-done event precedes
+        the replay's KV writes; None when the barrier already covers them."""
+        fence_ends_early = shared_read_ends is SharedReadEnds.PRE_REPLAY or (
+            shared_read_ends is SharedReadEnds.IN_REPLAY
+            and self.in_graph_metadata_prep_done is not None
+        )
+        if not fence_ends_early:
+            return None
+        event = self.device_module.Event()
+        event.record()
+        return event
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -478,6 +510,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            if self.read_fence is not None and self.read_fence.capture_marker:
+                self._record_in_graph_metadata_prep_done()
 
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -821,9 +855,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Draft extend is the last shared reader. UNKNOWN must discard any
         # earlier phase's event so the scheduler uses its whole-forward fence.
         self.model_runner.shared_read_done_event = None
-        shared_read_ends = self.draft_extend_attn_backend.shared_read_ends(
-            self.forward_mode
-        )
+        shared_read_ends = self._draft_extend_shared_read_ends()
         if shared_read_ends is SharedReadEnds.PRE_REPLAY:
             self._publish_read_done(in_graph=False)
 
@@ -835,10 +867,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 
-        # This runner has no in-graph read-done marker. A later event is safe;
-        # an event before replay cannot cover metadata reads inside the graph.
+        # IN_REPLAY hands over the marker recorded after the in-graph metadata
+        # reads; without a marker only an event after replay covers those reads.
         if shared_read_ends in (SharedReadEnds.IN_REPLAY, SharedReadEnds.POST_REPLAY):
-            self._publish_read_done(in_graph=False)
+            self._publish_read_done(
+                in_graph=shared_read_ends is SharedReadEnds.IN_REPLAY
+                and self.in_graph_metadata_prep_done is not None
+            )
+        if self.kv_reuse_guard is not None:
+            self.kv_reuse_guard.set_reuse_guard_event(
+                self._kv_writes_done_event(shared_read_ends)
+            )
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:raw_bs],

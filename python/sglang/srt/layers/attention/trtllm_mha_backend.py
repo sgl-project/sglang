@@ -34,6 +34,10 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.graph_variants import use_split_kv_attention
+from sglang.srt.layers.attention.trtllm_mha_decode_groups import (
+    DecodeGroupPlans,
+    run_planned_groups,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
@@ -57,6 +61,9 @@ from sglang.srt.runtime_context import (
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
+)
+from sglang.srt.speculative.draft_extend_read_fence import (
+    draft_extend_in_graph_fence_enabled,
 )
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
@@ -178,6 +185,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
         if fm == ForwardMode.EXTEND:
             return SharedReadEnds.PRE_REPLAY
+        # Draft-extend graphs read req_to_token only in the in-graph metadata
+        # kernel; later kernels read the backend-owned page table.
+        if fm.is_draft_extend_v2() and draft_extend_in_graph_fence_enabled():
+            return SharedReadEnds.IN_REPLAY
         return super().shared_read_ends(fm)
 
     def __init__(
@@ -404,6 +415,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        self.decode_split_hoist = (
+            self.decode_seq_len_splits > 1 and envs.SGLANG_Q35MF_PDDEC_SPLIT_HOIST.get()
+        )
+        self._decode_group_plans = DecodeGroupPlans()
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
@@ -1053,6 +1068,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._decode_group_plans.reset()
         bs = forward_batch.batch_size
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
@@ -1176,6 +1192,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        self._decode_group_plans.reset()
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1188,6 +1205,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
+        self._decode_group_plans.reset()
         metadata = TRTLLMMHAMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -1491,6 +1509,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         num_splits = min(self.decode_seq_len_splits, num_requests)
         if num_splits == 1:
             return run_group(query, block_tables, seq_lens, out)
+        if self.decode_split_hoist:
+            return run_planned_groups(
+                query=query,
+                plan=self._decode_group_plans.get(
+                    block_tables=block_tables, seq_lens=seq_lens
+                ),
+                num_splits=num_splits,
+                q_len_per_req=q_len_per_req,
+                out=out,
+                out_dtype=resolved_out_dtype,
+                run_group=run_group,
+            )
 
         order = torch.argsort(seq_lens)
         query_by_request = query.view(

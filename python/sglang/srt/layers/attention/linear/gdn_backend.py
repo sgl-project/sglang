@@ -578,6 +578,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        self._split_conv_prefill = (
+            is_cuda() and envs.SGLANG_Q35MF_GDN_PREFILL_SPLIT_CONV.get()
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -971,6 +974,46 @@ class GDNAttnBackend(MambaAttnBackendBase):
             **conv_kwargs,
         ).transpose(0, 1)[: mixed_qkv.shape[0]]
 
+    def _convolve_prefill_split(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        # The conv is per channel, so channel slices give the same values bitwise;
+        # each launch's output is a contiguous [1, T, H, D] tensor.
+        block_table = self.forward_metadata.conv_block_table
+        conv_kwargs = {"block_table": block_table} if block_table is not None else {}
+        has_initial_state = forward_batch.extend_prefix_lens > 0
+        seq_len = mixed_qkv.shape[0]
+        outputs = []
+        start = 0
+        for num_heads, head_dim in (
+            (layer.num_q_heads, layer.head_q_dim),
+            (layer.num_k_heads, layer.head_k_dim),
+            (layer.num_v_heads, layer.head_v_dim),
+        ):
+            channels = slice(start, start + num_heads * head_dim)
+            start = channels.stop
+            out = causal_conv1d_fn(
+                mixed_qkv[:, channels].transpose(0, 1),
+                layer.conv_weights[channels],
+                None if layer.bias is None else layer.bias[channels],
+                activation=layer.activation,
+                conv_states=conv_states[:, channels],
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=self.forward_metadata.query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                **conv_kwargs,
+            )
+            outputs.append(
+                out.transpose(0, 1)[:seq_len].view(1, seq_len, num_heads, head_dim)
+            )
+        return outputs
+
     @staticmethod
     def _prefill_gates(
         layer: RadixLinearAttention, a: torch.Tensor, b: torch.Tensor
@@ -1076,6 +1119,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
+        split_qkv = None
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
@@ -1107,17 +1151,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = self._convolve_prefill(
-                layer,
-                forward_batch,
-                mixed_qkv,
-                conv_states_contig,
-                state_cache_indices,
-            )
+            # Below the fused split limit one split kernel beats two extra conv launches.
+            if self._split_conv_prefill and (
+                layer.q_dim + layer.k_dim + layer.v_dim > MAX_FUSED_QKV_SPLIT_DIM
+            ):
+                split_qkv = self._convolve_prefill_split(
+                    layer,
+                    forward_batch,
+                    mixed_qkv,
+                    conv_states_contig,
+                    state_cache_indices,
+                )
+            else:
+                mixed_qkv = self._convolve_prefill(
+                    layer,
+                    forward_batch,
+                    mixed_qkv,
+                    conv_states_contig,
+                    state_cache_indices,
+                )
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (
+        if split_qkv is not None:
+            query, key, value = split_qkv
+        elif (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv

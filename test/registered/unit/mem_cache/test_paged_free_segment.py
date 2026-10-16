@@ -79,6 +79,26 @@ class TestFreeSegment(unittest.TestCase):
         self.assertEqual(len(alloc.staged_pages), 1)
         self.assertEqual(alloc.num_staged_pages, 2)
 
+    def test_need_sort_merge_waits_for_reuse_guard(self):
+        # PD: pages freed while a forward may still write their KV become
+        # allocatable only after its guard event; pages freed without one do not wait.
+        alloc = _make_allocator(need_sort=True)
+        waits = []
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        alloc.set_reuse_guard_event(
+            SimpleNamespace(synchronize=lambda: waits.append(1))
+        )
+        alloc.free_segment(row, start_pos=0)
+        alloc.set_reuse_guard_event(None)
+        self.assertEqual(waits, [])
+        everything = alloc.alloc(NUM_PAGES * PAGE_SIZE)  # needs the staged pages
+        self.assertIsNotNone(everything)
+        self.assertEqual(waits, [1])
+
+        alloc.free_segment(everything[: 2 * PAGE_SIZE], start_pos=0)
+        self.assertIsNotNone(alloc.alloc(2 * PAGE_SIZE))
+        self.assertEqual(waits, [1])
+
     def test_group_defers_until_group_end(self):
         alloc = _make_allocator()
         row = _make_kv_row(alloc, 2 * PAGE_SIZE)

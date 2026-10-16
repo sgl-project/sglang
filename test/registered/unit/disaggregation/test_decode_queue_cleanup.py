@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -10,6 +12,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_admit_overlap import DEFER_PREALLOC, AdmitOverlap
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
@@ -18,6 +21,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     poll_and_all_reduce_with_staging,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -472,6 +476,39 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIs(receiver.kv_mgr, manager)
         self.assertFalse(receiver.abort_notified)
 
+    def test_fake_transfer_without_bootstrap_address_enqueues(self):
+        # A fake-transfer request may carry no bootstrap host; enqueueing it
+        # must not try to format a network address (it used to raise).
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.kv_manager = FakeKVManager.__new__(FakeKVManager)
+        queue.transfer_backend = MagicMock()
+        queue.queue = []
+        req = SimpleNamespace(
+            bootstrap_host=None, bootstrap_port=None, bootstrap_room=7
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode._is_fake_transfer", return_value=True
+        ):
+            decode_req = queue._create_receiver_and_enqueue(req)
+
+        self.assertIsInstance(decode_req.kv_receiver, FakeKVReceiver)
+        self.assertEqual(queue.queue, [decode_req])
+
+        # A real backend still requires a bootstrap address.
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode._is_fake_transfer",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.get_kv_class",
+                return_value=MagicMock(),
+            ),
+            self.assertRaises(AttributeError),
+        ):
+            queue._create_receiver_and_enqueue(req)
+
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
@@ -685,6 +722,167 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.queue, [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
+
+
+def _queue_scheduler():
+    scheduler = SimpleNamespace(
+        scheduler_stage_metrics=None,
+        enable_decode_hicache=False,
+        enable_hisparse=False,
+        waiting_queue=[],
+        polling_count=0,
+        polling_interval=1,
+        disagg_decode_transfer_queue=SimpleNamespace(
+            resolve_deferred_releases=MagicMock(),
+            pop_transferred=MagicMock(return_value=[]),
+            extend=MagicMock(),
+        ),
+        disagg_decode_prealloc_queue=SimpleNamespace(
+            resume_retracted_reqs=MagicMock(return_value=[]),
+            retracted_queue=[],
+            pop_preallocated=MagicMock(return_value=([], [])),
+        ),
+    )
+    scheduler._preallocate_new_requests = lambda: Scheduler._preallocate_new_requests(
+        scheduler
+    )
+    return scheduler
+
+
+def _admit_req(**overrides):
+    fields = dict(
+        grammar=None,
+        output_dsa_topk_indices=None,
+        kv=SimpleNamespace(retraction_backup=None),
+        hidden_states_tensor=object(),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class TestAdmissionOverlap(CustomTestCase):
+    def test_nonblocking_admit_skips_the_whole_forward_wait(self):
+        """The stock prebuilt path makes the schedule stream wait for the whole
+        in-flight forward; the non-blocking one must not (it seeds on the forward
+        stream instead)."""
+        disagg = SimpleNamespace(
+            disaggregation_decode_enable_radix_cache=False,
+            disaggregation_decode_host_receive_threshold=1,
+        )
+        for nonblocking, waits in ((False, 1), (True, 0)):
+            scheduler = SimpleNamespace(
+                grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
+                waiting_queue=[MagicMock()],
+                enable_priority_scheduling=False,
+                req_to_token_pool=SimpleNamespace(size=4),
+                max_running_requests=4,
+                token_to_kv_pool_allocator=None,
+                tree_cache=None,
+                model_config=None,
+                enable_overlap=True,
+                spec_algorithm=None,
+                schedule_stream=MagicMock(),
+                forward_stream=MagicMock(),
+            )
+            with (
+                patch(
+                    "sglang.srt.disaggregation.decode.ScheduleBatch.init_new"
+                ) as init,
+                patch(
+                    "sglang.srt.disaggregation.decode.get_disagg", return_value=disagg
+                ),
+            ):
+                Scheduler._get_new_prebuilt_batch(
+                    scheduler, SimpleNamespace(batch_size=lambda: 0), nonblocking
+                )
+            self.assertEqual(scheduler.schedule_stream.wait_stream.call_count, waits)
+            init.return_value.prepare_for_prebuilt.assert_called_once_with(
+                nonblocking=nonblocking
+            )
+
+    def test_nonblocking_admit_scope(self):
+        # Paths whose seeding reads the device on the host, or restores KV on the
+        # schedule stream, keep the stock wait.
+        disagg = SimpleNamespace(disaggregation_decode_host_receive_threshold=1)
+
+        def in_scope(reqs, **overrides):
+            fields = dict(
+                enable_overlap=True,
+                spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+                enable_hisparse=False,
+                waiting_queue=reqs,
+            )
+            fields.update(overrides)
+            with patch(
+                "sglang.srt.disaggregation.decode.get_disagg", return_value=disagg
+            ):
+                return Scheduler._nonblocking_admit_in_scope(SimpleNamespace(**fields))
+
+        self.assertTrue(in_scope([_admit_req()]))
+        self.assertFalse(in_scope([_admit_req(), _admit_req(grammar=object())]))
+        self.assertFalse(in_scope([_admit_req(output_dsa_topk_indices=object())]))
+        self.assertFalse(
+            in_scope([_admit_req(kv=SimpleNamespace(retraction_backup=object()))])
+        )
+        self.assertFalse(in_scope([_admit_req()], enable_overlap=False))
+        self.assertFalse(
+            in_scope(
+                [_admit_req()], spec_algorithm=SimpleNamespace(is_eagle=lambda: False)
+            )
+        )
+
+
+class TestDeferredPrealloc(CustomTestCase):
+    def test_deferred_prealloc_is_left_to_the_loop(self):
+        """A deferring queue step must not preallocate itself (the loop does it once,
+        after the forward launch); otherwise it preallocates as before."""
+        disagg = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_polling_interval=1,
+        )
+        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            scheduler = _queue_scheduler()
+            self.assertTrue(
+                Scheduler.process_decode_queue(scheduler, defer_prealloc=True)
+            )
+            scheduler.disagg_decode_prealloc_queue.pop_preallocated.assert_not_called()
+
+            scheduler = _queue_scheduler()
+            self.assertFalse(Scheduler.process_decode_queue(scheduler))
+            scheduler.disagg_decode_prealloc_queue.pop_preallocated.assert_called_once()
+
+    def test_ctl_switches_between_iterations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = os.path.join(tmp, "admit")
+            overlap = AdmitOverlap(
+                static_flags=frozenset(), ctl_path=ctl, start_poller=False
+            )
+            # Missing control file: every switch off.
+            overlap._poll_ctl_once()
+            self.assertEqual(overlap.begin_iteration(), frozenset())
+            with open(ctl, "w") as f:
+                f.write("defer_prealloc bogus\n")
+            # An iteration keeps what the poller last read.
+            self.assertEqual(overlap.begin_iteration(), frozenset())
+            overlap._poll_ctl_once()
+            self.assertEqual(overlap.begin_iteration(), {DEFER_PREALLOC})
+            self.assertEqual(overlap.round_ct[DEFER_PREALLOC], 1)
+
+    def test_ctl_ignored_when_ranks_share_the_prealloc_poll(self):
+        # Ranks flipping at different iterations could reorder that collective.
+        queue = SimpleNamespace(gloo_group=SimpleNamespace(size=lambda: 2))
+        with (
+            envs.SGLANG_Q35MF_PDDEC_DEFER_PREALLOC.override(False),
+            envs.SGLANG_Q35MF_PDDEC_ADMIT_AB_CTL.override("/nonexistent/admit"),
+        ):
+            self.assertIsNone(AdmitOverlap.from_env(prealloc_queue=queue))
+        with (
+            envs.SGLANG_Q35MF_PDDEC_DEFER_PREALLOC.override(True),
+            envs.SGLANG_Q35MF_PDDEC_ADMIT_AB_CTL.override(""),
+        ):
+            overlap = AdmitOverlap.from_env(prealloc_queue=queue)
+            self.assertEqual(overlap.begin_iteration(), {DEFER_PREALLOC})
 
 
 if __name__ == "__main__":
