@@ -2731,14 +2731,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
-    def _pollers(self) -> list:
+    def pollers(self) -> list:
+        """Each queued request's transfer poll; with decode HiCache, its KV
+        poll gated on its local restore."""
         if self.enable_decode_hicache:
             return [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
         return [dr.kv_receiver for dr in self.queue]
 
     def _poll_with_metadata_gate(self) -> List[int]:
         return poll_and_all_reduce(
-            self._pollers(),
+            self.pollers(),
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
@@ -2750,7 +2752,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
-            pollers=self._pollers(),
+            pollers=self.pollers(),
         )
 
     def _init_staging_handler(self, kv_manager):
@@ -2786,13 +2788,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return []
 
         if self.enable_decode_hicache:
-            self._process_hicache_local_restores(
-                [
-                    decode_req
-                    for decode_req in self.queue
-                    if rids_to_check is None or decode_req.req.rid in rids_to_check
-                ]
-            )
+            # The whole queue, not rids_to_check (on a later PP rank, the ids the
+            # previous rank released): every PP rank runs this at the same ring
+            # point over the same queue, so the ranks queue the same load-backs,
+            # and the ready-load count PP0 sends refers to loads all have queued.
+            self._process_hicache_local_restores(self.queue)
 
         if self.enable_staging:
             polls = self._poll_with_staging()
@@ -3583,12 +3583,14 @@ class DisaggDecode:
                 )
                 self.transfer_queue.extend(req_conns)
 
-    def _poll_rids(self, decode_reqs: List[DecodeRequest], *poll_statuses_group):
+    def _poll_rids(
+        self, decode_reqs: List[DecodeRequest], pollers: list, *poll_statuses_group
+    ):
         """
         Used by PP, get the required rids with the given poll statuses.
         """
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.kv_receiver for req in decode_reqs],
+            pollers,
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
@@ -3621,6 +3623,7 @@ class DisaggDecode:
         ids ready for their KV, and the ids that failed."""
         return self._poll_rids(
             self.prealloc_queue.queue,
+            [decode_req.kv_receiver for decode_req in self.prealloc_queue.queue],
             [KVPoll.WaitingForInput],
             [KVPoll.Failed],
         )
@@ -3633,9 +3636,13 @@ class DisaggDecode:
         }
 
     def poll_transfer_rids(self) -> List[str]:
-        """The transfer requests whose KV transfer ended on this rank."""
+        """The transfer requests whose KV transfer ended on this rank. With
+        decode HiCache a request counts as transferred only once its local
+        restore ended too, so the consensus holds only requests every rank can
+        release, and the ranks admit the same ones."""
         return self._poll_rids(
             self.transfer_queue.queue,
+            self.transfer_queue.pollers(),
             [KVPoll.Success, KVPoll.Failed],
         )
 

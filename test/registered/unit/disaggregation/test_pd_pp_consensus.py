@@ -6,6 +6,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.pd_pp_consensus import (
     _DisaggDecodeRing,
     _DisaggPrefillRing,
@@ -18,6 +20,7 @@ from sglang.test.test_utils import CustomTestCase, enter_scope, published_topolo
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 PP_MODULE = "sglang.srt.disaggregation.pd_pp_consensus"
+DECODE_MODULE = "sglang.srt.disaggregation.decode"
 
 
 class _Channel:
@@ -132,6 +135,144 @@ class TestDisaggDecodeRing(CustomTestCase):
 
         owner.apply_transfer_consensus.assert_not_called()
         self.assertIsNone(ring.release_rids)
+
+
+class _PPHiCache:
+    """One PP rank's decode HiCache, reduced to its load-back acks. As in
+    UnifiedRadixCache.check_hicache_events, PP0 counts its finished loads at
+    the head of its queue and sends the count down the ring, and every rank
+    reaps that many acks from its own queue."""
+
+    def __init__(self, pp_rank, sent_counts, dma_time):
+        self.pp_rank = pp_rank
+        self.sent_counts = sent_counts
+        # How long a load takes on this rank, and the rank's clock.
+        self.dma_time = dma_time
+        self.now = 0.0
+        # Per load, when it finishes; the loads not yet reaped.
+        self.done_at = []
+        self.ack_load_queue = []
+
+    def check_hicache_events(self):
+        if self.pp_rank == 0:
+            count = 0
+            for load in self.ack_load_queue:
+                if self.done_at[load] > self.now:
+                    break
+                count += 1
+            self.sent_counts.append(count)
+        else:
+            count = self.sent_counts.pop(0)
+        for _ in range(count):
+            # Reaping waits for the load to finish.
+            load = self.ack_load_queue.pop(0)
+            self.done_at[load] = min(self.done_at[load], self.now)
+
+    def has_free_load_back_slot(self):
+        return len(self.ack_load_queue) < 2
+
+    def ready_to_load_host_cache(self):
+        self.done_at.append(self.now + self.dma_time)
+        self.ack_load_queue.append(len(self.done_at) - 1)
+        return len(self.done_at) - 1
+
+    def is_load_back_event_done(self, consumer_index):
+        return self.now >= self.done_at[consumer_index]
+
+
+class _LandedReceiver:
+    """A KV receiver whose transfer from the prefill node has landed."""
+
+    def poll(self):
+        return KVPoll.Success
+
+
+def _decode_rank(pp_rank, sent_counts, dma_time, rids):
+    tree_cache = _PPHiCache(pp_rank, sent_counts, dma_time)
+    queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+    queue.queue = [
+        DecodeRequest(
+            req=SimpleNamespace(rid=rid, finished_reason=None),
+            kv_receiver=_LandedReceiver(),
+            metadata_buffer_index=i,
+            prefix_match=SimpleNamespace(needs_local_restore=True),
+        )
+        for i, rid in enumerate(rids)
+    ]
+    queue.__dict__.update(
+        tree_cache=tree_cache,
+        enable_decode_hicache=True,
+        enable_staging=False,
+        enable_host_receive=False,
+        enable_hisparse=False,
+        gloo_group=None,
+        metadata_buffers=SimpleNamespace(bootstrap_room=[None] * len(rids)),
+        req_to_metadata_buffer_idx_allocator=Mock(),
+        _deferred_releases=[],
+        _commit_transfer_to_req=Mock(),
+    )
+
+    def queue_load_back(decode_req):
+        decode_req.hicache_restore_lock = object()
+        return True
+
+    queue._try_hicache_queue_load_back = queue_load_back
+    return decode_owner_shell(
+        enable_decode_hicache=True,
+        enable_hisparse=False,
+        tree_cache=tree_cache,
+        transfer_queue=queue,
+        core_lists=SimpleNamespace(decoding=[]),
+        attn_cp_cpu_group=None,
+        attn_tp_cpu_group=None,
+    )
+
+
+def _local_polls(pollers, *groups, **kwargs):
+    return [poller.poll() for poller in pollers]
+
+
+@patch(f"{DECODE_MODULE}.poll_and_all_reduce", _local_polls)
+@patch(f"{DECODE_MODULE}.poll_and_all_reduce_attn_cp_tp_group", _local_polls)
+class TestDecodeHiCacheAcrossPPRanks(CustomTestCase):
+    """Under PP every rank restores a transferred request's prefix from its own
+    host copy. The ranks must queue the same load-backs at the same ring point,
+    or the load acks PP0 counts are popped on a rank that has not queued them,
+    and must release a request in the same slot, or the microbatch differs."""
+
+    def _run_ring(self, pp0_dma_time, pp1_dma_time):
+        sent_counts = []
+        pp0 = _decode_rank(0, sent_counts, pp0_dma_time, rids=["a", "b"])
+        pp1 = _decode_rank(1, sent_counts, pp1_dma_time, rids=["a", "b"])
+        ranks = (pp0, pp1)
+        slot = ScheduleSlot(index=0)
+        released = []
+        for step in range(1, 7):
+            # take_ids: every rank drains its HiCache events, then polls.
+            for rank in ranks:
+                rank.tree_cache.now = step
+                rank.check_hicache_events()
+            consensus = sorted(
+                set(pp0.poll_transfer_rids()) & set(pp1.poll_transfer_rids())
+            )
+            # exchange_ids, half a slot later: PP0 applies the consensus, and
+            # the next rank applies the ids PP0 released.
+            for rank in ranks:
+                rank.tree_cache.now = step + 0.5
+            released_pp0 = pp0.apply_transfer_consensus(consensus, slot)
+            released_pp1 = pp1.apply_transfer_consensus(released_pp0, slot)
+            self.assertEqual(released_pp1, released_pp0)
+            released += released_pp0
+        self.assertEqual(sorted(released), ["a", "b"])
+
+    def test_a_late_rank_reaps_only_loads_it_queued(self):
+        # PP0's load lands before the next slot counts it.
+        self._run_ring(pp0_dma_time=0.25, pp1_dma_time=0.25)
+
+    def test_the_ranks_release_a_restored_request_in_one_slot(self):
+        # PP0's load lands between the next slot's count and its release;
+        # PP1's lands later.
+        self._run_ring(pp0_dma_time=1, pp1_dma_time=2)
 
 
 class TestDisaggPrefillRing(CustomTestCase):
