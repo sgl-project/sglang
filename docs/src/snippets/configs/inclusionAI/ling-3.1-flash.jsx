@@ -4,7 +4,7 @@ export const config = {
   groupHardware: false,
   variants: [{ id: "default", label: "Ling-3.1-flash" }],
   quantizations: [{ id: "fp8", label: "FP8" }],
-  strategies: [{ id: "low-latency", label: "Low-Latency (TP-only)" }, { id: "high-throughput", label: "High-Throughput (EP)" }],
+  strategies: [{ id: "low-latency", label: "Low-Latency" }, { id: "high-throughput", label: "High-Throughput" }],
   nodesOptions: [{ id: "single", label: "Single Node" }],
   modelNames: { "default|fp8": "inclusionAI/Ling-3.1-flash" },
   placeholders: {
