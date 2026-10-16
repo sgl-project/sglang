@@ -31,8 +31,10 @@ on:
   workflow_dispatch:
 
 concurrency:
+  # Only PR runs are superseded. Push/schedule runs on main queue instead, so a newer merge
+  # never kills an in-flight post-merge run (GitHub still collapses multiple pending runs).
   group: gateway-tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   SGLANG_IS_IN_CI: true
