@@ -746,30 +746,6 @@ def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
     )
 
 
-def test_unified_eager_table_must_be_packed():
-    """XQA and fmha_v2 index a page table as packed rows (row length = width,
-    strides ignored). A plan whose table an earlier captured reader had built in
-    its own wider buffer hands a graphs-off reader a strided view, which they
-    would misread for every row after the first."""
-    backend = _make_backend_for_hook_test()
-    v2p = _translate_through_a_moving_page_map(backend)
-    _move_every_page(v2p, 1)
-    translator = backend.kv_index_translator
-
-    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
-    translator.bind_own_plan(forward_batch)
-    backend.init_forward_metadata(forward_batch)
-    assert backend.forward_metadata.page_table.is_contiguous()
-    _assert_reads_only_current_pages(backend, v2p)
-
-    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
-    translator.bind_own_plan(forward_batch)
-    captured = torch.zeros((8, backend.max_num_pages), dtype=torch.int32)
-    translator.copy_page_table(forward_batch.kv_loc_plan, out=captured[:2])
-    with pytest.raises(AssertionError, match="packed rows"):
-        backend.init_forward_metadata(forward_batch)
-
-
 def _bind_iteration_plan(translator, forward_batch, window=4):
     """The plan a speculative worker builds once per iteration: its reads reach
     the whole draft window past the committed lengths."""
@@ -780,6 +756,49 @@ def _bind_iteration_plan(translator, forward_batch, window=4):
         write_virtual=forward_batch.out_cache_loc,
         read_extent=window,
     ).bind(forward_batch, translator)
+
+
+def test_unified_eager_reader_packs_a_graph_built_table():
+    """XQA and fmha_v2 index a page table as packed rows (row length = width,
+    strides ignored). Graph-backed drafting can build the iteration plan's table
+    inside its wider capture buffer; an eager draft extend on that plan must read
+    the same rows packed, leaving the graph's buffer and the plan's table as is."""
+    backend = _make_backend_for_hook_test()
+    v2p = _translate_through_a_moving_page_map(backend)
+    _move_every_page(v2p, 1)
+    translator = backend.kv_index_translator
+
+    # A graphs-off first reader gets the plan's own packed table, no copy.
+    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
+    translator.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    plan_table = translator.read_table(forward_batch.kv_loc_plan, rows=2).ids
+    assert backend.forward_metadata.page_table.data_ptr() == plan_table.data_ptr()
+    _assert_reads_only_current_pages(backend, v2p)
+
+    forward_batch = _eager_batch(
+        [127, 300],
+        ForwardMode.DRAFT_EXTEND_V2,
+        SimpleNamespace(num_tokens_per_req=4),
+        tokens_per_req=4,
+    )
+    forward_batch.extend_seq_lens = torch.full((2,), 4, dtype=torch.int32)
+    forward_batch.extend_seq_lens_cpu = [4, 4]
+    _bind_iteration_plan(translator, forward_batch)
+    captured = torch.zeros((8, backend.max_num_pages), dtype=torch.int32)
+    translator.copy_page_table(forward_batch.kv_loc_plan, out=captured[:2])
+    graph_table = captured.clone()
+    plan_table = translator.read_table(forward_batch.kv_loc_plan, rows=2).ids
+    assert plan_table.shape == (2, 3) and plan_table.stride() == (8, 1)
+
+    backend.init_forward_metadata(forward_batch)
+    page_table = backend.forward_metadata.page_table
+    assert page_table.is_contiguous()
+    assert torch.equal(page_table, plan_table)
+    _assert_reads_only_current_pages(backend, v2p)
+    assert torch.equal(captured, graph_table)
+    plan_table = translator.read_table(forward_batch.kv_loc_plan, rows=2).ids
+    assert plan_table.data_ptr() == captured.data_ptr()
 
 
 @pytest.mark.parametrize(
