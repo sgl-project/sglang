@@ -238,14 +238,36 @@ impl WorkerRegistry {
         *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
-    /// Register a new worker
+    /// Register a worker, replacing any worker already registered at its URL.
+    ///
+    /// `workers` and `url_to_id` are keyed, so they overwrite on their own. The
+    /// secondary indexes are not: they are appended to, so the previous worker
+    /// has to be taken out of them first or a re-registration leaves the old
+    /// entry behind forever. That matters because re-registering a live URL is
+    /// routine — with hostNetwork a pod's IP is its node's, so a rollout puts a
+    /// new pod at the address the old one had, and `POST /workers` allows it
+    /// outright.
+    ///
+    /// Left in, the stale entry is not merely a duplicate. `model_index` holds
+    /// `Arc<dyn Worker>` values and is what routing reads, so the old worker
+    /// object stays routable while no longer being in `workers` — nothing
+    /// health-checks it, and its health is frozen wherever it last was. And
+    /// because a replacement may carry a different worker type (the same
+    /// rollout can put a decode pod where a prefill pod was), the stale
+    /// `WorkerId` in the OLD type bucket makes `get_by_type(Prefill)` return
+    /// the decode worker.
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
-        let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
-            // Worker with this URL already exists, update it
-            existing_id.clone()
-        } else {
-            WorkerId::new()
-        };
+        let existing_id = self.url_to_id.get(worker.url()).map(|id| id.clone());
+        let worker_id = existing_id.clone().unwrap_or_default();
+
+        // Take the previous worker out of the secondary indexes, against ITS
+        // own model, type and connection mode rather than the replacement's.
+        let previous = existing_id
+            .as_ref()
+            .and_then(|id| self.workers.get(id).map(|entry| entry.clone()));
+        if let Some(ref previous) = previous {
+            self.unindex_secondary(&worker_id, previous);
+        }
 
         // Store worker
         self.workers.insert(worker_id.clone(), worker.clone());
@@ -269,6 +291,14 @@ impl WorkerRegistry {
 
         // Rebuild hash ring for this model
         self.rebuild_hash_ring(&model_id);
+
+        // A replacement can land under a different model, which leaves the
+        // model it left with a stale ring.
+        if let Some(ref previous) = previous {
+            if previous.model_id() != model_id {
+                self.rebuild_hash_ring(previous.model_id());
+            }
+        }
 
         // Update type index (clone needed for DashMap key ownership)
         self.type_workers
@@ -294,6 +324,32 @@ impl WorkerRegistry {
         }
 
         worker_id
+    }
+
+    /// Take a worker out of the secondary indexes, leaving `workers` and
+    /// `url_to_id` alone.
+    ///
+    /// Indexed by the passed worker's own model, type and connection mode, so
+    /// this removes what that worker was actually filed under — not what a
+    /// replacement is about to be filed under.
+    fn unindex_secondary(&self, worker_id: &WorkerId, previous: &Arc<dyn Worker>) {
+        let previous_url = previous.url();
+        if let Some(mut entry) = self.model_index.get_mut(previous.model_id()) {
+            let remaining: Vec<Arc<dyn Worker>> = entry
+                .iter()
+                .filter(|w| w.url() != previous_url)
+                .cloned()
+                .collect();
+            *entry = Arc::from(remaining.into_boxed_slice());
+        }
+
+        if let Some(mut ids) = self.type_workers.get_mut(previous.worker_type()) {
+            ids.retain(|id| id != worker_id);
+        }
+
+        if let Some(mut ids) = self.connection_workers.get_mut(previous.connection_mode()) {
+            ids.retain(|id| id != worker_id);
+        }
     }
 
     /// Reserve (or retrieve) a stable UUID for a worker URL.
@@ -831,5 +887,148 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    /// A worker at `url` serving `model`, with the given type.
+    fn test_worker(url: &str, model: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), model.to_string());
+        Arc::from(Box::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .labels(labels)
+                .build(),
+        ) as Box<dyn Worker>)
+    }
+
+    #[test]
+    fn test_reregistering_a_url_replaces_rather_than_duplicates() {
+        // Re-registering a live URL is routine: a hostNetwork rollout puts a
+        // new pod at the address the old one had, and POST /workers allows it
+        // outright. Appending to the secondary indexes would leave the
+        // previous worker in all of them.
+        let registry = WorkerRegistry::new();
+
+        let first = registry.register(test_worker(
+            "http://worker1:8080",
+            "llama-3",
+            WorkerType::Regular,
+        ));
+        let second = registry.register(test_worker(
+            "http://worker1:8080",
+            "llama-3",
+            WorkerType::Regular,
+        ));
+
+        assert_eq!(first, second, "the same URL must keep its worker id");
+        assert_eq!(
+            registry.get_by_model("llama-3").len(),
+            1,
+            "routing reads model_index; a duplicate would double this worker's \
+             share and keep an unhealth-checked copy routable"
+        );
+        assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
+        assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
+        assert_eq!(registry.get_worker_distribution(), (1, 0));
+    }
+
+    #[test]
+    fn test_reregistering_a_url_with_a_new_type_leaves_no_stale_type_entry() {
+        // The PD rollout case: a decode pod comes up at the address a prefill
+        // pod had. The worker id is reused, so a stale id left in the OLD type
+        // bucket resolves through `workers` to the NEW worker — making
+        // get_by_type(Prefill) hand back the decode worker.
+        let registry = WorkerRegistry::new();
+
+        registry.register(test_worker(
+            "http://worker1:8080",
+            "llama-3",
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        registry.register(test_worker(
+            "http://worker1:8080",
+            "llama-3",
+            WorkerType::Decode,
+        ));
+
+        assert!(
+            registry
+                .get_by_type(&WorkerType::Prefill {
+                    bootstrap_port: None
+                })
+                .is_empty(),
+            "the replaced prefill worker must not still be indexed as prefill"
+        );
+        assert_eq!(
+            registry.get_by_type(&WorkerType::Decode).len(),
+            1,
+            "and the replacement must be indexed as decode"
+        );
+        assert_eq!(registry.get_by_model("llama-3").len(), 1);
+    }
+
+    #[test]
+    fn test_reregistering_a_url_under_a_new_model_moves_it() {
+        let registry = WorkerRegistry::new();
+
+        registry.register(test_worker(
+            "http://worker1:8080",
+            "llama-3",
+            WorkerType::Regular,
+        ));
+        registry.register(test_worker(
+            "http://worker1:8080",
+            "gpt-4",
+            WorkerType::Regular,
+        ));
+
+        assert!(
+            registry.get_by_model("llama-3").is_empty(),
+            "the model it left must not keep it"
+        );
+        assert_eq!(registry.get_by_model("gpt-4").len(), 1);
+        assert!(
+            registry.get_hash_ring("llama-3").is_none()
+                || registry.get_hash_ring("gpt-4").is_some(),
+            "the vacated model's ring must not outlive its workers"
+        );
+    }
+
+    #[test]
+    fn test_removing_a_reregistered_worker_leaves_no_dangling_type_entry() {
+        // remove() cleans the type bucket of the CURRENT worker only, so it
+        // relies on register() having cleared the previous one. A leftover id
+        // is invisible to get_by_type -- it filter_maps through `workers` and
+        // silently drops ids that no longer resolve -- but it is NOT invisible
+        // to get_worker_distribution, which takes a raw len() of the Regular
+        // bucket. Registering as Regular first is what makes the leak
+        // observable.
+        let registry = WorkerRegistry::new();
+
+        registry.register(test_worker(
+            "http://worker1:8080",
+            "llama-3",
+            WorkerType::Regular,
+        ));
+        let worker_id = registry.register(test_worker(
+            "http://worker1:8080",
+            "llama-3",
+            WorkerType::Decode,
+        ));
+
+        registry.remove(&worker_id);
+
+        assert!(registry.get(&worker_id).is_none());
+        assert!(registry.get_by_url("http://worker1:8080").is_none());
+        assert!(registry.get_by_model("llama-3").is_empty());
+        assert!(registry.get_by_type(&WorkerType::Decode).is_empty());
+        assert_eq!(
+            registry.get_worker_distribution(),
+            (0, 0),
+            "an id left in the type bucket the worker was FIRST registered \
+             under still counts here, even though the worker is gone"
+        );
     }
 }
