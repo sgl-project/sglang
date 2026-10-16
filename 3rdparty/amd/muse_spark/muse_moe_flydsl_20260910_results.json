@@ -1,0 +1,167 @@
+{
+  "date": "2026-09-10",
+  "attention": "Plan B / aiter page16",
+  "tp_size": 8,
+  "ep_size": 8,
+  "input_len": 8192,
+  "output_len": 1024,
+  "schedule": "4 warmups and 4 measured requests per concurrency slot",
+  "implementation": {
+    "bf16_m_le_4": "FlyDSL split-K=4, BLOCK_N=16, K-unroll=4; FP32 partials; FlyDSL SiLU reduction; split-aware FlyDSL finalize",
+    "bf16_m_8_16": "BLOCK_N=64, GEMM1 K-unroll=2, GEMM2 K-unroll=4",
+    "mxfp4": "selector unchanged; shared finalize removes the second per-route LDS barrier"
+  },
+  "source_sha256": {
+    "aiter_muse_moe_gemm.py": "8bdebdca77615ff3c13ee79cdaf720f03921f13a9dd9f34f2b1684e1a6e65ed4",
+    "aiter_muse_moe_finalize.py": "48af597a54827b3e7f9340dada68f74759bee80213df01fbe8f95c4e95fe6d2b",
+    "selector": "91ec3ad93983655dde66e55e510ff1ae19519561e2ef5ed46c6f2ef1bcdb928a",
+    "overlay_patch": "c92222e9fdda1757ce2fd1c67c4d2cf17acd0d188770c0e15826c8dc09b22265"
+  },
+  "results": {
+    "bf16": {
+      "model": "/data/Muse-Spark-1.2-820B-A42B",
+      "result_dirs": {
+        "triton": "/home/yichiche/flydsl-work/e2e/bf16_splitk_ab_triton_20260910_003319",
+        "flydsl": "/home/yichiche/flydsl-work/e2e/bf16_splitk_ab_flydsl_20260910_004350"
+      },
+      "points": {
+        "4": {
+          "triton": {
+            "completed": 16,
+            "output_throughput": 227.89629702024615,
+            "median_tpot_ms": 16.385776034841932,
+            "median_ttft_ms": 471.3249404449016,
+            "median_e2el_ms": 15653.297384502366
+          },
+          "flydsl": {
+            "completed": 16,
+            "output_throughput": 229.33057767795657,
+            "median_tpot_ms": 16.157087762745256,
+            "median_ttft_ms": 433.4429204463959,
+            "median_e2el_ms": 15429.569931467995
+          },
+          "delta": {
+            "output_throughput_pct": 0.6293567190269078,
+            "median_tpot_pct": -1.3956511526241,
+            "median_e2el_pct": -1.4292672498247838
+          }
+        },
+        "8": {
+          "triton": {
+            "completed": 32,
+            "output_throughput": 345.3248483942426,
+            "median_tpot_ms": 21.625516636542415,
+            "median_ttft_ms": 452.39172456786036,
+            "median_e2el_ms": 20905.82024049945
+          },
+          "flydsl": {
+            "completed": 32,
+            "output_throughput": 350.90421562525825,
+            "median_tpot_ms": 21.432551575449626,
+            "median_ttft_ms": 430.30695361085236,
+            "median_e2el_ms": 20689.871267415583
+          },
+          "delta": {
+            "output_throughput_pct": 1.6156865794511033,
+            "median_tpot_pct": -0.8923026641903142,
+            "median_e2el_pct": -1.0329610156387226
+          }
+        },
+        "16": {
+          "triton": {
+            "completed": 64,
+            "output_throughput": 478.70553140082495,
+            "median_tpot_ms": 30.924278027976857,
+            "median_ttft_ms": 473.61308382824063,
+            "median_e2el_ms": 29479.442903073505
+          },
+          "flydsl": {
+            "completed": 64,
+            "output_throughput": 511.2763216954558,
+            "median_tpot_ms": 29.579617369231844,
+            "median_ttft_ms": 444.6448751259595,
+            "median_e2el_ms": 27836.977428290993
+          },
+          "delta": {
+            "output_throughput_pct": 6.803930215579435,
+            "median_tpot_pct": -4.3482362224544495,
+            "median_e2el_pct": -5.571562122740348
+          }
+        }
+      }
+    },
+    "mxfp4": {
+      "model": "/data/Muse-Spark-1.2-820B-A42B-MXFP4-amd",
+      "result_dirs": {
+        "triton": "/home/yichiche/flydsl-work/e2e/mxfp4_current_ab_triton_20260910_005416",
+        "flydsl": "/home/yichiche/flydsl-work/e2e/mxfp4_current_ab_flydsl_20260910_010304"
+      },
+      "points": {
+        "4": {
+          "triton": {
+            "completed": 16,
+            "output_throughput": 271.9284470230351,
+            "median_tpot_ms": 13.530103498304284,
+            "median_ttft_ms": 455.88241959922016,
+            "median_e2el_ms": 13202.554264571518
+          },
+          "flydsl": {
+            "completed": 16,
+            "output_throughput": 305.9752457729855,
+            "median_tpot_ms": 12.08595073778183,
+            "median_ttft_ms": 408.3549175411463,
+            "median_e2el_ms": 11606.519606430084
+          },
+          "delta": {
+            "output_throughput_pct": 12.520499095508853,
+            "median_tpot_pct": -10.673626855134167,
+            "median_e2el_pct": -12.088832404380446
+          }
+        },
+        "8": {
+          "triton": {
+            "completed": 32,
+            "output_throughput": 470.64656666060654,
+            "median_tpot_ms": 15.709749554448656,
+            "median_ttft_ms": 417.6191866863519,
+            "median_e2el_ms": 15272.899007657543
+          },
+          "flydsl": {
+            "completed": 32,
+            "output_throughput": 483.5602776183858,
+            "median_tpot_ms": 15.378196912233262,
+            "median_ttft_ms": 391.1334187723696,
+            "median_e2el_ms": 14951.148864580318
+          },
+          "delta": {
+            "output_throughput_pct": 2.7438234702116926,
+            "median_tpot_pct": -2.1104896743659785,
+            "median_e2el_pct": -2.106673676791193
+          }
+        },
+        "16": {
+          "triton": {
+            "completed": 64,
+            "output_throughput": 693.9605434963914,
+            "median_tpot_ms": 21.199595362658634,
+            "median_ttft_ms": 433.02136566489935,
+            "median_e2el_ms": 20390.385520411655
+          },
+          "flydsl": {
+            "completed": 64,
+            "output_throughput": 713.6095086062019,
+            "median_tpot_ms": 20.894141273736558,
+            "median_ttft_ms": 404.7526204958558,
+            "median_e2el_ms": 19884.907856117934
+          },
+          "delta": {
+            "output_throughput_pct": 2.831423961197088,
+            "median_tpot_pct": -1.4408486751596672,
+            "median_e2el_pct": -2.4790000355202513
+          }
+        }
+      }
+    }
+  },
+  "status": "BF16 and MXFP4 FlyDSL beat Triton at matched concurrency 4, 8, and 16"
+}

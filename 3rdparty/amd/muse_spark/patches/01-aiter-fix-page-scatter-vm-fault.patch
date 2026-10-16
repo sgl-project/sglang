@@ -1,0 +1,71 @@
+Fix gfx950 VM fault in Aiter CK batch-prefill page gather
+
+Target repo: aiter (applies into the composable_kernel submodule)
+    git -C $AITER_ROOT apply patches/01-aiter-fix-page-scatter-vm-fault.patch
+    # then rebuild aiter so the CK FMHA sources are recompiled
+
+Required by both Plan A and Plan B. Without it, --attention-backend aiter dies
+with a GPU VM fault (surfaces as a worker segmentation fault) once prefix cache
+reuse makes the prefill page ids non-contiguous.
+
+fmha_batch_prefill has three KV-load arms. When page_block_size < kN0 (Muse
+Spark: page_size=16 vs kN0=128) it takes the Case 3 BUFFER_LOAD arm, which
+covers the entire K/V pool with a single SRD and encodes page identity in a
+32-bit voffset. That gather faults on gfx950 for scattered page ids even when
+every address is in bounds; upstream #10180 already forced GLOBAL_LOAD_LDS for
+page_block_size == 1 for the same reason, and #9214's lo32+pool_size guard does
+not catch the scattered case. This forces GLOBAL_LOAD_LDS for the whole Case 3
+arm, leaving the per-page rebased BUFFER_LOAD path (page_block_size >= kN0)
+untouched. Costs roughly 9% prefill throughput and is the only known safe
+configuration.
+diff --git a/3rdparty/composable_kernel/example/ck_tile/01_fmha/fmha_fwd.hpp b/3rdparty/composable_kernel/example/ck_tile/01_fmha/fmha_fwd.hpp
+index 50ba8ffb6..65b6591ec 100644
+--- a/3rdparty/composable_kernel/example/ck_tile/01_fmha/fmha_fwd.hpp
++++ b/3rdparty/composable_kernel/example/ck_tile/01_fmha/fmha_fwd.hpp
+@@ -701,31 +701,21 @@ fmha_batch_prefill_select_kv_load_mode(ck_tile::index_t page_block_size,
+     if(page_block_size >= kN0)
+         return ck_tile::BlockAttentionKVCacheLoadModeEnum::BUFFER_LOAD;
+
+-    // Maximum byte offsets that buffer_load will add to K/V base pointers.
+-    // Each page is addressed as page_id * batch_stride * element_bytes.
+-    const auto k_pool_bytes = static_cast<uint64_t>(num_total_pages) *
+-                              static_cast<uint64_t>(batch_stride_k) *
+-                              static_cast<uint64_t>(element_bytes);
+-    const auto v_pool_bytes = static_cast<uint64_t>(num_total_pages) *
+-                              static_cast<uint64_t>(batch_stride_v) *
+-                              static_cast<uint64_t>(element_bytes);
+-
+-    // Low 32 bits of each base VA. K and V are independently allocated and may
+-    // have different low-32 values, so both are checked. Compare against
+-    // INT32_MAX (not UINT32_MAX): the low32 bits themselves are unsigned, but the
+-    // voffset they are added to is signed int32, so the effective address is
+-    // already wrong once base[31:0] + pool crosses 0x7FFFFFFF. A sum in the
+-    // (2GB, 4GB] range still fits in 32 unsigned bits but has passed the signed
+-    // wrap point - that is exactly the band this check must route to global load.
+-    const auto k_lo32 =
+-        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(k_base_ptr)) & 0xFFFFFFFFULL;
+-    const auto v_lo32 =
+-        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(v_base_ptr)) & 0xFFFFFFFFULL;
+-    const bool srd_would_overflow =
+-        (k_lo32 + k_pool_bytes) > INT32_MAX || (v_lo32 + v_pool_bytes) > INT32_MAX;
+-
+-    return srd_would_overflow ? ck_tile::BlockAttentionKVCacheLoadModeEnum::GLOBAL_LOAD_LDS
+-                              : ck_tile::BlockAttentionKVCacheLoadModeEnum::BUFFER_LOAD;
++    // Case 3 BUFFER_LOAD (page_block_size < kN0) uses one SRD over the whole K/V
++    // pool and encodes page identity in a 32-bit voffset:
++    //   physical_page * stride_page_block + within_page
++    // #10180 already forced GLOBAL_LOAD_LDS for page_block_size == 1 because that
++    // gather faults on gfx950 even for in-bounds addresses. Muse Spark page_size=16
++    // with kN0=128 is the same Case 3 arm: prefix-cache scatter still VM-faults
++    // after #9214's lo32+pool check. Keep BUFFER_LOAD only for the per-page
++    // rebased path (page_block_size >= kN0).
++    (void)num_total_pages;
++    (void)batch_stride_k;
++    (void)batch_stride_v;
++    (void)element_bytes;
++    (void)k_base_ptr;
++    (void)v_base_ptr;
++    return ck_tile::BlockAttentionKVCacheLoadModeEnum::GLOBAL_LOAD_LDS;
+ }
+
+ template <typename FmhaKernel>

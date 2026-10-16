@@ -1,0 +1,76 @@
+{
+  "date": "2026-09-10",
+  "container": "jacky-v0.5.19-rocm720-mi35x-muse-spark-day0-test",
+  "branch": "amd/mi355-rocm-day0",
+  "model": "/data/Muse-Spark-1.2-820B-A42B-MXFP4-amd",
+  "configuration": {
+    "tp_size": 8,
+    "ep_size": 8,
+    "attention": "Plan B / aiter page16",
+    "moe_backend": "flydsl"
+  },
+  "tests": {
+    "cpu_and_registration": {
+      "passed": 24,
+      "subtests_passed": 10
+    },
+    "hip_operator": {
+      "passed": 16
+    },
+    "plan_c_smoke": {
+      "enabled": true,
+      "answer": "The capital of France is Paris.",
+      "gpu_fault": false
+    }
+  },
+  "gsm8k": {
+    "questions": 1319,
+    "shots": 5,
+    "max_new_tokens": 2048,
+    "accuracy": 0.955,
+    "invalid": 0,
+    "output_throughput": 2246.946
+  },
+  "serving": {
+    "input_len": 8192,
+    "output_len": 1024,
+    "random_range_ratio": 0.8,
+    "ignore_eos": true,
+    "warmups_per_concurrency_slot": 4,
+    "measured_requests_per_concurrency_slot": 4,
+    "points": {
+      "4": {
+        "completed": 16,
+        "output_throughput": 303.943160470942,
+        "median_tpot_ms": 12.165378059569507,
+        "median_ttft_ms": 409.74606620147824,
+        "median_e2el_ms": 11697.2509494517,
+        "throughput_delta_vs_recorded_flydsl_pct": -0.664135862065359
+      },
+      "8": {
+        "completed": 32,
+        "output_throughput": 474.98311292470055,
+        "median_tpot_ms": 15.653945488204743,
+        "median_ttft_ms": 398.7807766534388,
+        "median_e2el_ms": 15197.401391807944,
+        "throughput_delta_vs_recorded_flydsl_pct": -1.773741987604967
+      },
+      "16": {
+        "completed": 64,
+        "output_throughput": 712.2782191351839,
+        "median_tpot_ms": 20.861422241657976,
+        "median_ttft_ms": 407.40898437798023,
+        "median_e2el_ms": 19921.272260602564,
+        "throughput_delta_vs_recorded_flydsl_pct": -0.186554311931635
+      },
+      "32": {
+        "completed": 128,
+        "output_throughput": 1008.084768048456,
+        "median_tpot_ms": 29.877403172511528,
+        "median_ttft_ms": 442.51149147748947,
+        "median_e2el_ms": 28218.765121651813
+      }
+    }
+  },
+  "status": "passed"
+}
