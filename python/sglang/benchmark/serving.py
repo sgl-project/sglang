@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
+import msgspec
 import numpy as np
 import orjson
 import requests
@@ -280,6 +281,30 @@ def _record_server_prompt_len(data, output):
         output.prompt_len = prompt_tokens
 
 
+class _OpenAIStreamState(msgspec.Struct):
+    num_choices: int = 1
+    seen_done: bool = False
+    seen_choices: set[int] = msgspec.field(default_factory=set)
+    finished_choices: set[int] = msgspec.field(default_factory=set)
+
+    def record_choices(self, data: Dict[str, Any]) -> None:
+        for position, choice in enumerate(data.get("choices") or []):
+            index = choice.get("index", position)
+            self.seen_choices.add(index)
+            if choice.get("finish_reason"):
+                self.finished_choices.add(index)
+
+    def validate(self) -> None:
+        # Some compatible servers omit [DONE]. In that case every requested
+        # and observed choice must have finished, not just the first one.
+        expected_choices = set(range(self.num_choices)) | self.seen_choices
+        if not self.seen_done and not expected_choices <= self.finished_choices:
+            raise ValueError(
+                "Incomplete streaming response: expected [DONE] or finish_reason "
+                "for all choices before EOF"
+            )
+
+
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
@@ -329,6 +354,12 @@ async def async_request_openai_completions(
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
+        num_prompts = 1
+        effective_prompt = payload["prompt"]
+        if isinstance(effective_prompt, list) and effective_prompt:
+            if isinstance(effective_prompt[0], (str, list)):
+                num_prompts = len(effective_prompt)
+        stream_state = _OpenAIStreamState((payload.get("n") or 1) * num_prompts)
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -349,9 +380,10 @@ async def async_request_openai_completions(
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
-                            pass
+                            stream_state.seen_done = True
                         else:
                             data = json.loads(chunk)
+                            stream_state.record_choices(data)
                             _record_server_prompt_len(data, output)
 
                             if getattr(args, "cache_report", False):
@@ -360,6 +392,11 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
+                            if payload["stream"] and not data["choices"]:
+                                continue
                             if data["choices"][0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
@@ -376,10 +413,9 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
 
+                    if payload["stream"]:
+                        stream_state.validate()
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
@@ -485,6 +521,7 @@ async def async_request_openai_chat_completions(
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
+        stream_state = _OpenAIStreamState(payload.get("n") or 1)
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -497,7 +534,7 @@ async def async_request_openai_chat_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    if args.disable_stream:
+                    if not payload["stream"]:
                         # Non-streaming response
                         response_json = await response.json()
                         message = response_json["choices"][0]["message"]
@@ -536,9 +573,10 @@ async def async_request_openai_chat_completions(
                             chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                             latency = time.perf_counter() - st
                             if chunk == "[DONE]":
-                                pass
+                                stream_state.seen_done = True
                             else:
                                 data = json.loads(chunk)
+                                stream_state.record_choices(data)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
                                 output_len = (data.get("usage") or {}).get(
@@ -575,6 +613,7 @@ async def async_request_openai_chat_completions(
                                     most_recent_timestamp = timestamp
                                     generated_text += content
 
+                        stream_state.validate()
                         output.generated_text = generated_text
                         output.success = True
                         output.latency = latency
