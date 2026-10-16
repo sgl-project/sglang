@@ -163,7 +163,9 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         """
         messages = self._parse_mistral_prompt(input_text)
         try:
-            input_ids = tokenizer.apply_chat_template(messages, tokenize=True)
+            input_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, return_dict=False
+            )
         except (ValueError, KeyError):
             # Fallback if prompt parsing produces malformed messages
             input_ids = tokenizer.encode(input_text)
