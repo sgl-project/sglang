@@ -301,7 +301,8 @@ class TestMonokernelFramework(CustomTestCase):
             runtime.is_metadata_unread(lm, batch("decode", 3, 3), schedule)
         )
         reads_all, _ = switched()
-        for model in (reads_all, Lm()):
+        without_monokernels = Lm()
+        for model in (reads_all, without_monokernels):
             self.assertFalse(
                 runtime.is_metadata_unread(model, batch("decode", 2, 2), schedule)
             )

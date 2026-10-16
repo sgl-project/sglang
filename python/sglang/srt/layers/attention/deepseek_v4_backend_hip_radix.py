@@ -1692,8 +1692,7 @@ class DeepseekV4HipRadixBackend(
                         for ratio, indexer_metadata in (
                             metadata.low_ratio_indexer_metadata_by_ratio().items()
                         )
-                        # Identity rows are not scored, so they need no schedule;
-                        # nor does a step whose monokernel forward never reads it.
+                        # Identity rows are not scored, so they need no schedule.
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
                         )

@@ -41,7 +41,7 @@ class Feature(enum.Enum):
 
 
 class StepMetadata(enum.Enum):
-    """Per-step attention metadata a backend skips for a forward that never reads it."""
+    """Per-step attention metadata a backend can skip building."""
 
     LOW_RATIO_DECODE_SCHEDULE = "the aiter decode schedule of each low-ratio indexer"
 
