@@ -38,6 +38,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.litetopk_decode import FP32_TOP2048
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -86,6 +87,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_num_sms,
     resolve_paged_mqa_logits_metadata_fn,
     should_use_dsa_fused_topk,
+)
+from sglang.srt.layers.attention.litetopk_decode import (
+    DSA_MAX_NEXT_N,
+    get_litetopk_decode,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
@@ -178,6 +183,18 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
+
+
+def _litetopk_causal_verify_ctx_lens(
+    *, num_draft_tokens: Optional[int], topk_backend: DSATopKBackend
+) -> bool:
+    # LiteTopK's histogram must count exactly the keys each verify token sees, so
+    # DG-native verify gets causal lengths, only when LiteTopK serves that verify.
+    return (
+        topk_backend.is_sgl_kernel()
+        and get_litetopk_decode(FP32_TOP2048) is not None
+        and (num_draft_tokens or 1) <= DSA_MAX_NEXT_N
+    )
 
 
 def _trim_trtllm_decode_dp_padding(
@@ -498,6 +515,8 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+    # LiteTopK's causal verify lengths; off also for instances built without __init__.
+    paged_mqa_causal_ctx_lens: bool = False
 
     def __init__(
         self,
@@ -647,6 +666,10 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
+        self.paged_mqa_causal_ctx_lens = _litetopk_causal_verify_ctx_lens(
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            topk_backend=self.dsa_topk_backend,
+        )
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
@@ -941,6 +964,10 @@ class DeepseekSparseAttnBackend(
             and get_platform().is_sm100
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
+            if self.paged_mqa_causal_ctx_lens:
+                rows = cache_seqlens_int32.shape[0] * next_n
+                # Not a view of seqlens_expanded: graph replays overwrite this buffer.
+                return seqlens_expanded[:rows].view(-1, next_n).clone()
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return _to_2d_context_lens(seqlens_expanded, batch_size)
@@ -1856,6 +1883,8 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded = metadata.dsa_seqlens_expanded[
                     : self.speculative_num_draft_tokens * bs
                 ]
+                if target_verify_ctx_lens_written and self.paged_mqa_causal_ctx_lens:
+                    paged_mqa_ctx_lens_2d.copy_(seqlens_expanded.view(bs, -1))
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32[
                     : self.speculative_num_draft_tokens * bs
                 ]
