@@ -990,7 +990,10 @@ class BaseMultimodalProcessor(ABC):
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
+                    # GPU JPEG decode can leave grayscale as 1 channel
+                    # (torchvision decode_jpeg UNCHANGED). Expand to RGB so
+                    # downstream processors that normalize with 3 means work.
+                    return smart_to_rgb(img)
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:

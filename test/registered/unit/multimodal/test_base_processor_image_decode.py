@@ -216,3 +216,47 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLoadSingleItemGrayscaleGpuTensor(CustomTestCase):
+    """GPU JPEG decode can leave grayscale as 1 channel; expand before return."""
+
+    def test_single_channel_chw_tensor_expanded_to_rgb(self):
+        gray = torch.full((1, 12, 10), 128, dtype=torch.uint8)
+
+        with patch.object(
+            common,
+            "load_image",
+            return_value=(gray, (10, 12)),
+        ):
+            out = _StubProcessor._load_single_item(b"fake", Modality.IMAGE)
+
+        self.assertIsInstance(out, torch.Tensor)
+        self.assertEqual(tuple(out.shape), (3, 12, 10))
+        self.assertTrue(torch.equal(out[0], out[1]))
+        self.assertTrue(torch.equal(out[1], out[2]))
+
+    def test_hw_grayscale_tensor_expanded_to_rgb(self):
+        gray = torch.full((12, 10), 64, dtype=torch.uint8)
+
+        with patch.object(
+            common,
+            "load_image",
+            return_value=(gray, (10, 12)),
+        ):
+            out = _StubProcessor._load_single_item(b"fake", Modality.IMAGE)
+
+        self.assertEqual(tuple(out.shape), (3, 12, 10))
+
+    def test_rgb_tensor_unchanged(self):
+        rgb = torch.zeros((3, 8, 8), dtype=torch.uint8)
+        rgb[1] = 1
+
+        with patch.object(
+            common,
+            "load_image",
+            return_value=(rgb, (8, 8)),
+        ):
+            out = _StubProcessor._load_single_item(b"fake", Modality.IMAGE)
+
+        self.assertIs(out, rgb)
