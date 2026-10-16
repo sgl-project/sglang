@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from sglang.srt.entrypoints.openai.chat_encoding import encode_simple_chat
-from sglang.srt.parser.inkling_output import InklingOutputParser
+from sglang.srt.parser.inkling_output import InklingOutputDelta, InklingOutputParser
 from sglang.srt.parser.inkling_renderer import (
     load_tml_renderers,
     render_inkling_assistant_prefix,
@@ -210,6 +210,33 @@ class TestInklingOutputParser(unittest.TestCase):
                     )
                     self.assertEqual(parsed.tool_calls, ())
                     self.assertEqual(parsed.content, expected)
+
+    def test_finish_flushes_once(self):
+        """A finish_reason stays set on later stream chunks; finishing again must
+        not re-emit a truncated message's payload."""
+        parser = InklingOutputParser(separate_reasoning=True, parse_tool_calls=True)
+        first = parser.finish(
+            _ids("<|message_model|>", "f", "<|content_invoke_tool_json|>", '{"a":')
+        )
+        self.assertEqual(first.content, '{"a":')
+        self.assertEqual(parser.finish(), InklingOutputDelta())
+
+    def test_end_message_stop_still_closes_the_call(self):
+        """With <|end_message|> among the stop tokens, the matched stop must stay in
+        the stream: it is what closes the message into a tool call."""
+        end_message = load_tml_renderers().tokenizer.encode_special("end_message")
+        token_ids = _ids(
+            "<|message_model|>",
+            "f",
+            "<|content_invoke_tool_json|>",
+            '{"name":"f","args":{"a":1}}',
+            "<|end_message|>",
+        )
+        parsed = InklingOutputParser(
+            separate_reasoning=True, parse_tool_calls=True
+        ).finish(token_ids, matched_stop=end_message)
+        self.assertEqual([call.name for call in parsed.tool_calls], ["f"])
+        self.assertEqual(parsed.content, "")
 
     def test_buffered_reasoning_survives_truncation(self):
         """With stream_reasoning=False a thinking block is held until it

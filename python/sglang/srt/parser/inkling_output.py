@@ -77,6 +77,7 @@ class InklingOutputParser:
         self._at_message_boundary = True
         self._in_unframed_text = False
         self._num_tool_calls = 0
+        self._finished = False
         self.num_consumed_tokens = 0
         if continues_text_block:
             # The prompt ended inside an open model text block, so the sampled
@@ -98,6 +99,11 @@ class InklingOutputParser:
         matched_stop: int | str | None = None,
         keep_matched_stop: bool = False,
     ) -> InklingOutputDelta:
+        # Callers see a sticky finish_reason on later chunks; flushing again would
+        # re-emit an unclosed message's payload.
+        if self._finished:
+            return InklingOutputDelta()
+        self._finished = True
         if isinstance(matched_stop, str):
             token_ids = self._cut_at_stop_string(
                 token_ids, matched_stop, keep_stop=keep_matched_stop

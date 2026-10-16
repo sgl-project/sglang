@@ -252,14 +252,10 @@ class InklingResponsesStream:
             separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
         )
         self._incremental = get_serving().incremental_streaming_output
-        self._finished = False
 
     def step(
         self, chunk: dict[str, Any], finish_reason: dict[str, Any] | None
     ) -> tuple[str, str, list[ToolCallItem]]:
-        # finish_reason stays set on later chunks; the parser finishes once.
-        if self._finished:
-            return "", "", []
         new_output_ids = select_new_output_ids(
             output_ids=chunk.get("output_ids") or [],
             num_consumed_tokens=self._parser.num_consumed_tokens,
@@ -270,7 +266,6 @@ class InklingResponsesStream:
         if finish_reason is None:
             delta = self._parser.feed(new_output_ids)
         else:
-            self._finished = True
             delta = self._parser.finish(
                 new_output_ids,
                 matched_stop=finish_reason.get("matched"),
