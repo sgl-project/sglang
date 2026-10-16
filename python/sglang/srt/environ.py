@@ -802,6 +802,16 @@ class Envs:
     # KV-transfer staging and Mooncake transport
     # ===================================================================
     # Staging buffer for heterogeneous TP KV transfer
+    # Experimental Qwen3 BF16 / TP=PP=CP=DCP=1 Mooncake prototype.
+    SGLANG_HICACHE_KV_COMPRESSION = EnvStr("off")
+    SGLANG_KV_COMPRESSION_WORKSPACE_MB = EnvInt(512)
+    SGLANG_PD_KV_COMPRESSION = EnvStr("off")
+    # Diagnostic only: requires LZ4/ANS + VERIFY; matching Prefill L2 is optional.
+    SGLANG_PD_KV_COMPRESSION_FORCE = EnvBool(False)
+    SGLANG_KV_COMPRESSION_TRACE_LENGTHS = EnvBool(False)
+    SGLANG_PD_KV_COMPRESSION_VERIFY = EnvBool(False)
+    SGLANG_KV_COMPRESSION_TRACE_HANDOFF = EnvBool(False)
+    SGLANG_KV_COMPRESSION_TRACE_REUSE = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in

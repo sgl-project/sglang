@@ -2427,7 +2427,8 @@ class OpenSessionReqOutput(BaseReq, kw_only=True):
 
 
 class HealthCheckOutput(BaseReq, kw_only=True):
-    pass
+    # Sticky until worker restart; normal health messages leave this unset.
+    quarantine_reason: Optional[str] = None
 
 
 class ExpertDistributionReqType(Enum):

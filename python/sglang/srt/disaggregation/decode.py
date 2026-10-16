@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.compression.protocol import CompressionCompatibilityError
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -1168,7 +1169,42 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self._ensure_last_attempt_time[bootstrap_addr] = now
 
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            try:
+                error = getattr(
+                    self.kv_manager, "compression_incompatible_peers", {}
+                ).get(bootstrap_addr)
+                if error:
+                    raise CompressionCompatibilityError(error)
+                available = self.kv_manager.try_ensure_parallel_info(bootstrap_addr)
+            except CompressionCompatibilityError as exc:
+                self.kv_manager.compression_incompatible_peers[bootstrap_addr] = str(
+                    exc
+                )
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
+                if prefetched is not None:
+                    prefetched[1].cancel()
+                failed_ids = {id(entry) for entry in reqs}
+                self.queue = [
+                    entry for entry in self.queue if id(entry) not in failed_ids
+                ]
+                self.pending_reqs = [
+                    entry for entry in self.pending_reqs if id(entry) not in failed_ids
+                ]
+                for decode_req in reqs:
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.clear()
+                        decode_req.kv_receiver = None
+                    prepare_abort(
+                        decode_req.req,
+                        str(exc),
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    self.scheduler.retire_unadmitted_request(decode_req.req)
+                continue
+
+            if available:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
@@ -1315,6 +1351,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise ValueError("rids_to_check cannot be used in PP mode")
 
         self._resolve_pending_reqs()
+        if self.scheduler.compression_failure_reason():
+            return [], []
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
@@ -2541,6 +2579,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
+        from sglang.srt.disaggregation.compression.diagnostics import trace_handoff
+
+        if envs.SGLANG_KV_COMPRESSION_TRACE_HANDOFF.get():
+            trace_handoff(
+                "decode_received",
+                decode_req.req,
+                output_id[0].item(),
+                received_room=int(output_bootstrap_room[0].item()),
+                slot=idx,
+                received_cached_tokens=int(cached_tokens[0].item()),
+            )
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
@@ -2719,7 +2768,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             DecodeStagingHandler,
         )
 
-        self.staging_handler = DecodeStagingHandler.create(
+        handler_cls = DecodeStagingHandler
+        if getattr(kv_manager, "compression_mode", "off") != "off":
+            from sglang.srt.disaggregation.mooncake.compression import (
+                CompressedDecodeStagingHandler,
+            )
+
+            handler_cls = CompressedDecodeStagingHandler
+        self.staging_handler = handler_cls.create(
             kv_manager, self.scheduler, self.tp_rank
         )
         kv_manager._staging_handler = self.staging_handler
@@ -2827,6 +2883,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
                 else:
+                    # Compression restore may still own destination KV pages.
+                    if (
+                        getattr(
+                            decode_req.kv_receiver.kv_mgr, "compression_mode", "off"
+                        )
+                        != "off"
+                    ):
+                        self.staging_handler.unregister_decode_req(
+                            decode_req.req.bootstrap_room
+                        )
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
                     self._release_request(decode_req)
                     decode_req.kv_receiver.clear()
@@ -2988,7 +3054,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            compressed = getattr(kv_mgr, "compression_mode", "off") != "off"
+            if compressed:
+                try:
+                    local_drained = self.staging_handler.abort_room_drained(room)
+                except Exception as exc:
+                    self.compression_quarantine_reason = (
+                        f"KV local drain failed for room={room}: {exc}"
+                    )
+                    kv_mgr.compression_runtime.transport_failed = True
+                    local_drained = False
+                drained = drained and local_drained
+            if not drained and (now < deadline or compressed):
+                if compressed and now >= deadline:
+                    logger.error(
+                        "Quarantining compression buffers for room=%s: remote drain unconfirmed",
+                        room,
+                    )
+                    self.compression_quarantine_reason = f"KV compression drain unconfirmed for room={room}; restart worker"
+                    kv_mgr.compression_runtime.transport_failed = True
+                    deadline = float("inf")
                 still_held.append(
                     (decode_req, start_time, deadline, idx, required_acks)
                 )
@@ -3008,7 +3093,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             try:
                 self._do_release(decode_req, idx)
             except Exception:
-                # Isolate a failed release so the rest still run; entry already dropped.
+                if (
+                    getattr(decode_req.kv_receiver.kv_mgr, "compression_mode", "off")
+                    != "off"
+                ):
+                    self.compression_quarantine_reason = (
+                        f"Deferred KV release failed for room={room}; restart worker"
+                    )
+                    decode_req.kv_receiver.kv_mgr.compression_runtime.transport_failed = True
+                    # Never retry a potentially partial release or drop its owners.
+                    if not hasattr(self, "_quarantined_releases"):
+                        self._quarantined_releases = []
+                    self._quarantined_releases.append((decode_req, idx))
                 logger.exception(f"Deferred KV release failed for room {room}")
                 outcome = "error"
             self._observe_deferred_kv_release(
@@ -3038,7 +3134,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
-            if not self._engine_paused:
+            if not self._engine_paused and self.compression_failure_reason() is None:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
@@ -3085,7 +3181,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
-            if not self._engine_paused:
+            if not self._engine_paused and self.compression_failure_reason() is None:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
@@ -3182,6 +3278,10 @@ class SchedulerDisaggregationDecodeMixin:
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
+        if failure := self.compression_failure_reason():
+            self._reject_quarantined_waiting(failure)
+            self.maybe_send_health_check_signal()
+            return None
         batch = self._get_new_prebuilt_batch(running_batch)
         if batch is None:
             return None
@@ -3327,15 +3427,43 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
+        self.disagg_decode_transfer_queue.resolve_deferred_releases()
+        if failure := self.compression_failure_reason():
+            # Preallocation, receive and retraction queues retain ownership.
+            # An uncertain worker cannot allocate or admit more requests.
+            self._reject_quarantined_waiting(failure)
+            prealloc = self.disagg_decode_prealloc_queue
+            entries = (
+                list(prealloc.queue)
+                + list(prealloc.pending_reqs)
+                + list(prealloc.retracted_queue)
+                + list(self.disagg_decode_transfer_queue.queue)
+            )
+            for entry in entries:
+                req = getattr(entry, "req", entry)
+                if getattr(req, "_compression_failure_reported", False):
+                    continue
+                req._compression_failure_reported = True
+                if hasattr(entry, "_staging_failed"):
+                    entry._staging_failed = True
+                receiver = getattr(entry, "kv_receiver", None)
+                if receiver is not None:
+                    try:
+                        receiver.abort()
+                    except Exception:
+                        logger.exception(
+                            "Failed to notify peer while quarantining request"
+                        )
+                prepare_abort(req, failure, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+                if not getattr(req, "finished_output", False):
+                    self.output_streamer.stream_output([req], req.return_logprob)
+            self.maybe_send_health_check_signal()
+            return
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
-
-        # Resolve held releases every iteration (before the retraction/polling
-        # gates below) so their timeouts fire under memory pressure.
-        self.disagg_decode_transfer_queue.resolve_deferred_releases()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()

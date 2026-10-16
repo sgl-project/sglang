@@ -1,0 +1,11 @@
+{
+  "source_manifest_sha256": "REPLACE_WITH_DELIVERED_MANIFEST_SHA256",
+  "image_digest": "sha256:REPLACE_WITH_NEW_IMAGE_DIGEST",
+  "model": "Qwen/Qwen3-8B",
+  "model_revision": "REPLACE_WITH_MODEL_REVISION_OR_FILES_MANIFEST_HASH",
+  "dtype": "bfloat16",
+  "kv_cache_dtype": "auto",
+  "topology": {"prefill": 1, "decode": 1, "tp": 1, "pp": 1, "cp": 1, "dcp": 1},
+  "page_size": 1,
+  "chunk_tokens": 1024
+}

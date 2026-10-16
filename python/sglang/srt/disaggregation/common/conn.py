@@ -121,6 +121,7 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    pd_kv_compression: str = "off"
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -160,6 +161,12 @@ class AckTarget(NamedTuple):
     ip: str
     port: int
     generation: int
+
+
+class CompressedAckTarget(NamedTuple):
+    ip: str
+    port: int
+    nonce: str
 
 
 class AbortNotification(msgspec.Struct, frozen=True):
@@ -374,8 +381,13 @@ class CommonKVManager(BaseKVManager):
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+        self._deferred_abort_lock = threading.Lock()
+        self._deferred_abort_identity = {}
+        self.compression_incompatible_peers = {}
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
-        self._deferred_ack_targets: Dict[int, Dict[Tuple[str, int], AckTarget]] = {}
+        self._deferred_ack_targets: Dict[
+            int, Dict[Tuple[str, int], Union[AckTarget, CompressedAckTarget]]
+        ] = {}
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
         self._deferred_ack_poisoned_rooms: Set[int] = set()
@@ -438,7 +450,9 @@ class CommonKVManager(BaseKVManager):
             # Deferred KV release: room -> current generation and ranks that
             # ACKed. The generation rejects an old request's late ACK after room
             # reuse.
-            self._deferred_abort_ack_tracker: Dict[int, DeferredAbortAckState] = {}
+            self._deferred_abort_ack_tracker: Dict[
+                int, Union[DeferredAbortAckState, Set[int]]
+            ] = {}
             self._deferred_abort_generation = 0
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
@@ -852,8 +866,20 @@ class CommonKVManager(BaseKVManager):
             prefill_rank,
         )
 
-    def register_deferred_abort_room(self, bootstrap_room: int) -> int:
-        """Arm a new generation for a held room and return its wire id."""
+    def register_deferred_abort_room(
+        self, bootstrap_room: int, nonce: str = "", expected_ranks=None
+    ) -> int:
+        """Arm a native generation or preserve a compressed request nonce."""
+        if nonce:
+            identity = (nonce, frozenset(expected_ranks or ()))
+            with self._deferred_abort_lock:
+                prior = self._deferred_abort_identity.get(bootstrap_room)
+                if prior is not None and prior != identity:
+                    raise RuntimeError("Cannot reuse a room with an outstanding drain")
+                self._deferred_abort_identity[bootstrap_room] = identity
+                self._deferred_abort_ack_tracker.setdefault(bootstrap_room, set())
+            # Compressed v2 peers use the request nonce, not native generations.
+            return 0
         self._deferred_abort_generation += 1
         generation = self._deferred_abort_generation
         self._deferred_abort_ack_tracker[bootstrap_room] = DeferredAbortAckState(
@@ -863,9 +889,18 @@ class CommonKVManager(BaseKVManager):
         return generation
 
     def note_abort_ack(
-        self, bootstrap_room: int, prefill_rank: int, generation: int
+        self, bootstrap_room: int, prefill_rank: int, generation: Union[int, str]
     ) -> None:
-        """Record an ACK only for the generation currently holding the room."""
+        """Record an ACK only for the identity currently holding the room."""
+        if isinstance(generation, str):
+            with self._deferred_abort_lock:
+                identity = self._deferred_abort_identity.get(bootstrap_room)
+                if identity is None or identity[0] != generation:
+                    return
+                if prefill_rank not in identity[1]:
+                    return
+                self._deferred_abort_ack_tracker[bootstrap_room].add(prefill_rank)
+            return
         state = self._deferred_abort_ack_tracker.get(bootstrap_room)
         if state is not None and state.generation == generation:
             state.prefill_ranks.add(prefill_rank)
@@ -875,6 +910,14 @@ class CommonKVManager(BaseKVManager):
         if not msg or msg[0] != ABORT_ACK_TAG:
             return False
         if not self.enable_deferred_decode_kv_release:
+            return True
+        if getattr(self, "compression_mode", "off") != "off":
+            if len(msg) != 4:
+                return True
+            try:
+                self.note_abort_ack(int(msg[1]), int(msg[2]), msg[3].decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                logger.warning("Malformed compressed ABORT_ACK received")
             return True
         ack = AbortAck.from_zmq(msg)
         if ack is None:
@@ -890,12 +933,24 @@ class CommonKVManager(BaseKVManager):
 
     def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
         """True once every prefill rank that could still write these pages has acked."""
+        if getattr(self, "compression_mode", "off") != "off":
+            with self._deferred_abort_lock:
+                identity = self._deferred_abort_identity.get(bootstrap_room)
+                acks = self._deferred_abort_ack_tracker.get(bootstrap_room, set())
+                if identity is None:
+                    return required_acks == 0
+                return len(identity[1]) == required_acks and identity[1] <= acks
         state = self._deferred_abort_ack_tracker.get(bootstrap_room)
         acks = state.prefill_ranks if state is not None else ()
         return len(acks) >= required_acks
 
     def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
-        self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
+        if getattr(self, "compression_mode", "off") == "off":
+            self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
+            return
+        with self._deferred_abort_lock:
+            self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
+            self._deferred_abort_identity.pop(bootstrap_room, None)
 
     def _prefill_unique_rank(self) -> int:
         """Stable per-sender id, matching what the transfer worker syncs on Success."""
@@ -905,13 +960,28 @@ class CommonKVManager(BaseKVManager):
             + self.attn_cp_rank
         )
 
-    def _send_abort_ack(self, room: int, target: AckTarget) -> None:
+    def _send_abort_ack(
+        self, room: int, target: Union[AckTarget, CompressedAckTarget]
+    ) -> None:
         """Best-effort ack that this rank's transfer for an aborted room drained."""
+        if room in getattr(self, "compression_uncertain_rooms", set()):
+            return  # A failed synchronous RDMA call is not proof of quiescence.
         try:
             na = NetworkAddress(target.ip, target.port)
+            if isinstance(target, CompressedAckTarget):
+                frames = [
+                    ABORT_ACK_TAG,
+                    str(room).encode("ascii"),
+                    str(self._prefill_unique_rank()).encode("ascii"),
+                    target.nonce.encode("ascii"),
+                ]
+            else:
+                frames = AbortAck(
+                    room, self._prefill_unique_rank(), target.generation
+                ).to_zmq()
             self._send_multipart_locked(
                 na.to_tcp(),
-                AbortAck(room, self._prefill_unique_rank(), target.generation).to_zmq(),
+                frames,
                 is_ipv6=na.is_ipv6,
             )
         except Exception as e:
@@ -920,6 +990,10 @@ class CommonKVManager(BaseKVManager):
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
+        if getattr(
+            self, "compression_mode", "off"
+        ) != "off" and self.compression_tasks.pending(room):
+            return
         if self._staging_outstanding.get(room, 0) > 0:
             return
         if room in self._deferred_ack_poisoned_rooms:
@@ -929,14 +1003,18 @@ class CommonKVManager(BaseKVManager):
         self._send_abort_acks(room, self._deferred_ack_targets.pop(room, None))
 
     def _send_abort_acks(
-        self, room: int, targets: Optional[Dict[Tuple[str, int], AckTarget]]
+        self,
+        room: int,
+        targets: Optional[Dict[Tuple[str, int], Union[AckTarget, CompressedAckTarget]]],
     ) -> None:
         # With prefill TP < decode TP several decode ranks share one room and
         # each sends its own ABORT; fan the ACK out to every one of them.
         for target in (targets or {}).values():
             self._send_abort_ack(room, target)
 
-    def register_deferred_ack_target(self, room: int, target: AckTarget) -> None:
+    def register_deferred_ack_target(
+        self, room: int, target: Union[AckTarget, CompressedAckTarget]
+    ) -> None:
         """Hold this generation's ACK until the room's transfer drains.
 
         Targets are kept per decode endpoint, so each decode rank that aborted
@@ -1192,6 +1270,15 @@ class CommonKVManager(BaseKVManager):
             logger.error(f"Error fetching prefill server info from bootstrap: {e}")
             return False
 
+        from sglang.srt.disaggregation.compression.protocol import (
+            capability,
+            check_peer,
+        )
+
+        check_peer(
+            capability(envs.SGLANG_PD_KV_COMPRESSION.get()), info.pd_kv_compression
+        )
+
         # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
@@ -1437,6 +1524,12 @@ class CommonKVManager(BaseKVManager):
             "prefill_http_port": get_serving().port,
         }
 
+        if envs.SGLANG_PD_KV_COMPRESSION.get() != "off":
+            from sglang.srt.disaggregation.compression.protocol import capability
+
+            payload["pd_kv_compression"] = capability(
+                envs.SGLANG_PD_KV_COMPRESSION.get()
+            )
         payload["decode_allocation_policy"] = (
             get_disagg().disaggregation_decode_allocation_policy
         )
@@ -2258,7 +2351,9 @@ class CommonKVReceiver(BaseKVReceiver):
         )
 
         if self.kv_mgr.enable_staging:
-            self.require_staging = (
+            self.require_staging = getattr(
+                self.kv_mgr, "compression_mode", "off"
+            ) != "off" or (
                 self.prefill_info.attn_tp_size != 0
                 and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
             )
@@ -2347,6 +2442,16 @@ class CommonKVReceiver(BaseKVReceiver):
                             logger.debug(
                                 f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"
                             )
+                            if getattr(self.kv_mgr, "compression_mode", "off") != "off":
+                                bootstrap_info["prefill_rank"] = (
+                                    target_tp_rank
+                                    * (
+                                        self.prefill_info.pp_size
+                                        * self.prefill_info.attn_cp_size
+                                    )
+                                    + target_pp_rank * self.prefill_info.attn_cp_size
+                                    + target_cp_rank
+                                )
                             bootstrap_infos.append(bootstrap_info)
                         else:
                             self.kv_mgr.record_failure(
@@ -2563,6 +2668,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
             self.bootstrap_room
         )
+        # The owning queue clears drain ACKs after safe release. Error reporting
+        # and receiver retirement must preserve ACKs that arrived earlier.
         if self.kv_mgr.defer_decode_allocation:
             self._owns_bootstrap_room = False
 
@@ -2591,6 +2698,18 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort_notified = True
 
     def _send_abort_notification(self, *, force_arm: bool = False):
+        nonce = (
+            getattr(self, "compression_nonce", "")
+            if getattr(self.kv_mgr, "compression_mode", "off") != "off"
+            else ""
+        )
+        if nonce:
+            if self.kv_mgr.enable_deferred_decode_kv_release:
+                self.kv_mgr.register_deferred_abort_room(
+                    self.bootstrap_room,
+                    nonce,
+                    {info["prefill_rank"] for info in self.bootstrap_infos},
+                )
         # Both abort() and the waiting timeout reach here. Once metadata is
         # published (init_time set) prefill may be writing, so arm the ACK
         # tracker before the ABORT goes out and an immediate ACK can land.
@@ -2599,8 +2718,10 @@ class CommonKVReceiver(BaseKVReceiver):
         # unarmed -- except on a partial publish, where init_time is still None
         # but earlier ranks already hold destinations; those callers defer and
         # pass force_arm.
-        if self.kv_mgr.enable_deferred_decode_kv_release and (
-            force_arm or self.init_time is not None
+        if (
+            not nonce
+            and self.kv_mgr.enable_deferred_decode_kv_release
+            and (force_arm or self.init_time is not None)
         ):
             self._abort_generation = self.kv_mgr.register_deferred_abort_room(
                 self.bootstrap_room
@@ -2611,12 +2732,22 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
                     sock.send_multipart(
-                        AbortNotification(
-                            room=self.bootstrap_room,
-                            decode_ip=self.kv_mgr.local_ip,
-                            decode_port=self.kv_mgr.rank_port,
-                            generation=self._abort_generation,
-                        ).to_zmq()
+                        (
+                            [
+                                ABORT_TAG,
+                                str(self.bootstrap_room).encode("ascii"),
+                                self.kv_mgr.local_ip.encode("ascii"),
+                                str(self.kv_mgr.rank_port).encode("ascii"),
+                                nonce.encode("ascii"),
+                            ]
+                            if nonce
+                            else AbortNotification(
+                                room=self.bootstrap_room,
+                                decode_ip=self.kv_mgr.local_ip,
+                                decode_port=self.kv_mgr.rank_port,
+                                generation=self._abort_generation,
+                            ).to_zmq()
+                        )
                     )
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
@@ -2649,6 +2780,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.pd_kv_compression = "off"
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -2717,6 +2849,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        self.pd_kv_compression = data.get("pd_kv_compression", "off")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
@@ -2830,9 +2963,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                pd_kv_compression=getattr(self, "pd_kv_compression", "off"),
                 decode_allocation_policy=self.decode_allocation_policy,
             )
             payload = dataclasses.asdict(info)
+            if info.pd_kv_compression == "off":
+                payload.pop("pd_kv_compression")  # Keep disabled wire format unchanged.
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
             return web.json_response(payload, status=200)

@@ -157,6 +157,12 @@ class FullComponent(TreeComponent):
             new_parent.component_data[ct].metadata["host_uuid"] = host_uuid
         assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
+        if "compression_page_refs" in child_cd.metadata:
+            refs = child_cd.metadata["compression_page_refs"]
+            new_parent.component_data[ct].metadata["compression_page_refs"] = refs[
+                :split_len
+            ]
+            child_cd.metadata["compression_page_refs"] = refs[split_len:]
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
             child_cd.value = child_cd.value[split_len:].clone()
@@ -261,6 +267,16 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.tree_core.evictable_host_leaves:
                 continue
+            state = getattr(getattr(self, "cache", None), "async_l2", None)
+            if state is not None:
+                cd = x.component_data[ct]
+                state.pool.trace_node(
+                    "evict_select",
+                    x.id,
+                    handles=cd.host_value,
+                    refs=cd.metadata.get("compression_page_refs", ()),
+                    requested_pages=num_tokens,
+                )
             self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
             if (
                 x.parent is not None
@@ -284,6 +300,10 @@ class FullComponent(TreeComponent):
             cd = node.component_data[ct]
             # write_back mode: the anchor may be device-only (no host_value); pin it anyway.
             if cd.host_value is None and not self.tree_core.is_write_back:
+                result.skipped_lock_components = (
+                    *result.skipped_lock_components,
+                    ct,
+                )
                 return result
             if cd.metadata.get("host_uuid") is None:
                 cd.metadata["host_uuid"] = next_component_uuid(ct)
@@ -335,7 +355,11 @@ class FullComponent(TreeComponent):
             assert boundary_uuid is not None, "Full host lock receipt has no boundary"
             while True:
                 cd = node.component_data[ct]
-                if cd.host_value is None and not self.tree_core.is_write_back:
+                if (
+                    cd.host_value is None
+                    and not self.tree_core.is_write_back
+                    and getattr(self.tree_core, "on_full_kv_recomputed", None) is None
+                ):
                     return
                 assert cd.host_lock_ref > 0, (
                     f"Full host segment release hit host_lock_ref=0 on node {node.id}"

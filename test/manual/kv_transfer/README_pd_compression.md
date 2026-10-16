@@ -1,0 +1,333 @@
+# Experimental LZ4/ANS KV transfer and compressed HiCache L2
+
+This opt-in prototype shares KV encoding between Mooncake P/D transfer and a
+compressed Prefill HiCache Host pool. Attention continues to use its existing
+KV tensors. HiCache owns prefix matching, backup, restoration, eviction and ACKs;
+P/D owns transfer ranges and remote completion. The shared compression executor
+owns representation conversion and bounded execution resources.
+
+The LZ4/ANS payload and chunk descriptor use v2, with nvCOMP `5.3.0.16`.
+The capability includes the registration layout and VERIFY policy; incompatible
+experimental peers are rejected during bootstrap. Update both workers together.
+With compression disabled, the original transfer path is used.
+
+## Supported configuration
+
+The initial scope is Qwen3-8B, BF16, FlashInfer, 1P1D, TP/PP/DP/CP/DCP=1,
+page size 1 and prefill chunk size 1024. The reference settings use 640 MiB
+compression workspace, 8 GB Prefill L2 and no Decode L2. Compressed L2 requires
+write-through and the Python UnifiedRadixCache. Overlap scheduling, CUDA graphs,
+HiSparse, speculative decoding, LoRA, sessions, external cache linkers and L3
+are outside this prototype's supported scope. Runtime P/D role switching is
+not supported with the required staging buffers.
+
+A compression object contains one token's K/V across all layers. The 4 KiB
+Host storage block size does not change KV pages or the attention layout.
+Ordinary mode retains raw fallback; FORCE is a verification mode that permits
+LZ4/ANS expansion and requires VERIFY=1. This is not a reproduction of KVServe's
+algorithms or controller.
+
+## Data flow and ownership
+
+```text
+Prefill GPU KV ---- shared encoder ---- P/D wire buffer ---- RDMA ---- Decode restore
+                          |                    ^
+                          v                    | read lease; release after copy
+                 HiCache fixed-block pool ----+
+                          |
+                          +---- restore + verify ---- HiCache admission ticket
+```
+
+The Host pool uses logical handles with generations and non-contiguous 4 KiB
+block chains. `alloc(n)` atomically reserves handles and output-upper-bound
+blocks before HiCache submits a backup. For example, a 197632-byte bound needs
+49 blocks; an actual 148224-byte payload needs 37. `prepare_write()` freezes the
+write mapping and returns the unused blocks for reuse. Allocation does not
+require a contiguous extent or move existing objects.
+
+```text
+FREE -> RESERVED -> WRITING -> READY -> RETIRED -> FREE
+```
+
+HiCache selects eviction victims in logical-page units. `available_size()`
+reports pages that can actually be reserved. Logical eviction removes the
+reuse index, but blocks remain allocated until outstanding leases drain.
+Uncertain drain failures retain resources and quarantine the affected path.
+
+Each write window contains at most 64 objects. The executor copies encoded GPU
+bytes into bounded pinned Host staging, confirms D2H completion, scatters them
+into blocks and publishes the objects. HiCache acknowledges the complete node
+only after all required objects succeed. A restore ticket becomes admissible
+only after decompression, GPU writeback and required byte verification finish.
+
+Two pinned Host staging channels separate writes from reads. Restore and P/D
+share the read channel. `acquire()` takes a read lease without copying data;
+`materialize_pages()` gathers at most 64 objects in an execution thread.
+P/D copies them into an independent wire buffer. Host leases protect that copy;
+the wire buffer remains live until RDMA finishes. The scheduler does not wait
+on a Future, staging channel or GPU event. With no GPU batch, pending compressed
+L2 work receives a 1 ms scheduling yield; ordinary upstream storage/P/D yields
+remain unchanged.
+
+## Budget and diagnostics
+
+The 8 GB budget includes the data arena, fixed object/block metadata, hashes,
+indexes, two pinned staging channels and bounded scratch. Python objects,
+temporary indexing allocations, logging and other serving allocations are
+outside this pool budget; it is not a process RSS limit. GPU workspace and
+Decode receive staging are also separate budgets.
+
+`KV_COMPRESSION_STATS.l2` exposes free/reserved/live/retired blocks, actual
+encoded bytes, internal padding, staging use, readers, writers and quarantined
+objects. Allocation, lock wait, maximum lock hold, gather/scatter and staging
+wait are recorded separately. Timers overlap and must not be summed as request
+latency. `SGLANG_KV_COMPRESSION_TRACE_STORE=1` adds node, handle, generation and
+page-identity logs; shared cache operations do not invent request ownership.
+
+## Image and online validation
+
+The HTTP P/D router must also propagate an early Decode rejection and cancel
+the paired Prefill request. After changing `sgl-model-gateway` Rust sources,
+rebuild and install the Router wheel; a Python source overlay does not update
+the loaded `sglang_router_rs` library. Record the wheel hash, loaded native
+library hash and source commit separately from the worker source manifest.
+Verify actual Prefill bootstrap cleanup after cancellation in the online test;
+local HTTP connection closure alone does not prove scheduler cleanup.
+
+Build the complete updated checkout with the existing dependencies. Generate a
+new source-hash manifest for that checkout. On each GPU worker, run:
+
+```bash
+python test/manual/kv_transfer/check_pd_compression_image.py --manifest /path/to/new-manifest.json
+python -m pytest -q test/manual/kv_transfer/test_pd_compression_gpu.py --junitxml=/tmp/gpu.xml
+python test/manual/kv_transfer/check_pd_compression_image.py --manifest /path/to/new-manifest.json --gpu-report /tmp/gpu.xml
+```
+
+Compare collected test node IDs with the new manifest; failures, missing cases
+and skips do not count as GPU acceptance. The GPU tests cover nvCOMP, block
+storage, actual-byte restoration and write-failure drain, not cross-node RDMA.
+
+The launcher accepts `MODEL_PATH`, `IB_DEVICE`, `ROLE` and GPU binding settings.
+Inspect its command with:
+
+```bash
+DRY_RUN=1 bash test/manual/kv_transfer/launch_pd_compression.sh
+```
+
+| Group | COMPRESSION_MODE | Prefill ENABLE_HICACHE | HICACHE_COMPRESSION | FORCE |
+|---|---|---:|---|---:|
+| native | off | 1 | off | 0 |
+| passthrough | passthrough | 1 | passthrough | 0 |
+| force-l2 | lz4 | 1 | lz4 | 1 |
+| off | off | 0 | off | 0 |
+| force | lz4 | 0 | off | 1 |
+| lz4 | lz4 | 1 | lz4 | 0 |
+| ans-transfer | ans | 0 | off | 0 |
+| force-ans | ans | 0 | off | 1 |
+| ans-l2 | ans | 1 | ans | 0 |
+| force-ans-l2 | ans | 1 | ans | 1 |
+
+Decode uses ENABLE_HICACHE=0 and HICACHE_COMPRESSION=off. Its P/D mode, FORCE
+and VERIFY must match Prefill. Re-establish native/off baselines with the new
+image. Run `native -> passthrough -> force-l2 -> off -> force -> lz4`, then `ans-transfer -> force-ans -> ans-l2 -> force-ans-l2`, then fault
+validation. Use fresh workers for each group, with no resets within a group.
+
+The launcher's exact variable names are `SGLANG_PD_KV_COMPRESSION_FORCE` and
+`SGLANG_PD_KV_COMPRESSION_VERIFY`. `FORCE` and `VERIFY` above are table labels,
+not environment variable names.
+
+```bash
+python test/manual/kv_transfer/validate_pd_compression.py run \
+  --workload workload.json --output results/force-l2 --phase force-l2 \
+  --router "$ROUTER" --execution-contract execution-contract.json \
+  --prefill-log-command "$PREFILL_LOG_COMMAND" \
+  --decode-log-command "$DECODE_LOG_COMMAND"
+python test/manual/kv_transfer/validate_pd_compression.py audit results/force-l2
+python test/manual/kv_transfer/validate_pd_compression.py compare results/native results/force-l2
+```
+
+The frozen acceptance workload requires 38 requests per cached group and 14
+per uncached group, complete same-path output-token equality, four concurrent
+requests and three cycles restoring/verifying/adopting 8191 Host pages. Each
+cycle must drain naturally within 180 seconds with three consecutive fresh
+zero-work snapshots, without request-time health failures or Router 503s.
+Missing/null cache-source details fail the Host-hit requirement.
+
+Forced LZ4/ANS must have per-object evidence of encoding, transfer, L2 publication,
+old-object reuse and restore after GPU eviction. Save image/source hashes,
+configuration, workload fingerprints, raw responses, diagnostics and metrics.
+Stop on a failed gate. Old-image results cannot substitute for this run.
+
+## Fault validation
+
+Faults belong in the test harness, not in worker environment variables. The
+manual GPU tests patch copy/write methods or alter actual KV bytes to exercise
+failure paths. Preserve the original source digest when corrupting data, and
+verify that the intended operation failed rather than skipping it.
+
+Online acceptance must cover cancellation, bad descriptors/checksums, partial
+writes, restoration failure and in-flight RDMA disconnects. Failed targets must
+not be published. Confirmed drain permits reclamation and a subsequent request;
+uncertain drain retains resources and marks the worker unavailable. Local/GPU
+injection does not replace actual transport-failure testing.
+
+When validating a fault-lifecycle fix, first rerun its targeted online failure
+before starting the normal matrix. For compressed receivers, `failure_exception()`
+reports the error without clearing the room or its drain ACKs. The transfer
+queue clears it only after local restoration and remote writes have drained;
+failed preallocation requests still clear immediately before destinations are
+published. Exercise both ACK-before-error-return and ACK-after-error-return
+through the concrete receiver, inherited failure method and transfer queue.
+After confirmed drain, require a successful next request without restarting.
+If drain remains uncertain, preserve resources and quarantine; restarting that
+worker is test cleanup, not evidence of successful drain. A missing client
+terminal response after quarantine remains a separate online acceptance failure.
+
+## Admission and resource ownership
+
+A completed compressed restore already owns destination GPU pages. HiCache now
+exposes only the matching request's ready, generation-checked reservation to
+PrefillAdder. Its initial budget check subtracts those pages once; global free
+capacity and other requests receive no credit. Admission still checks the new
+tail and output reservation. Stale or cancelled tickets are reconciled without
+publishing their target pages.
+
+`decode_pages()` now returns a `DecodedPages` owner. Borrow `owner.raw` and
+`owner.to_staging_order()` only while open, discard borrowed views, then call
+`owner.close(consumer_stream)` after writeback and verification. The reservation
+covers output, a possible layout copy, Host-input upload and declared consumer
+scratch until GPU work drains. An impossible reservation fails before allocation;
+external restore threads may wait for temporary pressure without holding the
+executor lock. The sole executor thread must never wait for its own workspace.
+Cancellation interrupts receive-side reservation waits. Uncertain drain retains
+both allocations and charges. Backend-private nvCOMP allocations, registered
+wire buffers, receive rings and model KV are separate; this is not a total CUDA
+memory cap. Record process/device peaks separately in image testing.
+
+Compression quarantine now blocks incoming requests, Prefill admission and
+Decode preallocation/prebuilt admission. It retains uncertain resources and
+sends an explicit unhealthy signal to the tokenizer. `/ready`, `/health` and `/health_generate` remain unavailable until
+worker replacement; successful old responses do not clear quarantine. GPU byte
+corruption that drains safely remains a request failure and can be followed by
+a healthy request. These are different fault classes.
+
+Before `run`, create `execution-contract.json` from the actual deployment. It
+must contain source_manifest_sha256, image_digest, model, model_revision, dtype,
+kv_cache_dtype, topology, page_size and chunk_tokens. Use the same contract for
+all six groups of the same image; group switches are captured by phase and
+startup diagnostics. Retain the actual expanded launcher configuration beside
+it. A template is provided in
+`execution_contract.example.json`; replace every placeholder before running.
+Comparisons reject self-comparison, incompatible phase pairs and contract or
+sampling differences. Historical evidence without a contract may be audited,
+but does not certify a new deployment.
+
+The frozen 8192-token L2 replay now requires exactly 8191 Host-adopted and verified
+pages and device=0, host=8191, storage=0 in the response. Missing/null source
+details, partial restore, duplicate restore events, changed output tokens or
+missing requests fail. Natural drain requires three independently observed
+snapshots within 180 seconds; a single record declaring consecutive=3 is invalid.
+New runs retain snapshot identities and reject stale duplicates.
+
+The GPU test inventory includes decoded-owner lifetime at 1/64/65/1024 full
+Qwen3-8B-shaped pages, too-small budgets, and actual payload/target corruption.
+Use the manifest's collected node IDs, never an old hard-coded case count.
+Local CPU success and GPU collection/skips are not GPU or RDMA acceptance.
+
+
+## ANS backend and algorithm probe
+
+ANS uses nvCOMP 5.3.0.16, NVCOMP_NATIVE, 65536-byte internal chunks and
+`data_type="|u1"`. BF16 values are treated as opaque bytes, never converted to
+FP16. Each logical token page includes all K/V layers; the Host pool's 4 KiB
+blocks do not change algorithm input granularity. No byte shuffle is enabled.
+Existing LZ4 capabilities are unchanged. ANS peers negotiate a distinct format
+and reject LZ4, force or VERIFY mismatches before accepting data. This is the
+nvCOMP ANS format, not an SSD-LLaMA rANS implementation.
+
+For a bounded, model-derived KV probe on an isolated GPU (not a serving Pod):
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU" python test/manual/kv_transfer/probe_ans_kv.py \
+  --model "$MODEL_PATH" --prompt-file "$PROMPT_FILE" --tokens 1024 \
+  --output results/ans-probe.json
+```
+
+The local prompt must contain at least the requested number of tokens. This
+loads Qwen3-8B using Transformers SDPA, measures the same captured BF16 KV with
+LZ4 and ANS, verifies every decoded byte, warms each batch, and saves three
+repetitions of sizes and timings. It does not save KV or prompt text. It is not
+SGLang attention or end-to-end performance evidence. Do not install new model
+or nvCOMP versions to make the probe pass silently.
+
+For the full path, set `COMPRESSION_MODE=ans`, and on Prefill set
+`ENABLE_HICACHE=1 HICACHE_COMPRESSION=ans`. Use
+`SGLANG_PD_KV_COMPRESSION_FORCE=1 SGLANG_PD_KV_COMPRESSION_VERIFY=1` for the
+forced diagnostic group; Decode keeps L2 off. Both workers use the same mode.
+The launcher preserves the fixed budgets; unsupported upper bounds fail
+admission rather than growing memory automatically.
+
+Run the existing validator with the four new phase names. Compare
+`ans-transfer` and `force-ans` against `off`; compare `ans-l2` and
+`force-ans-l2` against `native`. Original six groups remain required regressions.
+The two non-cache groups have 14 requests each, and the two cache groups have
+38 each (284 requests including the original 180). Stronger compression must
+not weaken 8191-page restore, identity, digest, drain or output assertions.
+Normal ANS may legitimately fall back to raw; forced groups must prove ANS at
+send, receive, publication and restore. Zero raw fallback is not a speed claim.
+
+Measure serving performance separately with evalscope after real Router smoke
+and warmup, with fixed sampling, cache state and three repeated runs. Record
+actual network bytes including descriptors, encoding/decoding, copies, queue
+waits, workspace and L2 occupancy. Cold encoding and cached-object reuse are
+separate experiments. Keep VERIFY settings matched. Show finalized commands
+and monitoring queries before a measured run; no performance result is implied
+by the algorithm probe or correctness validator.
+
+### Fault lifecycle revision (2026-10-10)
+
+Compression capability negotiation now includes `drain-v1`. Update both P/D
+workers together; older compression peers are rejected before transfer. The KV
+payload and registration layouts remain v2. Abort notifications and drain ACKs
+carry the receiver nonce, and ACKs are accepted only from expected prefill ranks.
+Local restore completion and remote drain are both required before release.
+
+Unconfirmed drain makes the worker unavailable and retains its resources. Pending
+requests receive an error; background drain polling continues. Quarantine remains
+sticky even if a late ACK permits safe cleanup. Restart the isolated workers after
+diagnosis. Capability mismatches return a request error and mark this experimental
+worker unavailable instead of escaping the scheduler loop. Reconfigure and restart
+a mismatched pair; this draft does not dynamically recover incompatible peers.
+
+Keep `SGLANG_KV_COMPRESSION_WORKSPACE_MB=640` for the validated Qwen3-8B
+1024-token configuration. This revision does not remove the 512 MiB capacity guard
+or change ANS batching/performance. Re-run GPU preflight, targeted abort/ACK and
+VERIFY mismatch faults, then the ten-group normal matrix on the new image. CPU
+method tests do not establish GPU/RDMA safety or Router retry behavior.
+
+
+## Upstream integration and validation boundary
+
+The latest integration merges upstream `c82e8bd5fe` and preserves the fixes from
+`8674c58d0a`. Priority matching and admission now use upstream's common
+`match_kv_cache()` helper with the same admissible prefix range. Compressed
+restore tickets return the adopted prefix length, matching the current HiCache
+interface; their reserved target pages are deducted from both admission and
+load-back demand.
+
+Native transfers retain upstream's generation-bearing abort messages and ACK
+fan-out. Compressed v2 transfers retain their nonce-bearing messages and strict
+expected-rank checks. Receiver error reporting does not clear drain ACKs; the
+owning release queue clears them only after safe release. Uncertain Prefill
+cancellation, including bootstrap failure handling, retains its owners and
+blocks further admission.
+
+Compression requires early Decode allocation and device receive destinations.
+Compressed L2 rejects virtual KV relocation; shared-layout, topology-converting
+and buffer-only combinations are outside this draft's supported scope.
+
+Local CPU/control-flow, Router and style checks are recorded separately from
+prior online results. GPU/nvCOMP, real RDMA and the complete online fault matrix
+have **not** been revalidated after this upstream integration. Build a new image
+from the updated PR head and repeat GPU preflight, LPM restoration, cancellation,
+normal-path and fault tests before claiming acceptance of this revision.

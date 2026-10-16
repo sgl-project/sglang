@@ -11,14 +11,18 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::{
+    pd_stream::{
+        read_error_body, DecodeReadAhead, RetryRequestIdentity, SseFrames, StreamFailure, Terminal,
+    },
+    pd_types::api_path,
+};
 use crate::{
     config::types::RetryConfig,
     core::{
@@ -83,7 +87,15 @@ struct PDRequestContext<'a> {
 /// and skips its own status-based `record_outcome` calls so a decode-only
 /// transport failure can't be misattributed to a healthy prefill.
 #[derive(Clone, Copy)]
-struct BreakerOutcomesRecorded;
+struct BreakerOutcomesRecorded {
+    prefill_error: bool,
+    decode_error: bool,
+}
+
+enum PrefillFailure {
+    Http(reqwest::Response),
+    Transport(reqwest::Error),
+}
 
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
@@ -387,9 +399,34 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
+        let shared_request = match serde_json::to_value(original_request) {
+            Ok(request) => Arc::new(request),
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        if shared_request.get("rid").is_some_and(|rid| {
+            rid.as_str() == Some("")
+                || rid
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some("")))
+        }) {
+            return error::bad_request("invalid_request_id", "rid must not be empty");
+        }
+        // Session history and Responses storage/cancel use the worker ID as a
+        // durable key. Without an alias registry, neither renaming that ID nor
+        // resubmitting it before cancellation completes is safe. Return the
+        // original attempt's verdict for these requests.
+        let persistent_identity = shared_request
+            .get("session_params")
+            .is_some_and(|v| !v.is_null())
+            || shared_request
+                .get("session_id")
+                .is_some_and(|v| !v.is_null())
+            || (route == "/v1/responses"
+                && shared_request
+                    .get("request_id")
+                    .is_some_and(|v| !v.is_null()));
+        let retry_ids_supported = shared_request.get("rid").is_none_or(Value::is_null)
+            || RetryRequestIdentity::can_replace(&shared_request);
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
@@ -419,13 +456,25 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+                        let mut json_request = shared_request.as_ref().clone();
                         // ResponsesRequest serializes an absent stream as null, which SRT rejects.
                         if context.route == "/v1/responses" {
                             json_request["stream"] = Value::Bool(context.is_stream);
+                        }
+
+                        // Closing HTTP cancels an attempt, but tokenizer state
+                        // can remain registered until the scheduler replies.
+                        // Keep the first submission unchanged, including real
+                        // client duplicate-ID validation. Stateless retries
+                        // receive a fresh paired P/D identity; restore their
+                        // public response ID in the response path.
+                        let retry_identity = if attempt > 0 {
+                            RetryRequestIdentity::replace(&mut json_request)
+                        } else {
+                            None
+                        };
+                        if let Some(identity) = &retry_identity {
+                            debug!(attempt, mappings = ?identity.mappings, "PD retry identity");
                         }
 
                         json_request = match Self::inject_bootstrap_into_value(
@@ -446,6 +495,7 @@ impl PDRouter {
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
                                 start_time,
+                                retry_identity,
                             )
                             .await;
 
@@ -472,23 +522,37 @@ impl PDRouter {
                         // Record worker errors for server errors (5xx)
                         if status.is_server_error() {
                             let error_type = error_type_from_status(status);
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_PREFILL,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_DECODE,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
+                            if response
+                                .extensions()
+                                .get::<BreakerOutcomesRecorded>()
+                                .is_none_or(|outcome| outcome.prefill_error)
+                            {
+                                Metrics::record_worker_error(
+                                    metrics_labels::WORKER_PREFILL,
+                                    metrics_labels::CONNECTION_HTTP,
+                                    error_type,
+                                );
+                            }
+                            if response
+                                .extensions()
+                                .get::<BreakerOutcomesRecorded>()
+                                .is_none_or(|outcome| outcome.decode_error)
+                            {
+                                Metrics::record_worker_error(
+                                    metrics_labels::WORKER_DECODE,
+                                    metrics_labels::CONNECTION_HTTP,
+                                    error_type,
+                                );
+                            }
                         }
 
                         response
                     }
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| {
+                !persistent_identity && retry_ids_supported && is_retryable_status(res.status())
+            },
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -531,7 +595,6 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -540,7 +603,7 @@ impl PDRouter {
             // Handle streaming error response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             response_headers.remove(CONTENT_LENGTH);
-            let error_payload = match res.bytes().await {
+            let error_payload = match read_error_body(res).await {
                 Ok(error_body) => match serde_json::from_slice::<Value>(&error_body) {
                     Ok(error_json) => {
                         json!({ "message": error_json, "status": status.as_u16() })
@@ -564,21 +627,20 @@ impl PDRouter {
                 }
             };
 
-            let sse_data = format!("data: {}\n\n", json!({ "error": error_payload }));
-            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
-
-            self.create_streaming_response(
-                error_stream,
-                status,
-                None,
-                context.return_logprob,
-                Some(response_headers),
-                prefill,
-                decode,
-            )
+            let done = if context.route == "/v1/responses" {
+                ""
+            } else {
+                "data: [DONE]\n\n"
+            };
+            let sse_data = format!("data: {}\n\n{done}", json!({ "error": error_payload }));
+            let mut response = Response::new(Body::from(sse_data));
+            *response.status_mut() = status;
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            *response.headers_mut() = response_headers;
+            response
         } else {
             // Handle non-streaming error response
-            match res.bytes().await {
+            match read_error_body(res).await {
                 Ok(error_body) => {
                     // Try to parse error message from body, fallback to status-based error
                     let error_message = if let Ok(error_json) =
@@ -618,7 +680,7 @@ impl PDRouter {
                         StatusCode::BAD_GATEWAY => {
                             error::bad_gateway("decode_bad_gateway", error_message)
                         }
-                        _ => error::internal_error("decode_error", error_message),
+                        _ => error::create_error(status_code, "decode_error", error_message),
                     }
                 }
                 Err(e) => {
@@ -641,7 +703,7 @@ impl PDRouter {
                         StatusCode::BAD_GATEWAY => {
                             error::bad_gateway("decode_read_failed", error_message)
                         }
-                        _ => error::internal_error("decode_read_failed", error_message),
+                        _ => error::create_error(status_code, "decode_read_failed", error_message),
                     }
                 }
             }
@@ -649,6 +711,7 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[allow(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -657,6 +720,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         _start_time: Instant,
+        retry_identity: Option<RetryRequestIdentity>,
     ) -> Response {
         // Count the request from dispatch so load-based policies see it before
         // upstream headers arrive; streaming responses attach their own guards.
@@ -707,74 +771,102 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
-        tokio::pin!(decode_fut);
-
-        // Poll both until prefill resolves; decode normally resolves later, but
-        // may resolve first if it rejects the request outright.
-        let prefill_result;
-        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
-        loop {
-            tokio::select! {
-                biased;
-                pr = &mut prefill_fut => {
-                    prefill_result = pr;
-                    break;
+        // Scope the futures so a failed side drops its pending peer before we
+        // read an error body or construct a downstream response. Dropping only a
+        // Pin<&mut Future> would leave the underlying request alive.
+        let mut read_ahead = DecodeReadAhead::default();
+        let mut stream_failure = None;
+        let (prefill_result, decode_result) = {
+            // A successful Prefill requires its whole response, not just 200
+            // headers. Body failure must cancel Decode while it is still waiting.
+            let prefill_fut = async {
+                let response = prefill_request
+                    .send()
+                    .await
+                    .map_err(PrefillFailure::Transport)?;
+                if !response.status().is_success() {
+                    return Err(PrefillFailure::Http(response));
                 }
-                dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                response.bytes().await.map_err(PrefillFailure::Transport)
+            };
+            let decode_fut = decode_request.send();
+            tokio::pin!(prefill_fut);
+            tokio::pin!(decode_fut);
+            let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    pr = &mut prefill_fut => {
+                        let failed = pr.is_err();
+                        if failed {
+                            break (Some(pr), None);
+                        }
+                        let dr = match decode_early {
+                            Some(dr) => dr,
+                            None => (&mut decode_fut).await,
+                        };
+                        break (Some(pr), Some(dr));
+                    }
+                    result = async {
+                        read_ahead.read(decode_early.as_mut().unwrap().as_mut().unwrap()).await
+                    }, if context.is_stream && decode_early.is_some() && !read_ahead.finished => {
+                        if let Err(error) = result {
+                            stream_failure = Some(error);
+                            break (None, None);
+                        }
+                    }
+                    dr = &mut decode_fut, if decode_early.is_none() => {
+                        let failed = match &dr {
+                            Ok(res) => !res.status().is_success(),
+                            Err(_) => true,
+                        };
+                        if failed {
+                            warn!(
+                                "Decode failed, aborting paired prefill request decode_url={} prefill_url={}",
+                                decode.url(), prefill.url()
+                            );
+                            break (None, Some(dr));
+                        }
+                        // A successful decode response can precede prefill's
+                        // response headers. Keep it for logprob merging and
+                        // prefill status validation; success does not cancel KV.
+                        decode_early = Some(dr);
+                    }
                 }
             }
-        }
-
-        // Decode can't generate without prefill's KV, so any prefill failure
-        // (non-2xx / transport error) dooms the paired decode request, which would
-        // otherwise block in WaitingForInput until the 300s disaggregation
-        // timeout. Drop the decode future to close its connection; the decode
-        // engine then detects the disconnect and aborts the request in ~4-8s.
-        let prefill_failed = match &prefill_result {
-            Ok(resp) => !resp.status().is_success(),
-            Err(_) => true,
         };
 
-        if prefill_failed {
+        if let Some(failure) = stream_failure {
+            // Both upstream connections have left scope before returning the
+            // terminal error. In particular, do not wait for Prefill bootstrap.
+            return self.decode_stream_failure(
+                failure,
+                context.route == "/v1/responses",
+                prefill,
+                decode,
+            );
+        }
+
+        if let Some(Err(failure)) = prefill_result {
             warn!(
                 "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
                 decode.url(),
                 prefill.url()
             );
-
-            // Tick prefill by its real status (4xx = client fault). Don't record
-            // decode: it was cancelled due to a prefill fault, not its own, so a
-            // prefill error storm can't trip healthy decode breakers.
-            let prefill_ok = match &prefill_result {
-                Ok(r) => r.status().is_client_error(),
-                Err(_) => false,
-            };
+            let prefill_ok = matches!(&failure,
+                PrefillFailure::Http(response) if response.status().is_client_error());
             prefill.record_outcome(prefill_ok);
-
-            // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
-            let mut response = match self
-                .process_prefill_response(prefill_result, prefill.url(), false)
-                .await
-            {
-                Err(error_response) => error_response,
-                Ok(_) => error::bad_gateway(
-                    "prefill_server_error",
-                    "Prefill reported failure but returned a success response".to_string(),
-                ),
-            };
-            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            let mut response = self.handle_prefill_failure(failure, prefill.url()).await;
+            response.extensions_mut().insert(BreakerOutcomesRecorded {
+                prefill_error: !prefill_ok,
+                decode_error: false,
+            });
             return response;
         }
 
-        // Prefill ok: take decode's result, awaiting it if still pending.
-        let decode_result = match decode_early {
-            Some(dr) => dr,
-            None => (&mut decode_fut).await,
-        };
+        // Either both returned, or decode failed and its pending peer was
+        // cancelled. A cancelled prefill has no outcome to attribute.
+        let decode_result = decode_result.expect("decode result unless prefill failed");
 
         events::RequestReceivedEvent {}.emit();
 
@@ -792,63 +884,27 @@ impl PDRouter {
                         status
                     );
 
-                    // Per-worker breaker attribution before the synthetic 5xx
-                    // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
-                    // status, not on the decode-driven failure. For
-                    // non-streaming the response carries no tracked stream
-                    // so record decode's outcome here too — but treat 4xx
-                    // as a client fault rather than a worker fault, matching
-                    // the legacy outer-dispatcher rule and the streaming
-                    // `BreakerTrackedStream` pre-mark in
-                    // `create_streaming_response`. For streaming
-                    // `handle_decode_error_response` wraps the synthetic
-                    // error SSE in a `BreakerTrackedStream` that ticks
-                    // decode on drop, so skip to avoid double-counting.
-                    // Mark the response so the outer dispatcher skips its
-                    // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
-                    prefill.record_outcome(prefill_ok);
-                    if !context.is_stream {
-                        let decode_ok = status.is_success() || status.is_client_error();
-                        decode.record_outcome(decode_ok);
+                    // Record only actual worker results. A pending prefill
+                    // cancelled by decode's rejection is neither a success nor
+                    // a failure. The known HTTP verdict is recorded before retry.
+                    if prefill_result.is_some() {
+                        prefill.record_outcome(true);
                     }
+                    decode.record_outcome(status.is_client_error());
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode)
                         .await;
-                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    response.extensions_mut().insert(BreakerOutcomesRecorded {
+                        prefill_error: false,
+                        decode_error: status.is_server_error(),
+                    });
                     return response;
                 }
 
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
+                let prefill_body = match prefill_result.expect("successful decode awaits prefill") {
+                    Ok(body) => context.return_logprob.then_some(body),
+                    Err(_) => unreachable!("Prefill failures returned above"),
                 };
 
                 if context.is_stream {
@@ -867,22 +923,26 @@ impl PDRouter {
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
                     self.create_streaming_response(
-                        res.bytes_stream(),
+                        futures_util::stream::once(async move { Ok(read_ahead.payload.freeze()) })
+                            .chain(res.bytes_stream()),
                         status,
                         prefill_logprobs,
                         context.return_logprob,
+                        context.route == "/v1/responses",
                         Some(response_headers),
                         prefill,
                         decode,
+                        retry_identity,
                     )
                 } else {
                     // Non-streaming response
-                    if context.return_logprob {
+                    let mut response = if context.return_logprob || retry_identity.is_some() {
                         self.process_non_streaming_response(
                             res,
                             status,
                             context.return_logprob,
                             prefill_body,
+                            retry_identity,
                         )
                         .await
                     } else {
@@ -905,7 +965,19 @@ impl PDRouter {
                                 )
                             }
                         }
+                    };
+                    // Prefill has fully succeeded. A Decode body/JSON failure
+                    // must not penalize that healthy peer in the outer retry
+                    // dispatcher, or remove it from subsequent selection.
+                    if response.status().is_server_error() {
+                        prefill.record_outcome(true);
+                        decode.record_outcome(false);
+                        response.extensions_mut().insert(BreakerOutcomesRecorded {
+                            prefill_error: false,
+                            decode_error: true,
+                        });
                     }
+                    response
                 }
             }
             Err(e) => {
@@ -914,32 +986,21 @@ impl PDRouter {
                     error = %e,
                     "Decode request failed"
                 );
-                // Decode failed at TCP/transport level. No tracked
-                // stream will ever wrap a response (streaming path) and
-                // we shortcut past the outer non-streaming
-                // `record_outcome` too — so record decode failure
-                // directly. Prefill ran concurrently in the
-                // `tokio::join!`: record its real per-worker outcome
-                // (success on a 2xx/4xx send, failure on transport
-                // error) so the decode-driven 502 doesn't penalise a
-                // healthy prefill. Mark the response so the outer
-                // dispatcher skips its status-derived `record_outcome`
-                // and we don't double-count.
+                // No tracked stream exists for a transport failure. Attribute
+                // decode once, and prefill only if it actually returned.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
-                prefill.record_outcome(prefill_ok);
+                if prefill_result.is_some() {
+                    prefill.record_outcome(true);
+                }
 
                 let mut response = error::bad_gateway(
                     "decode_server_error",
                     format!("Decode server error: {}", e),
                 );
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                response.extensions_mut().insert(BreakerOutcomesRecorded {
+                    prefill_error: false,
+                    decode_error: true,
+                });
                 response
             }
         }
@@ -1104,6 +1165,38 @@ impl PDRouter {
         Ok(available_workers[selected_idx].clone())
     }
 
+    fn record_decode_stream_error(status: StatusCode) {
+        Metrics::record_worker_error(
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::CONNECTION_HTTP,
+            error_type_from_status(status),
+        );
+    }
+
+    fn decode_stream_failure(
+        &self,
+        failure: StreamFailure,
+        responses_api: bool,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        warn!(decode_url = decode.url(), prefill_url = prefill.url(),
+            status = %failure.status, "Decode SSE failed, cancelling paired prefill");
+        if let Some(outcome) = failure.worker_outcome {
+            decode.record_outcome(outcome);
+        }
+        let mut response = Response::new(Body::from(failure.body(responses_api)));
+        *response.status_mut() = failure.status;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response.extensions_mut().insert(BreakerOutcomesRecorded {
+            prefill_error: false,
+            decode_error: failure.worker_outcome == Some(false),
+        });
+        response
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_streaming_response(
         &self,
@@ -1111,13 +1204,15 @@ impl PDRouter {
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
+        responses_api: bool,
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        retry_identity: Option<RetryRequestIdentity>,
     ) -> Response {
         use crate::core::AttachedBody;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
 
         // Uses select! to race stream.next() against tx.closed() so that
         // when the client disconnects the upstream HTTP connection is dropped
@@ -1126,14 +1221,11 @@ impl PDRouter {
         // disconnect, so a chunk already produced by reqwest reaches the
         // client (and the logprob merger) before we tear the loop down.
         //
-        // The upstream stream is wrapped in `BreakerTrackedStream` so the
-        // decode worker's circuit breaker is updated once on drop: success
-        // on clean completion (`[DONE]` sentinel or `None`), failure on
-        // stream error, neither on client disconnect. PD's pre-PR semantics
-        // treated 4xx (client error) as not-a-worker-fault, so we only
-        // pre-mark the wrapper as Errored on 5xx — `handle_decode_error_response`
-        // synthesizes a single-chunk SSE error envelope that would otherwise
-        // stream cleanly to None and record a spurious success.
+        // BreakerTrackedStream records one outcome when upstream is dropped.
+        // Successful model streams require DONE or a Responses terminal event;
+        // a bare EOF is a protocol failure. Client disconnects while active do
+        // not imply worker failure. Observed terminals close upstream before
+        // waiting for downstream queue capacity.
         let mut tracked =
             BreakerTrackedStream::new(stream, Arc::clone(&decode), decode.url().to_string());
         if !(status.is_success() || status.is_client_error()) {
@@ -1141,51 +1233,87 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
-            loop {
+            let mut frames = SseFrames::default();
+            'stream: loop {
                 tokio::select! {
                     biased;
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
-
-                                let result = if return_logprob && prefill_logprobs.is_some() {
-                                    Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                        .unwrap_or(chunk)
-                                } else {
-                                    chunk
+                                // HTTP error bodies are already shaped by the
+                                // caller. Preserve their established SSE format
+                                // and status-based breaker attribution.
+                                if !status.is_success() {
+                                    if tx.send(Ok(chunk)).await.is_err() { break; }
+                                    continue;
+                                }
+                                let events = match frames.push(&chunk) {
+                                    Ok(events) => events,
+                                    Err(error) => {
+                                        if error.worker_outcome == Some(false) {
+                                            tracked.mark_errored();
+                                            Self::record_decode_stream_error(error.status);
+                                        }
+                                        drop(tracked);
+                                        let _ = tx.send(Ok(error.body(responses_api))).await;
+                                        break;
+                                    }
                                 };
-
-                                // Mark the wrapper completed before the client
-                                // send: upstream finished cleanly regardless of
-                                // whether the client is still listening, and
-                                // the worker deserves the success tick either
-                                // way. `mark_completed` is a no-op once Errored
-                                // is set, so the synthetic-error path is unaffected.
-                                if is_done {
-                                    tracked.mark_completed();
+                                let terminal = events.last().and_then(|(_, terminal)| terminal.as_ref());
+                                let prepare = |frame: bytes::Bytes| {
+                                    let frame = if return_logprob && prefill_logprobs.is_some() {
+                                        Self::merge_streaming_logprobs(prefill_logprobs.clone(), &frame)
+                                            .unwrap_or(frame)
+                                    } else { frame };
+                                    retry_identity.as_ref().map_or_else(
+                                        || frame.clone(), |identity| identity.restore_frame(frame.clone()))
+                                };
+                                if let Some(terminal) = terminal {
+                                    let failed = matches!(terminal, Terminal::Failed(_));
+                                    if let Terminal::Failed(error) = terminal {
+                                        if error.worker_outcome == Some(false) {
+                                            tracked.mark_errored();
+                                            Self::record_decode_stream_error(error.status);
+                                        } else { tracked.mark_completed(); }
+                                    } else { tracked.mark_completed(); }
+                                    // The terminal is already known even if preceding
+                                    // frames fill the downstream queue. Close upstream
+                                    // before sending any buffered frame from this batch.
+                                    drop(tracked);
+                                    for (frame, _) in events {
+                                        if tx.send(Ok(prepare(frame))).await.is_err() { break 'stream; }
+                                    }
+                                    if failed && !responses_api {
+                                        let _ = tx.send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"))).await;
+                                    }
+                                    break 'stream;
                                 }
-
-                                if tx.send(Ok(result)).is_err() {
-                                    tracing::debug!(
-                                        "Receiver dropped (likely client disconnect), \
-                                        cancelling upstream PD stream"
-                                    );
-                                    break;
-                                }
-
-                                if is_done {
-                                    break;
+                                for (frame, _) in events {
+                                    if tx.send(Ok(prepare(frame))).await.is_err() { break 'stream; }
                                 }
                             }
                             Some(Err(e)) => {
                                 // BreakerTrackedStream already logged the error
                                 // and marked the terminal state as Errored so
                                 // the worker's circuit breaker will tick on drop.
-                                let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                Self::record_decode_stream_error(StatusCode::BAD_GATEWAY);
+                                let error = StreamFailure::protocol(format!("Decode stream read failed: {e}"));
+                                drop(tracked);
+                                let _ = tx.send(Ok(error.body(responses_api))).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                if status.is_success() {
+                                    tracked.mark_errored();
+                                    Self::record_decode_stream_error(StatusCode::BAD_GATEWAY);
+                                    let error = StreamFailure::protocol(if frames.has_incomplete_event() {
+                                        "Decode stream ended inside an SSE event"
+                                    } else { "Decode stream ended before a terminal event" });
+                                    drop(tracked);
+                                    let _ = tx.send(Ok(error.body(responses_api))).await;
+                                }
+                                break;
+                            },
                         }
                     }
                     _ = tx.closed() => {
@@ -1199,7 +1327,7 @@ impl PDRouter {
             }
         });
 
-        let stream = UnboundedReceiverStream::new(rx);
+        let stream = ReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
         let guards = vec![
@@ -1211,6 +1339,7 @@ impl PDRouter {
         *response.status_mut() = status;
 
         let mut response_headers = headers.unwrap_or_default();
+        response_headers.remove(CONTENT_LENGTH);
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
@@ -1224,7 +1353,9 @@ impl PDRouter {
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<bytes::Bytes>,
+        retry_identity: Option<RetryRequestIdentity>,
     ) -> Response {
+        let mut headers = header_utils::preserve_response_headers(res.headers());
         let response = res.bytes().await;
         let decode_body = match response {
             Ok(decode_body) => decode_body,
@@ -1234,129 +1365,67 @@ impl PDRouter {
             }
         };
 
-        if !return_logprob {
-            return (status, decode_body).into_response();
-        }
-
-        let Some(prefill_body) = prefill_body else {
-            return (status, decode_body).into_response();
-        };
-
-        // Merge logprobs from prefill and decode
-        let (Ok(prefill_json), Ok(mut decode_json)) = (
-            serde_json::from_slice::<Value>(&prefill_body),
-            serde_json::from_slice::<Value>(&decode_body),
-        ) else {
-            warn!("Failed to parse responses for logprob merging");
-            return (status, decode_body).into_response();
-        };
-
-        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
-
-        // Return merged response
-        match serde_json::to_vec(&decode_json) {
-            Ok(body) => (status, body).into_response(),
-            Err(e) => {
-                error!("Failed to serialize merged response: {}", e);
-                (status, decode_body).into_response()
-            }
-        }
-    }
-
-    // Helper to process prefill response and extract body if needed for logprobs
-    async fn process_prefill_response(
-        &self,
-        prefill_result: Result<reqwest::Response, reqwest::Error>,
-        prefill_url: &str,
-        return_logprob: bool,
-    ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
-        // Check prefill result first - it's critical for disaggregated mode
-        let prefill_response = match prefill_result {
-            Ok(response) => response,
-            Err(e) => {
-                error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
-                    prefill_url,
-                    e
-                );
-
-                // Return error immediately - don't wait for decode to timeout
-                return Err(error::bad_gateway(
-                    "prefill_server_error",
-                    format!(
-                        "Prefill server error: {}. This will cause decode timeout.",
-                        e
-                    ),
-                ));
-            }
-        };
-
-        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        // Check if prefill succeeded
-        if !prefill_status.is_success() {
-            // Get error body from prefill
-            let error_msg = prefill_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown prefill error".to_string());
-
-            error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
+        let mut body = decode_body;
+        let json = serde_json::from_slice::<Value>(&body);
+        if json.is_err() && retry_identity.is_some() {
+            return error::bad_gateway(
+                "invalid_decode_response",
+                "Decode returned invalid JSON; cannot restore the client request ID",
             );
-
-            // Map prefill_status to appropriate error function
-            let error_response = match prefill_status {
-                StatusCode::BAD_REQUEST => error::bad_request(
-                    "prefill_bad_request",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::NOT_FOUND => error::not_found(
-                    "prefill_not_found",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
-                    "prefill_internal_error",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
-                    "prefill_unavailable",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::BAD_GATEWAY => error::bad_gateway(
-                    "prefill_bad_gateway",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                _ => error::internal_error(
-                    "prefill_error",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-            };
-            return Err(error_response);
         }
-
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
-            match prefill_response.bytes().await {
-                Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
-                    None
+        if let Ok(mut decode_json) = json {
+            let mut changed = retry_identity
+                .as_ref()
+                .is_some_and(|identity| identity.restore_json(&mut decode_json));
+            if return_logprob {
+                if let Some(prefill_json) = prefill_body
+                    .as_ref()
+                    .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+                {
+                    changed |= Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
                 }
             }
-        } else {
-            // For non-logprob requests, just consume the response without storing
-            debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
+            if changed {
+                body = bytes::Bytes::from(serde_json::to_vec(&decode_json).expect("JSON value"));
+                headers.remove(CONTENT_LENGTH);
             }
-            None
-        };
+        }
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        response
+    }
 
-        Ok((prefill_status, prefill_body))
+    async fn handle_prefill_failure(&self, failure: PrefillFailure, prefill_url: &str) -> Response {
+        let response = match failure {
+            PrefillFailure::Transport(error) => {
+                error!(prefill_url, %error, "Prefill request or body failed");
+                return error::bad_gateway(
+                    "prefill_server_error",
+                    format!("Prefill server error: {error}"),
+                );
+            }
+            PrefillFailure::Http(response) => response,
+        };
+        let status = response.status();
+        let body = read_error_body(response)
+            .await
+            .map(|body| String::from_utf8_lossy(&body).into_owned())
+            .unwrap_or_else(|error| error);
+        error!(prefill_url, %status, %body, "Prefill rejected request");
+        let code = match status {
+            StatusCode::BAD_REQUEST => "prefill_bad_request",
+            StatusCode::NOT_FOUND => "prefill_not_found",
+            StatusCode::INTERNAL_SERVER_ERROR => "prefill_internal_error",
+            StatusCode::SERVICE_UNAVAILABLE => "prefill_unavailable",
+            StatusCode::BAD_GATEWAY => "prefill_bad_gateway",
+            _ => "prefill_error",
+        };
+        error::create_error(
+            status,
+            code,
+            format!("Prefill server error ({status}): {body}"),
+        )
     }
 
     fn build_post_with_headers(
@@ -1419,7 +1488,7 @@ impl PDRouter {
     ) -> Result<bytes::Bytes, ()> {
         // Skip non-data chunks
         let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
-        if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
+        if !chunk_str.starts_with("data: ") {
             return Err(());
         }
 
@@ -2035,7 +2104,7 @@ mod tests {
         assert_eq!(decode_ref.load(), 0);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
 
         {
             let response = router.create_streaming_response(
@@ -2043,9 +2112,11 @@ mod tests {
                 StatusCode::OK,
                 None,
                 false,
+                false,
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1

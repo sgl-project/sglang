@@ -54,6 +54,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.l2_completion import (
+    exceeds_load_quota,
+    record_load_back_metrics,
+    should_skip_full_load,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -172,7 +177,10 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class UnifiedRadixCache(BasePrefixCache):
+from sglang.srt.mem_cache.hicache_lifecycle import HiCacheLifecycleMixin
+
+
+class UnifiedRadixCache(HiCacheLifecycleMixin, BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
@@ -392,6 +400,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        self.reset_async_l2()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -572,6 +581,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        self.reset_async_l2()
+        self.close_async_l2()
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -600,6 +611,7 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        self.reconcile_restore_ticket(params, result)
         return result
 
     def supports_fast_match_prefix(self) -> bool:
@@ -1602,6 +1614,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self, action: BackupKV, write_back: bool = False
     ) -> int:
         """Run a backup action top-down, stopping at the first failed backup."""
+        if self.async_l2 is not None and write_back:
+            raise ValueError("Async compressed L2 supports write-through only")
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end
@@ -1612,25 +1626,60 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         written = 0
         for node_id in action.node_ids:
-            device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
-            # Overlapping chain actions may revisit nodes with Full KV already
-            # backed up. Skip only when no transfer remains.
-            if device_value.numel() == 0 and not comp_xfers:
-                continue
-            sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
-            host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
-            )
-            if host_indices is None:
-                return 0
-            self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
-            lock_params = None
-            if not write_back:
-                lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
-            self._track_write_through_node(
-                node_id, lock_params, publish_node_ids=publish_node_ids
-            )
+            prepared, execution_started = False, False
+            device_value = None
+            try:
+                page_refs = (
+                    self._prepare_async_backup(node_id)
+                    if self.async_l2 is not None
+                    else None
+                )
+                if self.async_l2 is not None and page_refs is None:
+                    continue
+                prepared = self.async_l2 is not None
+                device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+                # Overlapping actions may revisit an already-backed-up node.
+                if device_value.numel() == 0 and not comp_xfers:
+                    if prepared:
+                        self._rollback_async_backup(node_id)
+                        prepared = False
+                    continue
+                sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+                execution_started = True
+                host_indices = self._execute_kv_backup(
+                    node_id,
+                    device_value,
+                    comp_xfers,
+                    sidecar_xfers,
+                    page_refs=page_refs,
+                )
+                if host_indices is None:
+                    if self.async_l2 is not None:
+                        self._rollback_async_backup(node_id)
+                    return 0
+                self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+                lock_params = None
+                if self.async_l2 is not None:
+                    lock_params = self.async_l2.backup_pins[node_id][0]
+                    self.async_l2.stats["backup_submitted"] += 1
+                elif not write_back:
+                    lock_params = self.inc_lock_ref(node_id).to_dec_params()
+                publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
+                self._track_write_through_node(
+                    node_id, lock_params, publish_node_ids=publish_node_ids
+                )
+            except Exception:
+                if self.async_l2 is not None:
+                    if prepared and not execution_started:
+                        try:
+                            self._rollback_async_backup(node_id)
+                        except Exception:
+                            self.async_l2.quarantined.append((node_id, device_value))
+                            raise
+                    elif execution_started:
+                        # The executor/controller may already own these pages.
+                        self.async_l2.quarantined.append((node_id, device_value))
+                raise
             written = len(host_indices)
         return written
 
@@ -1654,9 +1703,47 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
+    def _execute_kv_backup(
+        self, node_id, device_value, comp_xfers, sidecar_xfers, page_refs=None
+    ):
         """Execute Backup action."""
         kv_tokens = len(device_value)
+        if self.async_l2 is not None:
+            admission_started = time.perf_counter()
+            try:
+                if comp_xfers or sidecar_xfers:
+                    raise ValueError("Compressed L2 supports FULL only")
+                pool = self.async_l2.pool
+                while not pool.can_reserve(kv_tokens):
+                    # Request only the current allocation shortfall. available_size
+                    # accounts for logical slots, reservation size and fragmentation;
+                    # logical eviction alone may not release bytes held by a reader.
+                    needed = kv_tokens - pool.available_size()
+                    if needed <= 0:
+                        # A background completion can release space after the check.
+                        break
+                    before = pool.snapshot()
+                    if self.evict_host(needed) == 0 or pool.snapshot() == before:
+                        break
+                if not pool.can_reserve(kv_tokens):
+                    self.async_l2.stats["admission_skips"] += 1
+                    return None
+                handles = self.cache_controller.write(
+                    device_value, node_id=node_id, page_refs=page_refs
+                )
+                pool.trace_node(
+                    "backup_submit",
+                    node_id,
+                    handles=handles if handles is not None else (),
+                    refs=page_refs or (),
+                    requested_pages=kv_tokens,
+                )
+                return handles
+            finally:
+                stats = self.async_l2.stats
+                stats["backup_admission_seconds"] = stats.get(
+                    "backup_admission_seconds", 0
+                ) + (time.perf_counter() - admission_started)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
         if (
             anchor_entry.host_pool.shared_allocation_domain is None
@@ -1789,9 +1876,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # when the Full-KV load is skipped by thresholding. max(1, ...): an
         # entirely empty spec (e.g. foreign-pin rejection) must never report
         # success, even at load_back_threshold <= 0.
-        if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
-            mem_quota is not None and kv_tokens + result.delta > mem_quota
-        ):
+        if should_skip_full_load(
+            kv_tokens, self.load_back_threshold, has_aux=bool(comp_xfers)
+        ) or exceeds_load_quota(kv_tokens, result.delta, mem_quota):
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
@@ -2625,6 +2712,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
+        # Queued requests may already own an asynchronous L2 restore. Mark it
+        # before any storage-prefetch early return; its ACK owns final cleanup.
+        self.abandon_restore_ticket(request)
         rid = request.rid
         if self.linker is not None:
             self.linker.release_request(rid)
@@ -3221,6 +3311,8 @@ class UnifiedRadixCache(BasePrefixCache):
         hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Attach (enable) the HiCache storage backend at runtime."""
+        if self.async_l2 is not None:
+            return False, "Compressed L2 does not support runtime L3 attachment"
         if self._storage_attachment is None:
             return (
                 False,
@@ -3243,6 +3335,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
+        self.close_async_l2()
         if self._storage_attachment is not None:
             self._storage_attachment.shutdown()
 
@@ -3261,7 +3354,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _count_ready_acks(self, ack_queue) -> int:
         ready_count = 0
         for ack in ack_queue:
-            if not ack.finish_event.query():
+            if not ack.query():
                 break
             ready_count += 1
         return ready_count
@@ -3339,7 +3432,7 @@ class UnifiedRadixCache(BasePrefixCache):
             cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
-                    ack.finish_event.synchronize()
+                    ack.wait()
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
@@ -3363,7 +3456,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # Process completed acks
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
-            ack.finish_event.synchronize()
+            if self.async_l2 is not None:
+                if self._complete_async_write_ack(ack):
+                    self._log_write_ack_metrics(
+                        ack._replace(num_bytes=ack.completion.actual_bytes or 0)
+                    )
+                finish_count -= 1
+                continue
+            ack.result()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
@@ -3409,7 +3509,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
-            ack.finish_event.synchronize()
+            if self.async_l2 is not None:
+                self._complete_async_load_ack(ack)
+                finish_count -= 1
+                continue
+            ack.result()
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
@@ -3422,19 +3526,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
                 self.tree_core.finish_load_back(node)
 
-            if self.metrics_collector is not None:
-                for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
-                    if num_tokens > 0:
-                        self.metrics_collector.increment_load_back_num_tokens(
-                            num_tokens=num_tokens, pool=pool
-                        )
-                if ack.num_bytes > 0:
-                    self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
-                if ack.timing_enabled:
-                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
-                    self.metrics_collector.observe_load_back_duration(
-                        duration_ms / 1000.0
-                    )
+            record_load_back_metrics(
+                self.metrics_collector,
+                ack.num_tokens_by_pool,
+                ack.num_bytes,
+                ack.start_event.elapsed_time(ack.finish_event) / 1000.0
+                if ack.timing_enabled and self.metrics_collector is not None
+                else None,
+            )
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
@@ -3444,8 +3543,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
-        """Only buffer mode returns None: its admission retries without
-        committing a load."""
+        """Return an adopted prefix length and node, or None while loading."""
+        if self.async_l2 is not None:
+            return self.init_async_load_back(params)
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3507,6 +3607,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._poll_async_l2_housekeeping()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
@@ -3571,6 +3672,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
+        if self.async_l2 is not None:
+            return -1  # The admission ticket was completely restored and verified.
         if self.linker is not None:
             return self.linker.start_layer_wise_loading()
         if self.cache_controller is not None:

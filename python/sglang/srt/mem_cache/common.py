@@ -228,6 +228,9 @@ def match_kv_cache(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    if max_prefix_len is None:
+        max_prefix_len = req._compute_max_prefix_len(len(token_ids))
+
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
