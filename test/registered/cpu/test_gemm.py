@@ -4,7 +4,6 @@ import unittest
 import sgl_kernel  # noqa: F401
 import torch
 import torch.nn as nn
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import (
     MXFP4QuantizeUtil,
@@ -33,6 +32,30 @@ class Mod(nn.Module):
 
 
 class TestGemm(CustomTestCase):
+    def test_bf16_gemm_deterministic_across_batch_sizes(self):
+        N, K = 32 * 13, 32 * 16
+        row = torch.randn(1, K, dtype=torch.bfloat16)
+        mat2 = torch.randn(N, K, dtype=torch.bfloat16)
+        packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)
+
+        reference = None
+        for batch_size in (1, 4, 5, 20, 32, 33):
+            mat1 = row.repeat(batch_size, 1)
+            out = torch.ops.sgl_kernel.weight_packed_linear(
+                mat1,
+                packed_mat2,
+                None,
+                True,
+                True,
+            )
+            # Every identical row must be bitwise equal, including across the
+            # regular tiny-GEMM/AMX threshold at M=4.
+            self.assertTrue(torch.equal(out, out[:1].expand_as(out)))
+            if reference is None:
+                reference = out[0].clone()
+            else:
+                self.assertTrue(torch.equal(reference, out[0]))
+
     @parametrize(
         M=[1, 101],
         N=[16, 32 * 13],
