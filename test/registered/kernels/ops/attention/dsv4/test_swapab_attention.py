@@ -98,13 +98,13 @@ class TestSwapABAttention(CustomTestCase):
         )
         ei = ei_storage[..., :ne]
         lengths = torch.tensor(
-            [0, 1, 31, 63, 64, nk - 1, nk, nk + 3][:b], device="cuda", dtype=torch.int32
-        )
+            [0, 1, 31, 63, 64, nk - 1, nk, nk + 3] * 5, device="cuda", dtype=torch.int32
+        )[:b]
         el = torch.tensor(
-            [ne, ne // 2, 1, 0, 63, ne - 1, 65, ne][:b],
+            [ne, ne // 2, 1, 0, 63, ne - 1, 65, ne] * 5,
             device="cuda",
             dtype=torch.int32,
-        )
+        )[:b]
         sink = torch.randn(64, device="cuda")
         sink[0], sink[1], sink[2] = -torch.inf, torch.inf, 20.0
         originals = [x.clone() for x in (raw, extra_raw, ids, ei, q, lengths, el, sink)]
@@ -221,6 +221,14 @@ class TestSwapABAttention(CustomTestCase):
 
     def test_dynamic_graph_replay(self):
         self.check_case(6, 64, 192, 512, graph=True)
+
+    @unittest.skipIf(is_hip(), "the gfx950 kernel keeps the 8-row cap")
+    def test_rows_up_to_cap(self):
+        """SM100 admits up to 40 rows: DSpark verify at TP4 bs <= 8."""
+        for case in ((20, 16, 133, 0), (40, 128, 192, 1024)):
+            with self.subTest(case=case):
+                self.check_case(*case)
+        self.check_case(40, 64, 192, 512, graph=True)
 
 
 if __name__ == "__main__":
