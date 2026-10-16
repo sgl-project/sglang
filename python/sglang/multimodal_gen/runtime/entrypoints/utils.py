@@ -1256,6 +1256,14 @@ def _save_image_frame(
             frame = frame[..., 0]
         Image.fromarray(frame).save(path, format="PNG", compress_level=compress_level)
     else:
+        if ext in (".jpg", ".jpeg") and frame.ndim == 3 and frame.shape[-1] == 4:
+            # Models such as Qwen-Image 2.1 produce RGBA even for opaque scenes.
+            # JPEG needs RGB; composite on white instead of dropping alpha and
+            # exposing arbitrary colors from transparent pixels.
+            rgba = Image.fromarray(frame)
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            frame = np.asarray(background)
         imageio.imwrite(path, frame, quality=quality)
 
 
