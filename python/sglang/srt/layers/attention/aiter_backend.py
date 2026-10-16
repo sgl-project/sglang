@@ -123,6 +123,35 @@ fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
 
 
+def _unified_attention_pow2_heads(*, q, k, out, sinks=None, **kwargs):
+    """aiter's gfx1250 Gluon unified_attention kernels need the number of query
+    heads per KV head to be a power of 2. Pad each KV group's query heads up to
+    one, run, and copy the real heads back into ``out``."""
+    num_tokens, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[2]
+    ratio = num_q_heads // num_kv_heads
+    if not is_gfx1250_supported() or ratio & (ratio - 1) == 0:
+        return unified_attention(q=q, k=k, out=out, sinks=sinks, **kwargs)
+
+    padded_ratio = 1 << ratio.bit_length()
+    padded_q = q.new_zeros(num_tokens, num_kv_heads, padded_ratio, head_dim)
+    padded_q[:, :, :ratio] = q.view(num_tokens, num_kv_heads, ratio, head_dim)
+    padded_out = out.new_empty(num_tokens, num_kv_heads * padded_ratio, out.shape[-1])
+    if sinks is not None:
+        padded_sinks = sinks.new_zeros(num_kv_heads, padded_ratio)
+        padded_sinks[:, :ratio] = sinks.view(num_kv_heads, ratio)
+        sinks = padded_sinks.view(-1)
+    unified_attention(
+        q=padded_q.view(num_tokens, -1, head_dim),
+        k=k,
+        out=padded_out,
+        sinks=sinks,
+        **kwargs,
+    )
+    real = padded_out.view(num_tokens, num_kv_heads, padded_ratio, -1)[:, :, :ratio]
+    out.copy_(real.reshape(out.shape))
+
+
 # Token-block parallel KV-index building is enabled only where it pays:
 # the speculative-decoding paths (target_verify / draft_extend / draft
 # decode) of long-context servers. Everything else keeps the historical
@@ -1018,7 +1047,7 @@ class AiterAttnBackend(AttentionBackend):
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
             dtype=self.input_dtype,
         )
-        unified_attention(
+        _unified_attention_pow2_heads(
             q=q_u,
             k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
             v=v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
@@ -3409,7 +3438,7 @@ class AiterAttnBackend(AttentionBackend):
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
                     # each replay and break the captured pointer.
-                    unified_attention(
+                    _unified_attention_pow2_heads(
                         q=q_unified,
                         k=k_unified,
                         v=v_unified,
@@ -3527,7 +3556,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 ):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-                unified_attention(
+                _unified_attention_pow2_heads(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
@@ -3920,7 +3949,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     q, _ = scaled_fp8_quant(q, q_descale)
 
-                unified_attention(
+                _unified_attention_pow2_heads(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
