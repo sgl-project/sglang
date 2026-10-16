@@ -19,6 +19,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
+from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+    DeepseekV4MegaAttnBackend,
+)
 from sglang.srt.layers.attention.dsv4.metadata import copy_unless_aliased
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -610,18 +613,11 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sum_q = sum(int(x) for x in extend_seq_lens_cpu)
             # q may be padded past the real extend tokens; pad rows sit at the end.
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            if tail is not None:
-                # SWA columns are bounded by causal lengths, not -1 sentinels: tail
-                # rows count from the tail start, whose earlier window KV is unwritten.
-                lens = tail.extend_seq_lens.to(torch.int64)
-                starts = torch.repeat_interleave(
-                    torch.cumsum(lens, 0) - lens, lens, output_size=sum_q
-                )
-                seq_lens_i32 = (
-                    torch.arange(sum_q, device=lens.device) - starts + 1
-                ).to(torch.int32)
-            else:
-                seq_lens_i32 = core.seq_lens_casual[:sum_q].to(torch.int32)
+            # SWA columns are bounded by causal lengths, not -1 sentinels; tail rows
+            # use their floored SWA counts, since window KV below the floor is unwritten.
+            seq_lens_i32 = (
+                core.swa_topk_lengths if tail is not None else core.seq_lens_casual
+            )[:sum_q].to(torch.int32)
             assert seq_lens_i32.shape == (sum_q,), f"{seq_lens_i32.shape=}"
             core.trtllm_prefill_qmeta = (sum_q, seq_lens_i32)
         sum_q, seq_lens = core.trtllm_prefill_qmeta
@@ -715,15 +711,20 @@ def is_dsv4_trtllm_attn_enabled() -> bool:
     return get_exec().kernel.dsv4_attn_backend == "trtllm"
 
 
+def is_dsv4_mega_attn_enabled() -> bool:
+    return get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+
+
 def create_deepseek_v4_attn_backend(
     model_runner: ModelRunner, **kwargs
 ) -> DeepseekV4AttnBackend:
     """Construct the DSV4 backend matching --dsv4-attn-backend."""
-    cls = (
-        DeepseekV4TrtllmAttnBackend
-        if is_dsv4_trtllm_attn_enabled()
-        else DeepseekV4AttnBackend
-    )
+    if is_dsv4_trtllm_attn_enabled():
+        cls = DeepseekV4TrtllmAttnBackend
+    elif is_dsv4_mega_attn_enabled():
+        cls = DeepseekV4MegaAttnBackend
+    else:
+        cls = DeepseekV4AttnBackend
     return cls(model_runner, **kwargs)
 
 
