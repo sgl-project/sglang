@@ -1,5 +1,6 @@
 import random
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -295,6 +296,7 @@ class _ContextStub:
 
 
 class _SchedulerStub:
+    _collect_inflight_batches = Scheduler._collect_inflight_batches
     collect_inflight_reqs = Scheduler.collect_inflight_reqs
 
     def __init__(
@@ -307,6 +309,8 @@ class _SchedulerStub:
         hisparse=None,
     ):
         self.serving = _ServingStub(version)
+        self.enable_continuous_input_polling = False
+        self.result_queue = deque()
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
         self.waiting_queue = waiting
@@ -316,7 +320,6 @@ class _SchedulerStub:
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def _scheduler(self, *args, pp_size=1, **kwargs):
-        # The recording path asks the context for the pipeline width.
         enter_scope(self, published_topology(pp_size=pp_size))
         scheduler = _SchedulerStub(*args, **kwargs)
         for name, value in (

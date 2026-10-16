@@ -196,14 +196,14 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
     layer's deferred post was never applied and every subsequent layer computed
     on corrupted activations.
 
-    Drives the real ``DeepseekV4DecoderLayer.forward`` on a mocked layer with the
+    Drives the real ``NonCudaDecoderMixin.forward`` on a mocked layer with the
     fused dispatcher forced to ``None`` and halts at ``self_attn`` via a sentinel,
     so only the boundary fallback executes.
     """
 
     def test_fallback_closes_previous_post_before_pre(self):
         try:
-            from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+            from sglang.srt.models.deepseek_v4_platform_stage import NonCudaDecoderMixin
         except Exception as e:  # pragma: no cover - env without full model deps
             self.skipTest(f"deepseek_v4 import unavailable: {e}")
 
@@ -224,12 +224,12 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.srt.models.deepseek_v4.apply_mhc_post_pre_boundary",
+                "sglang.srt.models.deepseek_v4_platform_stage.apply_mhc_post_pre_boundary",
                 return_value=None,
             ),
             self.assertRaises(_StopForward),
         ):
-            DeepseekV4DecoderLayer.forward(
+            NonCudaDecoderMixin.forward(
                 layer,
                 positions=object(),
                 hidden_states=hs_in,
@@ -263,14 +263,17 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
     silently corrupting every subsequent layer. The fix mirrors the unfused
     ``hc_pre`` branch: apply the input layernorm when ``norm_fused`` is False.
 
-    Drives the real ``DeepseekV4DecoderLayer.forward`` with the boundary forced to
+    Drives the real ``NonCudaDecoderMixin.forward`` with the boundary forced to
     return ``norm_fused=False`` and halts at ``self_attn`` via a sentinel.
     """
 
     def test_fused_success_applies_input_layernorm_when_not_norm_fused(self):
         try:
             import sglang.srt.models.deepseek_v4 as deepseek_v4
-            from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+            from sglang.srt.models.deepseek_v4 import (
+                DeepseekV4DecoderLayer,
+            )
+            from sglang.srt.models.deepseek_v4_platform_stage import NonCudaDecoderMixin
         except Exception as e:  # pragma: no cover - env without full model deps
             self.skipTest(f"deepseek_v4 import unavailable: {e}")
 
@@ -287,20 +290,23 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         # (norm_fused=False) -- the Triton fused post+pre contract.
         normed = object()
         layer.input_layernorm.return_value = normed
+        layer._input_norm = lambda *a, **k: DeepseekV4DecoderLayer._input_norm(
+            layer, *a, **k
+        )
         layer.self_attn.maybe_use_decode_attn_tp.side_effect = _StopForward
 
         # Force the non-aiter (torch layernorm) branch deterministically so the
         # test does not depend on the runner arch and needs no real tensors.
         with (
+            mock.patch.object(deepseek_v4, "_is_hip", False),
             mock.patch.object(deepseek_v4, "_use_aiter", False),
-            mock.patch.object(deepseek_v4, "_is_gfx95_supported", False),
             mock.patch(
-                "sglang.srt.models.deepseek_v4.apply_mhc_post_pre_boundary",
+                "sglang.srt.models.deepseek_v4_platform_stage.apply_mhc_post_pre_boundary",
                 return_value=(residual, fused_hs, post, comb, False),
             ),
             self.assertRaises(_StopForward),
         ):
-            DeepseekV4DecoderLayer.forward(
+            NonCudaDecoderMixin.forward(
                 layer,
                 positions=object(),
                 hidden_states=object(),
@@ -359,7 +365,11 @@ class TestAmdFusedMhcNumerical(unittest.TestCase):
         res = (torch.randn(m, hc_mult, hidden, device=dev) * 0.02).bfloat16()
         post = torch.randn(m, hc_mult, device=dev) * 0.02
         comb = torch.randn(m, hc_mult, hc_mult, device=dev) * 0.02
-        fn = (torch.randn(hc_mult3, hc_mult * hidden, device=dev) * 0.02).bfloat16()
+        # AITER reads fn as FP32; a BF16 allocation would be read out of bounds.
+        fn = (
+            torch.randn(hc_mult3, hc_mult * hidden, device=dev, dtype=torch.float32)
+            * 0.02
+        )
         scl = torch.ones(hc_mult3, device=dev)
         base = torch.zeros(hc_mult3, device=dev)
         nw = torch.ones(hidden, device=dev).bfloat16()

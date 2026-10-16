@@ -63,12 +63,14 @@ TEST_SIZES = [
     32 * 1024,
     256 * 1024,
     2 * 1024 * 1024,
+    3 * 1024 * 1024 + 24,  # chunks not a multiple of world_size
     4 * 1024 * 1024,
 ]
 TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
+    AllReduceAlgo.TWO_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
 ]
 USE_GRAPH_OPTIONS = [False, True]
@@ -130,8 +132,6 @@ def _init_cpu_group_once() -> dist.ProcessGroup:
         local_rank=local_rank,
         backend="nccl",
     )
-    # The context answers a handle from what was stated on it, not from
-    # this module global, so a rank stood up by hand says so itself.
     get_parallel().override_permanently(world_group=coord)
     atexit.register(dist.destroy_process_group)
     cpu_group = coord.cpu_group

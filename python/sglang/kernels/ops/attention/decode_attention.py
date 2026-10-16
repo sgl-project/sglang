@@ -77,8 +77,8 @@ _MLA_BUCKETS = (
 )
 
 # For the paths that must not depend on the batch; the mid bucket sits between the
-# other two geometries. Retuning it moves what deterministic inference produces, which
-# test_batch_free_geometry_is_pinned guards. max_splits goes unused there.
+# other two geometries. Retuning it moves what deterministic inference produces;
+# max_splits goes unused there.
 _MLA_BUCKET_BATCH_FREE = _MLA_BUCKETS[1]
 
 _KEEP_SCHEDULER_SPLITS = None
@@ -332,7 +332,9 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
             )
-            qk = tl.sum(q[None, :] * k, 1)
+            # Reduce in fp32; a bf16 tl.sum rounds each partial sum in compiler order.
+            # Cast the product, not q and k, to avoid a fp32 [BLOCK_N, D] tile.
+            qk = tl.sum((q[None, :] * k).to(tl.float32), 1)
             qk *= sm_scale_withk
 
             if logit_cap > 0:

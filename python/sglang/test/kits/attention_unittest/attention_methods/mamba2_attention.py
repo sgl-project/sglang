@@ -5,9 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# State the topology before importing modules that read it at __init__. The
-# group is stated too: `RowParallelLinear.forward` asks for it to manage
-# symmetric memory, and `world_size=1` short-circuits that.
+# Set the single-rank topology before importing the attention implementation.
 from sglang.srt.runtime_context import get_context, get_parallel
 
 _parallel_override = get_parallel().override(
@@ -15,7 +13,7 @@ _parallel_override = get_parallel().override(
     tp_rank=0,
     attn_tp_size=1,
     attn_tp_rank=0,
-    tp_group=SimpleNamespace(world_size=1),
+    tp_group=SimpleNamespace(rank_in_group=0, world_size=1),
 )
 _parallel_override.__enter__()
 
@@ -455,15 +453,14 @@ class MockMamba2ModelRunner(ModelRunner):
             enable_alt_stream=False,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.is_draft_worker = False
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
         self.is_hybrid_swa = False
         self.sliding_window_size = None
         self.use_mla_backend = False
-        self.is_draft_worker = False
         self._kernel_warmed_up = True
 
     @property
@@ -656,6 +653,8 @@ def _make_forward_batch(
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.kv_index_translator.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)

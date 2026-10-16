@@ -15,6 +15,7 @@ Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its nati
 - `/encode`(embedding model)
 - `/v1/rerank`(cross encoder rerank model)
 - `/v1/score`(decoder-only scoring)
+- `/v1/decisions`(typed decisions on a chat model)
 - `/classify`(reward model)
 - `/start_expert_distribution_record`
 - `/stop_expert_distribution_record`
@@ -256,6 +257,8 @@ Parameters:
 - `item_first`: Whether items come first in concatenation order (default: False)
 - `model`: Model name
 
+`query` and `items` also accept token ids, with `query` set to `[]` when each item is a complete prompt. `label_token_ids` can be one list per item. `temperature` divides the label logits before the softmax and needs `apply_softmax`, and `return_token_logprobs` adds `token_logprobs`, the full-vocabulary log-probabilities of the labels.
+
 The response contains `scores` - a list of probability lists, one per item, each in the order of `label_token_ids`.
 
 ```python Example
@@ -292,6 +295,20 @@ for item, scores in zip(items, response_json["scores"]):
 ```python Example
 terminate_process(score_process)
 ```
+
+## v1/decisions (typed decisions on a chat model)
+
+Answer typed questions about an input with per-option probabilities, without generating. The server renders each question with the model's chat template and thinking turned off, assigns one-token answer labels, and scores them through the same path as `v1/score`.
+
+Parameters:
+- `input`: Text, object, or array the questions are about
+- `questions`: List of questions, each with a unique `id` and a `type` of `choice` (with `options`), `score` (with `levels`), or `yes_no`
+- `temperature`: Divides the label logits before the softmax (default: 1)
+- `chat_template_kwargs`: Extra chat template arguments
+- `prompt_format_version`: Optional pin of the server-owned prompt wording
+- `return_prompt_token_ids`: Return the scored prompt and label token ids for replay through `v1/score` (default: False)
+
+The response contains `answers` keyed by question id, each with `type`, `probabilities`, and `label_mass`, plus `choice` for a choice question or `score` for a score question. A yes or no answer is read from `probabilities["yes"]`. See [Decision models](/docs/supported-models/decision_models) for examples, the full reference, and error cases.
 
 ## Classify (reward model)
 

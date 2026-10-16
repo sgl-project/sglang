@@ -81,8 +81,8 @@ python3 -m sglang.launch_server \
     --swa-full-tokens-ratio 0.3 \
     --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
-    --disable-piecewise-cuda-graph \
-    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --cuda-graph-backend-prefill disabled \
+    --attn-dp-size 2 --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode normal
 ```
 
@@ -90,7 +90,6 @@ python3 -m sglang.launch_server \
 
 ```bash Command
 # Use eagle_worker_v2 and overlap plan stream to hide the draft/target preparation
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 # DFlash draft model has a longer context length than the derived value
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
@@ -111,7 +110,7 @@ python3 -m sglang.launch_server \
     --disaggregation-mode decode --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
     --moe-a2a-backend deepep --deepep-mode low_latency \
-    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --attn-dp-size 2 --enable-dp-lm-head \
     --speculative-algorithm DFLASH \
     --speculative-num-draft-tokens 8
 ```

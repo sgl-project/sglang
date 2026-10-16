@@ -1,11 +1,4 @@
-"""Config fields of the ``schedule`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``schedule`` bag, which is what ``get_schedule()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``schedule`` namespace."""
 
 from __future__ import annotations
 
@@ -175,7 +168,9 @@ class Schedule(msgspec.Struct):
                 "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
                 "family), how many radix-cached prefix tails it keeps room for. "
                 "Each tail is one sliding window plus one page. Default: 4 x "
-                "max_running_requests per attention-DP rank, 0 when the radix "
+                "max_running_requests per attention-DP rank, multiplied by "
+                "num_layers // draft_layers under encoder SWA bounded replay with "
+                "DSpark (only draft layers are paged there); 0 when the radix "
                 "cache is disabled."
             ),
         ),

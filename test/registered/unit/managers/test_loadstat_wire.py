@@ -97,12 +97,10 @@ class TestLoadPublisherGating(CustomTestCase):
     """
 
     def _build(self, *, config=ZMQ_ENDPOINT, explicit="auto", ranks=None, **topology):
-        """Construct a publisher with the socket bind stubbed out, returning
-        (publisher, captured _open_pub_socket mock). Opts in via explicit="auto"
-        by default (the feature is off without it). The topology is published
-        rather than overridden, so the ranks the publisher reads are the ones a
-        layout of that shape actually produces; every read happens in the
-        constructor."""
+        """Return a publisher and its mocked socket factory under a published topology.
+
+        ``explicit="auto"`` enables load publication by default.
+        """
         with (
             published_topology(ranks=ranks, **topology),
             patch(
@@ -155,8 +153,7 @@ class TestLoadPublisherGating(CustomTestCase):
     def test_dp_attention_keys_the_load_port_by_attn_dp_rank(self):
         _, open_sock = self._build(
             tp_size=4,
-            dp_size=4,
-            enable_dp_attention=True,
+            attn_dp_size=4,
             ranks={"world_rank": 3, "dp_rank": 0},
         )
         open_sock.assert_called_once_with("tcp://*:5564")

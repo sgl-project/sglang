@@ -33,8 +33,6 @@ class TestFakeKVSender(unittest.TestCase):
             mgr=self.mgr if mgr is None else mgr,
             bootstrap_addr="fake_addr:1234",
             bootstrap_room=42,
-            dest_tp_ranks=[0],
-            pp_rank=0,
         )
 
     def _expire_deadline(self, sender: FakeKVSender, by: float = 1.0) -> None:
@@ -145,17 +143,6 @@ class TestFakeKVSender(unittest.TestCase):
         self.sender.abort()
         self.assertEqual(self.sender.conclude_state, KVPoll.Failed)
         self.assertEqual(self.sender.poll(), KVPoll.Failed)
-
-    def test_get_transfer_metric(self):
-        metric = self.sender.get_transfer_metric()
-        self.assertIsNone(metric.transfer_latency_s)
-        self.assertIsNone(metric.alloc_latency_s)
-        self.assertIsNone(metric.transfer_total_bytes)
-
-    def test_failure_exception(self):
-        with self.assertRaises(Exception) as ctx:
-            self.sender.failure_exception()
-        self.assertIn("Fake KVSender Exception", str(ctx.exception))
 
 
 if __name__ == "__main__":

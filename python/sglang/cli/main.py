@@ -9,8 +9,19 @@ def version(args, extra_argv):
     print(f"git revision: {get_git_commit_hash()[:7]}")
 
 
+COOKBOOK_URL = "https://docs.sglang.io/cookbook"
+COOKBOOK_EPILOG = (
+    f"Deploying a specific model? Its cookbook page at {COOKBOOK_URL} carries the "
+    "recommended command for it: GPU count, parallelism, quantization and the "
+    "flags that matter for that model."
+)
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        epilog=COOKBOOK_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
 
     # complex sub commands
     subparsers = parser.add_subparsers(dest="subcommand", required=True)

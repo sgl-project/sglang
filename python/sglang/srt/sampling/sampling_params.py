@@ -19,16 +19,19 @@ from typing import Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
+from sglang.srt.sampling.watermarking.core import (
+    WatermarkRequestConfig,
+    normalize_watermark_request,
+)
+
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:
     import re._parser as sre_parse
 except ImportError:
     import sre_parse  # Python < 3.11
 
-# JSON-safe value types for custom_params.  Must survive msgpack IPC
-# without PickleWrapper.  After deserialization on the scheduler side,
-# Req.__init__ injects "__req__" (a Req object) into the dict in-process;
-# that augmented dict is never re-serialized.
+# JSON-safe value types for custom_params. Must survive msgpack IPC
+# without PickleWrapper.
 _JsonScalar = Union[None, bool, int, float, str]
 CustomParamValue = Union[
     _JsonScalar,
@@ -152,6 +155,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    watermark: Optional[WatermarkRequestConfig] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -206,6 +210,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.no_stop_trim = (
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
+        self.watermark = normalize_watermark_request(self.watermark)
 
         # An empty grammar constraint means "unset", not "constrain to nothing".
         self.json_schema = self.json_schema or None
@@ -271,6 +276,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        if self.sampling_seed is not None:
+            if not isinstance(self.sampling_seed, int):
+                raise ValueError(
+                    "sampling_seed must be an integer, got "
+                    f"{type(self.sampling_seed).__name__}."
+                )
+            if not -(2**63) <= self.sampling_seed <= 2**63 - 1:
+                raise ValueError(
+                    "sampling_seed must be in [-2**63, 2**63 - 1], got "
+                    f"{self.sampling_seed}."
+                )
 
         get_request_reasoning_end_token_ids(
             self.custom_params,
