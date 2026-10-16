@@ -13,7 +13,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
+from sglang.srt.utils.common import (
+    is_gfx1250_supported,
+    is_mps,
+    is_no_spec_infer_or_topk_one,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -357,6 +361,9 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "flashinfer"
         elif get_platform().is_hip:
             head_num = model_config.get_num_kv_heads(cfg.tp_size)
+            # aiter MLA decode on gfx1250 only supports non-persistent fp8/fp8.
+            if is_gfx1250_supported():
+                return "triton"
             # TODO current aiter only support head number 16 or 128 head number
             if head_num == 128 or head_num == 16:
                 return "aiter"
