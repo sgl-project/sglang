@@ -126,10 +126,7 @@ class EagleVerifyInput(SpecInput):
             out=kv_indices,
             kind=kind,
         )
-        mask_numel = (
-            paged_kernel_lens_sum * self.draft_token_num
-            + (self.draft_token_num**2) * batch_size
-        )
+        mask_numel = paged_kernel_lens_sum * self.draft_token_num
         if self.custom_mask.numel() < mask_numel:
             # FIXME(attn): temporary fix for custom mask padding with cuda graph
             self.custom_mask = torch.cat(
