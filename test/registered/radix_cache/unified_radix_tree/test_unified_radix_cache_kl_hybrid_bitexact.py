@@ -301,6 +301,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = _base_args() + [
+            "--enable-metrics",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "4",
@@ -376,6 +377,17 @@ class TestUnifiedHybridHiCacheSlowLoadBitExact(TestUnifiedHybridHiCacheBitExact)
     def setUpClass(cls):
         with envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.override(50_000_000):
             super().setUpClass()
+
+    def test_multiturn_decode_cache_hit_branching(self):
+        server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
+        self.assertEqual(server_info["cuda_graph_config"]["prefill"]["backend"], "full")
+        graph_count = _prefill_graph_count(self.base_url)
+        super().test_multiturn_decode_cache_hit_branching()
+        self.assertGreater(
+            _prefill_graph_count(self.base_url),
+            graph_count,
+            "Delayed HiCache test did not replay the configured Full CUDA graph.",
+        )
 
 
 class TestUnifiedHybridMTPBitExact(CustomTestCase):

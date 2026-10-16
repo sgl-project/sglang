@@ -768,7 +768,10 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         counter.set_consumer(counter.update_producer())
         counter.complete(0, 0)
         counter.complete(0, 1)
-        waiter = threading.Thread(target=self._runner(counter)._wait_for_layer_loads)
+        waiter = threading.Thread(
+            target=self._runner(counter)._wait_for_layer_loads,
+            daemon=True,
+        )
         waiter.start()
         waiter.join(timeout=0.2)
         self.assertTrue(waiter.is_alive())
