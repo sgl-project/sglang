@@ -269,8 +269,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             (
-                # Only the folding CUDA backend syncs its replay rows per DP rank;
-                # wider attention TP is untested.
                 "DP attention other than CUDA attention TP 1",
                 attn_dp_enabled_of(cfg)
                 and not (get_platform().is_cuda and cfg.attn_dp_size == cfg.tp_size),

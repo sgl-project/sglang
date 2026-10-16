@@ -71,7 +71,7 @@ class _Fixture:
         self.batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             reqs=reqs,
-            encoder_swa_reset=[True] * len(REQS),  # all first chunks
+            encoder_swa_reset=[True] * len(REQS),
             req_pool_indices=torch.tensor([s for s, _, _ in REQS]),
             prefix_lens=[p for _, p, _ in REQS],
             extend_lens=[n for _, _, n in REQS],
@@ -86,7 +86,6 @@ class _Fixture:
             # Slot 3 asks for input logprobs from its 6th new token on.
             extend_logprob_start_lens=[40, 30, 5],
             engram_history=None,
-            # The scheduler gathers the folded row count (folded_replay_rows).
             global_num_tokens=[self.extend_num_tokens + REPLAY_ROWS],
             global_num_tokens_for_logprob=[1 + 1 + 15],
             can_run_decode_cuda_graph=False,
@@ -156,8 +155,7 @@ class TestFoldedExtendRows(CustomTestCase):
         )
 
     def test_fold_rejects_a_synced_count_without_replay_rows(self):
-        """Every DP rank pads to the gathered count, so a fold whose rows the
-        scheduler did not count is refused instead of shrinking input_ids."""
+        """A fold whose rows the scheduler did not count is refused."""
         fx = _Fixture()
         fx.batch.global_num_tokens = [fx.extend_num_tokens]
         with self.assertRaisesRegex(ValueError, "synced"):

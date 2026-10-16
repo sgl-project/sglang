@@ -32,7 +32,6 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
 
 
 def folded_replay_rows(batch) -> int:
-    """Rows the fold adds to an extend: each new window's <=128-token prefix tail."""
     if not batch.forward_mode.is_extend_without_speculative():
         return 0
     return sum(
@@ -253,7 +252,6 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
 
 
 def _check_folded_counts(*, batch, scheduled) -> None:
-    """The scheduler's MLP-sync gather already counts the replay rows (folded_replay_rows)."""
     if scheduled.global_num_tokens is None:
         return
     synced = scheduled.global_num_tokens[dp_slot_in(scheduled.global_num_tokens)]

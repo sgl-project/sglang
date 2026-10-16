@@ -515,7 +515,6 @@ def prepare_mlp_sync_batch_raw(
             local_batch.encoder_swa_reset is not None
             and model_runner.attn_backend.folds_encoder_swa_replay
         ):
-            # A folding backend runs each new window's replay inside this extend.
             num_tokens += folded_replay_rows(local_batch)
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
