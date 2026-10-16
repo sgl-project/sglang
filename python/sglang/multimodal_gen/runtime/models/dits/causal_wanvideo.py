@@ -294,7 +294,7 @@ class CausalWanTransformerBlock(nn.Module):
             self.norm_q = RMSNorm(dim, eps=eps)
             self.norm_k = RMSNorm(dim, eps=eps)
         else:
-            print("QK Norm type not supported")
+            logger.error("QK Norm type not supported")
             raise Exception
         self.tp_rmsnorm = (
             use_megatron_tp and qk_norm == "rms_norm_across_heads" and tp_size > 1
