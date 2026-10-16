@@ -123,6 +123,7 @@ def _refresh_lossless_buffers(layer):
     )
     if not torch.equal(restored.view(torch.int16), weight.view(torch.int16)):
         raise RuntimeError("Lossless head failed the full BF16 bit audit")
+    layer._derived_weight_cache_error = "Online weight updates require rebuilding the lossless BF16 head before graph capture"
     layer._lossless_bf16_source = weakref.ref(weight)
     layer._lossless_bf16_used_bytes = payload.numel() * 4 + metadata.numel() * 8
     logger.info(

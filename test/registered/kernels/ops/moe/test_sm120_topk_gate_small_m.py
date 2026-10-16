@@ -5,7 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.moe import moe_fused_gate as gate
-from sglang.kernels.ops.moe import sm120_topk_gate_small_m as small
+from sglang.kernels.ops.moe import sm120_topk_gate as small
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -119,7 +119,7 @@ class TestSmallMTop22(CustomTestCase):
                     self.assertTrue(torch.equal(packed, expected_packed))
 
     def test_single_token_nonfinite_bias_and_unique_ties(self):
-        from sglang.kernels.ops.moe.sm120_topk_gate_m1 import topk_gate_m1
+        from sglang.kernels.ops.moe.sm120_topk_gate import topk_gate_m1
 
         scores = torch.randn(1, 512, device="cuda")
         for value in (0.0, -float("inf"), float("inf"), float("nan")):

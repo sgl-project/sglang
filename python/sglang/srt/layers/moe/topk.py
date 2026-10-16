@@ -1542,7 +1542,7 @@ def biased_topk_jit_kernel_impl(
             and packed_out is None
             and not sqrtsoftplus_log1p
         ):
-            from sglang.kernels.ops.moe.sm120_topk_gate_m1 import (
+            from sglang.kernels.ops.moe.sm120_topk_gate import (
                 topk_gate_m1,
                 use_topk_gate_m1,
             )

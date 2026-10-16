@@ -404,9 +404,10 @@ def moe_fused_gate(
         assert input_ids.shape == (scores.size(0),)
     if packed_out is not None:
         assert packed_out.dtype == torch.int32, "packed_out must be int32"
-        assert packed_out.shape == (scores.size(0), topk), (
-            "packed_out must be [M, topk]"
-        )
+        assert packed_out.shape == (
+            scores.size(0),
+            topk,
+        ), "packed_out must be [M, topk]"
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
@@ -434,7 +435,7 @@ def moe_fused_gate(
         and packed_out is None
         and not sqrtsoftplus_log1p
     ):
-        from sglang.kernels.ops.moe.sm120_topk_gate_small_m import (
+        from sglang.kernels.ops.moe.sm120_topk_gate import (
             topk_gate_small_m,
         )
 

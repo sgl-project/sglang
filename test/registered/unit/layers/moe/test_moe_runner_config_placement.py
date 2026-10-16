@@ -144,9 +144,10 @@ def test_cutlass_passes_the_runner_config_placement(monkeypatch) -> None:
 
 
 def test_sm120_nvfp4_dispatch_uses_live_layer_placement(monkeypatch) -> None:
-    from sglang.kernels.ops.gemm import sm120_nvfp4_moe_mtp_mma
+    from sglang.kernels.ops.gemm import sm120_nvfp4_moe
 
     calls = []
+    monkeypatch.setattr(flashinfer_cutlass, "is_sm120", lambda: True)
     monkeypatch.setattr(flashinfer_cutlass, "_sm120_mtp_mma_supported", lambda: True)
     monkeypatch.setattr(
         flashinfer_cutlass, "_flashinfer_autotune_active", lambda: False
@@ -160,7 +161,7 @@ def test_sm120_nvfp4_dispatch_uses_live_layer_placement(monkeypatch) -> None:
         calls.append((kwargs["tp_size"], kwargs["ep_size"]))
         return [kwargs["output"]]
 
-    monkeypatch.setattr(sm120_nvfp4_moe_mtp_mma, "nvfp4_moe_mtp_mma", native)
+    monkeypatch.setattr(sm120_nvfp4_moe, "nvfp4_moe_mtp_mma", native)
     monkeypatch.setattr(
         flashinfer_cutlass, "_flashinfer_cutlass_fused_moe", lambda: (fallback, None)
     )

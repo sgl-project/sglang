@@ -17,7 +17,6 @@
 
 """Inference-only NemotronH model."""
 
-import os
 from collections.abc import Iterable
 from functools import lru_cache, partial
 
@@ -27,6 +26,7 @@ from torch import nn
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -89,7 +89,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -156,34 +156,10 @@ class NemotronHMLP(nn.Module):
 _alt_stream = None
 
 
-_l2_prefetch_stream = None
-
-
-def _get_or_create_l2_prefetch_stream(device_module):
-    global _l2_prefetch_stream
-    if _l2_prefetch_stream is None:
-        _l2_prefetch_stream = device_module.Stream()
-    return _l2_prefetch_stream
-
-
-def _l2_prefetch_enabled() -> bool:
-    import os
-
-    return os.environ.get("SGLANG_NEMOTRON_L2_PREFETCH", "0") == "1"
-
-
 def _get_or_create_alt_stream(device_module):
     global _alt_stream
     if _alt_stream is None:
-        import os
-
-        if os.environ.get("SGLANG_NEMOTRON_ALT_STREAM_HIGH_PRIORITY", "0") == "1":
-            # The routed-expert chain on the alt stream is the MoE-layer
-            # critical path; give it scheduling priority over the shared
-            # experts (which carry ~25us of slack per layer).
-            _alt_stream = device_module.Stream(priority=-1)
-        else:
-            _alt_stream = device_module.Stream()
+        _alt_stream = device_module.Stream()
     return _alt_stream
 
 
@@ -372,16 +348,12 @@ class NemotronHMoE(nn.Module):
         num_token_non_padded: torch.Tensor | None,
         forward_batch: ForwardBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        import os
-
-        if os.environ.get("SGLANG_NEMOTRON_DISABLE_MOE_OVERLAP", "0") == "1":
-            return self._forward_core_normal(hidden_states, num_token_non_padded)
         if (
             forward_batch is not None
             and forward_batch.forward_mode == ForwardMode.EXTEND
             and hidden_states.shape == (1024, 4096)
             and hidden_states.dtype == torch.bfloat16
-            and self.tp_size == self.ep_size == 1
+            and get_parallel().tp_size == self.ep_size == 1
             and self.n_routed_experts == 512
             and self.moe_hidden_size == 1024
             and self.shared_experts is not None
@@ -716,40 +688,6 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             use_triton_causal_conv=True,
         )
 
-    def forward(self, *, hidden_states, forward_batch: ForwardBatch):
-        # The legacy fused kernel owns the residual add and input norm. Only
-        # bypass prepare for its TP1 decode contract, then publish its residual
-        # and output through the current stage boundary.
-        if (
-            os.environ.get("SGLANG_NEMOTRON_MAMBA2_MEGA", "0") == "1"
-            and get_parallel().tp_size == 1
-            and not is_dp_attention_enabled()
-            and forward_batch.forward_mode.is_decode()
-        ):
-            stream = residual_batch.stream_of(forward_batch)
-            if stream.pending is None or stream.pending.update.is_plain_add:
-                attn_backend = get_attn_backend()
-                if isinstance(attn_backend, HybridLinearAttnBackend) and isinstance(
-                    attn_backend.linear_attn_backend, Mamba2AttnBackend
-                ):
-                    from sglang.srt.layers.attention.mamba.nemotron_mamba2_mega import (
-                        maybe_run_sglang,
-                    )
-
-                    hidden, residual = stream.export(hidden_states)
-                    mega_result = maybe_run_sglang(
-                        self,
-                        hidden,
-                        residual,
-                        forward_batch,
-                        attn_backend.linear_attn_backend,
-                    )
-                    if mega_result is not None:
-                        output, residual = mega_result
-                        stream.write(residual)
-                        return self.boundary.finish(output, forward_batch)
-        return super().forward(hidden_states=hidden_states, forward_batch=forward_batch)
-
     def _forward_mixer(
         self,
         hidden_states: torch.Tensor,
@@ -934,6 +872,10 @@ class NemotronHModel(nn.Module):
             self.norm_f = PPMissingLayer(return_tuple=True)
         self.layers_to_capture: set[int] = set()
 
+    @property
+    def supports_hybrid_prefill_graph(self) -> bool:
+        return is_sm120()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -955,9 +897,6 @@ class NemotronHModel(nn.Module):
             )
 
         aux_hidden_states = []
-        if _l2_prefetch_enabled() and not getattr(self, "_l2_prefetch_built", False):
-            self._build_l2_prefetch_blobs()
-
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 hidden_states, snapshot = self.layers[i].boundary.capture_output(
@@ -973,13 +912,6 @@ class NemotronHModel(nn.Module):
                     forward_batch=forward_batch,
                 )
 
-        if (
-            _l2_prefetch_enabled()
-            and _l2_prefetch_stream is not None
-            and forward_batch.forward_mode.is_decode()
-        ):
-            torch.get_device_module().current_stream().wait_stream(_l2_prefetch_stream)
-
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
@@ -993,36 +925,6 @@ class NemotronHModel(nn.Module):
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
-
-    def _build_l2_prefetch_blobs(self) -> None:
-        """Attach the next MoE layer's static shared-expert weight bytes to
-        each mamba layer (flat uint8 views over the contiguous base tensors);
-        best-effort, layers without a compatible next-MoE stay unset."""
-        self._l2_prefetch_built = True
-        for i in range(self.start_layer, self.end_layer - 1):
-            layer = self.layers[i]
-            nxt = self.layers[i + 1]
-            if not isinstance(layer, NemotronHMambaDecoderLayer):
-                continue
-            mixer = getattr(nxt, "mixer", None)
-            shared = getattr(mixer, "shared_experts", None)
-            if shared is None:
-                continue
-            blobs = []
-            for proj_name in ("up_proj", "down_proj"):
-                proj = getattr(shared, proj_name, None)
-                w = getattr(proj, "weight", None)
-                if w is None:
-                    continue
-                base = w if w.is_contiguous() else w.t()
-                if not base.is_contiguous():
-                    continue
-                try:
-                    blobs.append(base.reshape(-1).view(torch.uint8).view(-1))
-                except Exception:
-                    continue
-            if blobs:
-                layer._l2_prefetch_blobs = blobs
 
 
 class NemotronHForCausalLM(nn.Module):
@@ -1070,6 +972,7 @@ class NemotronHForCausalLM(nn.Module):
     ):
         super().__init__()
         lora_config = None
+        self._use_nvfp4_phase_layout = envs.SGLANG_SM120_NVFP4_PHASE_LAYOUT.get()
         self.config = config
         self.quant_config = quant_config
         self.model = self._init_model(
@@ -1241,6 +1144,58 @@ class NemotronHForCausalLM(nn.Module):
                 f"get_hidden_dim not implemented for {module_name}"
             )
 
+    def prepare_for_forward(self, forward_batch: ForwardBatch) -> None:
+        if not getattr(self, "_use_nvfp4_phase_layout", False):
+            return
+        from sglang.kernels.ops.gemm.sm120_nvfp4_moe import Nvfp4LayoutCycle
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            _flashinfer_autotune_active,
+            _sm120_mtp_mma_supported,
+        )
+
+        cycle = getattr(self, "_nvfp4_layout", None)
+        if cycle is None:
+            if not (
+                get_parallel().tp_size
+                == get_parallel().ep_size
+                == get_parallel().pp_size
+                == 1
+                and get_schedule().max_running_requests == 1
+                and _sm120_mtp_mma_supported()
+            ):
+                raise ValueError(
+                    "NVFP4 phase layout requires serial SM120 CUTLASS MoE with TP/EP/PP=1"
+                )
+            experts = [
+                m.experts for m in self.model.modules() if isinstance(m, NemotronHMoE)
+            ]
+            if not experts or not all(
+                getattr(m.quant_method, "enable_flashinfer_cutlass_moe", False)
+                and m.w13_weight.shape == (512, 2688, 512)
+                for m in experts
+            ):
+                raise ValueError(
+                    "NVFP4 phase layout requires compatible native NVFP4 experts"
+                )
+            cycle = self._nvfp4_layout = Nvfp4LayoutCycle(
+                [m.w2_weight for m in experts]
+            )
+            for index, module in enumerate(experts):
+                module._nvfp4_layout_slot = (cycle, index)
+            self._derived_weight_cache_error = (
+                "Online weight updates require disabling NVFP4 phase layout"
+            )
+            self._weight_export_error = (
+                "Weight export requires disabling NVFP4 phase layout"
+            )
+
+        mode = forward_batch.forward_mode
+        cycle.ensure(
+            (mode.is_target_verify() or mode.is_decode_or_idle())
+            and forward_batch.input_ids.numel() <= 4
+            and not _flashinfer_autotune_active()
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -1250,12 +1205,7 @@ class NemotronHForCausalLM(nn.Module):
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: PPProxyTensors | None = None,
     ):
-        if hasattr(self, "_sglang_nvfp4_layout_cycle"):
-            from sglang.srt.model_executor.model_runner_components.nvfp4_layout import (
-                prepare_nvfp4_layout,
-            )
-
-            prepare_nvfp4_layout(self, forward_batch)
+        self.prepare_for_forward(forward_batch)
         hidden_states = self.model.forward(
             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
         )

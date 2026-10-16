@@ -219,19 +219,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
-        self._lm_head_initialized_early = self._init_lossless_lm_head_early()
+        self._lm_head_initialized_early = self._init_shared_lm_head_early()
 
-    def _init_lossless_lm_head_early(self) -> bool:
-        if not envs.SGLANG_SM120_LOSSLESS_BF16_HEAD.get():
-            return False
-        from sglang.srt.models.nemotron_h_mtp import NemotronHForCausalLMMTP
-
+    def _init_shared_lm_head_early(self) -> bool:
         draft_model = self.draft_runner.model
         target_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
         source = getattr(target_head, "_lossless_bf16_source", None)
         if (
-            not isinstance(draft_model, NemotronHForCausalLMMTP)
-            or draft_model._owns_lm_head
+            getattr(draft_model, "_owns_lm_head", True)
             or draft_model.config.tie_word_embeddings
             or self.speculative_algorithm.is_eagle3()
             or get_spec().speculative_token_map is not None

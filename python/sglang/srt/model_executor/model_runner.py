@@ -722,13 +722,6 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
-        from sglang.srt.model_executor.model_runner_components.nvfp4_layout import (
-            initialize_nvfp4_layout,
-        )
-
-        self._sm120_nvfp4_layout = initialize_nvfp4_layout(
-            self.model, is_draft_worker=self.is_draft_worker
-        )
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
@@ -1945,12 +1938,9 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        if getattr(self, "_sm120_nvfp4_layout", None) is not None:
-            from sglang.srt.model_executor.model_runner_components.nvfp4_layout import (
-                prepare_nvfp4_layout,
-            )
-
-            prepare_nvfp4_layout(self.model, forward_batch)
+        prepare = getattr(self.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:

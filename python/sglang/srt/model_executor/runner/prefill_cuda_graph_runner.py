@@ -1696,15 +1696,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        if getattr(self.model_runner, "_sm120_nvfp4_layout", None) is not None:
-            from sglang.srt.model_executor.model_runner_components.nvfp4_layout import (
-                prepare_nvfp4_layout,
-            )
-
-            # Full/BCG prefill capture calls the inner transformer directly.
-            # Restore its original layout before warmup, including recapture
-            # after a decode graph has left the weights in the paired layout.
-            prepare_nvfp4_layout(self.model_runner.model, forward_batch)
+        # Recapture can follow decode replay, which may change model-owned storage.
+        prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(

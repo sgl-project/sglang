@@ -25,15 +25,10 @@ class WeightExporter:
     _weights_send_group: dict = field(default_factory=dict)
 
     def _check_weight_export_supported(self):
-        from sglang.srt.environ import envs
-
-        if envs.SGLANG_SM120_NVFP4_PHASE_LAYOUT.get():
-            raise RuntimeError(
-                "Weight export is not supported while "
-                "SGLANG_SM120_NVFP4_PHASE_LAYOUT is enabled. The live parameter "
-                "buffers can hold the reversible decode layout. Restart with "
-                "the layout cycle disabled before exporting checkpoint weights."
-            )
+        for module in self.get_model().modules():
+            reason = getattr(module, "_weight_export_error", None)
+            if reason is not None:
+                raise RuntimeError(reason)
 
     def init_weights_send_group_for_remote_instance(
         self,

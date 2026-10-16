@@ -63,8 +63,6 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     # fast path; None keeps the CUTLASS-only behavior.
     w13_blockscale_plain: Optional[torch.Tensor] = None
     w2_blockscale_plain: Optional[torch.Tensor] = None
-    is_gated: bool = True
-    activation: Optional[str] = None
     pair_w2_weight: Optional[torch.Tensor] = None
 
 
@@ -301,98 +299,37 @@ def _run_flashinfer_cutlass(
         dispatch_output, quant_info, runner_config
     )
 
-    # Native small-M NVFP4 MoE uses the actual CUTLASS-swizzled scales.
     if (
         quant_info.quant_type == "fp4"
         and not runner_config.is_gated
         and runner_config.activation == "relu2"
-        and x.ndim == 2
-        and 1 <= x.shape[0] <= 4
-        and x.shape[1] == 1024
-        and x_sf is None
-        and x.dtype == output_dtype == torch.bfloat16
         and runner_config.moe_ep_size == runner_config.moe_tp_size == 1
+        and x_sf is None
         and not enable_alltoall
-        and quant_info.w13_weight.shape == (512, 2688, 512)
-        and quant_info.w2_weight.shape == (512, 1024, 1344)
-        and topk_ids.shape == (x.shape[0], 22)
-        and _sm120_mtp_mma_supported()
-        # Keep the original tuning forward: FlashInfer 0.6.18 shares mutable
-        # MoERunner bucket state across target and draft quantization types.
-        # Bypassing target calls during tuning changes draft tactic keys.
-        and not _flashinfer_autotune_active()
+        and is_sm120()
     ):
-        from sglang.kernels.ops.gemm.sm120_nvfp4_moe_mtp_mma import (
-            nvfp4_moe_mtp_mma,
-        )
+        from sglang.kernels.ops.gemm.sm120_nvfp4_moe import try_nvfp4_moe
 
-        qs = quant_info.quant_scales
-        output = nvfp4_moe_mtp_mma(
+        result = try_nvfp4_moe(
             x,
             quant_info.w13_weight,
-            qs[1],
-            quant_info.pair_w2_weight
-            if quant_info.pair_w2_weight is not None
-            else quant_info.w2_weight,
-            qs[4],
-            qs[2],
-            qs[5],
-            qs[0],
-            qs[3],
+            quant_info.w2_weight,
+            quant_info.quant_scales,
             topk_ids,
             topk_weights,
+            output_dtype=output_dtype,
             out=output,
-            pair_layout=quant_info.pair_w2_weight is not None,
+            pair_w2_weight=quant_info.pair_w2_weight,
+            w13_blockscale_plain=quant_info.w13_blockscale_plain,
+            w2_blockscale_plain=quant_info.w2_blockscale_plain,
+            # Preserve FlashInfer target/draft tactic discovery during autotuning.
+            use_mtp=_sm120_mtp_mma_supported() and not _flashinfer_autotune_active(),
+            use_gemv=_sm120_moe_gemv_enabled(),
         )
-        return _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
-
+        if result is not None:
+            return _maybe_apply_routed_scaling_factor(result, quant_info, runner_config)
     if quant_info.pair_w2_weight is not None:
         raise RuntimeError("A paired NVFP4 weight reached an unsupported MoE path")
-
-    # SM120 decode fast path: M=1 NVFP4 non-gated ReLU^2 grouped GEMV.
-    if (
-        quant_info.quant_type == "fp4"
-        and quant_info.w13_blockscale_plain is not None
-        and not runner_config.is_gated
-        and runner_config.activation == "relu2"
-        and x.dim() == 2
-        and x.shape[0] == 1
-        and x_sf is None
-        and x.dtype == torch.bfloat16
-        and runner_config.moe_ep_size == 1
-        and runner_config.moe_tp_size == 1
-        and is_sm120()
-        and not enable_alltoall
-        and _sm120_moe_gemv_enabled()
-    ):
-        from sglang.kernels.ops.gemm.sm120_nvfp4_moe_gemv import (
-            nvfp4_moe_gemv_decode,
-            use_nvfp4_moe_gemv,
-        )
-
-        w13 = quant_info.w13_weight
-        w2 = quant_info.w2_weight
-        n1, k1 = w13.shape[1], w13.shape[2] * 2
-        n2, k2 = w2.shape[1], w2.shape[2] * 2
-        if use_nvfp4_moe_gemv(1, n1, k1, n2, k2):
-            qs = quant_info.quant_scales
-            if output is None:
-                output = torch.empty(1, output_col, dtype=output_dtype, device=x.device)
-            nvfp4_moe_gemv_decode(
-                x,
-                w13,
-                quant_info.w13_blockscale_plain,
-                w2,
-                quant_info.w2_blockscale_plain,
-                qs[2],
-                qs[5],
-                qs[0],
-                qs[3],
-                topk_ids,
-                topk_weights,
-                out=output,
-            )
-            return _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
 
     if output is None:
         with use_symmetric_memory(

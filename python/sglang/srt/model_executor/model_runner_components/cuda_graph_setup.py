@@ -54,7 +54,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_sm120, log_info_on_rank0
+from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -646,8 +646,7 @@ def capture_prefill_graph(
     )
 
     supports_hybrid_graph = (
-        type(layer_model).__name__ == "NemotronHModel"
-        and is_sm120()
+        getattr(layer_model, "supports_hybrid_prefill_graph", False)
         and prefill_backend == Backend.BREAKABLE
         and has_hybrid_graph_handlers(
             attention_layers=model_runner.attention_layers,

@@ -131,66 +131,6 @@ def _trace_e2e_logits(stage: str, **fields) -> None:
     print(f"SGLANG_TRACE_LOGITS_E2E {rank} stage={stage} {details}", flush=True)
 
 
-def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
-    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
-
-
-def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
-    if (
-        quant_method is None
-        or not hasattr(lm_head, "weight")
-        or not callable(getattr(quant_method, "apply", None))
-    ):
-        return False
-
-    method_name = type(quant_method).__name__
-    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
-        return False
-
-    # A shared target lm_head can retain the draft's stale ModelOpt method; use it
-    # only when the runtime tensor layout matches that method.
-    if method_name == "ModelOptFp4LinearMethod":
-        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale",
-                "weight_global_scale",
-                "workspace",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        ):
-            return True
-        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale_interleaved",
-                "alpha",
-                "input_scale_inv",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        )
-    if method_name == "ModelOptNvFp4A16LinearMethod":
-        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale",
-                "weight_global_scale",
-                "workspace",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        )
-    if method_name == "ModelOptFp8LinearMethod":
-        return (
-            lm_head.weight.dtype == torch.float8_e4m3fn
-            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
-        )
-
-    return True
-
-
 # FlashInfer autotune skips the unprofiled LM-head all-gather; its
 # [batch * num_dp_ranks, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
@@ -1014,37 +954,9 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = None
-                if (
-                    hidden_states.dim() == 2
-                    and hidden_states.shape[0] == 1
-                    and hidden_states.is_cuda
-                    and hidden_states.dtype == torch.bfloat16
-                    and lm_head.weight.dtype == torch.bfloat16
-                    and lm_head.weight.is_contiguous()
-                ):
-                    from sglang.srt.layers.quantization.unquant import (
-                        get_bf16_gemm_backend,
-                    )
+                from sglang.srt.layers.quantization.unquant import unquantized_lm_head
 
-                    if get_bf16_gemm_backend().is_gemv():
-                        from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
-                            hopper_bf16_gemv,
-                            use_hopper_bf16_gemv,
-                        )
-                        from sglang.kernels.ops.gemm.sm120_lossless_bf16_head import (
-                            try_lossless_bf16_head,
-                        )
-
-                        logits = try_lossless_bf16_head(hidden_states, lm_head)
-                        if logits is None and use_hopper_bf16_gemv(
-                            1, lm_head.weight.shape[0], lm_head.weight.shape[1]
-                        ):
-                            logits = hopper_bf16_gemv(hidden_states, lm_head.weight)
-                if logits is None:
-                    logits = torch.matmul(
-                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                    )
+                logits = unquantized_lm_head(hidden_states, lm_head)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

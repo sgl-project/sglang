@@ -424,6 +424,27 @@ def get_bf16_gemm_backend() -> Bf16GemmBackend:
     return _BF16_GEMM_BACKEND
 
 
+def unquantized_lm_head(x: torch.Tensor, layer: torch.nn.Module) -> torch.Tensor:
+    if (
+        get_bf16_gemm_backend().is_gemv()
+        and x.ndim == 2
+        and x.shape[0] == 1
+        and x.is_cuda
+        and x.dtype == layer.weight.dtype == torch.bfloat16
+        and layer.weight.is_contiguous()
+    ):
+        from sglang.kernels.ops.gemm.sm120_lossless_bf16_head import (
+            try_lossless_bf16_head,
+        )
+
+        logits = try_lossless_bf16_head(x, layer)
+        if logits is not None:
+            return logits
+        if _use_hopper_bf16_gemv(1, *layer.weight.shape):
+            return _hopper_bf16_gemv(x, layer.weight)
+    return torch.matmul(x.to(layer.weight.dtype), layer.weight.T)
+
+
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
