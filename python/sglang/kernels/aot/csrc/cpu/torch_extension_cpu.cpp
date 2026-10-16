@@ -526,6 +526,9 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
 // shared memory reduce_scatter_tensor
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle = -1);
 
+// pack qkv
+at::Tensor pack_qkv_destination_major_cpu(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, int64_t world_size, at::Tensor& out);
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
@@ -967,6 +970,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op, int handle=-1) -> ()");
   m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
 
+  // pack qkv
+  m.def("pack_qkv_destination_major_cpu(Tensor q, Tensor k, Tensor v, int world_size, Tensor(a!) out) -> Tensor(a!)");
+  m.impl("pack_qkv_destination_major_cpu", torch::kCPU, &pack_qkv_destination_major_cpu);
   // explicit group context initialization
   m.def("shm_group_initialize(str group_name, int group_size, int group_rank) -> int");
 

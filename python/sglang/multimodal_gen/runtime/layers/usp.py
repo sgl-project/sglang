@@ -54,7 +54,7 @@ def uncached_a2a_staging():
 
 # Accelerators whose device module exposes is_current_stream_capturing() and can
 # run the packed-QKV relayout kernel. "cuda" also covers ROCm, where is_cuda is True.
-_A2A_DEVICE_TYPES = ("cuda", "xpu")
+_A2A_DEVICE_TYPES = ("cuda", "xpu", "cpu")
 
 
 def drop_a2a_staging_buffers() -> None:
@@ -441,6 +441,22 @@ def _usp_input_all_to_all_packed_qkv(
                 q.device,
             ),
         )
+    elif (
+        q.device.type == "cpu"
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype
+        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+        and not torch.compiler.is_compiling()
+    ):
+        # CPU C++ fast path.
+        packed = _a2a_staging_buffer(
+            "usp_packed_qkv_src",
+            (world_size, s_local, h_local, 3 * head_size),
+            q.dtype,
+            q.device,
+        )
+
+        torch.ops.sgl_kernel.pack_qkv_destination_major_cpu(q, k, v, world_size, packed)
     else:
         packed = torch.empty(
             (world_size, s_local, h_local, 3 * head_size),
@@ -516,13 +532,22 @@ def _usp_input_all_to_all_qkv(
     b, s_local, h_global, d = q.shape
     h_local = h_global // world_size
     rows = b * s_local
-    packed = pack_qkv_destination_major(
+    pack_fn = (
+        torch.ops.sgl_kernel.pack_qkv_destination_major_cpu
+        if q.device.type == "cpu"
+        else pack_qkv_destination_major
+    )
+
+    packed = pack_fn(
         q.view(rows, h_global, d),
         k.view(rows, h_global, d),
         v.view(rows, h_global, d),
         world_size,
         out=_a2a_staging_buffer(
-            "usp_packed_qkv_src", (world_size, rows, h_local, 3 * d), q.dtype, q.device
+            "usp_packed_qkv_src",
+            (world_size, rows, h_local, 3 * d),
+            q.dtype,
+            q.device,
         ),
     )
     packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
