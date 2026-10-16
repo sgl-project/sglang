@@ -81,10 +81,8 @@ class TestPrefillMmRelease(CustomTestCase):
         mm_inputs = req.multimodal_inputs
         scheduler = _scheduler([])
         streamed_mm_inputs = []
-        scheduler.output_streamer.stream_output.side_effect = (
-            lambda reqs, *_: streamed_mm_inputs.extend(
-                r.multimodal_inputs for r in reqs
-            )
+        scheduler.output_streamer.stream_output.side_effect = lambda reqs, *_: (
+            streamed_mm_inputs.extend(r.multimodal_inputs for r in reqs)
         )
 
         with (

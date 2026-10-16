@@ -120,6 +120,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
+    _release_mm_inputs = Scheduler._release_mm_inputs
 
     def __init__(
         self,
