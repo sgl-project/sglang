@@ -429,11 +429,16 @@ class Conversation:
         """Append a new image."""
         self.image_data.append(ImageData(url=image, detail=detail))
 
-    def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
+    def append_video(
+        self,
+        video: str,
+        preprocess_kwargs: Optional[Dict] = None,
+        cache_id: Optional[str] = None,
+    ):
         """Append a new video."""
-        if preprocess_kwargs:
+        if preprocess_kwargs or cache_id is not None:
             self.video_data.append(
-                VideoData(video, preprocess_kwargs=preprocess_kwargs)
+                VideoData(video, preprocess_kwargs=preprocess_kwargs, cache_id=cache_id)
             )
         else:
             self.video_data.append(video)
@@ -695,6 +700,7 @@ def generate_chat_conv(
                         conv.append_video(
                             content.video_url.url,
                             preprocess_kwargs=preprocess_kwargs or None,
+                            cache_id=content.video_url.cache_id,
                         )
                     elif content.type == "audio_url":
                         real_content += audio_token

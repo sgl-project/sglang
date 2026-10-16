@@ -366,6 +366,94 @@ response = requests.post(url, json=data)
 print(response.text)
 ```
 
+### Reuse Qwen2.5-VL video preprocessing with caller IDs
+
+For repeated questions about the same video, you can attach an opaque `cache_id`
+to skip media reading, decoding, frame sampling, and Hugging Face preprocessing
+when the video artifact is cached. SGLang rebuilds prompt tokens and mRoPE
+positions for each question. Requests without a video `cache_id` keep their
+existing processing behavior.
+
+This opt-in supports Qwen2.5-VL requests containing videos and text through a local
+Python multimodal processor. Other models, mixed image/audio requests, and
+encoder-disaggregated requests with IDs are rejected with HTTP 400.
+
+The following launch example targets Linux with one NVIDIA CUDA GPU (`--tp 1`)
+and the public Hugging Face model `Qwen/Qwen2.5-VL-3B-Instruct`. It requires the
+normal SGLang video decoding dependencies; no Hugging Face token is needed for
+this public model.
+
+```bash Enable caller video IDs
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-VL-3B-Instruct \
+  --tp 1 --host 127.0.0.1 --port 30000 \
+  --trust-mm-cache-ids \
+  --mm-preprocess-cache-size-mb 256
+```
+
+Only enable `--trust-mm-cache-ids` for callers you trust to identify immutable
+media correctly. IDs are not content digests: a cache hit does not read or verify
+the URL. Give changed video contents a new ID, even when the URL stays the same.
+Each request must include a non-empty `cache_salt` identifying its tenant or
+application namespace. Your authenticated application must assign this namespace;
+`cache_salt` itself does not authenticate or authorize a caller.
+
+```python Ask about a cached video
+import requests
+
+video_url = "https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4"
+response = requests.post(
+    "http://127.0.0.1:30000/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "cache_salt": "tenant-a",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {
+                    "url": video_url,
+                    "cache_id": "ipod-presentation-v1",
+                    "fps": 2,
+                    "max_frames": 32,
+                }},
+                {"type": "text", "text": "What is the presenter holding?"},
+            ],
+        }],
+        "max_tokens": 128,
+    },
+    timeout=120,
+)
+response.raise_for_status()
+print(response.json())
+```
+
+Reuse the same ID, namespace, and preprocessing settings for subsequent questions.
+IDs must be non-empty strings of at most 256 characters. Different namespaces,
+processor configurations, or effective video settings produce separate cache
+entries. For chat requests, `fps` and `max_frames` can override the server's video
+settings. The native `/generate` API accepts the same ID in each `video_data`
+object, with per-video options inside `preprocess_kwargs`:
+
+```json Native video fields
+{
+  "video_data": [{
+    "url": "/absolute/path/to/video.mp4",
+    "cache_id": "clip-v1",
+    "preprocess_kwargs": {"fps": 2, "max_frames": 32}
+  }],
+  "cache_salt": "tenant-a"
+}
+```
+
+Include your normal text or token-ID prompt and sampling parameters in the native
+request, with one unexpanded Qwen video placeholder per video. Keep a valid URL
+in every request: cache entries can be evicted, flushed, or absent from another
+tokenizer worker. The CPU artifact cache uses the configured multimodal cache
+budget, shared with image artifacts and divided between tokenizer workers.
+Concurrent requests for the same entry share preprocessing; cancelling one
+request does not cancel another request's work. `/flush_cache` also clears these
+artifacts. Supplying IDs when the flag or cache is disabled returns HTTP 400.
+
 ## Serving the LLM tower of Cosmos3 checkpoints
 
 `nvidia/Cosmos3-Nano` and `nvidia/Cosmos3-Edge` are unified world-model checkpoints in a diffusers layout, so `sglang serve` routes them to the diffusion runtime by default (see the [Cosmos3 cookbook page](/cookbook/diffusion/Cosmos/Cosmos3) for media generation). To serve the understanding tower as a vision-language model instead, force the LLM backend with `--model-type llm`:
