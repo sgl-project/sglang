@@ -48,6 +48,9 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.parallel_image_preprocess import (
+    maybe_enable_parallel_image_preprocess,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -375,6 +378,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         if hf_config.model_type == "qwen3_omni_moe":
             hf_config = hf_config.thinker_config
 
+        # Swap in the parallel image processor before the base class builds its
+        # processor worker pool, so every clone it takes carries the swap.
+        maybe_enable_parallel_image_preprocess(_processor)
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
