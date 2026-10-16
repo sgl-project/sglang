@@ -203,7 +203,11 @@ _npu_all_gather_base_mm = None
 if is_npu():
     try:
         import torch_npu  # noqa: F401
+        import acl
 
+        # arch35 (Ascend 950) MC2 fused ops accumulate at lower GEMM precision
+        # and regress model accuracy; keep the plain collective fallback there.
+        _is_npu_arch35 = acl.rt.get_device_info(0, 601) == (3510, 0)
         _npu_mm_reduce_scatter_base = getattr(
             torch_npu, "npu_mm_reduce_scatter_base", None
         )
@@ -211,6 +215,7 @@ if is_npu():
         _HAS_NPU_MC2_FUSED = (
             _npu_mm_reduce_scatter_base is not None
             and _npu_all_gather_base_mm is not None
+            and not _is_npu_arch35
         )
     except Exception:
         _HAS_NPU_MC2_FUSED = False
