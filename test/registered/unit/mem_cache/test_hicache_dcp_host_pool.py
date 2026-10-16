@@ -10,12 +10,15 @@ pool sizing, and that the transfer entry points hand *physical* rows to the
 kernels.
 """
 
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -141,6 +144,55 @@ class TestDcpKernelIndices(CustomTestCase):
 
 
 class TestHostPoolSizingUnderDcp(CustomTestCase):
+    @staticmethod
+    def _attach_storage(pool, mode="cache"):
+        cc = HiCacheController.__new__(HiCacheController)
+        cc.mem_pool_host = cc.storage_host_pool = pool
+        cc.page_size = pool.logical_page_size
+        cc.enable_storage = False
+        cc.host_memory_mode = mode
+        cc.storage_stop_event = threading.Event()
+        cc._stop_storage_threads = mock.Mock()
+        cc._start_storage_threads = mock.Mock()
+        cc._create_sync_groups = mock.Mock(return_value=[])
+        cc._generate_storage_config = mock.Mock()
+        with (
+            mock.patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=pool.dcp_size),
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend"
+            ),
+        ):
+            cc.attach_storage_backend("file")
+        return cc
+
+    def test_prefetch_throttles_at_half_the_logical_capacity(self):
+        for dcp_size in (1, 2, 8):
+            with self.subTest(dcp_size=dcp_size):
+                pool = _make_host_pool(0, dcp_size=dcp_size)
+                cc = self._attach_storage(pool)
+
+                # The pool has an odd number of pages. Fill just below half,
+                # then cross the threshold with one more logical page.
+                half_pages = pool.logical_size // pool.logical_page_size // 2
+                indices = pool.alloc(half_pages * pool.logical_page_size)
+                self.assertIsNotNone(indices)
+                cc.prefetch_tokens_occupied = len(indices)
+                self.assertFalse(cc.prefetch_rate_limited())
+                next_page = pool.alloc(pool.logical_page_size)
+                self.assertIsNotNone(next_page)
+                cc.prefetch_tokens_occupied += len(next_page)
+                self.assertTrue(cc.prefetch_rate_limited())
+
+    def test_runtime_attach_rejects_dcp_buffer_only(self):
+        for dcp_size in (2, 8):
+            with self.subTest(dcp_size=dcp_size):
+                pool = _make_host_pool(0, dcp_size=dcp_size)
+                with self.assertRaisesRegex(NotImplementedError, "buffer_only"):
+                    self._attach_storage(pool, mode="buffer_only")
+
     def test_logical_and_physical_sizing(self):
         pool = _make_host_pool(dcp_rank=3)
         # kernel-facing page is physical

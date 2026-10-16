@@ -844,6 +844,7 @@ class TestDcpStorage(unittest.TestCase):
                 host.layout = "page_first_kv_split"
             cc = HiCacheController.__new__(HiCacheController)
             cc.enable_storage = False
+            cc.host_memory_mode = "cache"
             cc.storage_host_pool = object() if case == "non_mla" else host
             entries = [SimpleNamespace(name=PoolName.KV, host_pool=host)]
             if case in ("extra_pool", "wrong_pool", "file_kda", "mooncake_kda"):

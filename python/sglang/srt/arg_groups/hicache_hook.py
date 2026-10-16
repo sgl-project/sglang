@@ -113,6 +113,13 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
+    if (
+        cfg.hicache_storage_backend is not None
+        and cfg.hicache_host_memory_mode == "buffer_only"
+    ):
+        raise NotImplementedError(
+            "HiCache L3 with DCP does not support buffer_only host memory."
+        )
     if cfg.speculative_algorithm not in (None, "DSPARK"):
         raise NotImplementedError(
             "HiCache with --dcp-size > 1 only supports DSPARK speculative "

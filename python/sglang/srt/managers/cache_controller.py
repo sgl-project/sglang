@@ -549,6 +549,11 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
         if get_parallel().attn_dcp_size > 1:
+            if self.host_memory_mode == "buffer_only":
+                # Buffer-mode write staging still budgets physical host rows.
+                raise NotImplementedError(
+                    "HiCache L3 with DCP does not support buffer_only host memory."
+                )
             from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
@@ -624,8 +629,11 @@ class HiCacheController:
                     HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
                 )
             else:
-                # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+                # Leave half the pool for write-back. Prefetch occupancy counts
+                # logical tokens, not physical rows on each DCP rank.
+                self.prefetch_capacity_limit = int(
+                    0.5 * self.mem_pool_host.logical_size
+                )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 

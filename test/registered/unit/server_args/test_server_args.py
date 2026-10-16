@@ -2345,6 +2345,26 @@ class TestHiCacheArgs(CustomTestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_dcp_storage_rejects_buffer_only(self):
+        for dcp_size in (2, 8):
+            for backend in ("file", "mooncake"):
+                with self.subTest(dcp_size=dcp_size, backend=backend):
+                    args = self._make_args(
+                        enable_hierarchical_cache=True,
+                        hicache_host_memory_mode="buffer_only",
+                        hicache_storage_backend=backend,
+                        dcp_size=dcp_size,
+                        tp_size=dcp_size,
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                            return_value=True,
+                        ),
+                        self.assertRaisesRegex(NotImplementedError, "buffer_only"),
+                    ):
+                        handle_hicache(args)
+
     def test_buffer_only_resolves_write_back_to_write_through(self):
         """buffer_only has no retained host tier for write_back to defer
         writes into, so the mode resolves that policy to write_through
