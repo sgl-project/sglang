@@ -423,6 +423,16 @@ class UnifiedKvMetadata:
     gasm_kv_indptr: Optional[torch.Tensor] = None
     gasm_qo_indptr: Optional[torch.Tensor] = None
 
+    # Grouped target-verify streams for the FlyDSL fp8 decode: one per request
+    # on HCA / SWA-only layers, with per-draft key ranges (q_kv_bounds).
+    grp_qo_indptr: Optional[torch.Tensor] = None
+    grp_hca_indices: Optional[torch.Tensor] = None
+    grp_hca_indptr: Optional[torch.Tensor] = None
+    grp_hca_bounds: Optional[torch.Tensor] = None
+    grp_swa_indices: Optional[torch.Tensor] = None
+    grp_swa_indptr: Optional[torch.Tensor] = None
+    grp_swa_bounds: Optional[torch.Tensor] = None
+
     # prefill/extend per-token mapping
     pf_state_slot: Optional[torch.Tensor] = None
     pf_chunk_start: Optional[torch.Tensor] = None
@@ -451,6 +461,13 @@ class UnifiedKvMetadata:
                 "gasm_indices",
                 "gasm_kv_indptr",
                 "gasm_qo_indptr",
+                "grp_qo_indptr",
+                "grp_hca_indices",
+                "grp_hca_indptr",
+                "grp_hca_bounds",
+                "grp_swa_indices",
+                "grp_swa_indptr",
+                "grp_swa_bounds",
                 "csa_indices",
                 "csa_indptr",
                 "pf_state_slot",
@@ -483,6 +500,13 @@ class UnifiedKvMetadata:
                 "gasm_indices",
                 "gasm_kv_indptr",
                 "gasm_qo_indptr",
+                "grp_qo_indptr",
+                "grp_hca_indices",
+                "grp_hca_indptr",
+                "grp_hca_bounds",
+                "grp_swa_indices",
+                "grp_swa_indptr",
+                "grp_swa_bounds",
                 "csa_indices",
                 "csa_indptr",
                 "pf_state_slot",
