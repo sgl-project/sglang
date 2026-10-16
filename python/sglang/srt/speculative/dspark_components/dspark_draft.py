@@ -20,7 +20,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -201,7 +200,7 @@ def _draft_step(
     logits_out: Optional[torch.Tensor],
     top_prob_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if logits_out is None and top_prob_out is None and len(prev_tokens) == 1:
+    if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
         w2_weight = markov_head.greedy_w2_weight()
         # The kernel reads one w2 row per base-logit column.
@@ -210,6 +209,7 @@ def _draft_step(
                 base_logits=base_logits,
                 prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
                 w2_weight=w2_weight,
+                top_prob_out=top_prob_out,
             )
             return tokens, state
     bias, state = markov_head.step_bias(
@@ -339,6 +339,7 @@ class DraftBlockProposer:
         random_seed: int,
         greedy_draft: bool,
         dp_moe_sync: bool = False,
+        track_top_probs: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -349,7 +350,7 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
         self._greedy_draft = greedy_draft
-        self._track_top_probs = get_spec().speculative_adaptive_verification
+        self._track_top_probs = track_top_probs
         self._noise = DraftNoise(
             key=draft_noise_key(random_seed),
             offset=torch.zeros(

@@ -5,7 +5,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -32,6 +31,7 @@ class DsparkDraftSampler:
         noise: DraftNoise,
         tp_sync: SpecTpSync,
         greedy_draft: bool,
+        track_top_probs: bool = False,
         out=None,
     ):
         self.model = model
@@ -62,7 +62,7 @@ class DsparkDraftSampler:
             )
         self.top_probs_out = (
             torch.empty((self.max_bs, self.gamma), dtype=torch.float32, device=device)
-            if get_spec().speculative_adaptive_verification
+            if track_top_probs
             else None
         )
         self.greedy_draft = greedy_draft
@@ -152,6 +152,7 @@ def maybe_build_draft_sampler(
     noise: DraftNoise,
     greedy_draft: bool,
     tp_sync: SpecTpSync,
+    track_top_probs: bool = False,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
@@ -179,5 +180,6 @@ def maybe_build_draft_sampler(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        track_top_probs=track_top_probs,
         out=out,
     )

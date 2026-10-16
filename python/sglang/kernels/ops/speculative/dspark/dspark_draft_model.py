@@ -33,13 +33,14 @@ class MarkovGreedyStep:
         base_logits: torch.Tensor,
         prev_embeds: torch.Tensor,
         w2_weight: torch.Tensor,
+        top_prob_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if base_logits.is_cuda:
-            return cls.triton(
-                base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
-            )
-        return cls.torch(
-            base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
+        impl = cls.triton if base_logits.is_cuda else cls.torch
+        return impl(
+            base_logits=base_logits,
+            prev_embeds=prev_embeds,
+            w2_weight=w2_weight,
+            top_prob_out=top_prob_out,
         )
 
     @classmethod
@@ -49,9 +50,13 @@ class MarkovGreedyStep:
         base_logits: torch.Tensor,
         prev_embeds: torch.Tensor,
         w2_weight: torch.Tensor,
+        top_prob_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return markov_greedy_step(
-            base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
+            base_logits=base_logits,
+            prev_embeds=prev_embeds,
+            w2_weight=w2_weight,
+            top_prob_out=top_prob_out,
         )
 
     @classmethod
@@ -61,9 +66,13 @@ class MarkovGreedyStep:
         base_logits: torch.Tensor,
         prev_embeds: torch.Tensor,
         w2_weight: torch.Tensor,
+        top_prob_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return markov_greedy_step_triton(
-            base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
+            base_logits=base_logits,
+            prev_embeds=prev_embeds,
+            w2_weight=w2_weight,
+            top_prob_out=top_prob_out,
         )
 
 
@@ -72,8 +81,11 @@ def markov_greedy_step(
     base_logits: torch.Tensor,
     prev_embeds: torch.Tensor,
     w2_weight: torch.Tensor,
+    top_prob_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     step_logits = base_logits + F.linear(prev_embeds, w2_weight)
+    if top_prob_out is not None:
+        top_prob_out.copy_(torch.softmax(step_logits.float(), dim=-1).amax(dim=-1))
     return torch.argmax(step_logits, dim=-1)
 
 
@@ -84,6 +96,7 @@ def _markov_greedy_partial_kernel(
     w2_ptr,
     tile_val_ptr,
     tile_idx_ptr,
+    tile_sum_ptr,
     V,
     R,
     stride_base_row,
@@ -92,6 +105,7 @@ def _markov_greedy_partial_kernel(
     n_tiles,
     BLOCK_V: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    HAS_PROB: tl.constexpr,
 ):
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -119,15 +133,21 @@ def _markov_greedy_partial_kernel(
     idx = tl.where(score == tile_best, offs_v, _IDX_SENTINEL)
     tl.store(tile_val_ptr + row * n_tiles + tile, tile_best)
     tl.store(tile_idx_ptr + row * n_tiles + tile, tl.min(idx, axis=0))
+    if HAS_PROB:
+        tile_sum = tl.sum(tl.where(mask_v, tl.exp(score - tile_best), 0.0), axis=0)
+        tl.store(tile_sum_ptr + row * n_tiles + tile, tile_sum)
 
 
 @triton.jit
 def _markov_greedy_combine_kernel(
     tile_val_ptr,
     tile_idx_ptr,
+    tile_sum_ptr,
     next_tokens_ptr,
+    top_prob_ptr,
     n_tiles,
     BLOCK_TILES: tl.constexpr,
+    HAS_PROB: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_TILES)
@@ -138,6 +158,10 @@ def _markov_greedy_combine_kernel(
     # Lowest global index among equal-valued tiles, matching torch.argmax.
     cand = tl.where(vals == best, idxs, _IDX_SENTINEL)
     tl.store(next_tokens_ptr + row, tl.min(cand, axis=0).to(tl.int64))
+    if HAS_PROB:
+        sums = tl.load(tile_sum_ptr + row * n_tiles + offs, mask=mask, other=0.0)
+        total = tl.sum(tl.where(mask, sums * tl.exp(vals - best), 0.0), axis=0)
+        tl.store(top_prob_ptr + row, tl.where(total > 0, 1.0 / total, 0.0))
 
 
 def markov_greedy_step_triton(
@@ -145,6 +169,7 @@ def markov_greedy_step_triton(
     base_logits: torch.Tensor,
     prev_embeds: torch.Tensor,
     w2_weight: torch.Tensor,
+    top_prob_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     bs, vocab = base_logits.shape
     rank = w2_weight.shape[1]
@@ -157,6 +182,12 @@ def markov_greedy_step_triton(
     tile_vals = torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
     tile_idxs = torch.empty((bs, n_tiles), dtype=torch.int32, device=device)
     next_tokens = torch.empty((bs,), dtype=torch.int64, device=device)
+    has_prob = top_prob_out is not None
+    tile_sums = (
+        torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
+        if has_prob
+        else tile_vals
+    )
 
     _markov_greedy_partial_kernel[(bs, n_tiles)](
         base_logits,
@@ -164,6 +195,7 @@ def markov_greedy_step_triton(
         w2_weight,
         tile_vals,
         tile_idxs,
+        tile_sums,
         vocab,
         rank,
         base_logits.stride(0),
@@ -172,13 +204,17 @@ def markov_greedy_step_triton(
         n_tiles,
         BLOCK_V=_MARKOV_BLOCK_V,
         BLOCK_R=_MARKOV_BLOCK_R,
+        HAS_PROB=has_prob,
     )
     _markov_greedy_combine_kernel[(bs,)](
         tile_vals,
         tile_idxs,
+        tile_sums,
         next_tokens,
+        top_prob_out if has_prob else tile_vals,
         n_tiles,
         BLOCK_TILES=triton.next_power_of_2(n_tiles),
+        HAS_PROB=has_prob,
     )
     return next_tokens
 

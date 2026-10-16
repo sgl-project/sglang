@@ -335,6 +335,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             random_seed=target_worker.random_seed,
             greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
+            track_top_probs=get_spec().speculative_adaptive_verification,
         )
         self._verify_epilogue = None
         target_is_dsv41 = (
@@ -549,6 +550,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             noise=self._proposer.noise,
             greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
+            track_top_probs=get_spec().speculative_adaptive_verification,
             out=(
                 self._verify_epilogue.draft_tokens_buf
                 if self._verify_epilogue is not None

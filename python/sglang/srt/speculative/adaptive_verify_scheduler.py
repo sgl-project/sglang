@@ -37,13 +37,14 @@ _EMA_WEIGHT = 0.1
 
 
 class _ResidualCost:
-    """Step time outside target verify per batch size, measured on TP rank 0."""
+    """Step time outside target verify per (batch size, trimmed), measured on TP
+    rank 0; a trimmed step also pays for packing its verify window."""
 
     def __init__(self, *, tp_group, is_rank0: bool) -> None:
         self._tp_group = tp_group
         self._is_rank0 = is_rank0
-        self._local: dict[int, tuple[float, int]] = {}
-        self._synced: dict[int, float] = {}
+        self._local: dict[tuple[int, bool], tuple[float, int]] = {}
+        self._synced: dict[tuple[int, bool], float] = {}
         self._inflight: deque = deque()
         self._steps = 0
 
@@ -59,19 +60,20 @@ class _ResidualCost:
         *,
         start: Optional[torch.cuda.Event],
         num_reqs: int,
+        trimmed: bool,
         verify_cost_ms: float,
     ) -> None:
         if start is not None:
             end = torch.cuda.Event(enable_timing=True)
             end.record()
-            self._inflight.append((start, end, num_reqs, verify_cost_ms))
+            self._inflight.append((start, end, (num_reqs, trimmed), verify_cost_ms))
             self._drain()
         self._steps += 1
         if self._steps % _RESIDUAL_SYNC_INTERVAL == 0:
             self._synced = self._tp_group.broadcast_object(
                 {
-                    bs: value
-                    for bs, (value, count) in self._local.items()
+                    key: value
+                    for key, (value, count) in self._local.items()
                     if count >= _MIN_RESIDUAL_SAMPLES
                 },
                 src=0,
@@ -79,27 +81,28 @@ class _ResidualCost:
 
     def _drain(self) -> None:
         while self._inflight and self._inflight[0][1].query():
-            start, end, num_reqs, verify_cost_ms = self._inflight.popleft()
+            start, end, key, verify_cost_ms = self._inflight.popleft()
             residual = max(start.elapsed_time(end) - verify_cost_ms, 0.0)
-            value, count = self._local.get(num_reqs, (residual, 0))
+            value, count = self._local.get(key, (residual, 0))
             if count:
                 value = (1.0 - _EMA_WEIGHT) * value + _EMA_WEIGHT * residual
-            self._local[num_reqs] = (value, count + 1)
+            self._local[key] = (value, count + 1)
 
-    def lookup(self, num_reqs: int) -> Optional[float]:
-        if num_reqs in self._synced:
-            return self._synced[num_reqs]
-        known = sorted(self._synced)
+    def lookup(self, num_reqs: int, *, trimmed: bool) -> Optional[float]:
+        known = sorted(bs for bs, flag in self._synced if flag == trimmed)
         if not known:
             return None
         pos = bisect.bisect_left(known, num_reqs)
+        if pos < len(known) and known[pos] == num_reqs:
+            return self._synced[(num_reqs, trimmed)]
         if pos == 0:
-            return self._synced[known[0]]
+            return self._synced[(known[0], trimmed)]
         if pos == len(known):
-            return self._synced[known[-1]]
+            return self._synced[(known[-1], trimmed)]
         lo, hi = known[pos - 1], known[pos]
         frac = (num_reqs - lo) / (hi - lo)
-        return self._synced[lo] + frac * (self._synced[hi] - self._synced[lo])
+        lo_value, hi_value = self._synced[(lo, trimmed)], self._synced[(hi, trimmed)]
+        return lo_value + frac * (hi_value - lo_value)
 
 
 class AdaptiveVerifyScheduler:
@@ -232,6 +235,7 @@ class AdaptiveVerifyScheduler:
         self._residual.end(
             start=start,
             num_reqs=num_reqs,
+            trimmed=layout is not None,
             verify_cost_ms=(
                 self._uniform_costs[slots]
                 if layout is None
@@ -246,14 +250,14 @@ class AdaptiveVerifyScheduler:
             and self._num_planned % self._log_interval == 0
         )
 
-    def log_state(self, *, slope: float, intercepts: list[float]) -> None:
+    def log_state(self, *, estimator) -> None:
         logger.info(
             "Adaptive verification: steps=%d verify_token_ratio=%.3f slope=%.4f "
             "intercepts=%s",
             self._num_planned,
             self._num_scheduled_tokens / max(self._num_full_tokens, 1),
-            slope,
-            [round(v, 4) for v in intercepts],
+            float(estimator.slope.item()),
+            [round(v, 4) for v in estimator.intercepts.tolist()],
         )
 
     def _profile_verify_costs(
@@ -338,14 +342,18 @@ class AdaptiveVerifyScheduler:
     def _cost_table(
         self, *, num_reqs: int, slots: int, tiers: list[int]
     ) -> Optional[SpsAdditiveCostTable]:
-        residual = self._residual.lookup(num_reqs)
+        residual = self._residual.lookup(num_reqs, trimmed=False)
         if residual is None or not tiers:
             return None
+        trimmed_residual = self._residual.lookup(num_reqs, trimmed=True)
+        trim_overhead = 0.0 if trimmed_residual is None else trimmed_residual - residual
         return SpsAdditiveCostTable(
             bias_seconds=max(residual, 1e-3) / 1000.0,
             bs_probes=[num_reqs],
             alpha_seconds=[0.0],
             m_probes=tiers + [num_reqs * self.num_draft_tokens],
-            theta_seconds=[self._tier_costs[(slots, t)] / 1000.0 for t in tiers]
+            theta_seconds=[
+                (self._tier_costs[(slots, t)] + trim_overhead) / 1000.0 for t in tiers
+            ]
             + [self._uniform_costs[slots] / 1000.0],
         )

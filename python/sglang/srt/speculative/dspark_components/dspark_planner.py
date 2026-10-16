@@ -262,10 +262,7 @@ class DSparkVerifyPlanner:
             self._adaptive_scheduler is not None
             and self._adaptive_scheduler.should_log()
         ):
-            self._adaptive_scheduler.log_state(
-                slope=float(self._acceptance_estimator.slope.item()),
-                intercepts=self._acceptance_estimator.intercepts.tolist(),
-            )
+            self._adaptive_scheduler.log_state(estimator=self._acceptance_estimator)
 
     @property
     def schedules_verify_budget(self) -> bool:

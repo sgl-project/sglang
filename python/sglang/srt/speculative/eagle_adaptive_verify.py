@@ -174,10 +174,7 @@ class EagleAdaptiveVerifier:
             start=timer_start, num_reqs=step.num_reqs, layout=step.layout
         )
         if self.scheduler.should_log():
-            self.scheduler.log_state(
-                slope=float(self.estimator.slope.item()),
-                intercepts=self.estimator.intercepts.tolist(),
-            )
+            self.scheduler.log_state(estimator=self.estimator)
 
     def _build_forward(
         self,

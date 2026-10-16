@@ -261,11 +261,46 @@ def _alloc_stats(base_logits: torch.Tensor, *, enabled: bool):
     )
 
 
+@triton.jit
+def _top_prob_combine_kernel(
+    STATS,
+    OUT,
+    OUT_STRIDE,
+    ROWS,
+    PARTS: tl.constexpr,
+    WORLD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    i = tl.arange(0, BLOCK)
+    valid = i < PARTS * WORLD
+    rank, part = i // PARTS, i % PARTS
+    offset = ((rank * ROWS + row) * PARTS + part) * 2
+    block_max = tl.load(STATS + offset, valid, -float("inf"))
+    block_sum = tl.load(STATS + offset + 1, valid, 0.0)
+    row_max = tl.max(block_max, 0)
+    safe_max = tl.where(row_max == -float("inf"), 0.0, row_max)
+    total = tl.sum(tl.where(valid, block_sum * tl.exp(block_max - safe_max), 0.0), 0)
+    tl.store(OUT + row * OUT_STRIDE, tl.where(total > 0, 1.0 / total, 0.0))
+
+
 def _write_top_prob(*, stats, gather, rows: int, out: torch.Tensor) -> None:
     parts = stats.shape[1]
     flat = stats.reshape(rows, parts * 2)
     gathered = flat if gather is None else gather(flat)
-    blocks = gathered.view(-1, rows, parts, 2).transpose(0, 1).reshape(rows, -1, 2)
+    world = gathered.shape[0] // rows
+    if gathered.is_cuda:
+        _top_prob_combine_kernel[(rows,)](
+            gathered,
+            out,
+            out.stride(0),
+            rows,
+            parts,
+            world,
+            triton.next_power_of_2(parts * world),
+        )
+        return
+    blocks = gathered.view(world, rows, parts, 2).transpose(0, 1).reshape(rows, -1, 2)
     block_max, block_sum = blocks[..., 0], blocks[..., 1]
     row_max = block_max.amax(dim=1, keepdim=True)
     safe_max = torch.where(torch.isfinite(row_max), row_max, 0.0)

@@ -278,6 +278,27 @@ class TestMarkovSampleStep(CustomTestCase):
             top = run(rank, lambda _: next(replies))
             torch.testing.assert_close(top, expected, atol=1e-5, rtol=1e-4)
 
+    def test_greedy_step_top_prob_matches_softmax(self):
+        # The fused greedy step must report the softmax top-1 probability of the
+        # same fp32 step logits it argmaxes, across vocab tiles.
+        from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+            MarkovGreedyStep,
+        )
+
+        g = torch.Generator(device=DEVICE).manual_seed(3)
+        base = torch.randn(1, 9000, generator=g, device=DEVICE) * 3
+        embeds = torch.randn(1, 40, generator=g, device=DEVICE)
+        w2 = torch.randn(9000, 40, generator=g, device=DEVICE) * 0.1
+        top = torch.empty(1, device=DEVICE)
+        tokens = MarkovGreedyStep.triton(
+            base_logits=base, prev_embeds=embeds, w2_weight=w2, top_prob_out=top
+        )
+        logits = base + embeds @ w2.T
+        self.assertEqual(tokens.tolist(), logits.argmax(dim=1).tolist())
+        torch.testing.assert_close(
+            top, torch.softmax(logits, dim=1).amax(dim=1), atol=1e-5, rtol=1e-4
+        )
+
     def test_kept_sharded_logits_match_full_vocab(self):
         # Kept logits are gathered whole and every rank picks from them: the
         # same tokens and the same logits as the full vocab, both backends.
