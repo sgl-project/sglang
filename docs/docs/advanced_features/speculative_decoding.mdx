@@ -431,6 +431,32 @@ Greedy requests keep their existing verification behavior.
 Block verification adds vocabulary reductions during verification. Benchmark your
 model and workload to measure the effect on latency and throughput.
 
+---
+
+## Confidence-scheduled verification (DSpark)
+
+With `SGLANG_RAGGED_VERIFY_MODE=compact`, a DSpark server verifies only a prefix of
+each request's draft. Every draft position gets a confidence; a running product
+along the draft gives its survival, and the step's verify budget goes to the most
+likely slots across the batch. The budget is sized against a step-cost table that
+`python -m sglang.benchmark.dspark_sps_profiler` measures for your model and GPU;
+pass it with `--speculative-dspark-sps-table-path`. Without a table every draft
+token is verified.
+
+`--speculative-dspark-confidence-source` picks where the confidences come from:
+
+- `head`: the trained confidence head that DSpark checkpoints may ship.
+- `online`: an estimator fitted while serving,
+  `sigmoid(slope * logit(q_max) + intercept[position])`, where `q_max` is the draft
+  distribution's top probability. It refits every 100 decode steps from the target's
+  accept/reject outcomes, so it calibrates to the model pair and the live workload.
+- `auto` (default): the head when the checkpoint ships one, otherwise `online`.
+
+Both sources are lossless. A position's confidence never reads the token drafted
+there, and the budget is sized from confidences two decode steps old, so trimming
+cannot select on the drafted tokens. The trimmed draft composes with
+`--speculative-use-block-verification`.
+
 ## Multi Token Prediction
 
 We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [DeepSeek-V3.2 cookbook §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2#4-2-3-multi-token-prediction-eagle-speculative-decoding)).

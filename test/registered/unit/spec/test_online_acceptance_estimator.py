@@ -133,6 +133,49 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
         self.assertAlmostEqual(float(est.slope), true_slope, delta=0.03)
         torch.testing.assert_close(est.intercepts, true_intercepts, atol=0.08, rtol=0)
 
+    def test_calibrated_in_the_large_when_acceptance_saturates(self):
+        """Acceptance of a confident draft tops out at the target's own entropy,
+        which logit(q_max) cannot express. Each position's mean prediction must
+        still match its observed acceptance: the budget sums these."""
+        torch.manual_seed(2)
+        gamma, bs, steps, ceiling = 3, 128, 1500, 0.8
+        true_intercepts = torch.tensor([0.5, 0.0, -0.5])
+        est = self._estimator(gamma=gamma)
+
+        def batch():
+            confident = torch.rand(bs, 1) < 0.5
+            centers = torch.where(confident, torch.tensor(12.0), torch.tensor(1.0))
+            features = (centers + torch.randn(bs, gamma) * 3.0).clamp(min=0.0)
+            accept_prob = ceiling * torch.sigmoid(0.5 * features + true_intercepts)
+            return features, accept_prob
+
+        for _ in range(steps):
+            features, accept_prob = batch()
+            est.predict(
+                step_logits=_two_token_logits(features),
+                temperatures=torch.ones(bs),
+                greedy_mask=torch.zeros(bs, dtype=torch.bool),
+            )
+            accepted = torch.rand(bs, gamma) < accept_prob
+            est.observe(
+                num_correct_drafts=torch.cumprod(accepted.long(), dim=1).sum(dim=1),
+                num_graded_drafts=torch.full((bs,), gamma),
+            )
+        features, accept_prob = batch()
+        predicted = est.predict(
+            step_logits=_two_token_logits(features),
+            temperatures=torch.ones(bs),
+            greedy_mask=torch.zeros(bs, dtype=torch.bool),
+        )
+        est.skip_observe()
+        # Expected accepted drafts per request, the quantity the budget ranks.
+        expected = torch.cumprod(accept_prob, dim=1).sum(dim=1).mean()
+        self.assertAlmostEqual(
+            float(torch.cumprod(predicted, dim=1).sum(dim=1).mean()),
+            float(expected),
+            delta=0.08,
+        )
+
     def test_unlabeled_positions_do_not_move(self):
         est = self._estimator(gamma=3)
         for _ in range(est.REFIT_INTERVAL):
