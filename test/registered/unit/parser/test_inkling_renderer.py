@@ -211,6 +211,27 @@ class TestInklingOutputParser(unittest.TestCase):
                     self.assertEqual(parsed.tool_calls, ())
                     self.assertEqual(parsed.content, expected)
 
+    def test_call_arguments_keep_the_sampled_json(self):
+        """Arguments keep the model's key order, raw UTF-8 and integers wider than
+        64 bits, as json.dumps of the sampled args would."""
+        payload = '{"name":"f","args":{"z":1,"big":18446744073709551616,"c":"北京"}}'
+        token_ids = _ids(
+            "<|message_model|>",
+            "f",
+            "<|content_invoke_tool_json|>",
+            payload,
+            "<|end_message|>",
+        )
+        for mode, parse in (("batch", _batch), ("stream", _stream)):
+            with self.subTest(mode=mode):
+                parsed = parse(
+                    token_ids, separate_reasoning=True, parse_tool_calls=True
+                )
+                self.assertEqual(
+                    [call.arguments for call in parsed.tool_calls],
+                    ['{"z": 1, "big": 18446744073709551616, "c": "北京"}'],
+                )
+
     def test_finish_flushes_once(self):
         """A finish_reason stays set on later stream chunks; finishing again must
         not re-emit a truncated message's payload."""

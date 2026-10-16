@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -255,10 +256,13 @@ class InklingOutputParser:
             chat.OpenAIMessage.from_messages([message])
         )
         function = oss[0]["tool_calls"][0]["function"]
+        # The bridge re-serializes args with sorted keys, ASCII escapes and big ints
+        # as floats; build them from the sampled payload instead.
+        args = json.loads(self._payload_text())["args"]
         return InklingToolCall(
             index=self._num_tool_calls,
             name=function["name"],
-            arguments=function["arguments"],
+            arguments=json.dumps(args, ensure_ascii=False),
         )
 
     def _recover_message(self, delta: _DeltaBuilder, exc: Exception) -> None:
