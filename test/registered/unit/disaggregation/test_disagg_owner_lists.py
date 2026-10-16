@@ -119,7 +119,7 @@ class TestDisaggPrefillLists(CustomTestCase):
             extend_logprob_start_lens=None,
         )
         result = GenerationBatchResult(next_token_ids=torch.tensor([11]))
-        self.assertEqual(owner.commit_extend(batch, result, [], None), [])
+        self.assertEqual(owner.commit_extend(batch, result), [])
         self.assertEqual(_names(owner)["prefilling"], [])
         self.assertEqual(_names(owner)["transfer"], [req.rid])
         owner.send_kv_chunk.assert_called_with(req, last_chunk=True)

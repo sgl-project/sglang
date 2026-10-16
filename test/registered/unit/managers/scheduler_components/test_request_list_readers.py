@@ -143,6 +143,9 @@ _LOOP_SCHEDULING = {
     ("disaggregation/decode.py", "DisaggDecode.apply_prealloc_consensus"),
     ("disaggregation/decode.py", "DisaggDecode.apply_transfer_consensus"),
     ("disaggregation/decode.py", "DisaggDecode.pop_reqs_to_admit"),
+    # PD prefill's extend commit tells the request still chunking from a
+    # yielded one.
+    ("disaggregation/prefill.py", "DisaggPrefill.commit_extend"),
 }
 
 # L1 allowlist: (module under srt/, scope, field read) -> count.

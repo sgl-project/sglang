@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 from sglang.srt.disaggregation.decode import DisaggDecode
 from sglang.srt.disaggregation.prefill import DisaggPrefill
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.scheduler_components import (
     request_retirer as request_retirer_mod,
 )
@@ -25,6 +26,7 @@ def prefill_owner_shell(**attrs) -> DisaggPrefill:
     owner.prefilling = []
     owner.transfer = []
     owner.pending_chunk_rids = set()
+    owner.core_lists = CoreLists()
     owner.__dict__.update(attrs)
     return owner
 

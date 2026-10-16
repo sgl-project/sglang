@@ -557,7 +557,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         output_streamer=Mock(),
     )
 
-    owner.commit_extend(batch, result, [], None)
+    owner.commit_extend(batch, result)
 
     assert req.output_ids == [7]
     owner.checkpoint.assert_called_once_with(req)
