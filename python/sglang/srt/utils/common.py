@@ -680,9 +680,9 @@ def is_device_stream_capturing(device: torch.device) -> bool:
 
 
 def _amdgpu_memory_mib_from_torch(reason: str) -> float:
-    """VRAM of the smallest live HIP device in MiB; callers compare with N*1024."""
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
         raise RuntimeError(f"{reason} and no HIP device is visible.")
+    # Callers compare this MiB value with N*1024.
     capacity = min(
         torch.cuda.get_device_properties(i).total_memory / (1024 * 1024)
         for i in range(torch.cuda.device_count())
