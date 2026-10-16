@@ -4,9 +4,10 @@ import os
 import pickle
 import shutil
 import socket
+import sys
 import tempfile
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -1792,6 +1793,94 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
     def test_megamoe_requires_sm100_for_all_quantization_formats(self, _):
         with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
             handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
+
+    def _sm120_flashinfer(self, *, has_cake=True):
+        moe_ep = ModuleType("flashinfer.moe_ep")
+        if has_cake:
+            moe_ep.Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig = object
+        return patch.dict(
+            sys.modules,
+            {"flashinfer": ModuleType("flashinfer"), "flashinfer.moe_ep": moe_ep},
+        )
+
+    @override_platform(is_sm120=True, device_capability=(12, 0))
+    def test_megamoe_sm120_accepts_fp4_expert_checkpoint(self):
+        with self._sm120_flashinfer(), patch.dict(os.environ):
+            os.environ.pop("NCCL_CUMEM_ENABLE", None)
+            handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
+            # The cake kernel needs NCCL's Device API, which requires cuMem.
+            self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "1")
+
+    @override_platform(is_sm120=True, device_capability=(12, 0))
+    def test_megamoe_sm120_rejects_unsupported_setups(self):
+        fp4_experts = {"quantization": "fp8", "is_fp4_experts": True}
+        cases = (
+            ("supports only FP4-expert", {"quantization": "modelopt_fp4"}, {}),
+            ("--enable-eplb", fp4_experts, {"enable_eplb": True}),
+            (
+                "--speculative-moe-runner-backend",
+                fp4_experts,
+                {"speculative_algorithm": "EAGLE"},
+            ),
+        )
+        for message, config, overrides in cases:
+            with self.subTest(message=message), self._sm120_flashinfer():
+                server_args = self._make_args(**config)
+                for name, value in overrides.items():
+                    setattr(server_args, name, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_a2a_moe(server_args)
+
+    @override_platform(is_sm120=True, device_capability=(12, 0))
+    def test_megamoe_sm120_rejects_settings_it_cannot_honor(self):
+        fp4_experts = {"quantization": "fp8", "is_fp4_experts": True}
+        cases = (
+            (
+                "SGLANG_FLASHINFER_MEGAMOE_SM120_TRANSPORT_TABLE",
+                envs.SGLANG_FLASHINFER_MEGAMOE_SM120_TRANSPORT_TABLE.override("lsa"),
+            ),
+            (
+                "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE",
+                envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("mxfp8"),
+            ),
+            ("NCCL_CUMEM_ENABLE", patch.dict(os.environ, {"NCCL_CUMEM_ENABLE": "0"})),
+        )
+        for message, setting in cases:
+            with self.subTest(message=message), self._sm120_flashinfer(), setting:
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_a2a_moe(self._make_args(**fp4_experts))
+
+    @override_platform(is_sm120=True, device_capability=(12, 0))
+    def test_megamoe_sm120_token_budget_covers_the_prefill_chunk(self):
+        """The workspace holds max(--max-prefill-tokens, decode graph) rows per
+        rank; a larger per-rank prefill chunk must fail at startup, not in the kernel."""
+        from sglang.srt.arg_groups.moe_hook import (
+            validate_flashinfer_megamoe_sm120_token_budget,
+        )
+
+        args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="flashinfer_megamoe",
+            chunked_prefill_size=8192,
+            max_prefill_tokens=4096,
+        )
+        args.resolve_once()
+        with self.assertRaisesRegex(ValueError, "8192 tokens per rank"):
+            validate_flashinfer_megamoe_sm120_token_budget(args)
+        with envs.SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK.override(8192):
+            validate_flashinfer_megamoe_sm120_token_budget(args)
+
+    @override_platform(is_sm120=True, device_capability=(12, 1))
+    def test_megamoe_sm120_rejects_sm121(self):
+        with self._sm120_flashinfer():
+            with self.assertRaisesRegex(ValueError, "compute capability 12.0"):
+                handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
+
+    @override_platform(is_sm120=True, device_capability=(12, 0))
+    def test_megamoe_sm120_requires_flashinfer_cake_backend(self):
+        with self._sm120_flashinfer(has_cake=False):
+            with self.assertRaisesRegex(ValueError, "sm120_mxfp4_mxfp8_bf16_cake"):
+                handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
 
     @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
