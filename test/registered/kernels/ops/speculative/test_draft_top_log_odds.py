@@ -4,8 +4,12 @@ import pytest
 import torch
 
 from sglang.kernels.ops.speculative.acceptance_estimator import (
+    accumulate_bin_counts,
+    accumulate_bin_counts_torch,
     draft_top_log_odds,
     draft_top_log_odds_torch,
+    predict_acceptance,
+    predict_acceptance_torch,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -34,6 +38,47 @@ def test_matches_torch_reference(dtype, vocab):
     )
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+
+def test_predict_and_bin_counts_match_torch():
+    torch.manual_seed(1)
+    bs, gamma, vocab, num_bins = 37, 7, 151936, 128
+    logits = (torch.randn(bs * gamma, vocab, device="cuda") * 3).to(torch.bfloat16)
+    temperatures = torch.rand(bs, device="cuda") + 0.5
+    slope = torch.tensor([0.55], device="cuda")
+    intercepts = torch.linspace(0.5, -1.0, gamma, device="cuda")
+    kwargs = dict(
+        logits=logits,
+        temperatures=temperatures,
+        rows_per_request=gamma,
+        slope=slope,
+        intercepts=intercepts,
+    )
+    features, predictions = predict_acceptance(**kwargs)
+    ref_features, ref_predictions = predict_acceptance_torch(**kwargs)
+    torch.testing.assert_close(features, ref_features, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(predictions, ref_predictions, rtol=1e-4, atol=1e-4)
+
+    # Spread features over every bin, including both clamped edges.
+    features = torch.linspace(-12.0, 30.0, bs * gamma, device="cuda").view(bs, gamma)
+    num_correct = torch.randint(0, gamma + 1, (bs,), device="cuda")
+    num_graded = torch.randint(1, gamma + 1, (bs,), device="cuda")
+    counts = torch.zeros(gamma, num_bins, 2, device="cuda")
+    ref_counts = torch.zeros_like(counts)
+    for out, fn in (
+        (counts, accumulate_bin_counts),
+        (ref_counts, accumulate_bin_counts_torch),
+    ):
+        for _ in range(3):
+            fn(
+                counts=out,
+                features=features,
+                num_correct_drafts=num_correct,
+                num_graded_drafts=num_graded,
+                bin_low=-8.0,
+                bin_width=0.25,
+            )
+    assert torch.equal(counts, ref_counts)
 
 
 if __name__ == "__main__":

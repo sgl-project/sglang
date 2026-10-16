@@ -103,8 +103,8 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
             num_correct_drafts=torch.tensor([1, 4, 3]),
             num_graded_drafts=torch.tensor([4, 4, 2]),
         )
-        graded = est._stats[:, 5].tolist()
-        accepted = est._stats[:, 6].tolist()
+        graded = est._round_counts[..., 0].sum(dim=1).tolist()
+        accepted = est._round_counts[..., 1].sum(dim=1).tolist()
         self.assertEqual(graded, [3.0, 3.0, 1.0, 1.0])
         self.assertEqual(accepted, [3.0, 2.0, 1.0, 1.0])
 

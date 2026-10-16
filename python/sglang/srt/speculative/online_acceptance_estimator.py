@@ -3,11 +3,19 @@
 Predicts each draft position's acceptance probability from the draft
 distribution alone, ``p = sigmoid(slope * logit(q_max) + intercept[k])``, and
 refits the shared slope and per-position intercepts on the target's
-accept/reject outcomes while serving. The feature reads
-only ``q_k``, which depends on the drafts before position ``k`` and never on the
-drafted token itself, so trimming verification on it stays lossless. Scoring the
-drawn token's probability instead would select on the proposal and bias the
-output toward the drafter's confident modes.
+accept/reject outcomes while serving. The feature reads only ``q_k``, which
+depends on the drafts before position ``k`` and never on the drafted token
+itself, so trimming verification on it stays lossless. Scoring the drawn
+token's probability instead would select on the proposal and bias the output
+toward the drafter's confident modes.
+
+Labels are binned by (position, feature) and kept with a decayed history; each
+refit runs Newton iterations with a line search to the penalized maximum
+likelihood. A single Newton step per round from the current coefficients is
+cheaper but unstable: a confidently wrong prediction carries a full residual and
+almost no curvature, so one such label can fling an intercept, and when
+acceptance saturates below one for confident drafts (a sampled target keeps its
+own entropy) the slope update stalls and survival is over-predicted.
 """
 
 from __future__ import annotations
@@ -15,57 +23,44 @@ from __future__ import annotations
 import logging
 
 import torch
+import torch.nn.functional as F
 
-from sglang.kernels.ops.speculative.acceptance_estimator import DraftTopLogOdds
+from sglang.kernels.ops.speculative.acceptance_estimator import (
+    AccumulateBinCounts,
+    PredictAcceptance,
+)
 
 logger = logging.getLogger(__name__)
 
 # Cold-start coefficients: the median fit vLLM reports across five model pairs
-# (vllm-project/vllm#52228). Log-loss is flat near the optimum, so a real fit
-# replaces them within a refit or two.
+# (vllm-project/vllm#52228); the first refit replaces them.
 _INIT_SLOPE = 0.5
 _INIT_INTERCEPT = -0.2
 
-# Per-position columns of the round statistics.
-_A, _B, _C, _G_SLOPE, _G_INTERCEPT, _NUM_GRADED, _NUM_ACCEPT, _PRED_SUM = range(8)
-
-# Feature histogram of the binned fit: logit(q_max) in [-8, 24) at width 0.25;
-# values outside land in the edge bins. Arbitrary; covers q_max in [3e-4, 1 - 4e-11].
+# logit(q_max) bins: [-8, 24) at width 0.25, outliers in the edge bins.
+# Arbitrary; covers q_max in [3e-4, 1 - 4e-11].
 _BIN_LOW, _BIN_HIGH, _NUM_BINS = -8.0, 24.0, 128
 _BIN_WIDTH = (_BIN_HIGH - _BIN_LOW) / _NUM_BINS
-# Backtracking ladder of the binned Newton iterations, evaluated in one batch.
+# Backtracking ladder of each Newton iteration, evaluated in one batch.
 _STEP_SCALES = (1.0, 0.5, 0.25, 0.125, 0.0)
 
 
 class OnlineAcceptanceEstimator:
     """Per step, ``predict`` scores the drafted block before verification and
     ``observe`` grades the same block once the target has verified it. Every
-    TP rank sees identical inputs and fits identically."""
+    TP rank sees identical inputs and fits identically, on device."""
 
-    # Refit every this many observed steps; statistics accumulate in between.
+    # Refit every this many observed steps.
     REFIT_INTERVAL = 100
-    # Each Newton step is damped by n / (n + DAMPING_OBSERVATIONS), so thinly
-    # labeled deep positions move slowly instead of freezing behind a hard gate.
-    DAMPING_OBSERVATIONS = 50.0
-    # Ridge on the Newton solve.
-    L2 = 1e-3
-    # Binned fit: each refit keeps this fraction of the older counts.
+    # Each refit keeps this fraction of the older counts (about four rounds).
     HISTORY_DECAY = 0.75
-    # Binned fit: Gaussian prior on the change from the previous coefficients,
-    # in units of Fisher information (one label at p = 1/2 carries 1/4).
+    # Gaussian prior on the change from the previous coefficients, in units of
+    # Fisher information (one label at p = 1/2 carries 1/4). Keeps positions
+    # with no labels where they were.
     PRIOR_WEIGHT = 1.0
     NEWTON_ITERS = 8
 
-    def __init__(
-        self,
-        *,
-        gamma: int,
-        device: torch.device,
-        log_rank: bool,
-        fit: str = "binned_irls",
-    ) -> None:
-        assert fit in ("binned_irls", "newton_step")
-        self._fit = fit
+    def __init__(self, *, gamma: int, device: torch.device, log_rank: bool) -> None:
         self.gamma = int(gamma)
         self.slope = torch.full((1,), _INIT_SLOPE, dtype=torch.float32, device=device)
         self.intercepts = torch.full(
@@ -73,22 +68,18 @@ class OnlineAcceptanceEstimator:
         )
         self.num_refits = 0
         self._log_rank = log_rank
-        self._positions = torch.arange(self.gamma, device=device).view(1, -1)
-        # [gamma, 8] sufficient statistics of the current round, cleared on refit.
-        self._stats = torch.zeros((self.gamma, 8), dtype=torch.float32, device=device)
-        # [gamma, bins, (graded, accepted)] label counts of this round and the
-        # decayed history the binned fit solves on.
         self._bin_centers = (
             _BIN_LOW + (torch.arange(_NUM_BINS, device=device) + 0.5) * _BIN_WIDTH
         )
+        # [gamma, bins, (graded, accepted)] label counts of this round, and the
+        # decayed history the fit solves on.
         self._round_counts = torch.zeros(
             (self.gamma, _NUM_BINS, 2), dtype=torch.float32, device=device
         )
         self._history_counts = torch.zeros_like(self._round_counts)
         self._steps_since_refit = 0
-        # The last predict's [bs, gamma] features and predictions, graded by observe.
+        # The last predict's [bs, gamma] features, graded by observe.
         self._features: torch.Tensor | None = None
-        self._predictions: torch.Tensor | None = None
 
     def predict(
         self,
@@ -105,14 +96,15 @@ class OnlineAcceptanceEstimator:
         feature_temperatures = torch.where(
             greedy_mask.view(-1), torch.ones_like(temperatures), temperatures
         )
-        features = DraftTopLogOdds.execute(
+        features, predictions = PredictAcceptance.execute(
             logits=step_logits.reshape(bs * gamma, vocab),
             temperatures=feature_temperatures,
             rows_per_request=gamma,
-        ).view(bs, gamma)
-        predictions = torch.sigmoid(self.slope * features + self.intercepts)
-        self._features, self._predictions = features, predictions
-        return predictions
+            slope=self.slope,
+            intercepts=self.intercepts,
+        )
+        self._features = features.view(bs, gamma)
+        return predictions.view(bs, gamma)
 
     def observe(
         self,
@@ -124,158 +116,60 @@ class OnlineAcceptanceEstimator:
         target accepted before its first rejection, uncapped by the verify cut;
         ``num_graded_drafts``: [bs] leading drafts checked against a real target
         row. Drafts up to and including the first rejection carry labels."""
-        features, predictions = self._features, self._predictions
+        features = self._features
         assert features is not None, "observe() must follow predict()"
-        self._features = self._predictions = None
-        self._stats += _round_statistics(
+        self._features = None
+        AccumulateBinCounts.execute(
+            counts=self._round_counts,
             features=features,
-            predictions=predictions,
             num_correct_drafts=num_correct_drafts,
             num_graded_drafts=num_graded_drafts,
-            positions=self._positions,
+            bin_low=_BIN_LOW,
+            bin_width=_BIN_WIDTH,
         )
-        if self._fit == "binned_irls":
-            _accumulate_bin_counts(
-                counts=self._round_counts,
-                features=features,
-                num_correct_drafts=num_correct_drafts,
-                num_graded_drafts=num_graded_drafts,
-                positions=self._positions,
-            )
         self._steps_since_refit += 1
         if self._steps_since_refit >= self.REFIT_INTERVAL:
             self._refit()
 
     def skip_observe(self) -> None:
         """Drop the last prediction ungraded (e.g. its outcome was simulated)."""
-        self._features = self._predictions = None
+        self._features = None
 
     def _refit(self) -> None:
         if self._log_rank and _should_log_refit(self.num_refits + 1):
             self._log_round()
-        if self._fit == "binned_irls":
-            self._history_counts.mul_(self.HISTORY_DECAY).add_(self._round_counts)
-            self._round_counts.zero_()
-            slope, intercepts = _fit_binned(
-                counts=self._history_counts,
-                centers=self._bin_centers,
-                slope=self.slope,
-                intercepts=self.intercepts,
-                prior_weight=self.PRIOR_WEIGHT,
-                num_iters=self.NEWTON_ITERS,
-            )
-            self.slope.copy_(slope)
-            self.intercepts.copy_(intercepts)
-        else:
-            step_slope, step_intercepts = _newton_step(
-                stats=self._stats,
-                slope=self.slope,
-                l2=self.L2,
-                damping=self.DAMPING_OBSERVATIONS,
-            )
-            self.slope += step_slope
-            self.intercepts += step_intercepts
-        self._stats.zero_()
+        self._history_counts.mul_(self.HISTORY_DECAY).add_(self._round_counts)
+        self._round_counts.zero_()
+        slope, intercepts = _fit_binned(
+            counts=self._history_counts,
+            centers=self._bin_centers,
+            slope=self.slope,
+            intercepts=self.intercepts,
+            prior_weight=self.PRIOR_WEIGHT,
+            num_iters=self.NEWTON_ITERS,
+        )
+        self.slope.copy_(slope)
+        self.intercepts.copy_(intercepts)
         self._steps_since_refit = 0
         self.num_refits += 1
 
     def _log_round(self) -> None:
-        stats = self._stats.cpu()
-        graded = stats[:, _NUM_GRADED].clamp(min=1.0)
+        graded, accepted = self._round_counts.unbind(dim=-1)
+        predictions = torch.sigmoid(
+            self.slope * self._bin_centers.view(1, -1) + self.intercepts.view(-1, 1)
+        )
+        num_graded = graded.sum(dim=1)
+        denom = num_graded.clamp(min=1.0)
         logger.info(
             "Online acceptance estimator refit %d: slope=%.4f intercepts=%s "
             "graded=%s observed_accept=%s mean_pred=%s",
             self.num_refits + 1,
             float(self.slope.item()),
-            _fmt(self.intercepts.cpu()),
-            stats[:, _NUM_GRADED].to(torch.int64).tolist(),
-            _fmt(stats[:, _NUM_ACCEPT] / graded),
-            _fmt(stats[:, _PRED_SUM] / graded),
+            _fmt(self.intercepts),
+            num_graded.to(torch.int64).tolist(),
+            _fmt(accepted.sum(dim=1) / denom),
+            _fmt((graded * predictions).sum(dim=1) / denom),
         )
-
-
-def _round_statistics(
-    *,
-    features: torch.Tensor,
-    predictions: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    num_graded_drafts: torch.Tensor,
-    positions: torch.Tensor,
-) -> torch.Tensor:
-    """[gamma, 8] IRLS contributions of one graded block. For design row
-    x = [f, e_k], weight w = p(1-p) and residual y - p: X^T W X has the arrowhead
-    entries a_k = sum w f^2, b_k = sum w f, c_k = sum w, and X^T (y - p) has
-    g_k = sum (y - p) f and h_k = sum (y - p)."""
-    num_correct = num_correct_drafts.view(-1, 1).to(positions.dtype)
-    num_graded = num_graded_drafts.view(-1, 1).to(positions.dtype)
-    observed = (positions <= num_correct) & (positions < num_graded)
-    labels = (positions < num_correct).to(torch.float32)
-    weight = torch.where(observed, predictions * (1.0 - predictions), 0.0)
-    residual = torch.where(observed, labels - predictions, 0.0)
-    observed_f = observed.to(torch.float32)
-    columns = (
-        weight * features * features,
-        weight * features,
-        weight,
-        residual * features,
-        residual,
-        observed_f,
-        labels * observed_f,
-        predictions * observed_f,
-    )
-    return torch.stack(columns, dim=-1).sum(dim=0)
-
-
-def _newton_step(
-    *,
-    stats: torch.Tensor,
-    slope: torch.Tensor,
-    l2: float,
-    damping: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Solve (X^T W X + l2 I) d = X^T (y - p) for d = [d_slope, d_intercepts].
-
-    The system is an arrowhead: the slope row couples to every position, each
-    intercept only to itself, so the Schur complement gives d_slope in closed
-    form and each d_intercept follows from it."""
-    a_k, b_k, c_k = stats[:, _A], stats[:, _B], stats[:, _C] + l2
-    g_k, h_k, n_k = stats[:, _G_SLOPE], stats[:, _G_INTERCEPT], stats[:, _NUM_GRADED]
-    a = a_k.sum() + l2
-    step_slope = (g_k.sum() - (b_k * h_k / c_k).sum()) / (a - (b_k * b_k / c_k).sum())
-    total_graded = n_k.sum()
-    step_slope = step_slope * total_graded / (total_graded + damping)
-    # A NaN step or one that flips the slope negative is dropped.
-    keep = torch.isfinite(step_slope) & (slope + step_slope >= 0.0)
-    step_slope = torch.where(keep, step_slope, torch.zeros_like(step_slope))
-    step_intercepts = (h_k - b_k * step_slope) / c_k
-    step_intercepts = step_intercepts * n_k / (n_k + damping)
-    step_intercepts = torch.where(
-        torch.isfinite(step_intercepts),
-        step_intercepts,
-        torch.zeros_like(step_intercepts),
-    )
-    return step_slope.view(1), step_intercepts
-
-
-def _accumulate_bin_counts(
-    *,
-    counts: torch.Tensor,
-    features: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    num_graded_drafts: torch.Tensor,
-    positions: torch.Tensor,
-) -> None:
-    num_correct = num_correct_drafts.view(-1, 1).to(positions.dtype)
-    num_graded = num_graded_drafts.view(-1, 1).to(positions.dtype)
-    observed = ((positions <= num_correct) & (positions < num_graded)).to(torch.float32)
-    accepted = observed * (positions < num_correct).to(torch.float32)
-    bins = torch.clamp(
-        ((features - _BIN_LOW) / _BIN_WIDTH).floor(), 0, _NUM_BINS - 1
-    ).long()
-    flat = (positions * _NUM_BINS + bins).view(-1)
-    flat_counts = counts.view(-1, 2)
-    flat_counts[:, 0].index_add_(0, flat, observed.view(-1))
-    flat_counts[:, 1].index_add_(0, flat, accepted.view(-1))
 
 
 def _fit_binned(
@@ -287,10 +181,11 @@ def _fit_binned(
     prior_weight: float,
     num_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Maximum a posteriori fit on the binned labels: Newton iterations with a
-    batched backtracking line search, all on device. Unlike one Newton step per
-    round, a confidently wrong prediction cannot fling a coefficient, and at the
-    optimum each position's mean prediction matches its observed acceptance."""
+    """Penalized maximum likelihood on binned labels. Each Newton iteration
+    solves the arrowhead system (the slope row couples to every position, each
+    intercept only to itself) in closed form, then backtracks along the step.
+    At the optimum each position's mean prediction matches its observed
+    acceptance up to the prior, which is what the verify budget sums."""
     graded, accepted = counts[..., 0], counts[..., 1]
     f = centers.view(1, -1)
     prior_slope, prior_intercepts = slope.clone(), intercepts.clone()
@@ -299,18 +194,17 @@ def _fit_binned(
         p = torch.sigmoid(slope * f + intercepts.view(-1, 1))
         weight = graded * p * (1.0 - p)
         residual = accepted - graded * p
-        a_k = (weight * f * f).sum(dim=1)
         b_k = (weight * f).sum(dim=1)
         c_k = weight.sum(dim=1) + prior_weight
-        g = (residual * f).sum() - prior_weight * (slope - prior_slope)
         h_k = residual.sum(dim=1) - prior_weight * (intercepts - prior_intercepts)
-        a = a_k.sum() + prior_weight
+        a = (weight * f * f).sum() + prior_weight
+        g = (residual * f).sum() - prior_weight * (slope - prior_slope)
         d_slope = (g - (b_k * h_k / c_k).sum()) / (a - (b_k * b_k / c_k).sum())
         d_intercepts = (h_k - b_k * d_slope) / c_k
         cand_slope = torch.clamp(slope + scales * d_slope, min=0.0)
         cand_intercepts = intercepts.view(1, -1) + scales.view(-1, 1) * d_intercepts
         z = cand_slope.view(-1, 1, 1) * f.view(1, 1, -1) + cand_intercepts.unsqueeze(-1)
-        nll = (graded * torch.nn.functional.softplus(z) - accepted * z).sum(dim=(1, 2))
+        nll = (graded * F.softplus(z) - accepted * z).sum(dim=(1, 2))
         nll = nll + 0.5 * prior_weight * (
             (cand_slope - prior_slope) ** 2
             + ((cand_intercepts - prior_intercepts) ** 2).sum(dim=1)
@@ -327,4 +221,4 @@ def _should_log_refit(refit: int) -> bool:
 
 
 def _fmt(values: torch.Tensor) -> str:
-    return "[" + ", ".join(f"{float(v):.3f}" for v in values) + "]"
+    return "[" + ", ".join(f"{float(v):.3f}" for v in values.cpu()) + "]"
