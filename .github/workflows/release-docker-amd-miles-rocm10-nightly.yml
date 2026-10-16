@@ -60,7 +60,9 @@ jobs:
 
       - name: Build image via miles docker/build.py and tag with date
         run: |
-          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles
+          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles \
+            --build-arg SGLANG_BRANCH=codex/pr44720-amd-nightly-validation-20261016 \
+            --build-arg SGLANG_COMMIT=14def62fab9cb3a1d69da3912eca235c7e540c4a
           docker tag rocm/sgl-dev:miles-${{ matrix.variant }} rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
 
       - name: Login to Docker Hub (AMD)
