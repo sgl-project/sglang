@@ -24,6 +24,8 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -34,6 +36,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.hicache_storage import (
@@ -42,6 +45,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
     RustUnifiedTreeCore,
@@ -63,8 +67,10 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
@@ -5394,6 +5400,71 @@ def test_insert_reports_whether_it_reached_the_swa_branch_boundary():
             ),
         )
         assert result.swa_branch_inserted is expected, branching_seqlen
+
+
+# ---- request priority at the i64 boundary ----
+
+
+class _RecordingUnifiedRadixCache(UnifiedRadixCache):
+    def __init__(self, params):
+        self.insert_priorities = []
+        super().__init__(params)
+
+    def insert(self, params):
+        self.insert_priorities.append(params.priority)
+        return super().insert(params)
+
+
+@pytest.mark.parametrize("priority", [(1 << 63) - 2, (1 << 63) - 1])
+def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
+    """Caching a finished request re-inserts its prompt one priority above the
+    request so eviction drops the output first. The core stores priority as a
+    signed 64-bit integer, so the boost must saturate at INT64_MAX instead of
+    overflowing the binding and failing the insert."""
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    # release_kv_cache reads the serving config off the published bags.
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    req_to_token_pool = ReqToTokenPool(
+        size=2, max_context_len=16, device="cpu", enable_memory_saver=False
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=16, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
+    )
+    cache = _RecordingUnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+            tree_core_backend="rust",
+        )
+    )
+    req = Req(
+        rid="priority",
+        origin_input_text=None,
+        origin_input_ids=array("q", [1, 2, 3]),
+        sampling_params=SamplingParams(max_new_tokens=2),
+        priority=priority,
+    )
+    req.output_ids = array("q", [4, 5])
+    req.finished_reason = "finished"
+    (req.kv.req_pool_idx,) = req_to_token_pool.alloc([req])
+    req.lock = cache.lock(cache.root_node_handle())
+    indices = allocator.alloc(5)
+    assert indices is not None
+    req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), indices)
+    req.kv.kv_committed_len = req.kv.kv_allocated_len = 5
+
+    release_kv_cache(req, cache, checkpoint=True)
+
+    assert req.priority == priority
+    assert cache.insert_priorities == [priority, (1 << 63) - 1]
+    match = cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(req.origin_input_ids + req.output_ids))
+    )
+    assert torch.equal(cache.path_device_indices(match.last_device_node), indices)
 
 
 if __name__ == "__main__":

@@ -2289,6 +2289,21 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        # A cuda-graph wrapper built with custom_mask_buf always runs MaskMode.CUSTOM,
+        # but plan(custom_mask=None) skips refilling that buffer, so the kernel would
+        # silently read stale capture-time mask bits.
+        if (
+            spec_info is not None
+            and use_custom_mask is None
+            and wrapper_paged.is_cuda_graph_enabled
+            and wrapper_paged._custom_mask_buf is not None
+        ):
+            raise RuntimeError(
+                f"{spec_info.spec_input_type} verify planned without a custom mask on "
+                "a cuda-graph wrapper captured with one; capture and replay must agree "
+                "on custom_mask."
+            )
+
         # fast_prefill_plan (installed at capture) is sync-free: it needs the
         # host-known qo/kv layout from the caller. Assert rather than silently
         # fall back to plan()'s blocking D2H on the replay hot-path.

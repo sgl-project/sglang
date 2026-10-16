@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import functools
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import msgspec
 import torch
@@ -72,9 +73,9 @@ class DraftForwardResult(msgspec.Struct, frozen=True):
 class DraftProposal(msgspec.Struct, frozen=True):
     draft_block_ids: torch.Tensor
     draft_block: DraftBlockResult
-    draft_hidden: Optional[torch.Tensor]
+    # [bs, gamma]; None when the draft has no confidence head.
     confidence: Optional[torch.Tensor] = None
-    confidence_tap: Optional[torch.Tensor] = None
+    confidence_raw: Optional[torch.Tensor] = None
     folded: bool = False
 
 
@@ -116,6 +117,51 @@ def resolve_greedy_mask(
     if sampling_info is None:
         return torch.ones(bs, dtype=torch.bool, device=device)
     return (sampling_info.top_ks <= 1).view(-1)
+
+
+class DraftParams(NamedTuple):
+    temperatures: torch.Tensor
+    greedy_mask: torch.Tensor
+    # The temperature each step samples at: 0 on argmax rows.
+    step_temperatures: torch.Tensor
+
+
+@functools.cache
+def _zero(device: torch.device) -> torch.Tensor:
+    return torch.zeros((), dtype=torch.float32, device=device)
+
+
+def resolve_draft_params(
+    *,
+    sampling_info,
+    bs: int,
+    device: Optional[torch.device] = None,
+    out: Optional[DraftParams] = None,
+) -> DraftParams:
+    """Written into the ``[:bs]`` rows of ``out`` when given (the graph's
+    static buffers), else into fresh tensors on ``device``."""
+    if out is not None:
+        device = out.temperatures.device
+    else:
+        out = DraftParams(
+            temperatures=torch.empty(bs, dtype=torch.float32, device=device),
+            greedy_mask=torch.empty(bs, dtype=torch.bool, device=device),
+            step_temperatures=torch.empty(bs, dtype=torch.float32, device=device),
+        )
+    temperatures, greedy_mask, step_temperatures = (buf[:bs] for buf in out)
+    if sampling_info is None:
+        temperatures.fill_(1.0)
+        greedy_mask.fill_(True)
+        step_temperatures.zero_()
+    else:
+        torch.clamp(
+            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+            min=1e-5,
+            out=temperatures,
+        )
+        torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
+        torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
+    return DraftParams(temperatures, greedy_mask, step_temperatures)
 
 
 # XORed into the server seed so the draft noise differs from other samplers'.
@@ -234,14 +280,6 @@ def draft_markov_block(
     return torch.stack(draft_tokens, dim=1), logits_out
 
 
-def resolve_draft_temperatures(
-    *, bs: int, sampling_info, device: torch.device
-) -> torch.Tensor:
-    if sampling_info is None:
-        return torch.ones(bs, dtype=torch.float32, device=device)
-    return sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
-
-
 def sample_draft_block(
     *,
     base_logits: torch.Tensor,
@@ -254,17 +292,15 @@ def sample_draft_block(
     tp_sync: SpecTpSync,
     greedy_draft: bool,
 ) -> DraftBlockResult:
-    bs = base_logits.shape[0]
-    greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
-    temperatures = resolve_draft_temperatures(
-        bs=bs, sampling_info=sampling_info, device=device
+    params = resolve_draft_params(
+        sampling_info=sampling_info, bs=base_logits.shape[0], device=device
     )
     draft_tokens, step_logits = draft_markov_block(
         markov_head=markov_head,
         base_logits=base_logits,
         anchor_tokens=anchor_tokens,
         draft_hidden=draft_hidden,
-        step_temperatures=temperatures.masked_fill(greedy_mask, 0.0),
+        step_temperatures=params.step_temperatures,
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
@@ -274,8 +310,8 @@ def sample_draft_block(
         corrected_logits=(
             None if greedy_draft else expect(_DRAFT_STEP_LOGITS, step_logits)
         ),
-        greedy_mask=greedy_mask,
-        temperatures=temperatures,
+        greedy_mask=params.greedy_mask,
+        temperatures=params.temperatures,
         greedy_draft=greedy_draft,
     )
 
@@ -359,8 +395,7 @@ class DraftBlockProposer:
         )
         draft_block_ids = fwd.draft_block_ids
 
-        folded_confidence = None
-        confidence_tap = None
+        confidence = confidence_raw = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -373,15 +408,16 @@ class DraftBlockProposer:
                 corrected_logits=(
                     None if self._greedy_draft else draft_sampler.step_logits[:bs]
                 ),
-                greedy_mask=draft_sampler.greedy_mask[:bs],
-                temperatures=draft_sampler.temperatures[:bs],
+                greedy_mask=draft_sampler.params.greedy_mask[:bs],
+                temperatures=draft_sampler.params.temperatures[:bs],
                 greedy_draft=self._greedy_draft,
             )
             if draft_sampler.confidence_out is not None:
-                folded_confidence = draft_sampler.confidence_out[:bs]
+                confidence = draft_sampler.confidence_out[:bs]
+                confidence_raw = draft_sampler.confidence_raw_out[:bs]
         else:
             with self._base_logits_context():
-                base_logits, confidence_tap = self.draft_model.compute_base_logits(
+                base_logits, confidence_features = self.draft_model.compute_base_logits(
                     fwd.raw_hidden
                 )
                 base_logits = base_logits.view(bs, self.gamma, -1)
@@ -396,6 +432,12 @@ class DraftBlockProposer:
                 tp_sync=self._tp_sync,
                 greedy_draft=self._greedy_draft,
             )
+            if self.draft_model.confidence_head is not None:
+                confidence, confidence_raw = self.draft_model.compute_confidence(
+                    anchor_tokens=draft_block_ids[:, 0],
+                    draft_tokens=draft_block.draft_tokens,
+                    confidence_features=confidence_features,
+                )
         proposal_block_ids = (
             draft_block_ids
             if self.sample_from_anchor
@@ -404,9 +446,8 @@ class DraftBlockProposer:
         return DraftProposal(
             draft_block_ids=proposal_block_ids,
             draft_block=draft_block,
-            draft_hidden=fwd.draft_hidden_3d,
-            confidence=folded_confidence,
-            confidence_tap=confidence_tap,
+            confidence=confidence,
+            confidence_raw=confidence_raw,
             folded=folded,
         )
 

@@ -26,34 +26,16 @@ First, launch the SGLang environment using the provided container image:
   <Tab title="Ascend A3 Series">
 
 ```shell Command
-export IMAGE=quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+# TODO: CANN 9.1.0 has no stable image yet, so this temporarily uses the
+# daily build tag. Once the stable image is published, switch back to the
+# stable release tag.
+export IMAGE=quay.io/ascend/sglang:main-cann9.1.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
     --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
-    --device=/dev/davinci_manager \
-    --device=/dev/hisi_hdc \
-    --volume /usr/local/sbin:/usr/local/sbin \
-    --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
-    --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule \
-    --volume ~/.cache/:/root/.cache/ \
-    --entrypoint=bash \
-    $IMAGE
-```
-
-  </Tab>
-  <Tab title="Ascend A2 Series">
-
-```shell Command
-export IMAGE=quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-
-docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci_manager \
     --device=/dev/hisi_hdc \
     --volume /usr/local/sbin:/usr/local/sbin \
@@ -199,8 +181,8 @@ For more details, refer to the [EvalScope documentation](https://evalscope.readt
 
 ### SGLang Server Startup Failure
 
-1. Verify device mapping: A2 Series uses `davinci[0-7]`, A3 Series uses `davinci[0-15]`
-2. Confirm image tag matches device type: A2 Series uses `...-910b`, A3 Series uses `...-a3`
+1. Verify device mapping: A3 Series uses `davinci[0-15]`
+2. Confirm image tag matches device type: A3 Series uses `...-a3`
 3. Check NPU status with `npu-smi info`
 4. First run requires model download; set `HF_ENDPOINT=https://hf-mirror.com` if network access is restricted
 
