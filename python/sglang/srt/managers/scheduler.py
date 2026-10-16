@@ -6169,9 +6169,7 @@ class Scheduler(
             if success:
                 NixlEPBuffer.finish_recovery(operation_id)
             elif state is not None and state.recovery_rank_offset is not None:
-                NixlEPBuffer.abort_recovery(
-                    operation_id, state.recovery_rank_offset
-                )
+                NixlEPBuffer.abort_recovery(operation_id, state.recovery_rank_offset)
         if state is None or not completed or get_parallel().tp_rank != 0:
             return
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq

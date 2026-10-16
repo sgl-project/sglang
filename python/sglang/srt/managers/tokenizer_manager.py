@@ -4005,9 +4005,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ),
                     operation_id=operation_id,
                     instance_id=self.elastic_instance_id,
-                    old_ep_size=(
-                        self.elastic_worker_count * self.attn_replica_size
-                    ),
+                    old_ep_size=(self.elastic_worker_count * self.attn_replica_size),
                     new_ep_size=obj.new_ep_size,
                     pending_ep_size=self.elastic_pending_ep_size,
                     scale_phase=self.elastic_scale_phase,

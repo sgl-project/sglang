@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -1407,6 +1407,30 @@ class TestNixlEPRecoveryConnections(CustomTestCase):
         )
         NixlEPBuffer.prepare_recovery(next_operation)
         self.buffer.disconnect_ranks.assert_called_once_with([2])
+
+    def test_aborted_recovery_releases_nixl_operation_fence(self):
+        self.state.recovery_operation_id = self.operation.operation_id
+        self.state.recovery_disconnected_rank = self.operation.rank_offset
+        self.state.recovery_connections_ready = True
+
+        NixlEPBuffer.abort_recovery(
+            self.operation.operation_id, self.operation.rank_offset
+        )
+
+        self.assertIsNone(self.state.recovery_operation_id)
+        self.assertIsNone(self.state.recovery_disconnected_rank)
+        self.assertFalse(self.state.recovery_connections_ready)
+
+        next_operation = replace(
+            self.operation,
+            operation_id="recover/2",
+            allocation_id="pod/6",
+        )
+        NixlEPBuffer.prepare_recovery(next_operation)
+        self.assertEqual(
+            self.buffer.disconnect_ranks.call_args_list,
+            [call([2]), call([2])],
+        )
 
 
 if __name__ == "__main__":
