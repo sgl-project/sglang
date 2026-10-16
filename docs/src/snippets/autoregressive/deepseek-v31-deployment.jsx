@@ -153,7 +153,7 @@ export const DeepSeekV31Deployment = () => {
       }
       else{
         cmd += ` \\\n  --dp 6`;
-        cmd += ` \\\n  --enable-dp-attention`;        
+        cmd += ` \\\n  --enable-dp-attention`;
       }
 
     }
