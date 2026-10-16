@@ -56,7 +56,7 @@ fn normalize_method(method: &axum::http::Method) -> &'static str {
 /// `"unknown"` (running outside a container with neither set).
 static POD_ID: OnceLock<String> = OnceLock::new();
 
-fn pod_id() -> &'static str {
+pub(crate) fn pod_id() -> &'static str {
     POD_ID.get_or_init(|| {
         std::env::var("POD_NAME")
             .or_else(|_| std::env::var("HOSTNAME"))
