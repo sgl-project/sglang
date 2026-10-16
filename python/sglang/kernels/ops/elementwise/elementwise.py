@@ -84,6 +84,7 @@ def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps):
     return output, mid
 
 
+# Not layernorm.rmsnorm_fp32: dividing by sqrt(var + eps) rounds differently from rsqrt.
 @triton.jit
 def fused_rmsnorm_kernel(
     output_ptr,

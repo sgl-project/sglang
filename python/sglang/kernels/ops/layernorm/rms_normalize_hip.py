@@ -8,6 +8,8 @@ import triton
 import triton.language as tl
 
 
+# Matches layernorm.rmsnorm_fp32 bit-for-bit on CUDA, but is unverified on ROCm (its only
+# caller) and normalizes strided rows in place with an optional weight.
 @triton.jit
 def _rms_normalize_kernel(
     x_ptr,
