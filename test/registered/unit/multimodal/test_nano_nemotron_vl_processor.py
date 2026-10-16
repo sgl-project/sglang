@@ -2,11 +2,14 @@
 
 import asyncio
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.multimodal.evs import EVSConfig, EVSProcessor
 from sglang.srt.multimodal.processors.nano_nemotron_vl import (
     NanoNemotronVLImageProcessor,
@@ -134,6 +137,44 @@ class TestNanoNemotronVLProcessor(CustomTestCase):
                 )
             )
         processor.load_mm_data.assert_not_awaited()
+
+    def test_visual_offsets_ignore_literal_boundaries_and_preserve_audio(self):
+        model = object.__new__(NemotronH_Nano_VL_V2)
+        for text, start in (
+            ([5, 19, 18, 18, 20, 7, 20], 2),
+            ([5, 19, 9, 19, 18, 18, 20, 7], 4),
+            ([19, 4, 4, 20, 5, 19, 18, 18, 20], 6),
+        ):
+            with self.subTest(text=text):
+                mm = SimpleNamespace(
+                    mm_items=[
+                        MultimodalDataItem(
+                            modality=Modality.IMAGE,
+                            offsets=[(start, start + 1)],
+                            pad_value=1_000_001,
+                        ),
+                        MultimodalDataItem(
+                            modality=Modality.AUDIO,
+                            offsets=[(len(text) + 1, len(text) + 2)],
+                            pad_value=1_000_002,
+                        ),
+                    ],
+                    data_offsets=[],
+                    im_start_id=19,
+                    im_end_id=20,
+                    im_token_id=18,
+                    video_token_id=18,
+                    audio_token_id=32,
+                    audio_start_id=30,
+                    audio_end_id=31,
+                )
+                padded = model.pad_input_ids(array("q", text + [30, 32, 32, 31]), mm)
+                expected = text[:]
+                expected[start : start + 2] = [1_000_001] * 2
+                self.assertEqual(
+                    list(padded), expected + [30, 1_000_002, 1_000_002, 31]
+                )
+                self.assertEqual(mm.data_offsets, [start - 1, len(text)])
 
     def test_tubelet_label_matches_hf_reference(self):
         """Multi-frame tubelet labels must match the HF processor's prompt format."""

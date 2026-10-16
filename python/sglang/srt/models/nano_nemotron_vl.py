@@ -28,6 +28,7 @@ from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
@@ -139,21 +140,19 @@ class NemotronH_Nano_VL_V2(EVS):
         )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        im_start_id: int = mm_inputs.im_start_id
-        im_end_id: int = mm_inputs.im_end_id
-
         visual_items = [item for item in mm_inputs.mm_items if not item.is_audio()]
         audio_items = [item for item in mm_inputs.mm_items if item.is_audio()]
 
         all_data_offsets = []
 
         if visual_items:
+            # Literal boundary tokens in text must not change which spans are images.
             mm_inputs.mm_items = visual_items
-            helper = MultiModalityDataPaddingPatternTokenPairs(
-                [(im_start_id, im_end_id)]
-            )
+            helper = MultiModalityDataPaddingPatternMultimodalTokens()
             input_ids = helper.pad_input_tokens(input_ids, mm_inputs)
-            all_data_offsets.extend(mm_inputs.data_offsets)
+            all_data_offsets.extend(
+                start - 1 for item in visual_items for start, _ in item.offsets
+            )
 
         audio_start_id = getattr(mm_inputs, "audio_start_id", None)
         audio_end_id = getattr(mm_inputs, "audio_end_id", None)
