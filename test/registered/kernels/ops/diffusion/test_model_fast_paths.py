@@ -2095,5 +2095,321 @@ def test_anima_rope_dispatch_and_fallback():
         assert all(torch.equal(out, ref) for out, ref in zip(outputs, expected_fp32))
 
 
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX")
+@pytest.mark.parametrize("packed", [False, True])
+def test_moss_image_situ_fusion_is_bit_exact_and_verified(monkeypatch, packed):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    gate_state = BitExactFusionGate("MOSSImage SiTU test")
+    monkeypatch.setattr(moss_image, "_SITU_FUSION", gate_state)
+    torch.manual_seed(0)
+    if packed:
+        projection = torch.randn(1, 19, 256, device="cuda", dtype=torch.bfloat16)
+        hidden, gate = projection.chunk(2, -1)
+    else:
+        hidden = torch.randn(1, 19, 128, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn_like(hidden)
+    expected = moss_image._situ_native(hidden, gate)
+    for _ in range(2):
+        assert torch.equal(moss_image._situ(hidden, gate), expected)
+    assert gate_state.verified and not gate_state.disabled
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+def test_moss_image_rope_fusion_is_bit_exact_and_verified(monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    gate_state = BitExactFusionGate("MOSSImage RoPE test")
+    monkeypatch.setattr(moss_image, "_ROPE_FUSION", gate_state)
+    torch.manual_seed(0)
+    x = torch.randn(1, 17, 2, 128, device="cuda", dtype=torch.bfloat16)
+    rope = moss_image._RoPE(128, 10000).cuda()(2, 4, 9, torch.device("cuda"))
+    rope = moss_image._prepare_rope(rope.to(x.dtype))
+    expected = moss_image._rotate_native(x, rope)
+    for _ in range(2):
+        assert torch.equal(moss_image._rotate(x, rope), expected)
+    assert gate_state.verified and not gate_state.disabled
+
+
+def test_moss_image_situ_fusion_mismatch_disables_fast_path(monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    gate_state = BitExactFusionGate("test SiTU")
+    monkeypatch.setattr(moss_image, "_SITU_FUSION", gate_state)
+    monkeypatch.setattr(
+        moss_image, "can_use_fused_situ_softcap_mul", lambda **kwargs: True
+    )
+    calls = []
+
+    def incorrect(hidden, gate):
+        calls.append(1)
+        return torch.zeros_like(hidden)
+
+    monkeypatch.setattr(moss_image, "fused_situ_softcap_mul_bitexact", incorrect)
+    hidden = torch.ones(1, 2, 4)
+    gate = torch.full_like(hidden, 2)
+    expected = moss_image._situ_native(hidden, gate)
+    for _ in range(2):
+        assert torch.equal(moss_image._situ(hidden, gate), expected)
+    assert gate_state.disabled and not gate_state.verified
+    assert len(calls) == 1
+
+
+def test_moss_image_rope_fusion_mismatch_disables_fast_path(monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    gate_state = BitExactFusionGate("test RoPE")
+    monkeypatch.setattr(moss_image, "_ROPE_FUSION", gate_state)
+    calls = []
+
+    def incorrect(x, cos, sin):
+        calls.append(1)
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(moss_image, "fused_rope_rotate_half_bitexact", incorrect)
+    x = torch.ones(1, 3, 2, 16, device="cuda", dtype=torch.bfloat16)
+    rope = tuple(
+        torch.full((1, 3, 16), value, device=x.device, dtype=x.dtype)
+        for value in (0, 1)
+    )
+    for _ in range(2):
+        assert torch.equal(moss_image._rotate(x, rope), x)
+    assert gate_state.disabled and not gate_state.verified
+    assert len(calls) == 1
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX")
+@pytest.mark.parametrize("shape", [(1, 4096, 3072), (1, 97, 24, 128)])
+def test_moss_image_rmsnorm_fusion_is_bit_exact_and_verified(monkeypatch, shape):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
+    monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
+    norm = moss_image._RMSNorm(shape[-1]).to("cuda", torch.bfloat16)
+    norm.weight.copy_(torch.randn_like(norm.weight))
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    expected = norm.forward_native(x)
+    for _ in range(2):
+        assert torch.equal(norm(x), expected)
+    assert state.verified and not state.disabled
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "exception"])
+def test_moss_image_rmsnorm_failure_disables_fast_path(monkeypatch, failure):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
+    monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
+    monkeypatch.setattr(
+        moss_image, "can_use_rmsnorm_cast_before_weight", lambda **kwargs: True
+    )
+    calls = []
+
+    def incorrect(x, weight):
+        calls.append(1)
+        if failure == "exception":
+            raise RuntimeError("kernel unavailable")
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(moss_image, "rmsnorm_cast_before_weight_bitexact", incorrect)
+    norm = moss_image._RMSNorm(128)
+    x = torch.ones(1, 3, 128)
+    for _ in range(2):
+        assert torch.equal(norm(x), norm.forward_native(x))
+    assert state.disabled and not state.verified and len(calls) == 1
+
+
+@torch.no_grad()
+def test_moss_image_rmsnorm_unsupported_layout_uses_native(monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
+    monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
+    norm = moss_image._RMSNorm(128).to("cuda", torch.bfloat16)
+    x = torch.randn(2, 7, 3 * 128, device="cuda", dtype=torch.bfloat16)[..., :128]
+    assert torch.equal(norm(x), norm.forward_native(x))
+    assert not state.verified and not state.disabled
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA JIT")
+@pytest.mark.parametrize("batch", [1, 2])
+def test_moss_image_block_modulation_and_residual_match_eager(monkeypatch, batch):
+    from sglang.kernels.ops.diffusion import (
+        can_use_modulate_scale_shift_cuda,
+        can_use_residual_gate_add_cuda,
+        modulate_scale_shift,
+        residual_gate_add,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    class ValueAttention(nn.Module):
+        def forward(self, q, k, v):
+            return v
+
+    monkeypatch.setattr(moss_image, "LocalAttention", lambda **kwargs: ValueAttention())
+    block = moss_image._Block(128, 256, 1).to("cuda", torch.bfloat16)
+    block.attention = ValueAttention()
+    x = torch.randn(batch, 19, 128, device="cuda", dtype=torch.bfloat16)
+    modulation = torch.randn(batch, 6, 128, device="cuda", dtype=x.dtype)
+    rope = (
+        torch.zeros(batch, 19, 128, device="cuda", dtype=x.dtype),
+        torch.ones(batch, 19, 128, device="cuda", dtype=x.dtype),
+    )
+    calls = []
+
+    def modulate(x, scale, shift):
+        calls.append(("modulate", can_use_modulate_scale_shift_cuda(x, scale, shift)))
+        return modulate_scale_shift(x, scale, shift)
+
+    def residual(x, update, gate):
+        calls.append(("residual", can_use_residual_gate_add_cuda(x, update, gate)))
+        return residual_gate_add(x, update, gate)
+
+    monkeypatch.setattr(moss_image, "modulate_scale_shift", modulate)
+    monkeypatch.setattr(moss_image, "residual_gate_add", residual)
+    actual = block(x, rope, modulation)
+    monkeypatch.setattr(
+        moss_image,
+        "modulate_scale_shift",
+        lambda x, s, b: x * (1 + s[:, None]) + b[:, None],
+    )
+    monkeypatch.setattr(moss_image, "residual_gate_add", lambda x, h, g: x + h * g)
+    expected = block(x, rope, modulation)
+    assert torch.equal(actual, expected)
+    assert calls == [("modulate", batch == 1), ("residual", True)] * 2
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX and graph capture")
+def test_moss_image_rmsnorm_verifies_each_regime_and_preserves_graph_capture(
+    monkeypatch,
+):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
+    monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
+    token_norm = moss_image._RMSNorm(3072).to("cuda", torch.bfloat16)
+    for rows in [13, 17]:
+        x = torch.randn(1, rows, 3072, device="cuda", dtype=torch.bfloat16)
+        assert torch.equal(token_norm(x), token_norm.forward_native(x))
+    assert len(state.verified_sigs) == 2
+
+    head_norm = moss_image._RMSNorm(128).to("cuda", torch.bfloat16)
+    x = torch.randn(1, 19, 128, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            head_norm.forward_native(x)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = head_norm(x)
+    graph.replay()
+    assert torch.equal(captured, head_norm.forward_native(x))
+    # A previously verified width must not permit a host-synchronizing check
+    # for a new width inside capture.
+    assert len(state.verified_sigs) == 2
+
+    assert torch.equal(head_norm(x), head_norm.forward_native(x))
+    assert len(state.verified_sigs) == 3 and not state.disabled
+    stream.wait_stream(torch.cuda.current_stream())
+    fused_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(fused_graph, stream=stream):
+        fused = head_norm(x)
+    for _ in range(2):
+        x.copy_(torch.randn_like(x))
+        fused_graph.replay()
+        assert torch.equal(fused, head_norm.forward_native(x))
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+@pytest.mark.parametrize("epilogue", ["modulate", "rope"])
+def test_moss_image_norm_epilogue_gate_and_graph_replay(monkeypatch, epilogue):
+    import sglang.multimodal_gen.runtime.models.dits.moss_image as moss_image
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+
+    gate = BitExactFusionGate("test norm epilogue")
+    if epilogue == "modulate":
+        monkeypatch.setattr(moss_image, "_NORM_MOD_FUSION", gate)
+        norm = moss_image._RMSNorm(3072).cuda().bfloat16()
+        x = torch.randn(1, 33, 3072, device="cuda", dtype=torch.bfloat16)
+        scale = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+        shift = torch.randn_like(scale)
+        call = lambda: moss_image._norm_modulate(norm, x, scale, shift)
+        reference = lambda: (
+            norm.forward_native(x) * (1 + scale[:, None]) + shift[:, None]
+        )
+    else:
+        monkeypatch.setattr(moss_image, "_NORM_ROPE_FUSION", gate)
+        norm = moss_image._RMSNorm(128).cuda().bfloat16()
+        x = torch.randn(1, 33, 3072, device="cuda", dtype=torch.bfloat16)
+        rope = tuple(
+            torch.randn(1, 33, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        call = lambda: moss_image._norm_rope(norm, x, rope, 24)
+        reference = lambda: moss_image._rotate_native(
+            norm.forward_native(x.unflatten(-1, (24, 128))), rope
+        ).flatten(2)
+    with torch.no_grad():
+        # The unverified graph must capture the existing fallback without a sync.
+        cold = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cold):
+            cold_out = call()
+        assert not gate.verified
+        assert torch.equal(call(), reference())
+        assert gate.verified and not gate.disabled
+        hot = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(hot):
+            hot_out = call()
+        for _ in range(2):
+            x.copy_(torch.randn_like(x))
+            cold.replay()
+            hot.replay()
+            expected = reference()
+            assert torch.equal(cold_out, expected)
+            assert torch.equal(hot_out, expected)
+
+
+@pytest.mark.parametrize("operation", ["situ", "rmsnorm"])
+@torch.no_grad()
+def test_moss_image_selected_kernel_rejects_mismatched_operands(monkeypatch, operation):
+    """Invalid operands must not silently disable a selected fusion and run eager."""
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    x = torch.ones(1, 17, 128, device="cuda", dtype=torch.bfloat16)
+    if operation == "situ":
+        monkeypatch.setattr(
+            moss_image,
+            "_SITU_FUSION",
+            BitExactFusionGate("MOSSImage invalid input test"),
+        )
+        with pytest.raises(ValueError):
+            moss_image._situ(x, x[:, :-1])
+        assert not moss_image._SITU_FUSION.disabled
+    else:
+        monkeypatch.setattr(
+            moss_image,
+            "_RMSNORM_FUSION",
+            BitExactFusionGate("MOSSImage invalid input test"),
+        )
+        norm = moss_image._RMSNorm(64).to(device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError):
+            norm(x)
+        assert not moss_image._RMSNORM_FUSION.disabled
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

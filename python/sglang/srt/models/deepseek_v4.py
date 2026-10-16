@@ -638,6 +638,25 @@ def _freqs_cis_to_cos_sin(
     return cos, sin
 
 
+def _fp8_wo_a_einsum(
+    o_fp8: torch.Tensor,
+    o_s: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    recipe: Tuple[int, int, int],
+) -> torch.Tensor:
+    import deep_gemm
+
+    groups, rank = weight.shape[:2]
+    output = torch.empty(
+        o_fp8.shape[0], groups, rank, device=o_fp8.device, dtype=torch.bfloat16
+    )
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd", (o_fp8, o_s), (weight, weight_scale), output, recipe=recipe
+    )
+    return output
+
+
 def _apply_gguf_grouped_wo_a(
     o: torch.Tensor,
     qweight: torch.Tensor,
@@ -752,6 +771,23 @@ def deepseek_v4_attention_with_output(
 
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
+)
+
+
+def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> None:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens:
+        output[:real_num_tokens].copy_(
+            layer._mega_core(
+                query[:real_num_tokens], attn_sink, forward_batch, get_attn_backend()
+            )
+        )
+    output[real_num_tokens:].zero_()
+
+
+bcg_deepseek_v4_mega_attention_with_output = eager_on_graph(True)(
+    deepseek_v4_mega_attention_with_output
 )
 
 
@@ -994,7 +1030,7 @@ class MqaAttentionBase(nn.Module):
                 else 0
             )
         )
-        freqs_cis = precompute_freqs_cis(
+        self.rope_kwargs = dict(
             dim=self.qk_rope_head_dim,
             seqlen=config.max_position_embeddings,
             original_seq_len=original_seq_len,
@@ -1003,6 +1039,7 @@ class MqaAttentionBase(nn.Module):
             beta_fast=scaling.get("beta_fast", 32),
             beta_slow=scaling.get("beta_slow", 1),
         )
+        freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
@@ -1101,6 +1138,7 @@ class MqaAttentionBase(nn.Module):
 
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
+    use_mega_attention: bool = False
 
     def __init__(
         self,
@@ -1237,6 +1275,21 @@ class MQALayer(MqaAttentionBase):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
+        self.use_mega_attention = (
+            self.is_dsv41
+            and _is_cuda
+            and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+        )
+        self.mega_cos_sin_cache = None
+        if self.use_mega_attention:
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                precompute_cos_sin_table,
+            )
+
+            self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
+        self.mega_wo_a = None
+        self.mega_wq_b_permuted = False
+
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
         # in forward, after weights have loaded.
@@ -1263,6 +1316,77 @@ class MQALayer(MqaAttentionBase):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
+
+    def setup_mega_attention(self) -> None:
+        if not self.use_mega_attention:
+            return
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+            interleave_output_columns,
+            interleave_query_rows,
+            quantize_wo_a,
+        )
+
+        self.mega_wq_b_permuted = (
+            self.n_local_heads in (64, 128) and self._wq_b_uses_flashinfer_mxfp8()
+        )
+        if self.mega_wq_b_permuted:
+            for param in (self.wq_b.weight, self.wq_b.weight_scale_inv):
+                param.data.copy_(interleave_query_rows(param.data, self.n_local_heads))
+            self.wq_b.quant_method._process_mxfp8_linear_weight_scale(self.wq_b)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
+
+    def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
+        method = self.wq_b.quant_method
+        backend = getattr(method, "mxfp8_dense_backend", None)
+        return bool(
+            getattr(method, "use_mxfp8", False)
+            and backend is not None
+            and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
+        )
+
+    def _forward_mega(
+        self,
+        q: torch.Tensor,
+        kernel_num_heads: int,
+        attn_sink: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.deepseek_v4_mega_backend import pack_query
+
+        if forward_batch.forward_mode.is_idle():
+            return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
+        if not self.mega_wq_b_permuted:
+            q = pack_query(q, kernel_num_heads)
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
+            bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
+            return o
+        return self._mega_core(q, attn_sink, forward_batch, attn_backend)
+
+    def _mega_core(
+        self,
+        q: torch.Tensor,
+        attn_sink: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> torch.Tensor:
+        data, scale = attn_backend.forward(
+            q=q,
+            k=q,
+            v=q,
+            layer=self.attn_mqa,
+            forward_batch=forward_batch,
+            compress_ratio=self.compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=False,
+            cos_sin_cache=self.mega_cos_sin_cache,
+        )
+        groups = self.n_local_groups
+        return _fp8_wo_a_einsum(
+            data[:, :groups], scale[:, :groups], *self.mega_wo_a, recipe=(1, 1, 32)
+        )
 
     def _get_npu_rope_position_cache(
         self,
@@ -1374,6 +1498,8 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if self.use_mega_attention:
+            return q
         if not self.q_head_norm:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
@@ -2278,7 +2404,9 @@ class MQALayer(MqaAttentionBase):
 
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
-        if (
+        if self.use_mega_attention:
+            kernel_num_heads = 64 if self.n_local_heads <= 64 else 128
+        elif (
             self.is_dsv41
             and not self.q_head_norm
             and get_token_to_kv_pool().uniform_fp8
@@ -2402,6 +2530,12 @@ class MQALayer(MqaAttentionBase):
             kv, k_rope = _materialize_cp_unified_fp8_kv(
                 kv, k_rope, forward_batch, torch.cuda.current_stream()
             )
+
+        if self.use_mega_attention:
+            o = self._forward_mega(
+                q, kernel_num_heads, attn_sink, forward_batch, attn_backend
+            )
+            return self._project_wo_b(o, defer_all_reduce)
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
@@ -2567,8 +2701,6 @@ class MQALayer(MqaAttentionBase):
                     self.wo_a.weight_scale_inv.data,
                 )
             elif self.wo_a_fp8:
-                import deep_gemm
-
                 T, G, D = o.shape
                 R = self.o_lora_rank
                 if _FP8_WO_A_UE8M0:
@@ -2586,18 +2718,13 @@ class MQALayer(MqaAttentionBase):
                     o_fp8 = o_fp8.view(T, G, D)
                     o_s = o_s.view(T, G, -1)
                     recipe = (1, 128, 128)
-                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-                deep_gemm.fp8_einsum(
-                    "bhr,hdr->bhd",
-                    (o_fp8, o_s),
-                    (
-                        self.wo_a.weight.view(G, R, D),
-                        self.wo_a.weight_scale_inv.data,
-                    ),
-                    output,
+                o = _fp8_wo_a_einsum(
+                    o_fp8,
+                    o_s,
+                    self.wo_a.weight.view(G, R, D),
+                    self.wo_a.weight_scale_inv.data,
                     recipe=recipe,
                 )
-                o = output
             else:
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
@@ -4476,6 +4603,10 @@ class DeepseekV4ForCausalLM(nn.Module):
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
+
+        for module in self.modules():
+            if isinstance(module, MQALayer):
+                module.setup_mega_attention()
 
         if is_nextn:
             return
