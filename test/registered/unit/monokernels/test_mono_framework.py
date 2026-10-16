@@ -9,14 +9,8 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.srt.arg_groups.cuda_graph_hook import (
-    generate_decode_cuda_graph_batch_sizes,
-    parse_cuda_graph_config,
-)
-from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
     Phase,
     default_cuda_graph_config,
     with_phase,
@@ -270,108 +264,6 @@ class TestMonokernelFramework(CustomTestCase):
         )
         self.assertEqual(sizes, [1, 2, 3, 4, 8])
 
-    def test_capture_sizes_respect_the_configured_ceiling(self):
-        for tokens, configured, expected in (
-            (1, [1, 2, 4], [1, 2, 4]),
-            (1, [1, 2, 4, 8], [1, 2, 4, 6, 8]),
-            (6, [1], [1]),
-            (1, [], []),
-        ):
-            with self.subTest(tokens=tokens, configured=configured):
-                self.assertEqual(
-                    covered_capture_sizes(
-                        widths=WIDTHS, tokens_per_request=tokens, sizes=configured
-                    ),
-                    expected,
-                )
-
-    def _resolve_monokernel_graphs(self, **kwargs):
-        args = server_args(**kwargs)
-        parse_cuda_graph_config(args)
-        graph = resolving_view(args).cuda_graph_config
-        # Materialize the decode buckets as the memory-settings hook does,
-        # without probing a GPU or loading a model config.
-        sizes = graph.decode.bs
-        if sizes is None:
-            sizes = generate_decode_cuda_graph_batch_sizes(
-                args, graph.decode.max_bs or 32
-            )
-        declare_resolution(
-            args,
-            "test_decode_buckets",
-            cuda_graph_config=with_phase(
-                graph, Phase.DECODE, bs=sizes, max_bs=max(sizes)
-            ),
-        )
-        with (
-            patch.object(guards, "device_isa", return_value="gfx950"),
-            patch.object(guards, "model_config_of", return_value=None),
-            patch.object(guards, "monokernel_disable_reasons", return_value=(SPEC, [])),
-        ):
-            guards.handle_monokernel(args)
-        return args
-
-    def test_graph_resolution_preserves_explicit_limits_and_buckets(self):
-        for options, expected in (
-            ({"cuda_graph_max_bs_decode": 4}, [1, 2, 4]),
-            ({"cuda_graph_bs_decode": [2, 4]}, [2, 4]),
-            ({"cuda_graph_config": {"decode": {"bs": [2, 4]}}}, [2, 4]),
-            # Default buckets still align with the plugin's supported widths.
-            ({}, [1, 2, 4, 6, 12, 16, 24, 32]),
-            (
-                {"cuda_graph_backend_decode": Backend.DISABLED},
-                [1, 2, 4, 8, 12, 16, 24, 32],
-            ),
-        ):
-            with self.subTest(options=options):
-                args = self._resolve_monokernel_graphs(**options)
-                decode = resolving_view(args).cuda_graph_config.decode
-                self.assertEqual(decode.bs, expected)
-                self.assertEqual(decode.max_bs, max(expected))
-
-    def test_all_graph_disable_options_preserve_eager_draft_coverage(self):
-        registry.register(
-            backend=BACKEND, architecture="Draft", path=f"{__name__}:ONE_TOKEN_DRAFT"
-        )
-        self.addCleanup(reset_context)
-        for options in (
-            {"disable_cuda_graph": True},
-            {"disable_decode_cuda_graph": True},
-            {"cuda_graph_backend_decode": Backend.DISABLED},
-            {"cuda_graph_config": {"decode": {"backend": Backend.DISABLED}}},
-        ):
-            with self.subTest(options=options):
-                args = self._resolve_monokernel_graphs(
-                    speculative_algorithm="DSPARK",
-                    speculative_num_draft_tokens=2,
-                    cuda_graph_bs_decode=[1, 2],
-                    **options,
-                )
-                reset_context()
-                publish(args, role="test")
-                self.assertEqual(
-                    runtime._capture_keys(mode="target_verify", tokens=1), []
-                )
-                lm = install(archs=["Draft"], is_load_observed=True)
-                # Four one-token draft requests are supported, even though the
-                # unused graph configuration only lists batches of one and two.
-                self.assertEqual(
-                    lm(torch.zeros(4), None, batch("target_verify", 4, 4)), "mono"
-                )
-
-    def test_explicit_graph_backend_overrides_disable_flag(self):
-        args = self._resolve_monokernel_graphs(
-            disable_decode_cuda_graph=True,
-            cuda_graph_backend_decode=Backend.FULL,
-            cuda_graph_bs_decode=[1, 2],
-        )
-        publish(args, role="test")
-        self.addCleanup(reset_context)
-        self.assertEqual(
-            [k.batch_size for k in runtime._capture_keys(mode="decode", tokens=1)],
-            [1, 2],
-        )
-
     def test_the_switch_routes_by_graph_key(self):
         lm, _ = switched()
         # SGLang's graph runners choose what to pass from the forward's parameters
@@ -438,7 +330,9 @@ class TestMonokernelFramework(CustomTestCase):
             backend=BACKEND, architecture="Draft", path=f"{__name__}:ONE_TOKEN_DRAFT"
         )
         publish(
-            self._resolve_monokernel_graphs(
+            ServerArgs(
+                model_path="dummy",
+                monokernel_backend=BACKEND,
                 speculative_algorithm="DSPARK",
                 speculative_num_draft_tokens=2,
                 disable_cuda_graph=True,

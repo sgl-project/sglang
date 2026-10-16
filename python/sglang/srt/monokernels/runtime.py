@@ -377,10 +377,10 @@ def _server_step() -> tuple[str, int]:
 
 def _capture_keys(*, mode: str, tokens: int) -> list[ShapeKey]:
     """Return configured decode or verify graph keys, or [] when graphs are disabled."""
-    decode = get_exec().graph.cuda_graph_config.decode
-    if decode.backend == Backend.DISABLED:
+    graph = get_exec().graph.cuda_graph_config
+    if graph is None or graph.decode.backend == Backend.DISABLED:
         return []
-    sizes = sorted(set(decode.bs or []))
+    sizes = sorted(set(graph.decode.bs or []))
     return [
         ShapeKey(forward_mode=mode, batch_size=bs, tokens_per_request=tokens)
         for bs in sizes
