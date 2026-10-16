@@ -104,6 +104,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
         )
         self.unified_buffer = unified_buffer
+        self._awaiting_resize = unified_buffer.post_capture_active
         self._kvcache = kvcache
         self.lazy_compaction = lazy_compaction
 
@@ -782,10 +783,6 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
 
 class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     """Two-ended FULL/SWA allocator with asymmetric shared-byte reservations."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._awaiting_resize = self.unified_buffer.post_capture_active
 
     def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator:
         """The swa sub-allocator: an END pool in the 2-pool pair."""

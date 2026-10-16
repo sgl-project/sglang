@@ -156,6 +156,9 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         bundle = self._post_capture_bundle()
         kvcache = bundle.token_to_kv_pool
         allocator = bundle.token_to_kv_pool_allocator
+        with self.subTest("allocation before finalize_backing"):
+            with self.assertRaisesRegex(RuntimeError, "before resize"):
+                allocator.alloc(_PAGE_SIZE)
         with self.subTest("resize before finalize_backing"):
             with self.assertRaisesRegex(RuntimeError, "finalize_backing must run"):
                 allocator.resize(
