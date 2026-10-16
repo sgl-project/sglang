@@ -1666,6 +1666,11 @@ class Envs:
     # ROCm gfx950 TP-only: overlap wo_b's all-reduce with its GEMM through mori
     # cco. Off by default: it reserves a symmetric window outside torch's
     # allocator, so a run that enables it wants a lower --mem-fraction-static.
+    # It also substitutes the GEMM, so the output moves. Only where wo_a hands
+    # over an Fp8GridActivation -- the gfx950 native mxfp8 route -- do the two
+    # quantise identically and agree bit for bit. On --fp8-gemm-backend aiter,
+    # which the MI355X recipes pin, wo_b gets a plain bf16 tensor and each path
+    # rounds it itself: relative L2 7.5e-3 to 8.2e-3, measured at M=16384 TP4.
     SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
     # Send the fused wo_b's all-gather leg as fp8 e4m3 with a per-row scale,
     # halving its bytes. Off by default: it costs accuracy, and that is e4m3's
