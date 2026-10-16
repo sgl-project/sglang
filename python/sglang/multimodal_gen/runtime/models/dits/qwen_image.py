@@ -40,6 +40,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_world_size,
 )
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
@@ -247,6 +250,17 @@ def _defer_modelopt_output_bias(quant_config: Optional[QuantizationConfig]) -> b
     return _can_defer_modelopt_output_bias(
         quant_config, current_platform.get_device_capability()
     )
+
+
+def _gather_modulation_shards(
+    img_mod_local: torch.Tensor, txt_mod_local: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """All-gather both column-sharded [B, 6*dim/tp] modulations in one collective."""
+    num_img = img_mod_local.shape[0]
+    gathered = tensor_model_parallel_all_gather(
+        torch.cat([img_mod_local, txt_mod_local], dim=0), dim=-1
+    )
+    return gathered[:num_img], gathered[num_img:]
 
 
 def _safe_tensor_version(tensor: torch.Tensor) -> Optional[int]:
@@ -1379,10 +1393,23 @@ class QwenImageTransformerBlock(nn.Module):
         self.quant_config = quant_config
         self.zero_cond_t = zero_cond_t
 
+        # The two adaLN projections are 6.8B of the 20B params. Their input is
+        # one token per sample, so under TP shard the output columns and
+        # all-gather the [B, 6*dim] result instead of keeping a full copy per
+        # rank. Quantized checkpoints keep the replicated layout.
+        tp_size = get_tp_world_size()
+        self._shard_modulation = tp_size > 1 and quant_config is None
+        if self._shard_modulation:
+            mod_linear_cls = functools.partial(
+                ColumnParallelLinear, gather_output=False
+            )
+        else:
+            mod_linear_cls = ReplicatedLinear
+
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            mod_linear_cls(
                 dim,
                 6 * dim,
                 bias=True,
@@ -1410,7 +1437,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            mod_linear_cls(
                 dim,
                 6 * dim,
                 bias=True,
@@ -1469,13 +1496,6 @@ class QwenImageTransformerBlock(nn.Module):
                 dim_out=dim,
                 quant_config=quant_config,
                 prefix=f"{prefix}.txt_mlp",
-                # The text branch is ~1K tokens regardless of image size, so
-                # sharding its FFN saves less GEMM time than the per-block
-                # all-reduce it adds. Measured e2e crossover (H100, 1024x1024):
-                # tp=2 replication wins (5.58s -> 5.12s, -8%) but at tp=4 the
-                # duplicated GEMM outgrows the all-reduce saved (~1% loss), so
-                # gate on the TP degree.
-                replicated=get_tp_world_size() <= 2,
             )
 
         if nunchaku_enabled:
@@ -1628,6 +1648,10 @@ class QwenImageTransformerBlock(nn.Module):
 
         img_mod_params, _ = self.img_mod[1](temb_img_silu)
         txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)
+        if self._shard_modulation:
+            img_mod_params, txt_mod_params = _gather_modulation_shards(
+                img_mod_params, txt_mod_params
+            )
         self._modulation_cache = (
             (cache_key, img_mod_params, txt_mod_params)
             if cache_key is not None
