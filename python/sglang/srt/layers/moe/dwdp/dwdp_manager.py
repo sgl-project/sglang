@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     build_layer_weight_specs,
@@ -209,3 +210,49 @@ class DwdpManager:
                     f"shape={tuple(full.shape)} dtype={full.dtype} "
                     f"size={full.numel() * full.element_size() / 1e6:.1f}MB"
                 )
+
+
+def replicate_routed_experts(model: nn.Module) -> None:
+    """All-gather every routed expert of each EP-sharded FusedMoE in ``model``.
+
+    DWDP runs MoE on DP-local tokens with no post-experts sum, so a MoE layer
+    outside the target's prefetch pipeline (e.g. a speculative draft's) must
+    hold all routed experts on every rank.
+    """
+    group = get_parallel().moe_ep_group
+    for experts in model.modules():
+        if not isinstance(experts, FusedMoE) or experts.moe_ep_size == 1:
+            continue
+        if experts.num_fused_shared_experts > 0:
+            raise NotImplementedError(
+                "DWDP expert replication does not support fused shared experts"
+            )
+        side_tensors = experts.named_per_expert_tensors(experts.num_local_experts)
+        experts.bind_full_expert_weights(
+            {
+                name: _all_gather_experts(getattr(experts, name).data, group)
+                for name in _EXPERT_WEIGHT_NAMES
+            },
+            prefetched=False,
+        )
+        for name, data in side_tensors:
+            experts.replace_expert_tensor(name, _all_gather_experts(data, group))
+        logger.info(
+            f"DWDP: replicated all {experts.num_local_experts} routed experts "
+            f"of {experts.layer_name}"
+        )
+
+
+def _all_gather_experts(local: torch.Tensor, group) -> torch.Tensor:
+    # Gather in memory order, experts outermost, so a permuted layout such as
+    # DeepGEMM's mn-major scales keeps its strides.
+    order = sorted(range(local.dim()), key=lambda d: -local.stride(d))
+    send = local.permute(order)
+    if order[0] != 0 or not send.is_contiguous():
+        raise ValueError(
+            f"cannot all-gather expert tensor with shape={tuple(local.shape)} "
+            f"stride={local.stride()}"
+        )
+    full = send.new_empty((send.shape[0] * group.world_size, *send.shape[1:]))
+    all_gather_single(full, send, group=group.device_group)
+    return full.permute([order.index(d) for d in range(local.dim())])
