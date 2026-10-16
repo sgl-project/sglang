@@ -446,11 +446,12 @@ def late_layer_tail_layout(
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
     """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
     Returns (token indices into the extend, per-request tail lengths, per-row
-    absolute window floor)."""
+    absolute window floor). The floor is seq_len - tail_len, so a tail shorter
+    than tail_len reads rows the request wrote before this extend."""
     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
-        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
+        floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # One H2D copy for the three length vectors; launch count does not grow with bs.
     lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
@@ -464,7 +465,7 @@ def late_layer_tail_layout(
         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
     )
     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
-    floor = (seq_lens - tail_lens)[req].to(torch.int32)
+    floor = (seq_lens - tail_len).clamp_min(0)[req].to(torch.int32)
     return token_indices, tail_lens_cpu, floor
 
 

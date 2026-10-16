@@ -11,21 +11,31 @@ from typing import Any
 
 CACHE_OPTIONS_KEY = "sgld_cache_options"
 
+# Less aggressive than the server default (warmup 4, threshold 0.24, 3 cached
+# steps in a row): fewer skipped steps, closer to the uncached output.
+CONSERVATIVE_PRESET = {
+    "max_warmup_steps": 6,
+    "residual_diff_threshold": 0.12,
+    "max_continuous_cached_steps": 2,
+}
+
 
 def build_cache_options(
     enable_cache_dit: bool | None, cache_dit_params: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """Plain, pickle-safe options; unknown cache_dit_params keys raise."""
+    """Plain, pickle-safe options; unknown cache_dit_params keys raise.
+
+    Knobs are kept when caching is on or left to the loader/server default, and
+    dropped when it is off, so a tuned node can be switched off without resetting
+    every knob.
+    """
     from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
         resolve_cache_dit_request_overrides,
     )
 
     params = resolve_cache_dit_request_overrides(cache_dit_params)
-    if params and enable_cache_dit is not True:
-        raise ValueError(
-            "cache_dit_params were given but enable_cache_dit is not on; "
-            "they would be ignored."
-        )
+    if enable_cache_dit is False:
+        params = {}
     return {"enable_cache_dit": enable_cache_dit, "cache_dit_params": params or None}
 
 

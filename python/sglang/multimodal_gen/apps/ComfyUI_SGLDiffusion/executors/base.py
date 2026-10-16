@@ -160,6 +160,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
     cache_dit_needs_run_steps = True
     # Loader-option default (SGLDOptions); a per-run SGLDCacheOptions value wins.
     enable_cache_dit: bool | None = None
+    # Loader-option knobs (SGLDOptions manual tuning); per-run knobs override them.
+    cache_dit_params: dict | None = None
     # Whether the current sampler run alternates cond and uncond requests.
     _run_separate_cfg: bool = False
 
@@ -311,8 +313,13 @@ class SGLDiffusionExecutor(torch.nn.Module):
         enable = self._cache_dit_enabled_for(packed)
         if enable is not None:
             kwargs["enable_cache_dit"] = enable
-        if enable and packed.cache_options.get("cache_dit_params"):
-            kwargs["cache_dit_params"] = dict(packed.cache_options["cache_dit_params"])
+        if enable:
+            params = {
+                **(self.cache_dit_params or {}),
+                **(packed.cache_options.get("cache_dit_params") or {}),
+            }
+            if params:
+                kwargs["cache_dit_params"] = params
         return kwargs
 
     def _cache_dit_enabled_for(self, packed) -> bool | None:

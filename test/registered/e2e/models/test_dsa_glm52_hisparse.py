@@ -12,8 +12,8 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 
 register_cuda_ci(
     est_time=700,
-    stage="extra-b",
-    runner_config="8-gpu-b300",
+    stage="nightly",
+    runner_config="8-gpu-b200",
 )
 
 GLM52_NVFP4_MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
@@ -22,7 +22,7 @@ GLM52_NVFP4_MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
 class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
     """1P1D GLM-5.2 MTP with HiSparse target KV and dense draft KV transfer."""
 
-    # Match the existing GLM-5.2 PD test: NVFP4 fits TP4 + TP4 on eight B300s.
+    # Use separate TP4 groups for prefill and decode on eight B200s.
     model = GLM52_NVFP4_MODEL_PATH
     prefill_tp_size = decode_tp_size = 4
     decode_base_gpu_id = 4
@@ -54,6 +54,9 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
     # packed FP8 layout; Blackwell defaults prefill to TRT-LLM's raw FP8 layout.
     extra_prefill_args = common_args + [
         "--dsa-prefill-backend",
+        "flashmla_kv",
+        # Startup autotune runs a decode forward even on the prefill worker.
+        "--dsa-decode-backend",
         "flashmla_kv",
     ]
     extra_decode_args = common_args + [

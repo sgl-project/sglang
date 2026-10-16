@@ -848,6 +848,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
 
+    def _cache_dit_has_separate_cfg(self, batch: Req) -> bool:
+        """Whether CFG runs as separate cond/uncond transformer calls per step."""
+        return (
+            batch.do_classifier_free_guidance
+            and not self.server_args.enable_cfg_parallel
+        )
+
+    def _cache_dit_joint_cfg_decision(self) -> bool:
+        """Whether one forward carries the whole CFG pair (see
+        ``enable_cache_on_transformer``)."""
+        return False
+
     def _cache_dit_requested(self) -> bool:
         """Request-independent server default (init-time decisions only)."""
         return envs.SGLANG_CACHE_DIT_ENABLED
@@ -1086,13 +1098,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         # A ComfyUI CFG step arrives as one request per branch, so the request
         # itself carries no CFG; the sampler run says whether branches alternate.
-        has_separate_cfg = (
-            requested
-            and (
-                batch.do_classifier_free_guidance
-                or (comfyui_run is not None and comfyui_run[2])
+        has_separate_cfg = requested and (
+            self._cache_dit_has_separate_cfg(batch)
+            or (
+                comfyui_run is not None
+                and comfyui_run[2]
+                and not self.server_args.enable_cfg_parallel
             )
-            and not self.server_args.enable_cfg_parallel
         )
         desired_key = (
             (
@@ -1227,6 +1239,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 separate_cfg_override=(
                     True if comfyui_run is not None and comfyui_run[2] else None
                 ),
+                joint_cfg_decision=self._cache_dit_joint_cfg_decision(),
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",

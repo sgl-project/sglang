@@ -235,6 +235,8 @@ class MiniMaxH3Executor(SGLDiffusionExecutor):
     def _sampling_params_kwargs(self, packed, timestep) -> dict:
         kwargs = super()._sampling_params_kwargs(packed, timestep)
         drop_h3_pinned_sampling_fields(kwargs)
+        if getattr(self, "enable_spectrum", False):
+            kwargs["enable_spectrum"] = True
         return kwargs
 
 

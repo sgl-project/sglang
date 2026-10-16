@@ -463,8 +463,16 @@ def test_cache_options_node_returns_clone_and_keeps_input() -> None:
 def test_cache_options_reject_bad_requests() -> None:
     with pytest.raises(ValueError, match="Unknown cache_dit_params"):
         build_cache_options(True, {"not_a_knob": 1})
-    with pytest.raises(ValueError, match="enable_cache_dit is not on"):
-        build_cache_options(None, {"max_warmup_steps": 2})
+
+
+def test_cache_options_off_drops_tuned_knobs() -> None:
+    """Switching a tuned node to off must not raise; default keeps the knobs."""
+    knobs = {"max_warmup_steps": 2}
+    assert build_cache_options(False, knobs) == {
+        "enable_cache_dit": False,
+        "cache_dit_params": None,
+    }
+    assert build_cache_options(None, knobs)["cache_dit_params"] == knobs
 
 
 def test_cache_dit_run_sends_sampler_steps_and_cfg_mode() -> None:

@@ -837,6 +837,11 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
 
         stage = self._cache_dit_stage()
         step = state.steps_done
+        n_sigmas = _sample_sigmas_len(state.sample_sigmas)
+        if batch.enable_spectrum and n_sigmas is not None:
+            # Each ComfyUI step is a one-step request; Spectrum schedules (and
+            # resets) against the whole run, as Cache-DiT does at mount time.
+            batch.num_inference_steps = n_sigmas - 1
         attn_metadata = (
             state.step_attn_metadata(step)
             if state.step_attn_metadata is not None
