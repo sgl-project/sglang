@@ -68,6 +68,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
     _transfer_device: torch.device
 
+    @property
+    def storage_format_tag(self) -> str:
+        # page_first_direct adds a singleton page axis to layer_first pages.
+        layout = "layer_first" if self.layout == "page_first_direct" else self.layout
+        return f"mla-{layout}-v1"
+
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
