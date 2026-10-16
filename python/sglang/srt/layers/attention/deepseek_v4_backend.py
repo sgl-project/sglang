@@ -993,9 +993,6 @@ class DSV4Metadata:
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
-    # Captured with the late layers on a tail block (decoder SWA bounded replay
-    # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
-    prefill_graph_tail: bool = False
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -1113,6 +1110,7 @@ class DeepseekV4AttnBackend(
     folds_encoder_swa_replay: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
+    mega_attn: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -3581,6 +3579,7 @@ class DeepseekV4AttnBackend(
         # to True. Paged attention under active CP needs the page indices.
         return (
             self.trtllm_attn
+            or self.mega_attn
             or self.tail_forward_metadata is not None
             or self.forward_metadata.late_layer_tail is not None
             or self.token_to_kv_pool.request_window is not None
@@ -3657,8 +3656,9 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 1, 2, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
         **_,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(
                 (q.shape[0], q.shape[1], layer.v_head_dim),
@@ -3757,10 +3757,19 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
+            use_mega_paged = cos_sin_cache is not None and self._mega_paged_prefill(
+                forward_batch,
+                num_qo_tokens=q.shape[0],
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                num_heads=q.shape[-2],
+            )
+
             # The tail stays dense: its window floor lives in swa_page_indices,
             # which the sparse chunk cache ignores.
             if (
                 self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
+                and not use_mega_paged
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):
@@ -3782,6 +3791,23 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
+                    cos_sin_cache=cos_sin_cache,
+                )
+
+            if cos_sin_cache is not None:
+                return self._forward_mega_decode(
+                    q=q.squeeze(1),
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices.squeeze(1),
+                    positions=match_num_queries(core_attn_metadata.positions, value=0),
+                    cos_sin_cache=cos_sin_cache,
+                    attn_sink=attn_sink,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=None
+                    if extra_indices is None
+                    else extra_indices.squeeze(1),
+                    extra_topk_lengths=extra_topk_lengths,
                 )
 
             if (
@@ -3889,7 +3915,8 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
-    ) -> torch.Tensor:
+        cos_sin_cache: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
         if _is_xpu:
@@ -3947,6 +3974,17 @@ class DeepseekV4AttnBackend(
             layout=token_to_kv_pool.get_swa_key_layout(),
         )
         kv = workspace
+
+        if cos_sin_cache is not None:
+            return self._forward_mega_prefill(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                positions=core_attn_metadata.positions[: q_flat.shape[0]],
+                cos_sin_cache=cos_sin_cache,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
