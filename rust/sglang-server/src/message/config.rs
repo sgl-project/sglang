@@ -138,6 +138,12 @@ pub struct ServerArgs {
     /// Extra headers on a successful `/health_generate` response, for a router
     /// that reads deployment metadata off the deep health probe.
     pub health_generate_headers: BTreeMap<String, String>,
+    /// Priority given to a generation request that sets none; `None` unless
+    /// priority scheduling is on (Python `_set_default_priority`).
+    pub default_priority_value: Option<i64>,
+    /// Apply the router's `x-override-*` headers to `/generate` bodies
+    /// (`SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES`).
+    pub enable_request_header_overrides: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -167,6 +173,15 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// The scheduler's shared-memory load snapshot file, its DP rank count and
+    /// this listener's own slot, which `/v1/loads` reads (`None` when snapshots
+    /// go over ZMQ instead), plus the accelerator name and per-rank count that
+    /// endpoint reports.
+    pub load_snapshot_path: Option<String>,
+    pub load_snapshot_dp_size: usize,
+    pub load_snapshot_dp_rank: usize,
+    pub accelerator: Option<String>,
+    pub num_accelerators: u32,
     /// Prometheus metrics (`--enable-metrics`); `None` serves no `/metrics`.
     pub metrics: Option<MetricsConfig>,
 }
@@ -195,6 +210,8 @@ impl ServerArgs {
         skip_tokenizer_init,
         skip_server_warmup,
         health_generate_headers,
+        default_priority_value,
+        enable_request_header_overrides,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
@@ -205,6 +222,11 @@ impl ServerArgs {
         num_reserved_tokens,
         version,
         max_total_num_tokens,
+        load_snapshot_path,
+        load_snapshot_dp_size,
+        load_snapshot_dp_rank,
+        accelerator,
+        num_accelerators,
         metrics,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
@@ -230,6 +252,8 @@ impl ServerArgs {
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
         health_generate_headers: BTreeMap<String, String>,
+        default_priority_value: Option<i64>,
+        enable_request_header_overrides: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
@@ -240,6 +264,11 @@ impl ServerArgs {
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
+        load_snapshot_path: Option<String>,
+        load_snapshot_dp_size: usize,
+        load_snapshot_dp_rank: usize,
+        accelerator: Option<String>,
+        num_accelerators: u32,
         metrics: Option<MetricsConfig>,
     ) -> Self {
         Self {
@@ -263,6 +292,8 @@ impl ServerArgs {
             skip_tokenizer_init,
             skip_server_warmup,
             health_generate_headers,
+            default_priority_value,
+            enable_request_header_overrides,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
@@ -273,6 +304,11 @@ impl ServerArgs {
             num_reserved_tokens,
             version,
             max_total_num_tokens,
+            load_snapshot_path,
+            load_snapshot_dp_size,
+            load_snapshot_dp_rank,
+            accelerator,
+            num_accelerators,
             metrics,
         }
     }
@@ -304,6 +340,8 @@ impl Default for ServerArgs {
             skip_tokenizer_init: false,
             skip_server_warmup: false,
             health_generate_headers: BTreeMap::new(),
+            default_priority_value: None,
+            enable_request_header_overrides: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
@@ -314,6 +352,11 @@ impl Default for ServerArgs {
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
+            load_snapshot_path: None,
+            load_snapshot_dp_size: 0,
+            load_snapshot_dp_rank: 0,
+            accelerator: None,
+            num_accelerators: 0,
             metrics: None,
         }
     }
