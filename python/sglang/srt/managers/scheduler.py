@@ -5237,7 +5237,6 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                # Failed transfers held for a prefill drain ack still own KV pages.
                 idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
