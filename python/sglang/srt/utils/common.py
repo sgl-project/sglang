@@ -1755,6 +1755,29 @@ def media_url_max_file_size_bytes() -> int:
     return _media_url_max_file_size_bytes
 
 
+MediaUrlResolver = Callable[[str], bytes]
+_media_url_resolvers: dict[str, MediaUrlResolver] = {}
+
+
+def register_media_url_resolver(scheme: str, resolver: MediaUrlResolver) -> None:
+    """Fetch ``<scheme>://`` media URLs with ``resolver``.
+
+    Lets a deployment plug in object stores the loaders don't know about
+    (``s3://``, ``gs://``, ...). Unregistered schemes keep the historical
+    behavior of being decoded as bare base64.
+    """
+    _media_url_resolvers[scheme.lower()] = resolver
+
+
+def resolve_media_url(url: str) -> Optional[bytes]:
+    """Bytes from the resolver registered for ``url``'s scheme, or None."""
+    scheme, separator, _ = url.partition("://")
+    if not separator:
+        return None
+    resolver = _media_url_resolvers.get(scheme.lower())
+    return None if resolver is None else resolver(url)
+
+
 def _assert_media_url_allowed(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
@@ -1886,6 +1909,10 @@ def load_audio(
         source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
+    elif isinstance(audio_file, str) and (
+        (resolved := resolve_media_url(audio_file)) is not None
+    ):
+        source = resolved
     elif isinstance(audio_file, str):
         source = audio_file
     else:
@@ -2144,28 +2171,6 @@ def load_image(
     return image, image_size
 
 
-MediaUrlResolver = Callable[[str], bytes]
-_media_url_resolvers: dict[str, MediaUrlResolver] = {}
-
-
-def register_media_url_resolver(scheme: str, resolver: MediaUrlResolver) -> None:
-    """Fetch ``<scheme>://`` media URLs with ``resolver``.
-
-    Lets a deployment plug in object stores the loaders don't know about
-    (``s3://``, ``gs://``, ...). Unregistered schemes keep the historical
-    behavior of being decoded as bare base64.
-    """
-    _media_url_resolvers[scheme] = resolver
-
-
-def _resolve_media_url(url: str) -> Optional[bytes]:
-    scheme, separator, _ = url.partition("://")
-    if not separator:
-        return None
-    resolver = _media_url_resolvers.get(scheme)
-    return None if resolver is None else resolver(url)
-
-
 def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
@@ -2180,7 +2185,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
     if isinstance(image_file, str):
-        resolved = _resolve_media_url(image_file)
+        resolved = resolve_media_url(image_file)
         if resolved is not None:
             return resolved
         return pybase64.b64decode(image_file, validate=True)
@@ -2209,6 +2214,8 @@ def _normalize_video_input(
             return unquote(urlparse(video_file).path)
         elif os.path.isfile(unquote(urlparse(video_file).path)):
             return video_file
+        elif (resolved := resolve_media_url(video_file)) is not None:
+            return resolved
         else:
             return pybase64.b64decode(video_file, validate=True)
     else:

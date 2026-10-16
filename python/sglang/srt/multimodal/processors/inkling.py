@@ -52,7 +52,7 @@ from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID as INKLING_IMAGE_
 from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
 )
-from sglang.srt.utils.common import download_remote_media
+from sglang.srt.utils.common import download_remote_media, resolve_media_url
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +66,9 @@ def _resolve_media_item(item):
 
     The OpenAI chat path hands ImageData/AudioData objects or data:/http(s) URLs; the
     /generate path hands raw bytes or local file paths. Resolve URLs to bytes here
-    (data: base64 -> exact original bytes; http(s) -> download) and pass bytes / file
-    paths / PIL through unchanged for the per-modality byte loader to handle.
+    (data: base64 -> exact original bytes; http(s) and registered schemes -> download)
+    and pass bytes / file paths / PIL through unchanged for the per-modality byte
+    loader to handle.
     """
     url = None
     if isinstance(item, str):
@@ -83,6 +84,9 @@ def _resolve_media_item(item):
         return base64.b64decode(payload) if ";base64" in header else payload.encode()
     if url.startswith(("http://", "https://")):
         return download_remote_media(url, timeout=30)
+    resolved = resolve_media_url(url)
+    if resolved is not None:
+        return resolved
     return url  # plain path / file:// -> handled by the per-modality byte loader
 
 
