@@ -1,8 +1,10 @@
 import argparse
 import asyncio
+import functools
 import sys
 import unittest
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import orjson
@@ -1073,6 +1075,7 @@ class InklingOutputItemsTestCase(CustomTestCase):
 
     def setUp(self):
         self.serving = make_serving()
+        self.serving.tokenizer_manager.tokenizer = None
         self.serving.chat_encoding_spec = "inkling"
         self.serving.reasoning_parser = self.serving.tool_call_parser = "inkling"
         self.serving._spec_adapter = self.serving._build_spec_adapter()
@@ -1265,6 +1268,7 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
             with self.subTest(reasoning=reasoning_parser, tool=tool_call_parser):
                 with self.assertRaises(ValueError):
                     InklingSpecAdapter(
+                        tokenizer=None,
                         reasoning_parser=reasoning_parser,
                         tool_call_parser=tool_call_parser,
                         chat_hooks=self._hooks(),
@@ -1272,21 +1276,49 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
         for reasoning_parser, tool_call_parser in (("inkling", None), (None, None)):
             with self.subTest(reasoning=reasoning_parser, tool=tool_call_parser):
                 InklingSpecAdapter(
+                    tokenizer=None,
                     reasoning_parser=reasoning_parser,
                     tool_call_parser=tool_call_parser,
                     chat_hooks=self._hooks(),
                 )
 
+    def test_inkling_adapter_rejects_a_served_tokenizer_with_other_ids(self):
+        """The served tokenizer detokenizes and matches stops, while prompts and
+        outputs go through tml-renderers; a vocabulary that differs must fail boot."""
+        from sglang.srt.entrypoints.openai.serving_inkling import InklingSpecAdapter
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tml = load_tml_renderers().tokenizer
+
+        def served(shift_token=None):
+            return SimpleNamespace(
+                convert_tokens_to_ids=lambda token: (
+                    tml.encode_special(token[2:-2]) + (token == shift_token)
+                ),
+                encode=lambda text, add_special_tokens: list(tml.encode_ordinary(text)),
+            )
+
+        build = functools.partial(
+            InklingSpecAdapter,
+            reasoning_parser="inkling",
+            tool_call_parser="inkling",
+            chat_hooks=self._hooks(),
+        )
+        build(tokenizer=served())
+        with self.assertRaisesRegex(ValueError, "<\\|end_message\\|>"):
+            build(tokenizer=served("<|end_message|>"))
+
     def test_responses_handler_builds_one_adapter_bound_to_itself(self):
         """The Responses handler reuses the adapter from its base init; its
         chat hooks must belong to that handler, not to another instance."""
-        from sglang.srt.entrypoints.openai import spec_adapters
+        from sglang.srt.entrypoints.openai import serving_inkling, spec_adapters
         from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 
         with (
             patch.object(
                 OpenAIServingChat, "_resolve_chat_encoding_spec", return_value="inkling"
             ),
+            patch.object(serving_inkling, "_check_served_tokenizer"),
             patch.object(
                 spec_adapters,
                 "build_spec_adapter",

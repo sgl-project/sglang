@@ -26,6 +26,7 @@ from sglang.srt.parser.inkling_renderer import (
     render_inkling_assistant_prefix,
     render_inkling_messages,
 )
+from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 from sglang.srt.runtime_context import get_serving
 
 if TYPE_CHECKING:
@@ -42,6 +43,7 @@ class InklingSpecAdapter:
     def __init__(
         self,
         *,
+        tokenizer: Any,
         reasoning_parser: str | None,
         tool_call_parser: str | None,
         chat_hooks: ChatOutputHooks,
@@ -51,6 +53,8 @@ class InklingSpecAdapter:
         # fail at boot, not 400 every request.
         self._default_reasoning_effort = get_default_reasoning_effort()
         load_tml_renderers()
+        if tokenizer is not None:
+            _check_served_tokenizer(tokenizer)
         parsers = {reasoning_parser, tool_call_parser} - {None}
         if "inkling" in parsers and parsers != {"inkling"}:
             # The token parser emits Inkling calls while constraints would come
@@ -297,6 +301,30 @@ def select_new_output_ids(
         # The abort chunk re-sends already-streamed tokens.
         return output_ids[: max(completion_tokens - num_consumed_tokens, 0)]
     return output_ids
+
+
+_TOKENIZER_PROBE = "Hello, 世界! def f(x): return x**2"
+
+
+def _check_served_tokenizer(tokenizer: Any) -> None:
+    # Prompts and outputs use tml-renderers' tokenizer, while the scheduler matches
+    # stop strings and detokenizes with the served one; they must agree.
+    tml_tokenizer = load_tml_renderers().tokenizer
+    mismatched = [
+        token
+        for token in INKLING_SPECIAL_TOKEN_IDS
+        if tokenizer.convert_tokens_to_ids(token)
+        != tml_tokenizer.encode_special(token[2:-2])
+    ]
+    if tokenizer.encode(_TOKENIZER_PROBE, add_special_tokens=False) != list(
+        tml_tokenizer.encode_ordinary(_TOKENIZER_PROBE)
+    ):
+        mismatched.append("ordinary text")
+    if mismatched:
+        raise ValueError(
+            "The served tokenizer disagrees with tml-renderers' o200k_base_chat on "
+            f"{', '.join(mismatched)}; Inkling prompts and outputs would be misencoded."
+        )
 
 
 def _reasoning_as_thinking_part(message: dict[str, Any]) -> dict[str, Any]:

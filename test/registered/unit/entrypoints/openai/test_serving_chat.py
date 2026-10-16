@@ -3286,6 +3286,7 @@ class ServingChatTestCase(CustomTestCase):
         self.chat.chat_encoding_spec = "inkling"
         self.chat.reasoning_parser = "inkling"
         self.chat.tool_call_parser = "inkling"
+        self.tm.tokenizer = None
         self.chat._spec_adapter = self.chat._build_spec_adapter()
         self.tm.generate_request.return_value = generate()
 
