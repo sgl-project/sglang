@@ -6,13 +6,13 @@ from contextlib import aclosing
 
 from fastapi.responses import ORJSONResponse
 
-from sglang.srt.entrypoints.valen.encoding import encode_valen_schema, encode_valen_text
+from sglang.srt.entrypoints.valen.media import encode_valen_prompt
 from sglang.srt.entrypoints.valen.protocol import ValenRequest
 from sglang.srt.entrypoints.valen.responses import valen_answers
 from sglang.srt.layers.joint_schema_head import max_joint_prompt_tokens
 from sglang.srt.layers.valen_layout import pack_valen_layout
 from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_mm, get_schedule
 
 
 class ValenServing:
@@ -37,20 +37,26 @@ class ValenServing:
                     max_prefill_tokens=get_schedule().max_prefill_tokens,
                 ),
             )
+            media_limits = get_mm().limit_mm_data_per_request
 
             def compile_request():
-                context = encode_valen_text(manager.tokenizer, request.state)
-                return encode_valen_schema(
+                return encode_valen_prompt(
                     manager.tokenizer,
-                    context,
+                    getattr(manager, "processor", None),
+                    request.state,
                     {qid: q.model_dump() for qid, q in request.questions.items()},
+                    media_kwargs=manager.model_config.hf_config.valen_media_kwargs,
                     max_length=limit,
+                    media_limits=media_limits,
                 )
 
-            encoded = await asyncio.to_thread(compile_request)
+            processed = await asyncio.to_thread(compile_request)
+            encoded = processed.encoded
             obj = EmbeddingReqInput(
                 input_ids=encoded.input_ids,
                 valen_layout=pack_valen_layout(encoded.layout),
+                image_data=processed.image_data,
+                video_data=processed.video_data,
             )
             async with aclosing(manager.generate_request(obj, raw_request)) as results:
                 result = await results.__anext__()
@@ -80,9 +86,9 @@ class ValenServing:
 
     async def handle_systemone(self, request, raw_request=None):
         try:
-            if request.images or request.chat_template_kwargs:
+            if request.chat_template_kwargs:
                 raise ValueError(
-                    "Valen System One currently accepts text without chat_template_kwargs"
+                    "Valen uses the trained chat template without chat_template_kwargs"
                 )
             if not isinstance(request.state, str):
                 raise ValueError(
@@ -97,9 +103,30 @@ class ValenServing:
                             "Valen uses its trained fixed Noul descriptions"
                         )
                 questions[qid] = item
-            native = ValenRequest(
-                model=request.model, state=request.state, questions=questions
-            )
+            state = request.state
+            if request.images:
+                state = {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": state},
+                                *(
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": image.url
+                                            if hasattr(image, "url")
+                                            else image
+                                        },
+                                    }
+                                    for image in request.images
+                                ),
+                            ],
+                        }
+                    ]
+                }
+            native = ValenRequest(model=request.model, state=state, questions=questions)
             return await self.handle_request(native, raw_request)
         except ValueError as error:
             return ORJSONResponse(

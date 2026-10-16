@@ -158,12 +158,8 @@ def encode_valen_schema(
     return ValenEncodedPrompt(ids, layout, tuple(metadata))
 
 
-def encode_valen_text(tokenizer, state):
-    """Match Compiler._messages and its add_generation_prompt=False context.
-
-    Media must be rejected until the SGLang processor's sampling, expansion
-    and MRoPE have been validated against the released Valen processor.
-    """
+def valen_messages(tokenizer, state, *, allow_media=False):
+    """Normalize state without mutating it or accepting injected control tokens."""
     if isinstance(state, str):
         messages = [{"role": "user", "content": state}]
     else:
@@ -184,15 +180,33 @@ def encode_valen_text(tokenizer, state):
         if not isinstance(content, list):
             raise ValueError("Valen message content must be text or a content list")
         for item in content:
-            if not isinstance(item, dict) or item.get("type") != "text":
+            if not isinstance(item, dict):
+                raise ValueError("Valen content items must be objects")
+            kind = item.get("type")
+            if allow_media and kind in {"image_url", "video_url"}:
+                source = item.get(kind)
+                url = source.get("url") if isinstance(source, dict) else None
+                if not isinstance(url, str) or not url.strip():
+                    raise ValueError(f"Valen {kind} needs a nonempty url")
+                # HF consumes image/video items; the URL itself is not prompt text.
+                item.clear()
+                item.update(type=kind.removesuffix("_url"), url=url)
+                continue
+            if kind != "text":
                 raise ValueError(
-                    "This initial Valen integration supports text; image/video parity is pending"
+                    "Use the Valen multimodal processor for image/video content"
                 )
             text = item.get("text")
             if not isinstance(text, str):
                 raise ValueError("Valen text content must be a string")
             if any(token in text for token in tokenizer.all_special_tokens):
                 raise ValueError("Reserved tokenizer control token in Valen state")
+    return messages
+
+
+def encode_valen_text(tokenizer, state):
+    """Match the training compiler's add_generation_prompt=False text context."""
+    messages = valen_messages(tokenizer, state)
     return tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=False, return_dict=False
     )

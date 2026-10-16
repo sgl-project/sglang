@@ -68,6 +68,7 @@ from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
 )
+from sglang.srt.entrypoints.valen.media import validate_valen_media_payload
 from sglang.srt.environ import envs
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
@@ -1502,7 +1503,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "Valen returns decisions through /v1/valen or /v1/systemone"
             )
         if obj.contains_mm_input():
-            raise ValueError("Valen multimodal processor parity has not been validated")
+            validate_valen_media_payload(obj)
         limit = min(
             self.model_config.hf_config.valen_max_length,
             max_joint_prompt_tokens(
