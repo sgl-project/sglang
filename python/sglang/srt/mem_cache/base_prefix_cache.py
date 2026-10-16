@@ -264,6 +264,9 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    # A scheduler may already have promised this host hit. Keep quota/capacity
+    # checks, but do not discard the hit merely because its H2D is small.
+    skip_load_back_threshold: bool = dataclasses.field(default=False, kw_only=True)
 
 
 class MatchResult(NamedTuple):
