@@ -31,38 +31,8 @@ PREFILL_CUDA_GRAPH_LORA_SEGMENTS = 32
 
 
 class IntelXpuLoRABackend(BaseLoRABackend):
-    """LoRA backend that runs native Intel XPU kernels on both the prefill and
-    decode paths.
-
-    Prefill batches carry contiguous metadata (``permutation is None``) and use
-    the per-shape XPU kernels (``sgemm_lora_a_fwd`` / ``sgemm_lora_b_fwd`` /
-    ``qkv_lora_b_fwd`` / ``gate_up_lora_b_fwd``), which read each segment's rows
-    in physical order. Decode sorts tokens by adapter and carries a non-None
-    ``permutation`` (see ``compute_sgemm_routing``); those batches use the
-    chunked-SGMV kernels, which gather -> grouped-GEMM -> scatter by the
-    permutation internally and return rows in physical token order.
-
-    Coverage (as of now):
-      - embedding_lora_a  -> XPU (batch_info is always contiguous here)
-      - sgemm_lora_a      -> XPU both paths: sgemm_lora_a_fwd on prefill,
-                             chunked_sgmv_lora_shrink on decode
-      - sgemm_lora_b      -> XPU both paths: sgemm_lora_b_fwd on prefill,
-                             chunked_sgmv_lora_expand on decode
-      - qkv_lora_b        -> XPU both paths: qkv_lora_b_fwd on prefill,
-                             chunked_sgmv_lora_expand on decode
-      - gate_up_lora_b    -> XPU both paths: gate_up_lora_b_fwd on prefill,
-                             chunked_sgmv_lora_expand on decode
-      - per-expert MoE    -> triton (backend-agnostic fused kernel)
-
-    The chunked-SGMV shrink and expand are a matched pair: the shrink emits
-    ``(num_tokens, num_slices * max_rank)`` in physical order (num_slices
-    contiguous max_rank-wide bands), which is exactly the expand's input layout,
-    so the decode A->B chain stays on XPU end to end.
-
-    The batch-preparation logic (segment routing, lm_head pruning, CUDA graph
-    metadata) mirrors the triton backend, since both consume the same
-    ``LoRABatchInfo`` layout.
-    """
+    """LoRA on native Intel XPU kernels: per-shape sgemm kernels for contiguous prefill,
+    chunked-SGMV (gather/GEMM/scatter by permutation) for adapter-sorted decode."""
 
     name = "intel_xpu"
     supports_prefill_cuda_graph = True
@@ -107,13 +77,8 @@ class IntelXpuLoRABackend(BaseLoRABackend):
         sgemm_info: LoRABatchInfo,
         stack_num: int,
     ) -> torch.Tensor:
-        """LoRA A-projection (shrink) on XPU for both paths.
-
-        Prefill (contiguous) uses ``sgemm_lora_a_fwd``; decode (adapter-permuted)
-        uses the chunked-SGMV shrink, which unlike the chunked (triton) backend
-        needs no ``max_chunk_size`` -- it runs directly on the merged adapter
-        segments from ``compute_sgemm_routing`` and returns physical token order.
-        """
+        """LoRA A shrink: sgemm_lora_a_fwd on prefill, chunked-SGMV on decode (no
+        max_chunk_size needed). Output is always in physical token order."""
         if self._is_permuted(sgemm_info):
             return xpu_chunked_sgmv_lora_shrink_forward(
                 input_x=x,
@@ -145,14 +110,8 @@ class IntelXpuLoRABackend(BaseLoRABackend):
         num_slices: int,
         base_output: torch.Tensor = None,
     ) -> torch.Tensor:
-        """LoRA B-projection (expand) on the permuted decode path via chunked-SGMV.
-
-        Symmetric partner of ``_lora_a_shrink``: consumes the shrink's
-        physical-order, ``num_slices``-band ``max_rank``-strided output directly,
-        gathers/GEMMs/scatters by ``permutation``, and fuses the per-adapter
-        scaling and the ``base_output`` residual. Only the permuted decode path
-        routes here; prefill keeps the per-shape XPU B-kernels.
-        """
+        """Decode-only chunked-SGMV B expand; takes the shrink's (num_tokens,
+        num_slices * max_rank) output as-is and fuses scaling and base_output."""
         return xpu_chunked_sgmv_lora_expand_forward(
             input_x=x,
             weights=weights,
@@ -168,9 +127,7 @@ class IntelXpuLoRABackend(BaseLoRABackend):
             base_output=base_output,
         )
 
-    # ------------------------------------------------------------------ #
-    # LoRA kernel entry points
-    # ------------------------------------------------------------------ #
+    # ---- LoRA kernel entry points ----
 
     def run_lora_a_embedding(
         self,
@@ -258,8 +215,7 @@ class IntelXpuLoRABackend(BaseLoRABackend):
         **kwargs,
     ) -> torch.Tensor:
 
-        # x: (s, input_dim)
-        # qkv_lora_a: (num_lora, n_slices * r, input_dim)
+        # x: (s, input_dim), qkv_lora_a: (num_lora, n_slices * r, input_dim),
         # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
@@ -304,8 +260,7 @@ class IntelXpuLoRABackend(BaseLoRABackend):
         **kwargs,
     ) -> torch.Tensor:
 
-        # x: (s, input_dim)
-        # gate_up_lora_a: (num_lora, 2 * r, input_dim)
+        # x: (s, input_dim), gate_up_lora_a: (num_lora, 2 * r, input_dim),
         # gate_up_lora_b: (num_lora, 2 * output_dim, r)
         assert isinstance(gate_up_lora_b, torch.Tensor)
         output_dim = gate_up_lora_b.shape[-2] // 2
@@ -339,9 +294,7 @@ class IntelXpuLoRABackend(BaseLoRABackend):
             base_output=base_output,
         )
 
-    # ------------------------------------------------------------------ #
-    # Batch preparation (mirrors the triton backend's LoRABatchInfo layout)
-    # ------------------------------------------------------------------ #
+    # ---- Batch preparation (mirrors the triton backend's LoRABatchInfo layout) ----
 
     def init_cuda_graph_batch_info(
         self,
