@@ -399,6 +399,10 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_index_translator = model_runner.kv_index_translator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # Overwritten when MLA decode pads Q. Present either way so callers
+        # do not probe for the attribute.
+        self.head_pad_mode = "none"
+        self.num_head_padded = self.num_head
 
         self.dcp_world_size = get_parallel().attn_dcp_size
         self.mla_decode_backend = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get().lower()
@@ -480,17 +484,17 @@ class AiterAttnBackend(AttentionBackend):
         # FMHA serves it directly.
         self.use_mla_flydsl_fp8_prefill = False
         self.require_mla_flydsl_fp8_prefill = (
-            self.use_mla and envs.SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED.get()
+            self.use_mla and envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED.get()
         )
         self.use_mla_flydsl_fused_kv_proj = (
-            self.use_mla and envs.SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ.get()
+            self.use_mla and envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FUSED_KV_PROJ.get()
         )
         self._mla_flydsl_unit_descale = None
         self._mla_flydsl_fused_kv_logged = False
         self._mla_flydsl_fp8_fallback_logged = False
         if (
             self.use_mla
-            and envs.SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL.get()
+            and envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FP8_PREFILL.get()
             and is_gfx95_supported()
         ):
             try:
@@ -519,7 +523,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
         if self.require_mla_flydsl_fp8_prefill and not self.use_mla_flydsl_fp8_prefill:
             raise RuntimeError(
-                "SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED=1, but gfx950 "
+                "SGLANG_ENABLE_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED=1, but gfx950 "
                 "FlyDSL FP8 FMHA does not support this MLA configuration"
             )
 
@@ -1567,19 +1571,15 @@ class AiterAttnBackend(AttentionBackend):
         return o
 
     def _fp8_prefill_asm_enabled(self) -> bool:
-        """PS-ASM fp8 prefill. 12-head zero-pad stays off unless opted in.
-
-        That shape memory-faults on gfx950; SGLANG_AITER_MLA_ZERO_PAD_FP8_PREFILL
-        selects the 12->16 padded launch anyway. FlyDSL FP8 prefill, when the
-        head shape can use it, replaces this path.
-        """
+        # 12-head zero-pad PS-ASM memory-faults on gfx950 unless opted in.
+        # FlyDSL FP8 prefill replaces this path when the head shape can use it.
         if self.use_mla_flydsl_fp8_prefill:
             return False
         if not self.use_fp8_prefill_attn:
             return False
-        if getattr(self, "head_pad_mode", "none") != "zero":
+        if self.head_pad_mode != "zero":
             return True
-        return envs.SGLANG_AITER_MLA_ZERO_PAD_FP8_PREFILL.get()
+        return envs.SGLANG_ENABLE_AITER_MLA_ZERO_PAD_FP8_PREFILL.get()
 
     @staticmethod
     def _quantize_mla_prefill_fp8(
@@ -4899,7 +4899,7 @@ class AiterAttnBackend(AttentionBackend):
         q_pre_padded = (
             self.use_mla
             and q.ndim == 3
-            and q.shape[1] == getattr(self, "num_head_padded", -1)
+            and q.shape[1] == self.num_head_padded
             and q.shape[-1] == layer.qk_head_dim
         )
         if not q_pre_padded:

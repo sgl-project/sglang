@@ -64,9 +64,9 @@ class TestPrefixKvFp8Projection(unittest.TestCase):
         module = self._module(torch.float32)
         kv_a = torch.empty((4, 512))
         k_pe = torch.empty((4, 1, 64))
-        with envs.SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ.override(False):
+        with envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FUSED_KV_PROJ.override(False):
             self.assertIsNone(project_prefix_kv_fp8(module, kv_a, k_pe))
-        with envs.SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ.override(True):
+        with envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FUSED_KV_PROJ.override(True):
             self.assertIsNone(project_prefix_kv_fp8(module, kv_a, k_pe))
         self.assertEqual(module.kv_b_proj.calls, [])
 
@@ -74,7 +74,7 @@ class TestPrefixKvFp8Projection(unittest.TestCase):
         module = self._module(torch.uint8)
         kv_a = torch.empty((4, 1, 512))
         k_pe = torch.empty((4, 1, 64))
-        with envs.SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ.override(True):
+        with envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FUSED_KV_PROJ.override(True):
             projected = project_prefix_kv_fp8(module, kv_a, k_pe)
         self.assertIsNotNone(projected)
         k, v = projected

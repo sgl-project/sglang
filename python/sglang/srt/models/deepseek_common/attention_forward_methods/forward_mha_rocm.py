@@ -369,18 +369,16 @@ class DeepseekMHARocmForwardMixin:
         return kv_a, k_pe
 
 
-def project_prefix_kv_fp8(self, kv_a: torch.Tensor, k_pe: torch.Tensor):
-    """Project one prefix chunk straight to unit-scale FP8 K/V.
+_PREFIX_KV_FP8_LOGGED: set[int] = set()
 
-    Chunked MHA replays kv_b_proj over every prefix chunk. The BF16 result
-    is quantized again before FlyDSL. MXFP4 weights can write the FP8 K/V,
-    including the RoPE concat, in the GEMM epilogue instead.
-    """
+
+def project_prefix_kv_fp8(self, kv_a: torch.Tensor, k_pe: torch.Tensor):
+    # MXFP4 kv_b_proj writes unit-scale FP8 K/V, RoPE concat included.
     if k_pe is None:
         return None
-    if not envs.SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ.get():
+    if not envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FUSED_KV_PROJ.get():
         return None
-    weight = getattr(self.kv_b_proj, "weight", None)
+    weight = self.kv_b_proj.weight
     if weight is None or weight.dtype != torch.uint8:
         return None
     if kv_a.dim() == 3:
@@ -389,9 +387,9 @@ def project_prefix_kv_fp8(self, kv_a: torch.Tensor, k_pe: torch.Tensor):
         k_pe = k_pe.unsqueeze(1)
     if k_pe.shape[1] != self.num_local_heads:
         k_pe = k_pe.expand(-1, self.num_local_heads, -1)
-    if not getattr(self, "_prefix_kv_fp8_logged", False):
+    if self.layer_id not in _PREFIX_KV_FP8_LOGGED:
         logger.info("MLA prefix chunks project K/V directly to unit-scale FP8")
-        self._prefix_kv_fp8_logged = True
+        _PREFIX_KV_FP8_LOGGED.add(self.layer_id)
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
     return self.kv_b_proj(
