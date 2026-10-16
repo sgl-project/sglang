@@ -314,7 +314,9 @@ class Step3p7ForConditionalGeneration(nn.Module):
             self.language_model.load_weights(language_weights)
 
     def _load_step5_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Stream the full checkpoint, retaining strict coverage in both towers."""
+        """Load the checkpoint with strict coverage in both towers; later calls are
+        weight updates and, as in the language model, may stream any subset."""
+        checkpoint_load = not self.language_model._checkpoint_loaded
         vision_params = {
             name: param
             for name, param in self.named_parameters(remove_duplicate=False)
@@ -352,7 +354,7 @@ class Step3p7ForConditionalGeneration(nn.Module):
 
         loaded = self.language_model.load_weights(language_weights())
         missing = vision_params.keys() - seen
-        if missing:
+        if checkpoint_load and missing:
             raise ValueError(f"Step5 vision is missing weights: {sorted(missing)[:16]}")
         return seen | {"language_model." + name for name in loaded}
 

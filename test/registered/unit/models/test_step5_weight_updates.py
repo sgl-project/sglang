@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import save_file
 
+from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration
 from sglang.srt.models.step5 import Step5ForCausalLM, _step5_bf16_trtllm_supported
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -216,6 +217,52 @@ class TestStep5WeightUpdates(CustomTestCase):
                 model.load_weights(
                     [("model.norm.weight", norm), ("model.norm.weight", 2 * norm)]
                 )
+
+
+class _FakeStep5VL:
+    """The vision-language wrapper around a fake Step5 language model, with a two-weight vision tower."""
+
+    def __init__(self):
+        self.language_model = _FakeStep5()
+        calls = self.language_model.calls
+        self.vision = {
+            "vision_model.conv1.weight": _RecordingParam(torch.bfloat16, calls),
+            "vit_large_projector.weight": _RecordingParam(torch.bfloat16, calls),
+        }
+
+    def named_parameters(self, remove_duplicate=True):
+        return [
+            *self.vision.items(),
+            *(("language_model." + n, p) for n, p in self.language_model.params.items()),
+        ]
+
+    def load_weights(self, weights):
+        return Step3p7ForConditionalGeneration._load_step5_weights(self, weights)
+
+
+def _vision_checkpoint() -> list[tuple[str, torch.Tensor]]:
+    return [
+        ("vision_model.conv1.weight", torch.ones(2, dtype=torch.bfloat16)),
+        ("vit_large_projector.weight", torch.ones(2, dtype=torch.bfloat16)),
+    ]
+
+
+class TestStep5VisionLanguageWeightUpdates(CustomTestCase):
+    def test_checkpoint_load_needs_the_whole_vision_tower(self):
+        model = _FakeStep5VL()
+
+        with self.assertRaisesRegex(ValueError, "vision is missing weights"):
+            model.load_weights([*_checkpoint(), _vision_checkpoint()[0]])
+
+    def test_updates_may_leave_the_vision_tower_out(self):
+        """Text RL trains the decoder only, so its weight sync sends no vision weights."""
+        model = _FakeStep5VL()
+        model.load_weights([*_checkpoint(), *_vision_checkpoint()])
+        model.language_model.calls.clear()
+
+        model.load_weights([("model.norm.weight", torch.ones(8, dtype=torch.bfloat16))])
+
+        self.assertEqual(len(model.language_model.calls), 1)
 
 
 class TestStep5Bf16ExpertRunner(CustomTestCase):
