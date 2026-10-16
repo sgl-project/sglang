@@ -217,6 +217,22 @@ class TestMistralDetector(CustomTestCase):
         params = json.loads(full_params)
         self.assertEqual(params["city"], "Tokyo")
 
+    def test_streaming_compact_format_small_deltas(self):
+        # Braces, brackets and escaped quotes inside strings must not end the
+        # arguments early when the JSON scan resumes across many small deltas.
+        args = {"city": 'a {b} [c] \\"d\\" ' * 50, "days": [1, {"x": "}"}]}
+        text = "[TOOL_CALLS]get_weather[ARGS]" + json.dumps(args)
+        text += '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}'
+        detector = MistralDetector()
+        all_calls = []
+        for i in range(0, len(text), 3):
+            result = detector.parse_streaming_increment(text[i : i + 3], self.tools)
+            all_calls.extend(result.calls)
+
+        self.assertEqual([c.name for c in all_calls if c.name], ["get_weather"] * 2)
+        params = [json.loads(c.parameters) for c in all_calls if c.parameters]
+        self.assertEqual(params, [args, {"city": "Paris"}])
+
 
 if __name__ == "__main__":
     import unittest

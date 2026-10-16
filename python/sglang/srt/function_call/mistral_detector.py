@@ -40,6 +40,10 @@ class MistralDetector(BaseFormatDetector):
         self._tool_calls_marker = "[TOOL_CALLS"
         self.eot_token = "]"
         self.tool_call_separator = ", "
+        # (text, json_start, depth, in_string, escape_next) of the last
+        # incomplete JSON value scanned by _extract_json_value, so streaming
+        # resumes where it stopped instead of rescanning the whole buffer.
+        self._json_scan = None
 
     def has_tool_call(self, text: str) -> bool:
         """Return True if the text contains either supported tool-call marker."""
@@ -268,8 +272,14 @@ class MistralDetector(BaseFormatDetector):
         depth = 0
         in_string = False
         escape_next = False
+        first = json_start
 
-        for k in range(json_start, len(text)):
+        scan = self._json_scan
+        if scan is not None and scan[1] == json_start and text.startswith(scan[0]):
+            _, _, depth, in_string, escape_next = scan
+            first = len(scan[0])
+
+        for k in range(first, len(text)):
             ch = text[k]
             if escape_next:
                 escape_next = False
@@ -287,8 +297,10 @@ class MistralDetector(BaseFormatDetector):
             elif ch == closing:
                 depth -= 1
                 if depth == 0:
+                    self._json_scan = None
                     return text[json_start : k + 1], k + 1
 
+        self._json_scan = (text, json_start, depth, in_string, escape_next)
         return None, json_start
 
     def _extract_json_array(self, text: str) -> str:
