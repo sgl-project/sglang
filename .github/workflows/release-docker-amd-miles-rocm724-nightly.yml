@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: radixark/miles
-          ref: main
+          ref: 08752a1283f227104cb48353057d46120de1492c
           fetch-depth: 0
           persist-credentials: false
 
@@ -44,7 +44,10 @@ jobs:
 
       - name: Build image via miles docker/build.py and tag with date
         run: |
-          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles
+          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles \
+            --build-arg SGLANG_BRANCH=codex/pr44720-amd-nightly-miles-7b6993a \
+            --build-arg SGLANG_COMMIT=aab0b243c013fc887da9b68e60c133376458dd1a \
+            --build-arg MILES_COMMIT=08752a1283f227104cb48353057d46120de1492c
           docker tag rocm/sgl-dev:miles-${{ matrix.variant }} rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
 
       - name: Login to Docker Hub (AMD)
