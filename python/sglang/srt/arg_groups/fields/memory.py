@@ -218,7 +218,7 @@ class Memory(msgspec.Struct):
             choices=["rank-suffix", "unified"],
         ),
     ] = "rank-suffix"
-    hicache_storage_head_group: A[
+    hicache_storage_head_partition: A[
         Optional[int],
         Arg(
             help=(
@@ -239,7 +239,7 @@ class Memory(msgspec.Struct):
             help=(
                 "Layers per L3 chunk under --hicache-storage-key-scheme "
                 "unified; the pipeline-parallel counterpart of "
-                "--hicache-storage-head-group and equally fleet-wide. Every "
+                "--hicache-storage-head-partition and equally fleet-wide. Every "
                 "stage must START on a multiple of it; only the final stage may "
                 "end short, and that remainder forms the last chunk. Unset, "
                 "each stage stores its own layer range and shares only with an "

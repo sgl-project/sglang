@@ -72,7 +72,7 @@ def _pinned_host_pool(host_pool_cls, device_pool, **kwargs):
         ALLOC_MEMORY_FUNCS[DEVICE] = original
 
 
-def _roundtrip_storage_pages(host_pool, host_indices):
+def _restore_storage_pages(host_pool, host_indices):
     """Exercise the flat page API used by generic file storage at new offsets."""
     stored_pages = [
         host_pool.get_data_page(int(index)).clone()
@@ -94,7 +94,7 @@ def _roundtrip_storage_pages(host_pool, host_indices):
 
 @pytest.mark.parametrize("head_num,head_group_num", [(8, 1), (8, 2), (8, 8), (4, 4)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mha_page_unified_roundtrip(head_num, head_group_num, dtype):
+def test_mha_page_unified(head_num, head_group_num, dtype):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
@@ -144,7 +144,7 @@ def test_mha_page_unified_roundtrip(head_num, head_group_num, dtype):
         device_pool, host_indices_cpu, device_indices, "kernel"
     )
     torch.cuda.synchronize()
-    host_indices_cpu = _roundtrip_storage_pages(host_pool, host_indices_cpu)
+    host_indices_cpu = _restore_storage_pages(host_pool, host_indices_cpu)
 
     for layer in range(LAYERS):
         device_pool.k_buffer[layer].zero_()
@@ -170,7 +170,7 @@ def test_mha_page_unified_roundtrip(head_num, head_group_num, dtype):
 
 @pytest.mark.parametrize("kv_lora_rank,qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_mla_page_unified_roundtrip(kv_lora_rank, qk_rope_head_dim, dtype):
+def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype):
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
@@ -210,7 +210,7 @@ def test_mla_page_unified_roundtrip(kv_lora_rank, qk_rope_head_dim, dtype):
         device_pool, host_indices_cpu, device_indices, "kernel"
     )
     torch.cuda.synchronize()
-    host_indices_cpu = _roundtrip_storage_pages(host_pool, host_indices_cpu)
+    host_indices_cpu = _restore_storage_pages(host_pool, host_indices_cpu)
     for layer in range(LAYERS):
         device_pool.kv_buffer[layer].zero_()
 

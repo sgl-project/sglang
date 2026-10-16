@@ -1,6 +1,7 @@
+import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -75,12 +76,19 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "require --hicache-storage-key-scheme"):
             _resolve(
                 hicache_storage_key_scheme="rank-suffix",
-                hicache_storage_head_group=2,
+                hicache_storage_head_partition=2,
             )
 
     def test_non_positive_partition_config_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "must be positive"):
-            _resolve(hicache_storage_layer_partition=0)
+        for field in (
+            "hicache_storage_head_partition",
+            "hicache_storage_layer_partition",
+        ):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "must be positive"),
+            ):
+                _resolve(**{field: 0})
 
     def test_unified_needs_a_supported_storage_backend(self):
         with self.assertRaisesRegex(ValueError, "needs"):
@@ -93,6 +101,14 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
         # Draft layers sit on the host pool's layer axis but outside the grid.
         with self.assertRaises(NotImplementedError):
             _resolve(speculative_algorithm="EAGLE")
+
+    def test_unified_supports_full_page_attention_cp(self):
+        args = _resolve(attn_cp_size=2, enable_prefill_cp=True)
+        self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_unified")
+
+    def test_unified_refuses_decode_context_parallelism(self):
+        with self.assertRaisesRegex(NotImplementedError, "decode context parallelism"):
+            _resolve(dcp_size=2)
 
     def test_unified_refuses_shared_decode_host_receive_pool(self):
         with self.assertRaisesRegex(ValueError, "layer_first"):
@@ -133,10 +149,10 @@ class TestControllerUnifiedKeys(CustomTestCase):
         controller.mem_pool_device = SimpleNamespace(dtype=torch.float16)
         return controller
 
-    def _suffixes(self, controller):
+    def _suffixes(self, controller, *, attn_cp_size=1):
         memory = SimpleNamespace(
             hicache_storage_key_scheme="unified",
-            hicache_storage_head_group=4,
+            hicache_storage_head_partition=4,
             hicache_storage_layer_partition=4,
         )
         parallel = SimpleNamespace(
@@ -156,7 +172,9 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 return_value=parallel,
             ),
         ):
-            return controller._build_unified_suffixes("org/model", attn_cp_size=1)
+            return controller._build_unified_suffixes(
+                "org/model", attn_cp_size=attn_cp_size
+            )
 
     def test_anchor_dtype_and_attention_topology_define_mha_keys(self):
         namespace = derive_namespace(
@@ -187,6 +205,122 @@ class TestControllerUnifiedKeys(CustomTestCase):
             self._suffixes(self._controller(mla=True)),
             [f"{namespace_digest(namespace)}_L4-8"],
         )
+
+    def test_full_page_cp_keeps_attention_tp_shard_keys(self):
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                controller = self._controller(mla=mla)
+                self.assertEqual(
+                    self._suffixes(controller, attn_cp_size=4),
+                    self._suffixes(controller, attn_cp_size=1),
+                )
+
+    def test_runtime_attach_refuses_dcp_pool(self):
+        controller = self._controller(mla=True)
+        controller.storage_host_pool.dcp_size = 2
+        with self.assertRaisesRegex(NotImplementedError, "decode context parallelism"):
+            self._suffixes(controller)
+
+    def test_cp_writer_election_preserves_each_attention_tp_shard(self):
+        # With attention DP, the storage TP rank is attention-group-local.
+        # Every MHA head shard needs a writer, while MLA needs a single writer.
+        expected_writers = {
+            (False, False): [(0, 0), (1, 0), (0, 1), (1, 1)],
+            (False, True): [(0, 0), (0, 1)],
+            (True, False): [(0, 0), (1, 0)],
+            (True, True): [(0, 0)],
+        }
+        for (unified, mla), expected in expected_writers.items():
+            with self.subTest(unified=unified, mla=mla):
+                writers = []
+                for cp_rank in range(2):
+                    for tp_rank in range(2):
+                        controller = self._controller(mla=mla)
+                        controller.enable_storage = False
+                        controller.storage_host_pool.layout = (
+                            "page_unified" if unified else "page_first"
+                        )
+                        controller.mem_pool_host.size = 256
+                        controller.host_memory_mode = "cache"
+                        controller.storage_stop_event = threading.Event()
+                        config = HiCacheStorageConfig(
+                            tp_rank=tp_rank,
+                            tp_size=2,
+                            pp_rank=0,
+                            pp_size=1,
+                            attn_cp_rank=cp_rank,
+                            attn_cp_size=2,
+                            is_mla_model=mla,
+                            enable_storage_metrics=False,
+                            is_page_first_layout=not unified,
+                            model_name="org/model",
+                            unified_suffixes=["shared"] if unified else None,
+                        )
+                        memory = SimpleNamespace(
+                            hicache_storage_key_scheme=(
+                                "unified" if unified else "rank-suffix"
+                            )
+                        )
+                        with (
+                            patch(
+                                "sglang.srt.managers.cache_controller.get_memory",
+                                return_value=memory,
+                            ),
+                            patch.object(controller, "_stop_storage_threads"),
+                            patch.object(controller, "_start_storage_threads"),
+                            patch.object(
+                                controller,
+                                "_generate_storage_config",
+                                return_value=config,
+                            ),
+                            patch.object(
+                                controller, "_create_sync_groups", return_value=[]
+                            ),
+                            patch(
+                                "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend",
+                                return_value=MagicMock(),
+                            ),
+                        ):
+                            controller.attach_storage_backend("file")
+                        if not controller.backup_skip:
+                            writers.append((tp_rank, cp_rank))
+                self.assertEqual(writers, expected)
+
+    def test_attention_dp_config_uses_local_tp_and_cp_ranks(self):
+        controller = self._controller(mla=True)
+        controller.mem_pool_device = controller.storage_host_pool.device_pool
+        controller.mem_pool_host.layout = "page_unified"
+        controller.storage_host_pool.storage_format_tag = None
+        controller.enable_storage_metrics = False
+        parallel = SimpleNamespace(
+            tp_rank=6,
+            tp_size=8,
+            attn_tp_rank=0,
+            attn_tp_size=2,
+            attn_cp_rank=1,
+            attn_cp_size=2,
+            attn_dp_rank=1,
+            pp_rank=0,
+            pp_size=1,
+        )
+        with (
+            patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch.object(controller, "get_attn_cp_rank_and_size", return_value=(1, 2)),
+            patch.object(
+                controller, "_build_unified_suffixes", return_value=["shared"]
+            ),
+        ):
+            config = controller._generate_storage_config("org/model")
+        self.assertEqual((config.tp_rank, config.tp_size, config.dp_rank), (0, 2, 1))
+        self.assertEqual((config.attn_cp_rank, config.attn_cp_size), (1, 2))
+        self.assertTrue(config.is_mla_model)
 
     def test_hybrid_write_back_preserves_cpu_host_indices(self):
         controller = object.__new__(HybridCacheController)
@@ -244,7 +378,10 @@ class TestFileBackendUnifiedKeys(CustomTestCase):
     def test_unified_suffix_replaces_the_whole_rank_suffix(self):
         """No tp/pp/cp coordinate may survive, or the key stops being portable."""
         backend = HiCacheFile.__new__(HiCacheFile)
-        HiCacheFile._init_config_suffix(backend, self._config(["ukv1-abc_L0-80_H1"]))
+        config = self._config(["ukv1-abc_L0-80_H1"])
+        config.attn_cp_rank = 3
+        config.attn_cp_size = 4
+        HiCacheFile._init_config_suffix(backend, config)
         self.assertEqual(backend.config_suffix, "_ukv1-abc_L0-80_H1")
 
     def test_rank_suffix_path_is_unchanged(self):

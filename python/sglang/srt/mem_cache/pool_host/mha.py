@@ -8,7 +8,6 @@ import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
-    can_use_page_unified_write_back_jit_kernel,
     can_use_write_back_jit_kernel,
 )
 from sglang.kernels.ops.kvcache.hicache import (
@@ -330,41 +329,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             ),
         )
         return buffer
-
-    def _page_ids(self, token_indices: torch.Tensor) -> torch.Tensor:
-        """Page ids of a page-aligned transfer's token runs.
-
-        The page-unified write-back addresses whole pages. Write-back is only
-        ever issued for complete pages, so taking every page_size-th token is
-        the page list, not a subsample.
-        """
-        return token_indices[:: self.page_size] // self.page_size
-
-    def _init_page_unified_staging(self) -> None:
-        """Device-side scratch the write-back relayouts into before the D2H.
-
-        Sized in whole pages: the copy that follows moves one contiguous page
-        block per page, which is what keeps it on the copy engine.
-        """
-        geometry = self.page_unified_layout
-        self.can_use_write_back_jit = (
-            _is_cuda or _is_hip
-        ) and can_use_page_unified_write_back_jit_kernel(
-            group_bytes=geometry.group_bytes
-        )
-        if not self.can_use_write_back_jit:
-            raise ValueError(
-                "the 'page_unified' host layout requires the staged "
-                "write-back JIT kernel, which could not be built for a "
-                f"{geometry.group_bytes}-byte head-group row."
-            )
-        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
-        self.staging_token_capacity = self.staging_page_capacity * self.page_size
-        self.staging_buffer = torch.empty(
-            geometry.page_dims(self.staging_page_capacity),
-            dtype=self.dtype,
-            device=self._transfer_device,
-        )
 
     def _init_write_back_staging_buffers(self):
         self.staging_page_capacity = 0

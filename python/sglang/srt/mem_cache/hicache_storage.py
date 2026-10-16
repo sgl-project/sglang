@@ -400,7 +400,7 @@ class HiCacheFile(HiCacheStorage):
                 raise NotImplementedError(
                     f"the file backend stores one object per page, so it cannot "
                     f"serve a {len(storage_config.unified_suffixes)}-chunk "
-                    f"unified grid; drop --hicache-storage-head-group and "
+                    f"unified grid; drop --hicache-storage-head-partition and "
                     f"--hicache-storage-layer-partition."
                 )
             self.config_suffix = f"_{storage_config.unified_suffixes[0]}"

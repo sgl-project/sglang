@@ -158,7 +158,7 @@ def resolve_hicache_key_scheme(server_args: Any):
     cfg = resolving_view(server_args)
     unified = cfg.hicache_storage_key_scheme == "unified"
     partition_configs = (
-        cfg.hicache_storage_head_group is not None
+        cfg.hicache_storage_head_partition is not None
         or cfg.hicache_storage_layer_partition is not None
     )
     if not unified:
@@ -172,12 +172,12 @@ def resolve_hicache_key_scheme(server_args: Any):
             )
         if partition_configs:
             raise ValueError(
-                "--hicache-storage-head-group / --hicache-storage-layer-partition "
+                "--hicache-storage-head-partition / --hicache-storage-layer-partition "
                 "require --hicache-storage-key-scheme unified."
             )
         return
 
-    for name in ("hicache_storage_head_group", "hicache_storage_layer_partition"):
+    for name in ("hicache_storage_head_partition", "hicache_storage_layer_partition"):
         value = getattr(cfg, name)
         if value is not None and value <= 0:
             raise ValueError(
@@ -201,11 +201,11 @@ def resolve_hicache_key_scheme(server_args: Any):
             "--hicache-storage-key-scheme unified does not support speculative "
             "decoding: the draft layers are not part of the L3 layer grid."
         )
-    if cfg.dcp_size > 1 or cfg.attn_cp_size > 1:
+    if cfg.dcp_size > 1:
         raise NotImplementedError(
-            "--hicache-storage-key-scheme unified does not support context "
-            "parallelism: a CP rank holds sub-page slices, which needs the "
-            "token-granule extension."
+            "--hicache-storage-key-scheme unified does not support decode "
+            "context parallelism (--dcp-size > 1): a DCP rank holds "
+            "sub-page slices, which need token-granule storage keys."
         )
 
     # The layout IS part of the object identity, so it is pinned rather than

@@ -577,11 +577,16 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
+        # MLA replicates KV across attention-TP ranks. Full-page prefill CP
+        # also replicates KV, so unified keys need one CP writer per head shard.
+        # Legacy keys include the CP rank and must keep a writer for each copy.
         self.backup_skip = (
             self.storage_config.is_mla_model
             # todo: load balancing
             and self.storage_config.tp_rank != 0
+        ) or (
+            self.storage_config.unified_suffixes is not None
+            and self.storage_config.attn_cp_rank != 0
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -801,6 +806,11 @@ class HiCacheController:
                 "without packed draft layers."
             )
         device_pool = host_pool.device_pool
+        if getattr(host_pool, "dcp_size", 1) > 1:
+            raise NotImplementedError(
+                "The unified key scheme does not support decode context "
+                "parallelism: storage objects must contain full pages."
+            )
         plan = plan_unified_kv(
             model_id=model_name or "",
             # Logical KV dtype, not the storage view: fp8 variants all store as
@@ -815,7 +825,7 @@ class HiCacheController:
             start_layer=host_pool.start_layer,
             end_layer=host_pool.end_layer,
             is_final_stage=parallel.pp_rank == parallel.pp_size - 1,
-            head_group=memory.hicache_storage_head_group,
+            head_group=memory.hicache_storage_head_partition,
             layer_partition=memory.hicache_storage_layer_partition,
         )
         # The pool was sized from the same server arg before any backend
