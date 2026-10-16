@@ -4,7 +4,7 @@
 //! them asynchronously in background worker tasks.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
@@ -23,8 +23,8 @@ use crate::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-        WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        worker::local::find_workers_by_url, McpServerConfigRequest, TokenizerConfigRequest,
+        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
     },
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
 };
@@ -243,6 +243,35 @@ impl JobQueue {
         self.status_map.get(worker_url).map(|entry| entry.clone())
     }
 
+    /// Whether any AddWorker job is currently pending or processing.
+    ///
+    /// Used by the removal path to detect an in-flight add/remove handoff
+    /// (e.g. a rolling update replacing one worker with another).
+    ///
+    /// This is deliberately global rather than per-model, because the model
+    /// is not knowable here: `JobStatus` records only job type, URL, status
+    /// and timestamp, and k8s service discovery submits AddWorker with
+    /// `model_id: None` (the model is discovered once the add pipeline
+    /// reaches the engine). The queue also cannot inspect the queued `Job`
+    /// itself — it has been moved into the channel or a spawned task, leaving
+    /// `status_map` as the only observable state.
+    ///
+    /// The cost of the approximation is bounded: an unrelated model's add
+    /// makes this return true, which can delay one removal by up to
+    /// `HANDOFF_WAIT_MAX`. Nothing is lost, only deferred, and the TTL
+    /// cleanup of `status_map` caps how long a single add can keep returning
+    /// true.
+    ///
+    /// The `"AddWorker"` literal must match `Job::job_type()`, and the status
+    /// literals must match the `JobStatus` constructors. Both are plain
+    /// strings, so a rename on either side would disable this check silently.
+    pub fn has_add_worker_in_flight(&self) -> bool {
+        self.status_map.iter().any(|entry| {
+            entry.job_type == "AddWorker"
+                && matches!(entry.status.as_str(), "pending" | "processing")
+        })
+    }
+
     /// Remove job status (called when worker is deleted)
     pub fn remove_status(&self, worker_url: &str) {
         self.status_map.remove(worker_url);
@@ -288,6 +317,79 @@ impl JobQueue {
         }
 
         // Permit automatically released when dropped
+    }
+
+    /// Bounded wait before removing a worker that is the last healthy worker
+    /// of its model while an AddWorker job is in flight.
+    ///
+    /// Returns as soon as one of these holds:
+    /// - the worker is already gone from the registry (nothing to protect),
+    /// - the model retains at least one OTHER healthy worker,
+    /// - no AddWorker job is pending/processing (e.g. intentional
+    ///   scale-to-zero), or
+    /// - the deadline expires (an in-flight add that cannot activate must not
+    ///   block removals indefinitely).
+    ///
+    /// The wait is held while this job owns a job-queue concurrency permit,
+    /// and it delays deregistering the departing worker — which keeps sending
+    /// it new traffic for the duration. Both argue for a deadline only as
+    /// large as the handoff it protects: an observed activation takes about a
+    /// second, and the wait also stacks on top of the discovery resync
+    /// interval against a pod's termination-drain budget.
+    async fn wait_for_handoff_before_removal(url: &str, context: &Arc<AppContext>) {
+        const HANDOFF_WAIT_MAX: Duration = Duration::from_secs(5);
+        const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+        let dp_aware = context.router_config.dp_aware;
+        let start = std::time::Instant::now();
+        loop {
+            // Resolve the target exactly the way the removal workflow does. In
+            // dp-aware mode a single pod URL is registered as one worker per
+            // rank ("<url>@<dp_rank>"), so an exact-URL registry lookup never
+            // matches and this guard would silently do nothing while the
+            // removal itself still succeeds via prefix matching.
+            let removing = find_workers_by_url(&context.worker_registry, url, dp_aware);
+            let Some(target) = removing.first() else {
+                return;
+            };
+            let model_id = target.model_id().to_string();
+            // Every rank of the pod being removed is leaving, so none of them
+            // counts as a worker the model retains.
+            let removing_urls: HashSet<&str> = removing.iter().map(|w| w.url()).collect();
+            let model_retains_healthy_worker = context
+                .worker_registry
+                .get_by_model(&model_id)
+                .iter()
+                .any(|w| !removing_urls.contains(w.url()) && w.is_healthy());
+            if model_retains_healthy_worker {
+                return;
+            }
+
+            let add_in_flight = context
+                .worker_job_queue
+                .get()
+                .map(|queue| queue.has_add_worker_in_flight())
+                .unwrap_or(false);
+            if !add_in_flight {
+                return;
+            }
+
+            if start.elapsed() >= HANDOFF_WAIT_MAX {
+                warn!(
+                    "Removing last healthy worker {} for model {} after waiting {:?} \
+                     for an in-flight AddWorker to activate",
+                    url, model_id, HANDOFF_WAIT_MAX
+                );
+                return;
+            }
+
+            debug!(
+                "Delaying removal of {} (last healthy worker for model {}) while an \
+                 AddWorker job is in flight",
+                url, model_id
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// Execute a specific job
@@ -395,6 +497,18 @@ impl JobQueue {
                     .await
             }
             Job::RemoveWorker { url } => {
+                // Zero-downtime handoff: jobs run as independent tasks, so
+                // submission order does not imply completion order. When a
+                // rolling update submits AddWorker(new) and RemoveWorker(old)
+                // back to back, the removal (fast) can take effect before the
+                // add's multi-step activation (~1s) completes, leaving the
+                // model with zero routable workers — requests fail with 404
+                // during that window. If this removal would leave the model
+                // without any other healthy worker while an AddWorker is in
+                // flight, give the add a bounded head start. Intentional
+                // scale-to-zero (no add in flight) is not delayed.
+                Self::wait_for_handoff_before_removal(url, context).await;
+
                 let engines = context
                     .workflow_engines
                     .get()
@@ -794,5 +908,52 @@ impl JobQueue {
                 status_map.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_queue() -> Arc<JobQueue> {
+        JobQueue::new(JobQueueConfig::default(), Weak::new())
+    }
+
+    #[tokio::test]
+    async fn test_has_add_worker_in_flight_empty() {
+        let queue = test_queue();
+        assert!(!queue.has_add_worker_in_flight());
+    }
+
+    #[tokio::test]
+    async fn test_has_add_worker_in_flight_pending_and_processing() {
+        let queue = test_queue();
+        queue.status_map.insert(
+            "http://w1:8000".to_string(),
+            JobStatus::pending("AddWorker", "http://w1:8000"),
+        );
+        assert!(queue.has_add_worker_in_flight());
+
+        queue.status_map.insert(
+            "http://w1:8000".to_string(),
+            JobStatus::processing("AddWorker", "http://w1:8000"),
+        );
+        assert!(queue.has_add_worker_in_flight());
+    }
+
+    #[tokio::test]
+    async fn test_has_add_worker_in_flight_ignores_terminal_and_other_jobs() {
+        let queue = test_queue();
+        // A successfully completed AddWorker is removed from the map entirely;
+        // a failed one remains with a terminal status — neither is in flight.
+        queue.status_map.insert(
+            "http://w1:8000".to_string(),
+            JobStatus::failed("AddWorker", "http://w1:8000", "boom".to_string()),
+        );
+        queue.status_map.insert(
+            "http://w2:8000".to_string(),
+            JobStatus::pending("RemoveWorker", "http://w2:8000"),
+        );
+        assert!(!queue.has_add_worker_in_flight());
     }
 }
