@@ -6,15 +6,22 @@ import json
 import logging
 import os
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.entrypoints.v1_loads import (
+    _accelerator_name,
+    _num_accelerators_per_dp_rank,
+)
+from sglang.srt.environ import envs
+from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
     get_mm,
     get_model,
     get_observability,
+    get_schedule,
     get_serving,
 )
 from sglang.version import __version__
@@ -27,7 +34,10 @@ logger = logging.getLogger(__name__)
 
 
 def _build_server_args(
-    scheduler: Scheduler, *, extension: Optional[ModuleType] = None
+    scheduler: Scheduler,
+    *,
+    extension: Optional[ModuleType] = None,
+    health_generate_headers: Optional[Dict[str, str]] = None,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -52,6 +62,11 @@ def _build_server_args(
         if get_serving().smg_grpc_mode or get_serving().grpc_mode
         else get_serving().grpc_port
     )
+    # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
+    # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.
+    shm_writer = scheduler.load_snapshot_writer
+    if not isinstance(shm_writer, ShmLoadSnapshotWriter):
+        shm_writer = None
     return ext.ServerArgs(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
@@ -74,6 +89,13 @@ def _build_server_args(
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        health_generate_headers=dict(health_generate_headers or {}),
+        default_priority_value=(
+            get_schedule().default_priority_value
+            if get_schedule().enable_priority_scheduling
+            else None
+        ),
+        enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(
@@ -106,6 +128,11 @@ def _build_server_args(
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        load_snapshot_path=shm_writer.path if shm_writer else None,
+        load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
+        load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
+        accelerator=_accelerator_name(),
+        num_accelerators=_num_accelerators_per_dp_rank(),
         # Every process writes its prometheus_client samples under this
         # directory (set before the schedulers start); `/metrics` merges them.
         metrics=(
