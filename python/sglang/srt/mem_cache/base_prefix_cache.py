@@ -595,6 +595,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
 
+    def load_back_is_cache_owned(self) -> bool:
+        """Whether the slots loaded by ``init_load_back`` belong to this cache.
+
+        False means they belong to the request, which inserts them like any
+        computed KV once its forward confirms the load.
+        """
+        return True
+
     def finish_storage_prefetch_admission(
         self,
         handle: CacheRequestHandle,
@@ -668,10 +676,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # nothing deeper than the tail to protect.
         return None
 
-    def swa_reprefill_tail_tokens(self) -> int:
-        # Only the unified_kv compress-only HiCache layout needs to hold back a
-        # trailing sliding window for re-prefill; every other cache keeps SWA
-        # content-stable and overrides this where relevant.
+    def swa_reprefill_tail_tokens(self, req=None) -> int:
+        # Caches whose matched SWA is not reusable as is override this.
         return 0
 
     def supports_mamba(self) -> bool:
