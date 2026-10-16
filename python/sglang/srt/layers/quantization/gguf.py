@@ -41,24 +41,22 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
@@ -178,6 +176,23 @@ IMATRIX_QUANT_TYPES = {
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+# Token-tile height (MOE_X_*) of the ggml_moe_a8 kernels in sgl-kernel's
+# quantization/gguf/moe.cuh, i.e. what the sgl_kernel op ggml_moe_get_block_size
+# returns on CUDA and MUSA. That op cannot be called from Python: it takes no
+# tensor argument, so the dispatcher has no key to route it to its CUDA/MUSA
+# implementation. The GGUF kernels are not built for ROCm.
+GGML_MOE_BLOCK_SIZE = {
+    WeightType.Q4_0: 4,
+    WeightType.Q4_1: 4,
+    WeightType.Q5_0: 4,
+    WeightType.Q5_1: 4,
+    WeightType.Q8_0: 4,
+    WeightType.Q2_K: 4,
+    WeightType.Q3_K: 4,
+    WeightType.Q4_K: 4,
+    WeightType.Q5_K: 4,
+    WeightType.Q6_K: 4,
+}
 
 
 def dequantize_gguf_weight(
@@ -249,7 +264,10 @@ def fused_moe_gguf(
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
-        BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
+        BLOCK_SIZE = GGML_MOE_BLOCK_SIZE[qweight_type]
+
+        # sglang's wrapper allocates the output buffers of the sgl_kernel op.
+        from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
