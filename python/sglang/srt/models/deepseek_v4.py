@@ -3786,12 +3786,9 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     cp_all_tokens=cp_extend,
                 )
-                # Only multimodal placeholders become image_token_id, so a text-only
-                # batch skips this full-residual where.
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
-                    and forward_batch.contains_mm_inputs()
                 ):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
