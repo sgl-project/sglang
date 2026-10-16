@@ -68,6 +68,10 @@ class TestAiterGreedySample(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        from sglang.srt.layers import sampler as sampler_mod
+
+        if sampler_mod._disable_aiter_greedy_sample:
+            raise unittest.SkipTest("the sampler never uses aiter greedy_sample here")
         try:
             from aiter import greedy_sample
 
@@ -191,6 +195,9 @@ class TestAiterGreedyIntegration(unittest.TestCase):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         _mock_global_server_args()
+
+        if use_aiter and sampler_mod._disable_aiter_greedy_sample:
+            self.skipTest("the sampler never takes the aiter greedy path here")
 
         patches = {"_use_aiter": use_aiter}
         if use_aiter:
