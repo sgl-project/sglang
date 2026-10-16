@@ -819,25 +819,30 @@ class TestPollCollectives(CustomTestCase):
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
+        # Under CP-TP group sharing each CP rank owns its own linear-attention
+        # head shard, so no rank skips its state.
         cases = [
-            (1, 0, False, False),
-            (8, 0, False, False),
-            (8, 1, False, True),
-            (8, 7, False, True),
-            (8, 1, True, False),
+            (1, 0, False, False, False),
+            (8, 0, False, False, False),
+            (8, 1, False, False, True),
+            (8, 7, False, False, True),
+            (8, 1, True, False, False),
+            (8, 1, False, True, False),
         ]
 
-        for cp_size, cp_rank, layer_split, expected in cases:
+        for cp_size, cp_rank, layer_split, sharing, expected in cases:
             with self.subTest(
                 cp_size=cp_size,
                 cp_rank=cp_rank,
                 layer_split=layer_split,
+                sharing=sharing,
             ):
                 manager = object.__new__(CommonKVManager)
                 manager.attn_cp_size = cp_size
                 manager.attn_cp_rank = cp_rank
                 with get_context().override_server_args(
                     enable_dsa_cache_layer_split=layer_split,
+                    enable_cp_tp_group_sharing=sharing,
                 ):
                     self.assertEqual(
                         manager._should_skip_cp_replicated_state_transfer(),
@@ -1743,6 +1748,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             cached_tokens_device=0,
             cached_tokens_host=0,
             cached_tokens_storage=0,
+            get_mm_token_counts=lambda: (0, 0, 0),
             multimodal_inputs=None,
             return_logprob=False,
             return_sampling_mask=sampling_mask is not None,

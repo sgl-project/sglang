@@ -523,7 +523,7 @@ export const config = {
     "gb300|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "b200|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "gb200|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
-    a3:     "quay.io/ascend/sglang:main-cann9.0.0-a3",
+    a3:     "quay.io/ascend/sglang:main-cann9.1.0-a3",
     // 950PR/DT Series builds are CANN 9.1.0 and published from the Ascend SWR
     // registry (the quay.io A2/A3 line carries no 950PR/DT tag).
     a5:     "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B070",
