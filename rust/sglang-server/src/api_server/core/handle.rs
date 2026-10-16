@@ -472,6 +472,27 @@ impl CoreCall {
         }
     }
 
+    /// A generation the caller already pushed onto the scheduler ring itself
+    /// (bypassing Intake), so it starts admitted: dropping it aborts via the
+    /// normal abort lane.
+    pub(crate) fn pushed(
+        rid: Rid,
+        response_rx: mpsc::Receiver<ResponseItem>,
+        abort_tx: flume::Sender<AbortSource>,
+    ) -> Self {
+        let admission = RequestAdmission::pending();
+        let accepted = admission.try_accept();
+        debug_assert!(accepted, "a fresh admission is always pending");
+        Self::new(RuntimeCall {
+            rid,
+            response_rx,
+            abort_tx,
+            admission,
+            expected_response: ExpectedResponse::Generate,
+            in_flight: true,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_generation_parts(
         rid: Rid,

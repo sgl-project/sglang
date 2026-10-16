@@ -380,6 +380,43 @@ pub struct GenerateRequest {
     #[prost(message, optional, tag = "23")]
     pub extra_key: ::core::option::Option<StringOrList>,
 }
+/// One pre-tokenized request for an external frontend (e.g. a Dynamo worker)
+/// that already owns templating and tokenization. No batch forms, no text, no
+/// multimodal: the server maps it field-for-field onto the scheduler request.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenerateTokensRequest {
+    /// Client rid; a uuid is minted when absent.
+    #[prost(string, optional, tag = "1")]
+    pub rid: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub input_ids: ::core::option::Option<TokenIds>,
+    #[prost(message, optional, tag = "3")]
+    pub sampling_params: ::core::option::Option<SamplingParams>,
+    #[prost(bool, tag = "4")]
+    pub stream: bool,
+    #[prost(bool, tag = "5")]
+    pub return_logprob: bool,
+    #[prost(int64, optional, tag = "6")]
+    pub logprob_start_len: ::core::option::Option<i64>,
+    #[prost(int64, tag = "7")]
+    pub top_logprobs_num: i64,
+    #[prost(string, optional, tag = "8")]
+    pub bootstrap_host: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "9")]
+    pub bootstrap_port: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub bootstrap_room: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "11")]
+    pub bootstrap_pair_key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "12")]
+    pub decode_tp_size: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "13")]
+    pub routed_dp_rank: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "14")]
+    pub disagg_prefill_dp_rank: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "15")]
+    pub extra_key: ::core::option::Option<::prost::alloc::string::String>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParamsOrList {
     #[prost(oneof = "sampling_params_or_list::Value", tags = "1, 2")]

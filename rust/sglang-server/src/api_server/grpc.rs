@@ -10,6 +10,7 @@
 //! The thin Tonic-service structure, streamed response approach.
 
 pub(crate) mod app;
+pub(crate) mod direct;
 mod info;
 mod native_api;
 pub(crate) mod service;

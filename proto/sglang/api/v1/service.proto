@@ -17,6 +17,10 @@ service SglangService {
   // errors, pre-submit failures end the RPC with a gRPC status.
   rpc Generate(GenerateRequest) returns (stream GenerateStreamItem);
 
+  // Single pre-tokenized request; same stream contract as Generate, minus the
+  // batch `index`.
+  rpc GenerateTokens(GenerateTokensRequest) returns (stream GenerateStreamItem);
+
   // `/health_generate`: fires a 1-token probe and watches the response
   // heartbeat. UNAVAILABLE on a stalled pipeline.
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);

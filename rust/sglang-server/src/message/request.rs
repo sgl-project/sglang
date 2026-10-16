@@ -389,6 +389,64 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     Ok((requests, is_batch))
 }
 
+/// `GenerateTokens`: one pre-tokenized request mapped field-for-field, with
+/// none of `into_requests`' batch fan-out. Defaults match `GenerateReqInput`'s.
+/// No preferred params or schema defaults: inside a sent `sampling_params`, an
+/// unset `max_new_tokens` means no cap (an absent message takes `Default`'s 128).
+pub fn from_generate_tokens(req: api_v1::GenerateTokensRequest) -> Result<GenerateRequest, Error> {
+    let api_v1::GenerateTokensRequest {
+        rid,
+        input_ids,
+        sampling_params,
+        stream,
+        return_logprob,
+        logprob_start_len,
+        top_logprobs_num,
+        bootstrap_host,
+        bootstrap_port,
+        bootstrap_room,
+        bootstrap_pair_key,
+        decode_tp_size,
+        routed_dp_rank,
+        disagg_prefill_dp_rank,
+        extra_key,
+    } = req;
+    let input_ids = input_ids.map(|ids| ids.ids).unwrap_or_default();
+    if input_ids.is_empty() {
+        return Err(Error::Validation("input_ids cannot be empty".into()));
+    }
+    let sampling_params = sampling_params
+        .map(SamplingParams::try_from)
+        .transpose()
+        .map_err(Error::Validation)?
+        .unwrap_or_default();
+    Ok(GenerateRequest {
+        rid: rid.map_or_else(Rid::default, |r| Rid::from_client(&r)),
+        text: None,
+        input_ids: Some(input_ids),
+        skip_special_tokens: false,
+        sampling_params,
+        stream,
+        return_logprob,
+        logprob_start_len: logprob_start_len.unwrap_or(-1),
+        top_logprobs_num,
+        token_ids_logprob: None,
+        return_sampling_mask: false,
+        return_hidden_states: false,
+        return_text_in_logprobs: None,
+        bootstrap_host,
+        bootstrap_port,
+        bootstrap_room,
+        bootstrap_pair_key,
+        decode_tp_size,
+        routed_dp_rank,
+        disagg_prefill_dp_rank,
+        extra_key: extra_key.filter(|key| !key.is_empty()),
+        mm: None,
+        mm_buffers: Vec::new(),
+    })
+}
+
 /// Box the per-item mm values, `None` when the item has none — the common
 /// text-only case keeps `GenerateRequest` slim.
 fn pack_mm(
