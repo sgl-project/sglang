@@ -1613,6 +1613,31 @@ class Envs:
     # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+    # fp8 unified_kv decode/verify on aiter's FlyDSL v4 nm decode when the
+    # installed aiter ships it; 0 keeps the asm kernel.
+    SGLANG_DSV4_FLYDSL_DECODE = EnvBool(True)
+    # ... which copy: "auto" = aiter's when the installed aiter ships it, else
+    # sglang's in-tree copy; "aiter" = aiter's only (asm without it); "intree" =
+    # the in-tree copy only.
+    # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+    SGLANG_DSV4_FLYDSL_DECODE_SOURCE = EnvStr("auto")
+    # ... also with 128 local heads (DP attention). Off: there the asm path
+    # below (split plan + HCA persistent, ROCm/aiter#6126) measured the same
+    # DP8 DSpark decode step on MI355X without depending on FlyDSL.
+    SGLANG_DSV4_FLYDSL_DECODE_H128 = EnvBool(False)
+    # fp8 unified_kv asm decode (when FlyDSL is off or absent): pick the KV
+    # split count from aiter's v4 nm latency model (ROCm/aiter#6126; ported
+    # when aiter predates it) with a constant split_indptr, per stream kind.
+    SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL = EnvBool(True)
+    # context the HCA split plan is sized for, capped at the server context
+    # length (0: the server context length). Sizing for 1M over-splits HCA at
+    # AgentX lengths (32k-200k).
+    SGLANG_DSV4_FP8_DECODE_SPLIT_CTX = EnvInt(200_000)
+    # fp8 unified_kv asm decode: HCA layers with 128 local heads (DP attention)
+    # take aiter's persistent mla_decode_fwd_v4_nm_ps (in-kernel split + merge)
+    # for MIN_ROWS..32768 rows; needs aiter >= ROCm/aiter#6126.
+    SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
+    SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
