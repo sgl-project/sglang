@@ -87,10 +87,15 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.openai.openapi import completion_response_kwargs
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionStreamResponse,
     ClassifyRequest,
     CompletionRequest,
+    CompletionResponse,
+    CompletionStreamResponse,
     DecisionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
@@ -1790,9 +1795,17 @@ async def continue_generation(
 ##### OpenAI-compatible API endpoints #####
 
 
-@app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+@app.post(
+    "/v1/completions",
+    dependencies=[Depends(validate_json_request)],
+    **completion_response_kwargs(CompletionResponse, CompletionStreamResponse),
+)
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
-    """OpenAI-compatible text completion endpoint."""
+    """Serve a validated text request as JSON, SSE, or a serving-layer error.
+
+    Uses the completion service initialized on the request's app. Response
+    metadata documents native models without changing their serialization.
+    """
     return model_json_response(
         await raw_request.app.state.openai_serving_completion.handle_request(
             request, raw_request
@@ -1800,11 +1813,19 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
     )
 
 
-@app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+@app.post(
+    "/v1/chat/completions",
+    dependencies=[Depends(validate_json_request)],
+    **completion_response_kwargs(ChatCompletionResponse, ChatCompletionStreamResponse),
+)
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
-    """OpenAI-compatible chat completion endpoint."""
+    """Serve validated chat messages as JSON, SSE, or a serving-layer error.
+
+    Uses the chat service initialized on the request's app. Response metadata
+    documents native models without changing their serialization.
+    """
     return model_json_response(
         await raw_request.app.state.openai_serving_chat.handle_request(
             request, raw_request
