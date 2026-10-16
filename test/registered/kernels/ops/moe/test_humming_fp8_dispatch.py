@@ -6,9 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.moe import (
-    silu_and_mul_masked_post_quant,
-)
+from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
 from sglang.srt.layers.moe.moe_runner import humming as humming_runner
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -196,8 +194,7 @@ class TestHummingFp8Dispatch(CustomTestCase):
                         side_effect=AssertionError("SiLU fused path was not selected"),
                     ) as fallback_activation,
                     patch(
-                        "sglang.kernels.ops.attention.dsv4.moe."
-                        "silu_and_mul_masked_post_quant",
+                        "sglang.kernels.ops.moe.dsv4.silu_and_mul_masked_post_quant",
                         side_effect=run_poisoned_kernel,
                     ) as fused_silu,
                 ):

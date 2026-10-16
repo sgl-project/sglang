@@ -21,6 +21,7 @@ from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.utils import LazyImport
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -41,7 +42,18 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda() or is_musa():
+if is_cuda():
+    from sglang.kernels.ops.speculative.sampling import (
+        tree_speculative_sampling_target_only,
+    )
+
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module.
+    top_k_renorm_prob = LazyImport("flashinfer.sampling", "top_k_renorm_probs")
+    top_p_renorm_prob = LazyImport("flashinfer.sampling", "top_p_renorm_probs")
+
+    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+elif is_musa():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -197,8 +209,20 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     backend = attn_backend
     for _ in range(4):
+        if isinstance(backend, HybridAttnBackend):
+            # Resolve wrappers down to the backend that runs TARGET_VERIFY
+            backend = backend._select_backend(ForwardMode.TARGET_VERIFY)
+            continue
+        if isinstance(backend, TboAttnBackend):
+            # primary and children come from the same creator.
+            backend = backend.primary
+            continue
         full_backend = getattr(backend, "full_attn_backend", None)
         if full_backend is None:
             break
@@ -544,6 +568,8 @@ class DFlashDraftConfig:
     pure_draft_prefix_len: Optional[int]
     gru_hidden_dim: Optional[int]
     emb_dim: Optional[int]
+    attention_sink_bias: bool = False
+    attention_value_scale: Optional[float] = None
 
     @property
     def is_domino(self) -> bool:
@@ -708,6 +734,29 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    # MiMo DFlash draft extras: per-head attention sink bias and V value scale.
+    raw_attention_sink_bias = dflash_cfg.get("attention_sink_bias", False)
+    if not isinstance(raw_attention_sink_bias, bool):
+        raise ValueError(
+            "DFLASH dflash_config.attention_sink_bias must be a bool, "
+            f"got {raw_attention_sink_bias!r} (type={type(raw_attention_sink_bias).__name__})."
+        )
+    attention_sink_bias = bool(raw_attention_sink_bias)
+
+    raw_attention_value_scale = dflash_cfg.get("attention_value_scale", None)
+    if raw_attention_value_scale is None:
+        attention_value_scale: Optional[float] = None
+    else:
+        if isinstance(raw_attention_value_scale, bool) or not isinstance(
+            raw_attention_value_scale, (int, float)
+        ):
+            raise ValueError(
+                "DFLASH dflash_config.attention_value_scale must be int|float|None, "
+                f"got {raw_attention_value_scale!r} "
+                f"(type={type(raw_attention_value_scale).__name__})."
+            )
+        attention_value_scale = float(raw_attention_value_scale)
+
     projector_type = dflash_cfg.get(
         "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
     )
@@ -792,6 +841,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         pure_draft_prefix_len=pure_draft_prefix_len,
         gru_hidden_dim=gru_hidden_dim,
         emb_dim=emb_dim,
+        attention_sink_bias=attention_sink_bias,
+        attention_value_scale=attention_value_scale,
     )
 
 
@@ -920,10 +971,15 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_len: float,
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
+    next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
 ) -> None:
-    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
-    block_size = candidates.shape[1]
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
+    ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
+    bs, block_size = candidates.shape
+    if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
+        # The sampling-verify branch does not materialize the target argmax.
+        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
@@ -1050,7 +1106,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 dtype=torch.float32,
             )
 
-        target_probs = build_dflash_verify_target_probs(
+        target_probs = build_speculative_verify_target_probs(
             next_token_logits=next_token_logits,
             sampling_info=sampling_info,
             draft_token_num=draft_token_num,
@@ -1091,7 +1147,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def build_dflash_verify_target_probs(
+def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,

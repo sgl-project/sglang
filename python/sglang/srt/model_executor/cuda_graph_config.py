@@ -40,18 +40,18 @@ class Phase:
 class Backend:
     """CUDA graph capture backends a phase can use."""
 
+    # Temporary internal name while unreachable legacy branches are removed.
+    TC_PIECEWISE = "tc_piecewise"
     FULL = "full"
     BREAKABLE = "breakable"
-    TC_PIECEWISE = "tc_piecewise"
     DISABLED = "disabled"
-    ALL = (FULL, BREAKABLE, TC_PIECEWISE, DISABLED)
+    ALL = (FULL, BREAKABLE, DISABLED)
 
 
 ALLOWED_BACKENDS_PER_PHASE = {
     Phase.DECODE: (
         Backend.FULL,
         Backend.BREAKABLE,
-        Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
     # full for prefill captures one whole-forward graph per num_tokens
@@ -61,27 +61,27 @@ ALLOWED_BACKENDS_PER_PHASE = {
     Phase.PREFILL: (
         Backend.FULL,
         Backend.BREAKABLE,
-        Backend.TC_PIECEWISE,
         Backend.DISABLED,
     ),
 }
 
 # Per-phase settings schema. Keys other than backend are runner-level
-# (read by any backend in that phase); tc_compiler is the lone
-# backend-specific knob (only meaningful when backend == tc_piecewise).
+# (read by any backend in that phase).
 # For prefill, bs carries aggregate-token capture buckets for every backend;
 # full_prefill_max_req separately controls Full's fixed request-slot count.
 # full_prefill_max_req and full_prefill_prefix_chunk_tokens are prefill-only and
-# only meaningful when backend == full.
+# only meaningful when backend == full. max_context_size is shared by the
+# breakable and full prefill body-capture backends.
 ALLOWED_KEYS_PER_PHASE = {
-    Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
+    Phase.DECODE: ("backend", "max_bs", "bs"),
     Phase.PREFILL: (
         "backend",
         "max_bs",
         "bs",
-        "tc_compiler",
+        "max_context_size",
         "full_prefill_max_req",
         "full_prefill_prefix_chunk_tokens",
+        "max_seq_len",
     ),
 }
 
@@ -93,12 +93,16 @@ class PhaseConfig:
     backend: str = Backend.DISABLED
     max_bs: Optional[int] = None
     bs: Optional[List[int]] = None
-    # Only meaningful when backend == tc_piecewise; ignored otherwise.
+    # Internal compatibility only; rejected by both configuration parsers.
     tc_compiler: str = "eager"
+    # Effective for both full and breakable backends and currently only DSV4:
+    # fixed maximum context length used by context-shaped prefill graph metadata.
+    # Every token bucket shares this size; larger live contexts run eagerly.
+    max_context_size: Optional[int] = None
     # Only meaningful for the prefill phase with backend == full: max number of
     # request slots baked into each captured graph. Real bs <= full_prefill_max_req
     # reuses the graph (unused slots become zero-length sentinels); larger
-    # batches fall back to eager. Ignored by BCG and TC_PIECEWISE. None
+    # batches fall back to eager. Ignored by BCG. None
     # auto-derives chunked_prefill_size // 512.
     full_prefill_max_req: Optional[int] = None
     # Only meaningful for Full prefill CUDA graphs that capture a distinct
@@ -107,18 +111,16 @@ class PhaseConfig:
     # chunk variants and chooses the smallest one covering a batch. None uses
     # the scheduler's aggregate chunked_prefill_size token budget.
     full_prefill_prefix_chunk_tokens: Optional[int] = None
+    # Prefill only: a batch whose longest sequence exceeds this replays eagerly, and
+    # backends that capture context-wide work size it. None defers to token buckets.
+    max_seq_len: Optional[int] = None
 
 
 def default_prefill_backend() -> str:
-    """BCG (breakable) is the prefill default on CUDA only; other platforms
-    (HIP/NPU/...) keep tc_piecewise until BCG is validated there. Full-graph
-    prefill capture is opt-in per model architecture via the declarative
-    registry (see _inkling_overrides in arg_groups/overrides.py), not a global
-    default. Lazy import keeps this module's stdlib-only import invariant (see
-    module docstring)."""
+    """Enable BCG by default on CUDA; other platforms remain opt-in."""
     from sglang.srt.utils import is_cuda
 
-    return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
+    return Backend.BREAKABLE if is_cuda() else Backend.DISABLED
 
 
 def with_phase(config: "CudaGraphConfig", phase: str, **changes) -> "CudaGraphConfig":
@@ -178,6 +180,12 @@ class CudaGraphConfig:
             if phase not in Phase.ALL or not isinstance(phase_settings, dict):
                 continue
             phase_cfg = getattr(cfg, phase)
+            if phase_settings.get("backend") == "tc_piecewise":
+                raise ValueError(
+                    "tc_piecewise was removed; select breakable, full, or disabled"
+                )
+            if "tc_compiler" in phase_settings:
+                raise ValueError("tc_compiler was removed with tc_piecewise")
             allowed = ALLOWED_KEYS_PER_PHASE[phase]
             for key, value in phase_settings.items():
                 if key in allowed:
@@ -226,6 +234,15 @@ def cuda_graph_fully_disabled() -> bool:
     ) and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
 
 
+def parse_cuda_graph_backend_arg(raw: str) -> str:
+    """Reject the retired backend before argparse checks supported choices."""
+    if raw == "tc_piecewise":
+        raise argparse.ArgumentTypeError(
+            "tc_piecewise was removed; select breakable, full, or disabled"
+        )
+    return raw
+
+
 def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
     """argparse type for --cuda-graph-config: parse JSON dict of
     phase → settings dict. Each phase's settings dict is itself validated
@@ -253,6 +270,8 @@ def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
                 f"--cuda-graph-config['{phase}'] must be a JSON object, got "
                 f"{type(phase_settings).__name__}"
             )
+        if "backend" in phase_settings:
+            parse_cuda_graph_backend_arg(phase_settings["backend"])
         allowed = ALLOWED_KEYS_PER_PHASE[phase]
         result[phase] = {}
         for key, value in phase_settings.items():

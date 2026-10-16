@@ -202,17 +202,11 @@
     "52": {
       "inputs": {
         "model_type": "auto-detect",
-        "enable_torch_compile": false,
         "num_gpus": 2,
-        "tp_size": -1,
-        "sp_degree": -1,
-        "ulysses_degree": -1,
-        "ring_degree": -1,
-        "dp_size": 1,
-        "dp_degree": 1,
-        "enable_cfg_parallel": false,
-        "attention_backend": "",
-        "cache_strategy": "none"
+        "parallel_mode": "auto",
+        "execution_mode": "eager",
+        "attention_backend": "auto",
+        "memory_mode": "resident"
       },
       "class_type": "SGLDOptions",
       "_meta": {

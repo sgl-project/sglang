@@ -17,6 +17,7 @@ def make_configurator(
 ):
     configurator = SimpleNamespace(
         ps=SimpleNamespace(attn_dp_size=attn_dp_size),
+        attn_dp_size=attn_dp_size,
         mambaish_config=SimpleNamespace(
             mamba2_cache_params=SimpleNamespace(
                 layers=[], mamba_cache_per_req=STATE_BYTES

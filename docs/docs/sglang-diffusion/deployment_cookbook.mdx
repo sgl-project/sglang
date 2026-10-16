@@ -195,6 +195,21 @@ In this example, `auto` will not re-enable FSDP. The same applies to parallelism
 
 There are three placements, not two. A component can be in the list and still hold its blocks — `--layerwise-offload-components dit,text_encoder,vae` together with `--layerwise-resident-layers video_vae=36` transfers them once instead of per pass, and gives the VRAM back when the component finishes rather than holding it through denoise. On MiniMax-H3 at 864x480 / 124 frames that is 13 s of decode against 150 s streamed.
 
+That hand-back is the default lifetime, `forward`, and it is what lets the DiT's resident layers and the VAE's share one budget: each set is on the GPU only while its component runs. When both sets fit at once, `--layerwise-residency-lifetime video_vae=permanent` (or `--dit-layerwise-residency-lifetime permanent` for the DiT) places them at load instead — no transfer per request, and no host copy pinned for a reload that never comes. The trade is peak memory: `permanent` adds every component's resident set together, `forward` only the largest. On a card where the sum does not fit, `permanent` fails at startup rather than slowly; keep `forward` there.
+
+On a consumer card the trade is usually bad, so measure before reaching for it. Qwen-Image-2.1 on one RTX 5090 (1024px, 40 steps, three interleaved rounds, five requests each), making the text encoder's resident set permanent:
+
+| `text_encoder` resident | p50 | vs `forward` | peak at load | of a 31.4 GiB card |
+|---|---|---|---|---|
+| none (default) | 13.53 s | — | 25168 MiB | 78% |
+| 0.3 permanent | 13.45 s | −0.6% | 29570 MiB | 92% |
+| 0.5 permanent | 13.41 s | −0.8% | 31480 MiB | 98% |
+| 0.8 permanent | 13.37 s | −1.2% | 32092 MiB | 100% |
+
+Every round reproduces to 0.1% and the ordering is consistent, so the win is real — and it is 0.6% to 1.2% in exchange for nearly all of the card's remaining headroom, on a machine that also has a desktop to run. The faster the card, the smaller the share the saved transfer represents: the same flag measured −2.8% on a slower box whose baseline was 14.14 s. Output stays within the usual floating-point reordering (0.5 is bit-identical to the default; 0.8 deviates by at most 1/255 with no pixel beyond one LSB).
+
+`permanent` earns its memory where one use makes many passes and the sum still fits — a datacenter card, or a component whose set is small next to the budget.
+
 So do not read "drop it from the list" as the fix for a one-shot component: that keeps it resident for the whole process. With no resident blocks on either side, moving H3's 10.4 GB video VAE out of the list took decode from 39.9 s to 5.3 s on one RTX 4090 — but it also added 5.8 GB of peak, which is the budget a 12 GB card does not have.
 
 ### How deep to prefetch

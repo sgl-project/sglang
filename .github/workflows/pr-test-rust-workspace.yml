@@ -1,0 +1,137 @@
+name: PR Test (Rust workspace)
+
+# Native Rust unit tests for the rust/ workspace and the standalone
+# sglang-radix-tree crate, run only when files under rust/ change.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "rust/**"
+      - ".github/workflows/pr-test-rust-workspace.yml"
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "rust/**"
+      - ".github/workflows/pr-test-rust-workspace.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-workspace-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-workspace:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # sglang-server links libpython through pyo3.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install protoc + Rust toolchain
+        working-directory: .
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: "rust-workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo test (workspace)
+        run: cargo test --workspace
+
+      # `openai` is off by default; its OpenAI-parity fixtures run offline.
+      - name: cargo test (sglang-processor, openai feature)
+        run: cargo test -p sglang-processor --features openai
+
+      # Verify that the public crate builds with only its packaged inputs.
+      - name: cargo package (sglang-api-types)
+        run: cargo package -p sglang-api-types --locked --allow-dirty --offline
+
+  sglang-radix-tree:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The crate links libtorch from the installed torch wheel; the CPU wheel
+      # is enough for its native tests.
+      - name: Install CPU torch
+        run: |
+          TORCH_VERSION=$(grep -oE '"torch==[0-9.]+"' python/pyproject.toml | head -1 | tr -d '"' | cut -d= -f3)
+          python -m pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install Rust toolchain
+        run: bash scripts/ci/utils/install_rustup.sh
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/sglang-radix-tree
+          shared-key: "sglang-radix-tree"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # torch_build.py depends only on the standard library and torch, so it is
+      # loaded by path instead of installing the sglang package.
+      - name: cargo test (sglang-radix-tree)
+        run: |
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+          python - <<'EOF'
+          import importlib.util
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path.cwd()
+          spec = importlib.util.spec_from_file_location(
+              "torch_build", root / "python/sglang/srt/rust_extensions/torch_build.py"
+          )
+          torch_build = importlib.util.module_from_spec(spec)
+          sys.modules["torch_build"] = torch_build
+          spec.loader.exec_module(torch_build)
+
+          manifest = root / "rust/sglang-radix-tree/Cargo.toml"
+          build = torch_build.torch_build_configuration(
+              compat_header=manifest.parent / "torch_compat.h",
+              python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+          )
+          subprocess.run(
+              [
+                  "cargo",
+                  "test",
+                  "--manifest-path",
+                  str(manifest),
+                  "--locked",
+                  "--no-default-features",
+              ],
+              cwd=root / "rust",
+              env=build.environment,
+              check=True,
+          )
+          EOF

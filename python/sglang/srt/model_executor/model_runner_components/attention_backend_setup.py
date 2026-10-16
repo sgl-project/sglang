@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
-from sglang.srt.distributed import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import init_cublas
 
 if TYPE_CHECKING:
@@ -68,10 +68,30 @@ def configure_aux_hidden_state_capture(
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     """Init attention kernel backend."""
+    from sglang.srt.configs.model_config import AttentionArch
 
     # TODO: Refactor device-specific init branches into platform interface (separate PR).
+    # Must run before the SSM early-return below; Mamba mixers still issue GEMMs.
     if model_runner.device in ("cuda", "musa"):
         init_cublas()
+
+    # SSM models use the Mamba backend, not attention. Import inside the branch so
+    # non-SSM models don't load the Mamba-specific backend deps.
+    if model_runner.model_config.attention_arch == AttentionArch.SSM:
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            Mamba2AttnBackend,
+        )
+
+        mamba_backend = Mamba2AttnBackend(model_runner)
+        return AttentionBackends(
+            attn_backend=mamba_backend,
+            decode_attn_backend=None,
+            decode_attn_backend_group=[],
+            prefill_attention_backend_str="mamba2",
+            decode_attention_backend_str="mamba2",
+        )
+
+    server_args = model_runner.server_args
 
     # Already resolved and stamped on the runner before this call.
     resolved = ResolvedAttentionBackendStr(
@@ -125,9 +145,9 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         lazy_init_zbal_gva_mem(
             model_runner.device,
             model_runner.gpu_id,
-            get_world_group().rank_in_group,
-            get_world_group().world_size,
-            get_world_group().cpu_group,
+            get_parallel().world_group.rank_in_group,
+            get_parallel().launch_world_size,
+            get_parallel().world_group.cpu_group,
         )
 
     # Record resolved per-mode backends on the backend for model dispatch.

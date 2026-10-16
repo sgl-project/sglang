@@ -8,7 +8,7 @@ import unittest
 import warnings
 from contextlib import ExitStack
 
-from sglang.srt.environ import _DEPRECATED_ENVS, _DeprecatedEnv, envs
+from sglang.srt.environ import _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -114,21 +114,6 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         caught = self._apply(old_name, _DeprecatedEnv())
         self.assertIn(f"{old_name} is deprecated", str(caught[0].message))
 
-    def test_w4a4_mxfp4_megamoe_envs_warn_to_use_cli_flag(self):
-        old_names = (
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS",
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND",
-        )
-        for old_name in old_names:
-            with self.subTest(old_name=old_name):
-                os.environ[old_name] = "1"
-                self.addCleanup(os.environ.pop, old_name, None)
-
-                caught = self._apply(old_name, _DEPRECATED_ENVS[old_name])
-
-                self.assertIn("--enable-w4a4-mxfp4-megamoe", str(caught[0].message))
-                self.assertIsNone(_DEPRECATED_ENVS[old_name].replacement)
-
     def test_renamed_env_forwards_value(self):
         old_name, new_name = "SGLANG_TEST_OLD_ENV", "SGLANG_TEST_NEW_ENV"
         os.environ[old_name] = "abc"
@@ -143,24 +128,14 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         caught = self._apply("SGLANG_TEST_UNSET_ENV", _DeprecatedEnv())
         self.assertEqual(len(caught), 0)
 
-    def test_disable_tp_imbalance_check_polarity_is_inverted(self):
-        old_name = "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK"
-        new_name = "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"
-        os.environ[old_name] = "1"
+    def test_renamed_env_applies_transform(self):
+        old_name, new_name = "SGLANG_TEST_OLD_ENV", "SGLANG_TEST_NEW_ENV"
+        os.environ[old_name] = "abc"
         self.addCleanup(os.environ.pop, old_name, None)
         self.addCleanup(os.environ.pop, new_name, None)
 
-        self._apply(old_name, _DEPRECATED_ENVS[old_name])
-        self.assertIs(envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get(), False)
-
-    def test_ms_to_s_transform(self):
-        old_name = "SGLANG_QUEUED_TIMEOUT_MS"
-        os.environ[old_name] = "1500"
-        self.addCleanup(os.environ.pop, old_name, None)
-        self.addCleanup(os.environ.pop, "SGLANG_REQ_WAITING_TIMEOUT", None)
-
-        self._apply(old_name, _DEPRECATED_ENVS[old_name])
-        self.assertEqual(envs.SGLANG_REQ_WAITING_TIMEOUT.get(), 1.5)
+        self._apply(old_name, _DeprecatedEnv(replacement=new_name, transform=str.upper))
+        self.assertEqual(os.environ[new_name], "ABC")
 
 
 if __name__ == "__main__":

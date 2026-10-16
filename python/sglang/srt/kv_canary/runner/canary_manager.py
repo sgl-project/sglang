@@ -29,6 +29,7 @@ from sglang.srt.kv_canary.single_forward_manager.manager import (
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
+from sglang.srt.utils import create_device_stream
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -91,7 +92,7 @@ class CanaryManager:
             )
         )
 
-        self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
+        self._d2h_stream: torch.Stream = create_device_stream(device)
 
         swa_divergence_interval = (
             envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.get()
@@ -133,6 +134,7 @@ class CanaryManager:
         )
         self._health_checker = KernelRunCounterHealthChecker(
             config=config,
+            is_draft_runner=is_eagle_draft_decode,
             device_state=self._device_state,
             active_tags=self._active_tags,
             outer_step_counter_getter=self._get_outer_step_counter,

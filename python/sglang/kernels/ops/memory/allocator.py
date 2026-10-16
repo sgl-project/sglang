@@ -1,5 +1,105 @@
+import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit(do_not_specialize=["num_pages", "full_page_representatives"])
+def get_and_clear_swa_pages_kernel(
+    full_page_representatives,
+    mapping,
+    swa_pages,
+    peers_mapped,
+    page_mappings_valid,
+    num_pages,
+    index_stride: tl.constexpr,
+    page_size: tl.constexpr,
+    CHECK_PAGE_MAPPINGS: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+    BLOCK_OFFSETS: tl.constexpr,
+):
+    rep_offsets = tl.program_id(0) * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
+    rep_mask = rep_offsets < num_pages
+    full_reps = tl.load(
+        full_page_representatives + rep_offsets * index_stride,
+        mask=rep_mask,
+        other=0,
+    ).to(tl.int64)
+
+    # Resolve one SWA page per FULL-page representative:
+    # swa_reps = mapping[full_reps]
+    # swa_pages = swa_reps // page_size
+    swa_reps = tl.load(mapping + full_reps, mask=rep_mask, other=0)
+    tl.store(swa_pages + rep_offsets, swa_reps // page_size, mask=rep_mask)
+    tl.store(peers_mapped + rep_offsets, swa_reps > 0, mask=rep_mask)
+
+    page_offsets = tl.arange(0, BLOCK_OFFSETS)
+    full_page_starts = full_reps // page_size * page_size
+    mapping_offsets = full_page_starts[:, None] + page_offsets[None, :]
+    mapping_mask = rep_mask[:, None] & (page_offsets[None, :] < page_size)
+    if CHECK_PAGE_MAPPINGS:
+        page_mapping = tl.load(
+            mapping + mapping_offsets,
+            mask=mapping_mask,
+            other=0,
+        )
+        # Ignore zeros; each mapped slot must share its representative's SWA page.
+        same_swa_page = page_mapping // page_size == swa_reps[:, None] // page_size
+        page_mapping_valid = (swa_reps > 0) & (
+            tl.sum(((page_mapping > 0) & ~same_swa_page).to(tl.int32), axis=1) == 0
+        )
+        tl.store(
+            page_mappings_valid + rep_offsets,
+            page_mapping_valid,
+            mask=rep_mask,
+        )
+
+    # `mapping_offsets` includes `full_reps`. Finish every `mapping[full_reps]`
+    # load before any warp clears `mapping[mapping_offsets]`.
+    tl.debug_barrier()
+    tl.store(
+        mapping + mapping_offsets,
+        0,
+        mask=mapping_mask,
+    )
+
+
+def get_and_clear_swa_pages(
+    full_page_representatives: torch.Tensor,
+    mapping: torch.Tensor,
+    page_size: int,
+    check_page_mappings: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Resolve and clear mappings; input must represent distinct FULL pages."""
+    if check_page_mappings:
+        assert torch.all(
+            (full_page_representatives >= 0)
+            & (full_page_representatives < mapping.numel() // page_size * page_size)
+        ), "FULL page representative out of bounds"
+    num_pages = full_page_representatives.numel()
+    swa_pages = torch.empty(num_pages, dtype=mapping.dtype, device=mapping.device)
+    peers_mapped = torch.empty(num_pages, dtype=torch.bool, device=mapping.device)
+    page_mappings_valid = (
+        torch.empty(num_pages, dtype=torch.bool, device=mapping.device)
+        if check_page_mappings
+        else None
+    )
+    if num_pages:
+        block_offsets = triton.next_power_of_2(page_size)
+        block_pages = max(1, 256 // block_offsets)
+        get_and_clear_swa_pages_kernel[(triton.cdiv(num_pages, block_pages),)](
+            full_page_representatives,
+            mapping,
+            swa_pages,
+            peers_mapped,
+            page_mappings_valid if page_mappings_valid is not None else peers_mapped,
+            num_pages,
+            full_page_representatives.stride(0),
+            page_size,
+            check_page_mappings,
+            block_pages,
+            block_offsets,
+        )
+    return swa_pages, peers_mapped, page_mappings_valid
 
 
 # free_page_ptr aliases self.free_pages, which the paged allocator re-slices
