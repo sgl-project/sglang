@@ -30,6 +30,7 @@ mod pd_protocol_binding;
 mod radix_tree_routing;
 mod reorg_launch;
 mod rerank_routing;
+mod responses_api;
 mod retry;
 mod roundrobin_input_ids;
 mod sampling_overrides;
