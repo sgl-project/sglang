@@ -16,6 +16,7 @@ _SGLANG_NIXL_CONFIG_KEYS = {
     "l3_cleaner_enabled",
     "l3_cleaner_high_watermark",
     "l3_cleaner_low_watermark",
+    "l3_cleaner_capacity_gb",
 }
 
 
@@ -52,6 +53,7 @@ class NixlBackendConfig:
             "enabled": True,
             "high_watermark": 80.0,
             "low_watermark": 70.0,
+            "capacity_gb": None,
         }
         if "l3_cleaner_enabled" in self.config:
             enabled = self.config["l3_cleaner_enabled"]
@@ -61,10 +63,13 @@ class NixlBackendConfig:
         key_map = {
             "l3_cleaner_high_watermark": ("high_watermark", float),
             "l3_cleaner_low_watermark": ("low_watermark", float),
+            "l3_cleaner_capacity_gb": ("capacity_gb", float),
         }
         for raw_key, (cleaner_key, parser) in key_map.items():
             if raw_key in self.config:
                 config[cleaner_key] = parser(self.config[raw_key])
+        if config["capacity_gb"] is not None and config["capacity_gb"] <= 0:
+            raise ValueError("l3_cleaner_capacity_gb must be positive")
         return config
 
     def get_specified_plugin(self) -> str:
