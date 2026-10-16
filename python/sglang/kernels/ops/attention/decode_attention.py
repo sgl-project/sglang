@@ -821,7 +821,9 @@ def _decode_grouped_att_m_fwd(
     if _is_hip:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        # These are CDNA (MFMA) hints; on gfx1250 they make this kernel 3-4x slower.
+        if not _is_gfx1250:
+            extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
 
     if tune_mla:
