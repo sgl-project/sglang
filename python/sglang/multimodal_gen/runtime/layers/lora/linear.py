@@ -189,6 +189,20 @@ class BaseLayerWithLoRA(nn.Module):
     def bias(self):
         return getattr(self.base_layer, "bias", None)
 
+    def _scale_lora_delta(
+        self, delta: torch.Tensor, runtime_lora_scale: float
+    ) -> torch.Tensor:
+        if self.lora_alpha != self.lora_rank:
+            delta = delta * (self.lora_alpha / self.lora_rank)  # type: ignore
+        if _request_allows_lossless():
+            scale = self.strength * runtime_lora_scale
+            return delta if scale == 1.0 else delta * scale
+        if self.strength != 1.0:
+            delta = delta * self.strength
+        if runtime_lora_scale != 1.0:
+            delta = delta * runtime_lora_scale
+        return delta
+
     @staticmethod
     def _runtime_lora_scale() -> float:
         context = get_forward_context_or_none()
@@ -253,13 +267,7 @@ class BaseLayerWithLoRA(nn.Module):
             return _add_lora_delta_in_gemm(out, x_lora, lora_A, lora_B, scale)
 
         delta = _compute_lora_delta(x_lora, lora_A, lora_B)
-        if self.lora_alpha != self.lora_rank:
-            delta = delta * (self.lora_alpha / self.lora_rank)  # type: ignore
-        # x * 1.0 is exact, so skipping a unit scale keeps the reference bits
-        if self.strength != 1.0:
-            delta = delta * self.strength
-        if runtime_lora_scale != 1.0:
-            delta = delta * runtime_lora_scale
+        delta = self._scale_lora_delta(delta, runtime_lora_scale)
         return out + delta.to(dtype=out.dtype)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
@@ -802,18 +810,28 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             end_idx = (tp_rank + 1) * shard_size
             return B[:, start_idx:end_idx, :]
 
-        # Native fused checkpoints (MiniMax H3, etc.) store one concatenated 2D
-        # lora_B matrix per logical layer; shard each section independently.
-        shards: list[torch.Tensor] = []
-        row_offset = 0
-        for full_size, part_size in zip(
-            self.base_layer.output_sizes,
-            self.base_layer.output_partition_sizes,
-        ):
-            local_start = tp_rank * part_size
-            local_end = (tp_rank + 1) * part_size
-            shards.append(B[row_offset + local_start : row_offset + local_end, :])
-            row_offset += full_size
+        # Native fused checkpoints (MiniMax H3, FLUX.3, etc.) store one
+        # concatenated 2D lora_B matrix per logical layer; shard each section
+        # independently, rejecting a matrix that does not match output_sizes.
+        return self._slice_fused_lora_b_weights(B, tp_rank)
+
+    def _slice_fused_lora_b_weights(
+        self, B: torch.Tensor, tp_rank: int
+    ) -> torch.Tensor:
+        """Slice fused ``B`` ``[sum(output_sizes), r]`` per output shard."""
+        output_sizes = self.base_layer.output_sizes
+        if B.shape[0] != sum(output_sizes):
+            raise ValueError(
+                f"fused LoRA B has {B.shape[0]} output rows, expected "
+                f"{sum(output_sizes)} for merged output sizes {output_sizes}"
+            )
+        shards = []
+        offset = 0
+        for shard_idx, output_size in enumerate(output_sizes):
+            shard_size = self.base_layer.output_partition_sizes[shard_idx]
+            start_idx = offset + tp_rank * shard_size
+            shards.append(B[start_idx : start_idx + shard_size])
+            offset += output_size
         return torch.cat(shards, dim=0)
 
 
