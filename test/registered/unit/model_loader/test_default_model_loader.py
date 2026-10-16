@@ -6,7 +6,10 @@ from unittest.mock import Mock, patch
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
-from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.moe import MoeRunnerBackend
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.model_loader.loader import DefaultModelLoader, post_load_weights
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -14,6 +17,55 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDefaultModelLoader(CustomTestCase):
+    def test_routed_mxfp4_hardware_is_validated_before_model_construction(self):
+        for is_fp4, is_sm100 in ((True, False), (True, True), (False, False)):
+            with self.subTest(is_fp4=is_fp4, is_sm100=is_sm100):
+                config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                )
+                model_config = SimpleNamespace(
+                    quantization="fp8",
+                    dtype=torch.bfloat16,
+                    is_fp4_experts=is_fp4,
+                    hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+                    nvfp4_moe_meta=None,
+                )
+                with (
+                    patch.object(
+                        loader_mod,
+                        "get_model_architecture",
+                        return_value=(type("Model", (), {}), None),
+                    ),
+                    patch.object(loader_mod, "get_quant_config", return_value=config),
+                    patch.object(
+                        loader_mod,
+                        "get_moe_runner_backend",
+                        return_value=MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
+                    ),
+                    patch.object(
+                        loader_mod,
+                        "get_platform",
+                        return_value=SimpleNamespace(is_sm100=is_sm100),
+                    ),
+                    patch.object(
+                        loader_mod,
+                        "get_device_capability",
+                        return_value=(10, 0) if is_sm100 else (9, 0),
+                    ),
+                    loader_mod.envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+                ):
+                    if is_fp4 and not is_sm100:
+                        with self.assertRaisesRegex(
+                            ValueError, "MXFP4 experts requires SM100"
+                        ):
+                            loader_mod._get_quantization_config(model_config, object())
+                    else:
+                        self.assertIs(
+                            loader_mod._get_quantization_config(model_config, object()),
+                            config,
+                        )
+
     def test_load_weights_only_precedes_postprocessing(self):
         events = []
         model = Mock()
@@ -114,6 +166,83 @@ class TestDefaultModelLoader(CustomTestCase):
                     startup_prefetch_started=True,
                     startup_prefetch_active=True,
                 )
+
+
+class _ShardedParameter(torch.nn.Parameter):
+    pass
+
+
+class _TiedModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(8, 4)
+        self.lm_head = torch.nn.Linear(4, 8, bias=False)
+        self.lm_head.weight = self.embed.weight
+        self.proj = torch.nn.Module()
+        self.proj.weight = _ShardedParameter(torch.empty(3, 4), requires_grad=False)
+        self.proj.weight.weight_loader = "sharded loader"
+        self.register_buffer("cos_sin_cache", torch.empty(5))
+
+
+class TestInitializeModelWithoutStorage(CustomTestCase):
+    def _initialize(self):
+        built_on = []
+
+        def initialize_model(model_config, load_config, quant_config):
+            built_on.append(torch.empty(0).device.type)
+            return _TiedModel()
+
+        loader = object.__new__(DefaultModelLoader)
+        loader.load_config = object()
+        with (
+            patch.object(loader_mod, "_get_quantization_config", return_value=None),
+            patch.object(loader_mod, "_initialize_model", side_effect=initialize_model),
+        ):
+            model, built_shapes_by_name = loader.initialize_model_without_storage(
+                model_config=SimpleNamespace(dtype=torch.float32),
+                device=torch.device("cpu"),
+            )
+        return model, built_shapes_by_name, built_on
+
+    def test_the_model_is_built_on_meta_and_keeps_no_parameter_storage(self):
+        """A trainer holding a replica per engine rank cannot afford each one's startup allocation."""
+        model, built_shapes_by_name, built_on = self._initialize()
+
+        self.assertEqual(built_on, ["meta"])
+        self.assertEqual(
+            {name: param.numel() for name, param in model.named_parameters()},
+            {"embed.weight": 0, "proj.weight": 0},
+        )
+        self.assertEqual(
+            built_shapes_by_name,
+            {"embed.weight": torch.Size([8, 4]), "proj.weight": torch.Size([3, 4])},
+        )
+        self.assertEqual(model.cos_sin_cache.device.type, "meta")
+
+    def test_parameters_keep_their_subclass_attributes_and_ties(self):
+        """Loaders dispatch on the parameter class and its attributes, and a tied weight must stay one parameter."""
+        model, _, _ = self._initialize()
+
+        self.assertIsInstance(model.proj.weight, _ShardedParameter)
+        self.assertEqual(model.proj.weight.weight_loader, "sharded loader")
+        self.assertFalse(model.proj.weight.requires_grad)
+        self.assertIs(model.lm_head.weight, model.embed.weight)
+
+
+class TestPostLoadWeights(CustomTestCase):
+    def test_gemma_weight_follows_a_weight_written_without_its_loader(self):
+        """p2p weight updates and the remote-instance loader write params by address; fused allreduce kernels read
+        `gemma_weight`, so a stale one would run the old norm."""
+        model = torch.nn.Module()
+        model.norm = GemmaRMSNorm(4)
+        gemma_weight_address = model.norm.gemma_weight.data_ptr()
+        new_weight = torch.tensor([0.5, -0.25, 0.0, 2.0])
+
+        model.norm.weight.data.copy_(new_weight)
+        post_load_weights(model)
+
+        torch.testing.assert_close(model.norm.gemma_weight, new_weight + 1)
+        self.assertEqual(model.norm.gemma_weight.data_ptr(), gemma_weight_address)
 
 
 if __name__ == "__main__":

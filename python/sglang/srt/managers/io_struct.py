@@ -247,7 +247,9 @@ class GenerateReqInput:
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
-    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
+    # Return output top logprobs the same way, on the finished response only.
+    return_flat_raw_output_top_logprobs: bool = False
+    # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
@@ -460,12 +462,18 @@ class GenerateReqInput:
                 "scoring: delimiter-sparse top logprob rows have no contiguous "
                 "position mapping."
             )
-        if (
-            self.return_flat_raw_top_logprobs_b64
-            and not self.return_flat_raw_top_logprobs
+        if self.return_flat_raw_output_top_logprobs and self.stream:
+            raise ValueError(
+                "return_flat_raw_output_top_logprobs is only set on the finished "
+                "response and does not support stream=True."
+            )
+        if self.return_flat_raw_top_logprobs_b64 and not (
+            self.return_flat_raw_top_logprobs
+            or self.return_flat_raw_output_top_logprobs
         ):
             raise ValueError(
-                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
+                "or return_flat_raw_output_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -969,6 +977,7 @@ class GenerateReqInput:
             sampling_logprobs_mode=self.sampling_logprobs_mode[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+            return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
@@ -1494,34 +1503,46 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
-def build_flat_input_top_logprobs_arrays(
-    input_top_logprobs_val: List[Optional[List[float]]],
-    input_top_logprobs_idx: List[Optional[List[int]]],
-    top_logprobs_num: int,
-) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Convert nested per-position prompt top logprob rows into the flat
-    arrays of the `return_flat_raw_top_logprobs` response format.
+def flat_top_logprobs_layout(
+    top_logprobs_val: List[Optional[List[float]]], top_logprobs_num: int
+) -> Tuple[int, int]:
+    """(null_prefix, k) of nested per-position top logprob rows in the flat format.
 
-    Returns (float32 values [rows, k], int32 token ids [rows, k],
-    null_prefix). The leading null rows are counted into null_prefix and
-    excluded from the arrays. Raises ValueError when the rows are not
-    representable by (shape, null_prefix): interior nulls or ragged k,
-    e.g. multi-item scoring.
+    Raises ValueError when the rows are not representable by (shape,
+    null_prefix): interior nulls or ragged k, e.g. multi-item scoring.
     """
-    num_rows = len(input_top_logprobs_val)
+    num_rows = len(top_logprobs_val)
     null_prefix = 0
-    while null_prefix < num_rows and not input_top_logprobs_val[null_prefix]:
+    while null_prefix < num_rows and not top_logprobs_val[null_prefix]:
         null_prefix += 1
-    val_rows = input_top_logprobs_val[null_prefix:]
-    idx_rows = input_top_logprobs_idx[null_prefix:]
+    val_rows = top_logprobs_val[null_prefix:]
     k = len(val_rows[0]) if val_rows else top_logprobs_num
     for offset, row in enumerate(val_rows):
         if row is None or len(row) != k:
             raise ValueError(
-                "return_flat_raw_top_logprobs requires rectangular top logprob "
-                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
+                "Flat top logprobs require rectangular rows with nulls only in "
+                f"the leading prefix; row {null_prefix + offset} "
                 f"has {None if row is None else len(row)} entries (expected {k})."
             )
+    return null_prefix, k
+
+
+def build_flat_top_logprobs_arrays(
+    top_logprobs_val: List[Optional[List[float]]],
+    top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Convert nested per-position top logprob rows (prompt or output) into
+    the flat arrays of the flat raw top logprob response format.
+
+    Returns (float32 values [rows, k], int32 token ids [rows, k],
+    null_prefix). The leading null rows are counted into null_prefix and
+    excluded from the arrays; see `flat_top_logprobs_layout` for the rows
+    that raise ValueError.
+    """
+    null_prefix, k = flat_top_logprobs_layout(top_logprobs_val, top_logprobs_num)
+    val_rows = top_logprobs_val[null_prefix:]
+    idx_rows = top_logprobs_idx[null_prefix:]
     val_arr = np.asarray(val_rows, dtype=np.float32).reshape(len(val_rows), k)
     idx_arr = np.asarray(idx_rows, dtype=np.int32).reshape(len(idx_rows), k)
     return val_arr, idx_arr, null_prefix
@@ -1588,6 +1609,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1624,7 +1646,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Scheduler-side flat assembly of prompt top logprobs for requests with
     # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
-    # leading-null count (see build_flat_input_top_logprobs_arrays). For such
+    # leading-null count (see build_flat_top_logprobs_arrays). For such
     # requests the nested input_top_logprobs_val/idx entry is empty. None when
     # no request in the batch uses the flat format.
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
@@ -1686,6 +1708,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -2232,6 +2255,7 @@ class AbortReq(BaseReq, kw_only=True):
     # because batch requests derive child rids as ``f"{rid}_{i}"`` and an
     # abort for the parent rid must cover them.
     prefix: bool = False
+    prefill_weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

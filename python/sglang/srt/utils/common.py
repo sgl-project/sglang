@@ -2791,6 +2791,25 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     return request.url.path, False
 
 
+@contextmanager
+def _no_split_from_default_group():
+    """torch splits every new group from a device-bound default group. A group
+    that spans processes outside the default world must not be split, or each
+    process silently ends up in a group of its own."""
+    from torch.distributed.distributed_c10d import _world
+
+    default_pg = _world.default_pg
+    bound_device_id = None if default_pg is None else default_pg.bound_device_id
+    if bound_device_id is None:
+        yield
+        return
+    default_pg.bound_device_id = None
+    try:
+        yield
+    finally:
+        default_pg.bound_device_id = bound_device_id
+
+
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -2848,17 +2867,18 @@ def init_custom_process_group(
     pg_options_param_name = (
         "backend_options" if torch_release >= (2, 6) else "pg_options"
     )
-    pg, _ = _new_process_group_helper(
-        world_size,
-        rank,
-        [],
-        backend,
-        store,
-        group_name=group_name,
-        **{pg_options_param_name: pg_options},
-        timeout=timeout,
-        device_id=device_id,
-    )
+    with _no_split_from_default_group():
+        pg, _ = _new_process_group_helper(
+            world_size,
+            rank,
+            [],
+            backend,
+            store,
+            group_name=group_name,
+            **{pg_options_param_name: pg_options},
+            timeout=timeout,
+            device_id=device_id,
+        )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 

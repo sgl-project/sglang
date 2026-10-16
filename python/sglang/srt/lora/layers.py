@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -630,17 +630,31 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor):
-        local_tp_rank = self.base_layer.tp_rank
-        partition_sizes = self.base_layer.output_partition_sizes
-        output_sizes = self.base_layer.output_sizes
         slices = []
         offset = 0
-        for full_size, part_size in zip(output_sizes, partition_sizes):
-            start_idx = local_tp_rank * part_size
-            end_idx = start_idx + part_size
-            slices.append(B[offset + start_idx : offset + end_idx, :])
+        for member, full_size in enumerate(self.base_layer.output_sizes):
+            slices.append(
+                self.slice_lora_b_member(member, B[offset : offset + full_size, :])
+            )
             offset += full_size
         return torch.concat(slices, dim=0)
+
+    def lora_b_member_full_rows(self) -> Tuple[int, ...]:
+        """Adapter-side lora_B rows of each member (partition), in slot order."""
+        return tuple(self.base_layer.output_sizes)
+
+    def lora_b_member_local_offsets(self) -> Tuple[int, ...]:
+        """Where each member's rows start in this rank's lora_B."""
+        offsets = [0]
+        for part_size in self.base_layer.output_partition_sizes[:-1]:
+            offsets.append(offsets[-1] + part_size)
+        return tuple(offsets)
+
+    def slice_lora_b_member(self, member: int, B: torch.Tensor) -> torch.Tensor:
+        """This rank's rows of one member's full lora_B."""
+        part_size = self.base_layer.output_partition_sizes[member]
+        start_idx = self.base_layer.tp_rank * part_size
+        return B[start_idx : start_idx + part_size, :]
 
 
 class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
@@ -654,31 +668,43 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
     """
 
     def slice_lora_b_weights(self, B: torch.Tensor):
-        bl = self.base_layer
-        tp_rank = bl.tp_rank
-        hd, nkv, nh, dr, tp = (
-            bl.inkling_head_dim,
-            bl.inkling_num_kv_heads,
-            bl.inkling_num_heads,
-            bl.inkling_d_rel,
-            bl.inkling_tp_size,
+        members = torch.split(B, self.lora_b_member_full_rows(), dim=0)
+        return torch.concat(
+            [
+                self.slice_lora_b_member(i, member_b)
+                for i, member_b in enumerate(members)
+            ],
+            dim=0,
         )
-        q_size, kv_size, r_size = hd * nh, hd * nkv, dr * nh
-        q_off, k_off, v_off, r_off = 0, q_size, q_size + kv_size, q_size + 2 * kv_size
-        q_per, r_per = q_size // tp, r_size // tp
-        q = B[q_off + tp_rank * q_per : q_off + (tp_rank + 1) * q_per, :]
-        r = B[r_off + tp_rank * r_per : r_off + (tp_rank + 1) * r_per, :]
-        if tp > nkv:
+
+    def lora_b_member_full_rows(self) -> Tuple[int, ...]:
+        bl = self.base_layer
+        q_size = bl.inkling_head_dim * bl.inkling_num_heads
+        kv_size = bl.inkling_head_dim * bl.inkling_num_kv_heads
+        return q_size, kv_size, kv_size, bl.inkling_d_rel * bl.inkling_num_heads
+
+    def _lora_b_member_local_rows(self) -> Tuple[int, ...]:
+        bl = self.base_layer
+        q_size, kv_size, _, r_size = self.lora_b_member_full_rows()
+        tp = bl.inkling_tp_size
+        kv_local = (
+            bl.inkling_head_dim if tp > bl.inkling_num_kv_heads else kv_size // tp
+        )
+        return q_size // tp, kv_local, kv_local, r_size // tp
+
+    def lora_b_member_local_offsets(self) -> Tuple[int, ...]:
+        q_local, kv_local, _, _ = self._lora_b_member_local_rows()
+        return 0, q_local, q_local + kv_local, q_local + 2 * kv_local
+
+    def slice_lora_b_member(self, member: int, B: torch.Tensor) -> torch.Tensor:
+        bl = self.base_layer
+        local_rows = self._lora_b_member_local_rows()[member]
+        if member in (1, 2) and bl.inkling_tp_size > bl.inkling_num_kv_heads:
             # Replicate: each rank takes the single kv-head it shares (mirrors #15).
-            replicas = tp // nkv
-            kv_idx = tp_rank // replicas
-            k = B[k_off + kv_idx * hd : k_off + (kv_idx + 1) * hd, :]
-            v = B[v_off + kv_idx * hd : v_off + (kv_idx + 1) * hd, :]
+            shard = bl.tp_rank // (bl.inkling_tp_size // bl.inkling_num_kv_heads)
         else:
-            kv_per = kv_size // tp
-            k = B[k_off + tp_rank * kv_per : k_off + (tp_rank + 1) * kv_per, :]
-            v = B[v_off + tp_rank * kv_per : v_off + (tp_rank + 1) * kv_per, :]
-        return torch.concat([q, k, v, r], dim=0)
+            shard = bl.tp_rank
+        return B[shard * local_rows : (shard + 1) * local_rows, :]
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -741,33 +767,36 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
-        base_layer = self.base_layer
-        q_proj_shard_size = base_layer.q_proj_shard_size
-        kv_proj_shard_size = base_layer.kv_proj_shard_size
-        num_kv_head_replicas = base_layer.num_kv_head_replicas
-        local_tp_rank = base_layer.tp_rank
-
-        q_start_idx = q_proj_shard_size * local_tp_rank
-        q_end_idx = q_start_idx + q_proj_shard_size
-
-        kv_shard_id = local_tp_rank // num_kv_head_replicas
-        kv_start_idx = kv_proj_shard_size * kv_shard_id
-        kv_end_idx = kv_start_idx + kv_proj_shard_size
-
-        q_size = base_layer.output_sizes[0]
-        k_size = base_layer.output_sizes[1] // num_kv_head_replicas
-        B_q_shard = B[q_start_idx:q_end_idx, :]
-        B_k_shard = B[q_size + kv_start_idx : q_size + kv_end_idx, :]
-        B_v_shard = B[q_size + k_size + kv_start_idx : q_size + k_size + kv_end_idx, :]
-
+        members = torch.split(B, self.lora_b_member_full_rows(), dim=0)
         return torch.concat(
-            (
-                B_q_shard,
-                B_k_shard,
-                B_v_shard,
-            ),
+            [
+                self.slice_lora_b_member(i, member_b)
+                for i, member_b in enumerate(members)
+            ],
             dim=0,
         )
+
+    def lora_b_member_full_rows(self) -> Tuple[int, ...]:
+        """Adapter-side q/k/v lora_B rows; output_sizes counts replicated kv heads."""
+        base_layer = self.base_layer
+        q_size = base_layer.output_sizes[0]
+        kv_size = base_layer.output_sizes[1] // base_layer.num_kv_head_replicas
+        return q_size, kv_size, kv_size
+
+    def lora_b_member_local_offsets(self) -> Tuple[int, ...]:
+        q_shard = self.base_layer.q_proj_shard_size
+        kv_shard = self.base_layer.kv_proj_shard_size
+        return 0, q_shard, q_shard + kv_shard
+
+    def slice_lora_b_member(self, member: int, B: torch.Tensor) -> torch.Tensor:
+        base_layer = self.base_layer
+        if member == 0:
+            shard_size = base_layer.q_proj_shard_size
+            shard = base_layer.tp_rank
+        else:
+            shard_size = base_layer.kv_proj_shard_size
+            shard = base_layer.tp_rank // base_layer.num_kv_head_replicas
+        return B[shard * shard_size : (shard + 1) * shard_size, :]
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
@@ -974,6 +1003,15 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor):
+        return B
+
+    def lora_b_member_full_rows(self) -> Tuple[int, ...]:
+        return self.first_output_dim, self.output_size - self.first_output_dim
+
+    def lora_b_member_local_offsets(self) -> Tuple[int, ...]:
+        return 0, self.first_output_dim
+
+    def slice_lora_b_member(self, member: int, B: torch.Tensor) -> torch.Tensor:
         return B
 
 
