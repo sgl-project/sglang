@@ -86,4 +86,22 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
             logger.info(f"Use flashinfer_mxfp4 as MoE runner backend for {model_arch}.")
+
+    # Without an interval the scheduler is free to keep issuing prefill batches
+    # for as long as any request has prompt left, and decode on the requests
+    # already running starves: at 256K x 8 per-request decode measures 1.38
+    # tok/s with the interval disabled against 32.05 with it set, at no cost in
+    # TTFT or aggregate throughput. Long-context prefill is what makes this
+    # model's prefill batch long enough to monopolise the step, so the default
+    # is scoped to the in-tree architectures rather than made global.
+    if (
+        cfg.prefill_decode_interval is None
+        and cfg.device == "cuda"
+        and not get_platform().is_hip
+    ):
+        overrides["prefill_decode_interval"] = 8
+        logger.info(
+            f"Setting prefill_decode_interval to 8 for {model_arch} so "
+            "long-context prefill does not starve decode."
+        )
     return overrides
