@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+    FP4RowgroupDecodeWorkspace,
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
     logits_rows_per_chunk,
@@ -443,6 +444,26 @@ def topk_transform_flashinfer_fused(
     )
 
 
+def topk_transform_paged_bf16(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """DeepSelect paged top-k of bf16 logits: pool slots only, unordered."""
+    from sglang.kernels.ops.attention.deep_select import topk_page_transform
+
+    topk_page_transform(
+        logits,
+        out_page_indices.shape[1],
+        page_table=page_table,
+        page_size=page_size,
+        end=seq_lens.reshape(-1).to(torch.int32),
+        output_idx=out_page_indices,
+    )
+
+
 def topk_transform_paged_from_metadata(
     logits: torch.Tensor,
     metadata,
@@ -464,6 +485,16 @@ def topk_transform_paged_from_metadata(
         page_table = metadata.page_table[rows]
         out_page_indices = page_indices[rows]
         out_raw_indices = raw_indices[rows] if raw_indices is not None else None
+    if logits.dtype == torch.bfloat16:
+        assert out_raw_indices is None
+        topk_transform_paged_bf16(
+            logits,
+            seq_lens,
+            page_table,
+            out_page_indices,
+            metadata.compressed_page_size,
+        )
+        return
     if metadata.use_topk_v2:
         topk_transform_paged_v2(
             logits,
@@ -988,6 +1019,14 @@ class C4IndexerBackendMixin:
         elif use_aiter_fp4:
             q_fp4, q_scale = q
             is_decode = forward_batch.forward_mode.is_decode()
+            if isinstance(
+                getattr(metadata, "fp4_decode_workspace", None),
+                FP4RowgroupDecodeWorkspace,
+            ) and (is_decode or forward_batch.forward_mode.is_target_verify()):
+                # The backend built a row-group workspace for this step: target-verify
+                # rows score like decode rows, one launch over the whole batch, a
+                # request's rows sharing each key load.
+                is_decode = True
             # Hoisted: these await this layer's KV transfer, which every chunk
             # would otherwise re-await.
             k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(

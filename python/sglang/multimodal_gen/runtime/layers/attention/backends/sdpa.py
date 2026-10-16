@@ -22,6 +22,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# Ordered by preference, which only takes effect with ``set_priority=True``;
+# without it this is the set PyTorch already picks from, so the flag was inert.
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
     SDPBackend.FLASH_ATTENTION,
@@ -30,6 +32,16 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 ]
 
 _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
+
+
+def torch_default_sdpa_backends():
+    """Context in which SDPA picks from every PyTorch backend, cuDNN included.
+
+    The CUDA platform disables cuDNN SDPA process-wide (diffusers#9704). Modules
+    whose reference outputs were produced with PyTorch's defaults opt back in
+    around their own ``scaled_dot_product_attention`` calls.
+    """
+    return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
 
 
 class SDPABackend(AttentionBackend):
@@ -175,6 +187,25 @@ class SDPAImpl(AttentionImpl):
             if cu_seqlens_host is not None
             else tuple(int(item) for item in cu_seqlens.tolist())
         )
+        lengths = {stop - start for start, stop in zip(bounds[:-1], bounds[1:])}
+        covers_query = bounds[0] == 0 and bounds[-1] == query.shape[0]
+        if (
+            type(self) is not SDPAImpl
+            and query.device.type != "mps"
+            and covers_query
+            and len(lengths) == 1
+            and 0 not in lengths
+        ):
+            # Subclasses (cuDNN SDPA) never take the native varlen op above, so
+            # equal segments (e.g. packed CFG pairs) run as one batch instead.
+            segments = len(bounds) - 1
+            output = self.forward(
+                query.reshape(segments, -1, *query.shape[1:]),
+                key.reshape(segments, -1, *key.shape[1:]),
+                value.reshape(segments, -1, *value.shape[1:]),
+                None,
+            )
+            return output.reshape(query.shape)
         output = torch.empty_like(query)
         for start, stop in zip(bounds[:-1], bounds[1:]):
             if start == stop:
