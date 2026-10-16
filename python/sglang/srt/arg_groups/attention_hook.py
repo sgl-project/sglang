@@ -182,7 +182,7 @@ def handle_attention_backend_compatibility(server_args: Any):
     # fallback stay below.
     run_post_process_pass(server_args, _mla_backend_page_constraints)
 
-    # The TRT-LLM / tokenspeed MLA kv-dtype validations moved to the
+    # The TRT-LLM MLA kv-dtype validations moved to the
     # resolution pipeline (arg_groups/overrides.py:
     # _mla_kv_cache_dtype_checks), invoked here at their legacy slot.
 

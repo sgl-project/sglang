@@ -109,7 +109,6 @@ default = true
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 instanttensor = ["instanttensor>=0.1.9"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
-tokenspeed = ["tokenspeed_mla==0.1.8"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",
@@ -190,7 +189,6 @@ test = [
   # and the mmlu thresholds of run_eval's other callers before changing it.
   "sgl-eval==0.1.2",
   "sglang[fastokens]",
-  "sglang[tokenspeed]",
   "tabulate",
 ]
 
@@ -200,7 +198,6 @@ all = [
   "sglang[diffusion]",
   "sglang[fastokens]",
   "sglang[http2]",
-  "sglang[tokenspeed]",
   "sglang[tracing]",
 ]
 

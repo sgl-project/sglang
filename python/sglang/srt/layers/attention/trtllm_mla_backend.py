@@ -1017,8 +1017,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             raise NotImplementedError(
                 "trtllm_mla cannot forward a global causal bound to its decode "
                 "kernel, which is required for DCP with q_len > 1 (speculative "
-                "target-verify / draft-extend); select cutedsl_mla or "
-                "tokenspeed_mla for a DCP speculative run"
+                "target-verify / draft-extend); select cutedsl_mla "
+                "for a DCP speculative run"
             )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:

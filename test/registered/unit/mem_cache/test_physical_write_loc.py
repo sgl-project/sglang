@@ -243,7 +243,6 @@ _UNIFIED_BACKEND_FILES = {
     "trtllm_mha": ("layers/attention/trtllm_mha_backend.py",),
     "trtllm_mla": ("layers/attention/trtllm_mla_backend.py",),
     "cutedsl_mla": ("layers/attention/cutedsl_mla_backend.py",),
-    "tokenspeed_mla": ("layers/attention/tokenspeed_mla_backend.py",),
     "flashmla": ("layers/attention/flashmla_backend.py",),
 }
 # Model code and the rest of the forward path also write KV directly.

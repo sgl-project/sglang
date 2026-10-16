@@ -207,7 +207,6 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request â
 - DCP is the only axis that shards the TP-replicated MLA KV; Low-Latency skips it.
 - Leave `--dcp-comm-backend` unset (fabric-resolved: `fi_a2a` on GB200/GB300, `a2a` on B200/B300).
 - No `--enable-symm-mem` under DCP (force-disabled for decode-graph correctness).
-- Explicit `tokenspeed_mla` force-rewrites `--kv-cache-dtype` to fp8; the default `cutedsl_mla` serves either dtype.
 - Calculator ratios run well above 1 here (`r > 1` is legal): `bfloat16` state buys admission, `fp8` KV buys context.
 - Don't use EP with an a2a backend: a2a buffers reclaim the KV that DCP buys. Compose only to measure. a2a backend is set when `--moe-a2a-backend` is set.
 

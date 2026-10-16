@@ -102,22 +102,11 @@ def create_trtllm_mla_backend(runner):
                 "trtllm_mla cannot serve decode context parallelism with speculative "
                 "decoding: it does not forward the cyclic DCP metadata to its decode "
                 "kernel and returns no rank-local LSE for the cross-rank merge. "
-                "Select cutedsl_mla or tokenspeed_mla."
+                "Select cutedsl_mla."
             )
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
     return TRTLLMMLABackend(runner)
-
-
-@register_attention_backend("tokenspeed_mla")
-def create_tokenspeed_mla_backend(runner):
-    if not runner.use_mla_backend:
-        raise ValueError("tokenspeed_mla backend can only be used with MLA models.")
-    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-        TokenspeedMLABackend,
-    )
-
-    return TokenspeedMLABackend(runner)
 
 
 @register_attention_backend("cutedsl_mla")
