@@ -264,6 +264,19 @@ class TestStep5VisionLanguageWeightUpdates(CustomTestCase):
 
         self.assertEqual(len(model.language_model.calls), 1)
 
+    def test_updates_load_the_vision_weights_they_carry(self):
+        """A VL RL weight sync sends the trained tower under its checkpoint names."""
+        model = _FakeStep5VL()
+        model.load_weights([*_checkpoint(), *_vision_checkpoint()])
+        model.language_model.calls.clear()
+        projector = torch.full((2,), 3.0, dtype=torch.bfloat16)
+
+        model.load_weights([("vit_large_projector.weight", projector)])
+
+        ((param, weight, _, _),) = model.language_model.calls
+        self.assertIs(param, model.vision["vit_large_projector.weight"])
+        self.assertIs(weight, projector)
+
 
 class TestStep5Bf16ExpertRunner(CustomTestCase):
     def test_blackwell_uses_trtllm_only_with_the_swiglu_step_patch(self):
