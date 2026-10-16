@@ -131,7 +131,12 @@ class DeepseekMLAForwardMixin:
         return (
             mode.is_decode()
             or mode.is_target_verify()
-            or (self.use_dsa and mode.is_extend(include_draft_extend_v2=True))
+            or (
+                self.use_dsa
+                and mode.is_extend(include_draft_extend_v2=True)
+                # The DSA backend planned a gathered prefix: attend local heads.
+                and forward_batch.attn_dcp_metadata is None
+            )
         )
 
     def is_dcp_q_replicate_phase(
