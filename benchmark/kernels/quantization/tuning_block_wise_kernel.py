@@ -29,6 +29,7 @@ mp.set_start_method("spawn", force=True)
 
 from sglang.benchmark.deepseek_utils import get_weight_shapes
 from sglang.kernels.ops.gemm.fp8_kernel import (
+    _validate_w8a8_block_fp8_config,
     _w8a8_block_fp8_matmul,
     _w8a8_block_fp8_matmul_unrolledx4,
 )
@@ -92,8 +93,6 @@ def w8a8_block_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
-
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -113,8 +112,10 @@ def w8a8_block_matmul(
             if (_is_hip == True and num_workgroups <= get_device_core_count())
             else _w8a8_block_fp8_matmul
         )
+        if kernel is _w8a8_block_fp8_matmul:
+            _validate_w8a8_block_fp8_config(block_k, config)
         # set masking flag required by kernel arguments
-        extra_kernel_args["needs_masking"] = needs_masking
+        extra_kernel_args["needs_masking"] = bool(K % config["BLOCK_SIZE_K"] != 0)
     else:
         kernel = _w8a8_block_int8_matmul
 
