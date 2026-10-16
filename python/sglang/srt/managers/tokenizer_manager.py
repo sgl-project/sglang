@@ -42,6 +42,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -63,7 +64,15 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_size_to_dp_size,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.joint_schema_head import (
+    max_joint_prompt_tokens,
+    parse_decision_layout,
+)
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -99,13 +108,15 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
     async_sock_send,
-    build_flat_input_top_logprobs_arrays,
+    build_flat_top_logprobs_arrays,
+    flat_top_logprobs_layout,
     sock_send,
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -155,6 +166,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.watermarking.core import (
+    redact_watermark_command_line,
+    redact_watermark_secrets,
+    resolve_watermark_request,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -190,6 +206,21 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_watermark_request(sampling_params: SamplingParams) -> None:
+    watermark = sampling_params.watermark
+    features = get_exec().features
+    _, _, enabled = resolve_watermark_request(
+        watermark,
+        server_enabled=features.enable_watermark,
+        default_key=features.watermark_key,
+        default_context_window=features.watermark_context_window,
+        default_enabled=features.watermark_default_enabled,
+        enforce_all=features.watermark_enforce_all,
+    )
+    if enabled and (sampling_params.beam_width or 1) > 1:
+        raise ValueError("beam search is not supported with watermarking")
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -320,6 +351,9 @@ class ReqState:
     customized_info_accumulated: Dict[str, List[Any]] = dataclasses.field(
         default_factory=dict
     )
+    # Accumulated keys written to meta_info. Cumulative streams re-report only
+    # these, so a subclass can accumulate values it keeps out of responses.
+    customized_info_reported_keys: Set[str] = dataclasses.field(default_factory=set)
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
@@ -338,67 +372,70 @@ def _slice_streaming_output_meta_info(
         meta_info[key] = meta_info[key][last_output_offset:]
 
 
-def _build_flat_input_top_logprobs_fields(
-    input_top_logprobs_val: List[Optional[List[float]]],
-    input_top_logprobs_idx: List[Optional[List[int]]],
+def _build_flat_top_logprobs_fields(
+    side: str,
+    top_logprobs_val: List[Optional[List[float]]],
+    top_logprobs_idx: List[Optional[List[int]]],
     top_logprobs_num: int,
     return_b64: bool = False,
 ) -> Dict[str, Any]:
-    """Build the flat raw prompt top logprob response fields.
+    """Build the flat raw top logprob response fields under `{side}_top_logprobs_*`
+    keys, where side is "input" (prompt) or "output".
 
-    `input_top_logprobs_shape` is the literal [rows, k] shape of the flat
+    `{side}_top_logprobs_shape` is the literal [rows, k] shape of the flat
     arrays. The leading null positions (counted by
-    `input_top_logprobs_null_prefix`) precede the arrays, so covered position
+    `{side}_top_logprobs_null_prefix`) precede the arrays, so covered position
     i, entry j lives at flat[(i - null_prefix) * k + j] and the covered range
     spans null_prefix + rows positions. With ``return_b64``, the arrays are
     base64 contiguous little-endian binary; the dtype marker fields let the
     widths change later without a wire break.
     """
-    val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
-        input_top_logprobs_val, input_top_logprobs_idx, top_logprobs_num
-    )
     if return_b64:
-        return _build_flat_input_top_logprobs_fields_from_arrays(
-            val_arr, idx_arr, null_prefix, return_b64=True
+        val_arr, idx_arr, null_prefix = build_flat_top_logprobs_arrays(
+            top_logprobs_val, top_logprobs_idx, top_logprobs_num
         )
+        return _build_flat_top_logprobs_fields_from_arrays(
+            side, val_arr, idx_arr, null_prefix, return_b64=True
+        )
+    null_prefix, k = flat_top_logprobs_layout(top_logprobs_val, top_logprobs_num)
     # Flatten the original python rows so the JSON numbers keep their full
-    # (float64) precision, matching the pre-scheduler-flat output.
+    # (float64) precision.
     return {
-        "input_top_logprobs_val_flat": [
-            v for row in input_top_logprobs_val[null_prefix:] for v in row
+        f"{side}_top_logprobs_val_flat": [
+            v for row in top_logprobs_val[null_prefix:] for v in row
         ],
-        "input_top_logprobs_idx_flat": [
-            i for row in input_top_logprobs_idx[null_prefix:] for i in row
+        f"{side}_top_logprobs_idx_flat": [
+            i for row in top_logprobs_idx[null_prefix:] for i in row
         ],
-        "input_top_logprobs_shape": [val_arr.shape[0], val_arr.shape[1]],
-        "input_top_logprobs_null_prefix": null_prefix,
+        f"{side}_top_logprobs_shape": [len(top_logprobs_val) - null_prefix, k],
+        f"{side}_top_logprobs_null_prefix": null_prefix,
     }
 
 
-def _build_flat_input_top_logprobs_fields_from_arrays(
+def _build_flat_top_logprobs_fields_from_arrays(
+    side: str,
     val_arr: np.ndarray,
     idx_arr: np.ndarray,
     null_prefix: int,
     return_b64: bool = False,
 ) -> Dict[str, Any]:
-    """Build the flat response fields from scheduler-assembled [rows, k]
-    arrays (see `_build_flat_input_top_logprobs_fields` for the field
-    semantics)."""
+    """Build the flat response fields from [rows, k] arrays (see
+    `_build_flat_top_logprobs_fields` for the field semantics)."""
     fields: Dict[str, Any] = {}
     if return_b64:
-        fields["input_top_logprobs_val_flat_b64"] = pybase64.b64encode(
+        fields[f"{side}_top_logprobs_val_flat_b64"] = pybase64.b64encode(
             val_arr.tobytes()
         ).decode("utf-8")
-        fields["input_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
+        fields[f"{side}_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
             idx_arr.tobytes()
         ).decode("utf-8")
-        fields["input_top_logprobs_val_flat_b64_dtype"] = "float32"
-        fields["input_top_logprobs_idx_flat_b64_dtype"] = "int32"
+        fields[f"{side}_top_logprobs_val_flat_b64_dtype"] = "float32"
+        fields[f"{side}_top_logprobs_idx_flat_b64_dtype"] = "int32"
     else:
-        fields["input_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
-        fields["input_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
-    fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
-    fields["input_top_logprobs_null_prefix"] = null_prefix
+        fields[f"{side}_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
+        fields[f"{side}_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
+    fields[f"{side}_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
+    fields[f"{side}_top_logprobs_null_prefix"] = null_prefix
     return fields
 
 
@@ -419,6 +456,9 @@ _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
+
+    tokenized_generate_req_type = TokenizedGenerateReqInput
+    batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
 
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
@@ -491,7 +531,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
-        self.elastic_worker_count = get_parallel().num_dp_ranks
+        parallel = get_parallel()
+        self.elastic_worker_count = parallel.num_dp_ranks
+        self.attn_replica_size = attn_replica_size()
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -534,6 +576,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        # Init the CUDA IPC transport for GPU-resident embedding overrides
+        self.init_positional_embeds_transport()
 
         # Construct this last so later initialization failures cannot orphan
         # the transport's recycler thread.
@@ -833,6 +878,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.enable_metrics:
             self.metrics_collector.emit_startup_time(startup_time)
 
+    def init_positional_embeds_transport(self):
+        self.positional_embeds_transport = PositionalEmbedsTransport(
+            self.server_args.base_gpu_id, self.mm_processor
+        )
+
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -987,7 +1037,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         Tuple[List[int], Optional[List[int]]],
         Tuple[List[List[int]], Optional[List[List[int]]]],
     ]:
-        if not texts or self.tokenizer is None:
+        if (
+            texts is None
+            or (isinstance(texts, list) and len(texts) == 0)
+            or self.tokenizer is None
+        ):
             raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
         # Step 1: Detect input format and prepare for tokenization
@@ -1291,6 +1345,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "encoder SWA replay cannot return cached prompt logprobs"
                 )
+        # A decision layout indexes the whole prompt, so it is checked before any
+        # truncation below could cut the prompt.
+        self._validate_joint_schema_request(obj, input_ids)
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
@@ -1395,6 +1452,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "return_sampling_mask=true."
                 )
 
+    def _validate_joint_schema_request(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+    ) -> None:
+        """A Clef checkpoint scores the spans of a decision layout, and nothing else."""
+        if self.model_config.joint_head_config is None:
+            return
+        if isinstance(obj, GenerateReqInput) or obj.decision_layout is None:
+            # Health checks only need a response, which is an empty embedding.
+            if (
+                isinstance(obj, EmbeddingReqInput)
+                and isinstance(obj.rid, str)
+                and obj.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+            ):
+                return
+            raise ValueError(
+                "This checkpoint answers schema decisions, send them to /v1/systemone"
+            )
+        limit = max_joint_prompt_tokens(
+            context_len=self.context_len,
+            num_reserved_tokens=self.num_reserved_tokens,
+            max_req_input_len=self.max_req_input_len,
+            max_prefill_tokens=get_schedule().max_prefill_tokens,
+        )
+        if len(input_ids) > limit:
+            raise ValueError(
+                f"The prompt has {len(input_ids)} tokens, but this server scores "
+                f"at most {limit} in one prefill"
+            )
+        parse_decision_layout(obj.decision_layout, len(input_ids))
+
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
@@ -1477,7 +1564,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.preferred_sampling_params:
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
-            sampling_kwargs = obj.sampling_params
+            sampling_kwargs = dict(obj.sampling_params)
+        if isinstance(obj, GenerateReqInput) and obj.watermark is not None:
+            if sampling_kwargs.get("watermark") is not None:
+                raise ValueError(
+                    "watermark must be provided either at the request top level or "
+                    "inside sampling_params, not both"
+                )
+            sampling_kwargs["watermark"] = obj.watermark
         if isinstance(obj, GenerateReqInput) and obj.max_thinking_tokens is not None:
             sampling_kwargs = dict(sampling_kwargs)
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
@@ -1486,6 +1580,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        _validate_watermark_request(sampling_params)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -1501,7 +1596,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
-            tokenized_obj = TokenizedGenerateReqInput(
+            tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
@@ -1520,6 +1615,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
+                lora_name=obj.lora_path,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
@@ -1567,10 +1663,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
+                lora_name=obj.lora_path,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
+                decision_layout=obj.decision_layout,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
@@ -1688,12 +1786,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         prepared_mm_items = []
+        prepared_embeds = []
         dispatched = False
         try:
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
                     (tokenized_obj.mm_inputs,)
                 )
+            )
+            prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
+                (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
@@ -1710,6 +1812,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+                self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -1729,12 +1832,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
         prepared_mm_items = []
+        prepared_embeds = []
         dispatched = False
         try:
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
+            )
+            prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
+                tokenized_objs
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
@@ -1743,7 +1850,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-                batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+                batch_req = self.batch_tokenized_generate_req_type(batch=tokenized_objs)
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
@@ -1757,6 +1864,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+                self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
 
     def _coalesce_streaming_chunks(
         self,
@@ -1898,6 +2006,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             else:
                 out = out_list[-1]
+                if (
+                    is_stream
+                    and not incremental_stream
+                    and state.customized_info_reported_keys
+                ):
+                    meta_info = out.get("meta_info")
+                    if meta_info is not None:
+                        for key, values in state.customized_info_accumulated.items():
+                            if key in state.customized_info_reported_keys:
+                                meta_info.setdefault(key, list(values))
 
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
@@ -2240,10 +2358,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return self.resolved_config_dict(self.server_args.resolved_dict())
+            return redact_watermark_secrets(
+                self.resolved_config_dict(self.server_args.resolved_dict())
+            )
         except Exception as e:
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
             return None
+
+    def _server_args_for_dump(self) -> Union[ServerArgs, Dict[str, Any]]:
+        if not get_exec().features.enable_watermark:
+            return self.server_args
+        return redact_watermark_secrets(self.server_args.resolved_dict())
 
     def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
         """``base`` (a serialized ``ServerArgs``) with the control-plane changes on top."""
@@ -2415,6 +2540,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state.obj.return_text_in_logprobs and not self.skip_tokenizer_init,
                     recv_obj,
                     i,
+                    finished=recv_obj.finished_reasons[i] is not None,
                 )
             if (
                 isinstance(state.obj, GenerateReqInput)
@@ -2706,6 +2832,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         accumulated = state.customized_info_accumulated.setdefault(key, [])
         accumulated.extend(values)
         meta_info[key] = accumulated
+        state.customized_info_reported_keys.add(key)
 
     def update_request_meta_info(
         self,
@@ -2731,6 +2858,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         top_logprobs_num: int,
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
+        finished: bool,
     ):
         # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
@@ -2768,7 +2896,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.input_top_logprobs_scheduler_flat
                     )
                     state.input_top_logprobs_flat_fields = (
-                        _build_flat_input_top_logprobs_fields_from_arrays(
+                        _build_flat_top_logprobs_fields_from_arrays(
+                            "input",
                             val_arr,
                             idx_arr,
                             null_prefix,
@@ -2783,7 +2912,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ):
                     try:
                         state.input_top_logprobs_flat_fields = (
-                            _build_flat_input_top_logprobs_fields(
+                            _build_flat_top_logprobs_fields(
+                                "input",
                                 state.input_top_logprobs_val,
                                 state.input_top_logprobs_idx,
                                 top_logprobs_num,
@@ -2820,15 +2950,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
-            if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
-                state.output_top_logprobs.extend(
-                    self.detokenize_top_logprobs_tokens(
-                        state.output_top_logprobs_val[len(state.output_top_logprobs) :],
-                        state.output_top_logprobs_idx[len(state.output_top_logprobs) :],
-                        return_text_in_logprobs,
+            use_flat_output = state.obj.return_flat_raw_output_top_logprobs
+            # Built once on the finished response; streaming is rejected and
+            # only that response reaches a non-streaming client.
+            if use_flat_output and finished:
+                try:
+                    meta_info.update(
+                        _build_flat_top_logprobs_fields(
+                            "output",
+                            state.output_top_logprobs_val,
+                            state.output_top_logprobs_idx,
+                            top_logprobs_num,
+                            return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                        )
                     )
-                )
-            meta_info["output_top_logprobs"] = state.output_top_logprobs
+                except ValueError as e:
+                    use_flat_output = False
+                    logger.error(
+                        "Falling back to nested output top logprobs for rid=%s: %s",
+                        meta_info.get("id"),
+                        e,
+                    )
+            if not use_flat_output:
+                if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
+                    state.output_top_logprobs.extend(
+                        self.detokenize_top_logprobs_tokens(
+                            state.output_top_logprobs_val[
+                                len(state.output_top_logprobs) :
+                            ],
+                            state.output_top_logprobs_idx[
+                                len(state.output_top_logprobs) :
+                            ],
+                            return_text_in_logprobs,
+                        )
+                    )
+                meta_info["output_top_logprobs"] = state.output_top_logprobs
 
         # 3. Handle token_ids_logprob
         if token_ids_logprob is not None:
@@ -2873,6 +3029,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return_text_in_logprobs: bool,
         recv_obj: BatchStrOutput,
         recv_obj_index: int,
+        finished: bool,
     ):
         if (
             recv_obj.input_token_logprobs_val is not None
@@ -2949,6 +3106,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.obj.top_logprobs_num,
             state.obj.token_ids_logprob,
             return_text_in_logprobs,
+            finished=finished,
         )
 
     def detokenize_logprob_tokens(
@@ -3217,10 +3375,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         logger.info(log_message)
         to_dump_with_server_args = {
-            "server_args": self.server_args,
-            "config_updates": get_context().overrides_log(),
+            "server_args": self._server_args_for_dump(),
+            "config_updates": redact_watermark_secrets(get_context().overrides_log()),
             "resolved_config": self._dump_config_snapshot(),
-            "requests": data_list.copy(),
+            "requests": redact_watermark_secrets(data_list.copy()),
         }
 
         def background_task():
@@ -3302,11 +3460,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Write the data to the file
                 data_to_dump_with_server_args = {
-                    "server_args": self.server_args,
-                    "config_updates": get_context().overrides_log(),
+                    "server_args": self._server_args_for_dump(),
+                    "config_updates": redact_watermark_secrets(
+                        get_context().overrides_log()
+                    ),
                     "resolved_config": self._dump_config_snapshot(),
-                    "requests": data_to_dump,
-                    "launch_command": " ".join(sys.argv),
+                    "requests": redact_watermark_secrets(data_to_dump),
+                    "launch_command": redact_watermark_command_line(
+                        sys.argv, self.server_args.watermark_config
+                    ),
                 }
                 with open(filename, "wb") as f:
                     try:
@@ -3473,6 +3635,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.obj.token_ids_logprob,
                 state.obj.return_text_in_logprobs
                 and not get_serving().skip_tokenizer_init,
+                finished=True,
             )
 
         output_ids = state.output_ids
@@ -3504,16 +3667,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
 
         self._dispatch_to_scheduler(msg)
-        self.elastic_worker_count = msg.effective_ep_size
+        self.elastic_worker_count = physical_ep_size_to_dp_size(
+            msg.effective_ep_size, self.attn_replica_size
+        )
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "serving_expanded"
         self.elastic_last_error = None
-        self.update_control_communicator_fan_out(msg.effective_ep_size)
+        self.update_control_communicator_fan_out(self.elastic_worker_count)
 
     def get_elastic_ep_state(self):
         return {
             "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
-            "effective_ep_size": self.elastic_worker_count,
+            "effective_ep_size": self.elastic_worker_count * self.attn_replica_size,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
@@ -3530,7 +3695,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "A previous scale operation has not completed yet. Wait until "
                     "all pending ranks have joined before issuing another scale."
                 ),
-                old_ep_size=self.elastic_worker_count,
+                old_ep_size=self.elastic_worker_count * self.attn_replica_size,
                 new_ep_size=obj.new_ep_size,
                 pending_ep_size=self.elastic_pending_ep_size,
                 scale_phase=self.elastic_scale_phase,
@@ -3679,15 +3844,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        rids = set()
+        for rid, _, _ in items:
+            if rid in self.rid_to_state or rid in rids:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            rids.add(rid)
+
+        new_states = {}
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-            self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            new_states[rid] = state
+
+        self.rid_to_state.update(new_states)
 
     def _release_req_states_on_failure(self, request_states: Dict[str, ReqState]):
         """Release rid_to_state entries created for a failed handler.
@@ -3853,13 +4025,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return span_attrs
 
     def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
-        """Set the default priority value."""
+        """Set the default priority and validate the signed 64-bit range."""
         if (
             self.enable_priority_scheduling
             and obj.priority is None
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+        if obj.priority is not None and not -(1 << 63) <= obj.priority < (1 << 63):
+            raise ValueError(
+                "priority must be a signed 64-bit integer "
+                "between -9223372036854775808 and 9223372036854775807"
+            )
 
 
 class ServerStatus(Enum):

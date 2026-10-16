@@ -47,6 +47,9 @@ pub use vet::{VetError, VettedSnapshot};
 
 /// Wire-format version. Bump on any incompatible change to [`PeerSnapshot`].
 pub const SNAPSHOT_FORMAT: u32 = 1;
+/// LoRA aliases are required to interpret removals; older replicas must refuse these snapshots.
+pub const LORA_SNAPSHOT_FORMAT: u32 = 2;
+pub const LORA_MAPPINGS_PARAM: &str = "include_lora";
 
 /// Path the producer serves snapshots on.
 pub const SNAPSHOT_PATH: &str = "/internal/kv_snapshot";
@@ -136,6 +139,14 @@ pub enum SnapshotOutcome {
 }
 
 impl SnapshotOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 4] = [
+        Self::Accepted,
+        Self::Unreachable,
+        Self::ColdPeer,
+        Self::Rejected,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
@@ -164,6 +175,15 @@ pub enum SweepOutcome {
 }
 
 impl SweepOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 5] = [
+        Self::Found,
+        Self::NoPeers,
+        Self::FleetCold,
+        Self::TimedOut,
+        Self::RanksResolved,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Found => "found",
@@ -204,6 +224,19 @@ pub enum RankOutcome {
 }
 
 impl RankOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 9] = [
+        Self::Warm,
+        Self::Gap,
+        Self::WarmUnwitnessed,
+        Self::Uncovered,
+        Self::Abandoned,
+        Self::Overflow,
+        Self::PublisherReset,
+        Self::TreeRejected,
+        Self::FromOrigin,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Warm => "warm",
@@ -260,6 +293,9 @@ pub struct PeerSnapshot {
     pub cursors: Vec<(u32, i64)>,
     /// Tree nodes in dependency order; see [`SnapshotNode`].
     pub nodes: Vec<SnapshotNode>,
+    /// Per-worker opaque LoRA IDs needed to apply subsequent removals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lora_blocks: Vec<(u32, Vec<sgl_kv_indexer::lora::LoraBlock>)>,
     /// Ranks the producer is subscribed to but held no tree node for at export
     /// time: ranks it is still bootstrapping itself (their batches are held,
     /// not applied), and ranks whose applied stream left nothing standing.
@@ -331,6 +367,8 @@ mod test_support {
 
     pub(super) fn sample_snapshot() -> PeerSnapshot {
         PeerSnapshot {
+            lora_blocks: Vec::new(),
+
             format: SNAPSHOT_FORMAT,
             block_size: 64,
             is_bigram: true,
@@ -376,6 +414,8 @@ mod tests {
     #[test]
     fn wire_cursor_is_addressed_by_identity_not_table_position() {
         let snap = PeerSnapshot {
+            lora_blocks: Vec::new(),
+
             format: SNAPSHOT_FORMAT,
             block_size: 4,
             is_bigram: false,
@@ -470,6 +510,26 @@ mod tests {
             snap.wire_cursor_for("http://a:30000", 1),
             None,
             "a listed worker with no cursor entry is not a witness",
+        );
+    }
+
+    /// Connect and read cut a dead or stalled peer loose well inside the total
+    /// cap, which is what lets the cap be generous enough for a large healthy
+    /// snapshot.
+    #[test]
+    fn fetch_bounds_separate_hung_from_big() {
+        assert!(
+            SNAPSHOT_FETCH_CONNECT_TIMEOUT < DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "connect must cut a dead peer long before the total bound",
+        );
+        assert!(
+            SNAPSHOT_FETCH_READ_TIMEOUT < DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "an idle bound above the total can never fire, leaving the total as \
+             the hang detector again",
+        );
+        assert!(
+            DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP >= Duration::from_secs(90),
+            "a cap this side of ~90s cannot seed a warm fleet",
         );
     }
 }

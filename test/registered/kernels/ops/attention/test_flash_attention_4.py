@@ -5,6 +5,7 @@
 import itertools
 import math
 import sys
+import unittest
 
 import pytest
 import torch
@@ -15,14 +16,67 @@ from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+from sglang.kernels.ops.attention.flash_attention_v4 import (
+    flash_attn_with_kvcache as flash_attn_with_kvcache_v4,
+)
+from sglang.kernels.ops.attention.flash_attention_v4 import (
+    make_image_mask_mod,
+)
+from sglang.kernels.ops.attention.flash_attn.cute import (
+    clear_shear_bias_workspace,
+)
+from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+    _shear_bias_empty,
+    _shear_bias_workspace,
+)
 from sglang.srt.utils import is_sm100_or_sm110_supported
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=300, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-# Skip this test on Hopper machine
+# Existing tests below target SM100+; the SM90 regression class has its own guard.
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
+
+
+def test_shear_bias_workspace_is_stream_local_and_clearable():
+    clear_shear_bias_workspace()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    shape = (4096,)
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    with torch.cuda.stream(stream_a):
+        workspace_a = _shear_bias_empty(shape, torch.uint8, device)
+        workspace_a_reused = _shear_bias_empty((shape[0] // 2,), torch.uint8, device)
+    with torch.cuda.stream(stream_b):
+        workspace_b = _shear_bias_empty(shape, torch.uint8, device)
+
+    assert workspace_a.data_ptr() == workspace_a_reused.data_ptr()
+    assert workspace_a.data_ptr() != workspace_b.data_ptr()
+    assert len(_shear_bias_workspace) == 2
+
+    # Force B's write between A's write and read. A device-only cache aliases
+    # the two workspaces and deterministically changes observed_a to all twos.
+    a_ready = torch.cuda.Event()
+    b_done = torch.cuda.Event()
+    observed_a = torch.empty_like(workspace_a)
+    with torch.cuda.stream(stream_a):
+        workspace_a.fill_(1)
+        a_ready.record()
+    with torch.cuda.stream(stream_b):
+        stream_b.wait_event(a_ready)
+        workspace_b.fill_(2)
+        b_done.record()
+    with torch.cuda.stream(stream_a):
+        stream_a.wait_event(b_done)
+        observed_a.copy_(workspace_a)
+    torch.cuda.synchronize()
+
+    assert torch.all(observed_a == 1)
+    clear_shear_bias_workspace()
+    assert not _shear_bias_workspace
 
 
 def apply_rotary_emb(
@@ -1793,6 +1847,175 @@ def test_flash_attn_hd256_noncontiguous_inputs(strided_input):
     )
     assert torch.equal(out, out_dense)
     assert torch.equal(lse, lse_dense)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9,
+    "Requires Hopper",
+)
+class TestFlashAttention4SM90(CustomTestCase):
+    def test_paged_attention(self):
+        cases = (
+            (1, 1, 0, True),
+            (64, 1, 1, True),
+            (128, 17, 1, True),
+            (128, 1, 3, True),
+            (64, 3, 3, False),
+        )
+        for (dim, kv_heads, window), (
+            page_size,
+            q_len,
+            splits,
+            pack,
+        ) in itertools.product(((256, 16, (1023, 0)), (512, 4, (-1, -1))), cases):
+            with self.subTest(
+                dim=dim, page=page_size, q_len=q_len, splits=splits, pack=pack
+            ):
+                torch.manual_seed(42)
+                lengths = (max(q_len, 7), 1103)
+                pages_per_seq = (max(lengths) + page_size - 1) // page_size
+                table = (
+                    torch.randperm(2 * pages_per_seq, device="cuda")
+                    .reshape(2, -1)
+                    .int()
+                )
+                q = (
+                    torch.randn(2 * q_len, 32, dim, device="cuda", dtype=torch.bfloat16)
+                    * 0.3
+                )
+                k = (
+                    torch.randn(
+                        2 * pages_per_seq,
+                        page_size,
+                        kv_heads,
+                        dim,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    * 0.3
+                )
+                v = torch.randn_like(k)
+                out = flash_attn_with_kvcache_v4(
+                    q,
+                    k,
+                    v,
+                    page_table=table,
+                    cache_seqlens=torch.tensor(
+                        lengths, device="cuda", dtype=torch.int32
+                    ),
+                    cu_seqlens_q=torch.tensor(
+                        [0, q_len, 2 * q_len], device="cuda", dtype=torch.int32
+                    ),
+                    max_seqlen_q=q_len,
+                    softmax_scale=1.0,
+                    causal=True,
+                    window_size=window,
+                    num_splits=splits,
+                    pack_gqa=pack,
+                )
+                refs = []
+                for batch, length in enumerate(lengths):
+                    kb = k[table[batch].long()].reshape(-1, kv_heads, dim)[:length]
+                    vb = v[table[batch].long()].reshape(-1, kv_heads, dim)[:length]
+                    kb = kb.repeat_interleave(32 // kv_heads, dim=1).float()
+                    vb = vb.repeat_interleave(32 // kv_heads, dim=1).float()
+                    qb = q[batch * q_len : (batch + 1) * q_len].float()
+                    scores = torch.einsum("qhd,khd->hqk", qb, kb)
+                    pos = torch.arange(q_len, device="cuda") + length - q_len
+                    keys = torch.arange(length, device="cuda")
+                    mask = keys[None, :] <= pos[:, None]
+                    if window[0] >= 0:
+                        mask &= keys[None, :] >= pos[:, None] - window[0]
+                    scores.masked_fill_(~mask[None, :, :], -torch.inf)
+                    refs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), vb))
+                torch.testing.assert_close(
+                    out.float(), torch.cat(refs), atol=0.01, rtol=0.01
+                )
+
+    def test_image_mask(self):
+        """Future tokens are visible only within one image, also after a prefix.
+
+        A second text-only request guards batch leakage. A long first image
+        crosses the left-window boundary, and uneven query lengths exercise
+        padded tiles and packed GQA. Dropping mask_mod must fail this test.
+        """
+        for dim, kv_heads, window in ((256, 16, 31), (512, 4, -1)):
+            for splits, pack in ((1, True), (3, False)):
+                with self.subTest(dim=dim, splits=splits, pack=pack):
+                    torch.manual_seed(123)
+                    lengths, qlens = (1137, 19), (81, 19)
+                    page_size = 64
+                    table = torch.randperm(36, device="cuda").reshape(2, 18).int()
+                    q = (
+                        torch.randn(100, 32, dim, device="cuda", dtype=torch.bfloat16)
+                        * 0.3
+                    )
+                    k = (
+                        torch.randn(
+                            36,
+                            page_size,
+                            kv_heads,
+                            dim,
+                            device="cuda",
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.3
+                    )
+                    v = torch.randn_like(k)
+                    cu_q = torch.tensor([0, 81, 100], device="cuda", dtype=torch.int32)
+                    ranges = torch.full((100, 2), -1, device="cuda", dtype=torch.int32)
+                    prefix = lengths[0] - qlens[0]
+                    images = ((prefix + 3, prefix + 47), (prefix + 55, prefix + 73))
+                    for begin, end in images:
+                        ranges[begin - prefix : end + 1 - prefix] = torch.tensor(
+                            [begin, end], device="cuda"
+                        )
+                    out = flash_attn_with_kvcache(
+                        q,
+                        k,
+                        v,
+                        page_table=table,
+                        cache_seqlens=torch.tensor(
+                            lengths, device="cuda", dtype=torch.int32
+                        ),
+                        cu_seqlens_q=cu_q,
+                        max_seqlen_q=81,
+                        softmax_scale=1.0,
+                        causal=False,
+                        num_splits=splits,
+                        pack_gqa=pack,
+                        mask_mod=make_image_mask_mod(window),
+                        aux_tensors=[ranges, cu_q],
+                        ver=4,
+                    )
+                    refs = []
+                    offset = 0
+                    for batch, (length, qlen) in enumerate(zip(lengths, qlens)):
+                        kb = k[table[batch].long()].reshape(-1, kv_heads, dim)[:length]
+                        vb = v[table[batch].long()].reshape(-1, kv_heads, dim)[:length]
+                        kb = kb.repeat_interleave(32 // kv_heads, dim=1).float()
+                        vb = vb.repeat_interleave(32 // kv_heads, dim=1).float()
+                        scores = torch.einsum(
+                            "qhd,khd->hqk", q[offset : offset + qlen].float(), kb
+                        )
+                        pos = torch.arange(qlen, device="cuda") + length - qlen
+                        keys = torch.arange(length, device="cuda")
+                        mask = keys[None, :] <= pos[:, None]
+                        if batch == 0:
+                            for begin, end in images:
+                                mask[(pos >= begin) & (pos <= end), begin : end + 1] = (
+                                    True
+                                )
+                        if window >= 0:
+                            mask &= keys[None, :] >= pos[:, None] - window
+                        scores.masked_fill_(~mask[None], -torch.inf)
+                        refs.append(
+                            torch.einsum("hqk,khd->qhd", scores.softmax(-1), vb)
+                        )
+                        offset += qlen
+                    torch.testing.assert_close(
+                        out.float(), torch.cat(refs), atol=0.01, rtol=0.01
+                    )
 
 
 if __name__ == "__main__":

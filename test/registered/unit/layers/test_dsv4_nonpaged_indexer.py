@@ -904,6 +904,61 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
 
 
+class TestDeepSelectFullTopKDecode(CustomTestCase):
+    @staticmethod
+    def _decode_case():
+        from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DecodeScores
+
+        scores = torch.tensor(
+            [[1.0, 4.0, 2.0, 3.0], [3.0, 2.0, -torch.inf, -torch.inf]],
+            dtype=torch.float32,
+        )
+        lens = torch.tensor([4, 2], dtype=torch.int64)
+        slots = torch.tensor([[40, 10, 30, 20], [80, 70, 0, 0]], dtype=torch.int64)
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[10], [20]], dtype=torch.int32),
+            compressed_page_size=4,
+        )
+        page_indices = torch.full((2, 8), -1, dtype=torch.int32)
+        inputs = DecodeInputs(
+            indexer=SimpleNamespace(index_topk=8),
+            layer_id=0,
+            compress_ratio=1,
+            freqs_cis=None,
+            x=None,
+            q_lora=None,
+            positions=None,
+            req_rows=torch.arange(2),
+            paged_metadata=metadata,
+            is_verify=False,
+            out_page_indices=page_indices,
+        )
+        data = DecodeScores(bs=2, lmax=4, lens=lens, slots=slots, scores=scores)
+        return inputs, data
+
+    def test_decode_uses_select_decode_fallback(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
+
+        inputs, data = self._decode_case()
+        inputs.indexer.index_topk = 2
+        indexer = object.__new__(mod.FullTopKIndexer)
+        indexer.token_to_kv_pool = None
+        indexer.req_to_token = None
+        indexer.use_deep_gemm_decode = False
+        indexer.use_deep_select_decode = False
+
+        with (
+            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(mod, "topk_page_transform") as page_transform,
+            patch.object(mod, "select_decode") as select_decode,
+        ):
+            indexer.topk_decode(inputs)
+
+        page_transform.assert_not_called()
+        select_decode.assert_called_once_with(inputs, data, 2)
+
+
 class TestChunkedPagedDecode(CustomTestCase):
     """An eager decode whose paged-MQA metadata is split into row chunks (#40637):
     every DeepGEMM call must get its own chunk's schedule and every top-k its own
@@ -942,6 +997,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             req_rows=torch.arange(num_rows),
             paged_metadata=metadata,
             is_verify=True,
+            out_page_indices=torch.full((num_rows, 4), -1, dtype=torch.int32),
         )
         data = DeepGEMMDecodeData(
             q_fp4=torch.zeros((num_rows, 1, 2, 64), dtype=torch.int8),
@@ -950,12 +1006,6 @@ class TestChunkedPagedDecode(CustomTestCase):
             k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
         )
         return inputs, data
-
-    def _selection(self):
-        from sglang.srt.layers.attention.dsv4.v41_indexer import Selection
-
-        page_indices = torch.full((self.num_rows, 4), -1, dtype=torch.int32)
-        return Selection(page_indices=page_indices, raw_indices=page_indices.clone())
 
     def _mocks(self):
         width = self.width
@@ -1019,7 +1069,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             patch.object(mod.torch.cuda, "Event", return_value=event),
             patch.object(mod.torch.cuda, "current_stream", return_value=stream),
         ):
-            table = backend.publish_decode(inputs, self._selection())
+            table = backend.publish_decode(inputs)
 
         self._assert_chunked_calls(deep_gemm, topk)
         self.assertEqual(table.blocks.shape, (self.num_rows, backend.topk_blocks))
@@ -1040,7 +1090,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
             patch.object(mod, "topk_transform_paged_from_metadata", topk),
         ):
-            indexer.topk_decode(inputs, self._selection())
+            indexer.topk_decode(inputs)
 
         self._assert_chunked_calls(deep_gemm, topk)
 

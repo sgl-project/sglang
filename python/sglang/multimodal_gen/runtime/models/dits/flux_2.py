@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -77,8 +77,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     apply_nvfp4_gemm_prequantized,
     apply_nvfp4_gemm_swiglu_quant,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    NDRotaryEmbedding,
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
+    FluxPosEmbed as Flux2PosEmbed,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -208,9 +208,10 @@ def _try_flux2_norm_modulate_fp8(
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
     if (
         _FLUX2_LN_FP8.disabled
+        or not x.is_cuda
         or x.shape[-1] != 6144
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return None
 
@@ -373,8 +374,9 @@ def _flux2_norm_modulate(
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
     if (
         _FLUX2_LN_MOD.disabled
+        or not x.is_cuda
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return norm(x) * (1 + scale) + shift
 
@@ -428,7 +430,7 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     verified = sig in _FLUX2_SWIGLU_SIGS
     can_fuse = (
         not _FLUX2_SWIGLU.disabled
-        and x.is_cuda
+        and (x.is_cuda or x.is_xpu)
         and x.dtype is torch.bfloat16
         and x.dim() == 3
         and x.stride(-1) == 1
@@ -439,7 +441,11 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     )
     # Per-signature verification may compare tensors and synchronize.  Never
     # verify a new layout while a CUDA graph is being captured.
-    if can_fuse and not verified and torch.cuda.is_current_stream_capturing():
+    if (
+        can_fuse
+        and not verified
+        and torch.get_device_module(x.device).is_current_stream_capturing()
+    ):
         return F.silu(x[..., :half]) * x[..., half:]
     if can_fuse:
         try:
@@ -571,7 +577,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.dropout = dropout
 
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
 
         # Packed NVFP4 checkpoints already serialize QKV together. ModelOpt
         # FP8 exports separate Diffusers tensors, but the loader can merge
@@ -1447,33 +1452,6 @@ class Flux2Modulation(nn.Module):
         return tuple(
             mod_params[3 * i : 3 * (i + 1)] for i in range(self.mod_param_sets)
         )
-
-
-class Flux2PosEmbed(nn.Module):
-    def __init__(self, theta: int, axes_dim: List[int]):
-        super().__init__()
-        self.rope = NDRotaryEmbedding(
-            rope_dim_list=axes_dim,
-            rope_theta=theta,
-            use_real=False,
-            repeat_interleave_real=False,
-            dtype=(
-                torch.float64
-                if (
-                    current_platform.is_float64_supported()
-                    if hasattr(current_platform, "is_float64_supported")
-                    else True
-                )
-                else torch.float32
-            ),
-        )
-
-    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        pos = ids.float()
-        # TODO: potential error: flux use n_axes = ids.shape[-1]
-        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
-        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
-        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
 class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):

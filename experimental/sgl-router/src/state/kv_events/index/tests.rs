@@ -5,6 +5,50 @@ use super::*;
 use crate::state::kv_events::wire::{BlockRemoved, BlockStored};
 use crate::state::load_monitor::engine_reported_load::LoadStat;
 
+/// Bootstrap buffers LoRA tokens until ingestion can translate opaque IDs.
+#[tokio::test]
+async fn pump_keeps_lora_tokens_while_bootstrap_holds_batches() {
+    let id = worker_id("http://w1", 0);
+    let tracker = pending_tracker(std::slice::from_ref(&id));
+    let h = spawn_pump_with_bootstrap(std::slice::from_ref(&id), tracker.clone());
+    h.tx.send(WorkerEvent::Batch {
+        worker: id.clone(),
+        seq: 6,
+        batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            block_hashes: vec![100],
+            parent_block_hash: None,
+            token_ids: vec![1, 2],
+            block_size: 2,
+            lora_id: None,
+            lora_name: Some("adapter-a".into()),
+            cache_salt: None,
+            is_bigram: false,
+            medium: Some("GPU".into()),
+        })]),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.tree.node_count(), 0);
+    h.ctrl_tx
+        .send(PumpControl::AbandonBootstrap {
+            obligations: obligations(&tracker, std::slice::from_ref(&id)),
+        })
+        .await
+        .unwrap();
+    drop(h.tx);
+    drop(h.ctrl_tx);
+    h.pump.await.unwrap();
+    assert_eq!(
+        h.tree.prefix_depths(None, &[1132550695741458728]),
+        HashMap::from([(id, 1)])
+    );
+    assert!(
+        h.tree.prefix_depths(None, &[100]).is_empty(),
+        "opaque IDs must not receive prompt credit"
+    );
+}
+
 /// The manager re-runs `add_worker` for a worker it already knows (its
 /// reconcile loop does so for a worker that advertises no model name), so a
 /// rank the tracker already holds must not buy another sweep: a `Pending`
@@ -314,6 +358,10 @@ async fn pump_applies_block_stored_to_tree() {
         worker: id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![10, 20, 30],
             token_ids: vec![],
@@ -348,6 +396,10 @@ async fn pump_keeps_host_backed_block_owned_across_device_eviction() {
 
     let stored = |medium: Option<&str>| {
         KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![10, 20],
             token_ids: vec![],
@@ -413,6 +465,10 @@ async fn pump_tallies_applied_events_by_medium() {
 
     let stored = |medium: Option<&str>, hashes: Vec<i64>| {
         KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: hashes,
             token_ids: vec![],
@@ -522,6 +578,10 @@ async fn pump_filters_out_of_order_seq() {
         worker: id.clone(),
         seq: 5,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![10],
             token_ids: vec![],
@@ -569,6 +629,10 @@ async fn pump_handles_all_blocks_cleared() {
         worker: id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![1, 2],
             token_ids: vec![],
@@ -616,6 +680,10 @@ async fn pump_drops_events_from_detached_workers() {
         worker: dead_id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![42],
             token_ids: vec![],
@@ -631,6 +699,10 @@ async fn pump_drops_events_from_detached_workers() {
         worker: live_id.clone(),
         seq: 1,
         batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+
             parent_block_hash: None,
             block_hashes: vec![99],
             token_ids: vec![],
@@ -668,6 +740,7 @@ async fn add_worker_rejects_block_size_mismatch() {
         topic: String::new(),
         load_port_base: None,
         load_topic: None,
+        replay_port_base: None,
         block_size: 128,
         dp_size: 1,
         is_bigram: false,
@@ -699,6 +772,7 @@ async fn add_worker_seeds_oracle_with_first_block_size() {
         topic: String::new(),
         load_port_base: None,
         load_topic: None,
+        replay_port_base: None,
         block_size: 64,
         dp_size: 0,
         is_bigram: false,
@@ -722,6 +796,7 @@ async fn add_worker_seeds_bigram_flag_from_event_config() {
         topic: String::new(),
         load_port_base: None,
         load_topic: None,
+        replay_port_base: None,
         block_size: 64,
         dp_size: 0,
         is_bigram: true,
@@ -747,6 +822,7 @@ async fn metadata_only_mode_keeps_the_load_subscriber() {
         topic: "kv-events".into(),
         load_port_base: Some(30410),
         load_topic: Some("load".into()),
+        replay_port_base: None,
         block_size: 64,
         dp_size: 2,
         is_bigram: true,
@@ -775,6 +851,7 @@ async fn remove_worker_clears_engine_load() {
         topic: String::new(),
         load_port_base: Some(59223),
         load_topic: Some("load".into()),
+        replay_port_base: None,
         block_size: 64,
         dp_size: 1,
         is_bigram: false,
@@ -826,6 +903,7 @@ async fn remove_worker_clears_every_rank_before_returning() {
         topic: String::new(),
         load_port_base: None,
         load_topic: None,
+        replay_port_base: None,
         block_size: 64,
         dp_size: 2,
         is_bigram: false,
@@ -860,5 +938,60 @@ async fn remove_worker_clears_every_rank_before_returning() {
         "every dp rank of the removed worker must be cleared",
     );
     assert_eq!(tree.node_count(), 0, "cleared chains must prune");
+    index.shutdown().await;
+}
+
+/// The snapshot client must not follow redirects: a sibling router never
+/// redirects this route, so a 3xx is a misconfigured or hostile peer steering
+/// the fetch — and its multi-gigabyte buffering budget — at an arbitrary
+/// in-cluster URL. The 3xx must land as `FetchAnswer::NoBody` (peer is not a
+/// source) with the redirect target never contacted.
+///
+/// Asserted against the index's OWN client, not a test-local one: reqwest's
+/// default policy follows up to ten redirects, so a copy built in the test
+/// would prove nothing about the client the sweep and the probe actually use.
+#[tokio::test]
+async fn snapshot_client_refuses_to_follow_a_redirecting_peer() {
+    use crate::state::kv_events::bootstrap::{fetch_snapshot, FetchAnswer, SNAPSHOT_PATH};
+
+    let followed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let poisoned = Arc::clone(&followed);
+    let app = axum::Router::new()
+        .route(
+            SNAPSHOT_PATH,
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "/poison")],
+                )
+            }),
+        )
+        .route(
+            "/poison",
+            axum::routing::get(move || {
+                let poisoned = Arc::clone(&poisoned);
+                async move {
+                    poisoned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "gotcha"
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let index = KvEventIndex::new();
+    let got = fetch_snapshot(&index.snapshot_http, &base, None)
+        .await
+        .expect("a refused redirect is an answer, not a transport error");
+    assert!(
+        matches!(got, FetchAnswer::NoBody(status) if status.is_redirection()),
+        "a redirecting peer must read as 'no snapshot here'",
+    );
+    assert_eq!(
+        followed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the redirect target must never be contacted",
+    );
     index.shutdown().await;
 }

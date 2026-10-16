@@ -181,6 +181,7 @@ for _mod, _fn in [
     ("dsa.transform_index", "transform_index_page_table_prefill"),
     ("dsa.transform_index", "transform_index_page_table_decode"),
     ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
+    ("dsa.transform_index", "transform_index_page_table_dcp"),
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
@@ -276,6 +277,19 @@ for _mod, _fn, _backend, _device in [
         KernelBackend.FLYDSL,
         CapabilityRequirement.HIP,
     ),
+    # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+    (
+        "dsv4.flydsl_v4nm.mla_v4_decode",
+        "flydsl_mla_decode_fwd_v4_nm",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "dsv4.flydsl_v4nm.mla_v4_decode",
+        "flydsl_mla_v4_decode_fused",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
 ]:
     register_kernel(
         KernelSpec(
@@ -359,3 +373,51 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.pack_prefix_current",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dllm_kv_pack:pack_prefix_current",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        description="Pack CSR prefix and current K/V into caller-provided dense buffers.",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.flash_attn_gqa_512",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.flash_attention_v4:flash_attn_gqa_512",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(11, 9))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16"),
+            description="SM100/SM110 D512 GQA with separate K/V and optional page tables.",
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.gemma_qkv_norm_rope",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.gemma_qkv_norm_rope:gemma_qkv_norm_rope",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16"),
+            in_place=True,
+            description="Strided QKV normalization and partial NeoX RoPE.",
+        ),
+    )
+)
+
+for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.fp4_indexer:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _fn

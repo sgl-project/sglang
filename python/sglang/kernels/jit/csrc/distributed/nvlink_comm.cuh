@@ -2,6 +2,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -21,31 +22,7 @@ namespace sglang {
 
 using device::distributed::PushWorkSpace;
 using device::distributed::Semaphore;
-
-// Runtime uint32 division as a multiply-high and a shift (round-up magic,
-// exact below 2^31); cuda::fast_mod_div needs a newer CCCL than CUDA 13 bundles.
-struct fast_mod_div_u32_t {
-  uint32_t divisor;
-  uint32_t magic;
-  uint32_t shift;
-
-  __host__ explicit fast_mod_div_u32_t(uint32_t d) : divisor(d), magic(0), shift(0) {
-    if (d > 1) {
-      const uint32_t log2_ceil = 32 - std::countl_zero(d - 1);
-      const uint32_t p = 31 + log2_ceil;
-      magic = static_cast<uint32_t>(((uint64_t{1} << p) + d - 1) / d);
-      shift = p - 32;
-    }
-  }
-
-  __device__ friend uint32_t operator/(uint32_t n, const fast_mod_div_u32_t& fd) {
-    return fd.divisor == 1 ? n : __umulhi(n, fd.magic) >> fd.shift;
-  }
-
-  __device__ friend uint32_t operator%(uint32_t n, const fast_mod_div_u32_t& fd) {
-    return n - (n / fd) * fd.divisor;
-  }
-};
+using device::math::fast_mod_div_u32_t;
 
 template <uint32_t kWorldSize>
 struct NVLinkCommPushParams {
@@ -168,8 +145,7 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
         ptx::st_multimem_16B(vec, dst_ptr_mc, vid);
       }
     } else /* reduce-scatter only */ {
-      const auto token_id = vid / params.vecs_per_token_div;
-      const auto offset = vid % params.vecs_per_token_div;
+      const auto [token_id, offset] = math::div(vid, params.vecs_per_token_div);
       // Both by a compile-time constant, so this is a mask and a shift.
       const auto dst_rank = token_id % kWorldSize;
       const auto dst_token_id = token_id / kWorldSize;
