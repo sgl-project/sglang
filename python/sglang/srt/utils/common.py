@@ -2848,41 +2848,87 @@ class RefCountedGauge:
                 self._gauge.dec()
 
 
-def add_prometheus_track_response_middleware(
-    app, extra_labels: Optional[Dict[str, str]] = None
-):
-    from prometheus_client import Counter, Gauge
+class _HttpRequestMetrics:
+    """The prometheus objects behind the HTTP request metrics of one process."""
 
-    extra_labels = extra_labels or {}
-    extra_label_names = list(extra_labels.keys())
+    def __init__(self, extra_labels: Dict[str, str], worker_id: Optional[str]):
+        from prometheus_client import Counter, Gauge
 
-    http_request_counter = Counter(
-        name="sglang:http_requests_total",
-        documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=extra_label_names + ["endpoint", "method"],
-    )
+        extra_label_names = list(extra_labels.keys())
+        self.extra_labels = extra_labels
 
-    http_response_counter = Counter(
-        name="sglang:http_responses_total",
-        documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
-    )
+        self.request_counter = Counter(
+            name="sglang:http_requests_total",
+            documentation="Total number of HTTP requests by endpoint and method",
+            labelnames=extra_label_names + ["endpoint", "method"],
+        )
 
-    http_requests_active = Gauge(
-        name="sglang:http_requests_active",
-        documentation="Number of currently active HTTP requests",
-        labelnames=extra_label_names + ["endpoint", "method"],
-        multiprocess_mode="livesum",
-    )
+        self.response_counter = Counter(
+            name="sglang:http_responses_total",
+            documentation="Total number of HTTP responses by endpoint and status code",
+            labelnames=extra_label_names + ["endpoint", "status_code", "method"],
+        )
 
-    routing_keys_active = RefCountedGauge(
-        Gauge(
-            name="sglang:routing_keys_active",
-            documentation="Number of unique routing keys with active requests",
+        self.requests_active = Gauge(
+            name="sglang:http_requests_active",
+            documentation="Number of currently active HTTP requests",
+            labelnames=extra_label_names + ["endpoint", "method"],
             multiprocess_mode="livesum",
         )
-    )
 
+        self.routing_keys_active = RefCountedGauge(
+            Gauge(
+                name="sglang:routing_keys_active",
+                documentation="Number of unique routing keys with active requests",
+                multiprocess_mode="livesum",
+            )
+        )
+
+        self.worker_active = (
+            Gauge(
+                name="sglang:http_worker_active_requests",
+                documentation=(
+                    "Number of currently active HTTP requests handled by this "
+                    "tokenizer worker"
+                ),
+                labelnames=["worker_id"],
+                multiprocess_mode="livesum",
+            ).labels(worker_id=worker_id)
+            if worker_id is not None
+            else None
+        )
+
+
+_http_request_metrics: Optional[_HttpRequestMetrics] = None
+
+
+def init_http_request_metrics(
+    *, extra_labels: Optional[Dict[str, str]] = None, worker_id: Optional[str] = None
+) -> None:
+    """Create this process's HTTP request metrics.
+
+    Called once the process has published its config rather than at import:
+    importing prometheus_client fixes its value backend from
+    ``PROMETHEUS_MULTIPROC_DIR``, which SGLang only sets in
+    ``_set_envs_and_config`` -- after this module has already been imported.
+    Creating the metrics earlier would leave them in the in-memory registry,
+    where the ``/metrics`` endpoint (which reads the multiprocess directory)
+    never sees them.
+    """
+    global _http_request_metrics
+    _http_request_metrics = _HttpRequestMetrics(extra_labels or {}, worker_id)
+
+
+def add_prometheus_track_response_middleware(app):
+    """Track per-endpoint HTTP request metrics.
+
+    Registering the middleware and creating the metrics (see
+    ``init_http_request_metrics``) are deliberately separate, because the two
+    have to happen at different times: the middleware must be in place while
+    this module is imported so that every tokenizer worker process gets it,
+    while the metrics can only be created once the process has published its
+    config.
+    """
     # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
     # that passes `receive` through, so request.is_disconnected() keeps working.
     from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
@@ -2891,21 +2937,32 @@ def add_prometheus_track_response_middleware(
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
+        metrics = _http_request_metrics
+        if metrics is None:  # metrics are not enabled in this process
+            return await call_next(request)
+
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
         path, is_handled_path = _get_fastapi_request_path(request)
         method = request.method
         routing_key = request.headers.get("x-smg-routing-key")
+        extra_labels = metrics.extra_labels
 
-        http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
-        http_requests_active.labels(**extra_labels, endpoint=path, method=method).inc()
+        metrics.request_counter.labels(
+            **extra_labels, endpoint=path, method=method
+        ).inc()
+        metrics.requests_active.labels(
+            **extra_labels, endpoint=path, method=method
+        ).inc()
+        if metrics.worker_active is not None:
+            metrics.worker_active.inc()
         if routing_key:
-            routing_keys_active.inc(routing_key)
+            metrics.routing_keys_active.inc(routing_key)
 
         try:
             response = await call_next(request)
 
-            http_response_counter.labels(
+            metrics.response_counter.labels(
                 **extra_labels,
                 endpoint=path,
                 method=method,
@@ -2914,11 +2971,13 @@ def add_prometheus_track_response_middleware(
 
             return response
         finally:
-            http_requests_active.labels(
+            metrics.requests_active.labels(
                 **extra_labels, endpoint=path, method=method
             ).dec()
+            if metrics.worker_active is not None:
+                metrics.worker_active.dec()
             if routing_key:
-                routing_keys_active.dec(routing_key)
+                metrics.routing_keys_active.dec(routing_key)
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
