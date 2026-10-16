@@ -1386,6 +1386,14 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # CANN deterministic level for NPU (e.g. "3"). When set, sglang calls
+    # torch_npu.npu.set_deterministic_level(<level>) once at model init (after
+    # the NPU device is set, before the first forward). Level 3 makes the CANN
+    # context report GetDeterministicLevel()==3, which switches
+    # ops-transformer's hc_pre / compressor to the batch-consistency
+    # (shape-invariant) path WITHOUT recompiling the op. Unset = no-op; the
+    # default numerics are unchanged.
+    SGLANG_DSV4_DETERMINISTIC_LEVEL = EnvInt(None)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)

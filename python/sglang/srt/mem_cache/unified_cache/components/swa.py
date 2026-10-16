@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -468,6 +469,70 @@ class SWAComponent(TreeComponent):
         full_cd.value = incoming_full.clone()
         cache_actions.append(FreeDeviceKVFullOnly([old_full]))
         self._publish_window(node=node, cache_actions=cache_actions)
+
+    def resync_window_full_to_swa_mapping(
+        self, node_id: int, prefix_len: int | None = None
+    ) -> None:
+        """Re-point the allocator's global full -> swa table for the reused window.
+
+        A prefix-cache hit restores only the Full req_to_token rows, while
+        attention resolves the window's SWA pages from the allocator-global
+        table, which is mutable and may have been cleared or rebound since the
+        node was written. This must run BEFORE the request's forward pass: the
+        prefill computes its own KV from this window, so a late fix only rewrites
+        a mapping that has already produced wrong KV.
+        """
+        if node_id is None:
+            return
+        if os.environ.get("DSV4_DISABLE_SWA_WINDOW_RESYNC"):
+            return
+        alloc = self.cache.token_to_kv_pool_allocator
+        if is_swa_req_ring(alloc):
+            return
+        # unified_kv keeps SWA as a device-only ring; host-only nodes are not
+        # handled here (mirrors build_hicache_transfers' guard).
+        if self.tree_core.enable_hicache and not self.tree_core.has_swa_host_pool:
+            return
+        ct = self.component_type
+        root = self.tree_core.root_node
+        node = self.tree_core.node_by_id(node_id)
+        # a hit's deepest match node can be the suffix, whose range starts at the
+        # boundary; the window to repair ends there, so step up past such nodes.
+        if prefix_len is not None:
+            while node.id != root.id:
+                fv = node.component_data[BASE_COMPONENT_TYPE].value
+                cd = node.component_data[ct]
+                if (
+                    fv is not None
+                    and cd.value is not None
+                    and fv.numel() > 0
+                    and int(fv.reshape(-1)[-1]) < prefix_len
+                ):
+                    break
+                node = node.parent
+        full_chunks: list[torch.Tensor] = []
+        swa_chunks: list[torch.Tensor] = []
+        n_swa = 0
+        while node.id != root.id and n_swa < self.sliding_window_size:
+            cd = node.component_data[ct]
+            assert cd.value is not None, (
+                f"swa window node {node.id} is a tombstone (no device value): the "
+                "window spans SWA-evicted nodes, so the full->swa mapping cannot "
+                "cover it (recover SWA from Full instead of re-pointing)"
+            )
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            assert full_value is not None and len(full_value) == len(cd.value), (
+                "swa node value is not element-wise aligned with its full value"
+            )
+            full_chunks.append(full_value)
+            swa_chunks.append(cd.value)
+            n_swa += len(cd.value)
+            node = node.parent
+        if not full_chunks:
+            return
+        full = torch.cat(full_chunks)
+        swa = torch.cat(swa_chunks)
+        alloc.set_full_to_swa_mapping(full, swa)
 
     def tree_owned_swa_floor(self, node_id: int, hi_pos: int) -> int | None:
         """Earliest position on this request's path whose SWA the tree still owns."""

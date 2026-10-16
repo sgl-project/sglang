@@ -27,8 +27,37 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+
+def _resync_swa_window(batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor) -> None:
+    """Re-point full->swa for the reused prefix window, before the forward pass.
+
+    A hit restores only the Full req_to_token rows; attention reads the window's
+    SWA pages through the allocator-global table, which the previous owner may
+    have cleared or rebound. Running before the forward is what matters: the
+    prefill computes its own KV from this window.
+    """
+    tree_cache = getattr(batch, "tree_cache", None)
+    components = getattr(tree_cache, "components", None)
+    if not components:
+        return
+    component = components.get(ComponentType.SWA)
+    if component is None:
+        return
+    for i, req in enumerate(batch.reqs):
+        if i >= len(prefix_lens_cpu) or int(prefix_lens_cpu[i]) <= 0:
+            continue
+        node_id = getattr(req, "last_node", None)
+        if node_id is not None:
+            # deepest match node can be the freshly-extended suffix node; the
+            # window to repair ends at this req's cached prefix length instead.
+            component.resync_window_full_to_swa_mapping(
+                node_id, int(prefix_lens_cpu[i])
+            )
 
 
 def maybe_write_dsv4_extend(
@@ -44,6 +73,8 @@ def maybe_write_dsv4_extend(
     from the full-token table.
 
     """
+    _resync_swa_window(batch, prefix_lens_cpu)
+
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
     # None on CUDA / non-V4 paths → no-op.
     bundle = batch.out_cache_loc_dsv4
