@@ -165,6 +165,7 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
             input_ids=torch.zeros(16, dtype=torch.long),
             positions=torch.zeros(16, dtype=torch.long),
             input_embeds=torch.full((16, 7), -1.0),
+            num_token_non_padded=None,
         )
         batch = SimpleNamespace(
             needs_forward_metadata_init=lambda: False,

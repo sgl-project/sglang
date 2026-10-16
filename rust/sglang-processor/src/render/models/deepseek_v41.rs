@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use super::deepseek_v4::{
     check_tool_arguments, drop_merged_tasks, engine_message, normalize_messages, pydantic_bool,
-    split_continuation, thinking,
+    renders_tools, split_continuation, thinking,
 };
 use crate::render::reasoning::requested_effort;
 
@@ -40,9 +40,10 @@ pub(crate) fn render(
     let prefix = split_continuation(&mut messages, request)?;
     let first = messages.first().ok_or("messages must not be empty")?;
     // Only request tools get the empty system turn, which V4.1 renders as a token.
-    let tools = request["tools"]
+    let request_tools = request["tools"]
         .as_array()
         .filter(|tools| !tools.is_empty());
+    let tools = request_tools.filter(|tools| renders_tools(request, tools));
     if tools.is_some() && first["role"] != "system" {
         messages.insert(0, json!({"role": "system", "content": ""}));
     }
@@ -59,8 +60,17 @@ pub(crate) fn render(
     }
     drop_merged_tasks(&mut messages);
     normalize_messages(&mut messages)?;
-    if let Some(tools) = tools {
-        messages[0]["tools"] = tools.iter().map(tool_payload).collect::<Result<_, _>>()?;
+    // Pydantic validates the request tools whether or not they render.
+    let payloads = request_tools
+        .map(|tools| {
+            tools
+                .iter()
+                .map(tool_payload)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    if let (Some(_), Some(payloads)) = (tools, payloads) {
+        messages[0]["tools"] = payloads.into();
     }
     let mode = if thinking(request, defaults) {
         ThinkingMode::Thinking

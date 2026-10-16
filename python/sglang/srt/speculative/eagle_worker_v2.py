@@ -735,13 +735,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk == 1
             and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
         )
-        # Materialize the chain directly only when the CUDA kernel can write
+        # Materialize the chain directly only when the Triton kernel can write
         # every subsequent column. Other topk=1 paths retain the token list and
         # assemble it with one final cat instead of launching a copy per step.
         draft_tokens_topk1 = None
         if (
             topk1_chain_fits
-            and _is_cuda
+            and (_is_cuda or _is_hip)
             and self.hot_token_id is None
             and not needs_draft_probs
         ):

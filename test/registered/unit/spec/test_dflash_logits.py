@@ -340,10 +340,16 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     monkeypatch.setattr(
         worker_mod, "is_dflash_sampling_verify_available", lambda: False
     )
+    observed = {}
+
+    def fake_correct_drafts_and_bonus(**kwargs):
+        observed.update(kwargs)
+        return torch.tensor([0]), torch.tensor([7])
+
     monkeypatch.setattr(
         worker_mod,
         "compute_dflash_correct_drafts_and_bonus",
-        lambda **kwargs: (torch.tensor([0]), torch.tensor([7])),
+        fake_correct_drafts_and_bonus,
     )
 
     sync_sites = []
@@ -367,12 +373,12 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         bs=1,
     )
 
-    accept_len, commit_lens, bonus, out_tokens, _, target_predict = result
+    accept_len, commit_lens, bonus, out_tokens, _ = result
     assert accept_len.tolist() == [0]
     assert commit_lens.tolist() == [1]
     assert bonus.tolist() == [7]
     assert out_tokens.tolist() == [[7, 0]]
-    assert target_predict.tolist() == [[1, 0]]
+    assert observed["target_predict"].tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
 
 
