@@ -96,4 +96,15 @@ def configure_kv_cache_dtype(
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         resolved_kv_cache_dtype = "auto"
 
+    if current_platform.is_npu():
+        from sglang.srt.hardware_backend.npu.kv_capability import (
+            resolve_npu_kv_capability,
+        )
+
+        capability = resolve_npu_kv_capability(
+            kv_cache_dtype, requested=server_args_kv_cache_dtype
+        )
+        if not capability.supported:
+            raise ValueError(capability.unsupported_reason)
+
     return resolved_kv_cache_dtype, kv_cache_dtype

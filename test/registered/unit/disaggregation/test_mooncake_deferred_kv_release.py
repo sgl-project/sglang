@@ -169,7 +169,7 @@ class TestMooncakeAbortNotification(
         for i in range(num_dsts):
             session = f"decode-session-{i}"
             manager.decode_kv_args_table[session] = MagicMock(
-                requires_dcp_relayout=False
+                requires_dcp_relayout=False, kv_layout_error=None
             )
             manager.transfer_infos[ROOM][(DECODE_IP, DECODE_PORT + i)] = TransferInfo(
                 room=ROOM,
