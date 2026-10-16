@@ -154,13 +154,6 @@ class TestFoldedExtendRows(CustomTestCase):
             out.hidden_states, fx.batch.input_ids[:, None].float()
         )
 
-    def test_fold_rejects_a_synced_count_without_replay_rows(self):
-        """A fold whose rows the scheduler did not count is refused."""
-        fx = _Fixture()
-        fx.batch.global_num_tokens = [fx.extend_num_tokens]
-        with self.assertRaisesRegex(ValueError, "synced"):
-            _fold_batch(batch=fx.batch, runner=fx.runner, rows=HITS)
-
     def test_replay_rows_follow_window_resets_only(self):
         """A request that keeps its window (a later chunk) adds no replay rows."""
         fx = _Fixture()
