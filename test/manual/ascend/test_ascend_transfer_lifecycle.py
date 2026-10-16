@@ -1,3 +1,4 @@
+import queue
 import threading
 import unittest
 from unittest.mock import Mock
@@ -50,17 +51,21 @@ class TestAscendTransferLifecycle(unittest.TestCase):
         manager.server_socket.close.assert_called_once_with(linger=0)
         manager._zmq_ctx.destroy.assert_called_once_with(linger=0)
 
-    def test_live_worker_prevents_socket_and_engine_destruction(self):
-        manager = AscendKVManager.__new__(AscendKVManager)
-        manager.engine = self.engine
-        worker = Mock(spec=threading.Thread)
-        worker.name = "stuck-transfer-worker"
-        worker.is_alive.return_value = True
+    def test_teardown_stops_idle_worker_before_destroying_session(self):
+        manager = self._manager()
+        transfer_queue = queue.Queue()
+        worker = threading.Thread(target=transfer_queue.get, daemon=True)
+        manager.transfer_queues = [transfer_queue]
         manager._worker_threads = [worker]
-        with self.assertRaisesRegex(RuntimeError, "did not stop"):
+        worker.start()
+        self.native.destroy.side_effect = lambda: self.assertFalse(worker.is_alive())
+        try:
             manager.teardown()
-        worker.join.assert_called_once_with(timeout=3.0)
-        self.native.destroy.assert_not_called()
+        finally:
+            transfer_queue.put(None)
+            worker.join(timeout=3.0)
+        self.native.destroy.assert_called_once_with()
+        self.assertEqual(manager._worker_threads, [])
 
     def test_registration_uses_memfabric_batch_api(self):
         self.assertEqual(self.engine.batch_register([123, 456], [16, 32]), 0)

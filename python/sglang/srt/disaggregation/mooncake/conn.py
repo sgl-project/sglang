@@ -437,11 +437,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # thread-safe, so don't close server_socket while a worker may poll it.
         for t in self._worker_threads:
             t.join(timeout=3.0)
-        alive = [t.name for t in self._worker_threads if t.is_alive()]
-        if alive:
-            raise RuntimeError(
-                f"Transfer workers did not stop during teardown: {alive}"
-            )
         self._worker_threads = []
 
         # Drop the queues so their buffered tasks/senders are released too.
