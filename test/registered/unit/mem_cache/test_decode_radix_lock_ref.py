@@ -20,6 +20,7 @@ Usage:
     python -m pytest test/registered/unit/mem_cache/test_decode_radix_lock_ref.py -v
 """
 
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -704,6 +705,51 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # After all iterations, root lock should be 1, no protected nodes
         self.assertEqual(cache.root_node.lock_ref, 1)
         self.assertEqual(cache.protected_size(), 0)
+
+
+class TestPDRequestLocalMambaState(CustomTestCase):
+    def setUp(self):
+        self.comp = object.__new__(MambaComponent)
+        self.comp.state_from_prefill = True
+        self.pool = MagicMock()
+        self.comp.cache = SimpleNamespace(req_to_token_pool=self.pool)
+
+    def test_kv_hit_does_not_restore_or_publish_recurrent_state(self):
+        node = SimpleNamespace(
+            component_data={
+                ComponentType.MAMBA: SimpleNamespace(value=None, host_value=None)
+            }
+        )
+        params = SimpleNamespace(cow_mamba=True, mamba_value=None)
+        result = object()
+        self.assertTrue(self.comp.create_match_validator()(node))
+        self.assertIs(
+            self.comp.finalize_match_result_in_tree_core(result, params, [], 64), result
+        )
+        self.assertIs(self.comp.finalize_match_result_in_cache(params, result), result)
+        self.assertIsNone(
+            self.comp.prepare_for_caching_req(
+                SimpleNamespace(), params, token_ids_len=65, is_finished=True
+            )
+        )
+        self.assertIsNone(params.mamba_value)
+        self.comp.commit_insert_component_data(node, True, params, None, [])
+        self.assertIsNone(node.component_data[ComponentType.MAMBA].value)
+        self.assertEqual(self.pool.mock_calls, [])
+        # Ordinary checkpoint caches must still reject the same state-less hit.
+        self.comp.state_from_prefill = False
+        self.assertFalse(self.comp.create_match_validator()(node))
+
+    def test_request_state_retained_until_finish_or_abort(self):
+        for inserted in (False, True):
+            with self.subTest(inserted=inserted):
+                self.pool.reset_mock()
+                req = SimpleNamespace()
+                params = SimpleNamespace(mamba_value=None) if inserted else None
+                self.comp.cleanup_after_caching_req(req, False, insert_params=params)
+                self.pool.free_mamba_cache.assert_not_called()
+                self.comp.cleanup_after_caching_req(req, True, insert_params=params)
+                self.pool.free_mamba_cache.assert_called_once_with(req)
 
 
 if __name__ == "__main__":
