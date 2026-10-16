@@ -54,5 +54,52 @@ class TestRegexPatternMaxLength(unittest.TestCase):
                 self.assertEqual(get_max_seq_length(regex_str), max_len)
 
 
+class TestNegatedCharClassMaxLength(unittest.TestCase):
+    """A single-character negated class must get a finite bound (sglang#30932).
+
+    `[^a]` matches exactly one character, but was bounded at MAX_LEN, which
+    downstream becomes the per-decode-step re-decode tail window.
+    """
+
+    FINITE_CASES = {
+        "[^a]": 1,
+        "[^\n]": 1,
+        # Two or more excluded characters take a different parse path; it stayed
+        # correct throughout and must not regress.
+        "[^ab]": 1,
+        "ab[^,]cd": 5,
+        "[^a][^a]": 2,
+        "[^a]|b": 1,
+        "[^a]{3}": 3,
+    }
+
+    # Controls: a fix that merely weakened the unbounded-repeat branch would make
+    # these finite too.
+    UNBOUNDED_CASES = ["[^a]+", "a+", '"[^"]*"']
+
+    def test_finite_negated_class_bounds(self):
+        for regex_str, expected in self.FINITE_CASES.items():
+            with self.subTest(regex_str=regex_str):
+                self.assertEqual(get_max_seq_length(regex_str), expected)
+
+    def test_unbounded_patterns_stay_unbounded(self):
+        for regex_str in self.UNBOUNDED_CASES:
+            with self.subTest(regex_str=regex_str):
+                self.assertGreaterEqual(get_max_seq_length(regex_str), MAX_LEN)
+
+    def test_no_unhandled_token_warning(self):
+        """Guards the failure mode itself: an opcode falling to the catch-all else.
+
+        The bound would still be sound but silently MAX_LEN, so only the log line
+        distinguishes "unbounded" from "unsupported".
+        """
+        for regex_str in [*self.FINITE_CASES, *self.UNBOUNDED_CASES]:
+            with self.subTest(regex_str=regex_str):
+                with self.assertNoLogs(
+                    "sglang.srt.sampling.sampling_params", level="WARNING"
+                ):
+                    get_max_seq_length(regex_str)
+
+
 if __name__ == "__main__":
     unittest.main()
