@@ -175,6 +175,8 @@ def register_fake_ops(tp_size: int):
 
     none_return_ops = [
         "shm_allreduce",
+        "shm_allgather_into_tensor",
+        "shm_reduce_scatter_tensor",
         "bmm_cpu",
         "fused_add_rmsnorm_cpu",
         "decode_attention_cpu",
