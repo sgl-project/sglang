@@ -1,5 +1,7 @@
 """Step5 VL model entry point: Step3.7-compatible wrapper with the Step5 backbone."""
 
+from collections.abc import Iterable
+
 from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration
 
 
@@ -12,10 +14,12 @@ class Step5ForConditionalGeneration(Step3p7ForConditionalGeneration):
     """
 
     kv_cache_dtype_full_attention_only = True
-    lora_frozen_routed_experts = True
 
     def get_hidden_dim(self, module_name: str, layer_idx: int) -> tuple[int, int]:
         return self.language_model.get_hidden_dim(module_name, layer_idx)
+
+    def lora_targets_routed_experts(self, target_modules: Iterable[str]) -> bool:
+        return self.language_model.lora_targets_routed_experts(target_modules)
 
 
 EntryClass = Step5ForConditionalGeneration

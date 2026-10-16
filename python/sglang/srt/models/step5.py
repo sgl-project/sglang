@@ -638,6 +638,26 @@ class Step5MoE(nn.Module):
         self.dp_alt_stream = get_stream("alt") if self.use_allreduce_dp_gather else None
         self.dp_overlap_max_rows = 128
 
+    def check_routed_expert_lora_support(self) -> None:
+        """Routed-expert LoRA runs in FusedMoEWithLoRA's Triton hooks; MegaMoE and the
+        FlashInfer runners (including the deferred-finalize path) never call them."""
+        backend = get_moe_runner_backend()
+        unsupported = [
+            name
+            for name, used in (
+                ("MegaMoE", self.use_mega_moe),
+                ("NVFP4 experts", self.use_nvfp4_experts),
+                ("FlashInfer TRT-LLM BF16 experts", self.bf16_trtllm),
+                (f"the {backend.value} MoE runner", not backend.is_triton()),
+            )
+            if used
+        ]
+        if unsupported:
+            raise ValueError(
+                f"Step5 routed-expert LoRA needs --moe-runner-backend triton; layer "
+                f"{self.layer_id} uses {', '.join(unsupported)}"
+            )
+
     def _can_use_allreduce_dp_gather(self, gathered, forward_batch):
         comm = get_tp_group().ca_comm
         return (
@@ -1512,8 +1532,6 @@ class Step5Model(nn.Module):
 
 class Step5ForCausalLM(nn.Module):
     kv_cache_dtype_full_attention_only = True
-    # LoRA adapts attention, the dense MLPs and the shared expert, never the routed experts.
-    lora_frozen_routed_experts = True
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -1596,8 +1614,25 @@ class Step5ForCausalLM(nn.Module):
             return config.hidden_size, 2 * intermediate
         if module_name == "down_proj":
             return intermediate, config.hidden_size
-        # The head-wise gate (g_proj) and the routed experts stay frozen.
+        if module_name == "gate_up_proj_moe":
+            return config.hidden_size, 2 * config.moe_intermediate_size
+        if module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
+        # The head-wise gate (g_proj) stays frozen.
         raise ValueError(f"Step5 LoRA does not adapt {module_name}")
+
+    def lora_targets_routed_experts(self, target_modules: Iterable[str]) -> bool:
+        """gate_up_proj/down_proj also name the dense MLPs and the shared expert, so
+        only a target under moe.experts, or all linear layers, adapts the routed experts."""
+        adapts = any(
+            target in ("all", "all-linear") or ".moe.experts." in f".{target}"
+            for target in target_modules
+        )
+        if adapts:
+            for layer in self.model.layers:
+                if layer.use_moe:
+                    layer.moe.check_routed_expert_lora_support()
+        return adapts
 
     @staticmethod
     def _checkpoint_duplicate_owners(expected, model_path) -> dict[str, str]:
