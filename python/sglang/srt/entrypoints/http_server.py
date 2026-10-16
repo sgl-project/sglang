@@ -2712,17 +2712,19 @@ def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
         raise SystemExit(1) from error
 
 
-def _granian_http1_settings():
+def _granian_http1_settings(max_buffer_size: int = 10 * 1024 * 1024):
     from granian.http import HTTP1Settings
 
+    kwargs = {"max_buffer_size": max_buffer_size}
     if not envs.SGLANG_TIMEOUT_KEEP_ALIVE.is_set():
-        return HTTP1Settings()
+        return HTTP1Settings(**kwargs)
     timeout_s = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
     if timeout_s <= 0:
         raise ValueError(
             f"SGLANG_TIMEOUT_KEEP_ALIVE must be a positive number of seconds, got {timeout_s}"
         )
-    return HTTP1Settings(header_read_timeout=timeout_s * 1000)
+    kwargs["header_read_timeout"] = timeout_s * 1000
+    return HTTP1Settings(**kwargs)
 
 
 def _run_granian_server(
@@ -2731,6 +2733,7 @@ def _run_granian_server(
     log_level,
     http2_max_concurrent_streams,
     http2_initial_connection_window_size,
+    max_payload_size=10 * 1024 * 1024,
     tokenizer_manager=None,
     tokenizer_worker_num=1,
     ssl_certfile=None,
@@ -2768,9 +2771,10 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
-        http1_settings=_granian_http1_settings(),
+        http1_settings=_granian_http1_settings(max_buffer_size=max_payload_size),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
+            initial_stream_window_size=max_payload_size,
             max_concurrent_streams=http2_max_concurrent_streams,
         ),
         log_level=log_level,
@@ -2910,6 +2914,7 @@ def _setup_and_run_http_server(
                     http2_initial_connection_window_size=(
                         get_serving().http2_initial_connection_window_size
                     ),
+                    max_payload_size=get_serving().max_payload_size,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -2928,6 +2933,7 @@ def _setup_and_run_http_server(
                     or get_observability().log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
+                    h11_max_incomplete_event_size=get_serving().max_payload_size,
                     ssl_keyfile=get_serving().ssl_keyfile,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -2971,6 +2977,7 @@ def _setup_and_run_http_server(
                         or get_observability().log_level,
                         timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                         loop="uvloop",
+                        h11_max_incomplete_event_size=get_serving().max_payload_size,
                         ssl_keyfile=get_serving().ssl_keyfile,
                         ssl_certfile=get_serving().ssl_certfile,
                         ssl_ca_certs=get_serving().ssl_ca_certs,
@@ -3015,6 +3022,7 @@ def _setup_and_run_http_server(
                     http2_initial_connection_window_size=(
                         get_serving().http2_initial_connection_window_size
                     ),
+                    max_payload_size=get_serving().max_payload_size,
                     tokenizer_worker_num=get_serving().tokenizer_worker_num,
                     ssl_certfile=get_serving().ssl_certfile,
                     ssl_keyfile=get_serving().ssl_keyfile,
@@ -3033,6 +3041,7 @@ def _setup_and_run_http_server(
                     "timeout_worker_healthcheck": envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                     "loop": "uvloop",
                     "workers": get_serving().tokenizer_worker_num,
+                    "h11_max_incomplete_event_size": get_serving().max_payload_size,
                     "ssl_keyfile": get_serving().ssl_keyfile,
                     "ssl_certfile": get_serving().ssl_certfile,
                     "ssl_ca_certs": get_serving().ssl_ca_certs,
