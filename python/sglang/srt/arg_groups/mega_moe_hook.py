@@ -77,7 +77,7 @@ def mega_moe_needs_token_budget(
 def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
     # Runs after speculative resolution so the decode / verify bound is final.
     cfg = resolving_view(server_args)
-    if cfg.moe_a2a_backend != "megamoe":
+    if cfg.moe_a2a_backend != "megamoe" or cfg.encoder_only:
         return
     validate_flydsl_decode_capacity(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
