@@ -264,12 +264,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_data_parallelism, server_args)
 
-    from sglang.srt.arg_groups.deepseek_v4_hook import (
-        validate_deepseek_v41_encoder_replay_budget,
-    )
-
-    run_hook(validate_deepseek_v41_encoder_replay_budget, server_args)
-
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)

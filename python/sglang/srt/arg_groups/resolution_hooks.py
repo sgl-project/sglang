@@ -66,7 +66,6 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_prefill_only_disable_kv_cache",
         "handle_hicache",
         "handle_data_parallelism",
-        "validate_deepseek_v41_encoder_replay_budget",
         "handle_load_balance_method",
         "handle_context_parallelism",
         "apply_prefill_cp_cuda_graph_default",
