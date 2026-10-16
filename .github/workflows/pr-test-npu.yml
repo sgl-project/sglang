@@ -300,11 +300,13 @@ jobs:
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
+          set -o pipefail
+          mkdir -p "$SGLANG_DIFFUSION_ARTIFACT_DIR"
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-npu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2
+            --total-partitions 2 2>&1 | tee "$SGLANG_DIFFUSION_ARTIFACT_DIR/run.log"
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -370,11 +372,13 @@ jobs:
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
+          set -o pipefail
+          mkdir -p "$SGLANG_DIFFUSION_ARTIFACT_DIR"
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-npu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2
+            --total-partitions 2 2>&1 | tee "$SGLANG_DIFFUSION_ARTIFACT_DIR/run.log"
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -564,6 +568,7 @@ jobs:
     with:
       log_artifact_pattern: selected-test-logs-*
       recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
+      upstream_job_results: ${{ toJSON(needs) }}
 
   # ==================== Coverage Assembly & Publish ==================== #
   # Assembles coverage data and publishes the baseline to the shared disk.
