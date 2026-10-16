@@ -31,9 +31,9 @@ def _jit_module(max_tokens: int, hidden_size: int) -> Module:
         max_tokens, hidden_size, _SPLIT_K, _N_TILE, _THREADS, is_arch_support_pdl()
     )
     return load_jit(
-        "muse_spark_v12_router_gemm",
+        "muse_spark_router_gemm",
         *args,
-        cuda_files=["muse_spark_v12/router_gemm.cuh"],
+        cuda_files=["muse_spark/router_gemm.cuh"],
         cuda_wrappers=[("run", f"MuseSparkRouterGemm<{args}>::run")],
     )
 

@@ -23,7 +23,7 @@ def _jit_module(dtype: torch.dtype, head_dim: int) -> Module:
     return load_jit(
         "muse_spark_norm_gate",
         *args,
-        cuda_files=["muse_spark_v12/norm_gate.cuh"],
+        cuda_files=["muse_spark/norm_gate.cuh"],
         cuda_wrappers=[("rms_norm_gate", f"NormGateKernel<{args}>::run")],
     )
 

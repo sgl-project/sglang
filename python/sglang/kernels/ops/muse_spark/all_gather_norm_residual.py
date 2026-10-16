@@ -12,7 +12,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.muse_spark_v12.norm_residual import (
+from sglang.kernels.ops.muse_spark.norm_residual import (
     norm_residual_launch_config,
 )
 
@@ -53,9 +53,9 @@ def _jit_module(
         has_gate,
     )
     return load_jit(
-        "muse_spark_v12_all_gather_norm_residual",
+        "muse_spark_all_gather_norm_residual",
         *args,
-        cuda_files=["muse_spark_v12/all_gather_norm_residual.cuh"],
+        cuda_files=["muse_spark/all_gather_norm_residual.cuh"],
         cuda_wrappers=[("run", f"MuseSparkAllGatherNormResidual<{args}>::run")],
         extra_cuda_cflags=["-O3"],
     )

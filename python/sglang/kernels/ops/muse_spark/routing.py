@@ -1,7 +1,7 @@
 """Fused MuseSpark MoE routing (CUDA JIT).
 
 Drop-in replacement for the Triton ``fused_muse_spark_routing`` topk8 path in
-``sglang.kernels.ops.muse_spark_v12.fused_muse_spark_routing``: sigmoid/softmax normalization,
+``sglang.kernels.ops.muse_spark.fused_muse_spark_routing``: sigmoid/softmax normalization,
 bias-scored iterative top-k, and renormalization by the selected unbiased score
 sum, fused into one kernel with one warp per token.
 
@@ -43,9 +43,9 @@ def _jit_module(
         topk, experts_per_lane, norm_mode, warps_per_block, is_arch_support_pdl()
     )
     return load_jit(
-        "muse_spark_v12_routing",
+        "muse_spark_routing",
         *args,
-        cuda_files=["muse_spark_v12/routing.cuh"],
+        cuda_files=["muse_spark/routing.cuh"],
         cuda_wrappers=[
             ("fused_muse_spark_routing", f"fused_muse_spark_routing<{args}>")
         ],

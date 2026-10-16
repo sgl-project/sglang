@@ -6,7 +6,7 @@ import helion
 import helion.language as hl
 import torch
 
-from sglang.kernels.ops.muse_spark_v12.helion_runtime import (
+from sglang.kernels.ops.muse_spark.helion_runtime import (
     token_count_specialization_key,
 )
 

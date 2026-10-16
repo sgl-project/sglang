@@ -766,7 +766,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
     ):
         """Fused JIT CUDA kernel implementation."""
         assert renormalize, "MuseSpark routing requires renormalize=True"
-        from sglang.kernels.ops.muse_spark_v12.routing import (
+        from sglang.kernels.ops.muse_spark.routing import (
             fused_muse_spark_routing as _jit_fused_muse_spark_routing,
         )
 
@@ -835,7 +835,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
         backends differ only in how they produce the raw scores and indices.
         """
         if envs.SGLANG_USE_CUSTOM_ROUTER_SUM.get():
-            from sglang.kernels.ops.muse_spark_v12.row_sum import row_sum
+            from sglang.kernels.ops.muse_spark.row_sum import row_sum
 
             score_sum = row_sum(topk_scores, dim=-1, keepdim=True)
         else:

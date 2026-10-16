@@ -19,10 +19,10 @@ import torch
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.muse_spark_v12 import (
+from sglang.kernels.ops.muse_spark import (
     fi_trtllm_moe_finalize_with_rmsnorm_cutedsl,
 )
-from sglang.kernels.ops.muse_spark_v12.fi_trtllm_moe_finalize_with_rmsnorm_cutedsl import (
+from sglang.kernels.ops.muse_spark.fi_trtllm_moe_finalize_with_rmsnorm_cutedsl import (
     FinalizePushWorkspace,
 )
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
@@ -354,7 +354,7 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
         *,
         ar_workspace: FinalizePushWorkspace | None = None,
     ) -> bool:
-        from sglang.kernels.ops.muse_spark_v12.helion_runtime import helion_supported
+        from sglang.kernels.ops.muse_spark.helion_runtime import helion_supported
 
         return (
             helion_supported("post_expert_finalize", output)
@@ -385,11 +385,11 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
     ) -> None:
         """Run Helion finalize, then a separate AR when delegated by the model."""
 
-        from sglang.kernels.ops.muse_spark_v12.helion_post_expert import (
+        from sglang.kernels.ops.muse_spark.helion_post_expert import (
             POST_EXPERT_FINALIZE_CONFIGS,
             _post_expert_finalize_helion_kernel,
         )
-        from sglang.kernels.ops.muse_spark_v12.helion_runtime import (
+        from sglang.kernels.ops.muse_spark.helion_runtime import (
             run_pinned_helion,
         )
 

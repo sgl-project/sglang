@@ -1,7 +1,7 @@
 """Fused post-norm + residual-add + pre-norm for MuseSpark v1.2.
 
 CUDA replacement for ``_fused_norm_residual_triton_kernel`` in
-``sglang.kernels.ops.muse_spark_v12.fused_norm_residual``. It dispatches between the original
+``sglang.kernels.ops.muse_spark.fused_norm_residual``. It dispatches between the original
 one-CTA kernel and the measured multi-CTA cluster kernel from the row count.
 
 The bf16 round-trips reproduced here are load-bearing for parity with the torch
@@ -125,9 +125,9 @@ def _jit_module(
         cluster_size,
     )
     return load_jit(
-        "muse_spark_v12_norm_residual",
+        "muse_spark_norm_residual",
         *args,
-        cuda_files=["muse_spark_v12/norm_residual.cuh"],
+        cuda_files=["muse_spark/norm_residual.cuh"],
         cuda_wrappers=[
             ("run_std", f"MuseSparkNormResidual<{args}, false, false>::run"),
             ("run_std_router", f"MuseSparkNormResidual<{args}, false, true>::run"),

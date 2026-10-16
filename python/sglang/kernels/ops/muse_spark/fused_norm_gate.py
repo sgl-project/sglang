@@ -15,7 +15,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.muse_spark_v12 import fused_op_tuning
+from sglang.kernels.ops.muse_spark import fused_op_tuning
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 
 
@@ -229,7 +229,7 @@ class FusedRMSNormGate(BaseFusedOp):
         if x.numel() == 0:
             return self.forward_native(x, g)
 
-        from sglang.kernels.ops.muse_spark_v12.norm_gate import (
+        from sglang.kernels.ops.muse_spark.norm_gate import (
             rms_norm_gate as _jit_rms_norm_gate,
         )
 
@@ -248,7 +248,7 @@ class FusedRMSNormGate(BaseFusedOp):
         x: torch.Tensor,
         g: torch.Tensor = None,
     ) -> bool:
-        from sglang.kernels.ops.muse_spark_v12.helion_runtime import helion_supported
+        from sglang.kernels.ops.muse_spark.helion_runtime import helion_supported
 
         if not helion_supported("rms_norm_gate", x):
             return False
@@ -278,11 +278,11 @@ class FusedRMSNormGate(BaseFusedOp):
     ) -> torch.Tensor:
         """Run Helion behind the existing fused operation boundary."""
         from sglang.kernels.jit.utils import is_arch_support_pdl
-        from sglang.kernels.ops.muse_spark_v12.helion_norm_gate import (
+        from sglang.kernels.ops.muse_spark.helion_norm_gate import (
             RMS_NORM_GATE_CONFIGS,
             _rms_norm_gate_helion_kernel,
         )
-        from sglang.kernels.ops.muse_spark_v12.helion_runtime import (
+        from sglang.kernels.ops.muse_spark.helion_runtime import (
             run_pinned_helion,
         )
 

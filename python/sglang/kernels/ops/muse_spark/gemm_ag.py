@@ -37,9 +37,9 @@ _VEC = 8
 def _jit_module(n: int, world_size: int) -> Module:
     args = make_cpp_args(n, world_size, is_arch_support_pdl())
     return load_jit(
-        "muse_spark_v12_all_gather",
+        "muse_spark_all_gather",
         *args,
-        cuda_files=["muse_spark_v12/all_gather.cuh"],
+        cuda_files=["muse_spark/all_gather.cuh"],
         cuda_wrappers=[("run", f"MuseSparkAllGather<{args}>::run")],
         extra_cuda_cflags=["-O3"],
     )

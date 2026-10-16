@@ -44,9 +44,9 @@ def _num_threads(hidden_size: int) -> int:
 def _jit_module(hidden_size: int, num_threads: int) -> Module:
     args = make_cpp_args(hidden_size, num_threads, is_arch_support_pdl())
     return load_jit(
-        "muse_spark_v12_norm_fp4_quant",
+        "muse_spark_norm_fp4_quant",
         *args,
-        cuda_files=["muse_spark_v12/norm_fp4_quant.cuh"],
+        cuda_files=["muse_spark/norm_fp4_quant.cuh"],
         cuda_wrappers=[
             ("run_quant", f"MuseSparkNormFp4Quant<{args}, true, false>::run"),
             ("run_quant_normed", f"MuseSparkNormFp4Quant<{args}, true, true>::run"),
@@ -137,7 +137,7 @@ class _FusedNormFP4Quant(BaseFusedOp):
         if backend is not KernelBackend.HELION:
             return True
 
-        from sglang.kernels.ops.muse_spark_v12.helion_runtime import helion_supported
+        from sglang.kernels.ops.muse_spark.helion_runtime import helion_supported
 
         return (
             helion_supported("norm_fp4_quant", x)
@@ -194,7 +194,7 @@ class _FusedNormFP4Quant(BaseFusedOp):
         quantize: bool = True,
         want_normed: bool = False,
     ):
-        from sglang.kernels.ops.muse_spark_v12.helion_norm_fp4_quant import (
+        from sglang.kernels.ops.muse_spark.helion_norm_fp4_quant import (
             fused_norm_fp4_quant_helion,
         )
 

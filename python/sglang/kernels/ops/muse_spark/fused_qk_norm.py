@@ -375,7 +375,7 @@ class FusedQKNorm(BaseFusedOp):
         cos_sin_cache: Optional[torch.Tensor] = None,
         kv_store: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> bool:
-        from sglang.kernels.ops.muse_spark_v12.helion_runtime import helion_supported
+        from sglang.kernels.ops.muse_spark.helion_runtime import helion_supported
 
         return (
             helion_supported("qk_norm", qkv)
@@ -405,11 +405,11 @@ class FusedQKNorm(BaseFusedOp):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run Helion behind the existing fused operation boundary."""
 
-        from sglang.kernels.ops.muse_spark_v12.helion_qk_norm import (
+        from sglang.kernels.ops.muse_spark.helion_qk_norm import (
             QK_NORM_CONFIGS,
             _qk_norm_helion_kernel,
         )
-        from sglang.kernels.ops.muse_spark_v12.helion_runtime import (
+        from sglang.kernels.ops.muse_spark.helion_runtime import (
             run_pinned_helion,
         )
 

@@ -7,7 +7,7 @@ uses tl.sum, whose reduction order is fixed by the Triton compiler
 and does not change across CUDA runtime versions.
 
 Usage:
-    from sglang.kernels.ops.muse_spark_v12.triton_sum import triton_sum
+    from sglang.kernels.ops.muse_spark.triton_sum import triton_sum
     score_sum = triton_sum(topk_scores, dim=-1, keepdim=True)
 """
 

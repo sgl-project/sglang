@@ -19,8 +19,8 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
-from sglang.kernels.ops.muse_spark_v12 import fused_op_tuning
-from sglang.kernels.ops.muse_spark_v12.all_gather_norm_residual import (
+from sglang.kernels.ops.muse_spark import fused_op_tuning
+from sglang.kernels.ops.muse_spark.all_gather_norm_residual import (
     all_gather_norm_residual,
 )
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
@@ -52,7 +52,7 @@ def _fused_norm_residual_config(
 
 
 def _jit_launch_config_ok(hidden_size: int) -> bool:
-    from sglang.kernels.ops.muse_spark_v12.norm_residual import _launch_config
+    from sglang.kernels.ops.muse_spark.norm_residual import _launch_config
 
     try:
         _launch_config(hidden_size, 1)
@@ -447,7 +447,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
                 pre_norm_dtype=pre_norm_dtype,
             )
 
-        from sglang.kernels.ops.muse_spark_v12.norm_residual import (
+        from sglang.kernels.ops.muse_spark.norm_residual import (
             fused_norm_residual as _jit_fused_norm_residual,
         )
 

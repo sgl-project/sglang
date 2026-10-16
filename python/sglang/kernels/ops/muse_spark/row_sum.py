@@ -1,4 +1,4 @@
-"""Row sum over [N, K] fp32, bitwise-identical to ``sglang.kernels.ops.muse_spark_v12.triton_sum``.
+"""Row sum over [N, K] fp32, bitwise-identical to ``sglang.kernels.ops.muse_spark.triton_sum``.
 
 Same contract: the reduction order is fixed by the kernel (tl.sum's pairwise
 tree), not by the CUDA runtime version, so results are stable across toolkits.
@@ -27,9 +27,9 @@ _THREADS = 128
 def _jit_module(block_k: int, threads: int) -> Module:
     args = make_cpp_args(block_k, threads, is_arch_support_pdl())
     return load_jit(
-        "muse_spark_v12_row_sum",
+        "muse_spark_row_sum",
         *args,
-        cuda_files=["muse_spark_v12/row_sum.cuh"],
+        cuda_files=["muse_spark/row_sum.cuh"],
         cuda_wrappers=[("muse_spark_row_sum", f"muse_spark_row_sum<{args}>")],
     )
 
