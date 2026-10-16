@@ -234,6 +234,23 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     )
 
 
+def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None:
+    # Runs after the DP division, so chunked_prefill_size is each rank's budget.
+    cfg = resolving_view(server_args)
+    if not cfg.enable_encoder_swa_bounded_replay:
+        return
+    if (
+        cfg.max_running_requests is None
+        or cfg.max_running_requests <= 0
+        or not cfg.chunked_prefill_size
+        or cfg.chunked_prefill_size < 128
+    ):
+        raise ValueError(
+            "encoder SWA replay requires --max-running-requests > 0 and at least "
+            "128 chunked prefill tokens per attention DP rank"
+        )
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
@@ -286,19 +303,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 raise ValueError(
                     f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
                 )
-        # This validation precedes the DP division of chunked_prefill_size.
-        min_prefill_tokens = 128 * cfg.attn_dp_size
-        if (
-            cfg.max_running_requests is None
-            or cfg.max_running_requests <= 0
-            or not cfg.chunked_prefill_size
-            or cfg.chunked_prefill_size < min_prefill_tokens
-        ):
-            raise ValueError(
-                "encoder SWA replay requires --max-running-requests > 0 and "
-                f"--chunked-prefill-size >= {min_prefill_tokens} "
-                "(128 tokens per attention DP rank)"
-            )
 
     unsupported = (
         (
