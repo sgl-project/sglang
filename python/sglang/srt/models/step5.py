@@ -1509,6 +1509,8 @@ class Step5Model(nn.Module):
 
 class Step5ForCausalLM(nn.Module):
     kv_cache_dtype_full_attention_only = True
+    # LoRA adapts attention, the dense MLPs and the shared expert, never the routed experts.
+    lora_frozen_routed_experts = True
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -1573,6 +1575,26 @@ class Step5ForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> tuple[int, int]:
+        """LoRA (input, output) widths; an MoE layer's gate_up/down is its shared expert."""
+        config = self.config
+        if module_name == "qkv_proj":
+            heads = config.num_attention_heads + 2 * config.num_key_value_heads
+            return config.hidden_size, heads * config.head_dim
+        if module_name == "o_proj":
+            return config.num_attention_heads * config.head_dim, config.hidden_size
+        intermediate = (
+            config.share_expert_dim
+            if layer_idx in config.moe_layer_list
+            else config.intermediate_size
+        )
+        if module_name == "gate_up_proj":
+            return config.hidden_size, 2 * intermediate
+        if module_name == "down_proj":
+            return intermediate, config.hidden_size
+        # The head-wise gate (g_proj) and the routed experts stay frozen.
+        raise ValueError(f"Step5 LoRA does not adapt {module_name}")
 
     @staticmethod
     def _checkpoint_duplicate_owners(expected, model_path) -> dict[str, str]:

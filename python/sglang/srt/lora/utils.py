@@ -153,6 +153,12 @@ def get_hidden_dim(
         )
 
 
+def lora_adapts_routed_experts(model: torch.nn.Module) -> bool:
+    """False for models whose gate_up_proj/down_proj targets name only dense and
+    shared-expert MLPs (Step5): their FusedMoE stays unwrapped and gets no buffers."""
+    return not getattr(model, "lora_frozen_routed_experts", False)
+
+
 def shared_experts_count(config: AutoConfig) -> Optional[int]:
     # DeepSeek-style configs say n_shared_experts, Kimi K3 says num_shared_experts
     return getattr(config, "n_shared_experts", None) or getattr(

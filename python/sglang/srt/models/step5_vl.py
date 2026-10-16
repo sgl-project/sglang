@@ -12,6 +12,10 @@ class Step5ForConditionalGeneration(Step3p7ForConditionalGeneration):
     """
 
     kv_cache_dtype_full_attention_only = True
+    lora_frozen_routed_experts = True
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> tuple[int, int]:
+        return self.language_model.get_hidden_dim(module_name, layer_idx)
 
 
 EntryClass = Step5ForConditionalGeneration

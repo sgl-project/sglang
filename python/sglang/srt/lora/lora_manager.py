@@ -44,6 +44,7 @@ from sglang.srt.lora.utils import (
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
+    lora_adapts_routed_experts,
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -1303,7 +1304,9 @@ class LoRAManager:
                 )
                 continue
 
-            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)):
+            if isinstance(
+                module, (FusedMoE, InklingBatchDenseMLP)
+            ) and lora_adapts_routed_experts(self.base_model):
                 expert_projections = ("gate_up_proj", "down_proj")
                 missing = [
                     x for x in expert_projections if x not in self.target_modules
