@@ -740,6 +740,8 @@ class Scheduler(
                 else self.draft_worker.graph_time_usage
             ),
         )
+        if self.rust_server is not None:
+            self.rust_server.set_startup_time(self.startup_time)
 
     def maybe_init_hccl_dp_prewarm(self) -> None:
         if not (

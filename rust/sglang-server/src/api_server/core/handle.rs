@@ -56,6 +56,7 @@ pub(crate) struct CoreMetadata {
     max_context_length: u64,
     max_total_num_tokens: u64,
     version: String,
+    launch_server_info: Arc<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<&ServerArgs> for CoreMetadata {
@@ -73,6 +74,7 @@ impl From<&ServerArgs> for CoreMetadata {
             max_context_length: args.model_config.context_len,
             max_total_num_tokens: args.max_total_num_tokens,
             version: args.version.clone(),
+            launch_server_info: args.launch_server_info.0.clone(),
         }
     }
 }
@@ -190,9 +192,10 @@ impl CoreHandle {
     /// Raw control bytes and the scheduler's full launch-argument dump never
     /// cross the core boundary.
     pub(crate) async fn server_info(&self) -> Result<ServerInfo, CoreError> {
-        let internal_state = self.internal_state().await?;
+        let mut internal_state = self.internal_state().await?;
         let metadata = &self.inner.metadata;
         Ok(ServerInfo {
+            launch_fields: metadata.launch_server_info.clone(),
             model_path: metadata.model_path.clone(),
             served_model_name: metadata.served_model_name.clone(),
             tokenizer_path: metadata.tokenizer_path.clone(),
@@ -200,6 +203,7 @@ impl CoreHandle {
             max_total_num_tokens: metadata.max_total_num_tokens,
             version: metadata.version.clone(),
             frontend: "rust",
+            startup_time: internal_state.rust_server_startup_time.take(),
             internal_states: vec![internal_state],
         })
     }
