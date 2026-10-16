@@ -367,7 +367,6 @@ def test_mhc_refresh_without_deepgemm_prenorm():
     base = torch.zeros(24, device="cuda")
     layer = _hopper_mhc_layer(norm, w, scale, base)
     layer._can_fuse_attn_mhc = layer._can_fuse_ffn_mhc = True
-    layer.local_boundary = layer.next_boundary = object()
     with (
         override_platform(is_sm100=True, is_sm90=False),
         envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
@@ -381,7 +380,6 @@ def test_mhc_refresh_without_deepgemm_prenorm():
     assert layer.attn_hc.bf16_parts is None
     assert "_can_fuse_attn_mhc" not in layer.__dict__
     assert "_can_fuse_ffn_mhc" not in layer.__dict__
-    assert layer.local_boundary is None and layer.next_boundary is None
 
 
 @pytest.mark.parametrize(

@@ -24,6 +24,8 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -34,6 +36,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.hicache_storage import (
@@ -42,6 +45,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
     RustUnifiedTreeCore,
@@ -63,8 +67,10 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
@@ -2184,7 +2190,14 @@ def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
 
 
 def _swa_transfer_core(
-    backend, unified=False, mamba=False, page_size=1, window=16, is_eagle=False
+    backend,
+    unified=False,
+    mamba=False,
+    page_size=1,
+    window=16,
+    is_eagle=False,
+    request_window=False,
+    has_swa_host_pool=True,
 ):
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -2210,6 +2223,7 @@ def _swa_transfer_core(
         tree_components=(ComponentType.FULL, ComponentType.SWA)
         + ((ComponentType.MAMBA,) if mamba else ()),
         sliding_window_size=window,
+        swa_gates_prefix_match=not request_window,
     )
     with get_context().override_server_args(
         _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -2229,7 +2243,7 @@ def _swa_transfer_core(
             core = UnifiedTreeCore(params, components)
             cache.tree_core = core
     core.set_hicache_enabled()
-    core.has_swa_host_pool = True
+    core.has_swa_host_pool = has_swa_host_pool
     return core, allocator
 
 
@@ -2609,7 +2623,13 @@ def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
     core.sanity_check([], [])
 
 
-def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
+def _swa_cache(
+    window: int = 8,
+    page_size: int = 1,
+    backend="rust",
+    ring=False,
+    request_window=False,
+):
     """A real UnifiedRadixCache and SWA allocator, defaulting to the Rust core."""
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -2636,6 +2656,9 @@ def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
     )
     if ring:
         kv_pool.swa_req_ring_size = window
+    if request_window:
+        # Stand-in for DeepSeek-V4.1's encoder-replay request window.
+        kv_pool.request_window = object()
     allocator = SWATokenToKVPoolAllocator(
         size=64,
         size_swa=64,
@@ -2654,6 +2677,7 @@ def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
                 page_size=page_size,
                 disable=False,
                 sliding_window_size=window,
+                swa_gates_prefix_match=not (ring or request_window),
                 tree_components=(ComponentType.FULL, ComponentType.SWA),
             )
         )
@@ -3690,10 +3714,14 @@ def test_write_back_swa_repair_backup_leaves_the_unbacked_parent_to_eviction(bac
         return device + 40000
 
     cache._execute_kv_backup = write
+    # An SWA eviction floor of 4 means the request's window already slid past
+    # its first 4 slots and released their SWA peers.
+    value = allocator.alloc(8)
+    allocator.free_swa(value[:4])
     cache.insert(
         InsertParams(
             key=_key(list(range(8))),
-            value=allocator.alloc(8),
+            value=value,
             component_evicted_seqlens={ComponentType.SWA: 4},
         )
     )
@@ -3991,6 +4019,50 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     assert cache.path_device_indices(matched.last_device_node).tolist() == (
         indices[:8].tolist() if ring else []
     )
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("hicache", [False, True])
+def test_swa_match_ignores_tombstones_with_a_request_window(backend, hicache):
+    # Encoder SWA replay keeps SWA in a per-request window and rebuilds it on a
+    # hit, so an SWA tombstone must not cut the Full-KV match short.
+    cache, allocator = _swa_cache(backend=backend, request_window=True)
+    indices = allocator.alloc(12)
+    cache.insert(
+        InsertParams(
+            key=_key(list(range(12))),
+            value=indices,
+            component_evicted_seqlens={ComponentType.SWA: 8},
+        )
+    )
+    if hicache:
+        cache.tree_core.set_hicache_enabled()
+    matched = cache.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
+    assert matched.full_kv_hit_length == 8
+    assert matched.device_prefix_len == 8
+    assert (
+        cache.path_device_indices(matched.last_device_node)[:8].tolist()
+        == indices[:8].tolist()
+    )
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("request_window", [False, True])
+def test_swa_host_only_prefix_matches_with_a_request_window(backend, request_window):
+    # Without an SWA host pool, a prefix demoted to host keeps no SWA value.
+    # Replay rebuilds a request window, so the prefix stays a host hit; paged
+    # SWA still requires resident SWA state.
+    core, _ = _swa_transfer_core(
+        backend, request_window=request_window, has_swa_host_pool=False
+    )
+    leaf = _insert(core, list(range(8)), list(range(10, 18))).last_device_node
+    core.commit_backup(leaf, torch.arange(100, 108), {})
+    core.mark_write_through_pending([leaf], leaf)
+    core.finish_write_through([leaf], leaf)
+    _accumulate_step(core.demote(leaf), {}, {}, {})
+    assert core.component_has_host_value_only(leaf, ComponentType.FULL)
+    matched = core.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
+    assert matched.host_hit_length == (8 if request_window else 0)
 
 
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
@@ -5394,6 +5466,71 @@ def test_insert_reports_whether_it_reached_the_swa_branch_boundary():
             ),
         )
         assert result.swa_branch_inserted is expected, branching_seqlen
+
+
+# ---- request priority at the i64 boundary ----
+
+
+class _RecordingUnifiedRadixCache(UnifiedRadixCache):
+    def __init__(self, params):
+        self.insert_priorities = []
+        super().__init__(params)
+
+    def insert(self, params):
+        self.insert_priorities.append(params.priority)
+        return super().insert(params)
+
+
+@pytest.mark.parametrize("priority", [(1 << 63) - 2, (1 << 63) - 1])
+def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
+    """Caching a finished request re-inserts its prompt one priority above the
+    request so eviction drops the output first. The core stores priority as a
+    signed 64-bit integer, so the boost must saturate at INT64_MAX instead of
+    overflowing the binding and failing the insert."""
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    # release_kv_cache reads the serving config off the published bags.
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    req_to_token_pool = ReqToTokenPool(
+        size=2, max_context_len=16, device="cpu", enable_memory_saver=False
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=16, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
+    )
+    cache = _RecordingUnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+            tree_core_backend="rust",
+        )
+    )
+    req = Req(
+        rid="priority",
+        origin_input_text=None,
+        origin_input_ids=array("q", [1, 2, 3]),
+        sampling_params=SamplingParams(max_new_tokens=2),
+        priority=priority,
+    )
+    req.output_ids = array("q", [4, 5])
+    req.finished_reason = "finished"
+    (req.kv.req_pool_idx,) = req_to_token_pool.alloc([req])
+    req.lock = cache.lock(cache.root_node_handle())
+    indices = allocator.alloc(5)
+    assert indices is not None
+    req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), indices)
+    req.kv.kv_committed_len = req.kv.kv_allocated_len = 5
+
+    release_kv_cache(req, cache, checkpoint=True)
+
+    assert req.priority == priority
+    assert cache.insert_priorities == [priority, (1 << 63) - 1]
+    match = cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(req.origin_input_ids + req.output_ids))
+    )
+    assert torch.equal(cache.path_device_indices(match.last_device_node), indices)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,9 @@ class KVArgs:
     # scatter transfer can slice each independently head-sharded sub-block; None
     # per tensor when the single contiguous slice already matches the layout.
     state_conv_shard_groups: List[List[Optional[List[int]]]]
+    # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
+    # None when the SWA state is not held in an MHA sub-pool.
+    swa_kv_cache_layout: Optional[str]
     ib_device: str
     gpu_id: int
     kv_head_num: int
@@ -125,6 +128,13 @@ class BaseKVManager(ABC):
 
     enable_deferred_decode_kv_release: bool = False
     supports_host_destination: bool = False
+
+    def should_verify_kv_checksum(self, bootstrap_addr: str) -> bool:
+        """Whether the checksum sent by the prefill at bootstrap_addr is comparable
+        with one over this rank's local KV. A backend returns False for a peer
+        whose digest covers a different byte range, e.g. a TP width mismatch where
+        each decode rank receives only a slice of what the sender digested."""
+        return True
 
     @abstractmethod
     def __init__(
