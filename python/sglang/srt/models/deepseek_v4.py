@@ -551,7 +551,14 @@ def _apply_wo_a_bf16_matmul(
     return torch.einsum("tgd,grd->tgr", o, wo_a)
 
 
-def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
+def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps, e8m0: bool = False):
+    if e8m0:
+        # Consumers run the e8m0 mxscale GEMM (SGLANG_DSV4_DENSE_MXSCALE).
+        from sglang.kernels.ops.layernorm.rmsnorm_fp8_e8m0 import (
+            rmsnorm_fp8_e8m0_quant,
+        )
+
+        return rmsnorm_fp8_e8m0_quant(hidden_states, weight, eps)
     x_quant, x_bf16, _, _ = fused_rms_fp8_group_quant(
         hidden_states,
         weight,
@@ -1125,6 +1132,22 @@ class MqaAttentionBase(nn.Module):
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
         return self._attn_sink_local[:kernel_num_heads]
+
+    def _q_lora_quant_e8m0(self, with_indexer: bool) -> bool:
+        """Whether the fused q_norm quant feeds wq_b (and the indexer's wq_b, which
+        reuses it) with ue8m0 scales: only when each consumer runs the e8m0 mxscale
+        GEMM. Resolved on first use, after the weights are processed."""
+        key = "_q_lora_e8m0_idx" if with_indexer else "_q_lora_e8m0"
+        cached = self.__dict__.get(key)
+        if cached is None:
+            from sglang.srt.layers.quantization.fp8_utils import dense_mxscale_ready
+
+            indexer = getattr(self, "indexer", None) if with_indexer else None
+            cached = dense_mxscale_ready(
+                self.wq_b, getattr(indexer, "wq_b", None) if indexer else None
+            )
+            self.__dict__[key] = cached
+        return cached
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -1897,6 +1920,7 @@ class MQALayer(MqaAttentionBase):
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
+                    e8m0=self._q_lora_quant_e8m0(with_indexer=False),
                 )
                 q, _ = self.wq_b(q_for_wqb)
             else:
@@ -2036,6 +2060,7 @@ class MQALayer(MqaAttentionBase):
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
+                    e8m0=self._q_lora_quant_e8m0(with_indexer=True),
                 )
                 q, _ = self.wq_b(q_for_wqb)
             else:
@@ -4251,10 +4276,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Module-level toggles default OFF; flipped True here for DSV4
         if _is_hip:
             from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
-            from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
+            from sglang.srt.layers.quantization.fp8_utils import (
+                set_dense_mxscale,
+                set_force_ck_w8a8,
+            )
 
             set_force_ck_w8a8(True)
             set_batched_rope(True)
+            if envs.SGLANG_DSV4_DENSE_MXSCALE.get():
+                set_dense_mxscale(True)
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
