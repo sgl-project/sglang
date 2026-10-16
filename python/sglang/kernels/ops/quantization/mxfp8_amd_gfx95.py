@@ -852,13 +852,13 @@ def flydsl_mxfp8_blockscaled_linear(
         )
 
     try:
-        from aiter.ops.flydsl import gemm_mxscale_preshuffle
+        from aiter.ops.flydsl import gemm_a8w8_mxscale_preshuffle_1x32_flydsl
     except ImportError as error:
         raise RuntimeError(
             "AITER FlyDSL MX-scale preshuffle GEMM is unavailable."
         ) from error
 
-    gemm_mxscale_preshuffle(
+    gemm_a8w8_mxscale_preshuffle_1x32_flydsl(
         x_q,
         weight,
         activation_scale_shuffled,
