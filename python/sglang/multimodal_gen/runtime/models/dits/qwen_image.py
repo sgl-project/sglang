@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -34,6 +33,7 @@ from sglang.kernels.ops.diffusion import (
     try_fused_scale_residual_norm_scale_shift_fp8,
     try_fused_scale_residual_norm_scale_shift_nvfp4,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
@@ -771,8 +771,7 @@ class QwenImageCrossAttention(nn.Module):
             and current_platform.is_cuda()
             and capability is not None
             and capability.major == 9
-            and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
-            not in {"0", "false", "off", "no"}
+            and envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         )
         self.use_fused_qkv = (
             isinstance(quant_config, NunchakuConfig) or quant_name == "modelopt_fp8"

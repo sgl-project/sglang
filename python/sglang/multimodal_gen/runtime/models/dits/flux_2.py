@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -42,6 +41,7 @@ from sglang.kernels.ops.diffusion import (
     try_fused_flux2_qkv_epilogue,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -139,8 +139,7 @@ def _flux2_single_qk_rope(q, k, q_norm, k_norm, head_dim, cache, complex_freqs):
             is not RMSNorm.forward_cuda
             for norm in (q_norm, k_norm)
         )
-        or os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
-        in {"0", "false", "off", "no"}
+        or not envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         or not can_use_flux2_strided_qknorm_rope(
             q, k, q_norm.weight, k_norm.weight, cache
         )
