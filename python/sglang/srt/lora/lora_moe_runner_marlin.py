@@ -31,6 +31,7 @@ if _is_cuda:
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
+        swiglu_gpt_oss_sigmoid_alpha_contiguous,
     )
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         moe_align_block_size,
@@ -80,11 +81,21 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         )
         routed_scaling_factor = runner_config.routed_scaling_factor
 
-        M, K = hidden_states.shape
+        M, hidden_size = hidden_states.shape
+        K = quant_info.w13_qweight.shape[1] * 16
+        padded_hidden_states = (
+            torch.nn.functional.pad(hidden_states, (0, K - hidden_size))
+            if K != hidden_size
+            else hidden_states
+        )
         E = quant_info.w13_qweight.shape[0]
         N = quant_info.w2_qweight.shape[1] * 16
+        intermediate_size = runner_config.intermediate_size_per_partition
         topk = topk_ids.shape[1]
         num_bits = quant_info.weight_bits
+        # Match the base MXFP4 runner: accumulate split-K in FP32 instead of
+        # BF16 atomics, which otherwise changes even a zero-adapter forward.
+        use_atomic_add = quant_info.w13_scales.dtype != torch.float8_e8m0fnu
 
         for block_size_m in [8, 16, 32, 48, 64]:
             if M * topk / E / block_size_m < 0.9:
@@ -123,7 +134,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
         )
         intermediate_cache1 = moe_wna16_marlin_gemm(
-            hidden_states,
+            padded_hidden_states,
             intermediate_cache1,
             quant_info.w13_qweight,
             quant_info.w13_bias,
@@ -146,23 +157,50 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             size_n=2 * N,
             size_k=K,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
 
+        # Remove Marlin's tile padding before applying the unpadded adapters.
+        if N != intermediate_size:
+            intermediate_cache1 = torch.cat(
+                (
+                    intermediate_cache1[:, :intermediate_size],
+                    intermediate_cache1[:, N : N + intermediate_size],
+                ),
+                dim=-1,
+            )
+
         # Hook: after gate_up
         if hooks.after_gate_up:
-            intermediate_cache1_3d = intermediate_cache1.view(M, topk, 2 * N)
+            intermediate_cache1_3d = intermediate_cache1.view(
+                M, topk, 2 * intermediate_size
+            )
             hooks.after_gate_up(
                 hidden_states, intermediate_cache1_3d, topk_weights, topk_ids
             )
 
         # Stage 2: Activation
         intermediate_cache2 = torch.empty(
-            (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype
+            (M * topk, intermediate_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
-        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+        if runner_config.gemm1_alpha is not None:
+            swiglu_gpt_oss_sigmoid_alpha_contiguous(
+                intermediate_cache2,
+                intermediate_cache1,
+                runner_config.gemm1_alpha,
+                runner_config.gemm1_clamp_limit,
+            )
+        else:
+            silu_and_mul(intermediate_cache1, intermediate_cache2)
+        padded_intermediate = (
+            torch.nn.functional.pad(intermediate_cache2, (0, N - intermediate_size))
+            if N != intermediate_size
+            else intermediate_cache2
+        )
 
         # Stage 3: Down (Marlin)
         intermediate_cache3 = torch.empty(
@@ -172,7 +210,7 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             intermediate_cache3.zero_()
 
         intermediate_cache3 = moe_wna16_marlin_gemm(
-            intermediate_cache2,
+            padded_intermediate,
             intermediate_cache3,
             quant_info.w2_qweight,
             quant_info.w2_bias,
@@ -195,11 +233,13 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
             size_n=K,
             size_k=N,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
-        intermediate_cache3 = intermediate_cache3.view(M, topk, K)
+        intermediate_cache3 = (
+            intermediate_cache3[:, :hidden_size].contiguous().view(M, topk, hidden_size)
+        )
 
         # Hook: after down
         if hooks.after_down:
