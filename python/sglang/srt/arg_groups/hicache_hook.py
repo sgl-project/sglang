@@ -76,26 +76,6 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
-    validate_radixshmem_storage(server_args)
-
-
-def validate_radixshmem_storage(server_args: Any):
-    cfg = resolving_view(server_args)
-    if cfg.hicache_storage_backend != "radixshmem":
-        return
-    if cfg.pp_size > 1:
-        raise ValueError(
-            "--hicache-storage-backend radixshmem does not support pipeline "
-            f"parallelism yet (--pp-size {cfg.pp_size})."
-        )
-    attn_group = cfg.tp_size // cfg.attn_dp_size
-    gpus_per_node = cfg.tp_size // max(cfg.nnodes, 1)
-    if cfg.nnodes > 1 and attn_group > gpus_per_node:
-        raise ValueError(
-            "--hicache-storage-backend radixshmem does not support an attention "
-            f"TP/CP group spanning nodes yet ({attn_group} ranks per group, "
-            f"{gpus_per_node} ranks per node)."
-        )
 
 
 def handle_hicache_ratio_default(server_args: Any):

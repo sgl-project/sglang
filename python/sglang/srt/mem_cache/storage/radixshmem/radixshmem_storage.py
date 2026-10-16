@@ -22,6 +22,12 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 logger = logging.getLogger(__name__)
 
+_PREFIX_KEYS_REQUIRED = (
+    "radixshmem stores each prefix as one radix path and needs "
+    '"hicache_storage_pass_prefix_keys": true in '
+    "--hicache-storage-backend-extra-config"
+)
+
 
 def _salt(*parts: object) -> int:
     digest = hashlib.blake2b("|".join(map(str, parts)).encode(), digest_size=8)
@@ -61,6 +67,55 @@ class _Comm:
 
     def min(self, tensor: torch.Tensor) -> None:
         self._dist.all_reduce(tensor, op=self._dist.ReduceOp.MIN, group=self.group)
+
+
+def _shard_layout():
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_cp_group,
+        get_attn_tp_group,
+    )
+
+    tp, cp = get_attn_tp_group(), get_attn_cp_group()
+    rows = [list(tp.ranks)]
+    if cp.world_size > 1:
+        gathered = [None] * cp.world_size
+        dist.all_gather_object(
+            gathered, (cp.rank_in_group, list(tp.ranks)), group=cp.cpu_group
+        )
+        rows = [row for _, row in sorted(gathered)]
+    members = [r for row in rows for r in row]
+    if len(set(members)) != tp.world_size * cp.world_size or any(
+        len(row) != tp.world_size for row in rows
+    ):
+        raise RuntimeError(
+            f"attention TP groups {rows} do not tile the attention CP group"
+        )
+    identity = dict(
+        tp_part=tp.rank_in_group,
+        tp_parts=tp.world_size,
+        cp_rank=cp.rank_in_group,
+        cp_parts=cp.world_size,
+        leader_rank=rows[0][0],
+    )
+    return members, identity
+
+
+def _prefix_keys_enabled() -> Optional[bool]:
+    try:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.runtime_context import get_memory
+
+        memory = get_memory()
+        if memory.hicache_storage_backend != "radixshmem":
+            return None
+        raw = memory.hicache_storage_backend_extra_config
+    except Exception:
+        return None
+    return bool(HybridCacheController.parse_storage_backend_extra_config(raw)[4])
 
 
 def _as_comm(group, src: int):
@@ -148,7 +203,6 @@ class _Pool:
 
 class RadixShmemStorage(HiCacheStorage):
     shard_collective = True
-    sidecars_after_kv = True
 
     def __init__(self, storage_config: HiCacheStorageConfig, mem_pool_host: Any = None):
         import radixshmem
@@ -158,6 +212,8 @@ class RadixShmemStorage(HiCacheStorage):
                 "radixshmem does not support pipeline parallelism yet "
                 f"(pp_size={storage_config.pp_size})"
             )
+        if _prefix_keys_enabled() is False:
+            raise ValueError(_PREFIX_KEYS_REQUIRED)
         self.radixshmem = radixshmem
         self.config = storage_config
         cfg = storage_config.extra_config or {}
@@ -181,8 +237,10 @@ class RadixShmemStorage(HiCacheStorage):
         }
         self.swa_window_pages = int(cfg.get("radixshmem_swa_window_pages", 0))
         self.kv_heads_override = cfg.get("radixshmem_kv_heads")
-        self.device_pools: Dict[Any, Any] = {}
+        self.mamba_shape: Any = None
         self.insert_ok = radixshmem.InsertError.OK
+        self.full_path_missing = radixshmem.InsertError.FULL_PATH_MISSING
+        self.defer_s = float(cfg.get("radixshmem_defer_s", 60))
         self.host_pools: Dict[Any, Any] = {}
         self.pools: Dict[Any, _Pool] = {}
         self.client = None
@@ -192,7 +250,38 @@ class RadixShmemStorage(HiCacheStorage):
         self._attach_lock = threading.Lock()
         self._retry_at = 0.0
         self._down_since: Optional[float] = None
+        self._deferred: List[Tuple[float, np.ndarray, np.ndarray, Any]] = []
+        self._own_groups: List[Any] = []
         self.set_shard_groups(None, None)
+        self._build_shard_groups()
+
+    def _build_shard_groups(self) -> None:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            return
+        import socket
+
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        members, identity = _shard_layout()
+        groups = [
+            create_custom_parallel_group(group_ranks=members, backend="gloo")
+            for _ in range(2)
+        ]
+        if len(members) == 1:
+            for group in groups:
+                dist.destroy_process_group(group)
+            return
+        self._own_groups = groups
+        hosts = [None] * len(members)
+        dist.all_gather_object(hosts, socket.gethostname(), group=groups[0])
+        if len(set(hosts)) > 1:
+            raise RuntimeError(
+                "radixshmem does not support an attention TP/CP group spanning "
+                f"nodes yet: {sorted(set(hosts))}"
+            )
+        self.set_shard_groups(*groups, **identity)
 
     def read_barrier(self, go: bool) -> bool:
         flag = torch.tensor([int(go)], dtype=torch.int64)
@@ -226,9 +315,6 @@ class RadixShmemStorage(HiCacheStorage):
 
     def register_mem_host_pool_v2(self, host_pool: Any, host_pool_name) -> None:
         self._register(host_pool_name, host_pool)
-
-    def describe_pool(self, name, device_pool: Any) -> None:
-        self.device_pools[name] = getattr(device_pool, "mamba_pool", device_pool)
 
     def _register(self, name, host_pool: Any) -> None:
         self.host_pools[name] = host_pool
@@ -317,6 +403,18 @@ class RadixShmemStorage(HiCacheStorage):
         )
         return _Layout([part], 2 * shape[1] * ps * heads * shape[4] * kv.itemsize)
 
+    def _mamba_state_shape(self) -> Any:
+        if self.mamba_shape is None:
+            try:
+                from sglang.srt.configs.hybrid_arch import mambaish_config
+                from sglang.srt.runtime_context import process_model_config
+
+                config = mambaish_config(process_model_config())
+                self.mamba_shape = config.mamba2_cache_params.shape
+            except Exception:
+                self.mamba_shape = False
+        return self.mamba_shape or None
+
     def _mamba_layout(self, name, host_pool: Any) -> Optional[_Layout]:
         from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 
@@ -325,9 +423,9 @@ class RadixShmemStorage(HiCacheStorage):
         side = list(getattr(host_pool, "slot_state_buffers", None) or ())
         if len(side) != len(getattr(host_pool, "slot_state_device_tensors", ())):
             return None
-        device = self.device_pools.get(name)
-        groups = getattr(device, "conv_shard_groups", None)
-        conv_axis = getattr(device, "conv_slice_axis", 0)
+        shape = self._mamba_state_shape()
+        groups = getattr(shape, "conv_shard_groups", None)
+        conv_axis = getattr(shape, "conv_slice_axis", 0)
         page_first = host_pool.layout in ("page_first", "page_first_direct")
 
         def at(buf):
@@ -538,6 +636,7 @@ class RadixShmemStorage(HiCacheStorage):
         return self._hit(self.pools[PoolName.KV], keys, extra_info)
 
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
+        self._require_prefix(extra_info)
         self._plan()
         return self._store(self.pools[PoolName.KV], keys, host_indices, extra_info)
 
@@ -587,6 +686,7 @@ class RadixShmemStorage(HiCacheStorage):
         return PoolTransferResult(final, hits, restorable)
 
     def batch_set_v2(self, transfers, extra_info=None) -> dict:
+        self._require_prefix(extra_info)
         self._plan()
         return {t.name: self._write_transfer(t, extra_info) for t in transfers}
 
@@ -613,6 +713,11 @@ class RadixShmemStorage(HiCacheStorage):
                 pool, transfer.keys, transfer.host_indices, extra_info
             )
         return self._load_pages(pool, transfer.keys, transfer.host_indices)
+
+    @staticmethod
+    def _require_prefix(extra_info) -> None:
+        if extra_info is None or extra_info.prefix_keys is None:
+            raise ValueError(_PREFIX_KEYS_REQUIRED)
 
     @staticmethod
     def _has_prefix(extra_info) -> bool:
@@ -836,7 +941,10 @@ class RadixShmemStorage(HiCacheStorage):
 
         def publish(slots):
             result = self.index.insert(chain, slots, start, True, component=self.full)
-            return [self._published(chain, slots, result)] * n
+            ok = self._published(chain, slots, result)
+            if ok and self._deferred:
+                self._publish_deferred()
+            return [ok] * n
 
         return self._write(
             pool,
@@ -899,13 +1007,9 @@ class RadixShmemStorage(HiCacheStorage):
 
         def publish(slots):
             if len(ends) == 1:
-                result = self.index.insert(chain, slots, 0, True, component=pool.kind)
-                return [result.error == self.insert_ok] * n
+                return [self._publish_component(chain, slots, pool.kind)] * n
             return [
-                self.index.insert(
-                    chain[:end], slots[i : i + 1], 0, True, component=pool.kind
-                ).error
-                == self.insert_ok
+                self._publish_component(chain[:end], slots[i : i + 1], pool.kind)
                 for i, end in enumerate(ends)
             ]
 
@@ -915,6 +1019,32 @@ class RadixShmemStorage(HiCacheStorage):
             lambda slots: self._copy(pool, host_indices, list(enumerate(slots)), True),
             publish,
         )
+
+    def _publish_component(self, chain: np.ndarray, slots: np.ndarray, kind) -> bool:
+        result = self.index.insert(chain, slots, 0, False, component=kind)
+        if result.error == self.full_path_missing:
+            self._deferred.append((time.monotonic(), chain, slots, kind))
+            return True
+        unused = np.asarray(getattr(result, "unused_slots", ()), dtype=np.int32)
+        if result.error != self.insert_ok:
+            unused = slots
+        if len(unused):
+            self.index.recycle_slots(unused, kind)
+        return result.error == self.insert_ok
+
+    def _publish_deferred(self) -> None:
+        now, pending = time.monotonic(), self._deferred
+        self._deferred = []
+        for since, chain, slots, kind in pending:
+            result = self.index.insert(chain, slots, 0, False, component=kind)
+            if result.error == self.full_path_missing and now - since < self.defer_s:
+                self._deferred.append((since, chain, slots, kind))
+                continue
+            unused = np.asarray(getattr(result, "unused_slots", ()), dtype=np.int32)
+            if result.error != self.insert_ok:
+                unused = slots
+            if len(unused):
+                self.index.recycle_slots(unused, kind)
 
     def _load_component(self, pool: _Pool, keys, host_indices, extra_info):
         n = len(keys)
@@ -1005,6 +1135,15 @@ class RadixShmemStorage(HiCacheStorage):
     def close(self) -> None:
         if self.client is not None:
             self.client.close()
+        if self._own_groups:
+            import torch.distributed as dist
+
+            for group in self._own_groups:
+                try:
+                    dist.destroy_process_group(group)
+                except Exception:
+                    pass
+            self._own_groups = []
 
     def get(self, key, target_location=None, target_sizes=None):
         raise NotImplementedError("radixshmem uses the zero-copy v1/v2 interface")

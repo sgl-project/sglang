@@ -319,7 +319,6 @@ class HiCacheController:
         self.pp_group = pp_group
         self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
-        self.storage_shard_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -427,68 +426,6 @@ class HiCacheController:
                 )
             )
         return groups
-
-    @staticmethod
-    def _shard_layout():
-        from sglang.srt.distributed.parallel_state import (
-            get_attn_cp_group,
-            get_attn_tp_group,
-        )
-
-        tp, cp = get_attn_tp_group(), get_attn_cp_group()
-        rows = [list(tp.ranks)]
-        if cp.world_size > 1:
-            gathered = [None] * cp.world_size
-            torch.distributed.all_gather_object(
-                gathered, (cp.rank_in_group, list(tp.ranks)), group=cp.cpu_group
-            )
-            rows = [row for _, row in sorted(gathered)]
-        members = [r for row in rows for r in row]
-        if len(set(members)) != tp.world_size * cp.world_size or any(
-            len(row) != tp.world_size for row in rows
-        ):
-            raise RuntimeError(
-                f"attention TP groups {rows} do not tile the attention CP group"
-            )
-        identity = dict(
-            tp_part=tp.rank_in_group,
-            tp_parts=tp.world_size,
-            cp_rank=cp.rank_in_group,
-            cp_parts=cp.world_size,
-            leader_rank=rows[0][0],
-        )
-        return members, identity
-
-    def _attach_shard_groups(self) -> None:
-        if not getattr(self.storage_backend, "shard_collective", False):
-            return
-        if not torch.distributed.is_initialized():
-            self.storage_backend.set_shard_groups(None, None)
-            return
-        import socket
-
-        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
-
-        members, identity = self._shard_layout()
-        groups = [
-            create_custom_parallel_group(group_ranks=members, backend="gloo")
-            for _ in range(2)
-        ]
-        if len(members) == 1:
-            self._destroy_sync_groups(groups)
-            groups = [None, None]
-        else:
-            self.storage_shard_groups = groups
-            hosts = [None] * len(members)
-            torch.distributed.all_gather_object(
-                hosts, socket.gethostname(), group=groups[0]
-            )
-            if len(set(hosts)) > 1:
-                raise RuntimeError(
-                    f"{self.storage_backend_type} does not support an attention "
-                    f"TP/CP group spanning nodes yet: {sorted(set(hosts))}"
-                )
-        self.storage_backend.set_shard_groups(*groups, **identity)
 
     def _storage_read_barrier(self, go: bool) -> bool:
         backend = self.storage_backend
@@ -647,7 +584,6 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.storage_host_pool
             )
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
-            self._attach_shard_groups()
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -706,10 +642,8 @@ class HiCacheController:
                 pass
             self._destroy_sync_groups(self.prefetch_hits_sync_groups)
             self._destroy_sync_groups(self.prefetch_completion_sync_groups)
-            self._destroy_sync_groups(self.storage_shard_groups)
             self.prefetch_hits_sync_groups = []
             self.prefetch_completion_sync_groups = []
-            self.storage_shard_groups = []
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -748,13 +682,10 @@ class HiCacheController:
 
         # Best-effort destroy process groups created for storage ops.
         self._destroy_sync_groups(
-            self.prefetch_hits_sync_groups
-            + self.prefetch_completion_sync_groups
-            + self.storage_shard_groups
+            self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
         )
         self.prefetch_hits_sync_groups = []
         self.prefetch_completion_sync_groups = []
-        self.storage_shard_groups = []
 
         # Best-effort close (some backends rely on GC/destructor).
         try:

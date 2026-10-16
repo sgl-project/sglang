@@ -463,7 +463,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
             ) = HybridCacheController.parse_storage_backend_extra_config(
-                get_memory().hicache_storage_backend_extra_config, storage_backend
+                get_memory().hicache_storage_backend_extra_config
             )
             if server_args.file_storage_path:
                 storage_extra_config = dict(storage_extra_config or {})

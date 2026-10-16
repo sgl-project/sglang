@@ -342,13 +342,7 @@ class HybridCacheController(BaseHiCacheController):
             raise
 
         for entry in host_pools or []:
-            self._register_storage_entry(entry)
-
-    def _register_storage_entry(self, entry: PoolEntry) -> None:
-        describe = getattr(self.storage_backend, "describe_pool", None)
-        if describe is not None:
-            describe(entry.name, entry.device_pool)
-        self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def detach_storage_backend(self):
         super().detach_storage_backend()
@@ -366,12 +360,11 @@ class HybridCacheController(BaseHiCacheController):
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
-            self._register_storage_entry(entry)
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
-        storage_backend: Optional[str] = None,
     ) -> tuple[dict, int, float, float, bool]:
         extra_config = {}
         if storage_backend_extra_config:
@@ -423,12 +416,6 @@ class HybridCacheController(BaseHiCacheController):
                 "hicache_storage_pass_prefix_keys must be bool, got "
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
-        if storage_backend == "radixshmem" and not hicache_storage_pass_prefix_keys:
-            logger.warning(
-                "radixshmem stores each prefix as one radix path and needs "
-                "hicache_storage_pass_prefix_keys; enabling it."
-            )
-            hicache_storage_pass_prefix_keys = True
 
         return (
             extra_config,
@@ -1589,9 +1576,6 @@ class HybridCacheController(BaseHiCacheController):
             for transfer in operation.pool_transfers or []
             if self.should_backup(transfer)
         ]
-        kv_first = getattr(self.storage_backend, "sidecars_after_kv", False)
-        if kv_first and not self.backup_skip:
-            super()._page_backup(operation)
 
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
@@ -1607,8 +1591,7 @@ class HybridCacheController(BaseHiCacheController):
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
         if not self.backup_skip:
-            if not kv_first:
-                super()._page_backup(operation)
+            super()._page_backup(operation)
         else:
             sidecar_ok = bool(backup_transfers)
             if sidecar_ok:

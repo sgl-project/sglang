@@ -326,9 +326,8 @@ class TestRadixShmemLayout(CustomTestCase):
             )
             mambas = [_MambaHost(4 // tp, 16 // tp) for _ in range(tp)]
             for (s, _), m in zip(ranks, mambas):
-                s.describe_pool(
-                    PoolName.MAMBA,
-                    SimpleNamespace(conv_shard_groups=groups, conv_slice_axis=0),
+                s.mamba_shape = SimpleNamespace(
+                    conv_shard_groups=groups, conv_slice_axis=0
                 )
                 s.register_mem_host_pool_v2(m, PoolName.MAMBA)
             writers.append((ranks, mambas, tp))
@@ -369,7 +368,7 @@ class TestRadixShmemLayout(CustomTestCase):
         ranks = self._ranks(2, lambda _: _MHAHost("page_first", KV_HEADS // 2))
         mambas = [_MambaHost(2, 8, side=3) for _ in ranks]
         for r, ((s, _), m) in enumerate(zip(ranks, mambas)):
-            s.describe_pool(PoolName.MAMBA, SimpleNamespace(conv_shard_groups=None))
+            s.mamba_shape = SimpleNamespace(conv_shard_groups=None, conv_slice_axis=0)
             s.register_mem_host_pool_v2(m, PoolName.MAMBA)
             m.temporal_buffer[1].fill_(r + 1)
             m.slot_state_buffers[0][1].fill_(7 if r == 0 else -1)

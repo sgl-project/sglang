@@ -185,6 +185,56 @@ class TestRadixShmemComponents(CustomTestCase):
         )
         storage.close()
 
+    def test_component_before_kv_is_deferred(self):
+        mamba = _HostPool(4, 256, page_size=1)
+        storage, _ = self._backend(mamba=mamba)
+        keys = _keys(3)
+        mamba.page(0).fill_(6)
+        state = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.tensor([0]),
+            keys=keys[2:],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        self.assertEqual(
+            storage.batch_set_v2([state], _info(keys[:2])), {PoolName.MAMBA: [True]}
+        )
+        probe = PoolTransfer(
+            name=PoolName.MAMBA, keys=["x"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+        )
+        self.assertEqual(
+            storage.batch_exists_v2(keys, [probe], _info([])).kv_hit_pages, 0
+        )
+        self.assertEqual(len(storage._deferred), 1)
+        storage.batch_set_v1(keys, _indices(3), _info([]))
+        self.assertEqual(storage._deferred, [])
+        self.assertEqual(
+            storage.batch_exists_v2(keys, [probe], _info([])).kv_hit_pages, 3
+        )
+        mamba.buf.zero_()
+        self.assertEqual(
+            storage.batch_get_v2([state], _info(keys[:2])), {PoolName.MAMBA: [True]}
+        )
+        self.assertTrue(torch.all(mamba.page(0) == 6))
+        storage.close()
+
+    def test_deferred_component_expires(self):
+        mamba = _HostPool(4, 256, page_size=1)
+        storage, _ = self._backend(mamba=mamba)
+        storage.defer_s = 0.0
+        keys = _keys(2, "orphan")
+        state = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.tensor([0]),
+            keys=keys[1:],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        storage.batch_set_v2([state], _info(keys[:1]))
+        self.assertEqual(len(storage._deferred), 1)
+        storage.batch_set_v1(_keys(1, "other"), _indices(1), _info([]))
+        self.assertEqual(storage._deferred, [])
+        storage.close()
+
     def test_window_unknown_falls_back_to_pages(self):
         swa = _HostPool(16, 32)
         storage, _ = self._backend(window=0, swa=swa)

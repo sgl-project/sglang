@@ -118,7 +118,7 @@ class StorageAttachment:
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
             ) = HybridCacheController.parse_storage_backend_extra_config(
-                storage_backend_extra_config_json, storage_backend
+                storage_backend_extra_config_json
             )
         except Exception as e:
             logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")

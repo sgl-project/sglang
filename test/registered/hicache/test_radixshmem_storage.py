@@ -435,11 +435,16 @@ class TestRadixShmemStorage(CustomTestCase):
             storage.batch_set_v1(keys[4:], _indices(2), _info(keys[:4])), [True] * 2
         )
 
-    def test_prefix_none_means_root(self):
+    def test_prefix_keys_required(self):
         storage, _ = self._backend()
-        keys = _keys(2)
-        storage.batch_set_v1(keys, _indices(2), HiCacheStorageExtraInfo())
-        self.assertEqual(storage.batch_exists(keys, _info([])), 2)
+        with self.assertRaises(ValueError):
+            storage.batch_set_v1(_keys(2), _indices(2), HiCacheStorageExtraInfo())
+        with mock.patch(
+            "sglang.srt.mem_cache.storage.radixshmem.radixshmem_storage._prefix_keys_enabled",
+            return_value=False,
+        ):
+            with self.assertRaises(ValueError):
+                self._backend()
 
     def _group(self, tp=2, cp=1, is_mla=False, pages=8):
         size = tp * cp
@@ -697,7 +702,9 @@ class TestRadixShmemStorage(CustomTestCase):
 
 class TestRadixShmemConfig(CustomTestCase):
     def test_shard_layout_from_sglang_groups(self):
-        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.storage.radixshmem.radixshmem_storage import (
+            _shard_layout,
+        )
 
         rows = [[9, 3, 12, 0], [5, 1, 14, 7]]
         tp = SimpleNamespace(ranks=rows[1], rank_in_group=2, world_size=4)
@@ -720,7 +727,7 @@ class TestRadixShmemConfig(CustomTestCase):
             ),
             mock.patch("torch.distributed.all_gather_object", side_effect=gather),
         ):
-            members, identity = HiCacheController._shard_layout()
+            members, identity = _shard_layout()
         self.assertEqual(members, [9, 3, 12, 0, 5, 1, 14, 7])
         self.assertEqual(
             identity,
@@ -739,7 +746,7 @@ class TestRadixShmemConfig(CustomTestCase):
             mock.patch("torch.distributed.all_gather_object", side_effect=gather),
             self.assertRaises(RuntimeError),
         ):
-            HiCacheController._shard_layout()
+            _shard_layout()
 
     def test_pipeline_parallel_rejected(self):
         with mock.patch.dict(sys.modules, {"radixshmem": _FAKE_RADIXSHMEM}):
@@ -749,43 +756,6 @@ class TestRadixShmemConfig(CustomTestCase):
             config.pp_size = 2
             with self.assertRaises(ValueError):
                 RadixShmemStorage(config, _FakeHostPool(8))
-
-    def test_prefix_keys_forced_on(self):
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-            HybridCacheController,
-        )
-
-        parse = HybridCacheController.parse_storage_backend_extra_config
-        self.assertFalse(parse("{}", "mooncake")[4])
-        with self.assertLogs(level="WARNING"):
-            self.assertTrue(parse("{}", "radixshmem")[4])
-        self.assertTrue(
-            parse('{"hicache_storage_pass_prefix_keys": true}', "radixshmem")[4]
-        )
-
-    def test_startup_guard(self):
-        from sglang.srt.arg_groups import hicache_hook
-
-        def check(**kw):
-            cfg = SimpleNamespace(
-                hicache_storage_backend="radixshmem",
-                enable_dsa_cache_layer_split=False,
-                tp_size=8,
-                pp_size=1,
-                attn_dp_size=1,
-                nnodes=1,
-            )
-            for k, v in kw.items():
-                setattr(cfg, k, v)
-            with mock.patch.object(hicache_hook, "resolving_view", lambda _: cfg):
-                hicache_hook.validate_radixshmem_storage(None)
-
-        check()
-        check(nnodes=2, attn_dp_size=2)
-        check(enable_dsa_cache_layer_split=True)
-        for bad in (dict(nnodes=2), dict(pp_size=2), dict(pp_size=2, nnodes=2)):
-            with self.assertRaises(ValueError, msg=str(bad)):
-                check(**bad)
 
 
 if __name__ == "__main__":
