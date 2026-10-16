@@ -25,9 +25,13 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-TEST_MODEL = os.environ.get(
-    "SGLANG_ELASTIC_RECOVER_TEST_MODEL",
-    try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA),
+TEST_MODEL = (
+    os.environ.get("SGLANG_ELASTIC_RECOVER_TEST_MODEL")
+    # Shared with test_mooncake_scale_down.py in this directory, so one export
+    # aims both at a locally staged copy. Checked before the cached default,
+    # which reaches the hub and so fails on a host without access to it.
+    or os.environ.get("NIXL_EP_TEST_MODEL")
+    or try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 )
 EP_SIZE = 8
 LOCAL_EP_SIZE = 4
@@ -39,6 +43,19 @@ RECOVER_TIMEOUT_SECONDS = float(
     os.environ.get("SGLANG_ELASTIC_RECOVER_TIMEOUT_SECONDS", "300")
 )
 RANDOM_SEED = int(os.environ.get("SGLANG_ELASTIC_RECOVER_RANDOM_SEED", "42"))
+# Raise this above the scheduler's watchdog to let a stuck cohort dump its stacks
+# rather than have the client give up first and take the servers down with it.
+REQUEST_TIMEOUT_SECONDS = float(
+    os.environ.get("SGLANG_ELASTIC_RECOVER_REQUEST_TIMEOUT_S", "90")
+)
+# Named explicitly, as test_mooncake_scale_down.py does. ``auto`` resolves to
+# ``triton`` for the unquantized BF16 weights this test defaults to, and no
+# ``deepep_ll``->``triton`` pre-permute is registered, so with
+# --deepep-mode low_latency every rank dies on its first forward with
+#   AssertionError: Pre-permute function for deepep_ll to triton is not registered
+MOE_RUNNER_BACKEND = os.environ.get(
+    "SGLANG_ELASTIC_RECOVER_MOE_RUNNER_BACKEND", "deep_gemm"
+).strip()
 ib_devices = get_rdma_devices_args()
 
 
@@ -88,6 +105,8 @@ def _server_args(node_rank: int, port: int, recover: bool = False) -> list[str]:
         "mooncake",
         "--deepep-mode",
         "low_latency",
+        "--moe-runner-backend",
+        MOE_RUNNER_BACKEND,
         "--moe-dense-tp-size",
         "1",
         "--disable-custom-all-reduce",
@@ -150,7 +169,9 @@ class TestElasticRecover4To4(CustomTestCase):
         name: str,
         recover: bool = False,
     ) -> subprocess.Popen:
-        log_path = Path(f"/tmp/elastic_ep_recover_{name}_{int(time.time())}.log")
+        log_dir = Path(os.environ.get("SGLANG_ELASTIC_RECOVER_LOG_DIR", "/tmp"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"elastic_ep_recover_{name}_{int(time.time())}.log"
         log_file = open(log_path, "w")
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
@@ -181,7 +202,9 @@ class TestElasticRecover4To4(CustomTestCase):
         }
         if routed_dp_rank is not None:
             payload["routed_dp_rank"] = routed_dp_rank
-        return requests.post(f"{self.base_url}/generate", json=payload, timeout=90)
+        return requests.post(
+            f"{self.base_url}/generate", json=payload, timeout=REQUEST_TIMEOUT_SECONDS
+        )
 
     def _generate_ok(self, description: str, routed_dp_rank: int | None = None) -> None:
         response = self._generate(routed_dp_rank)
@@ -227,9 +250,30 @@ class TestElasticRecover4To4(CustomTestCase):
             ):
                 for request_index in range(3):
                     self._generate_ok(f"post-recovery request {request_index + 1}")
+                for dp_rank in range(LOCAL_EP_SIZE, EP_SIZE):
+                    self._generate_ok_on_recovered_rank(dp_rank)
                 return
             time.sleep(2)
         self.fail(f"Timed out waiting for recovery collective: {primary_log}")
+
+    def _generate_ok_on_recovered_rank(self, dp_rank: int) -> None:
+        # Round robin may never land on a recovered rank, so pin one request to each.
+        # The controller rejects a pin until it sees the rank active, and that reject
+        # returns at once; a request it accepts but never answers hits the timeout.
+        description = f"request routed to recovered DP{dp_rank}"
+        deadline = time.monotonic() + RECOVER_TIMEOUT_SECONDS
+        while True:
+            response = self._generate(dp_rank)
+            if response.status_code == 200 or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+        self.assertEqual(response.status_code, 200, f"{description}: {response.text}")
+        generated_text = response.json().get("text", "")
+        self.assertIn(
+            "paris",
+            generated_text.casefold(),
+            f"{description}: unexpected generation: {generated_text!r}",
+        )
 
     def test_recover_four_ranks(self):
         self._generate_ok("initial service")

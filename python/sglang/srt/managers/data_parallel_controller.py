@@ -37,12 +37,15 @@ from sglang.srt.elastic_ep.topology import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ElasticDrainClearReq,
     ElasticScaleUpdateReq,
     ProfileReq,
+    ScaleElasticEPReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -99,6 +102,14 @@ class WorkerPortHandshake:
     worker_ports: list[int]
     attn_tp_size: int
     attn_cp_size: int
+
+
+class DPRoutingUnavailable(RuntimeError):
+    """No DP worker can take this request.
+
+    Its own type so the event loop can absorb exactly this and nothing else. Every
+    other failure in a dispatch is a bug, and swallowing those hides them.
+    """
 
 
 class LoadBalanceMethod(Enum):
@@ -177,9 +188,16 @@ class DataParallelController:
 
         # Init inter-process communication
         self.context = zmq.Context(1 + get_parallel().num_dp_ranks)
+        self.send_to_tokenizer = None
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            # The only path back. Everything else here pushes down to the schedulers,
+            # so a request this process cannot route has nowhere to be reported and
+            # the client is left waiting on a rid nothing will ever complete.
+            self.send_to_tokenizer = get_zmq_socket(
+                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
         # Dispatch method
@@ -237,6 +255,10 @@ class DataParallelController:
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
+        # Slots that are draining for a shrink. Still active for control delivery --
+        # they need the scale request itself -- but excluded from request routing, so
+        # their drain can reach idle instead of being fed until the commit.
+        self._draining_slots: set[int] = set()
 
         if get_parallel().attn_dp_enabled:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -334,6 +356,58 @@ class DataParallelController:
             self.max_dp_size,
         )
 
+    def remove_elastic_workers(self, slot_offset: int, slot_count: int):
+        """Deactivate retired slots, keeping ZMQ sockets bound for a later regrow."""
+        end = slot_offset + slot_count
+        if end > self.max_dp_size:
+            raise ValueError(
+                f"remove_elastic_workers: {slot_offset}+{slot_count} > {self.max_dp_size}"
+            )
+        for slot in range(slot_offset, end):
+            self.dp_active[slot] = self.status[slot] = False
+        self._refresh_active_workers()
+
+    def _dispatch_elastic_scale_request(self, obj: ScaleElasticEPReqInput) -> None:
+        """Forward the scale request, then stop routing new work to the retiring slots.
+
+        Forwarded first, because the retirees have to receive this message to begin
+        draining at all. Once they have it they must not be fed any more requests, or
+        their drain never reaches idle; that is also what lets the tokenizer hold back
+        only the requests pinned to those slots instead of pausing the whole server."""
+        self.send_control_message(obj)
+        if obj.new_ep_size < self._active_count_cache:
+            # Retirees are the contiguous tail of the active list.
+            self._draining_slots = {
+                slot for slot in self._active_workers if slot >= obj.new_ep_size
+            }
+
+    def _clear_elastic_draining(self, msg: ElasticDrainClearReq) -> None:
+        """Route to the retiring slots again: the shrink was rejected or it failed.
+
+        Nothing else clears this on those paths. A rejection produces no scale update,
+        and a failure is dropped by the tokenizer before dispatch, so without this the
+        pickers skip the tail for the rest of the deployment's life while
+        /is_scaling_elastic_ep still reports it idle at full width.
+        """
+        self._draining_slots = set()
+
+    def _dispatch_elastic_scale_update(self, msg: ElasticScaleUpdateReq) -> None:
+        # Terminal either way: the slots are gone, or the shrink failed and they stay.
+        self._draining_slots = set()
+        # The tokenizer drops failure reports before dispatch; they carry no slots.
+        if msg.direction == "shrink":
+            self.remove_elastic_workers(msg.slot_offset, msg.slot_count)
+        else:
+            self.add_elastic_workers(msg.slot_offset, msg.slot_count)
+
+    def _routable_workers(self) -> list[int]:
+        """Active workers that may receive new requests (excludes draining slots)."""
+        if not self._draining_slots:
+            return self._active_workers
+        return [
+            slot for slot in self._active_workers if slot not in self._draining_slots
+        ]
+
     def _refresh_active_workers(self) -> None:
         self._active_workers = [
             i for i, active in enumerate(self.dp_active) if active and self.status[i]
@@ -404,12 +478,9 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
-                (
-                    ElasticScaleUpdateReq,
-                    lambda msg: self.add_elastic_workers(
-                        msg.slot_offset, msg.slot_count
-                    ),
-                ),
+                (ElasticScaleUpdateReq, self._dispatch_elastic_scale_update),
+                (ElasticDrainClearReq, self._clear_elastic_draining),
+                (ScaleElasticEPReqInput, self._dispatch_elastic_scale_request),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -495,7 +566,7 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
-        is_joiner = get_exec().moe.is_ep_scale_joiner
+        is_joiner = get_exec().moe.is_ep_offset_joiner
         if get_parallel().dist_init_addr is None or is_joiner:
             na = NetworkAddress(
                 get_serving().host or "127.0.0.1",
@@ -616,8 +687,8 @@ class DataParallelController:
             bind_host = NetworkAddress.parse(get_parallel().dist_init_addr).host
 
         worker_ports = []
-        if get_exec().moe.is_ep_scale_joiner:
-            # Scale joiners connect to their pre-bound primary worker sockets.
+        if get_exec().moe.is_ep_offset_joiner:
+            # Offset joiners connect to their pre-bound primary worker sockets.
             primary = NetworkAddress.parse(get_parallel().dist_init_addr)
             primary_endpoint = NetworkAddress(
                 primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
@@ -698,8 +769,8 @@ class DataParallelController:
 
         nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = get_parallel().tp_size // nnodes_per_tp_group
-        if get_exec().moe.is_ep_scale_joiner:
-            # Scale joiners enumerate their full local TP span.
+        if get_exec().moe.is_ep_offset_joiner:
+            # Offset joiners enumerate their full local TP span.
             tp_rank_range = range(get_parallel().tp_size)
             tp_size_per_node = get_parallel().tp_size
         else:
@@ -724,8 +795,10 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    if get_exec().moe.is_ep_scale_joiner:
-                        # Scale-joiner outputs return through the primary tokenizer.
+                    if get_exec().moe.is_ep_joiner:
+                        # PortArgs derives joiner ports from the joiner's own --port,
+                        # and a joiner runs no tokenizer, so outputs, a bare recovery
+                        # at offset 0 included, return through the primary's.
                         primary_addr = NetworkAddress.parse(
                             get_parallel().dist_init_addr
                         )
@@ -845,7 +918,7 @@ class DataParallelController:
                 or rank not in self._active_workers
                 or self.workers[rank] is None
             ):
-                raise ValueError(f"DP rank {rank} is not active.")
+                raise DPRoutingUnavailable(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
             sock_send(self.workers[rank], req)
             return True
@@ -855,9 +928,11 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        active = self._active_workers
+        active = self._routable_workers()
         if not active:
-            raise RuntimeError("No active DP workers are available for routing.")
+            raise DPRoutingUnavailable(
+                "No active DP workers are available for routing."
+            )
         attempts = 0
         while attempts < len(active):
             slot = active[self.round_robin_counter % len(active)]
@@ -867,7 +942,7 @@ class DataParallelController:
                 sock_send(self.workers[slot], req)
                 return
             attempts += 1
-        raise RuntimeError(
+        raise DPRoutingUnavailable(
             f"Cannot route request: all {len(active)} active DP workers "
             "are unavailable."
         )
@@ -881,13 +956,13 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        sock_send(self.workers[target_rank], req)
+        sock_send(self.workers[self._redirect_if_draining(target_rank)], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        sock_send(self.workers[target_worker], req)
+        sock_send(self.workers[self._redirect_if_draining(target_worker)], req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -896,7 +971,40 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        sock_send(self.workers[target_worker], req)
+        sock_send(self.workers[self._redirect_if_draining(target_worker)], req)
+
+    def _redirect_if_draining(self, slot: int) -> int:
+        """Move a request off a draining slot.
+
+        The budget and bootstrap-room pickers choose from the full worker set, so they
+        can land on a slot that is retiring. Redirecting is round-robin over what is
+        left rather than a re-run of the picker: the point is only to not feed a rank
+        that is trying to reach idle."""
+        if slot not in self._draining_slots:
+            return slot
+        routable = self._routable_workers()
+        if not routable:
+            raise DPRoutingUnavailable(
+                "No active DP workers are available for routing."
+            )
+        chosen = routable[self.round_robin_counter % len(routable)]
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(routable)
+        return chosen
+
+    def _abort_undispatchable(self, recv_req, message: str) -> None:
+        """Fail the request back to the tokenizer instead of dropping it.
+
+        Dropped, its rid_to_state entry is never completed and the client waits
+        forever, so a router holding a stale routed_dp_rank sees hangs where it should
+        see failures. An abort completes the rid and the client fails fast.
+        """
+        rid = getattr(recv_req, "rid", None)
+        if not rid or self.send_to_tokenizer is None:
+            return
+        try:
+            sock_send(self.send_to_tokenizer, AbortReq(rid=rid, abort_message=message))
+        except Exception:
+            logger.exception("[DPC] could not report rid=%s back to the tokenizer", rid)
 
     def event_loop(self):
         while True:
@@ -906,7 +1014,16 @@ class DataParallelController:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                self._request_dispatcher(recv_req)
+                try:
+                    self._request_dispatcher(recv_req)
+                except DPRoutingUnavailable as exc:
+                    # Per-request, not fatal: routing rejects a request pinned to a
+                    # slot that has retired, and letting that escape here would take
+                    # the controller down and with it every other DP worker. Only this
+                    # one, though. Every other failure in a dispatch is a bug, and on
+                    # main it took the controller down rather than going unnoticed.
+                    logger.warning("[DPC] %s (%s)", exc, type(recv_req).__name__)
+                    self._abort_undispatchable(recv_req, str(exc))
 
 
 def run_scheduler_process_with_init_pipe(run_scheduler_process_func: Callable, pipe):
@@ -972,7 +1089,7 @@ def run_data_parallel_controller_process(
             )
         pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
-        if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+        if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_offset_joiner:
             controller.event_loop()
         if prelaunched_schedulers is not None:
             # The launcher owns these processes. Their pipes close when they exit.

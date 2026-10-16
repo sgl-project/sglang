@@ -22,6 +22,11 @@ class FanOutCommunicator(Generic[T]):
     Only one request is in-flight at any time in either mode.
     """
 
+    # Bounds how long a short-completed call keeps its bucket open to catch the
+    # replies it is still owed. See _absorb_stragglers.
+    _STRAGGLER_WINDOW_S = 0.05
+    _STRAGGLER_POLL_S = 0.005
+
     def __init__(
         self,
         send: Callable[[T], None],
@@ -50,11 +55,48 @@ class FanOutCommunicator(Generic[T]):
             self._result_event = asyncio.Event()
             self._result_values = []
             self._result_fan_out = self._fan_out
-            await self._result_event.wait()
-            result_values = self._result_values
-            self._result_event = self._result_values = None
-            self._result_fan_out = None
-            return result_values
+            requested = self._fan_out
+            try:
+                await self._result_event.wait()
+                # Snapshot: a straggler absorbed below must not reach the caller.
+                result_values = list(self._result_values)
+                if len(result_values) < requested:
+                    await self._absorb_stragglers(requested)
+                return result_values
+            finally:
+                self._result_event = self._result_values = None
+                self._result_fan_out = None
+
+    async def _absorb_stragglers(self, requested: int) -> None:
+        """Collect replies still owed to a call that finished short, then drop them.
+
+        Reachable only when ``set_fan_out`` lowered the target under an in-flight
+        call, because the event fires at ``len(values) >= _result_fan_out`` and so
+        ``len < requested`` can mean nothing else. That lowering happens only when a
+        resize retires a rank, so outside a resize this is never entered.
+
+        Holding the lock is what makes it sound rather than best effort: the request
+        is sent under the same lock, so no later call has been sent yet and anything
+        arriving here belongs to the call that just finished. Without this the
+        straggler lands in the next call's ``_result_values``, which both corrupts
+        that call's results and can complete it early.
+
+        The window is short because a straggler is an in-flight reply from a local
+        scheduler, and because one of these communicators carries the resize itself,
+        where added latency would show up as settle time. A reply slower than the
+        window still escapes, and is dropped by ``handle_recv`` if it lands between
+        calls. Full coverage needs the reply to name the call it answers, which these
+        payloads do not carry.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._STRAGGLER_WINDOW_S
+        while (
+            self._result_values is not None
+            and len(self._result_values) < requested
+            and loop.time() < deadline
+        ):
+            # Yields, so the recv loop can hand over anything already queued.
+            await asyncio.sleep(self._STRAGGLER_POLL_S)
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -85,7 +127,13 @@ class FanOutCommunicator(Generic[T]):
             return await self.watching_call(obj)
 
     def set_fan_out(self, fan_out: int):
+        # Shrink mid-call: lower in-flight expected replies (retirees already exited).
         self._fan_out = fan_out
+        if self._result_fan_out is not None and fan_out < self._result_fan_out:
+            self._result_fan_out = fan_out
+            values, event = self._result_values, self._result_event
+            if values is not None and event is not None and len(values) >= fan_out:
+                event.set()
 
     def handle_recv(self, recv_obj: T):
         if (
@@ -99,7 +147,8 @@ class FanOutCommunicator(Generic[T]):
             )
             return
         self._result_values.append(recv_obj)
-        if len(self._result_values) == self._result_fan_out:
+        # >=, not ==: set_fan_out can lower the target below what already arrived.
+        if len(self._result_values) >= self._result_fan_out:
             self._result_event.set()
 
     @staticmethod
