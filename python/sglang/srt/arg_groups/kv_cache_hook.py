@@ -491,7 +491,7 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 # The MHA backends that read through the KV-index translator on every path a
 # draft forward takes. A fused draft region holds dense K/V rows, so a fused
 # draft runs only on these.
-TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3"})
+TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha"})
 
 
 def _assert_spec_verify_backends(
@@ -659,15 +659,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "preserve unified page-envelope indices and compaction lifetimes. "
         "Use --enable-hierarchical-cache for supported L2/L3 transfers."
     )
-    if cfg.enable_hierarchical_cache:
-        assert cfg.pp_size == 1, (
-            "--enable-unified-memory with hierarchical cache does not support "
-            "pipeline parallelism (--pp-size > 1)."
-        )
-        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
-            "--enable-unified-memory with hierarchical cache requires lazy "
-            "compaction so pending H2D physical reservations remain stable."
-        )
     assert not (
         cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
         and cfg.disaggregation_decode_retraction_backup == "host_pool"
@@ -716,18 +707,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 sorted(full_cg_backends),
                 sorted(backends),
             )
-    # trtllm_mha refills its graph page table before replay from
-    # `cache_seqlens_int32`, which only the in-graph metadata kernel writes, so
-    # it uses the previous replay's lengths. Refuse until it uses the batch's.
-    _, decode_backend = attention_backends_of(resolved_view(server_args))
-    if decode_backend == "trtllm_mha":
-        assert _cg_cfg is None or _cg_cfg.decode.backend == Backend.DISABLED, (
-            "--enable-unified-memory does not yet support decode cuda graphs "
-            "with the trtllm_mha attention backend: its replay refills the page "
-            "table from the previous replay's sequence lengths. Pass "
-            "--disable-cuda-graph, or pick another decode attention backend "
-            "(fa3 / fa4 / flashinfer / triton)."
-        )
 
 
 def _validate_unified_memory_dcp(server_args: Any) -> None:

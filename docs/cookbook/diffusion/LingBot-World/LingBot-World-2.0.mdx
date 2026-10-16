@@ -1,5 +1,6 @@
 ---
 title: LingBot World 2.0
+description: "Serve LingBot World 2.0 realtime camera-controlled video world models with SGLang-diffusion."
 metatags:
     description: "Serve LingBot World 2.0 realtime camera-controlled video world models with SGLang-diffusion."
 tag: REALTIME
@@ -9,13 +10,28 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["realtime", "world model", "14B causal DiT", "camera control", "interactive KV window"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/LingBot/lingbot-world2.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+Use the [Realtime WebUI](#3-realtime-webui) to start a camera-controlled session. The Request tab checks model metadata; video generation uses WebSocket, not an HTTP POST.
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [LingBot World 2.0](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers) is the 14B realtime camera-controlled world model in the LingBot family. It generates continuously from a live causal session, accepts control updates between chunks, and reuses DiT and VAE state for incremental frame delivery.
 
 Choose 2.0 when the larger model and interactive KV-window path justify an 8-GPU deployment. Like the earlier LingBot release, it prioritizes responsive control and bounded causal state over the full-clip global context of offline video diffusion.
 
-## 2. Deployment
+<a id="2-deployment" />
+
+## 3. Deployment
 
 ```bash Command
 export SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES=60
@@ -42,7 +58,9 @@ The current and most recent completed chunks remain in BF16. See
 for the algorithm, tuning options, measured memory-latency tradeoff, and
 support limits.
 
-## 3. Realtime WebUI
+<a id="3-realtime-webui" />
+
+## 4. Realtime WebUI
 
 The lightweight local WebUI is useful for validating latency, frame transport, and camera control behavior.
 
@@ -56,7 +74,9 @@ Open `http://127.0.0.1:18080` and use:
 ws://127.0.0.1:30000/v1/realtime_video/generate
 ```
 
-## 4. HTTP and WebSocket API
+<a id="4-http-and-websocket-api" />
+
+## 5. HTTP and WebSocket API
 
 LingBot World 2.0 uses the realtime video WebSocket endpoint. The server keeps one live session, generates one chunk at a time, and accepts runtime control events while generation is running.
 
@@ -175,17 +195,23 @@ ws.send_binary(msgspec.msgpack.encode({
 }))
 ```
 
-## 5. Consistency
+<a id="5-consistency" />
+
+## 6. Consistency
 
 LingBot World 2.0 uses raw-frame websocket GT plus per-chunk latency guards for consistency checks.
 
-## 6. Notes
+<a id="6-notes" />
+
+## 7. Notes
 
 - Use the realtime endpoint for interactive sessions: `/v1/realtime_video/generate`.
 - Prefer WebP preview transport for interactive testing; use raw-frame transport for consistency checks.
 - Long-running sessions should be validated with raw-frame consistency before changing causal cache, condition sampling, or VAE decode behavior.
 
-## 7. Run in ComfyUI
+<a id="7-run-in-comfyui" />
+
+## 8. Run in ComfyUI
 
 import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
 

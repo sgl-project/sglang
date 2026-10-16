@@ -87,7 +87,6 @@ from sglang.srt.utils import (
     is_npu,
     round_up,
 )
-from sglang.srt.utils.common import is_building_neighbour_layer
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
@@ -164,8 +163,6 @@ def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
-    if is_building_neighbour_layer():
-        return StandardDispatcher(moe_runner_config)
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)

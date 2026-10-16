@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.allocator.paged import (
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
+    UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -327,7 +328,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
         # Zero page envelopes on hand-out -- see _maybe_zero_pages.
-        self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
+        self._zero_pages_on_alloc = isinstance(
+            kvcache, (UnifiedMHATokenToKVPool, UnifiedMLATokenToKVPool)
+        )
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
         self.forward_stream = forward_stream
@@ -953,8 +956,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._alloc_bind_fast_or_slow"):
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
-            if self.lazy_compaction and self._free_phys_pages.numel() > 0:
-                self._wait_hicache_transfers()
 
             # FAST PATH: eager, or lazy with no current holes.
             if not self.lazy_compaction or self._free_phys_pages.numel() == 0:
@@ -1005,9 +1006,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return phys_pages
 
     def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
-        """Zero the page ENVELOPES on hand-out (MLA full pool only): the MLA
-        kernels arithmetically mask the rows beyond seq_len, so never-written page
-        bytes must read as finite values.
+        """Zero the page ENVELOPES on hand-out (MHA and MLA pools): the MLA
+        kernels and trtllm_mha's fmha_v2 prefill (and fp8 XQA decode) load whole
+        pages and give the rows past seq_len a zero weight, so a NaN there still
+        reaches the output. Never-written bytes must read as finite values; a
+        mamba neighbour's fp32 state, read as bf16, may not.
         """
         if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
             return
@@ -2014,6 +2017,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._pending_hicache_load_pages = 0
 
     def _wait_hicache_transfers(self) -> None:
+        """Order the current stream after outstanding HiCache copies. Only moves
+        and frees need this: a copy's source and target are not free pages until
+        its finish event is observed, so allocation never reuses them."""
         if not self._hicache_transfer_done_events:
             return
         current_stream = torch.cuda.current_stream()
@@ -2041,26 +2047,23 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if need_size > self.available_size():
             if not _relieve_for_alloc(self, need_size):
                 return None
-        if self.lazy_compaction and self._free_phys_pages.numel() > 0:
-            self._wait_hicache_transfers()
         physical_pages = self.take_physical_pages(need_size // self.page_size)
         if physical_pages is None:
             return None
-        if self.lazy_compaction:
-            self._pending_hicache_load_pages += int(physical_pages.shape[0])
+        # Blocks page moves (`moves_blocked`) until the H2D is queued or cancelled.
+        self._pending_hicache_load_pages += int(physical_pages.shape[0])
         return self._expand_pages_to_tokens(physical_pages)
 
     def cancel_physical_reservation(self, free_index: torch.Tensor) -> None:
         """Roll back a HiCache physical allocation before its H2D is submitted."""
         if free_index is None or free_index.numel() == 0:
             return
-        if self.lazy_compaction:
-            num_pages = free_index.numel() // self.page_size
-            assert num_pages <= self._pending_hicache_load_pages, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}) released {num_pages} "
-                f"HiCache pages with only {self._pending_hicache_load_pages} pending"
-            )
-            self._pending_hicache_load_pages -= num_pages
+        num_pages = free_index.numel() // self.page_size
+        assert num_pages <= self._pending_hicache_load_pages, (
+            f"MultiEndedAllocator({self.sub_pool_name!r}) released {num_pages} "
+            f"HiCache pages with only {self._pending_hicache_load_pages} pending"
+        )
+        self._pending_hicache_load_pages -= num_pages
         self.free_physical(free_index)
 
     def free_physical(self, free_index: torch.Tensor) -> None:
@@ -2353,6 +2356,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         if phys_pages is None:
             return None
         self.bind(v_pages, phys_pages)
+        self._maybe_zero_pages(phys_pages)
         return phys_pages
 
     # -- free: hole-marking, boundary absorption, park-on-empty --

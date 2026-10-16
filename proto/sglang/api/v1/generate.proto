@@ -2,7 +2,7 @@
 // rust/sglang-server/src/message/request.rs's GenerateBody (request) and
 // api_core/frame.rs's frame shape (response). Unknown JSON keys on the
 // request are IGNORED: `deny_unknown_fields` broke real clients that send
-// Python-only `GenerateReqInput` fields (priority, extra_key, session_id,
+// Python-only `GenerateReqInput` fields (session_id,
 // ...), pinned by request.rs's unported-fields test.
 
 syntax = "proto3";
@@ -53,6 +53,13 @@ message GenerateRequest {
   optional StringListOrList mm_hashes = 20;
   optional MediaInput video_data = 21;
   optional MediaInput audio_data = 22;
+  // Prefix-cache namespace: requests share cached prefixes only under the same
+  // key. One key for every batch item, or one per item; an empty key means
+  // none.
+  StringOrList extra_key = 23;
+  // Scheduling priority, one value for every batch item; the scheduler
+  // validates it against its priority-scheduling mode.
+  optional int64 priority = 24;
 }
 
 message SamplingParamsOrList {
@@ -122,6 +129,10 @@ message GenerateMetaInfo {
   // Seconds from normalized-request acceptance to the terminal output; only
   // on the terminal frame.
   optional double e2e_latency = 12;
+  // Prompt tokens served from the prefix cache, and output tokens spent
+  // reasoning so far; reported on every frame.
+  uint32 cached_tokens = 13;
+  uint64 reasoning_tokens = 14;
 }
 
 message GenerateResponse {
@@ -184,6 +195,14 @@ message MediaRef {
   optional int64 max_image_tokens = 13;
   // Video: also decode the audio track.
   optional bool use_audio = 14;
+  // GLM-Image external AR uses grids with input_ids to compute MRoPE positions.
+  optional ImageGridThw image_grid_thw = 15;
+}
+
+// One (t, h, w) row per image; the processor validates row arity.
+message ImageGridThw {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated Int64List rows = 1;
 }
 
 // One media item. JSON: a bare string is the source; an object is a MediaRef.
