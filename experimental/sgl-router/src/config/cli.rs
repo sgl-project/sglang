@@ -14,12 +14,12 @@ use crate::config::{
     default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
     AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
-    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
-    FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode,
-    KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
-    TokenizerBackend, TokenizerConfig, DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
-    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
+    EligibilityConfig, FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig,
+    K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
+    StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
+    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -126,6 +126,11 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_port())]
     pub port: u16,
 
+    /// Port for the native gRPC server (`sglang.runtime.v1.SglangService`, which
+    /// engines serve with `--grpc-port`); requests reach engines over their gRPC port.
+    #[arg(long)]
+    pub grpc_port: Option<u16>,
+
     /// Keep serving after SIGTERM with /readyz returning 503 before stopping accepts.
     /// Leave time in the pod grace period for in-flight requests; cover readiness
     /// probe failureThreshold * periodSeconds when probe-driven. 0 disables the pause.
@@ -142,12 +147,28 @@ pub struct ServerArgs {
     #[arg(long)]
     pub worker_api_key: Option<String>,
 
-    /// Per-request upstream timeout in seconds.
+    /// Upstream timeout in seconds: the whole response of a non-streaming request,
+    /// the response headers of a streaming one. SGLang's chat endpoint sends those
+    /// headers with the first token, so for streaming chat this bounds time to
+    /// first token, queueing included. Must be greater than zero.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
     /// Maximum silence between upstream stream chunks, in seconds.
     #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
     pub stream_idle_timeout_secs: u64,
+
+    /// Dispatch attempts per request, including the first. A request that fails
+    /// before any response reaches the client (transport error, 5xx, 429) is
+    /// retried on a worker it has not tried yet. 1 disables retries; 3 is typical.
+    #[arg(long, default_value_t = ProxyConfig::default().max_attempts)]
+    pub retry_max_attempts: NonZeroU32,
+    /// Backoff before the first retry, in milliseconds; doubles per retry, with
+    /// jitter. 0 retries immediately.
+    #[arg(long, default_value_t = ProxyConfig::default().initial_backoff_ms)]
+    pub retry_initial_backoff_ms: u64,
+    /// Upper bound on the backoff between retries, in milliseconds.
+    #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
+    pub retry_max_backoff_ms: u64,
 
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
@@ -229,6 +250,11 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub dp_aware: bool,
 
+    /// How --dp-aware picks a rank that no routing key or cached prefix decides,
+    /// which in PD mode is every decode rank. Defaults to least_in_flight.
+    #[arg(long, value_enum, requires = "dp_aware")]
+    pub dp_rank_policy: Option<DpRankPolicy>,
+
     /// Static bucket configuration JSON; the reorg schema with --chat-routing reorg.
     /// Omit to use the global candidate domain (default buckets with reorg).
     #[arg(long)]
@@ -244,7 +270,7 @@ pub struct RoutingArgs {
     #[arg(long, value_delimiter = ',')]
     pub filter: Vec<FilterKind>,
 
-    /// Router-local in-flight limit for `--filter overloaded`.
+    /// Router-local in-flight limit: for `--filter overloaded`, or reorg admission.
     #[arg(long)]
     pub max_in_flight: Option<usize>,
 
@@ -252,6 +278,19 @@ pub struct RoutingArgs {
     /// of its reported capacity, in (0, 1].
     #[arg(long)]
     pub max_kv_usage: Option<f64>,
+
+    /// Reorg admission: reject an engine whose running requests have reached this
+    /// share of its reported capacity, in (0, 1].
+    #[arg(long)]
+    pub max_running_usage: Option<f64>,
+
+    /// Reorg admission: reject an engine reporting this many waiting requests.
+    #[arg(long)]
+    pub max_waiting_requests: Option<u64>,
+
+    /// Reorg admission: reject an engine reporting this many waiting uncached tokens.
+    #[arg(long)]
+    pub max_pending_prefill_tokens: Option<u64>,
 
     /// Minimum cached prompt share for `--filter prefix_cache`.
     #[arg(long)]
@@ -471,8 +510,12 @@ impl Cli {
                 "prefer, balanced, --affinity-balanced-by and --affinity-load-* require --chat-routing reorg"
             );
             ensure!(
-                self.routing.max_kv_usage.is_none(),
-                "--max-kv-usage requires --chat-routing reorg"
+                self.routing.max_kv_usage.is_none()
+                    && self.routing.max_running_usage.is_none()
+                    && self.routing.max_waiting_requests.is_none()
+                    && self.routing.max_pending_prefill_tokens.is_none(),
+                "--max-kv-usage, --max-running-usage, --max-waiting-requests and \
+                 --max-pending-prefill-tokens require --chat-routing reorg"
             );
             ensure!(
                 self.affinity.affinity_mode.is_none()
@@ -526,7 +569,7 @@ impl Cli {
             }
         }
         let fused = self.routing.build_fused()?;
-        let eligibility = self.routing.build_eligibility()?;
+        let eligibility = self.routing.build_eligibility(reorg)?;
         let reorg_admission = self.routing.build_reorg_admission()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
         let sampling_overrides = self
@@ -560,6 +603,7 @@ impl Cli {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
+                grpc_port: self.server.grpc_port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
@@ -583,6 +627,7 @@ impl Cli {
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
                 dp_aware: self.routing.dp_aware,
+                dp_rank_policy: self.routing.dp_rank_policy.unwrap_or_default(),
                 bucket_config,
                 reorg_buckets,
                 reorg_admission,
@@ -599,6 +644,9 @@ impl Cli {
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
                 stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
+                max_attempts: self.server.retry_max_attempts,
+                initial_backoff_ms: self.server.retry_initial_backoff_ms,
+                max_backoff_ms: self.server.retry_max_backoff_ms,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -732,7 +780,7 @@ impl RoutingArgs {
         Ok(Some(terms))
     }
 
-    fn build_eligibility(&self) -> Result<Option<EligibilityConfig>> {
+    fn build_eligibility(&self, reorg: bool) -> Result<Option<EligibilityConfig>> {
         for (i, kind) in self.filter.iter().enumerate() {
             ensure!(
                 !self.filter[..i].contains(kind),
@@ -741,8 +789,13 @@ impl RoutingArgs {
         }
         let has = |k: FilterKind| self.filter.contains(&k);
         ensure!(
-            (self.max_in_flight.is_some() == has(FilterKind::Overloaded)),
-            "--max-in-flight and `--filter overloaded` require each other"
+            !has(FilterKind::Overloaded) || self.max_in_flight.is_some(),
+            "`--filter overloaded` requires --max-in-flight"
+        );
+        // Reorg applies --max-in-flight as admission; legacy only through the filter.
+        ensure!(
+            reorg || self.max_in_flight.is_none() || has(FilterKind::Overloaded),
+            "--max-in-flight requires `--filter overloaded` or --chat-routing reorg"
         );
         ensure!(
             self.max_in_flight != Some(0),
@@ -773,13 +826,15 @@ impl RoutingArgs {
     /// Reorg admission for groups without their own limits.
     fn build_reorg_admission(&self) -> Result<AdmissionLimits> {
         let limits = AdmissionLimits {
-            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
+            max_running_usage: self.max_running_usage,
             max_kv_usage: self.max_kv_usage,
-            ..Default::default()
+            max_waiting_requests: self.max_waiting_requests,
+            max_pending_prefill_tokens: self.max_pending_prefill_tokens,
+            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
         };
         limits
             .validate()
-            .map_err(|error| anyhow!("--max-in-flight / --max-kv-usage: {error}"))?;
+            .map_err(|error| anyhow!("reorg admission flags: {error}"))?;
         Ok(limits)
     }
 }
@@ -1168,10 +1223,47 @@ mod tests {
         let kv = parse(&["--max-kv-usage", "0.9"]).unwrap().model;
         assert_eq!(kv.reorg_admission.max_kv_usage, Some(0.9));
         assert!(kv.eligibility.is_none());
-        let legacy_kv = Cli::try_parse_from(base.iter().chain(&["--max-kv-usage", "0.9"]));
-        assert!(legacy_kv.unwrap().into_config().is_err());
+        let admission = parse(&[
+            "--max-in-flight",
+            "96",
+            "--max-running-usage",
+            "0.9",
+            "--max-waiting-requests",
+            "48",
+            "--max-pending-prefill-tokens",
+            "32768",
+        ])
+        .unwrap()
+        .model;
+        assert!(admission.eligibility.is_none());
+        assert_eq!(
+            admission.reorg_admission,
+            AdmissionLimits {
+                max_running_usage: Some(0.9),
+                max_kv_usage: None,
+                max_waiting_requests: Some(48),
+                max_pending_prefill_tokens: Some(32768),
+                max_inflight_requests: Some(96),
+            }
+        );
+        for args in [
+            ["--max-kv-usage", "0.9"],
+            ["--max-running-usage", "0.9"],
+            ["--max-waiting-requests", "48"],
+            ["--max-pending-prefill-tokens", "32768"],
+            ["--max-in-flight", "96"],
+        ] {
+            let legacy = Cli::try_parse_from(base.iter().chain(&args));
+            assert!(
+                legacy.unwrap().into_config().is_err(),
+                "legacy accepted {args:?}"
+            );
+        }
         for args in [
             vec!["--max-kv-usage", "1.5"],
+            vec!["--max-running-usage", "0"],
+            vec!["--max-waiting-requests", "0"],
+            vec!["--filter", "overloaded"],
             vec!["--policy", "round_robin"],
             vec!["--decode-policy", "legacy_host_affinity"],
             vec!["--policy", "session_aware", "--stable-pair"],
@@ -2270,8 +2362,8 @@ mod tests {
     #[test]
     fn filter_misconfigurations_fail_at_startup() {
         let cases: [(&[&str], &str); 8] = [
-            (&["--filter", "overloaded"], "require each other"),
-            (&["--max-in-flight", "64"], "require each other"),
+            (&["--filter", "overloaded"], "requires --max-in-flight"),
+            (&["--max-in-flight", "64"], "or --chat-routing reorg"),
             (&["--filter", "prefix_cache"], "require each other"),
             (&["--prefix-cache-min-share", "0.6"], "require each other"),
             (

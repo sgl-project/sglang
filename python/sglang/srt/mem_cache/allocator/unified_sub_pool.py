@@ -953,8 +953,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._alloc_bind_fast_or_slow"):
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
-            if self.lazy_compaction and self._free_phys_pages.numel() > 0:
-                self._wait_hicache_transfers()
 
             # FAST PATH: eager, or lazy with no current holes.
             if not self.lazy_compaction or self._free_phys_pages.numel() == 0:
@@ -2014,6 +2012,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._pending_hicache_load_pages = 0
 
     def _wait_hicache_transfers(self) -> None:
+        """Order the current stream after outstanding HiCache copies. Only moves
+        and frees need this: a copy's source and target are not free pages until
+        its finish event is observed, so allocation never reuses them."""
         if not self._hicache_transfer_done_events:
             return
         current_stream = torch.cuda.current_stream()
@@ -2041,26 +2042,23 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if need_size > self.available_size():
             if not _relieve_for_alloc(self, need_size):
                 return None
-        if self.lazy_compaction and self._free_phys_pages.numel() > 0:
-            self._wait_hicache_transfers()
         physical_pages = self.take_physical_pages(need_size // self.page_size)
         if physical_pages is None:
             return None
-        if self.lazy_compaction:
-            self._pending_hicache_load_pages += int(physical_pages.shape[0])
+        # Blocks page moves (`moves_blocked`) until the H2D is queued or cancelled.
+        self._pending_hicache_load_pages += int(physical_pages.shape[0])
         return self._expand_pages_to_tokens(physical_pages)
 
     def cancel_physical_reservation(self, free_index: torch.Tensor) -> None:
         """Roll back a HiCache physical allocation before its H2D is submitted."""
         if free_index is None or free_index.numel() == 0:
             return
-        if self.lazy_compaction:
-            num_pages = free_index.numel() // self.page_size
-            assert num_pages <= self._pending_hicache_load_pages, (
-                f"MultiEndedAllocator({self.sub_pool_name!r}) released {num_pages} "
-                f"HiCache pages with only {self._pending_hicache_load_pages} pending"
-            )
-            self._pending_hicache_load_pages -= num_pages
+        num_pages = free_index.numel() // self.page_size
+        assert num_pages <= self._pending_hicache_load_pages, (
+            f"MultiEndedAllocator({self.sub_pool_name!r}) released {num_pages} "
+            f"HiCache pages with only {self._pending_hicache_load_pages} pending"
+        )
+        self._pending_hicache_load_pages -= num_pages
         self.free_physical(free_index)
 
     def free_physical(self, free_index: torch.Tensor) -> None:

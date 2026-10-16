@@ -2,30 +2,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod forward;
+mod openai;
 mod preparation;
 mod reorg;
 
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
-use crate::discovery::{ModelId, WorkerMode};
+use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{Policy, PrefixLookupResult};
+use crate::proxy::grpc::GrpcResponse;
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
-use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
+use crate::server::metrics::RequestLogContext;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
-use forward::{forward_request, SelectedWorkers};
+use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    parse_embedding_request, parse_routing_fields, PreparedRequest, CLASSIFY_PATH, EMBEDDINGS_PATH,
+    parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
+    COMPLETIONS_PATH, EMBEDDINGS_PATH,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +47,24 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    openai_route(&ctx, CHAT_PATH, headers, body).await
+}
+
+/// OpenAI completions; see [`PreparedRequest::openai`].
+pub async fn completions(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    openai_route(&ctx, COMPLETIONS_PATH, headers, body).await
+}
+
+async fn openai_route(
+    ctx: &AppContext,
+    path: &'static str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
@@ -52,16 +73,45 @@ pub async fn chat_completions(
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
     );
-    let routing = ModelRouting::lookup(&ctx, &model)?;
-    let request = PreparedRequest::chat(
-        &ctx,
-        model,
-        fields,
-        body,
-        routing.needs_request_tokens(&ctx),
-    )?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
+    let tokens = routing.needs_request_tokens(ctx);
+    let request = PreparedRequest::openai(ctx, path, model, fields, &headers, body, tokens)?;
+    routing.dispatch(ctx, request, headers, start).await
+}
+
+pub async fn chat_completions_grpc(
+    ctx: &AppContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
+    let start = Instant::now();
+    let prepared = async {
+        let fields = parse_routing_fields(&body)?;
+        let model = ModelId(
+            fields
+                .model
+                .clone()
+                .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
+        );
+        let routing = ModelRouting::lookup(ctx, &model)?;
+        let request = PreparedRequest::openai_grpc(
+            ctx,
+            CHAT_PATH,
+            model,
+            fields,
+            &headers,
+            body,
+            routing.needs_request_tokens(ctx),
+        )?;
+        Ok::<_, ApiError>((request, routing))
+    }
+    .await;
+    match prepared {
+        Ok((mut request, routing)) => {
+            forward_request_grpc(ctx, &mut request, &routing, headers, start).await
+        }
+        Err(error) => (Err(error), None),
+    }
 }
 
 /// SGLang's native `/generate`: same request and response schema as the engine.
@@ -75,8 +125,7 @@ pub async fn generate(
     let model = ModelId(ctx.config.model.id.clone());
     let routing = ModelRouting::lookup(&ctx, &model)?;
     let request = PreparedRequest::generate(&ctx, model, body)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// OpenAI `/v1/embeddings`, forwarded to the engine's with the same request and response.
@@ -105,11 +154,10 @@ async fn embedding_input(
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let (model, value) = parse_embedding_request(&body)?;
-    let routing = ModelRouting::lookup(&ctx, &model)?;
+    let (model, routing) = ModelRouting::lookup_openai(&ctx, model)?;
     require_plain_workers(&ctx, &model, path)?;
     let request = PreparedRequest::embeddings(&ctx, path, model, body, value)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// SGLang's `/v1/rerank`, forwarded as sent to the model this router serves.
@@ -123,8 +171,7 @@ pub async fn rerank(
     let routing = ModelRouting::lookup(&ctx, &model)?;
     require_plain_workers(&ctx, &model, "/v1/rerank")?;
     let request = PreparedRequest::rerank(model, body)?;
-    let workers = routing.select_workers(&ctx, &request, &headers).await?;
-    forward_request(&ctx, request, workers, headers, start).await
+    routing.dispatch(&ctx, request, headers, start).await
 }
 
 /// Prefill and decode engines serve generation only.
@@ -153,6 +200,19 @@ impl<'a> ModelRouting<'a> {
         routing.ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))
     }
 
+    /// Like `lookup`, but `base:adapter` (SGLang's LoRA syntax) resolves to
+    /// `base`; the body still names the adapter for the engine.
+    fn lookup_openai(ctx: &'a AppContext, model: ModelId) -> Result<(ModelId, Self), ApiError> {
+        match (Self::lookup(ctx, &model), model.0.split_once(':')) {
+            (Err(error), Some((base, _))) => {
+                let base = ModelId(base.trim().to_owned());
+                let routing = Self::lookup(ctx, &base).map_err(|_| error)?;
+                Ok((base, routing))
+            }
+            (routing, _) => Ok((model, routing?)),
+        }
+    }
+
     fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
         match self {
             Self::Legacy(policy) => policy.needs_request_tokens() || ctx.config.model.dp_aware,
@@ -162,17 +222,71 @@ impl<'a> ModelRouting<'a> {
         }
     }
 
-    /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
+    /// Select workers for `request` and forward it to them. An attempt that
+    /// fails before any response reaches the client is retried, after a
+    /// backoff, on workers it has not tried, up to `--retry-max-attempts`.
+    async fn dispatch(
+        &self,
+        ctx: &AppContext,
+        mut request: PreparedRequest,
+        headers: HeaderMap,
+        start: Instant,
+    ) -> Result<Response<Body>, ApiError> {
+        let mut excluded = Vec::new();
+        let mut failed = None;
+        let mut duration = None;
+        for attempt in 0..ctx.config.proxy.max_attempts.get() {
+            if attempt > 0 {
+                // A retry never starts past the request's stale deadline, so the
+                // backoff is capped by what remains of it. Backing off before
+                // selecting lets the pick see fresh breaker and load state.
+                let deadline = ctx.router_inflight_load.stale_request_timeout();
+                let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
+                    break;
+                };
+                tokio::time::sleep(ctx.config.proxy.backoff(attempt).min(remaining)).await;
+                if start.elapsed() >= deadline {
+                    break;
+                }
+            }
+            let workers = match self
+                .select_workers(ctx, &request, &headers, &excluded)
+                .await
+            {
+                Ok(workers) => workers,
+                // Every eligible worker already failed this request: report the last failure.
+                Err(error) => return failed.ok_or(error),
+            };
+            if failed.is_some() {
+                ctx.metrics.record_retry(&request.model.0);
+            }
+            let duration = duration
+                .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
+            let attempt =
+                forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
+                    .await?;
+            if attempt.retry_excluding.is_empty() {
+                return Ok(attempt.response);
+            }
+            excluded.extend(attempt.retry_excluding);
+            failed = Some(attempt.response);
+        }
+        Ok(failed.expect("at least one attempt"))
+    }
+
+    /// Pick a plain worker, or a prefill worker followed by a decode peer in PD mode,
+    /// never one in `excluded`.
     async fn select_workers(
         &self,
         ctx: &AppContext,
         request: &PreparedRequest,
         headers: &HeaderMap,
+        excluded: &[WorkerId],
     ) -> Result<SelectedWorkers, ApiError> {
         match self {
             Self::Legacy(policy) => {
                 // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
-                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+                let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry)).excluding(excluded);
                 let candidates = resolver
                     .prefill_candidates(&request.model)
                     .map_err(|error| pool_error(error, &request.model))?;
@@ -186,7 +300,9 @@ impl<'a> ModelRouting<'a> {
                 )
                 .await
             }
-            Self::Reorg(resolver) => reorg::select_workers(ctx, resolver, request, headers).await,
+            Self::Reorg(resolver) => {
+                reorg::select_workers(ctx, resolver, request, headers, excluded).await
+            }
         }
     }
 }
@@ -353,6 +469,7 @@ fn pick_prefill_worker(
         request_input_tokens: request.input_token_count as u64,
         request_sequence_tokens: request.sequence_token_count as u64,
         request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        cache_namespace: &request.cache_namespace,
         external_prefix: routing.prefix_matches.as_ref(),
         load_snapshot: routing.load_snapshot.as_ref(),
         workers: candidates,
@@ -411,18 +528,19 @@ async fn lookup_prefix_matches(
     ctx: &AppContext,
     request: &PreparedRequest,
 ) -> Result<Option<PrefixLookupResult>, ApiError> {
-    let signal = match (
-        ctx.prefix_index.as_ref(),
-        request.tokens.as_ref(),
-        ctx.block_size_oracle.get(),
-    ) {
-        // Remote indexer: hash tokens into blocks and match against the KV index.
-        (Some(index), Some(tokens), Some(block_size)) => {
-            let hashes = if ctx.block_size_oracle.is_bigram() {
-                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
-            } else {
-                compute_block_hashes(&tokens.ids, block_size as usize)
-            };
+    let namespace = &request.cache_namespace;
+    let tokens = request.tokens.as_ref();
+    let remote = ctx
+        .prefix_index
+        .as_ref()
+        .zip(tokens)
+        .and_then(|(index, tokens)| {
+            let hashes = ctx.block_size_oracle.block_hashes(&tokens.ids, namespace)?;
+            Some((index, hashes))
+        });
+    let signal = match remote {
+        // Remote indexer: match the prompt's block hashes against the KV index.
+        Some((index, hashes)) => {
             let query_blocks = hashes.len();
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
@@ -436,11 +554,11 @@ async fn lookup_prefix_matches(
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.
-        _ => ctx
+        None => ctx
             .radix_tree_prefix_provider
             .as_ref()
-            .zip(request.tokens.as_ref())
-            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
+            .zip(tokens)
+            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids, namespace)),
     };
     Ok(signal)
 }

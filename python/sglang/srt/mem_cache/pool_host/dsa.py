@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -31,6 +32,7 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
     HostPoolStorageInfo,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -98,7 +100,7 @@ def make_dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:
     """Index key buffers riding on the full-KV pages: indices and layout both follow KV."""
-    index_page_bytes = pool.slots_per_page * dsa_indexer_bytes_per_token_per_layer(
+    index_page_bytes = pool.index_page_size * dsa_indexer_bytes_per_token_per_layer(
         index_head_dim=pool.index_head_dim,
         quant_block_size=pool.quant_block_size,
     )
@@ -141,6 +143,7 @@ class DSAIndexerPoolHost(HostKVCache):
         is_dummy: bool = False,
     ):
         self._is_dummy = is_dummy
+        self._destroyed = False
         self.decl = decl
         storage_info = decl.storage_info
         device_pool = decl.device_pool
@@ -226,6 +229,15 @@ class DSAIndexerPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
+    def destroy(self):
+        if self._destroyed:
+            return
+        if not self._is_dummy and self.pin_memory and (_is_cuda or _is_hip):
+            _cuda_host_unregister(self.index_k_with_scale_buffer)
+        self.index_k_with_scale_buffer = None
+        self.index_k_data_refs = []
+        super().destroy()
+
     def get_size_per_token(self):
         return self.decl.storage_info.bytes_per_token_per_layer * self.layer_num
 
@@ -295,7 +307,10 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
