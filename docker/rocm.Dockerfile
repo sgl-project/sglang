@@ -440,7 +440,8 @@ ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 # gfx950); disable with --build-arg ENABLE_SGL_AMD_MONO=0.
 ARG ENABLE_SGL_AMD_MONO=1
 ARG SGL_AMD_MONO_REPO="https://github.com/sgl-project/sgl-amd-mono.git"
-ARG SGL_AMD_MONO_COMMIT="815b104f483d180027054a8f44bad0c2a3f895fd"
+# the commit python/pyproject_other.toml pins for srt_hip; bump both together
+ARG SGL_AMD_MONO_COMMIT="e07665c8b36f7d42a48f6615bacf911d0656f5c5"
 
 ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
