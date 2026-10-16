@@ -84,6 +84,17 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
+      # mori's own put test, bounded and with no collective behind it. A stack
+      # whose SDMA queues exist but whose copies never land fails here in
+      # seconds, rather than as a timeout in the collective test below.
+      - name: Gate on mori's SDMA put
+        timeout-minutes: 5
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e MORI_ENABLE_SDMA=1 \
+            -w /sgl-workspace/mori \
+            python3 -m pytest -q tests/python/cco/test_sdma_api.py -k alltoall
+
       # Without MORI_ENABLE_SDMA the cco puts move no bytes, the all-reduce
       # returns mostly the local slice, and self_test is what reports it.
       - name: Run gemm_ar tests
