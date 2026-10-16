@@ -1,13 +1,10 @@
 import json
-import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from sglang.srt.entrypoints.openai.chat_encoding import encode_simple_chat
 from sglang.srt.parser.inkling_output import InklingOutputParser
 from sglang.srt.parser.inkling_renderer import (
-    TML_RENDERERS_INSTALL_HINT,
     load_tml_renderers,
     render_inkling_assistant_prefix,
     render_inkling_messages,
@@ -28,16 +25,6 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 _GOLDEN = json.loads(
     (Path(__file__).with_name("inkling_tmlv0_golden.json")).read_text()
 )
-
-
-class TestTmlRenderersLoader(unittest.TestCase):
-    def test_missing_tml_renderers_names_the_package(self):
-        load_tml_renderers.cache_clear()
-        self.addCleanup(load_tml_renderers.cache_clear)
-        with mock.patch.dict(sys.modules, {"tml_renderers": None}):
-            with self.assertRaises(ImportError) as ctx:
-                load_tml_renderers()
-        self.assertEqual(str(ctx.exception), TML_RENDERERS_INSTALL_HINT)
 
 
 class TestInklingRenderer(unittest.TestCase):

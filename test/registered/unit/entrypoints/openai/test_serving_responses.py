@@ -1267,7 +1267,10 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
         """Serving another model must not need tml-renderers, while selecting
         Inkling must still fail at construction when it is missing."""
         from sglang.srt.entrypoints.openai import spec_adapters
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+        from sglang.srt.parser.inkling_renderer import (
+            TML_RENDERERS_INSTALL_HINT,
+            load_tml_renderers,
+        )
 
         load_tml_renderers.cache_clear()
         self.addCleanup(load_tml_renderers.cache_clear)
@@ -1281,8 +1284,9 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
             for spec in (None, "kimi_k3", "dsv4", "dsv41", "dsv32"):
                 with self.subTest(spec=spec):
                     self.assertIsNone(spec_adapters.build_spec_adapter(spec, ctx))
-            with self.assertRaises(ImportError):
+            with self.assertRaises(ImportError) as raised:
                 spec_adapters.build_spec_adapter("inkling", ctx)
+        self.assertEqual(str(raised.exception), TML_RENDERERS_INSTALL_HINT)
 
     def test_inkling_parser_cannot_be_mixed_with_another_parser(self):
         from sglang.srt.entrypoints.openai.serving_inkling import InklingSpecAdapter
