@@ -1,6 +1,5 @@
 """JIT-compiled CUDA Interior Point Method LP solver.
 
-Replaces the Numba/nvmath-python implementation in ``cublasdx_solver.py``.
 The kernel is a single-block fused IPM defined in
 ``csrc/lplb/ipm.cuh`` and compiled per ``(NC, NV, BLOCK_DIM, SM_VER,
 NUM_ITERS)`` tuple via sglang's ``tvm-ffi`` ``load_jit``.

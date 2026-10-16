@@ -34,7 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.kernels.deepseek_v4.quant_k_cache import (
+from sglang.test.kernels.deepseek_v4.k_cache_reference import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 
