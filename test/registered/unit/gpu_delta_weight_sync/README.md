@@ -397,10 +397,12 @@ directly by DE; these traffic categories are not a throughput estimate.
 before decode. Batch/group/contract/grid counts describe the runtime work;
 `apply_kernel_cache_reused` is a per-rank boolean, not a number of reused groups. `host_batch_plan_reused` reports cached active tensor geometry.
 
-With `GPU_DELTA_TIMING=1`, events report decode on the DE stream and layout apply,
-raw apply and derived refresh on the apply stream. `paused_gpu_pipeline` excludes
-setup. These spans overlap and must not be summed. nvCOMP can wait inside an Async
-call, so host enqueue durations can contain GPU backpressure.
+`GPU_DELTA_NVTX=1` labels preparation and scheduler controls; level `2` adds
+worker, planning and enqueue detail for Nsight Systems. CUDA timing events are
+not collected in receipts. CPU timings and counters remain available for W&B
+metrics independently of profiling. GPU work and host ranges can overlap;
+nvCOMP can wait inside an Async call, so enqueue durations can contain GPU
+backpressure.
 
 `host_encoded_cache_created`/`host_encoded_cache_reused` identify the creator
 and followers. Creator-only `host_encoded_cache_read_hash_s` measures submission
@@ -468,9 +470,9 @@ HPC-Ops derived-weight-cache exclusions before creating a delta plan or session.
 
 The paired Miles feature contains `tests/manual/gpu_delta/bench_gpu_delta.py`, which launches
 one EP8 or two EP4 engines and measures the selected publication codec using a
-persistent altered checkpoint and publications. `GPU_DELTA_TIMING=1` enables
-phase events without synchronizing every tensor; correctness comparisons stay
-outside timed updates.
+persistent altered checkpoint and publications. Optional NVTX capture labels a
+selected update for Nsight Systems; correctness comparisons stay outside timed
+updates.
 
 Each original-rank receipt includes `scheduler_timing` on that process's
 `monotonic_ns` clock. `blocked_s` runs from the scheduler's pause flag, before

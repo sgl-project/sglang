@@ -56,22 +56,29 @@ def _apply_binding(binding, mask):
 
 
 class TestCanonicalPlanCache(unittest.TestCase):
-    def test_nvtx_phase_without_cuda_event_timing_balances_failure(self):
+    def test_nvtx_phase_balances_failure_without_cuda_events(self):
         events = []
         nvtx = SimpleNamespace(
             range_push=lambda name: events.append(("push", name)),
             range_pop=lambda: events.append(("pop",)),
         )
-        prepared = SimpleNamespace(timing_enabled=False)
-        with (
-            patch.object(layout.profiling, "DETAIL", True),
-            patch.object(layout.profiling, "nvtx", nvtx, create=True),
-            patch.object(torch.cuda, "Event", side_effect=AssertionError("new event")),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "enqueue failed"):
-                with layout.PreparedDelta._phase(prepared, "decode"):
-                    raise RuntimeError("enqueue failed")
-        self.assertEqual(events, [("push", "gpu_delta.pause.decode"), ("pop",)])
+        for enabled in (False, True):
+            with (
+                self.subTest(detail=enabled),
+                patch.object(layout.profiling, "DETAIL", enabled),
+                patch.object(layout.profiling, "nvtx", nvtx, create=True),
+                patch.object(
+                    torch.cuda, "Event", side_effect=AssertionError("new event")
+                ),
+            ):
+                events.clear()
+                with self.assertRaisesRegex(RuntimeError, "enqueue failed"):
+                    with layout.PreparedDelta._phase(SimpleNamespace(), "decode"):
+                        raise RuntimeError("enqueue failed")
+                self.assertEqual(
+                    events,
+                    [("push", "gpu_delta.pause.decode"), ("pop",)] if enabled else [],
+                )
 
     def publication(self):
         entries = [
@@ -217,7 +224,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 host_input = torch.empty_like(canonical)
                 decoded = torch.zeros_like(canonical)
                 prepared.error = torch.zeros(1, dtype=torch.int32)
-                prepared.timing_enabled = False
                 payload = binding.selected_bytes(decoded)
                 self.assertEqual(
                     payload.untyped_storage().data_ptr(),
@@ -375,7 +381,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
         prepared.backend = SimpleNamespace(layout=plan)
         prepared.device, prepared.stream = torch.device("cpu"), object()
-        prepared.timing_enabled = False
         prepared.batches, prepared.status_checks = [], []
         prepared.apply_bindings, prepared.apply_source_patches = [], []
         prepared.apply_fallback_groups = set()

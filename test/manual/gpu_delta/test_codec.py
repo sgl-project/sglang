@@ -134,7 +134,6 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         assert batch._arguments[5:7] == (temporary.data_ptr(), temporary.numel())
     prepared = PreparedDelta.__new__(PreparedDelta)
     prepared.device = device
-    prepared.timing_enabled = False
     prepared.decode_stages = stages
     prepared.stream, prepared.de_streams = stream, de_streams
     prepared.decoded_ready = [torch.cuda.Event() for _ in range(stages)]

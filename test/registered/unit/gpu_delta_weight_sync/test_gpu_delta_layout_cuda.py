@@ -37,7 +37,6 @@ def _apply_prepared_masks(bindings, masks, derived=()):
         payload[offset : offset + length].copy_(mask.reshape(-1))
     prepared = PreparedDelta.__new__(PreparedDelta)
     prepared.error = torch.zeros(1, dtype=torch.int32, device="cuda")
-    prepared.timing_enabled = False
     decoded = torch.empty(size, dtype=torch.uint8, device="cuda")
     outputs = [
         (view, offset, size)

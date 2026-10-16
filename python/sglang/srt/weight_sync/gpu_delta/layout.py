@@ -403,7 +403,7 @@ class PreparedDelta:
         self.de_streams = ()
         self.host_snapshot = None
         self.batches, self.raw_copies = [], {}
-        self.events, self.timings = {}, {}
+        self.timings = {}
         self.status_checks = []
         self.apply_bindings, self.apply_source_patches = [], []
         self.apply_fallback_groups = set()
@@ -411,7 +411,6 @@ class PreparedDelta:
         self.backend, self.device = backend, backend.device
         self.decode_stages = backend.decode_stages
         preparation_started = time.perf_counter()
-        self.timing_enabled = os.environ.get("GPU_DELTA_TIMING", "0") == "1"
         layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
         if layers_per_batch < 1:
             raise ValueError("GPU_DELTA_LAYERS_PER_BATCH must be positive")
@@ -779,22 +778,11 @@ class PreparedDelta:
         )
 
     @contextmanager
-    def _phase(self, name, stream=None):
+    def _phase(self, name):
         if profiling.DETAIL:
             profiling.nvtx.range_push("gpu_delta.pause." + name)
         try:
-            if not self.timing_enabled:
-                yield
-                return
-            start, end = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            stream = self.stream if stream is None else stream
-            start.record(stream)
             yield
-            end.record(stream)
-            self.events.setdefault(name, []).append((start, end))
         finally:
             if profiling.DETAIL:
                 profiling.nvtx.range_pop()
@@ -808,8 +796,8 @@ class PreparedDelta:
             self._allocate_paused()
             with torch.cuda.stream(self.stream):
                 with self._phase("paused_gpu_pipeline"):
-                    # Paused setup may touch every slot. This one fence also
-                    # places the enclosing timing event before initial DE.
+                    # Every DE stream must wait for paused setup before using
+                    # decoded slots or metadata.
                     if self.batches:
                         for stream in self.de_streams:
                             stream.wait_stream(self.stream)
@@ -856,13 +844,6 @@ class PreparedDelta:
             raise RuntimeError(
                 "direct GPU delta decompression failed; session is poisoned"
             )
-        if self.timing_enabled:
-            # Decode intervals on different DE streams may overlap. These sums
-            # are not elapsed pipeline time and must not be added to it.
-            self.timings["cuda_event_ms"] = {
-                name: sum(start.elapsed_time(end) for start, end in pairs)
-                for name, pairs in self.events.items()
-            }
         # The loop-local batch also holds output/workspace leases. Drop it before
         # releasing the dedicated DE allocations, so free/fence overhead is
         # included in paused host wall time and completes before generation resumes.
@@ -874,7 +855,6 @@ class PreparedDelta:
             "verification": "manifest-sha256-and-decoder-status",
             "target_version": self.target_version,
             "tensors": self.matrix_tensor_count + self.raw_tensor_count,
-            "timing_enabled": self.timing_enabled,
             "timings": self.timings,
             "h2d_bytes": self.h2d_bytes,
         }
@@ -885,7 +865,7 @@ class PreparedDelta:
             slot = index % self.decode_stages
             if index >= self.decode_stages:
                 stream.wait_event(self.decoded_free[slot])
-            with self._phase("decode", stream):
+            with self._phase("decode"):
                 if batch.zero_ranges:
                     torch._foreach_zero_(batch.zero_ranges)
                 batch.decoder.enqueue()
