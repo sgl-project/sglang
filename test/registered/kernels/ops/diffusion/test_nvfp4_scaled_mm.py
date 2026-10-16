@@ -196,6 +196,10 @@ def _set_diffusion_fp4_backend(
     diffusion_modelopt_quant._get_fp4_gemm_op.cache_clear()
 
 
+def _copy_into_param(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
+    param.data.copy_(loaded_weight)
+
+
 def _build_layer(
     weight_fp4: torch.Tensor,
     weight_scale_linear: torch.Tensor,
@@ -227,7 +231,7 @@ def _build_layer(
         input_size=input_size,
         output_size=output_size,
         params_dtype=DTYPE,
-        weight_loader=lambda *args, **kwargs: None,
+        weight_loader=_copy_into_param,
     )
     layer = layer.to(device=DEVICE)
 
@@ -239,7 +243,9 @@ def _build_layer(
     layer.weight_scale_2.data.copy_(
         (1.0 / weight_global_scale).reshape_as(layer.weight_scale_2)
     )
-    layer.weight_scale.data.copy_(weight_scale_linear)
+    # Through the parameter's own loader, as a checkpoint load does: a
+    # swizzled checkpoint's scales are converted to row-major there.
+    layer.weight_scale.weight_loader(layer.weight_scale, weight_scale_linear)
     if weight_scale_device is not None:
         layer.weight_scale = torch.nn.Parameter(
             layer.weight_scale.detach().to(weight_scale_device), requires_grad=False
