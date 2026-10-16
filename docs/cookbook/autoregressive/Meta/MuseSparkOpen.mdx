@@ -49,7 +49,7 @@ This cookbook provides deployment recipes for the Muse Spark Open 816B-A42B chec
 
 ### Aggregated serving capacity and timeouts
 
-For the aggregated TP/EP recipes without attention data parallelism, set an explicit request cap for your workload. Let `C` be the expected number of active client requests. You can use `CAPACITY=2*C` to leave scheduling headroom. The example below uses the same value for `--cuda-graph-max-bs-decode`; lower this graph cap to save memory without reducing `--max-running-requests`. Decode batches above the graph cap use eager execution, so validate memory and throughput at your intended concurrency. Larger admission or graph caps consume more memory and do not guarantee higher throughput.
+For the aggregated TP/EP recipes without attention data parallelism, set an explicit request cap for your workload. Let `C` be the expected number of active client requests. You can use `CAPACITY=2*C` to leave scheduling headroom. The example below uses the same value for `--cuda-graph-max-bs-decode`; lower this graph cap to save memory without reducing `--max-running-requests`. Decode batches above the graph cap use eager execution. With DFlash2, also set `SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1` when request admission exceeds the graph cap, so selector parameters are not staged into buffers sized for the captured batch. Validate memory and throughput at your intended concurrency. Larger admission or graph caps consume more memory and do not guarantee higher throughput.
 
 Set the environment variable in the serving process, then add the flags below to your selected launch command, replacing any existing values:
 
