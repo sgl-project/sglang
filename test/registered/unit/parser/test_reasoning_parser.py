@@ -1117,6 +1117,7 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
         Streamed reasoning cannot be taken back, so only content is compared."""
         for text in (
             "<think>All reasoning, no answer</think>",
+            "<think><think>All reasoning, no answer</think>",
             "<think>Reasoning here</think>The answer is 42.",
         ):
             for stream_reasoning in (True, False):

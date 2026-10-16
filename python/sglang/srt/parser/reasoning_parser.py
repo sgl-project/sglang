@@ -158,10 +158,7 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult(normal_text=text)
 
         # The text is considered to be in a reasoning block.
-        think_start_text = self.think_start_token + self.think_start_self_label
-        processed_text = text
-        while processed_text.startswith(think_start_text):
-            processed_text = processed_text[len(think_start_text) :]
+        processed_text = self._strip_repeated_think_starts(text)
 
         if (
             self.think_end_token not in processed_text
@@ -295,6 +292,12 @@ class BaseReasoningFormatDetector:
 
         return StreamingParseResult()
 
+    def _strip_repeated_think_starts(self, text: str) -> str:
+        think_start_text = self.think_start_token + self.think_start_self_label
+        while text.startswith(think_start_text):
+            text = text[len(think_start_text) :]
+        return text
+
     def _strip_leading_think_start(self, text: str) -> str:
         think_start_text = self.think_start_token + self.think_start_self_label
         if text.startswith(think_start_text):
@@ -343,7 +346,10 @@ class BaseReasoningFormatDetector:
                 and not leftover
                 and not self._content_streamed
             ):
-                leftover = self._accumulated_reasoning
+                # Streaming strips only the first <think>; strip any repeats here.
+                leftover = self._strip_repeated_think_starts(
+                    self._accumulated_reasoning
+                )
             self._accumulated_reasoning = ""
             return StreamingParseResult(normal_text=leftover)
 
