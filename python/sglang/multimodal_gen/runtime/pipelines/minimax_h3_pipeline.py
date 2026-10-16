@@ -49,7 +49,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         # scheduler intentionally absent: model_index carries scheduler=null;
         # per-modality sigma schedules are generated in TimestepPreparation
         # from the task profile, and the loop scheduler math lives in
-        # scheduling_minimax_h3_euler_ancestral (stages accept scheduler=None).
+        # minimax_h3/denoise_loop.py (stages accept scheduler=None).
         "transformer",
     ]
 
