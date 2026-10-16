@@ -89,6 +89,7 @@ struct CompletionRequest {
     response_format: Option<ResponseFormat>,
     custom_params: Option<Map<String, Value>>,
     custom_logit_processor: Option<String>,
+    watermark: Option<Map<String, Value>>,
     images_config: Option<Map<String, Value>>,
     data_parallel_rank: Option<i64>,
     rid: Option<OneOrList<String>>,
@@ -158,7 +159,7 @@ pub fn lower_completion(
     if (request.echo || request.logprobs.is_some()) && tokenizer.is_none() {
         return Err(Unsupported("no_tokenizer"));
     }
-    if let Some(schema) = format_json_schema(request.response_format.as_ref())? {
+    if let Some(schema) = format_json_schema(request.response_format.as_ref(), false)? {
         request.json_schema = Some(schema);
     }
     if request.routed_dp_rank.is_none() {
@@ -220,6 +221,7 @@ fn generate_body(
         "logit_bias": logit_bias,
         "custom_params": request.custom_params,
         "sampling_seed": request.seed,
+        "watermark": request.watermark,
     });
     let (prompt_key, prompt) = match &request.prompt {
         Prompt::Text(text) => ("text", json!(text)),

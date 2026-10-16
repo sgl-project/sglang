@@ -152,6 +152,19 @@ pub enum DecodePolicyKind {
     LegacyHostAffinity,
 }
 
+/// How `--dp-aware` picks a DP rank that no routing key or cached prefix decides,
+/// which in PD mode is every decode rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DpRankPolicy {
+    /// The rank with the fewest requests this router has in flight on it.
+    #[default]
+    #[value(name = "least_in_flight")]
+    LeastInFlight,
+    /// The worker's ranks in turn.
+    #[value(name = "round_robin")]
+    RoundRobin,
+}
+
 /// Role served by a static bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -283,6 +296,8 @@ impl std::fmt::Display for StickyFallbackKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Native gRPC listener on `host`; `None` disables it.
+    pub grpc_port: Option<u16>,
     /// Pause after SIGTERM with `/readyz` returning 503 before stopping accepts.
     /// Allows endpoint removal or readiness-probe failures to reach load balancers.
     /// Leave time in the pod grace period for in-flight draining; 0 disables the pause.
@@ -318,6 +333,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            grpc_port: None,
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
@@ -372,6 +388,8 @@ pub struct ModelConfig {
     pub decode_policy: DecodePolicyKind,
     /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
     pub dp_aware: bool,
+    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it.
+    pub dp_rank_policy: DpRankPolicy,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
