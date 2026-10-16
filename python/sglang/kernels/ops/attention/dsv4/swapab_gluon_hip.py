@@ -127,4 +127,6 @@ def partial_gluon(
 
 
 # the SM100 host path (sink, combine, inverse RoPE) on the gfx950 split-KV kernel above
-swapab_attention = functools.partial(_swapab_attention, partial_gluon=partial_gluon)
+swapab_attention = functools.partial(
+    _swapab_attention, partial_gluon=partial_gluon, pdl=False, narrow_combine=False
+)

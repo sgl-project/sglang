@@ -98,8 +98,19 @@ def partial_gluon(
     DATA_BYTES: gl.constexpr,
     SCALE_BYTES: gl.constexpr,
     TILE: gl.constexpr,
+    USE_GDC: gl.constexpr = False,
 ):
     gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
+    if USE_GDC:
+        # tl.extra.cuda.gdc_wait: every input is read after it.
+        gl.inline_asm_elementwise(
+            "griddepcontrol.wait; // $0",
+            "=r",
+            [],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
     b, t = gl.program_id(0), gl.program_id(1)
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
@@ -150,6 +161,17 @@ def partial_gluon(
         gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
         value=kv,
     )
+    if USE_GDC:
+        # tl.extra.cuda.gdc_launch_dependents after the last global load: the combine
+        # launches while the MMAs and the epilogue run.
+        gl.inline_asm_elementwise(
+            "griddepcontrol.launch_dependents; // $0",
+            "=r",
+            [],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
     score_tmem = allocate_tensor_memory(
         gl.float32, [BT, H], TensorMemoryLayout(block=(BT, H), col_stride=1)
     )
