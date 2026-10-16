@@ -109,13 +109,35 @@ def dequantize_k_cache_paged_v41(
     """
     layout = KVLayout.parse(layout)
     assert layout in (KVLayout.V41, KVLayout.V41_FP4), layout
+    assert quant_k_cache.is_cuda and quant_k_cache.ndim == 2
+    assert quant_k_cache.is_contiguous()
+    assert page_table_1_flattened.ndim == 1
+    assert page_table_1_flattened.is_contiguous()
+    assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+    assert page_table_1_flattened.device == quant_k_cache.device
+    assert page_size > 0
+    if out is not None:
+        assert out.shape == (page_table_1_flattened.numel(), 1, 512)
+        assert out.dtype == torch.bfloat16
+        assert out.device == quant_k_cache.device
+        assert out.stride(2) == 1
+        assert out.shape[0] <= 1 or out.stride(0) >= 512
     if is_hip_runtime():
         supported = is_gfx95_supported()
     else:
+        # Select the software decoder from the cache's actual device, never
+        # from an environment-selected JIT target. SM86 is not covered.
+        if torch.cuda.get_device_capability(quant_k_cache.device) == (8, 0):
+            from .dequant_k_cache_sm80 import dequantize_k_cache_paged_sm80
+
+            return dequantize_k_cache_paged_sm80(
+                quant_k_cache, page_table_1_flattened, page_size, out=out, layout=layout
+            )
         supported = get_jit_cuda_arch().major >= 10
     if not supported:
         raise RuntimeError(
-            "DeepSeek V4.1 KV cache dequantization requires CUDA SM100 or newer, or gfx950"
+            "DeepSeek V4.1 KV cache dequantization requires CUDA SM80 (8, 0), "
+            "CUDA SM100 or newer, or gfx950"
         )
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)

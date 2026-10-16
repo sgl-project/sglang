@@ -21,6 +21,9 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
+
 #include <sgl_kernel/tensor.h>
 
 #include <sgl_kernel/scalar_type.hpp>
@@ -317,6 +320,25 @@ bool is_valid_config(
   COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)  \
   COMMON_GET_IF_M234(W_TYPE, 4, 8, 128)
 
+// FP8 block-32 checkpoints need group_blocks=2. Keep this separate from
+// COMMON_GET_IF so adding group-32 does not also instantiate group-64 kernels.
+#define GROUP32_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false)  \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define GROUP32_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)   \
+  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define GROUP32_GET_IF(W_TYPE)            \
+  GROUP32_GET_IF_M1(W_TYPE, 8, 8, 256)    \
+  GROUP32_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  GROUP32_GET_IF_M1(W_TYPE, 4, 8, 128)    \
+  GROUP32_GET_IF_M234(W_TYPE, 16, 4, 256) \
+  GROUP32_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+  GROUP32_GET_IF_M234(W_TYPE, 4, 8, 128)
+
 #define BIGGROUP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 8, NUM_THREADS, false)   \
@@ -416,6 +438,7 @@ MarlinFuncPtr get_marlin_kernel(
   FP4_GET_IF(host::kFE2M1f)
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
+  GROUP32_GET_IF(host::kFE4M3fn)
 
   ACT_GET_IF(host::kU4B8)
   ACT_GET_IF(host::kU8B128)
@@ -444,7 +467,47 @@ exec_config_t determine_exec_config(
     bool has_zp,
     bool is_zp_float,
     int max_shared_mem,
-    int sms) {
+    int sms,
+    bool sm80_single_token) {
+#if SGL_CUDA_ARCH == 800
+  // Diagnostic opt-in: original BF16/FP8 group-32 arithmetic and existing kernels.
+  // Other architectures, shapes, M sizes, quant types and default dispatch stay unchanged.
+  const char* experimental = std::getenv("SGLANG_DSV41_SM80_EXPERIMENTAL");
+  const char* dense_tile = std::getenv("SGLANG_DSV41_SM80_DENSE_TILE");
+  const bool eligible_shape = (prob_n == 1792 && prob_k == 5120) ||
+                              (prob_n == 4096 && prob_k == 1280) ||
+                              (prob_n == 5120 && prob_k == 1024);
+  // The two shared-expert projections are the worst-throughput dense shapes on
+  // this deployment: (576, 5120) streams 2.9 MiB at ~165 GB/s and (5120, 320)
+  // streams 1.6 MiB at ~179 GB/s, because the tile the heuristic picks leaves
+  // only a handful of the 108 launched CTAs with real work (576 columns / 64
+  // per tile = 9) or starves the K loop (320 / 128 = 2.5 steps). Kept behind its
+  // own opt-in so the shipped dense-tile setting is untouched.
+  const char* dense_tile_small = std::getenv("SGLANG_DSV41_SM80_DENSE_TILE_SMALL");
+  const bool small_shape = (prob_n == 576 && prob_k == 5120) ||
+                           (prob_n == 5120 && prob_k == 320);
+  if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+    if (experimental != nullptr && std::strcmp(experimental, "1") == 0 && dense_tile != nullptr &&
+        sm80_single_token && eligible_shape && prob_m == 1 && thread_m_blocks == 1 && m_block_size_8 &&
+        q_type == host::kFE4M3fn && group_size == 32 && !has_act_order && is_k_full && !has_zp && !is_zp_float) {
+      if (std::strcmp(dense_tile, "n64") == 0) return {1, {128, 64, 128}};
+      if (std::strcmp(dense_tile, "n128k64") == 0) return {1, {64, 128, 128}};
+      if (std::strcmp(dense_tile, "n64x2") == 0) return {2, {128, 64, 128}};
+    }
+    if (experimental != nullptr && std::strcmp(experimental, "1") == 0 &&
+        dense_tile_small != nullptr && sm80_single_token && small_shape && prob_m == 1 &&
+        thread_m_blocks == 1 && m_block_size_8 && q_type == host::kFE4M3fn &&
+        group_size == 32 && !has_act_order && is_k_full && !has_zp && !is_zp_float) {
+      // Narrower N tiles (n32) put more of the 108 CTAs to work on (576, 5120);
+      // a shorter K tile (k64) lengthens the 2.5-step K loop of (5120, 320).
+      if (std::strcmp(dense_tile_small, "n64") == 0) return {1, {128, 64, 128}};
+      if (std::strcmp(dense_tile_small, "n128k64") == 0) return {1, {64, 128, 128}};
+      if (std::strcmp(dense_tile_small, "n32") == 0) return {1, {128, 32, 128}};
+      if (std::strcmp(dense_tile_small, "n64k64") == 0) return {1, {64, 64, 128}};
+      if (std::strcmp(dense_tile_small, "n32k64") == 0) return {1, {64, 32, 128}};
+    }
+  }
+#endif
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
   int thread_configs_size = thread_m_blocks > 1 ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
@@ -649,7 +712,8 @@ void marlin_mm(
           has_zp,
           is_zp_float,
           max_shared_mem,
-          sms);
+          sms,
+          prob_m == 1 && use_fp32_reduce && !use_atomic_add);
       thread_tfg = exec_cfg.tb_cfg;
       if (thread_tfg.thread_k == -1 && max_thread_m_blocks > 1) {
         max_thread_m_blocks--;

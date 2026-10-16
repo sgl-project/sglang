@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.deep_select import (
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
+from sglang.kernels.ops.attention.dsv4.sm80_utils import is_dsv41_sm80_experimental
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
@@ -38,6 +39,64 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
 
+def _all_causal_bound(inputs, req_to_token: torch.Tensor) -> int | None:
+    """A host/shape-only upper bound; never synchronize live device lengths.
+
+    These backends are exclusive to V4.1. The shared gate checks the actual
+    query device, not a global platform flag or the current CUDA device.
+    """
+    if (
+        not is_dsv41_sm80_experimental("deepseek_v41", inputs.positions.device)
+        or inputs.compress_ratio not in (1, 2)
+        or inputs.indexer.index_topk != 512
+        or inputs.req_rows is None
+        or inputs.req_rows.shape != inputs.positions.shape
+    ):
+        return None
+    ratio = inputs.compress_ratio
+    if isinstance(inputs, PrefillInputs):
+        lengths, rows = inputs.seq_lens_cpu, inputs.rows_per_request
+        if (
+            lengths is None
+            or rows is None
+            or len(lengths) != len(rows)
+            or len(lengths) != inputs.req_pool_indices.shape[0]
+            or sum(rows) != inputs.positions.shape[0]
+            or any(s < 0 or n < 0 or n > s for s, n in zip(lengths, rows))
+        ):
+            return None
+        bound = max(lengths, default=0) // ratio
+    else:
+        # This is a replay-capacity bound, NOT a live length read. Wide graph
+        # capacities deliberately fall back even if today's rows are short.
+        bound = inputs.paged_metadata.max_compressed_seq_len
+    if bound < 0 or bound > req_to_token.shape[1] // ratio:
+        return None
+    return bound
+
+
+def _write_all_causal(
+    inputs, req_to_token: torch.Tensor, bound: int, candidate_lens=None
+) -> None:
+    """Every visible key is in top-512, independent of queries and scores."""
+    inputs.reset_outputs()
+    num_rows = inputs.positions.shape[0]
+    j = torch.arange(bound, device=inputs.positions.device)
+    valid = j[None, :] < ((inputs.positions + 1) // inputs.compress_ratio)[:, None]
+    if candidate_lens is not None:
+        valid = valid & (j[None, :] < candidate_lens[:, None])
+    if isinstance(inputs, PrefillInputs):
+        inputs.out_raw_indices[:num_rows, :bound] = torch.where(valid, j[None, :], -1)
+    if inputs.out_page_indices is not None:
+        slots = (
+            req_to_token[
+                inputs.req_rows[:, None], (j * inputs.compress_ratio)[None, :]
+            ].to(torch.int64)
+            // inputs.compress_ratio
+        )
+        inputs.out_page_indices[:num_rows, :bound] = torch.where(valid, slots, -1)
+
+
 class FullTopKIndexer:
     def __init__(
         self,
@@ -56,6 +115,11 @@ class FullTopKIndexer:
         )
 
     def topk_prefill(self, inputs: PrefillInputs) -> None:
+        if not self.use_deep_gemm_prefill:
+            bound = _all_causal_bound(inputs, self.req_to_token)
+            if bound is not None and bound <= 512:
+                _write_all_causal(inputs, self.req_to_token, bound)
+                return
         if self.use_deep_gemm_prefill:
             self._deep_gemm_prefill(inputs)
         else:
@@ -65,6 +129,11 @@ class FullTopKIndexer:
         self._deep_gemm_prefill_captured(inputs)
 
     def topk_decode(self, inputs: DecodeInputs) -> None:
+        if not self.use_deep_gemm_decode:
+            bound = _all_causal_bound(inputs, self.req_to_token)
+            if bound is not None and bound <= 512:
+                _write_all_causal(inputs, self.req_to_token, bound)
+                return
         if self.use_deep_gemm_decode:
             self._deep_gemm_decode(inputs)
         else:

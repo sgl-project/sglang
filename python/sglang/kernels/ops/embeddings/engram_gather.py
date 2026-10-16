@@ -10,6 +10,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache_sm80 import (
+    _e4m3_to_fp32,
+    _scaled_bf16,
+    _ue8m0_to_fp32,
+)
+
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
 
@@ -25,6 +31,7 @@ def _engram_gather_kernel(
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
+    SM80: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
@@ -32,18 +39,30 @@ def _engram_gather_kernel(
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
     s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
-    exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
-        tl.int32
-    )
-    # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
-    scale = (exps << 23).to(tl.float32, bitcast=True)
-    scale = tl.where(exps == 0, E8M0_ZERO, scale)
-    out = tl.where(owned, vals * scale, 0.0)
-    tl.store(out_ptr + row * DIM + offs, out.to(tl.bfloat16))
+    if SM80:
+        # Keep the original raw address, but never instantiate an FP8 pointer
+        # or conversion on SM80: Triton cannot compile float8e4nv there.
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        codes = tl.load(w + local * DIM + offs, mask=owned, other=0)
+        exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0)
+        vals = _e4m3_to_fp32(codes)
+        # The shared decoder maps 255 to NaN (including 0 * NaN), and 0
+        # to 2**-127. The multiply must not flush FP32 subnormals to zero.
+        decoded = _scaled_bf16(vals, _ue8m0_to_fp32(exps))
+        out = tl.where(owned, decoded, 0.0).to(tl.bfloat16)
+    else:
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
+        exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
+            tl.int32
+        )
+        # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
+        scale = (exps << 23).to(tl.float32, bitcast=True)
+        scale = tl.where(exps == 0, E8M0_ZERO, scale)
+        out = tl.where(owned, vals * scale, 0.0).to(tl.bfloat16)
+    tl.store(out_ptr + row * DIM + offs, out)
 
 
 def engram_gather(
@@ -81,5 +100,9 @@ def engram_gather(
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
+            SM80=(
+                torch.version.hip is None
+                and torch.cuda.get_device_capability(ids.device) == (8, 0)
+            ),
         )
     return out

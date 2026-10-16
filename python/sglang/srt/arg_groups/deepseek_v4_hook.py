@@ -47,6 +47,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+    validate_deepseek_v41_sm80_experimental(server_args)
 
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
@@ -110,6 +111,125 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             assert cfg.speculative_eagle_topk == 1, (
                 f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
             )
+
+
+def validate_deepseek_v41_sm80_experimental(server_args: ServerArgs) -> None:
+    """Fail closed for opt-in V4.1 SM80 eager or BS=1 full-decode experiments."""
+    # Do not query CUDA or change declarations for ordinary serving. In particular,
+    # EnvBool accepts more spellings than this experimental opt-in permits.
+    if envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() != "1":
+        return
+    cfg = resolving_view(server_args)
+    model_config = model_config_of(server_args)
+    if model_config.hf_text_config.model_type != "deepseek_v41" or cfg.device != "cuda":
+        return
+
+    import torch
+
+    # Startup runs before worker device selection. Probe the actual allocation
+    # base rather than CUDA's current/default device or a cached platform gate.
+    if torch.cuda.get_device_capability(cfg.base_gpu_id) != (8, 0):
+        return
+
+    prefix = "DeepSeek-V4.1 experimental SM80"
+    unsupported = (
+        ("TRT-LLM attention", cfg.dsv4_attn_backend == "trtllm"),
+        (
+            "unified KV layout",
+            envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "unified_kv_triton"
+            or envs.SGLANG_DSV4_UNIFIED_KV_FP8.get(),
+        ),
+        ("Q8 sparse prefill", cfg.dsv4_prefill_backend == "flashmla_sparse_q8"),
+        ("FP4 indexer", cfg.enable_deepseek_v4_fp4_indexer),
+        (
+            "context parallelism (CP/DCP)",
+            cfg.enable_prefill_cp or cfg.attn_cp_size > 1 or cfg.dcp_size > 1,
+        ),
+        ("DP attention", attn_dp_enabled_of(cfg)),
+        ("pipeline parallelism", cfg.pp_size > 1),
+        ("multiple nodes", cfg.nnodes > 1),
+        ("PD disaggregation", cfg.disaggregation_mode != "null"),
+        (
+            "speculative decoding / MTP",
+            cfg.speculative_algorithm is not None
+            or cfg.speculative_draft_model_path is not None
+            or cfg.decoupled_spec_role != "null",
+        ),
+        ("mixed prefill/decode", cfg.enable_mixed_chunk),
+        ("decoder SWA bounded replay", cfg.enable_decoder_swa_bounded_replay),
+        ("encoder SWA bounded replay", cfg.enable_encoder_swa_bounded_replay),
+        ("HiCache", cfg.enable_hierarchical_cache),
+        ("HiSparse", cfg.enable_hisparse),
+        ("LoRA", cfg.enable_lora),
+        (
+            "vision / multimodal pipeline (use --language-model-only)",
+            model_config.is_multimodal and not cfg.language_model_only,
+        ),
+        ("two-batch overlap", cfg.enable_two_batch_overlap),
+    )
+    for feature, enabled in unsupported:
+        if enabled:
+            raise ValueError(f"{prefix} does not support {feature}; disable it.")
+
+    # Validate the resolved config, not just legacy booleans: explicit per-phase
+    # selectors and JSON override those booleans and can re-enable capture.
+    if envs.SGLANG_DSV41_SM80_FULL_GRAPH.get() == "1":
+        decode_graph = cfg.cuda_graph_config.decode
+        if (
+            decode_graph.backend != Backend.FULL
+            or cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                f"{prefix} full-graph experiment requires decode backend full "
+                "and prefill backend disabled."
+            )
+        # Unresolved defaults must not widen the capture set after this guard.
+        if (
+            cfg.max_running_requests != 1
+            or decode_graph.bs != [1]
+            or decode_graph.max_bs != 1
+        ):
+            raise ValueError(
+                f"{prefix} full-graph experiment requires max_running_requests=1 "
+                "and resolved decode bs=[1], max_bs=1."
+            )
+        if envs.SGLANG_DSV41_SM80_FFN_GRAPH.get() == "1":
+            raise ValueError(
+                f"{prefix} full-graph experiment forbids "
+                "SGLANG_DSV41_SM80_FFN_GRAPH=1 (nested capture)."
+            )
+    elif (
+        cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+        or cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            f"{prefix} requires eager decode and prefill: use "
+            "--disable-decode-cuda-graph --disable-prefill-cuda-graph "
+            "and remove CUDA graph backend overrides."
+        )
+
+    if cfg.dsv4_attn_backend not in ("auto", "flashmla"):
+        raise ValueError(
+            f"{prefix} requires --dsv4-attn-backend flashmla, "
+            f"got {cfg.dsv4_attn_backend!r}."
+        )
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
+    if (prefill_backend, decode_backend) != ("dsv4", "dsv4"):
+        raise ValueError(
+            f"{prefix} requires dsv4 attention for both phases, "
+            f"got prefill={prefill_backend!r}, decode={decode_backend!r}."
+        )
+    if cfg.kv_cache_dtype != "fp8_e4m3":
+        raise ValueError(
+            f"{prefix} requires --kv-cache-dtype fp8_e4m3, got {cfg.kv_cache_dtype!r}."
+        )
+    if cfg.dsv4_attn_backend == "auto":
+        # Keep the existing dsv4 selector; the device-aware backend owns fallback.
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_sm80_experimental",
+            dsv4_attn_backend="flashmla",
+        )
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
