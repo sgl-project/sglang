@@ -1,13 +1,14 @@
-"""M-RoPE section handling in ``MRotaryEmbedding.forward_npu`` on Ascend NPU.
+"""M-RoPE handling in ``MRotaryEmbedding.forward_npu`` on Ascend NPU.
 
-``forward_npu`` used to pass a literal ``mrope_section=[0, 0, 0]`` to
-``torch_npu.npu_mrope``. The CANN op documents all-zero section as "M-RoPE not
-enabled", so every axis got zero rotary lanes and multimodal prompts received
-degenerate 1D positions -- on NPU only, and silently: the output looks
-plausible, accuracy just degrades.
+Both values this path derives for ``torch_npu.npu_mrope`` fail silently when
+wrong -- the output looks plausible, accuracy just degrades. The section: a
+literal ``[0, 0, 0]`` is the op's "M-RoPE disabled" sentinel, so passing it always
+collapses multimodal prompts to 1D positions. The axis map: ``cache_mode`` must
+follow ``mrope_interleaved``, or a model needing the round-robin mapping gets the
+contiguous one instead.
 
-This guards the fix by comparing the NPU path against ``forward_triton``, the
-path ``forward_cuda`` takes for sectioned M-RoPE.
+Guarded by comparing against ``forward_triton``, the path ``forward_cuda`` takes
+for sectioned M-RoPE.
 """
 
 import unittest
@@ -24,7 +25,7 @@ register_npu_ci(est_time=30, suite="full-1-npu-a3", nightly=True)
 
 @unittest.skipUnless(is_npu(), "Ascend NPU not available")
 class TestMRotaryEmbeddingNpuSection(CustomTestCase):
-    def test_forward_npu_matches_cuda_path(self):
+    def _assert_matches_cuda_path(self, mrope_interleaved):
         head_dim = 128
         rot = MRotaryEmbedding(
             head_size=head_dim,
@@ -34,6 +35,7 @@ class TestMRotaryEmbeddingNpuSection(CustomTestCase):
             is_neox_style=False,
             dtype=torch.bfloat16,
             mrope_section=[16, 24, 24],
+            mrope_interleaved=mrope_interleaved,
         ).to("npu")
 
         torch.manual_seed(0)
@@ -50,14 +52,19 @@ class TestMRotaryEmbeddingNpuSection(CustomTestCase):
             .npu()
         )
         q = torch.randn(seq, heads * head_dim, dtype=torch.bfloat16, device="npu")
-        k = q.clone()
 
-        npu_q, _ = rot.forward_npu(positions, q.clone(), k.clone())
-        triton_q, _ = rot.forward_triton(positions, q.clone(), k.clone())
-
-        # Before the fix these differed by ~1.8 (1D positions instead of 3-axis);
-        # with the section passed through they are bit-identical.
+        npu_q, _ = rot.forward_npu(positions, q.clone(), q.clone())
+        triton_q, _ = rot.forward_triton(positions, q.clone(), q.clone())
         self.assertTrue(torch.equal(npu_q, triton_q))
+
+    def test_contiguous_axis_map(self):
+        # GLM-OCR: lanes split as [0]*16 [1]*24 [2]*24.
+        self._assert_matches_cuda_path(mrope_interleaved=False)
+
+    def test_interleaved_axis_map(self):
+        # Qwen2-VL: axes assigned round-robin, which the op calls cache_mode
+        # 'interleave'. Dropping it silently applies the contiguous map instead.
+        self._assert_matches_cuda_path(mrope_interleaved=True)
 
 
 if __name__ == "__main__":
