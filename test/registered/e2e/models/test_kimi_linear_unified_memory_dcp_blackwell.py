@@ -47,7 +47,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=161, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=330, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 
@@ -80,6 +80,18 @@ class TestKimiLinearUnifiedMemoryDCPCuteDsl(
         "--cuda-graph-max-bs-decode",
         "128",
         "--enable-unified-memory",
+    ]
+
+
+class TestKimiLinearUnifiedMemoryDCPCuteDslBreakablePrefill(
+    TestKimiLinearUnifiedMemoryDCPCuteDsl
+):
+    """Same server with breakable prefill CUDA graphs: capture used to crash
+    under DCP (attn_dcp_metadata is None on the capture batch)."""
+
+    other_args = TestKimiLinearUnifiedMemoryDCPCuteDsl.other_args + [
+        "--cuda-graph-backend-prefill",
+        "breakable",
     ]
 
 
