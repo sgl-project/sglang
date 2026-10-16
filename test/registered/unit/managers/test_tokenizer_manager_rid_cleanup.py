@@ -14,10 +14,15 @@ Covers:
 """
 
 import asyncio
+import concurrent.futures
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+import numpy as np
+import pybase64
+import torch
+from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -29,6 +34,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     GenerateReqInput,
 )
+from sglang.srt.managers.output_store import TokenOutputStash  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
@@ -37,6 +43,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk  # noqa: E402
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -401,6 +408,150 @@ class TestAbortOutputPayload(CustomTestCase):
                 out = state.out_list[0]
                 self.assertEqual(out["output_ids"], expected)
                 self.assertEqual(out["meta_info"]["completion_tokens"], 3)
+
+
+class _FakeOutputStore:
+    """OutputStoreWriter boundary: records what would be written or removed."""
+
+    def __init__(self):
+        self.future = concurrent.futures.Future()
+        self.puts = []
+        self.cleanup_futures = []
+
+    def submit_put(self, stash):
+        self.puts.append(stash)
+        return self.future
+
+    def cleanup_after(self, future):
+        self.cleanup_futures.append(future)
+
+
+class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCase):
+    def setUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.request_logger = Mock()
+        self.tm.request_metrics_exporter_manager = Mock()
+        self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        self.store = _FakeOutputStore()
+        self.tm.output_store = self.store
+        self.routed_experts = torch.arange(4, dtype=torch.int32).reshape(2, 1, 2)
+        self.indexer_topk = torch.arange(24, dtype=torch.int32).reshape(2, 3, 4)
+
+    def _state(self, rid, *, via_store):
+        state = _make_req_state(rid)
+        state.obj.background = False
+        if via_store:
+            state.token_output_stash = TokenOutputStash()
+        self.tm.rid_to_state[rid] = state
+        return state
+
+    def _batch(self, rid, finished_reason=None):
+        batch = _make_batch_str_output(rid, finished_reason)
+        batch.routed_experts_raw = [self.routed_experts]
+        batch.indexer_topk_raw = [self.indexer_topk]
+        batch.output_token_sampling_mask = [
+            SamplingMaskChunk(
+                lengths=np.array([2, 1], np.int32),
+                token_ids=np.array([5, 6, 7], np.int32),
+                logprobs=np.array([-0.5, -1.0], np.float32),
+            )
+        ]
+        return batch
+
+    async def test_store_request_returns_ref_instead_of_arrays(self):
+        state = self._state("store_rid", via_store=True)
+        stream = self.tm._wait_one_response(state.obj)
+        self.store.future.set_result({"handle": {"h": 1}, "fields": {}})
+
+        await self.tm._handle_batch_output(self._batch("store_rid"))
+        meta_info = (await anext(stream))["meta_info"]
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
+        self.assertEqual(
+            meta_info["output_store_ref"], {"handle": {"h": 1}, "fields": {}}
+        )
+        self.assertEqual(meta_info["output_token_sampling_mask_length"], 2)
+        for key in (
+            "routed_experts",
+            "indexer_topk",
+            "output_token_sampling_mask",
+            "output_token_sampling_logprobs",
+        ):
+            self.assertNotIn(key, meta_info)
+        (stash,) = self.store.puts
+        self.assertIs(stash.routed_experts, self.routed_experts)
+        self.assertIs(stash.indexer_topk, self.indexer_topk)
+        self.assertEqual(len(stash.sampling_mask_chunks), 1)
+
+    async def test_other_requests_on_a_store_server_stay_inline(self):
+        """With the store enabled the detokenizer sends tensors, so the tokenizer
+        must encode them for requests that did not opt in."""
+        state = self._state("inline_rid", via_store=False)
+
+        await self.tm._handle_batch_output(self._batch("inline_rid"))
+
+        meta_info = state.out_list[-1]["meta_info"]
+        self.assertEqual(
+            meta_info["routed_experts"],
+            pybase64.b64encode(self.routed_experts.numpy().tobytes()).decode("utf-8"),
+        )
+        self.assertEqual(
+            meta_info["indexer_topk"],
+            pybase64.b64encode(self.indexer_topk.numpy().tobytes()).decode("utf-8"),
+        )
+        self.assertEqual(meta_info["output_token_sampling_mask"], [[5, 6], [7]])
+        self.assertNotIn("output_store_ref", meta_info)
+        self.assertEqual(self.store.puts, [])
+
+    async def test_failing_abort_writes_nothing(self):
+        state = self._state("abort_rid", via_store=True)
+        stream = self.tm._wait_one_response(state.obj)
+        abort = {"type": "abort", "status_code": 503, "message": "overloaded"}
+
+        await self.tm._handle_batch_output(self._batch("abort_rid", abort))
+
+        with self.assertRaises(HTTPException) as raised:
+            await anext(stream)
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(self.store.puts, [])
+
+    async def test_put_failure_fails_the_request(self):
+        state = self._state("put_fail_rid", via_store=True)
+        stream = self.tm._wait_one_response(state.obj)
+        self.store.future.set_exception(RuntimeError("master unreachable"))
+
+        await self.tm._handle_batch_output(self._batch("put_fail_rid"))
+
+        with self.assertRaises(HTTPException) as raised:
+            await anext(stream)
+        self.assertEqual(raised.exception.status_code, 500)
+
+    async def test_cancelled_waiter_hands_the_put_to_cleanup(self):
+        state = self._state("cancel_rid", via_store=True)
+        stream = self.tm._wait_one_response(state.obj)
+        await self.tm._handle_batch_output(self._batch("cancel_rid"))
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertEqual(self.store.cleanup_futures, [self.store.future])
+
+    async def test_disconnected_client_gets_no_ref_and_its_put_is_removed(self):
+        """A client that disconnects while the put runs never reads the ref, so the
+        stored object must be removed rather than left pinned in the store."""
+        state = self._state("gone_rid", via_store=True)
+        request = Mock(is_disconnected=AsyncMock(return_value=True))
+        stream = self.tm._wait_one_response(state.obj, request)
+        self.store.future.set_result({"handle": {"h": 1}, "fields": {}})
+
+        await self.tm._handle_batch_output(self._batch("gone_rid"))
+
+        with self.assertRaisesRegex(ValueError, "disconnected"):
+            await anext(stream)
+        self.assertEqual(self.store.cleanup_futures, [self.store.future])
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
