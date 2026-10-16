@@ -519,6 +519,9 @@ class Envs:
     # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
     SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
+    # DSpark on HIP: apply the simulated correct_len / bonus inside the folded verify epilogue
+    # (hip graph) instead of falling back to the eager accept + commit path.
+    SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(True)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
@@ -1615,6 +1618,40 @@ class Envs:
     # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+    # ROCm gfx950, DeepSeek-V4 128x128 block-fp8 dense linears: run the GEMM as
+    # aiter's e8m0 mxscale bpreshuffle (flydsl) instead of the fp32-scale
+    # CK/asm/triton bpreshuffle. The weight bytes are shared; only an e8m0 copy
+    # of the (power-of-two) weight scale is added at load, and activations are
+    # quantized with power-of-two (ue8m0) scales. Restricted to the (N, K)
+    # shapes in SGLANG_DSV4_DENSE_MXSCALE_SHAPES ("N:K,N:K"; empty = built-in
+    # whitelist of shapes that win in the microbench, "all" = every shape).
+    SGLANG_DSV4_DENSE_MXSCALE = EnvBool(False)
+    SGLANG_DSV4_DENSE_MXSCALE_SHAPES = EnvStr("")
+    # fp8 unified_kv decode/verify on aiter's FlyDSL v4 nm decode when the
+    # installed aiter ships it; 0 keeps the asm kernel.
+    SGLANG_DSV4_FLYDSL_DECODE = EnvBool(True)
+    # ... which copy: "auto" = aiter's when the installed aiter ships it, else
+    # sglang's in-tree copy; "aiter" = aiter's only (asm without it); "intree" =
+    # the in-tree copy only.
+    # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+    SGLANG_DSV4_FLYDSL_DECODE_SOURCE = EnvStr("auto")
+    # ... also with 128 local heads (DP attention). Off: there the asm path
+    # below (split plan + HCA persistent, ROCm/aiter#6126) measured the same
+    # DP8 DSpark decode step on MI355X without depending on FlyDSL.
+    SGLANG_DSV4_FLYDSL_DECODE_H128 = EnvBool(False)
+    # fp8 unified_kv asm decode (when FlyDSL is off or absent): pick the KV
+    # split count from aiter's v4 nm latency model (ROCm/aiter#6126; ported
+    # when aiter predates it) with a constant split_indptr, per stream kind.
+    SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL = EnvBool(True)
+    # context the HCA split plan is sized for, capped at the server context
+    # length (0: the server context length). Sizing for 1M over-splits HCA at
+    # AgentX lengths (32k-200k).
+    SGLANG_DSV4_FP8_DECODE_SPLIT_CTX = EnvInt(200_000)
+    # fp8 unified_kv asm decode: HCA layers with 128 local heads (DP attention)
+    # take aiter's persistent mla_decode_fwd_v4_nm_ps (in-kernel split + merge)
+    # for MIN_ROWS..32768 rows; needs aiter >= ROCm/aiter#6126.
+    SGLANG_DSV4_FP8_HCA_PERSIST = EnvBool(True)
+    SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
@@ -1665,6 +1702,16 @@ class Envs:
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
+    # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
+    # FP4 MQA logits kernel, a request's verify rows sharing each key load.
+    SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
+    # DeepSeek-V4 C4 decode / target-verify indexer: the same row-group kernel (aiter >= #6145),
+    # its workspace built in the graph without a schedule; a request's verify rows share each
+    # key load.
+    SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP = EnvBool(False)
+    # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
+    # 64-slot page), so a candidate consumer layer scores only its published blocks.
+    SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
