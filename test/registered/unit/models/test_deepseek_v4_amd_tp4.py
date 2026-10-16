@@ -67,6 +67,7 @@ class _Projection:
 
 class _Attention:
     attn_tp_size = 4
+    wo_b_publish = None
 
     def __init__(self, group):
         self.wo_b = _Projection(group)

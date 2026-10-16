@@ -1,0 +1,46 @@
+{
+  "gemm1": {
+    "symbol": "dsv41_routed_expert_gemm1",
+    "block": [
+      512,
+      1,
+      1
+    ],
+    "shared_memory_bytes": 216832,
+    "cluster_dimensions": null,
+    "use_pdl": true,
+    "function_attributes": [],
+    "parameters": [
+      "A",
+      "SFA",
+      "X",
+      "XS",
+      "route",
+      "clamp",
+      "H",
+      "HS",
+      "cta_words"
+    ]
+  },
+  "gemm2": {
+    "symbol": "dsv41_routed_expert_gemm2",
+    "block": [
+      512,
+      1,
+      1
+    ],
+    "shared_memory_bytes": 180736,
+    "cluster_dimensions": null,
+    "use_pdl": true,
+    "function_attributes": [],
+    "parameters": [
+      "A",
+      "SFA",
+      "H",
+      "HS",
+      "route",
+      "Y",
+      "cta_words"
+    ]
+  }
+}

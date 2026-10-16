@@ -60,6 +60,7 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
 )
@@ -823,6 +824,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         if self.lm_head is not None:
             self.markov_head.configure_tp_shard(lm_head=self.lm_head)
+        if _is_cuda and get_exec().features.enable_dsv41_low_latency_decode:
+            from sglang.srt.models.dsv41_low_latency.dspark.install import (
+                install_draft_model,
+            )
+
+            install_draft_model(self)
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -841,18 +848,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         projected, _ = stage0.main_proj(main_hidden)
         return stage0.main_norm(projected)
 
-    def write_target_hidden_kv(
-        self,
-        *,
-        main_hidden: torch.Tensor,
-        swa_loc: torch.Tensor,
-        positions: torch.Tensor,
-        pool: DeepSeekV4TokenToKVPool,
-    ) -> None:
-        main_x = self.project_target_hidden(main_hidden)
-        swa_loc = swa_loc.to(torch.int32)
-        kvs = CommitKvProj.execute(
-            main_x=main_x,
+    def project_context_kv(
+        self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> list[torch.Tensor]:
+        """Every stage's context KV (before kv_norm / RoPE) from the target hidden
+        states; reads nothing that depends on the accept."""
+        return CommitKvProj.execute(
+            main_x=self.project_target_hidden(main_hidden),
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
             allow_strided_output=(
@@ -861,6 +863,23 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 and not pool.uniform_fp8
             ),
         )
+
+    def write_target_hidden_kv(
+        self,
+        *,
+        main_hidden: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+        context_kv: Optional[list[torch.Tensor]] = None,
+    ) -> None:
+        """``context_kv``: `project_context_kv` of ``main_hidden``, if already computed."""
+        kvs = (
+            self.project_context_kv(main_hidden=main_hidden, pool=pool)
+            if context_kv is None
+            else context_kv
+        )
+        swa_loc = swa_loc.to(torch.int32)
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
         # store just needs to target the bf16 ring instead of the fp8 flashmla

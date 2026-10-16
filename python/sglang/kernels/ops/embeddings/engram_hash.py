@@ -28,12 +28,19 @@ def _engram_commit_history_kernel(
     tokens_ptr,
     slots_ptr,
     commit_ptr,
+    live_ptr,
+    gate_ptr,
     HISTORY_STRIDE: tl.constexpr,
     HISTORY_WIDTH: tl.constexpr,
     TOKEN_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
+    GATED: tl.constexpr,
 ):
     row = tl.program_id(0)
+    if GATED:
+        # Captured rows past the live batch, or a step the graph does not commit.
+        if (tl.load(live_ptr + row) == 0) | (tl.load(gate_ptr) == 0):
+            return
     slot = tl.load(slots_ptr + row).to(tl.int64)
     commit = tl.load(commit_ptr + row)
     col = tl.arange(0, BLOCK)
@@ -60,23 +67,31 @@ def engram_commit_history(
     verify_ids: torch.Tensor,
     req_slots: torch.Tensor,
     commit_lens: torch.Tensor,
+    live_rows: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
 ) -> None:
-    """Update distinct live request slots with anchor + correct drafts, not bonus."""
+    """Update distinct live request slots with anchor + correct drafts, not bonus.
+    With ``live_rows`` and ``gate`` (a CUDA graph replay), rows whose live entry is 0
+    are skipped, and all rows when ``gate[0]`` is 0."""
     bs = req_slots.numel()
     width = history.shape[1]
     if bs == 0 or width == 0:
         return
     assert history.stride(1) == 1 and verify_ids.stride(1) == 1
     assert req_slots.stride(0) == 1 and commit_lens.stride(0) == 1
+    assert (live_rows is None) == (gate is None)
     _engram_commit_history_kernel[(bs,)](
         history,
         verify_ids,
         req_slots,
         commit_lens,
+        live_rows if live_rows is not None else commit_lens,
+        gate if gate is not None else commit_lens,
         HISTORY_STRIDE=history.stride(0),
         HISTORY_WIDTH=width,
         TOKEN_STRIDE=verify_ids.stride(0),
         BLOCK=triton.next_power_of_2(width),
+        GATED=live_rows is not None,
         num_warps=4,
     )
 

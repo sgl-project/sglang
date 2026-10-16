@@ -511,6 +511,9 @@ class Fp8LinearMethod(LinearMethodBase):
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
 
+        # A model may set this per layer: (layer, x, weight_scale, bias) -> output,
+        # or None to decline, tried before the MXFP8 CuTe DSL GEMM.
+        self.mxfp8_cutedsl_override = None
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
@@ -1272,6 +1275,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv
+            if (
+                self.mxfp8_cutedsl_override is not None
+                and backend.is_flashinfer_cutedsl()
+            ):
+                out = self.mxfp8_cutedsl_override(layer, x, weight_scale, bias)
+                if out is not None:
+                    return out
             if isinstance(x, tuple):
                 return self.w8a8_mxfp8_linear(
                     input=x[0],

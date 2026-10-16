@@ -160,6 +160,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
+        # The DSV4.1 low-latency verify paths (--enable-dsv41-low-latency-decode).
+        self.low_latency = None
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
@@ -430,6 +432,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
 
+        if get_exec().features.enable_dsv41_low_latency_decode:
+            from sglang.srt.models.dsv41_low_latency.dspark.worker import install
+
+            self.low_latency = install(
+                executor=self._verify_executor,
+                epilogue=self._verify_epilogue,
+                draft_is_moe=self._draft_is_moe,
+                resolve_engram_hasher=lambda: (
+                    self.model_runner.ngram_embedding_manager.engram_hasher
+                ),
+                resolve_draft_sampler=lambda: self._draft_sampler,
+                tp_sync=self._tp_sync,
+                fused_argmax=target_is_dsv41,
+                random_seed=target_worker.random_seed,
+                device=self.device,
+                capture_bs=list(get_exec().graph.cuda_graph_config.decode.bs),
+                rows_per_request=self.query_token_num,
+                stride=self.verify_num_draft_tokens,
+                block_verification=get_spec().speculative_use_block_verification,
+            )
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -528,6 +551,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        if self.low_latency is not None:
+            self.low_latency.precompile()
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
@@ -986,24 +1011,48 @@ class DSparkWorkerV2(BaseSpecWorker):
             and can_run_cuda_graph
             and (run_compact or self._verify_planner.mode_value == "static")
         )
-        accept = self._verify_executor.accept_and_finalize(
+        graph_accept = None
+        if (
+            self.low_latency is not None
+            and not folded_accept
+            and can_run_cuda_graph
+            and not run_compact
+        ):
+            graph_accept = self.low_latency.sampling_accept(
+                bs=bs,
+                target_logits=logits_output.next_token_logits,
+                proposal_folded=proposal.folded,
+                planner_mode=self._verify_planner.mode_value,
+                sampling_info=sampling_info,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                has_grammar=batch.has_grammar,
+            )
+        if graph_accept is not None:
+            accept = graph_accept
+        else:
+            accept = self._verify_executor.accept_and_finalize(
+                folded_accept=folded_accept,
+                bs=bs,
+                verify_ids_2d=verify_ids_2d,
+                target_logits=logits_output.next_token_logits,
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                layout=layout,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+        if self.low_latency is None or not self.low_latency.committed_engram(
             folded_accept=folded_accept,
-            bs=bs,
-            verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            layout=layout,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
-        )
-        self.model_runner.ngram_embedding_manager.update_after_verify(
-            verify_ids_2d=verify_ids_2d,
-            req_pool_indices=batch.req_pool_indices,
-            commit_lens=accept.commit_lens,
-        )
+            run_compact=run_compact,
+            graph_accept=graph_accept is not None,
+        ):
+            self.model_runner.ngram_embedding_manager.update_after_verify(
+                verify_ids_2d=verify_ids_2d,
+                req_pool_indices=batch.req_pool_indices,
+                commit_lens=accept.commit_lens,
+            )
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
             next_token_logits=logits_output.next_token_logits,
@@ -1038,7 +1087,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             commit_lens=accept.commit_lens,
         )
 
-        folded_commit = folded_accept and epilogue.folds_commit
+        folded_commit = (
+            folded_accept or graph_accept is not None
+        ) and epilogue.folds_commit
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:

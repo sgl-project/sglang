@@ -66,6 +66,8 @@ class TestMxfp4TrtllmPadding(CustomTestCase):
             method._fp8 = Mock()
             method.prefix = "test.experts"
             method.flashinfer_mxfp4_moe_precision = "default"
+            method.low_batch_gemm_factory = None
+            method.low_batch_gemm = None
             method.process_weights_after_loading(layer)
             method.create_moe_runner(layer, SimpleNamespace(swiglu_limit=10.0))
             return method, layer

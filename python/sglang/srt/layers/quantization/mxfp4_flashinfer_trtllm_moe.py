@@ -138,6 +138,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self._fp8 = fp8_method
         self.prefix = prefix
         self._bypassed_routing_method = None
+        # A model may set the factory before loading: (layer, clamp) -> a low-batch
+        # routed-expert GEMM with the deferred-finalize ABI (or finalizing into
+        # the output), or None.
+        self.low_batch_gemm_factory = None
+        self.low_batch_gemm = None
         # precision=fp8 is an SM90 knob (Humming W4A8); this SM100 trtllm path
         # already runs MXFP8 activations, so the flag is inert here rather than
         # an error -- one config can move across hardware.
@@ -331,6 +336,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         self._register_static_scale_ones(layer)
+        if self.low_batch_gemm_factory is not None:
+            self.low_batch_gemm = self.low_batch_gemm_factory(
+                layer, self._gemm1_clamp_limit_tensor
+            )
         torch.cuda.empty_cache()
 
     def _register_static_scale_ones(self, layer: Module) -> None:
@@ -483,6 +492,13 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if input_ready is not None:
             # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
+
+        if self.low_batch_gemm is not None and self.low_batch_gemm.supports(
+            x_quant, x_scale, topk_output, finalize=not defer_finalize
+        ):
+            return self.low_batch_gemm.apply(
+                x_quant, x_scale, topk_output, None if defer_finalize else symm_output
+            )
 
         result = moe_call(
             **routing,
