@@ -57,6 +57,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
+_flashinfer_rmsnorm_fp4quant_available = False
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -95,6 +96,16 @@ if _is_cuda or _is_xpu or _is_musa:
             _flashinfer_rmsnorm_quant_available = True
         except (ImportError, AttributeError):
             _flashinfer_rmsnorm_quant_available = False
+
+        try:
+            from flashinfer.norm import (
+                add_rmsnorm_fp4quant as _flashinfer_add_rmsnorm_fp4quant,
+            )
+            from flashinfer.norm import rmsnorm_fp4quant as _flashinfer_rmsnorm_fp4quant
+
+            _flashinfer_rmsnorm_fp4quant_available = True
+        except (ImportError, AttributeError):
+            _flashinfer_rmsnorm_fp4quant_available = False
     else:
         _flashinfer_layernorm_available = False
         _flashinfer_rmsnorm_quant_available = False
@@ -431,6 +442,10 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
             or getattr(quant_method, "use_mxfp8", False)
             or getattr(quant_method, "use_marlin", False)
         )
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    if isinstance(quant_method, ModelOptFp8LinearMethod):
+        return not quant_method.use_marlin
     try:
         from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
             CompressedTensorsLinearMethod,
@@ -446,6 +461,105 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
             scheme, "is_static_input_scheme", False
         )
     return False
+
+
+def _nvfp4_input_global_scale(linear) -> Optional[torch.Tensor]:
+    """Return the activation global scale of an NVFP4 W4A4 ModelOpt ``linear``
+    that consumes a pre-quantized ``(fp4, block_scale)`` input; otherwise ``None``."""
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
+
+    quant_method = linear.quant_method
+    if not (
+        isinstance(quant_method, ModelOptFp4LinearMethod)
+        and quant_method.quant_mode == "w4a4"
+        and not quant_method.quant_config.is_awq
+        and getattr(linear, "_accepts_prequantized_fp4", False)
+        and not get_fp4_gemm_runner_backend().is_marlin()
+    ):
+        return None
+    return linear.input_scale_inv
+
+
+def _rmsnorm_per_tensor_fp8_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    scale: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    post_residual_addition: Optional[torch.Tensor],
+    fp8_dtype: torch.dtype,
+):
+    orig_dtype = x.dtype
+    needs_reshape = x.dim() != 2
+    if needs_reshape:
+        original_shape = x.shape
+        x = x.contiguous().reshape(-1, original_shape[-1])
+    elif not x.is_contiguous():
+        x = x.contiguous()
+
+    out = torch.empty_like(x, dtype=fp8_dtype)
+    if residual is not None:
+        if post_residual_addition is not None:
+            residual = residual + post_residual_addition
+        if residual.dim() != 2:
+            residual = residual.contiguous().reshape(-1, residual.shape[-1])
+        elif not residual.is_contiguous():
+            residual = residual.contiguous()
+        # In-place: residual += x, then out = quant(rmsnorm(residual) * w).
+        _flashinfer_fused_add_rmsnorm_quant(out, x, residual, weight, scale, eps)
+        if needs_reshape:
+            out = out.reshape(original_shape)
+            residual = residual.reshape(original_shape)
+        return (out, scale, orig_dtype), residual
+
+    _flashinfer_rmsnorm_quant(out, x, weight, scale, eps)
+    if needs_reshape:
+        out = out.reshape(original_shape)
+    return out, scale, orig_dtype
+
+
+def _rmsnorm_nvfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    global_scale: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    post_residual_addition: Optional[torch.Tensor],
+):
+    """Fused (residual add +) RMSNorm + NVFP4 quantization of a 2D ``x``.
+
+    Emits ``(x_fp4, block_scale)`` in the layout ``fp4_quantize`` returns: packed
+    uint8 ``[M, K/2]`` and 128x4-swizzled uint8 scales ``[round_up(M, 128), K/16]``.
+    """
+    m, k = x.shape
+    x = x.contiguous()
+    # ModelOpt keeps a 0-dim global scale; the kernel takes a 1-element tensor.
+    global_scale = global_scale.reshape(1)
+    if residual is not None:
+        if post_residual_addition is not None:
+            residual = residual + post_residual_addition
+        residual = residual.contiguous()
+        # In-place: residual += x, then quantize rmsnorm(residual) * w.
+        x_fp4, block_scale = _flashinfer_add_rmsnorm_fp4quant(
+            x,
+            residual,
+            weight,
+            global_scale=global_scale,
+            eps=eps,
+            is_sf_swizzled_layout=True,
+        )
+    else:
+        x_fp4, block_scale = _flashinfer_rmsnorm_fp4quant(
+            x, weight, global_scale=global_scale, eps=eps, is_sf_swizzled_layout=True
+        )
+    sf_rows = (m + 127) // 128 * 128
+    sf_cols = (k // 16 + 3) // 4 * 4
+    out = (
+        x_fp4.view(torch.uint8),
+        block_scale.view(torch.uint8).view(sf_rows, sf_cols),
+    )
+    return out if residual is None else (out, residual)
 
 
 class RMSNorm(BaseFusedOp):
@@ -976,37 +1090,15 @@ class RMSNorm(BaseFusedOp):
         * no residual -> ``(fp8_out, scale, orig_dtype)``
         * w/ residual -> ``((fp8_out, scale, orig_dtype), residual_out)``
         """
-        orig_dtype = x.dtype
-        needs_reshape = x.dim() != 2
-        if needs_reshape:
-            original_shape = x.shape
-            x = x.contiguous().reshape(-1, original_shape[-1])
-        elif not x.is_contiguous():
-            x = x.contiguous()
-
-        out = torch.empty_like(x, dtype=fp8_dtype)
-        if residual is not None:
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
-            if residual.dim() != 2:
-                residual = residual.contiguous().reshape(-1, residual.shape[-1])
-            elif not residual.is_contiguous():
-                residual = residual.contiguous()
-            # In-place: residual += x, then out = quant(rmsnorm(residual) * w).
-            _flashinfer_fused_add_rmsnorm_quant(
-                out, x, residual, self.weight.data, scale, self.variance_epsilon
-            )
-            if needs_reshape:
-                out = out.reshape(original_shape)
-                residual = residual.reshape(original_shape)
-            return (out, scale, orig_dtype), residual
-
-        _flashinfer_rmsnorm_quant(
-            out, x, self.weight.data, scale, self.variance_epsilon
+        return _rmsnorm_per_tensor_fp8_quant(
+            x,
+            self.weight.data,
+            self.variance_epsilon,
+            scale,
+            residual,
+            post_residual_addition,
+            fp8_dtype,
         )
-        if needs_reshape:
-            out = out.reshape(original_shape)
-        return out, scale, orig_dtype
 
 
 class LayerNorm(BaseFusedOp):
@@ -1094,6 +1186,9 @@ class LayerNorm(BaseFusedOp):
 
 
 class GemmaRMSNorm(BaseFusedOp):
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -1115,6 +1210,45 @@ class GemmaRMSNorm(BaseFusedOp):
         param.data.copy_(loaded_weight)
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         torch.add(param.data, 1.0, out=self.gemma_weight)
+
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Fuse the input quantization of ``linear``, the projection that consumes
+        this norm's output, whenever forward_cuda can: static per-tensor FP8, or
+        NVFP4 W4A4. The projection stays out of this module's children."""
+        self.__dict__["_quant_linear"] = linear
+
+    def _forward_with_input_quant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor],
+    ):
+        # The fused kernels apply the stored (1 + w) as a plain RMSNorm weight.
+        linear = self._quant_linear
+        if _flashinfer_rmsnorm_quant_available:
+            scale = _fp8_static_input_scale(linear)
+            if scale is not None:
+                return _rmsnorm_per_tensor_fp8_quant(
+                    x,
+                    self.gemma_weight,
+                    self.variance_epsilon,
+                    scale,
+                    residual,
+                    post_residual_addition,
+                    torch.float8_e4m3fn,
+                )
+        if _flashinfer_rmsnorm_fp4quant_available and x.dim() == 2:
+            global_scale = _nvfp4_input_global_scale(linear)
+            if global_scale is not None:
+                return _rmsnorm_nvfp4_quant(
+                    x,
+                    self.gemma_weight,
+                    self.variance_epsilon,
+                    global_scale,
+                    residual,
+                    post_residual_addition,
+                )
+        return None
 
     def _forward_impl(
         self,
@@ -1164,6 +1298,10 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self._quant_linear is not None and x.numel() > 0:
+            out = self._forward_with_input_quant(x, residual, post_residual_addition)
+            if out is not None:
+                return out
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(

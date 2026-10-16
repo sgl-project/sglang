@@ -237,6 +237,15 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
 
 
+def _fuse_norm_input_quant(norm: GemmaRMSNorm, linear: nn.Module) -> None:
+    """Quantize ``linear``'s input inside ``norm`` when it is static FP8 or NVFP4 W4A4."""
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
+
+    if isinstance(linear.quant_method, ModelOptFp4LinearMethod):
+        linear._accepts_prequantized_fp4 = True
+    norm.fuse_input_quant(linear)
+
+
 def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
     return bool(
         not is_nextn
@@ -1186,6 +1195,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
                 ),
             )
+            # in_proj_ba reads the bf16 input norm, so only the MLP input is fused.
+            if isinstance(self.mlp, Qwen2MoeMLP):
+                _fuse_norm_input_quant(
+                    self.post_attention_layernorm, self.mlp.gate_up_proj
+                )
             self.attn_boundary, self.ffn_boundary = append_stages(
                 (attn, self.input_layernorm, {"fusions": boundary_fusions}),
                 (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
@@ -1412,6 +1426,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
                 ),
             )
+            _fuse_norm_input_quant(self.input_layernorm, self.qkv_proj)
+            if isinstance(self.mlp, Qwen2MoeMLP):
+                _fuse_norm_input_quant(
+                    self.post_attention_layernorm, self.mlp.gate_up_proj
+                )
             self.attn_boundary, self.ffn_boundary = append_stages(
                 (attn, self.input_layernorm, {"fusions": boundary_fusions}),
                 (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
@@ -1478,7 +1497,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
-        seq_len = hidden_states.shape[0]
+        seq_len = qkv.shape[0]
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1)
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None

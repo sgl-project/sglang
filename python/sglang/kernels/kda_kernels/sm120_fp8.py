@@ -61,7 +61,7 @@ def _supports_common(
     if (
         input.device.type != "cuda"
         or input.ndim != 2
-        or input.dtype != torch.bfloat16
+        or input.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
         or not input.is_contiguous()
         or input_scale is None
         or output_scale is None
@@ -100,7 +100,11 @@ def try_sm120_fp8_linear(
     output_scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor | None:
-    """Run the best qualified SM12x FP8 small-M kernel, or return ``None``."""
+    """Run the best qualified SM12x FP8 small-M kernel, or return ``None``.
+
+    An fp8 ``input`` is taken as already quantized with ``input_scale``."""
+    import torch
+
     if not _supports_common(
         input,
         weight,
@@ -135,7 +139,10 @@ def try_sm120_fp8_linear(
 
     from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
-    quantized, _ = static_quant_fp8(input, input_scale, repeat_scale=False)
+    if input.dtype == torch.float8_e4m3fn:
+        quantized = input
+    else:
+        quantized, _ = static_quant_fp8(input, input_scale, repeat_scale=False)
     if use_native_gemv:
         from sglang.kernels.ops.gemm.sm120_fp8_gemv import sm120_fp8_gemv
 
