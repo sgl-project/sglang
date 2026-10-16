@@ -56,6 +56,9 @@ class CacheInitParams:
     sliding_window_size: Optional[int] = None
     # Tokens a trailing-window replay covers; None disables SWA recompute.
     swa_recompute_len: Optional[int] = None
+    # False when tree nodes do not own the SWA state (a per-request SWA ring, or a
+    # paged SWA pool only a draft uses), so it must not gate prefix matching.
+    swa_gates_prefix_match: bool = True
     decoder_swa_bounded_replay: bool = False
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.

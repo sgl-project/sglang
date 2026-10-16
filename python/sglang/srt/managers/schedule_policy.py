@@ -923,6 +923,9 @@ class PrefillAdder:
             self.tree_cache.discard_storage_prefetch_accounting(
                 req.cache_request_handle
             )
+            self.tree_cache.finish_storage_prefetch_admission(
+                req.cache_request_handle, fulfilled_tokens=0, reason=None
+            )
             return
 
         if prefix_len > 0:
