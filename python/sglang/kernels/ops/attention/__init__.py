@@ -267,12 +267,6 @@ for _mod, _fn, _backend, _device in [
     ),
     (
         "kda_flydsl.kimi_k3_kda_decode",
-        "flydsl_kimi_k3_kda_decode",
-        KernelBackend.FLYDSL,
-        CapabilityRequirement.HIP,
-    ),
-    (
-        "kda_flydsl.kimi_k3_kda_decode",
         "flydsl_kimi_k3_kda_decode_with_f_b",
         KernelBackend.FLYDSL,
         CapabilityRequirement.HIP,

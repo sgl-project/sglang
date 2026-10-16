@@ -53,22 +53,6 @@ register_kernel(
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(
-        op="memory.adler32_checksum",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.adler32:adler32_checksum",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="memory.adler32_regions_checksum",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.adler32:adler32_regions_checksum",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
-    )
-)
-register_kernel(
-    KernelSpec(
         op="memory.adler32_strided_checksum",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.adler32:adler32_strided_checksum",
