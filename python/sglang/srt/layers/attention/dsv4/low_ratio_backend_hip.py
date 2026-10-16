@@ -473,6 +473,12 @@ def low_ratio_index_topk_hip_extend(
     groups = _request_groups(extend_lens_cpu, rows_per_chunk)
     for req_lo, req_hi, tok_lo, tok_hi in groups:
         group_is_identity = is_identity[req_lo:req_hi]
+        if tok_hi == tok_lo:
+            # Prefill CP: a one-token extend lands on one rank, so a group can own no rows
+            # here; neither kernel takes 0 rows (fp4 prefill logits: ROCm/aiter#6562).
+            if publish is not None:
+                publish.extend([None] * (req_hi - req_lo))
+            continue
         if all(group_is_identity):
             fill_identity_requests(req_lo, req_hi, tok_lo)
             continue
