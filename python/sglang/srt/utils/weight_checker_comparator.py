@@ -134,6 +134,124 @@ _E2M1_SPACING = (0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 2.0, 2.0)
 _MXFP4_GROUP_SIZE = 32
 
 
+class Nvfp4MoEComparable(ComparableWeight):
+    def __init__(
+        self,
+        w_q: torch.Tensor,
+        w_s: torch.Tensor,
+        w_global: torch.Tensor,
+        *,
+        layout: str,
+        gated: bool,
+        half: Optional[int] = None,
+    ):
+        assert w_q.dtype == torch.uint8 and w_q.ndim == 3
+        self.w_q, self.w_s, self.w_global = w_q, w_s, w_global
+        self.layout, self.gated, self.half = layout, gated, half
+
+    def __repr__(self):
+        return f"nvfp4_moe(shape={tuple(self.w_q.shape)} layout={self.layout})"
+
+    def _row_indices(self):
+        n, k_bytes = self.w_q.shape[-2:]
+        if self.layout == "trtllm":
+            from flashinfer.fused_moe.core import (
+                _maybe_get_cached_w3_w1_permute_indices,
+                get_w2_permute_indices_with_cache,
+            )
+
+            permute = (
+                _maybe_get_cached_w3_w1_permute_indices
+                if self.gated
+                else get_w2_permute_indices_with_cache
+            )
+            cache = {}
+            q_rows = permute(cache, self.w_q[0], 128)
+            scale_shape = self.w_q[0, :, : k_bytes // 8]
+            s_rows = permute(cache, scale_shape, 128, num_elts_per_sf=16)
+            return q_rows, torch.argsort(s_rows)[q_rows]
+        rows = torch.arange(n, device=self.w_q.device)
+        if self.gated:
+            # CuteDSL standard loads [up, gate], interleaved in 64-row groups.
+            rows = ((rows // 64) % 2) * (n // 2) + (rows // 128) * 64 + rows % 64
+            rows = (rows + n // 2) % n
+        return rows, torch.arange(n, device=self.w_q.device)
+
+    def _scales(self):
+        e, n, k_bytes = self.w_q.shape
+        if self.layout == "cutedsl_linear":
+            s = self.w_s.view(torch.uint8)
+            # Non-gated experts can retain unpadded source scales alongside padded weights.
+            s = torch.nn.functional.pad(
+                s, (0, k_bytes // 8 - s.shape[2], 0, n - s.shape[1])
+            )
+            return s.view(torch.float8_e4m3fn)
+        s = self.w_s
+        if self.layout == "cutedsl_mma":
+            assert s.ndim == 6
+            s = s.permute(5, 2, 4, 0, 1, 3).contiguous()
+        else:
+            assert self.layout in ("trtllm", "cutedsl")
+        padded_n, padded_k = -(-n // 128) * 128, -(-(k_bytes // 8) // 4) * 4
+        s = s.view(torch.float8_e4m3fn).reshape(
+            e, padded_n // 128, padded_k // 4, 32, 4, 4
+        )
+        return s.permute(0, 1, 4, 3, 2, 5).reshape(e, padded_n, padded_k)[
+            :, :n, : k_bytes // 8
+        ]
+
+    def _iter_decoded(self):
+        e, n, k_bytes = self.w_q.shape
+        rows, scale_rows = self._row_indices()
+        scales = self._scales()
+        global_scale = self.w_global.reshape(e, -1)
+        assert global_scale.shape[1] in (1, 2)
+        assert self.gated or global_scale.shape[1] == 1
+        step = max(1, CHUNK_NUMEL // (4 * k_bytes * 2))
+        for expert in range(e):
+            for start in range(0, n, step):
+                end = min(start + step, n)
+                q = self.w_q[expert, start:end].cuda()
+                row = rows[start:end]
+                s = (
+                    scales.view(torch.uint8)[expert, scale_rows[start:end]]
+                    .view(torch.float8_e4m3fn)
+                    .cuda()
+                    .float()
+                )
+                g = global_scale[expert].cuda().float()
+                halves = (
+                    (row // (n // 2)).cuda()
+                    if self.gated
+                    else torch.zeros_like(row).cuda()
+                )
+                if g.numel() == 2:
+                    g = g[halves, None]
+                s = s * g
+                codes = torch.stack((q & 15, q >> 4), dim=-1).reshape(
+                    end - start, -1, 16
+                )
+                magnitude = (codes & 7).long()
+                sign = 1.0 - 2.0 * (codes >> 3).float()
+                values = torch.tensor(_E2M1_VALUES, device=q.device)[magnitude] * sign
+                spacing = torch.tensor(_E2M1_SPACING, device=q.device)[magnitude]
+                dequantized = (values * s.unsqueeze(-1)).reshape(end - start, -1)
+                ulp = (spacing * s.abs().unsqueeze(-1)).reshape(end - start, -1)
+                if self.half is not None:
+                    dequantized, ulp = (
+                        dequantized[halves == self.half],
+                        ulp[halves == self.half],
+                    )
+                yield dequantized, ulp
+
+    def iter_chunks(self):
+        for values, ulp in self._iter_decoded():
+            yield values.to(torch.bfloat16), ulp
+
+    def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return torch.cat([values.to(dtype) for values, _ in self._iter_decoded()])
+
+
 class Mxfp4MarlinComparable(ComparableWeight):
     """MXFP4 MoE experts after `prepare_moe_mxfp4_layer_for_marlin`: e2m1 nibbles in
     Marlin-repacked int32 `(E, K/16, 2N)`, e8m0 scales in Marlin order `(E, K/32, N)`.
@@ -321,8 +439,11 @@ def select_comparable_weight(quant_method) -> Optional[type]:
     ):
         return Fp8BlockComparable
     if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
-        if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):
-            return None
+        if (
+            quant_method.enable_flashinfer_trtllm_moe
+            or quant_method._is_cutedsl_v2_standard
+        ):
+            return Nvfp4MoEComparable
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
         )
