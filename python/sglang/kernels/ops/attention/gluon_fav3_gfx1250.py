@@ -24,8 +24,9 @@
 """Dense FAv3 forward kernel specialized for AMD gfx1250.
 
 Inputs and output use SGLang diffusion's ``[batch, sequence, heads, dim]``
-layout. The production path is intentionally narrow: non-causal BF16 MHA with
-head dimension 128. Unsupported contracts are handled by the diffusion backend
+layout. The production path supports non-causal BF16/FP16 MHA with head
+dimensions 64, 128, and 256. BF16/D128 retains the specialized guarded and
+persistent schedules. Unsupported contracts are handled by the diffusion backend
 before this module is imported.
 
 This is adapted from Triton's ``f16_fa_cdna5.py`` example:
@@ -458,7 +459,7 @@ class _AttentionProgram:
             tile_sum = gl.sum(probabilities, 1)
             accumulator = accumulator * alpha[:, None]
             # Round to nearest to avoid biasing every nonnegative probability down.
-            probabilities = probabilities.to(gl.bfloat16, fp_downcast_rounding="rtne")
+            probabilities = probabilities.to(self.q.dtype, fp_downcast_rounding="rtne")
             row_sum = row_sum * alpha + tile_sum
         return probabilities, row_sum, accumulator
 
@@ -1486,8 +1487,16 @@ def select_fav3_launch_config(
     *,
     seqlen_k: int | None = None,
     num_cus: int | None = None,
+    head_size: int = 128,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> FAv3LaunchConfig:
-    """Select the measured gfx1250 D128 launch policy."""
+    """Select a gfx1250 launch while retaining the BF16/D128 specializations."""
+    if head_size not in (64, 128, 256):
+        raise ValueError(
+            f"Gluon FAv3 requires head_size in (64, 128, 256), got {head_size}"
+        )
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("Gluon FAv3 requires BF16 or FP16")
     if min(batch, num_heads, seqlen_q) <= 0:
         raise ValueError("batch, num_heads, and seqlen_q must be positive")
     if num_cus is None:
@@ -1498,7 +1507,9 @@ def select_fav3_launch_config(
     )
     persistent_workgroups = batch * num_heads * persistent_groups
     if (
-        seqlen_k is not None
+        head_size == 128
+        and dtype == torch.bfloat16
+        and seqlen_k is not None
         and 257 <= seqlen_k <= 512
         and persistent_workgroups >= num_cus
     ):
@@ -1513,7 +1524,9 @@ def select_fav3_launch_config(
 
     wide_block_m = 256
     workgroups = batch * num_heads * math.ceil(seqlen_q / wide_block_m)
-    if workgroups >= num_cus:
+    # D256 spills heavily with the wide eight-wave tile. The four-wave
+    # pipeline keeps its larger output accumulator in registers.
+    if head_size != 256 and workgroups >= num_cus:
         # TDM output is profitable at and above the same full-device boundary
         # that admits the wide ping-pong tile.
         scheduler = (
@@ -1521,7 +1534,7 @@ def select_fav3_launch_config(
             if seqlen_k is not None and (seqlen_k <= 512 or seqlen_k >= 16_384)
             else ""
         )
-        return FAv3LaunchConfig("pingpong", 256, 64, 8, True, scheduler)
+        return FAv3LaunchConfig("pingpong", 256, 64, 8, head_size == 128, scheduler)
     return FAv3LaunchConfig(
         "pipeline",
         128,
@@ -1540,18 +1553,20 @@ def gluon_fav3_attention(
     softmax_scale: float | None = None,
     launch_config: FAv3LaunchConfig | None = None,
 ) -> torch.Tensor:
-    """Run non-causal BF16 MHA on gfx1250.
+    """Run non-causal BF16/FP16 MHA on gfx1250.
 
     Q/K/V use BSHD layout. Query and key sequence lengths may differ.
     """
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("Gluon FAv3 expects rank-4 BSHD query, key, and value")
     if (
-        query.dtype != torch.bfloat16
+        query.dtype not in (torch.bfloat16, torch.float16)
         or key.dtype != query.dtype
         or value.dtype != query.dtype
     ):
-        raise TypeError("Gluon FAv3 requires matching BF16 query, key, and value")
+        raise TypeError(
+            "Gluon FAv3 requires matching BF16 or FP16 query, key, and value"
+        )
     if not query.is_cuda or key.device != query.device or value.device != query.device:
         raise ValueError("Gluon FAv3 requires Q/K/V on the same ROCm device")
 
@@ -1565,8 +1580,10 @@ def gluon_fav3_attention(
         head_size,
     ):
         raise ValueError("Gluon FAv3 requires full MHA with matching Q/K/V heads")
-    if head_size != 128:
-        raise ValueError(f"Gluon FAv3 requires head_size=128, got {head_size}")
+    if head_size not in (64, 128, 256):
+        raise ValueError(
+            f"Gluon FAv3 requires head_size in (64, 128, 256), got {head_size}"
+        )
     if min(batch, num_heads, seqlen_q, seqlen_k) <= 0:
         raise ValueError("Gluon FAv3 requires non-empty batches, heads, and sequences")
     if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
@@ -1590,8 +1607,12 @@ def gluon_fav3_attention(
         seqlen_q,
         seqlen_k=seqlen_k,
         num_cus=get_num_cus(query.device),
+        head_size=head_size,
+        dtype=query.dtype,
     )
     if config.schedule == "persistent":
+        if query.dtype != torch.bfloat16 or head_size != 128:
+            raise ValueError("persistent requires BF16 with head_size=128")
         expected_geometry = (128, 256, 4)
         actual_geometry = (config.block_m, config.block_n, config.num_warps)
         if actual_geometry != expected_geometry:
@@ -1653,6 +1674,8 @@ def gluon_fav3_attention(
         if (
             launch_config is None
             and config.schedule == "pingpong"
+            and query.dtype == torch.bfloat16
+            and head_size == 128
             and min(seqlen_q, seqlen_k) >= 65_536
             and seqlen_k < 2**31
             and softmax_scale == head_size**-0.5

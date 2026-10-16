@@ -107,7 +107,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`gluon_fav3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`GLUON_FAV3`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense gfx1250 Gluon/Triton FAv3. Supports non-causal BF16 MHA with head dimension 128 and rectangular Q/KV lengths. It selects stable pipeline/ping-pong kernels generally and a persistent short-KV schedule when 257–512 K/V tokens fit in LDS and the resulting grid fills the device. Unsupported dtype, head, causal, dropout, or GQA contracts that reach this backend use AITER; shared masked-attention routing may use SDPA.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense gfx1250 Gluon/Triton FAv3. Supports non-causal BF16/FP16 MHA with head dimensions 64, 128, and 256 and rectangular Q/KV lengths. It selects stable pipeline/ping-pong kernels generally and a BF16/D128 persistent short-KV schedule when 257–512 K/V tokens fit in LDS and the resulting grid fills the device. Unsupported dtype, head, causal, dropout, or GQA contracts that reach this backend use AITER; shared masked-attention routing may use SDPA.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>aiter_sage</code></td>
@@ -794,7 +794,7 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx1250 only. Uses the in-tree Gluon FAv3 kernel for BF16 D128 non-causal MHA. The backend falls back to AITER for unsupported dense contracts; shared masked-attention routing may use SDPA.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx1250 only. Uses the in-tree Gluon FAv3 kernel for BF16/FP16 non-causal MHA with head dimensions 64, 128, and 256. The backend falls back to AITER for unsupported dense contracts; shared masked-attention routing may use SDPA.</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sparse_video_gen_2_attn`</td>
@@ -870,8 +870,8 @@ sglang generate \
 ### Gluon FAv3 on gfx1250
 
 On AMD ROCm with a gfx1250 GPU, select `gluon_fav3` explicitly for dense,
-non-causal BF16 multi-head attention with head dimension 128. Q, K, and V
-must have matching batch and head counts in BSHD layout; query and K/V
+non-causal BF16 or FP16 multi-head attention with head dimension 64, 128, or
+256. Q, K, and V must have matching batch and head counts in BSHD layout; query and K/V
 sequence lengths can differ. The optimized path requires zero dropout and
 a contiguous head dimension. Unsupported dense contracts use AITER, while
 shared masked-attention routing may use SDPA.
@@ -895,22 +895,24 @@ sglang generate \
   --attention-backend gluon_fav3
 ```
 
-Gluon uses stable softmax with FP32 state and round-to-nearest BF16
-probabilities. Dispatch depends on tensor geometry and device occupancy:
+Gluon uses stable softmax with FP32 state and probabilities rounded to the
+input dtype (BF16 or FP16). Dispatch depends on tensor geometry and device
+occupancy:
 
-- Small grids use the four-wave pipeline.
-- Grids that fill the device use the eight-wave ping-pong kernel.
-- Contiguous workloads with 257–512 K/V tokens can use persistent K/V reuse
+- Head dimension 256 and small grids use the four-wave pipeline.
+- Other grids that fill the device use the eight-wave ping-pong kernel.
+- Contiguous BF16/D128 workloads with 257–512 K/V tokens can use persistent K/V reuse
   when its LDS and occupancy requirements are satisfied.
 
-For automatically selected large ping-pong workloads with both sequence lengths
+For automatically selected BF16/D128 ping-pong workloads with both sequence lengths
 at least 65,536 and the default scale, GPU checks of Q/K norms and V magnitudes
 can enable a fixed softmax shift. This keeps exponents bounded and normalizes
 the rounded BF16 probabilities with FP32 sums. Inputs outside these bounds use
 the existing guarded fused exponents or maximum subtraction before scaling.
 The checks run again on every graph replay. Short-KV persistent attention uses
-one maximum across its cached keys.
-
+one maximum across its cached keys. FP16 and other supported head dimensions
+use the stable generic schedules; the BF16 fixed-shift optimization is not
+used for FP16 probabilities.
 
 Sequence lengths and softmax scale are JIT compile-time constants. A new
 resolution, frame count, prompt length, or scale can trigger a separate
@@ -929,11 +931,15 @@ per-call shapes against parameters equivalent to the default BF16
 ```bash
 python benchmark/kernels/attention/benchmark_gluon_fav3_gfx1250.py --preset wan-cross
 python benchmark/kernels/attention/benchmark_gluon_fav3_gfx1250.py --preset wan-self
+python benchmark/kernels/attention/benchmark_gluon_fav3_gfx1250.py --dtype fp16 --head-size 64 --provider gluon
 ```
 
-The benchmark checks finite outputs, BF16 agreement, and sampled queries against
-independent FP64 attention over all keys before timing. It prints the selected schedule, effective AITER `ENABLE_CK` setting, and
-runtime/compiler provenance alongside repeated measurements. You can use
+The benchmark checks finite outputs and sampled queries against independent
+FP64 attention over all keys before timing. With both providers selected, it
+also checks their agreement. Use `--provider gluon` when the installed AITER
+build does not support the selected dtype or head dimension.
+The benchmark prints the selected schedule, effective AITER `ENABLE_CK`
+setting, and runtime/compiler provenance alongside repeated measurements. You can use
 `--batch 2` as an additional batch stress case. Interpret the reported ratio
 for the recorded shape and software stack; kernel measurements do not
 establish a pipeline-wide speedup.
@@ -1094,7 +1100,7 @@ sglang generate \
 
 ### Notes for ROCm / MPS
 
-- ROCm gfx1250: `aiter` remains the automatic default. Select `--attention-backend gluon_fav3` explicitly for compatible dense BF16 D128 attention.
+- ROCm gfx1250: `aiter` remains the automatic default. Select `--attention-backend gluon_fav3` explicitly for compatible dense BF16/FP16 attention with head dimension 64, 128, or 256.
 - Other ROCm GPUs: `aiter` is the automatic default.
 - ROCm gfx1151 / Strix Halo (wave32): do **not** use `aiter`; prefer `torch_sdpa` (the image sets `SGLANG_USE_AITER=0`).
 - MPS: the platform implementation always uses `torch_sdpa`.

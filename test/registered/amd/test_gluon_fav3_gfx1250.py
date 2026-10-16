@@ -838,10 +838,6 @@ def test_norm_probability_rounding_boundaries(num_warps, block_m):
     torch.testing.assert_close(rounded, expected.float(), rtol=0, atol=0)
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
 @pytest.mark.parametrize("layout", ["sliced", "transposed"])
 @pytest.mark.parametrize(
@@ -881,3 +877,157 @@ def test_guarded_attention_independent_layout_strides(layout, route, expected_bi
     assert invalid.item() == expected_bits
     _assert_norm_attention_fp64(query, key, value, output)
     assert torch.all(storage[untouched] == 7.0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+def test_extended_launch_selection_cpu(dtype, head_size):
+    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
+        select_fav3_launch_config,
+    )
+
+    config = select_fav3_launch_config(
+        1,
+        40,
+        32768,
+        seqlen_k=511,
+        num_cus=256,
+        head_size=head_size,
+        dtype=dtype,
+    )
+    if dtype == torch.bfloat16 and head_size == 128:
+        assert config.schedule == "persistent"
+    elif head_size == 256:
+        assert config.schedule == "pipeline"
+        assert not config.tdm_output
+    else:
+        assert config.schedule == "pingpong"
+        assert config.tdm_output is (head_size == 128)
+
+
+def _assert_extended_attention_fp64(query, key, value, output, scale):
+    expected = _fp64_attention(query, key, value, scale)
+    actual = output.double()
+    rms = expected.square().mean().sqrt()
+    assert output.dtype == query.dtype
+    assert torch.isfinite(actual).all()
+    tolerance = 0.003 if query.dtype == torch.bfloat16 else 0.001
+    assert (actual - expected).square().mean().sqrt() <= tolerance * rms
+    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.01 * rms.item())
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("schedule", ["pipeline", "pingpong"])
+@pytest.mark.parametrize("case", ["tail-scale", "strided", "large-uniform", "late-key"])
+def test_gluon_fav3_extended_contract_fp64(dtype, head_size, schedule, case):
+    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import gluon_fav3_attention
+
+    torch.manual_seed(20261016)
+    batch, sq, sk, heads = 2, 129, 769, 3
+    scale = head_size**-0.5
+    if case == "strided":
+        query = torch.randn(
+            batch, heads, sq * 2, head_size, device="cuda", dtype=dtype
+        )[:, :, ::2].transpose(1, 2)
+        key = torch.randn(batch, sk, heads * 2, head_size, device="cuda", dtype=dtype)[
+            :, :, 1::2
+        ]
+        value = torch.randn(
+            batch, heads, sk * 2, head_size, device="cuda", dtype=dtype
+        )[:, :, ::2].transpose(1, 2)
+    else:
+        query = torch.randn(batch, sq, heads, head_size, device="cuda", dtype=dtype)
+        key = torch.randn(batch, sk, heads, head_size, device="cuda", dtype=dtype)
+        value = torch.randn_like(key)
+        if case == "tail-scale":
+            scale = 0.017
+        elif case == "large-uniform":
+            magnitude = 66048 if dtype == torch.bfloat16 else 60000
+            query.fill_(magnitude)
+            query[1].neg_()
+            key.fill_(magnitude)
+            value.fill_(1)
+        elif case == "late-key":
+            query.fill_(1)
+            key.zero_()
+            key[:, 128].fill_(8)
+            key[:, 129].fill_(16)
+            value.zero_()
+            value[:, 129].fill_(1)
+
+    output = gluon_fav3_attention(
+        query,
+        key,
+        value,
+        softmax_scale=scale,
+        launch_config=_forced_config(schedule),
+    )
+    _assert_extended_attention_fp64(query, key, value, output, scale)
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+def test_gluon_fav3_extended_auto_short_kv_fp64(dtype, head_size):
+    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import gluon_fav3_attention
+
+    torch.manual_seed(20261017)
+    query = torch.randn(1, 32768, 40, head_size, device="cuda", dtype=dtype)
+    key = torch.randn(1, 511, 40, head_size, device="cuda", dtype=dtype)
+    value = torch.randn_like(key)
+    output = gluon_fav3_attention(query, key, value)
+    assert output.dtype == dtype
+    assert torch.isfinite(output).all()
+    rows = torch.tensor([0, 127, 128, 255, 256, 16384, 32766, 32767], device="cuda")
+    heads = torch.tensor([0, 20, 39], device="cuda")
+    _assert_extended_attention_fp64(
+        query.index_select(1, rows).index_select(2, heads),
+        key.index_select(2, heads),
+        value.index_select(2, heads),
+        output.index_select(1, rows).index_select(2, heads),
+        head_size**-0.5,
+    )
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize(
+    "dtype,head_size",
+    [
+        (torch.float16, 64),
+        (torch.float16, 128),
+        (torch.float16, 256),
+        (torch.bfloat16, 64),
+        (torch.bfloat16, 256),
+    ],
+)
+def test_extended_long_attention_avoids_bf16_d128_norm_route(dtype, head_size):
+    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import gluon_fav3_attention
+
+    # The BF16 fixed shift yields probabilities of 2**-32 for these zero logits;
+    # they would underflow in FP16. Other dimensions also need their own guards.
+    query = torch.zeros(1, 65536, 1, head_size, device="cuda", dtype=dtype)
+    key = torch.zeros_like(query)
+    value = torch.ones_like(query)
+    output = gluon_fav3_attention(query, key, value)
+    torch.testing.assert_close(output, value, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize(
+    "dtype,head_size", [(torch.float16, 128), (torch.bfloat16, 64)]
+)
+def test_forced_persistent_rejects_other_dtypes_and_dimensions(dtype, head_size):
+    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import gluon_fav3_attention
+
+    query = torch.zeros(1, 129, 1, head_size, device="cuda", dtype=dtype)
+    key = torch.zeros(1, 257, 1, head_size, device="cuda", dtype=dtype)
+    with pytest.raises(ValueError, match="persistent requires BF16 with head_size=128"):
+        gluon_fav3_attention(
+            query, key, key, launch_config=_forced_config("persistent")
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
