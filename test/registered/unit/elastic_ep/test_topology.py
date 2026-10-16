@@ -10,6 +10,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     ScaleCohort,
     register_scale_cohort,
+    register_scale_operation,
     validate_scale_cohort_topology,
 )
 from sglang.srt.elastic_ep.topology import (
@@ -39,7 +40,11 @@ def test_attention_topology_mapping_and_complete_boundaries():
 
 
 def test_scale_cohort_records_and_validates_attention_topology():
+    values = {}
     store = MagicMock()
+    store.set.side_effect = values.__setitem__
+    store.get.side_effect = values.__getitem__
+    store.check.side_effect = lambda keys: all(key in values for key in keys)
     joining_parallel = SimpleNamespace(attn_tp_size=2, attn_cp_size=1)
     with (
         patch(
@@ -51,16 +56,23 @@ def test_scale_cohort_records_and_validates_attention_topology():
             return_value=joining_parallel,
         ),
     ):
+        register_scale_operation(4, 6, "runtime-1", "grow-1")
         register_scale_cohort(
             rank_offset=4,
             target_ep_size=6,
+            timeout=1,
             cuda_graph_enabled=True,
         )
 
     key, payload = store.set.call_args.args
-    assert key == "elastic_ep/scale_cohort/4"
+    assert key == "elastic_ep/scale_cohort/runtime-1/grow-1/4"
     cohort = msgspec.json.decode(payload, type=ScaleCohort)
     assert cohort == ScaleCohort(
+        runtime_instance_id="runtime-1",
+        operation_id="grow-1",
+        rank_offset=4,
+        ready_rank_count=2,
+        allocation_id=None,
         target_ep_size=6,
         cuda_graph_enabled=True,
         attn_tp_size=2,
@@ -91,6 +103,7 @@ def test_attention_tp_scale_requires_moe_dense_tp_one():
         pp_size=1,
         mooncake_ib_device=None,
         ep_join_mode=None,
+        elastic_ep_allocation_index=None,
         ep_join_rank_offset=0,
         max_ep_size=8,
         tp_size=4,
@@ -121,14 +134,24 @@ def test_incomplete_replica_is_rejected_before_scale_request():
         patch("sglang.srt.managers.scheduler.get_parallel", return_value=parallel),
         patch("sglang.srt.elastic_ep.topology.get_parallel", return_value=parallel),
         patch.object(ElasticEPStateManager, "get_effective_ep_size", return_value=4),
+        patch.object(ElasticEPStateManager, "_instance", None),
         patch.object(ElasticEPStateManager, "request_scale") as request_scale,
     ):
         result = Scheduler.handle_scale_elastic_ep(
-            SimpleNamespace(), ScaleElasticEPReqInput(new_ep_size=5)
+            SimpleNamespace(),
+            ScaleElasticEPReqInput(
+                new_ep_size=5,
+                runtime_instance_id="runtime-1",
+                operation_id="grow-1",
+                submission_id="submission-1",
+            ),
         )
 
     assert not result.success
     assert "incomplete attention replica" in result.message
+    assert result.terminal
+    assert result.operation_id == "grow-1"
+    assert result.submission_id == "submission-1"
     request_scale.assert_not_called()
 
 

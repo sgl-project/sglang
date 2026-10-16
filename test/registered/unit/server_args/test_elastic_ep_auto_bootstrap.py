@@ -180,7 +180,7 @@ class TestElasticEPAutoBootstrap(CustomTestCase):
             handle_elastic_ep(_args(0, attn_dp_size=4))
 
     def test_automatic_mode_rejects_attention_context_parallelism(self, _device_count):
-        with self.assertRaisesRegex(AssertionError, "--attn-cp-size 1"):
+        with self.assertRaisesRegex(AssertionError, "Invalid attention topology"):
             handle_elastic_ep(_args(0, attn_cp_size=2))
 
 
