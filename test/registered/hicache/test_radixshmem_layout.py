@@ -64,6 +64,12 @@ class _Member:
         tensor.copy_(out)
 
 
+def _identity(rank, tp, cp):
+    return dict(
+        tp_part=rank % tp, tp_parts=tp, cp_rank=rank // tp, cp_parts=cp, leader_rank=0
+    )
+
+
 def _run(fns):
     out, errors = [None] * len(fns), []
 
@@ -206,7 +212,9 @@ class TestRadixShmemLayout(CustomTestCase):
             pool = make_pool(r % tp)
             storage = self.cls(config, pool)
             if size > 1:
-                storage.set_shard_groups(write.member(r), read.member(r))
+                storage.set_shard_groups(
+                    write.member(r), read.member(r), **_identity(r, tp, cp)
+                )
             storage.register_mem_pool_host(pool)
             ranks.append((storage, pool))
         return ranks
@@ -348,8 +356,8 @@ class TestRadixShmemLayout(CustomTestCase):
         readers, rmambas, _ = writers[1]
         readers[0][0].batch_exists(keys, _info())
         self.assertEqual(
-            readers[0][0].pools[PoolName.MAMBA].salt,
-            ranks[0][0].pools[PoolName.MAMBA].salt,
+            readers[0][0].pools[PoolName.MAMBA].salt(0),
+            ranks[0][0].pools[PoolName.MAMBA].salt(0),
         )
         got = readers[0][0].batch_get_v2([state()], _info(keys[:1]))
         self.assertEqual(got, {PoolName.MAMBA: [True]})

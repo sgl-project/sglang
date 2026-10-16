@@ -1,30 +1,3 @@
-"""RadixShmem as a HiCache L3 backend.
-
-radixshmem keeps its own index and SlotStore; sglang keeps its host staging
-pool and pages are copied between the two. One slot holds the whole page of
-the attention TP/CP group. MHA KV pages are stored as
-(2, layer, page, kv_heads, head_dim) over all KV heads and Mamba states as
-temporal plus conv over all heads, whatever the host layout and TP size:
-each rank copies its own heads into place, so instances with different TP
-sizes share slots. Pools whose shape is not known are stored as the ranks'
-parts side by side, keyed by the TP size; rank-replicated pools (MLA) store
-one copy. Under DSA layer split each CP rank holds only its own layers, so
-those pools store the CP ranks' pages side by side, keyed by the CP size. Keys are sglang's chained page hashes folded to uint64 and salted
-per model, PP stage, pool and slot shape.
-
-The anchor pool (kv) owns the radix path of a prefix. The swa and mamba
-pools ride on that path as radixshmem's SWA and MAMBA components with their
-own slot sizes, so one masked query decides whether a prefix and its trailing
-state are restorable. Other trailing pools, and every pool when the anchor
-holds no bytes, keep one single-block path per page.
-
-Group rank 0 (attention TP 0, CP 0) is the only rank that touches the index:
-it answers hit queries (the others report every page present and sglang
-keeps the minimum), allocates and publishes slots, and pins slots while the
-group copies them. Writes and reads of a shared slot are collective over the
-group's gloo groups, handed over by the controller in set_shard_groups().
-"""
-
 from __future__ import annotations
 
 import ctypes
@@ -75,14 +48,12 @@ class _Solo:
 
 
 class _Comm:
-    def __init__(self, group):
+    def __init__(self, group, src: int):
         import torch.distributed as dist
 
         self._dist = dist
         self.group = group
-        self.rank = dist.get_rank(group)
-        self.size = dist.get_world_size(group)
-        self._src = dist.get_global_rank(group, 0)
+        self._src = src
 
     def bcast(self, tensor: torch.Tensor) -> None:
         self._dist.broadcast(tensor, self._src, group=self.group)
@@ -91,10 +62,10 @@ class _Comm:
         self._dist.all_reduce(tensor, op=self._dist.ReduceOp.MIN, group=self.group)
 
 
-def _as_comm(group):
+def _as_comm(group, src: int):
     if group is None:
         return _Solo()
-    return group if hasattr(group, "bcast") else _Comm(group)
+    return group if hasattr(group, "bcast") else _Comm(group, src)
 
 
 class _Part:
@@ -155,7 +126,7 @@ class _Pool:
         page_bytes: int,
         parts: int,
         part: int,
-        salt: int,
+        salt: Callable[[int], int],
         kind,
         mask: int,
         layout: Optional[_Layout] = None,
@@ -219,22 +190,26 @@ class RadixShmemStorage(HiCacheStorage):
         self.read_comm.min(flag)
         return bool(flag[0])
 
-    def set_shard_groups(self, write_group, read_group) -> None:
+    def set_shard_groups(
+        self,
+        write_group,
+        read_group,
+        *,
+        tp_part: int = 0,
+        tp_parts: int = 1,
+        cp_rank: int = 0,
+        cp_parts: int = 1,
+        leader_rank: int = 0,
+    ) -> None:
         if self.index is not None:
             raise RuntimeError("radixshmem: shard groups must be set before first use")
-        self.write_comm = _as_comm(write_group)
-        self.read_comm = _as_comm(read_group)
-        cp_size = max(1, int(self.config.attn_cp_size)) if read_group else 1
-        if self.read_comm.size % cp_size:
-            raise ValueError(
-                f"radixshmem: shard group of {self.read_comm.size} ranks is not "
-                f"a multiple of attn_cp_size={cp_size}"
-            )
-        self.cp_parts = cp_size
-        self.tp_parts = self.read_comm.size // cp_size
-        self.tp_part = self.read_comm.rank % self.tp_parts
-        self.cp_rank = self.read_comm.rank // self.tp_parts
-        self.leader = self.read_comm.rank == 0
+        if (write_group is None) != (tp_parts * cp_parts == 1):
+            raise ValueError("radixshmem: shard groups do not match the shard identity")
+        self.write_comm = _as_comm(write_group, leader_rank)
+        self.read_comm = _as_comm(read_group, leader_rank)
+        self.tp_part, self.tp_parts = int(tp_part), int(tp_parts)
+        self.cp_rank, self.cp_parts = int(cp_rank), int(cp_parts)
+        self.leader = self.tp_part == 0 and self.cp_rank == 0
 
     def register_mem_pool_host(self, mem_pool_host: Any) -> None:
         self.mem_pool_host = mem_pool_host
@@ -406,12 +381,14 @@ class RadixShmemStorage(HiCacheStorage):
             )
         page_bytes = layout.local_bytes if layout else _page_bytes(host_pool)
         kind, mask = self.full, self.full_mask
-        salt = _salt(
-            self.config.model_name,
-            f"pp{self.config.pp_rank}/{self.config.pp_size}",
-            tag,
-            str(name),
-        )
+        model, pp_size = self.config.model_name, self.config.pp_size
+        salts: Dict[int, int] = {}
+
+        def salt(pp_rank: int) -> int:
+            if pp_rank not in salts:
+                salts[pp_rank] = _salt(model, f"pp{pp_rank}/{pp_size}", tag, str(name))
+            return salts[pp_rank]
+
         component = self.components.get(name)
         if (
             component is not None
@@ -477,13 +454,13 @@ class RadixShmemStorage(HiCacheStorage):
             self.kind_slot_bytes = sizes
             self.pools = pools
             logger.info(
-                "RadixShmemStorage ready: rank %d/%d (tp part %d/%d, cp %d) "
+                "RadixShmemStorage ready: tp part %d/%d, cp %d/%d, leader=%s "
                 "block_size=%d slot_bytes=%d slots=%d distributed=%s pools=%s",
-                self.read_comm.rank,
-                self.read_comm.size,
                 self.tp_part,
                 self.tp_parts,
                 self.cp_rank,
+                self.cp_parts,
+                self.leader,
                 block_size,
                 slot_bytes,
                 info.geometry["pools"]["full"]["num_slots"],
@@ -538,7 +515,7 @@ class RadixShmemStorage(HiCacheStorage):
                     set(range(1, kv_pages + 1)) if not self.leader else {boundary} - {0}
                 )
             else:
-                present = self._present(pool, keys[:kv_pages])
+                present = self._present(pool, keys[:kv_pages], extra_info)
                 window = max(1, len(transfer.keys or ()))
                 stops = {
                     n
@@ -586,9 +563,13 @@ class RadixShmemStorage(HiCacheStorage):
 
     # ---- keys ----
 
+    def _salt_of(self, pool: _Pool, extra_info) -> int:
+        extra = (extra_info.extra_info if extra_info is not None else None) or {}
+        return pool.salt(int(extra.get("pp_rank", self.config.pp_rank)))
+
     def _chain(self, pool: _Pool, keys, extra_info) -> Tuple[np.ndarray, int]:
         prefix = (extra_info.prefix_keys if extra_info is not None else None) or []
-        salt = pool.salt
+        salt = self._salt_of(pool, extra_info)
         chain = np.fromiter(
             (int(k[:16], 16) ^ salt for k in (*prefix, *keys)),
             dtype=np.uint64,
@@ -596,8 +577,9 @@ class RadixShmemStorage(HiCacheStorage):
         )
         return chain, len(prefix)
 
-    def _single(self, pool: _Pool, key: str) -> np.ndarray:
-        return np.array([int(key[:16], 16) ^ pool.salt], dtype=np.uint64)
+    def _single(self, pool: _Pool, key: str, extra_info=None) -> np.ndarray:
+        salt = self._salt_of(pool, extra_info)
+        return np.array([int(key[:16], 16) ^ salt], dtype=np.uint64)
 
     # ---- index (leader only) ----
 
@@ -900,10 +882,10 @@ class RadixShmemStorage(HiCacheStorage):
 
     # ---- TRAILING_PAGES pools: one-block path per page ----
 
-    def _present(self, pool: _Pool, keys) -> List[bool]:
+    def _present(self, pool: _Pool, keys, extra_info=None) -> List[bool]:
         if not self.leader:
             return [True] * len(keys)
-        return [self._query(self._single(pool, key)) == 1 for key in keys]
+        return [self._query(self._single(pool, key, extra_info)) == 1 for key in keys]
 
     def _store_pages(self, pool: _Pool, keys, host_indices) -> List[bool]:
         n = len(keys)

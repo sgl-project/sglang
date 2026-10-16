@@ -428,40 +428,67 @@ class HiCacheController:
             )
         return groups
 
-    def _shard_group_ranks(self) -> List[int]:
-        me = torch.distributed.get_rank()
-        tp = (
-            torch.distributed.get_process_group_ranks(self.attn_tp_group)
-            if self.attn_tp_group is not None
-            else [me]
+    @staticmethod
+    def _shard_layout():
+        from sglang.srt.distributed.parallel_state import (
+            get_attn_cp_group,
+            get_attn_tp_group,
         )
-        cp = (
-            torch.distributed.get_process_group_ranks(self.attn_cp_group)
-            if self.attn_cp_group is not None
-            else [me]
+
+        tp, cp = get_attn_tp_group(), get_attn_cp_group()
+        rows = [list(tp.ranks)]
+        if cp.world_size > 1:
+            gathered = [None] * cp.world_size
+            torch.distributed.all_gather_object(
+                gathered, (cp.rank_in_group, list(tp.ranks)), group=cp.cpu_group
+            )
+            rows = [row for _, row in sorted(gathered)]
+        members = [r for row in rows for r in row]
+        if len(set(members)) != tp.world_size * cp.world_size or any(
+            len(row) != tp.world_size for row in rows
+        ):
+            raise RuntimeError(
+                f"attention TP groups {rows} do not tile the attention CP group"
+            )
+        identity = dict(
+            tp_part=tp.rank_in_group,
+            tp_parts=tp.world_size,
+            cp_rank=cp.rank_in_group,
+            cp_parts=cp.world_size,
+            leader_rank=rows[0][0],
         )
-        return [c + t - me for c in cp for t in tp]
+        return members, identity
 
     def _attach_shard_groups(self) -> None:
         if not getattr(self.storage_backend, "shard_collective", False):
             return
-        groups = [None, None]
-        if torch.distributed.is_initialized():
-            from sglang.srt.distributed.parallel_state import (
-                create_custom_parallel_group,
-            )
+        if not torch.distributed.is_initialized():
+            self.storage_backend.set_shard_groups(None, None)
+            return
+        import socket
 
-            ranks = self._shard_group_ranks()
-            groups = [
-                create_custom_parallel_group(group_ranks=ranks, backend="gloo")
-                for _ in range(2)
-            ]
-            if len(ranks) == 1:
-                self._destroy_sync_groups(groups)
-                groups = [None, None]
-            else:
-                self.storage_shard_groups = groups
-        self.storage_backend.set_shard_groups(*groups)
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        members, identity = self._shard_layout()
+        groups = [
+            create_custom_parallel_group(group_ranks=members, backend="gloo")
+            for _ in range(2)
+        ]
+        if len(members) == 1:
+            self._destroy_sync_groups(groups)
+            groups = [None, None]
+        else:
+            self.storage_shard_groups = groups
+            hosts = [None] * len(members)
+            torch.distributed.all_gather_object(
+                hosts, socket.gethostname(), group=groups[0]
+            )
+            if len(set(hosts)) > 1:
+                raise RuntimeError(
+                    f"{self.storage_backend_type} shares one page across the "
+                    f"attention TP/CP group, which spans nodes {sorted(set(hosts))}"
+                )
+        self.storage_backend.set_shard_groups(*groups, **identity)
 
     def _storage_read_barrier(self, go: bool) -> bool:
         backend = self.storage_backend

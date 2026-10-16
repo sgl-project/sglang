@@ -277,6 +277,12 @@ class _Member:
         tensor.copy_(out)
 
 
+def _identity(rank, tp, cp):
+    return dict(
+        tp_part=rank % tp, tp_parts=tp, cp_rank=rank // tp, cp_parts=cp, leader_rank=0
+    )
+
+
 def _run(fns):
     out, errors = [None] * len(fns), []
 
@@ -409,7 +415,9 @@ class TestRadixShmemStorage(CustomTestCase):
         for r in range(size):
             pool = _FakeHostPool(pages)
             storage = self.cls(_config(tp_rank=r % tp, is_mla=is_mla, cp_size=cp), pool)
-            storage.set_shard_groups(write.member(r), read.member(r))
+            storage.set_shard_groups(
+                write.member(r), read.member(r), **_identity(r, tp, cp)
+            )
             storage.register_mem_pool_host(pool)
             ranks.append((storage, pool))
         return ranks
@@ -530,7 +538,9 @@ class TestRadixShmemStorage(CustomTestCase):
             pool.device_pool = SimpleNamespace(layer_shard_enabled=True)
             pool.buf.fill_(10 * (r // tp) + 1)
             storage = self.cls(_config(tp_rank=r % tp, is_mla=True, cp_size=cp), pool)
-            storage.set_shard_groups(write.member(r), read.member(r))
+            storage.set_shard_groups(
+                write.member(r), read.member(r), **_identity(r, tp, cp)
+            )
             storage.register_mem_pool_host(pool)
             ranks.append((storage, pool))
         got = _run(
@@ -653,28 +663,69 @@ class TestRadixShmemStorage(CustomTestCase):
 
 
 class TestRadixShmemConfig(CustomTestCase):
-    def test_shard_group_ranks(self):
+    def test_shard_layout_from_sglang_groups(self):
         from sglang.srt.managers.cache_controller import HiCacheController
 
-        ctl = HiCacheController.__new__(HiCacheController)
-        ctl.attn_tp_group, ctl.attn_cp_group = "tp", "cp"
-        groups = {"tp": [5, 6, 7, 4], "cp": [2, 6, 10, 14]}
+        rows = [[9, 3, 12, 0], [5, 1, 14, 7]]
+        tp = SimpleNamespace(ranks=rows[1], rank_in_group=2, world_size=4)
+        cp = SimpleNamespace(
+            ranks=[0, 7], rank_in_group=1, world_size=2, cpu_group="cp"
+        )
+
+        def gather(out, obj, group):
+            self.assertEqual(group, "cp")
+            out[:] = [(1, rows[1]), (0, rows[0])]
+
         with (
-            mock.patch("torch.distributed.get_rank", return_value=6),
             mock.patch(
-                "torch.distributed.get_process_group_ranks", side_effect=groups.get
+                "sglang.srt.distributed.parallel_state.get_attn_tp_group",
+                return_value=tp,
             ),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_attn_cp_group",
+                return_value=cp,
+            ),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
         ):
-            ranks = ctl._shard_group_ranks()
-        self.assertEqual(sorted(ranks), list(range(0, 16)))
-        ctl.attn_cp_group = None
+            members, identity = HiCacheController._shard_layout()
+        self.assertEqual(members, [9, 3, 12, 0, 5, 1, 14, 7])
+        self.assertEqual(
+            identity,
+            dict(tp_part=2, tp_parts=4, cp_rank=1, cp_parts=2, leader_rank=9),
+        )
+        rows[1] = [5, 1, 14, 9]
         with (
-            mock.patch("torch.distributed.get_rank", return_value=6),
             mock.patch(
-                "torch.distributed.get_process_group_ranks", side_effect=groups.get
+                "sglang.srt.distributed.parallel_state.get_attn_tp_group",
+                return_value=tp,
             ),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_attn_cp_group",
+                return_value=cp,
+            ),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+            self.assertRaises(RuntimeError),
         ):
-            self.assertEqual(sorted(ctl._shard_group_ranks()), [4, 5, 6, 7])
+            HiCacheController._shard_layout()
+
+    def test_pp_rank_selects_stage_key(self):
+        _FakeClient.servers.clear()
+        with mock.patch.dict(sys.modules, {"radixshmem": _FAKE_RADIXSHMEM}):
+            from sglang.srt.mem_cache.storage.radixshmem import RadixShmemStorage
+
+            stages = []
+            for pp in range(2):
+                config = _config()
+                config.pp_rank, config.pp_size = pp, 2
+                pool = _FakeHostPool(8)
+                storage = RadixShmemStorage(config, pool)
+                storage.register_mem_pool_host(pool)
+                stages.append(storage)
+            keys = _keys(2)
+            stages[1].batch_set_v1(keys, _indices(2), _info([]))
+            self.assertEqual(stages[0].batch_exists(keys, _info([])), 0)
+            other = HiCacheStorageExtraInfo(prefix_keys=[], extra_info={"pp_rank": 1})
+            self.assertEqual(stages[0].batch_exists(keys, other), 2)
 
     def test_prefix_keys_forced_on(self):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
