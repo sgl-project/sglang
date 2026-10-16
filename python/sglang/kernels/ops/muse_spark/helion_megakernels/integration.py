@@ -9,9 +9,6 @@ from typing import Any
 
 import torch
 
-from sglang.kernels.ops.muse_spark.fused_norm_residual import (
-    FusedPostNormResidualPreNorm,
-)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -200,34 +197,20 @@ def _layer_scalars(layer: Any):
             "per-token NVFP4 activation scales and no DP attention"
         )
     _check_model_dims(layer)
-    attn_boundary = layer._fused_attn_boundary
-    # The last layer has no next pre-attn norm; its attention-input output is
-    # discarded, so any [hidden] weight stands in.
-    ffn_boundary = layer._fused_ffn_boundary or FusedPostNormResidualPreNorm(
-        layer.post_feedforward_layernorm,
-        layer.post_feedforward_residual_gate,
-        layer.input_layernorm,
-    )
-    for op in (attn_boundary, ffn_boundary):
-        op._ensure_cached_weights(layer.operator_dtype)
     scalars = LayerScalars(
         attn_scale=layer.self_attn.attn.scaling,
         attn_norm_eps=layer.self_attn.norm_eps,
-        post_attn_eps=attn_boundary._post_norm.eps,
-        pre_ffn_eps=attn_boundary._pre_norm.eps,
         pre_expert_eps=mlp.pre_expert_norm.eps,
         router_multiplier=mlp.router_multiplier,
         route_scale=mlp.route_scale,
         route_eps=mlp.route_eps,
         post_expert_eps=experts.post_expert_norm.eps,
-        post_ffn_eps=ffn_boundary._post_norm.eps,
-        next_pre_attn_eps=ffn_boundary._pre_norm.eps,
     )
     layer._derived_weight_cache_error = DERIVED_WEIGHT_CACHE_ERROR
-    return attn_boundary, ffn_boundary, scalars
+    return scalars
 
 
-def _layer_weights(layer: Any, runner: Any, attn_boundary: Any, ffn_boundary: Any):
+def _layer_weights(layer: Any, runner: Any):
     from sglang.kernels.ops.muse_spark.helion_megakernels.megakernel_verify import (
         MoeVerifyWeights,
     )
@@ -242,39 +225,19 @@ def _layer_weights(layer: Any, runner: Any, attn_boundary: Any, ffn_boundary: An
         )
     rank, world = get_tp_group().rank_in_group, get_parallel().tp_size
     boundary = runner.attention_boundary.prepare_weights(
-        o_proj=layer.self_attn.o_proj.weight,
         pre_expert=mlp.pre_expert_proj.weight,
         router=mlp.gate.weight,
-        alpha=attn_boundary._cc_alpha,
-        beta=attn_boundary._cc_beta,
-        pre_ffn_norm=attn_boundary._cc_pre_weight,
         pre_expert_norm=experts._pre_norm_weight(mlp.pre_expert_norm),
         router_bias=mlp.gate.e_score_correction_bias,
         rank=rank,
         world=world,
     )
-    nxt = layer._next_layer
-    fuse_qkv = (
-        layer._fused_ffn_boundary is not None
-        and nxt is not None
-        and nxt._megakernel_capable
-        and nxt.mlp.experts.helion_verify_bank is not None
-    )
-    unpool_rows = mlp.hidden_size // world
     moe = MoeVerifyWeights(
         bank=experts.helion_verify_bank,
         output1_scale_scalar=experts.g1_scale_c,
         output1_scale_gate_scalar=experts.g1_alphas,
         output2_scale_scalar=experts.g2_alphas,
         post_expert_norm=experts._post_expert_norm_weight,
-        unpool=mlp.post_expert_proj.weight[
-            rank * unpool_rows : (rank + 1) * unpool_rows
-        ],
-        alpha=ffn_boundary._cc_alpha,
-        beta=ffn_boundary._cc_beta,
-        post_weight=ffn_boundary._cc_post_weight,
-        pre_weight=ffn_boundary._cc_pre_weight,
-        next_qkv=nxt.self_attn.qkv_proj.weight if fuse_qkv else None,
     )
     return boundary, moe
 
@@ -305,39 +268,53 @@ def try_helion_megakernel_forward(
     require_helion_features()
     params = getattr(layer, "_megakernel_verify_params", None)
     if params is None:
-        attn_boundary, ffn_boundary, scalars = _layer_scalars(layer)
+        scalars = _layer_scalars(layer)
         runner = _runner(scalars, attn_input)
         params = layer._megakernel_verify_params = (
             scalars,
-            *_layer_weights(layer, runner, attn_boundary, ffn_boundary),
+            *_layer_weights(layer, runner),
         )
         _log_engaged(attn_input.shape[0])
     scalars, boundary, moe = params
     runner = _runner(scalars, attn_input)
-    # The previous layer's tail computed this layer's QKV in this same forward.
-    pending, layer._verify_qkv = layer._verify_qkv, None
-    qkv = pending[1] if pending is not None and pending[0] is forward_batch else None
-    if qkv is None:
-        qkv, _ = layer.self_attn.qkv_proj(attn_input)
-    if layer.self_attn.use_rope:
+    attention = layer.self_attn
+    qkv, _ = attention.qkv_proj(attn_input)
+    if attention.use_rope:
         gated = runner.sliding_attention(
             qkv=qkv,
-            attention=_attention_inputs(layer.self_attn, positions, forward_batch),
+            attention=_attention_inputs(attention, positions, forward_batch),
         )
     else:
         # Global layers keep the stock attention: its KV-split decode scales with
         # the context, while the megakernel's one task per SM falls behind past
         # ~16K keys (B200, 80K keys: 69.6 us vs 32.8 us).
-        gated = layer.self_attn.gated_attention(positions, qkv, forward_batch)
-    stream, next_attn_input, next_qkv = runner.layer(
-        gated=gated, stream=stream, attention_boundary=boundary, moe=moe
+        gated = attention.gated_attention(positions, qkv, forward_batch)
+    # The stock O-projection (its GEMM streams the weights in under PDL while the
+    # attention runs), all-reduce and post-attention / pre-FFN norms.
+    attn_output, _ = attention.o_proj(gated)
+    ffn_input, stream, _ = layer._fused_attn_boundary(
+        stream, attn_output, branch_dtype=layer.operator_dtype
+    )
+    expert_output = runner.experts(
+        ffn_in=ffn_input, attention_boundary=boundary, moe=moe
     )
     if (capturer := get_global_experts_capturer()) is not None:
         capturer.capture(layer_id=layer.layer_idx, topk_indices=runner.topk_ids)
-    if next_qkv is not None:
-        layer._next_layer._verify_qkv = (forward_batch, next_qkv)
+    # Expert TP already reduced the routes; the stock unpooler and FFN boundary
+    # follow (the unpooler GEMM streams its weights in while the MoE finishes).
+    ffn_output = layer.mlp._reduce_and_unpool(expert_output, already_reduced=True)
+    if ffn_output.shape[-1] != stream.shape[-1]:
+        next_attn_input, stream = layer._fused_ffn_boundary.forward_with_ag(
+            stream, ffn_output, get_tp_group().ca_comm
+        )
+        return stream, next_attn_input
     if layer._fused_ffn_boundary is None:
-        return stream, None
+        return layer.post_feedforward_residual_gate(
+            stream, layer.post_feedforward_layernorm(ffn_output)
+        ), None
+    next_attn_input, stream, _ = layer._fused_ffn_boundary(
+        stream, ffn_output, branch_dtype=layer.operator_dtype
+    )
     return stream, next_attn_input
 
 
