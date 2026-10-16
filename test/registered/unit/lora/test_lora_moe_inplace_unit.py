@@ -64,8 +64,11 @@ def _make_base_layer(quant_method=None) -> types.SimpleNamespace:
         should_fuse_routed_scaling_factor_in_topk=False,
         moe_tp_size=1,
         moe_tp_rank=0,
+        moe_ep_size=2,
+        moe_ep_rank=1,
         intermediate_size_per_partition=32,
         runner=None,
+        named_parameters=lambda recurse=True: iter(()),
     )
 
 
@@ -110,6 +113,18 @@ class FusedMoEWithLoRAInplaceTest(unittest.TestCase):
         self.assertIsNotNone(core_config)
         self.assertIs(core_config, base_layer.moe_runner_config)
         self.assertFalse(core_config.inplace)
+
+
+class FusedMoEWithLoRAOwnerPartitionTest(unittest.TestCase):
+    def test_wrapper_exposes_the_owner_partitions_weight_loaders_read(self):
+        """Model weight loaders read moe_{tp,ep}_{rank,size} off `self.experts`, which is
+        the LoRA wrapper once adapters are attached; a missing one fails the weight load."""
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        base_layer = _make_base_layer()
+        layer = FusedMoEWithLoRA(base_layer, types.SimpleNamespace())
+        for name in ("moe_tp_rank", "moe_tp_size", "moe_ep_rank", "moe_ep_size"):
+            self.assertEqual(getattr(layer, name), getattr(base_layer, name), name)
 
 
 if __name__ == "__main__":

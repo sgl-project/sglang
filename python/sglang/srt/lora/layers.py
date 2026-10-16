@@ -1061,6 +1061,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         if hasattr(base_layer, "scheme"):
             self.scheme = base_layer.scheme
 
+        # Model weight loaders read the owner partitions off `self.experts`, i.e. this wrapper.
+        self.moe_tp_size = base_layer.moe_tp_size
+        self.moe_tp_rank = base_layer.moe_tp_rank
+        self.moe_ep_size = base_layer.moe_ep_size
+        self.moe_ep_rank = base_layer.moe_ep_rank
+
         self.tp_size = base_layer.moe_tp_size
         self.tp_rank = base_layer.moe_tp_rank
         self.intermediate_size_per_partition = (
