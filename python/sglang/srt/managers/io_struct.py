@@ -1284,6 +1284,9 @@ class EmbeddingReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     decision_layout: Optional[Union[List[List[int]], List[int]]] = None
 
+    # Final Valen context/schema/readout positions, internal to decision routes.
+    valen_layout: Optional[Union[List[List[int]], List[int]]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -1356,6 +1359,11 @@ class EmbeddingReqInput:
 
         if not self.is_single:
             self._validate_mm_batch_lengths()
+            if self.valen_layout is not None and (
+                len(self.valen_layout) != self.batch_size
+                or any(not isinstance(layout, list) for layout in self.valen_layout)
+            ):
+                raise ValueError("valen_layout needs one packed layout per request")
 
         # Fill in default arguments
         if self.is_single:
@@ -1505,6 +1513,9 @@ class EmbeddingReqInput:
                     if self.decision_layout is not None
                     else None
                 ),
+                valen_layout=(
+                    self.valen_layout[i] if self.valen_layout is not None else None
+                ),
             )
         cache[i] = sub
         return sub
@@ -1538,6 +1549,7 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     token_indices_to_pool: Optional[List[int]] = None
     # Question and option spans for a joint schema head
     decision_layout: Optional[List[int]] = None
+    valen_layout: Optional[List[int]] = None
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None

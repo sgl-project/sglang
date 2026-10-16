@@ -118,6 +118,8 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
+from sglang.srt.entrypoints.valen.protocol import ValenRequest
+from sglang.srt.entrypoints.valen.serving import ValenServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -362,6 +364,7 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.systemone_serving = SystemOneServing(
         fast_api_app.state.openai_serving_chat
     )
+    fast_api_app.state.valen_serving = ValenServing(_global_state.tokenizer_manager)
 
     # Launch tool server
     tool_server = None
@@ -1004,6 +1007,8 @@ def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
     # Only /v1/systemone builds a decision layout, from the prompt it compiles.
     if obj.decision_layout is not None:
         raise ValueError("decision_layout is set only by /v1/systemone")
+    if obj.valen_layout is not None:
+        raise ValueError("valen_layout is set only by /v1/valen or /v1/systemone")
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
@@ -2114,7 +2119,18 @@ async def anthropic_v1_count_tokens(
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
 async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
     """System One compatible decisions, answered by candidate scoring without generation."""
+    if getattr(_global_state.tokenizer_manager.model_config, "is_valen", False):
+        return await raw_request.app.state.valen_serving.handle_systemone(
+            request, raw_request
+        )
     return await raw_request.app.state.systemone_serving.handle_request(
+        request, raw_request
+    )
+
+
+@app.post("/v1/valen", dependencies=[Depends(validate_json_request)])
+async def valen_decisions(request: ValenRequest, raw_request: Request):
+    return await raw_request.app.state.valen_serving.handle_request(
         request, raw_request
     )
 
@@ -2403,6 +2419,15 @@ def _execute_server_warmup(server_args: ServerArgs):
         request_name = "/v1/systemone"
         json_data = {
             "model": "warmup",
+            "state": "The capital city of France is Paris.",
+            "questions": {
+                "warmup": {"type": "noul", "instructions": "Is the state true?"}
+            },
+        }
+
+    if model_info.get("architectures") == ["ValenQwenForDecisionMaking"]:
+        request_name = "/v1/valen"
+        json_data = {
             "state": "The capital city of France is Paris.",
             "questions": {
                 "warmup": {"type": "noul", "instructions": "Is the state true?"}

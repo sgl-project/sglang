@@ -37,6 +37,7 @@ from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneratio
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+from sglang.srt.models.valen import ValenQwenForDecisionMaking
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifactCacheMixin,
@@ -339,6 +340,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         Qwen3VLForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
         Qwen3_5ForConditionalGeneration,
+        ValenQwenForDecisionMaking,
         Qwen3_5MoeForConditionalGeneration,
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,

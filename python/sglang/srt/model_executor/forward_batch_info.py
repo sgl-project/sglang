@@ -617,6 +617,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Joint schema head decision layouts (one per request, None if absent)
     decision_layouts: Optional[List[Optional[List[int]]]] = None
+    valen_layouts: Optional[List[Optional[List[int]]]] = None
 
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
@@ -1304,6 +1305,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             if any(r.decision_layout is not None for r in batch.reqs):
                 self.decision_layouts = [r.decision_layout for r in batch.reqs]
+            if any(r.valen_layout is not None for r in batch.reqs):
+                self.valen_layouts = [r.valen_layout for r in batch.reqs]
 
         token_type_ids = [
             r.token_type_ids for r in batch.reqs if r.token_type_ids is not None

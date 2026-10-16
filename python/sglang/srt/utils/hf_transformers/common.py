@@ -97,6 +97,7 @@ from sglang.srt.configs import (
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
 from sglang.srt.configs.internvl import InternVLChatConfig
+from sglang.srt.configs.valen import ValenQwenConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
@@ -161,6 +162,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         NanbeigeConfig,
         DeepseekVLV2Config,
         Qwen3_5Config,
+        ValenQwenConfig,
         Qwen3_5MoeConfig,
         Qwen3_5TextConfig,
         Qwen3_5MoeTextConfig,

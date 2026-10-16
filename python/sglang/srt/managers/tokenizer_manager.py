@@ -73,6 +73,7 @@ from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
 )
+from sglang.srt.layers.valen_layout import parse_valen_layout
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -1348,6 +1349,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
+        self._validate_valen_request(obj, input_ids)
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
@@ -1481,6 +1483,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"at most {limit} in one prefill"
             )
         parse_decision_layout(obj.decision_layout, len(input_ids))
+
+    def _validate_valen_request(self, obj, input_ids: List[int]) -> None:
+        is_valen = getattr(self.model_config, "is_valen", False)
+        layout = obj.valen_layout if isinstance(obj, EmbeddingReqInput) else None
+        if not is_valen:
+            if layout is not None:
+                raise ValueError("Valen layouts require a Valen checkpoint")
+            return
+        if isinstance(obj, GenerateReqInput) or layout is None:
+            if (
+                isinstance(obj, EmbeddingReqInput)
+                and isinstance(obj.rid, str)
+                and obj.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+            ):
+                return
+            raise ValueError(
+                "Valen returns decisions through /v1/valen or /v1/systemone"
+            )
+        if obj.contains_mm_input():
+            raise ValueError("Valen multimodal processor parity has not been validated")
+        limit = min(
+            self.model_config.hf_config.valen_max_length,
+            max_joint_prompt_tokens(
+                context_len=self.context_len,
+                num_reserved_tokens=self.num_reserved_tokens,
+                max_req_input_len=self.max_req_input_len,
+                max_prefill_tokens=get_schedule().max_prefill_tokens,
+            ),
+        )
+        if len(input_ids) > limit:
+            raise ValueError(
+                f"Valen prompt has {len(input_ids)} tokens, but this server permits {limit}; no truncation"
+            )
+        parse_valen_layout(layout, len(input_ids))
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1669,6 +1705,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 decision_layout=obj.decision_layout,
+                valen_layout=obj.valen_layout,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
