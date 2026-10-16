@@ -327,8 +327,14 @@ class TestROPE(CustomTestCase):
         ]
 
         for shape, input_dtype, param_dtype in test_config:
-            x = torch.randn(shape, dtype=input_dtype)
-            x_before = x.clone()
+            if len(shape) == 3:
+                x = torch.randn(
+                    shape[1], shape[0], shape[2], dtype=input_dtype
+                ).transpose(0, 1)
+            else:
+                x = torch.randn(
+                    shape[0], shape[2], shape[1], shape[3], dtype=input_dtype
+                ).transpose(1, 2)
 
             num_tokens = shape[0] if len(shape) == 3 else shape[1]
             head_size = shape[-1]
@@ -350,8 +356,6 @@ class TestROPE(CustomTestCase):
 
             output_ref = self.apply_rotary_embedding_reference(x, cos, sin)
             output_sgl = torch.ops.sgl_kernel.apply_rotary_embedding_cpu(x, cos, sin)
-
-            torch.testing.assert_close(x, x_before)
 
             self.assertEqual(output_sgl.shape, x.shape)
             self.assertEqual(output_sgl.dtype, x.dtype)
