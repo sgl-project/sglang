@@ -214,6 +214,8 @@ class StepPlanner:
         prefill_bs_tracker = RecentPrefillBatchSizeTracker(
             window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
         )
+        # DFlash auto-enables the legacy formula; other workloads opt in via
+        # --min-free-slots-delay. Built independently of the prefill delayer.
         min_free_slots_delayer = create_min_free_slots_delayer(
             get_schedule().min_free_slots_delay,
             capacity.max_running_requests,

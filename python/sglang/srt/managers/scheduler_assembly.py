@@ -728,7 +728,6 @@ def assemble_scheduler(
         session_controller=session_controller,
         hisparse_coordinator=mode_owners.hisparse_coordinator,
         capacity=capacity,
-        # Match the allocator and radix counters' logical units.
     )
     kv_events_publisher = SchedulerKvEventsPublisher(
         kv=kv,
@@ -928,8 +927,6 @@ def assemble_scheduler(
         mode_owners=mode_owners,
         request_intake=request_intake,
         prefill_delayer=prefill_delayer,
-        # DFlash auto-enables the legacy formula; other workloads opt in via
-        # --min-free-slots-delay. Built independently of the prefill delayer.
         dynamic_chunk_sizer=dynamic_chunk_sizer,
         limits=limits,
     )
@@ -949,7 +946,6 @@ def assemble_scheduler(
         ipc_channels=ipc_channels,
     )
     load_inquirer = SchedulerLoadInquirer(
-        # The worker reports logical DCP capacity; add KV shard widening.
         capacity=capacity,
         pool_stats_observer=pool_stats_observer,
         workers=workers,
