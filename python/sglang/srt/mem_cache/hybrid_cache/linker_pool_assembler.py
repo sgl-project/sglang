@@ -501,6 +501,24 @@ def _build_mamba_swa_device_pool_group(
         _swa_layer_mappings,
     )
 
+    # TODO(alphabetc1): support unified memory for hybrid Mamba models.
+    if get_memory().enable_unified_memory:
+        raise ValueError(
+            "The direct external linker does not support --enable-unified-memory "
+            "on hybrid Mamba models yet."
+        )
+    # TODO(alphabetc1): support int8 Mamba checkpoints and Mamba side states.
+    req_to_token_pool = params.req_to_token_pool
+    if (
+        req_to_token_pool.mamba_ckpt_pool is not None
+        or req_to_token_pool.short_conv_pool.enabled
+        or req_to_token_pool.ngram_pool.enabled
+    ):
+        raise ValueError(
+            "The direct external linker does not support int8 Mamba checkpoints "
+            "or Mamba side states yet."
+        )
+
     full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
     entries = [
         _mha_device_pool_entry(
@@ -526,25 +544,6 @@ def resolve_hybrid_device_pool_group(
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _select_strategy,
     )
-
-    if ComponentType.MAMBA in components:
-        # TODO(alphabetc1): support unified memory for hybrid Mamba models.
-        if get_memory().enable_unified_memory:
-            raise ValueError(
-                "The direct external linker does not support --enable-unified-memory "
-                "on hybrid Mamba models yet."
-            )
-        # TODO(alphabetc1): support int8 Mamba checkpoints and Mamba side states.
-        req_to_token_pool = params.req_to_token_pool
-        if (
-            req_to_token_pool.mamba_ckpt_pool is not None
-            or req_to_token_pool.short_conv_pool.enabled
-            or req_to_token_pool.ngram_pool.enabled
-        ):
-            raise ValueError(
-                "The direct external linker does not support int8 Mamba checkpoints "
-                "or Mamba side states yet."
-            )
 
     return _select_strategy(kvcache, components).build_direct_linker_pool_group(
         kvcache=kvcache,
