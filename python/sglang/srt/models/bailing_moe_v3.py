@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -70,6 +71,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
+    triton_w8a8_block_fp8_linear,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -333,36 +335,26 @@ class BailingMLP(nn.Module):
         return any(local_intermediate_size % block != 0 for block in block_size)
 
     @classmethod
-    def supports_standalone_fp8_tail(
+    def standalone_fp8_tail_route(
         cls,
         *,
         hidden_size: int,
         intermediate_size: int,
         quant_config: Optional[QuantizationConfig],
         tp_size: int,
-    ) -> bool:
-        """Whether a standalone shared MLP can keep its logical TP K tail."""
+    ) -> Optional[str]:
+        """GEMM route for a standalone shared MLP that keeps its logical TP K tail."""
         if not cls.requires_standalone_fp8_tail(
             intermediate_size=intermediate_size,
             quant_config=quant_config,
             tp_size=tp_size,
         ) or getattr(quant_config, "weight_block_size", None) != [128, 128]:
-            return False
+            return None
         if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
-            return False
-
-        local_intermediate_size = intermediate_size // tp_size
-        if not (
-            _is_cuda
-            and not _is_hip
-            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            # gate_up uses hidden_size as K (DeepGEMM requires K % 128),
-            # while down_proj uses it as N (requiring N % 64).
-            and hidden_size % 128 == 0
-            and (2 * local_intermediate_size) % 64 == 0
-        ):
-            return False
+            return None
+        # gate_up uses hidden_size as K, quantized per 128-wide token group.
+        if not (_is_cuda and not _is_hip and hidden_size % 128 == 0):
+            return None
 
         parallel = get_parallel()
         runtime = get_exec()
@@ -379,17 +371,49 @@ class BailingMLP(nn.Module):
             and runtime.offload.cpu_offload_gb == 0
             and runtime.offload.offload_group_size <= 0
         ):
-            return False
+            return None
 
-        try:
-            return cls._is_deepgemm_block_linear(
-                dispatch_w8a8_block_fp8_linear(
-                    weight_block_size=quant_config.weight_block_size,
-                    act_scale_ue8m0=getattr(quant_config, "scale_fmt", None) == "ue8m0",
-                )
+        local_intermediate_size = intermediate_size // tp_size
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            # down_proj uses the merged gate_up width as N (DeepGEMM: N % 64).
+            and (2 * local_intermediate_size) % 64 == 0
+        ):
+            try:
+                if cls._is_deepgemm_block_linear(
+                    dispatch_w8a8_block_fp8_linear(
+                        weight_block_size=quant_config.weight_block_size,
+                        act_scale_ue8m0=getattr(quant_config, "scale_fmt", None)
+                        == "ue8m0",
+                    )
+                ):
+                    return "deepgemm"
+            except RuntimeError:
+                pass
+        # Triton block-FP8 masks the partial K block and reads the requantized
+        # fp32 local-grid scales; UE8M0 DeepGEMM (SM100+) cannot.
+        return "triton"
+
+    @classmethod
+    def supports_standalone_fp8_tail(
+        cls,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config: Optional[QuantizationConfig],
+        tp_size: int,
+    ) -> bool:
+        """Whether a standalone shared MLP can keep its logical TP K tail."""
+        return (
+            cls.standalone_fp8_tail_route(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                quant_config=quant_config,
+                tp_size=tp_size,
             )
-        except RuntimeError:
-            return False
+            is not None
+        )
 
     @staticmethod
     def _is_deepgemm_block_linear(linear) -> bool:
@@ -424,8 +448,8 @@ class BailingMLP(nn.Module):
         if not supports_tail:
             raise NotImplementedError(
                 "Bailing standalone shared experts with blockwise-FP8 TP tails "
-                "require BF16 and the native Hopper DeepGEMM path; model-level "
-                "intermediate-size padding or a backend fallback is not allowed."
+                "require CUDA, a serialized [128, 128] block-FP8 checkpoint and "
+                "pure-TP MoE; model-level intermediate-size padding is not allowed."
             )
         return supports_tail
 
@@ -495,10 +519,38 @@ class BailingMLP(nn.Module):
                 "Bailing standalone blockwise-FP8 TP tails currently require "
                 f"BF16 activations, but got {self.down_proj.orig_dtype}."
             )
+        self.fp8_tail_route = (
+            self.standalone_fp8_tail_route(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                quant_config=quant_config,
+                tp_size=tp_size,
+            )
+            if allow_fp8_blockwise_tail
+            else None
+        )
+        if self.fp8_tail_route == "triton":
+            # Keeps the fp32 local-grid scales: post-load UE8M0 requant only
+            # runs for DeepGEMM-dispatched layers.
+            triton_linear = partial(
+                triton_w8a8_block_fp8_linear,
+                act_scale_ue8m0=getattr(quant_config, "scale_fmt", None) == "ue8m0",
+            )
+            for proj in (self.gate_up_proj, self.down_proj):
+                proj.quant_method.w8a8_block_fp8_linear = triton_linear
+            log_info_on_rank0(
+                logger,
+                f"{prefix}: blockwise-FP8 TP K-tail runs on Triton block-FP8.",
+            )
         self.use_prequantized_fp8_tail = (
             allow_fp8_blockwise_tail
             and isinstance(down_quant_method, Fp8LinearMethod)
-            and self._is_deepgemm_block_linear(down_quant_method.w8a8_block_fp8_linear)
+            and (
+                self.fp8_tail_route == "triton"
+                or self._is_deepgemm_block_linear(
+                    down_quant_method.w8a8_block_fp8_linear
+                )
+            )
             and local_intermediate_size
             % down_quant_method.quant_config.weight_block_size[1]
             != 0
@@ -692,7 +744,8 @@ class BailingMLP(nn.Module):
             block_k = self.quant_config.weight_block_size[1]
             logical_shape = x.shape
             x, x_scale = block_quant_fp8(x.reshape(-1, logical_shape[-1]), (1, block_k))
-            x_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(x_scale)
+            if self.fp8_tail_route != "triton":
+                x_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(x_scale)
             x = (x.view(logical_shape), x_scale)
 
         x, _ = self.down_proj(x)
