@@ -1825,6 +1825,37 @@ class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
         )
         self._assert_all_backed_up(cache, [parent, child])
 
+    def test_queued_full_backed_parent_owns_its_ack_ahead_of_a_queued_child(self):
+        # The parent's Full is backed but its SWA is device-only, and its own
+        # incremental backup queues behind the child. Backing the child up first
+        # would mark the parent pending under the child's ack, so a second
+        # component's incremental backup (e.g. Mamba) on the parent would then
+        # conflict on the node-level ack; the parent must back up first.
+        cache, allocator = self._build(cfg=self.swa_cfg)
+        cache.write_through_threshold = 100
+        parent = self._insert(cache, allocator, [1, 2, 3, 4])
+        child = self._insert(cache, allocator, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(_node_parent(cache, child), parent)
+        self.assertEqual(cache.queued_backups, {})
+        parent_full = _device_value(cache, parent, ComponentType.FULL)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(len(parent_full))
+        self.assertIsNotNone(host_indices)
+        cache.tree_core.set_component_host_value_raw(
+            parent, ComponentType.FULL, host_indices
+        )
+        self.assertTrue(cache.tree_core.is_backuped(parent))
+
+        cache._apply_cache_action(BackupKV(node_ids=[child]))
+        cache._apply_cache_action(BackupKV(node_ids=[parent]))
+        self.assertEqual(list(cache.queued_backups), [child, parent])
+
+        cache.flush_pending_backups()
+        self.assertEqual(cache.tree_core.get_write_through_pending_id(parent), parent)
+        self.assertEqual(cache.tree_core.get_write_through_pending_id(child), child)
+        self._assert_all_backed_up(cache, [parent, child])
+        for node in (parent, child):
+            self.assertIsNotNone(_host_value(cache, node, ComponentType.SWA))
+
     def test_backup_dispatch_queues_only_batched_write_through(self):
         action = BackupKV(node_ids=[7])
         cases = [

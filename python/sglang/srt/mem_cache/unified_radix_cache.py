@@ -3677,14 +3677,22 @@ class UnifiedRadixCache(BasePrefixCache):
     def _ancestors_first(
         self, queued: dict[NodeId, Optional[DecLockRefParams]]
     ) -> dict[NodeId, Optional[DecLockRefParams]]:
-        """Queued nodes in an order that puts every unbacked ancestor first; a split
-        can queue a parent behind its child or leave it unqueued (no lock held)."""
+        """Queued nodes in an order that puts every unbacked or queued ancestor first.
+
+        A split can queue a parent behind its child or leave it unqueued (no lock
+        held). A queued ancestor with Full already backed up must still go first:
+        a descendant's SWA window would otherwise mark it pending under the
+        descendant's ack before its own incremental backup claims it."""
         ordered: dict[NodeId, Optional[DecLockRefParams]] = {}
+        # Every node above a walked node was already placed or ruled out.
+        walked: set[NodeId] = set()
         for node_id, lock_params in queued.items():
             chain = []
             parent = self.tree_core.get_parent_node_id(node_id)
-            while parent not in ordered and self._is_unbacked_node(parent):
-                chain.append(parent)
+            while parent is not None and parent not in walked:
+                walked.add(parent)
+                if parent in queued or self._is_unbacked_node(parent):
+                    chain.append(parent)
                 parent = self.tree_core.get_parent_node_id(parent)
             for ancestor in reversed(chain):
                 ordered[ancestor] = queued.get(ancestor)
