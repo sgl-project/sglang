@@ -546,6 +546,18 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.effective_logical_max_total_num_tokens
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
+        # Not an error: a deployment that never sends max-length requests may
+        # want a small pool. Checked here because this is the final served value.
+        if kv_capacity < self.model_config.context_len:
+            logger.warning(
+                "KV pool holds %d tokens, fewer than --context-length %d. One "
+                "full-length request cannot fit, so long requests will be "
+                "refused or truncated at serving time. Lower --context-length, "
+                "raise --mem-fraction-static, or free memory taken before the "
+                "pool is sized.",
+                kv_capacity,
+                self.model_config.context_len,
+            )
         max_req_len = min(
             self.model_config.context_len - 1,
             kv_capacity - 1,

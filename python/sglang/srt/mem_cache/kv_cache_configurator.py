@@ -374,48 +374,6 @@ class KVCacheConfigurator:
             max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
         )
 
-    def _warn_if_pool_cannot_hold_context(
-        self,
-        *,
-        max_total_num_tokens: int,
-        full_max_total_num_tokens: Optional[int],
-        swa_max_total_num_tokens: Optional[int],
-        allocator: BaseTokenToKVPoolAllocator,
-    ) -> None:
-        """Warn when the KV pool cannot hold one full-length request, which would
-        otherwise surface only as refusals at serving time. Not an error: a
-        deployment that never sends max-length requests may want a small pool."""
-        # The draft shares the target's capacity; one warning is enough.
-        if self.is_draft_worker:
-            return
-        if self.is_hybrid_swa:
-            # Match what ModelRunner serves: unified memory resizes the full
-            # side past the sizer's estimate.
-            max_total_num_tokens = self.hybrid_swa_token_capacity(
-                allocator=allocator,
-                full_capacity=full_max_total_num_tokens,
-                swa_capacity=swa_max_total_num_tokens,
-            )
-        # Request tokens, not per-rank rows: DCP widens rows by attn_dcp_size,
-        # KV sharding by kv_shard_size. Approximate: ModelRunner also caps this
-        # via req_to_token_pool.schedulable_token_capacity.
-        capacity = (
-            self.logical_token_capacity(max_total_num_tokens=max_total_num_tokens)
-            * self.kv_shard_size
-        )
-        context_len = self.model_config.context_len
-        if capacity >= context_len:
-            return
-        logger.warning(
-            "KV pool holds %d tokens, fewer than --context-length %d. One "
-            "full-length request cannot fit, so long requests will be refused "
-            "or truncated at serving time rather than here. Lower "
-            "--context-length, raise --mem-fraction-static, or free memory taken "
-            "before the pool is sized.",
-            capacity,
-            context_len,
-        )
-
     def _resolve_kv_shard(self) -> None:
         """Resolve the logical-page KV sharding identity: ``(rank, size)`` of
         the shard group, or ``(None, 1)`` when sharding is off. Consumed by the
@@ -496,13 +454,6 @@ class KVCacheConfigurator:
                 f"{sizes.swa_max_total_num_tokens} -> {swa_max_total_num_tokens} "
                 "(fixed per-request SWA ring capacity)."
             )
-
-        self._warn_if_pool_cannot_hold_context(
-            max_total_num_tokens=sizes.max_total_num_tokens,
-            full_max_total_num_tokens=sizes.full_max_total_num_tokens,
-            swa_max_total_num_tokens=swa_max_total_num_tokens,
-            allocator=alloc,
-        )
 
         logger.info(
             f"Memory pool end. "
