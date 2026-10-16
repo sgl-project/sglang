@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.embedding_model_spec import (
     AttentionPattern,
     BCGEligibility,
@@ -12,6 +14,7 @@ from sglang.srt.configs.embedding_model_spec import (
     resolve_embedding_model_spec,
     resolved_embedding_plan,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -30,10 +33,61 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertEqual(spec.pooling, PoolingStrategy.MEAN)
         self.assertTrue(spec.auto_enable_embedding)
         self.assertTrue(spec.safe_disable_kv_cache)
+        # Gemma layers are DECODER_BIDIRECTIONAL, not ENCODER_ONLY.
+        self.assertFalse(spec.encoder_only_attention)
         self.assertEqual(spec.bcg_prefill_policy, BCGPrefillPolicy.FULL_ENCODER)
         self.assertEqual(spec.execution, EmbeddingExecution.ENCODER_ONLY)
         self.assertEqual(spec.attention, AttentionPattern.BIDIRECTIONAL)
         self.assertEqual(spec.bcg_eligibility, BCGEligibility.FULL_ENCODER)
+
+    def test_embedding_nemotron3_declares_bidirectional_mean_contract(self):
+        spec = resolve_embedding_model_spec(
+            ["EmbeddingNemotron3Model"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+        )
+
+        self.assertEqual(spec.family, "embedding_nemotron3")
+        self.assertEqual(spec.task, EmbeddingTask.EMBED)
+        self.assertEqual(spec.pooling, PoolingStrategy.MEAN)
+        self.assertEqual(spec.attention, AttentionPattern.BIDIRECTIONAL)
+        self.assertTrue(spec.normalize)
+        self.assertTrue(spec.auto_enable_embedding)
+        self.assertTrue(spec.safe_disable_radix_cache)
+        self.assertTrue(spec.safe_disable_chunked_prefill)
+        self.assertTrue(spec.safe_disable_kv_cache)
+        self.assertTrue(spec.encoder_only_attention)
+
+    def _resolve_nemotron3_embedding_args(self, attention_backend):
+        args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
+        args._model_config = SimpleNamespace(
+            embedding_model_spec=resolve_embedding_model_spec(
+                ["EmbeddingNemotron3Model"],
+                is_embedding_requested=False,
+                is_embedding_gemma=False,
+            ),
+            joint_head_config=None,
+            is_multimodal=False,
+            hf_config=SimpleNamespace(architectures=["EmbeddingNemotron3Model"]),
+        )
+        handle_model_capability_adjustments(args)
+        return args
+
+    def test_embedding_nemotron3_skips_kv_cache_with_fa_prefill(self):
+        for attention_backend in ("fa3", "fa4"):
+            with self.subTest(attention_backend=attention_backend):
+                args = self._resolve_nemotron3_embedding_args(attention_backend)
+                self.assertTrue(
+                    resolution_result(args, "prefill_only_disable_kv_cache")
+                )
+
+    def test_embedding_nemotron3_keeps_kv_cache_with_other_prefill(self):
+        for attention_backend in ("flashinfer", "triton"):
+            with self.subTest(attention_backend=attention_backend):
+                args = self._resolve_nemotron3_embedding_args(attention_backend)
+                self.assertFalse(
+                    resolution_result(args, "prefill_only_disable_kv_cache")
+                )
 
     def test_encoder_embedding_models_enable_embedding_mode_automatically(self):
         spec = resolve_embedding_model_spec(
@@ -52,7 +106,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 8)
+        self.assertEqual(len(matrix), 9)
         self.assertIn("EmbeddingGemma2Model", by_architecture)
         self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")

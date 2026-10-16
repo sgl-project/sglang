@@ -5,7 +5,7 @@ description: Dense and sparse embedding models with FlashInfer acceleration and 
 SGLang provides robust support for embedding models by integrating efficient serving mechanisms with its flexible programming interface. This integration allows for streamlined handling of embedding tasks, facilitating faster and more accurate retrieval and semantic search operations. SGLang's architecture enables better resource utilization and reduced latency in embedding model deployment.
 
 <Warning>
-Native encoder embedding architectures and `google/embeddinggemma-300m` are detected automatically. Decoder-style embedding models require `--is-embedding`; add `--trust-remote-code` when the model requires it.
+Native encoder embedding architectures, `google/embeddinggemma-300m` and `nvidia/Nemotron-3-Embed-1B` are detected automatically. Decoder-style embedding models require `--is-embedding`; add `--trust-remote-code` when the model requires it.
 </Warning>
 
 ## Quick Start
@@ -27,6 +27,16 @@ sglang serve --model-path google/embeddinggemma-300m
 ```
 
 On CUDA, SGLang automatically uses breakable CUDA graph (BCG) for its full encoder prefill and disables incompatible radix-cache and chunked-prefill behavior. Do not add the deprecated piecewise CUDA graph knobs.
+
+### Nemotron-3-Embed
+
+`nvidia/Nemotron-3-Embed-1B-BF16` and `nvidia/Nemotron-3-Embed-1B-NVFP4` use a bidirectional Ministral3 backbone with normalized mean pooling. They are auto-detected from their checkpoint config, so `--is-embedding` is not needed:
+
+```bash
+sglang serve --model-path nvidia/Nemotron-3-Embed-1B-BF16
+```
+
+SGLang disables radix cache and chunked prefill for these models, and skips the KV cache allocation when the prefill attention backend is FA3 or FA4. Prepend the task prefix to each input text as described in the model card, for example `query: ...` or `passage: ...`.
 
 ### Client Request
 
