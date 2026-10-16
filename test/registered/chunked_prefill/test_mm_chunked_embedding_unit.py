@@ -694,7 +694,8 @@ def test_embedding_evicted_between_chunks_is_not_encoded_again(monkeypatch, path
 
 
 def test_rows_in_a_buffer_the_encoder_reuses_are_copied():
-    # The cache holds a clone; the next encoder call overwrites the encoder's slice.
+    # The cache holds a clone; the next encoder call overwrites the encoder's slice,
+    # so the kept rows are the cache's clone and not one more copy.
     mm_schedule.init_mm_embedding_cache(1 << 30)
     buffer = torch.empty(2 * VIDEO_TOKENS, HIDDEN)
 
@@ -704,6 +705,9 @@ def test_rows_in_a_buffer_the_encoder_reuses_are_copied():
 
     item, other = _video_item(), _video_item(78)
     chunks = [_prefill_chunk(encode, item, *VIDEO_CHUNKS[0]).clone()]
+    (kept,) = mm_schedule._prefill_rows.values()
+    (cached,) = mm_schedule.embedding_cache.mm_cache.values()
+    assert kept.result.embedding is cached.embedding
     _prefill_chunk(encode, other, 0, VIDEO_LEN)
     chunks += [
         _prefill_chunk(encode, item, prefix_len, extend_len)

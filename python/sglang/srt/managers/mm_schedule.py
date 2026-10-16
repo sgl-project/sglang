@@ -443,7 +443,11 @@ def _get_chunked_embedding_full(
             if isinstance(embedding, torch.Tensor)
             else embedding
         )
-        embedding_cache.set(embedding_items_hash, embedding_per_req)
+        if embedding_cache.set(embedding_items_hash, embedding_per_req):
+            cached = embedding_cache.peek(embedding_items_hash)
+            # set() may store a clone; reading the cache's tensor avoids a second copy.
+            if cached.embedding.shape == embedding_per_req.embedding.shape:
+                embedding_per_req = cached
 
     # cache hits keep raw-input leases until request cleanup for eviction/re-prefill
 
