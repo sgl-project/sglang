@@ -21,9 +21,7 @@ _RESOLVERS = (
     ("flashattention", FlashAttentionBackend._resolve_swa_kv_pool, SWAKVPool),
 )
 # FA only uses the allocator pool for the frozen-KV draft.
-_ALLOCATOR_FALLBACK_RESOLVERS = tuple(
-    r for r in _RESOLVERS if r[0] != "flashattention"
-)
+_ALLOCATOR_FALLBACK_RESOLVERS = tuple(r for r in _RESOLVERS if r[0] != "flashattention")
 
 
 def _mock_runner(
