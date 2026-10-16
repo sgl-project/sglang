@@ -491,6 +491,66 @@ prefill server of a PD-disaggregated deployment: decode batches of a few request
 rank run slower than with `--moe-runner-backend flashinfer_mxfp4`, so serve decode
 with the regular SM120 recipe.
 
+The default FlashInfer `0.7.1` dependency does not include this backend. Selecting
+SM120 MegaMoE with that version gives an explicit startup error; the regular
+`flashinfer_mxfp4` path remains available. To try the experimental backend before
+the dependency pin is updated, install the fixed FlashInfer source revision below
+**after installing SGLang with SM120 MegaMoE support**.
+
+The source installation was checked on Linux x86-64 with CUDA 13.0, PyTorch
+`2.14.1+cu130`, NCCL `2.30.7`, and CUTLASS DSL `4.8.0`. These commands retain that
+environment's dependencies and replace only FlashInfer. Remove the old prebuilt
+kernel packages so they cannot mix with the source build; kernels compile on first
+use. `BUILD_NVEP=0` skips the unrelated NIXL-EP/NCCL-EP package builds, not the
+cake backend's NCCL Device API transport.
+
+```bash Command
+git clone https://github.com/flashinfer-ai/flashinfer.git flashinfer-sm120-cake
+cd flashinfer-sm120-cake
+git checkout --detach 399b6c1d31a13f38dd827018f89c6a04c8487acb
+git submodule update --init --recursive 3rdparty/cccl 3rdparty/cutlass 3rdparty/spdlog
+
+python3 - <<'PY'
+import importlib.metadata as metadata
+import pathlib
+import shutil
+import subprocess
+import sys
+import sysconfig
+
+names = sorted({d.metadata['Name'] for d in metadata.distributions()
+                if d.metadata['Name'].lower().replace('_', '-').startswith(
+                    ('flashinfer-cubin', 'flashinfer-jit-cache'))})
+if names:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'uninstall', '-y', *names])
+# Some images leave namespace directories after uninstalling the providers.
+for name in ('flashinfer_jit_cache', 'flashinfer_cubin'):
+    path = pathlib.Path(sysconfig.get_paths()['purelib']) / name
+    if path.exists():
+        shutil.rmtree(path)
+PY
+
+BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 FLASHINFER_LOCAL_VERSION=g399b6c1d \
+  python3 -m pip install --no-deps --no-build-isolation -e .
+unset PYTHONPATH FLASHINFER_DISABLE_VERSION_CHECK
+export FLASHINFER_WORKSPACE_BASE="${HOME}/.cache/flashinfer-sm120-399b6c1d"
+python3 - <<'PY'
+import importlib.metadata as metadata
+import flashinfer
+from flashinfer.moe_ep import Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig
+
+assert flashinfer.__version__ == metadata.version('flashinfer-python')
+assert flashinfer.__version__ == '0.7.2+g399b6c1d'
+print(flashinfer.__version__, flashinfer.__file__)
+PY
+```
+
+`0.7.2+g399b6c1d` identifies this local source build, not a released wheel. This
+opt-in installation overrides SGLang's `0.7.1` pin, so `pip check` reports that
+dependency mismatch; resolving SGLang's dependencies again can restore `0.7.1`.
+Keep this source checkout available for the editable installation. Default-package
+CI does not validate the cake execution path.
+
 ```bash Command
 sglang serve \
   --model-path deepseek-ai/DeepSeek-V4-Flash \
