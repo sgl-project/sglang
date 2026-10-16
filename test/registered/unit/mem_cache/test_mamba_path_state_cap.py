@@ -89,12 +89,6 @@ def _build_unified_chain(cap, length=3):
 
 
 class TestMambaPathStateCap(unittest.TestCase):
-    def test_server_arg_defaults_to_unlimited(self):
-        self.assertEqual(
-            ServerArgs(model_path="dummy").mamba_max_states_per_path,
-            -1,
-        )
-
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
             args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)

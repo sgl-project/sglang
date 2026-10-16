@@ -464,7 +464,8 @@ class ExaoneMoEDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        if config.is_moe_layer[layer_id]:
+        attn, ffn = self.stage_facts(config, layer_id)
+        if ffn.sparse:
             self.mlp = ExaoneMoESparseMoEBlock(
                 layer_id=layer_id,
                 config=config,
@@ -485,17 +486,23 @@ class ExaoneMoEDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
         is_moe_layer = config.is_moe_layer
         num_layers = config.num_hidden_layers
-        self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=is_moe_layer[layer_id],
-                    next_layer_sparse=layer_id + 1 < num_layers
-                    and is_moe_layer[layer_id + 1],
-                ),
-                self.post_attention_layernorm,
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_moe_layer[layer_id],
+                next_layer_sparse=layer_id + 1 < num_layers
+                and is_moe_layer[layer_id + 1],
             ),
         )
 
@@ -559,6 +566,7 @@ class ExaoneMoEModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: ExaoneMoEDecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

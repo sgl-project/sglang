@@ -135,6 +135,8 @@ message GenerateRequest {
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
   optional KVHintsEnvelope kv_hints = 17;
+  // Also return the detokenized text, as HTTP /generate does; off by default.
+  optional bool return_text = 18;
 }
 
 // Versioned KV-hint envelope forwarded from a trusted orchestrator.
@@ -156,6 +158,8 @@ message GenerateResponse {
   repeated int32 output_ids = 1;
   map<string, string> meta_info = 2;
   bool finished = 3;
+  // Set only when the request asked for return_text.
+  optional string text = 4;
 }
 
 // ---- Text-based embed (text in, embedding out) ----
@@ -336,6 +340,8 @@ message OpenAIRequest {
 message OpenAIStreamChunk {
   bytes json_chunk = 1;
   bool finished = 2;
+  // HTTP status of a non-streaming response, set on its single finished chunk.
+  optional int32 status_code = 3;
 }
 
 message OpenAIResponse {

@@ -28,6 +28,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan_image3 import (
+    HunyuanImage3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
@@ -38,6 +41,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
     LingBotWorldV2CausalDMDConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.llada_image import (
+    LLaDAImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -77,8 +83,10 @@ __all__ = [
     "HunyuanConfig",
     "FastHunyuanConfig",
     "Hunyuan3D2PipelineConfig",
+    "HunyuanImage3PipelineConfig",
     "Ideogram4PipelineConfig",
     "Ideogram4DistilledPipelineConfig",
+    "LLaDAImagePipelineConfig",
     "FluxPipelineConfig",
     "Flux2PipelineConfig",
     "Flux2KleinPipelineConfig",
