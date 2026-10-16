@@ -440,7 +440,7 @@ ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 # gfx950); disable with --build-arg ENABLE_SGL_AMD_MONO=0.
 ARG ENABLE_SGL_AMD_MONO=1
 ARG SGL_AMD_MONO_REPO="https://github.com/sgl-project/sgl-amd-mono.git"
-# empty: the commit the srt_hip extras of the SGLang being built pin
+# empty: the commit pip installed through the monokernels_hip extra
 ARG SGL_AMD_MONO_COMMIT=""
 
 ARG ENABLE_MORI=0
@@ -896,15 +896,8 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 RUN /bin/bash -lc 'set -euo pipefail; \
     [ "${ENABLE_SGL_AMD_MONO}" = "1" ] || { echo "[sgl-amd-mono] skip (ENABLE_SGL_AMD_MONO=${ENABLE_SGL_AMD_MONO})"; exit 0; }; \
     case "${GPU_ARCH}" in gfx950*) ;; *) echo "[sgl-amd-mono] skip (GPU_ARCH=${GPU_ARCH})"; exit 0 ;; esac; \
-    commit="${SGL_AMD_MONO_COMMIT}"; \
-    if [ -z "${commit}" ]; then \
-      pyproject=/sgl-workspace/sglang/python/pyproject_other.toml; \
-      grep -q "sgl-amd-mono @" "${pyproject}" || { echo "[sgl-amd-mono] skip (this SGLang pins no sgl-amd-mono)"; exit 0; }; \
-      pins=$(grep -oE "sgl-amd-mono\.git@[0-9a-f]{40}" "${pyproject}" | sort -u || true); \
-      [ -n "${pins}" ] || { echo "[sgl-amd-mono] ${pyproject} pins no full sgl-amd-mono commit"; exit 1; }; \
-      [ "$(printf "%s\n" "${pins}" | wc -l)" = 1 ] || { echo "[sgl-amd-mono] the srt_hip extras pin different commits:" ${pins}; exit 1; }; \
-      commit="${pins#*@}"; \
-    fi; \
+    python3 -m pip show sgl-amd-mono > /dev/null || { echo "[sgl-amd-mono] skip (this SGLang does not install it)"; exit 0; }; \
+    commit="${SGL_AMD_MONO_COMMIT:-$(python3 -c "import json, importlib.metadata as md; print(json.loads(md.distribution(\"sgl-amd-mono\").read_text(\"direct_url.json\"))[\"vcs_info\"][\"commit_id\"])")}"; \
     git clone "${SGL_AMD_MONO_REPO}" /sgl-workspace/sgl-amd-mono; \
     cd /sgl-workspace/sgl-amd-mono; \
     git checkout -f "${commit}"; \
