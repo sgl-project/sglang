@@ -53,9 +53,7 @@ class TestDecoderSWAReplayDefaults(CustomTestCase):
             with self.subTest(backend=backend):
                 self.assertTrue(self.resolve(backend=backend))
                 self.assertFalse(
-                    self.resolve(
-                        backend=backend, enable_decoder_swa_bounded_replay=False
-                    )
+                    self.resolve(backend=backend, disable_decoder_bounded_replay=True)
                 )
                 self.assertTrue(
                     self.resolve(
@@ -95,20 +93,26 @@ class TestDecoderSWAReplayDefaults(CustomTestCase):
             with self.subTest(kwargs=kwargs):
                 self.assertFalse(self.resolve(**kwargs))
 
+    def test_conflicting_flags_rejected(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            self.resolve(
+                enable_decoder_swa_bounded_replay=True,
+                disable_decoder_bounded_replay=True,
+            )
+
     def test_cli_auto_enable_disable(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
-        for flags, expected in (
-            ([], None),
-            (["--enable-decoder-swa-bounded-replay"], True),
-            (["--no-enable-decoder-swa-bounded-replay"], False),
+        for flags, enabled, disabled in (
+            ([], False, False),
+            (["--enable-decoder-swa-bounded-replay"], True, False),
+            (["--disable-decoder-bounded-replay"], False, True),
         ):
             with self.subTest(flags=flags):
                 raw = parser.parse_args(["--model-path", "local-dsv41", *flags])
-                self.assertIs(
-                    ServerArgs.from_cli_args(raw).enable_decoder_swa_bounded_replay,
-                    expected,
-                )
+                args = ServerArgs.from_cli_args(raw)
+                self.assertIs(args.enable_decoder_swa_bounded_replay, enabled)
+                self.assertIs(args.disable_decoder_bounded_replay, disabled)
 
 
 if __name__ == "__main__":

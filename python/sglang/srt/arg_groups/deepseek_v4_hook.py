@@ -361,9 +361,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ),
         ),
     )
-    if cfg.enable_decoder_swa_bounded_replay is None:
+    if cfg.disable_decoder_bounded_replay and cfg.enable_decoder_swa_bounded_replay:
+        raise ValueError(
+            "--disable-decoder-bounded-replay cannot be combined with "
+            "--enable-decoder-swa-bounded-replay"
+        )
+    if not cfg.enable_decoder_swa_bounded_replay:
         enabled = (
-            get_platform().is_cuda
+            not cfg.disable_decoder_bounded_replay
+            and get_platform().is_cuda
             and cfg.disaggregation_mode == "null"
             and not cfg.enable_prefill_cp
             and cfg.attn_cp_size == 1
