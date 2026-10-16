@@ -421,9 +421,7 @@ def run_bench_serving(
             "--gsp-num-groups",
             str(gsp_num_groups) if gsp_num_groups else "1",
             "--gsp-prompts-per-group",
-            str(gsp_prompts_per_group)
-            if gsp_prompts_per_group
-            else str(num_prompts),
+            str(gsp_prompts_per_group) if gsp_prompts_per_group else str(num_prompts),
             "--gsp-system-prompt-len",
             (
                 str(int((repeat_rate if repeat_rate is not None else 0.9) * input_len))
@@ -605,7 +603,9 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 4:
                         metrics["cache_hit_rate_pct"] = parts[-1].rstrip("%")
-                elif stripped_line.startswith("Device:") and stripped_line.endswith("%"):
+                elif stripped_line.startswith("Device:") and stripped_line.endswith(
+                    "%"
+                ):
                     metrics["device_hit_rate_pct"] = stripped_line.split()[-1].rstrip(
                         "%"
                     )
