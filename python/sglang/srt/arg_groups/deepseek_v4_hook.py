@@ -235,7 +235,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
 
 def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None:
-    # Runs after the DP division, so chunked_prefill_size is each rank's budget.
     cfg = resolving_view(server_args)
     if not cfg.enable_encoder_swa_bounded_replay:
         return
