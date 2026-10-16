@@ -83,13 +83,18 @@ def validate_radixshmem_storage(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.hicache_storage_backend != "radixshmem":
         return
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--hicache-storage-backend radixshmem does not support pipeline "
+            f"parallelism yet (--pp-size {cfg.pp_size})."
+        )
     attn_group = cfg.tp_size // cfg.attn_dp_size
-    gpus_per_node = cfg.tp_size * cfg.pp_size // max(cfg.nnodes, 1)
+    gpus_per_node = cfg.tp_size // max(cfg.nnodes, 1)
     if cfg.nnodes > 1 and attn_group > gpus_per_node:
         raise ValueError(
-            "--hicache-storage-backend radixshmem shares one page across the "
-            f"attention TP/CP group ({attn_group} ranks), which must stay within "
-            f"one node ({gpus_per_node} ranks per node)."
+            "--hicache-storage-backend radixshmem does not support an attention "
+            f"TP/CP group spanning nodes yet ({attn_group} ranks per group, "
+            f"{gpus_per_node} ranks per node)."
         )
 
 

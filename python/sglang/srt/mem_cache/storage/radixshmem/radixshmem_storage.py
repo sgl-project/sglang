@@ -152,6 +152,11 @@ class RadixShmemStorage(HiCacheStorage):
     def __init__(self, storage_config: HiCacheStorageConfig, mem_pool_host: Any = None):
         import radixshmem
 
+        if storage_config.pp_size > 1:
+            raise ValueError(
+                "radixshmem does not support pipeline parallelism yet "
+                f"(pp_size={storage_config.pp_size})"
+            )
         self.radixshmem = radixshmem
         self.config = storage_config
         cfg = storage_config.extra_config or {}

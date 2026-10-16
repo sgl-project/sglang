@@ -485,8 +485,8 @@ class HiCacheController:
             )
             if len(set(hosts)) > 1:
                 raise RuntimeError(
-                    f"{self.storage_backend_type} shares one page across the "
-                    f"attention TP/CP group, which spans nodes {sorted(set(hosts))}"
+                    f"{self.storage_backend_type} does not support an attention "
+                    f"TP/CP group spanning nodes yet: {sorted(set(hosts))}"
                 )
         self.storage_backend.set_shard_groups(*groups, **identity)
 

@@ -708,24 +708,14 @@ class TestRadixShmemConfig(CustomTestCase):
         ):
             HiCacheController._shard_layout()
 
-    def test_pp_rank_selects_stage_key(self):
-        _FakeClient.servers.clear()
+    def test_pipeline_parallel_rejected(self):
         with mock.patch.dict(sys.modules, {"radixshmem": _FAKE_RADIXSHMEM}):
             from sglang.srt.mem_cache.storage.radixshmem import RadixShmemStorage
 
-            stages = []
-            for pp in range(2):
-                config = _config()
-                config.pp_rank, config.pp_size = pp, 2
-                pool = _FakeHostPool(8)
-                storage = RadixShmemStorage(config, pool)
-                storage.register_mem_pool_host(pool)
-                stages.append(storage)
-            keys = _keys(2)
-            stages[1].batch_set_v1(keys, _indices(2), _info([]))
-            self.assertEqual(stages[0].batch_exists(keys, _info([])), 0)
-            other = HiCacheStorageExtraInfo(prefix_keys=[], extra_info={"pp_rank": 1})
-            self.assertEqual(stages[0].batch_exists(keys, other), 2)
+            config = _config()
+            config.pp_size = 2
+            with self.assertRaises(ValueError):
+                RadixShmemStorage(config, _FakeHostPool(8))
 
     def test_prefix_keys_forced_on(self):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -760,8 +750,9 @@ class TestRadixShmemConfig(CustomTestCase):
         check()
         check(nnodes=2, attn_dp_size=2)
         check(enable_dsa_cache_layer_split=True)
-        with self.assertRaises(ValueError):
-            check(nnodes=2)
+        for bad in (dict(nnodes=2), dict(pp_size=2), dict(pp_size=2, nnodes=2)):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                check(**bad)
 
 
 if __name__ == "__main__":
