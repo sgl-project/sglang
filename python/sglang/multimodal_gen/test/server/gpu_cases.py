@@ -1602,6 +1602,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
+        "test_server_flux3_image.py",
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
