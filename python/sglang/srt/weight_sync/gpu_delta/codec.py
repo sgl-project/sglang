@@ -19,6 +19,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from sglang.srt.weight_sync.gpu_delta import profiling
+
 
 class _SnappyOptions(ctypes.Structure):
     _fields_ = [
@@ -269,6 +271,7 @@ class NvcompDecoder:
             geometry.append((count, int(decoded.max()), int(decoded.sum())))
         return geometry, bounds, remainders
 
+    @profiling.annotate("gpu_delta.prepare.decoder_metadata", detail=True)
     def prepare_batches(
         self,
         table: np.ndarray,
@@ -413,6 +416,7 @@ class PreparedDecodePlan:
         ):
             record_device_stream(tensor, stream)
 
+    @profiling.annotate("gpu_delta.pause.bind_decoder_outputs", detail=True)
     def bind_outputs(
         self, decoded_slots: Sequence[torch.Tensor]
     ) -> list[PreparedDecode]:
@@ -492,6 +496,7 @@ class PreparedDecode:
     output_offsets: np.ndarray
     output_pointers: np.ndarray
 
+    @profiling.annotate("gpu_delta.pause.nvcomp_enqueue", detail=True)
     def enqueue(self) -> None:
         """Launch only; caller checks statuses/sizes on device before applying weights.
 

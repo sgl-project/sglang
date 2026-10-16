@@ -22,6 +22,8 @@ import numpy as np
 import orjson
 import torch
 
+from sglang.srt.weight_sync.gpu_delta import profiling
+
 from sglang.srt.weight_sync.gpu_delta.bindings import (
     _ITEMSIZES,
     BACKEND_LAYOUTS,
@@ -127,6 +129,7 @@ class GpuDeltaLayout:
                 )
         self._tensor_checks = tuple(unique.values())
 
+    @profiling.annotate("gpu_delta.check_identity", detail=True)
     def check_identity(self):
         for module, name, tensor, _ in self._parameter_roots:
             if module._parameters.get(name) is not tensor:
@@ -251,6 +254,7 @@ class _PreparedBatch:
     check_status: Callable[[], None]
 
 
+@profiling.annotate("gpu_delta.prepare.layer_plan", detail=True)
 def _plan_layers(backend, bindings, entries, layers_per_batch=1):
     """Cache membership, canonical offsets and apply geometry, never wire frames."""
     key = layers_per_batch, tuple(binding.name for binding in bindings)
@@ -298,6 +302,7 @@ def _plan_layers(backend, bindings, entries, layers_per_batch=1):
     return backend.batch_plan[1]
 
 
+@profiling.annotate("gpu_delta.prepare.frame_plan", detail=True)
 def _plan_decode(plans, entries, records):
     """Pack fresh frame rows and omitted ranges for every cached layer batch."""
     counts = [
@@ -331,6 +336,7 @@ def _plan_decode(plans, entries, records):
     return table.reshape(sum(counts), 4).T.copy(order="C"), counts, gaps
 
 
+@profiling.annotate("gpu_delta.prepare.canonical_plan", detail=True)
 def _qualify_canonical_plan(backend, manifest):
     """Admit static bindings once; Miles preserves them for the negotiated digest."""
     entries = {entry["name"]: entry for entry in manifest["tensors"]}
@@ -386,6 +392,7 @@ def _qualify_canonical_plan(backend, manifest):
 
 
 class PreparedDelta:
+    @profiling.annotate("gpu_delta.prepare.layout", detail=True)
     def __init__(self, backend, manifest_path, manifest_sha256, metadata):
         from pathlib import Path
 
@@ -522,6 +529,7 @@ class PreparedDelta:
         self._prepare_gpu_metadata(frame_table, frame_counts, raw_targets)
         self.timings["host_prepare_s"] = time.perf_counter() - preparation_started
 
+    @profiling.annotate("gpu_delta.prepare.gpu_metadata", detail=True)
     def _prepare_gpu_metadata(self, frame_table, frame_counts, raw_targets):
         """Prepare small GPU inputs; retain their leases, not wire-frame objects."""
         from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
@@ -635,6 +643,7 @@ class PreparedDelta:
             ),
         )
 
+    @profiling.annotate("gpu_delta.prepare.apply_bindings", detail=True)
     def _prepare_apply_bindings(self):
         """Prepare fixed descriptors, target pointers and source-index patches."""
         self.apply_host_view = self.apply_host_metadata.numpy()
@@ -671,6 +680,7 @@ class PreparedDelta:
             for i, o in zip(indices, offsets)
         ]
 
+    @profiling.annotate("gpu_delta.pause.bind_apply_metadata", detail=True)
     def _bind_apply_metadata(self):
         """Patch only actual source bases; misalignment retains the generic path."""
         groups, calls = [], []
@@ -697,6 +707,7 @@ class PreparedDelta:
                 self.apply_host_view[indices] = offsets + self.decoded[slot].data_ptr()
         return groups, calls
 
+    @profiling.annotate("gpu_delta.pause.allocate_bind", detail=True)
     def _allocate_paused(self):
         """Allocate reusable decoded outputs, then bind their pointers."""
         from sglang.srt.weight_sync.gpu_delta.memory import device_empty
@@ -761,19 +772,26 @@ class PreparedDelta:
 
     @contextmanager
     def _phase(self, name, stream=None):
-        if not self.timing_enabled:
+        if profiling.DETAIL:
+            profiling.nvtx.range_push("gpu_delta.pause." + name)
+        try:
+            if not self.timing_enabled:
+                yield
+                return
+            start, end = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            stream = self.stream if stream is None else stream
+            start.record(stream)
             yield
-            return
-        start, end = (
-            torch.cuda.Event(enable_timing=True),
-            torch.cuda.Event(enable_timing=True),
-        )
-        stream = self.stream if stream is None else stream
-        start.record(stream)
-        yield
-        end.record(stream)
-        self.events.setdefault(name, []).append((start, end))
+            end.record(stream)
+            self.events.setdefault(name, []).append((start, end))
+        finally:
+            if profiling.DETAIL:
+                profiling.nvtx.range_pop()
 
+    @profiling.annotate("gpu_delta.pause.apply")
     def apply(self):
         apply_started = time.perf_counter()
         self.backend.layout.check_identity()
@@ -865,6 +883,7 @@ class PreparedDelta:
             if batch.apply is not None:
                 batch.apply()
 
+    @profiling.annotate("gpu_delta.pause.release_gpu", detail=True)
     def _release_gpu(self):
         self.batches.clear()
         self.status_checks.clear()
@@ -879,6 +898,7 @@ class PreparedDelta:
             self.decode_plan
         ) = None
 
+    @profiling.annotate("gpu_delta.release_host", detail=True)
     def release_and_close(self):
         try:
             self.host_snapshot.mark_reusable()

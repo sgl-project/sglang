@@ -672,3 +672,99 @@ def test_describe_binds_published_scheduler_ranks(monkeypatch):
         control.session._executor.shutdown(wait=True)
     finally:
         reset_context()
+
+
+def test_nvtx_disabled_identity_and_worker_exception_balance(monkeypatch):
+    profiling = delta_runtime.profiling
+    events = []
+    nvtx = SimpleNamespace(
+        range_push=lambda name: events.append((threading.get_ident(), "push", name)),
+        range_pop=lambda: events.append((threading.get_ident(), "pop")),
+    )
+    monkeypatch.setattr(profiling, "nvtx", nvtx, raising=False)
+
+    def work(fail=False):
+        if fail:
+            raise RuntimeError("worker failure")
+        return threading.get_ident()
+
+    monkeypatch.setattr(profiling, "ENABLED", False)
+    assert profiling.annotate("unused")(work) is work
+    assert profiling.annotate("unused", detail=True)(work) is work
+    monkeypatch.setattr(profiling, "ENABLED", True)
+    monkeypatch.setattr(profiling, "DETAIL", False)
+    assert profiling.annotate("unused", detail=True)(work) is work
+    monkeypatch.setattr(profiling, "DETAIL", True)
+    wrapped = profiling.annotate("gpu_delta.worker", detail=True)(work)
+    with delta_runtime.ThreadPoolExecutor(max_workers=1) as pool:
+        worker_id = pool.submit(wrapped).result()
+        with pytest.raises(RuntimeError, match="worker failure"):
+            pool.submit(wrapped, True).result()
+    assert worker_id != threading.get_ident()
+    assert events == [
+        (worker_id, "push", "gpu_delta.worker"),
+        (worker_id, "pop"),
+        (worker_id, "push", "gpu_delta.worker"),
+        (worker_id, "pop"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "outcome", ["resumed", "retained", "apply_failed", "resume_failed"]
+)
+def test_nvtx_pause_ends_only_after_successful_unpause(
+    make_session, monkeypatch, outcome
+):
+    events = []
+    profiling = delta_runtime.profiling
+    monkeypatch.setattr(profiling, "ENABLED", True)
+    monkeypatch.setattr(profiling, "DETAIL", False)
+
+    def start(name):
+        events.append(("start", name))
+        return 17
+
+    monkeypatch.setattr(
+        profiling,
+        "nvtx",
+        SimpleNamespace(
+            range_start=start,
+            range_end=lambda handle: events.append(("end", handle)),
+            mark=lambda name: events.append(("mark", name)),
+        ),
+        raising=False,
+    )
+    session, backend = make_session()
+    prepare_ready(session, backend)
+
+    def fail():
+        raise RuntimeError("control failure")
+
+    if outcome == "apply_failed":
+        with pytest.raises(RuntimeError, match="control failure"):
+            session.apply(fail, lambda: None, None)
+        assert session.status()["state"] == "POISONED"
+        assert events[-1] == ("mark", "gpu_delta.pause.poisoned")
+    else:
+        session.apply(lambda: None, lambda: None, None)
+        assert events == [("start", "gpu_delta.pause")]
+
+        def resume(version):
+            assert version == 1
+            events.append(("resume", version))
+            if outcome == "resume_failed":
+                fail()
+
+        if outcome == "resume_failed":
+            with pytest.raises(RuntimeError, match="control failure"):
+                session.resume(resume)
+        else:
+            session.resume(resume, keep_pause=outcome == "retained")
+    if outcome == "resumed":
+        assert events[-2:] == [("resume", 1), ("end", 17)]
+        assert session._session.nvtx_pause_id is None
+        assert session.status()["scheduler_timing"]["blocked_s"] is not None
+    else:
+        assert not any(event[0] == "end" for event in events)
+        assert session._session.nvtx_pause_id == 17
+        assert session.status()["scheduler_timing"]["blocked_s"] is None

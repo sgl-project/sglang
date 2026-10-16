@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sglang.srt.weight_sync.gpu_delta import io as delta_io
+from sglang.srt.weight_sync.gpu_delta import profiling
 
 
 class GpuDeltaCommunicator:
@@ -67,6 +68,7 @@ class _Session:
     pause_started_ns: int | None = None
     reader_fence_completed_ns: int | None = None
     resumed_ns: int | None = None
+    nvtx_pause_id: int | None = None
 
 
 class DeltaSession:
@@ -147,6 +149,7 @@ class DeltaSession:
             self._executor.submit(self._prepare, session)
             return self.status()
 
+    @profiling.annotate("gpu_delta.prepare")
     def _prepare(self, session: _Session) -> None:
         prepared = None
         try:
@@ -168,6 +171,7 @@ class DeltaSession:
             if prepared is not None:
                 prepared.close()
 
+    @profiling.annotate("gpu_delta.scheduler.apply")
     def apply(
         self,
         fence: Callable[[], None],
@@ -180,6 +184,15 @@ class DeltaSession:
             # already be mutating. Miles does not abort after dispatching apply.
             session.state = "APPLYING"
             session.pause_started_ns = time.monotonic_ns()
+            if profiling.ENABLED:
+                # A process range spans separate apply/resume RPCs. Thread-local
+                # push/pop ranges must not be left open across those calls.
+                session.nvtx_pause_id = profiling.nvtx.range_start("gpu_delta.pause")
+        if profiling.DETAIL:
+            fence = profiling.annotate("gpu_delta.pause.reader_fence")(fence)
+            retract = profiling.annotate("gpu_delta.pause.retract")(retract)
+            if flush is not None:
+                flush = profiling.annotate("gpu_delta.pause.flush_cache")(flush)
         try:
             fence()
             session.reader_fence_completed_ns = time.monotonic_ns()
@@ -192,12 +205,16 @@ class DeltaSession:
             with self._lock:
                 session.state = "POISONED"
                 session.message = f"update failed after pause: {exc}; restart required"
+                if profiling.ENABLED:
+                    # The scheduler is still paused: do not fabricate an end.
+                    profiling.nvtx.mark("gpu_delta.pause.poisoned")
             raise
         with self._lock:
             session.result = result
             session.state = "APPLIED"
             return self.status()
 
+    @profiling.annotate("gpu_delta.scheduler.resume")
     def resume(self, resume: Callable[[int], None], keep_pause: bool = False) -> dict:
         with self._lock:
             session = self._session
@@ -209,6 +226,11 @@ class DeltaSession:
             # Version commit does not end a pause retained by the caller.
             if not keep_pause:
                 session.resumed_ns = time.monotonic_ns()
+                if profiling.ENABLED:
+                    profiling.nvtx.range_end(session.nvtx_pause_id)
+                    session.nvtx_pause_id = None
+            elif profiling.ENABLED:
+                profiling.nvtx.mark("gpu_delta.pause.retained")
             session.state = "RESUMED"
             prepared, session.prepared = session.prepared, None
             # Keep host release I/O off the scheduler; this FIFO executor runs

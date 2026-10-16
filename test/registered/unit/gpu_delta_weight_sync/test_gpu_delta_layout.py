@@ -56,6 +56,23 @@ def _apply_binding(binding, mask):
 
 
 class TestCanonicalPlanCache(unittest.TestCase):
+    def test_nvtx_phase_without_cuda_event_timing_balances_failure(self):
+        events = []
+        nvtx = SimpleNamespace(
+            range_push=lambda name: events.append(("push", name)),
+            range_pop=lambda: events.append(("pop",)),
+        )
+        prepared = SimpleNamespace(timing_enabled=False)
+        with (
+            patch.object(layout.profiling, "DETAIL", True),
+            patch.object(layout.profiling, "nvtx", nvtx, create=True),
+            patch.object(torch.cuda, "Event", side_effect=AssertionError("new event")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "enqueue failed"):
+                with layout.PreparedDelta._phase(prepared, "decode"):
+                    raise RuntimeError("enqueue failed")
+        self.assertEqual(events, [("push", "gpu_delta.pause.decode"), ("pop",)])
+
     def publication(self):
         entries = [
             {
