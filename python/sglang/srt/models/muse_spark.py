@@ -64,6 +64,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.muse_spark import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import MuseSpark1xBf16Experts
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
 from sglang.srt.layers.muse_spark.muse_spark_layers import (
@@ -107,6 +108,82 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
         self.use_fp32_output = True
+        # The verify lm head megakernel gathers capped FP32 logits over TP4.
+        self.use_helion_verify_lm_head = (
+            expert_tp.helion_verify_enabled()
+            and bool(self.final_logit_softcapping)
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.use_tp_lm_head_all_to_all
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and get_parallel().tp_size == 4
+        )
+
+    def _get_logits(
+        self,
+        hidden_states,
+        lm_head,
+        logits_metadata,
+        embedding_bias=None,
+        use_logits_buffer=True,
+    ):
+        if not (
+            self.use_helion_verify_lm_head
+            and hidden_states.shape[0] in expert_tp.VERIFY_TOKENS
+            and logits_metadata.forward_mode.is_target_verify()
+            and embedding_bias is None
+            and hasattr(lm_head, "weight")
+            and lm_head.weight.shape[0] * get_parallel().tp_size == self.vocab_size
+        ):
+            return super()._get_logits(
+                hidden_states,
+                lm_head,
+                logits_metadata,
+                embedding_bias=embedding_bias,
+                use_logits_buffer=use_logits_buffer,
+            )
+        return self._get_logits_helion_verify(
+            hidden_states, lm_head, logits_metadata, use_logits_buffer
+        )
+
+    def _get_logits_helion_verify(
+        self, hidden_states, lm_head, logits_metadata, use_logits_buffer
+    ):
+        """One megakernel for the lm head, the logit scale and softcap and the
+        gather of the vocab shards, written into the logits buffer when it fits."""
+        from sglang.kernels.ops.muse_spark.helion_megakernels.integration import (
+            require_helion_features,
+        )
+        from sglang.kernels.ops.muse_spark.helion_megakernels.lm_head_verify_megakernel import (
+            LogitScalars,
+            get_lm_head_verify_megakernel,
+        )
+
+        require_helion_features()
+
+        weight = lm_head.weight
+        tokens = hidden_states.shape[0]
+        lm_head_mk = get_lm_head_verify_megakernel(
+            device=hidden_states.device,
+            group=get_parallel().tp_group.device_group,
+            scalars=LogitScalars(
+                scale=1.0 if self.logit_scale is None else float(self.logit_scale),
+                cap=float(self.final_logit_softcapping),
+            ),
+            tokens=tokens,
+            vocab_shard=weight.shape[0],
+        )
+        out = logits_metadata.next_token_logits_buffer if use_logits_buffer else None
+        if (
+            out is None
+            or tuple(out.shape) != (tokens, self.vocab_size)
+            or out.dtype != torch.float32
+            or not out.is_contiguous()
+        ):
+            out = hidden_states.new_empty(tokens, self.vocab_size, dtype=torch.float32)
+        return lm_head_mk(
+            hidden_states=hidden_states.to(weight.dtype), weight=weight, out=out
+        )
 
     def _compute_lm_head(self, hidden_states, lm_head, embedding_bias=None):
         if not hasattr(lm_head, "weight"):
@@ -370,6 +447,17 @@ class MuseSpark1xAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
+        output, _ = self.o_proj(self.gated_attention(positions, qkv, forward_batch))
+        return output
+
+    def gated_attention(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Everything between the QKV and output projections: QK norm (and RoPE)
+        with the KV store, attention, then the output norm and gate."""
         split_sizes = [self.q_size, self.kv_size, self.kv_size]
         if self.use_o_gate:
             q, k, v, o_gate = qkv.split(split_sizes + [self.q_size], dim=-1)
@@ -392,9 +480,7 @@ class MuseSpark1xAttention(nn.Module):
         if self.rotary_emb is not None and not fuse_rope:
             q, k = self.rotary_emb(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
-        output = self._fused_o_norm_gate(output, o_gate)
-        output, _ = self.o_proj(output)
-        return output
+        return self._fused_o_norm_gate(output, o_gate)
 
 
 class MuseSpark1xMLP(nn.Module):
@@ -436,16 +522,7 @@ class MuseSpark1xMoE(nn.Module):
             raise ValueError("Muse Spark OSS supports routed experts only")
         parallel = get_parallel()
         int4_checkpoint = _uses_gptq_int4_experts(quant_config)
-        if parallel.moe_tp_size != 1:
-            if not int4_checkpoint:
-                raise ValueError(
-                    "The torch-native Muse MoE requires expert TP1; use EP equal "
-                    "to TP. Expert TP is implemented for int4 checkpoints only."
-                )
-            if parallel.moe_ep_size != 1:
-                raise ValueError(
-                    "Muse int4 experts support either expert TP or EP, not both"
-                )
+        expert_tp.validate(int4_checkpoint)
         if config.num_local_experts % parallel.moe_ep_size:
             raise ValueError("num_experts must be divisible by expert parallel size")
         self.layer_idx = layer_idx
@@ -717,7 +794,7 @@ class MuseSpark1xMoE(nn.Module):
         global_hidden = get_global_dp_buffer(tp_group)
         dp_gather_replicate(global_hidden, hidden_states, forward_batch)
         output = self._forward_experts(global_hidden)
-        if self.tp_size > 1 and (not _is_cpu or self.moe_tp_size == 1):
+        if self.tp_size > 1 and self.moe_tp_size == 1:
             output = tensor_model_parallel_all_reduce(output)
         if self.post_expert_proj is not None:
             if _is_cpu:
@@ -948,6 +1025,14 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm,
         )
         self._fused_ffn_boundary = None
+        self._next_layer = None
+        # (forward batch, QKV) the previous layer's Helion verify tail computed.
+        self._verify_qkv = None
+        # The checkpoint keeps the first and last layers' experts in BF16; those
+        # layers stay on the stock path.
+        self._megakernel_capable = (
+            expert_tp.helion_enabled() and self.is_moe_layer and nvfp4_checkpoint
+        )
 
     @staticmethod
     def _is_moe_layer(config: MuseSparkTextConfig, layer_idx: int) -> bool:
@@ -966,6 +1051,10 @@ class MuseSpark1xDecoderLayer(nn.Module):
         ):
             self.mlp.set_unpool_gather_boundary(self._fused_ffn_boundary)
 
+    def bind_next_layer(self, next_layer: MuseSpark1xDecoderLayer) -> None:
+        # Not a submodule: the model owns it. The Helion verify tail computes its QKV.
+        object.__setattr__(self, "_next_layer", next_layer)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -974,6 +1063,16 @@ class MuseSpark1xDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Returns the updated residual stream and the next layer's attention input."""
+        if self._megakernel_capable:
+            from sglang.kernels.ops.muse_spark.helion_megakernels.integration import (
+                try_helion_megakernel_forward,
+            )
+
+            result = try_helion_megakernel_forward(
+                self, positions, stream, attn_input, forward_batch
+            )
+            if result is not None:
+                return result
         attn_output = self.self_attn(positions, attn_input, forward_batch)
         router_dtype = self._router_dtype
         if router_dtype is not None and _use_split_bf16_router(attn_output.shape[0]):
@@ -1061,6 +1160,7 @@ class MuseSpark1xModel(nn.Module):
             self.layers.append(layer)
         for layer, next_layer in zip(self.layers[:-1], self.layers[1:]):
             layer.bind_next_pre_attn_norm(next_layer.input_layernorm)
+            layer.bind_next_layer(next_layer)
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
         if is_cuda() and envs.SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR.get():
@@ -1162,6 +1262,18 @@ class MuseSpark1xModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Prefill CUDA graphs capture this decoder directly, below the causal
+        # LM's scope; open it here as well (it nests) so they keep the defaults.
+        with expert_tp.default_fused_ops_for_single_request(forward_batch):
+            return self._forward(input_ids, positions, forward_batch, input_embeds)
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
@@ -1251,6 +1363,16 @@ class MuseSparkTextForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
     ):
+        with expert_tp.default_fused_ops_for_single_request(forward_batch):
+            return self._forward(input_ids, positions, forward_batch, input_embeds)
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+    ):
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds=input_embeds
         )
@@ -1332,6 +1454,8 @@ class MuseSparkTextForCausalLM(nn.Module):
             local = loaded_weight.shape[0] // parallel.moe_ep_size
             start = parallel.moe_ep_rank * local
             loaded_weight = loaded_weight.narrow(0, start, local)
+        if expert_tp.copy_shard(param, loaded_weight, name):
+            return
         if param.shape != loaded_weight.shape:
             raise RuntimeError(
                 f"Expert weight shape mismatch for {name}: "

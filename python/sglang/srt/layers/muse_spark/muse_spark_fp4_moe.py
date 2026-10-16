@@ -28,10 +28,12 @@ from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_trtllm im
 from sglang.kernels.ops.muse_spark.norm_fp4_quant import fused_norm_fp4_quant
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.muse_spark import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
     MuseSparkNvFp4FusedMoEMethod,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
@@ -95,6 +97,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         params_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
+        intermediate_size, self.expert_tp = expert_tp.partition(intermediate_size)
         # create_weights sizes the activation scales from ``num_experts``, so it
         # must be the LOCAL count; the kernel separately wants the global count.
         self.num_experts = num_local_experts
@@ -123,10 +126,16 @@ class MuseSpark1xFp4Experts(nn.Module):
             inplace=False,
         )
         self.dispatcher = _DirectDispatcher()
+        self.helion_verify_bank = None
 
         capability = get_device_capability() if is_cuda() else None
         self.moe_runner_backend = _resolve_moe_runner_backend()
         self.use_marlin = self.moe_runner_backend.is_marlin()
+        if self.use_marlin and self.expert_tp:
+            raise ValueError(
+                "Muse NVFP4 expert TP needs FlashInfer's TRT-LLM MoE: the Marlin "
+                "path does not reduce the expert-TP partials. Use EP equal to TP."
+            )
         self._sm_major = capability[0] if capability is not None else 0
         if not self.use_marlin and capability is not None and capability < (10, 0):
             raise ValueError(
@@ -148,7 +157,6 @@ class MuseSpark1xFp4Experts(nn.Module):
                 "Marlin preparation asserts on the unpadded shape instead of "
                 "padding."
             )
-
         # post_expert_norm is unknown until set_post_expert_norm; start with the
         # OSS default (standard, eps=1e-8) and rebuild when the real module arrives.
         self._post_expert_norm: Optional[nn.Module] = None
@@ -246,6 +254,71 @@ class MuseSpark1xFp4Experts(nn.Module):
                 weight_first=weight_first,
             )
 
+    def bind_helion_verify_bank(self) -> None:
+        """Build the verify megakernel bank (collective over the MoE-TP group) and
+        rebind FI W13 to views of it. FI W2 stays resident for the stock path."""
+        from sglang.kernels.ops.muse_spark.helion_megakernels.integration import (
+            DERIVED_WEIGHT_CACHE_ERROR,
+            require_helion_features,
+        )
+        from sglang.kernels.ops.muse_spark.helion_megakernels.moe_tp4_verify_megakernel import (
+            build_moe_tp4_verify_bank,
+        )
+
+        require_helion_features()
+        # The bank is derived from the loaded weights; updates would leave it stale.
+        self._derived_weight_cache_error = DERIVED_WEIGHT_CACHE_ERROR
+        bank = build_moe_tp4_verify_bank(
+            w13=self.gate_up_proj,
+            w13_scale=self.gate_up_proj_weight_scale,
+            w2=self.down_proj,
+            w2_scale=self.down_proj_weight_scale,
+            group=get_parallel().moe_tp_group.device_group,
+        )
+        scale = self.gate_up_proj_weight_scale
+        self.gate_up_proj.data = bank.w13.view(self.gate_up_proj.dtype)
+        scale.data = bank.w13_scale.view(scale.dtype).view(scale.shape)
+        self.helion_verify_bank = bank
+
+    def forward_helion_verify(
+        self,
+        *,
+        hs_fp4: torch.Tensor,
+        hs_scale: torch.Tensor,
+        per_token_scale: torch.Tensor,
+        packed_topk_ids: torch.Tensor,
+        post_expert_norm: nn.Module,
+    ) -> torch.Tensor:
+        """16-token experts and post-expert norm on the Helion MoE megakernel;
+        returns the route sum, replicated on every MoE-TP rank."""
+        from sglang.kernels.ops.muse_spark.helion_megakernels.moe_tp4_verify_megakernel import (
+            get_moe_tp4_verify_megakernel,
+        )
+
+        if self._post_expert_norm is not post_expert_norm:
+            self.set_post_expert_norm(post_expert_norm)
+        if not self._post_expert_norm_weight_first:
+            raise RuntimeError(
+                "the Helion verify MoE megakernel fuses only the weight-first "
+                "post-expert norm"
+            )
+        megakernel = get_moe_tp4_verify_megakernel(
+            device=hs_fp4.device,
+            group=get_parallel().moe_tp_group.device_group,
+            norm_eps=self._post_expert_norm_eps,
+        )
+        return megakernel(
+            bank=self.helion_verify_bank,
+            packed_routing=packed_topk_ids,
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale,
+            per_token_scale=per_token_scale,
+            output1_scale_scalar=self.g1_scale_c,
+            output1_scale_gate_scalar=self.g1_alphas,
+            output2_scale_scalar=self.g2_alphas,
+            norm_weight=self._post_expert_norm_weight,
+        )
+
     def _pre_norm_weight(self, pre_expert_norm: nn.Module) -> Optional[torch.Tensor]:
         weight = pre_expert_norm._get_effective_weight()
         cached = getattr(self, "_pre_norm_weight_cache", (None, None))
@@ -330,6 +403,8 @@ class MuseSpark1xFp4Experts(nn.Module):
         out_dtype: torch.dtype,
         ar_workspace: FinalizePushWorkspace | None = None,
     ) -> torch.Tensor:
+        if self.expert_tp:
+            deferred_output = expert_tp.reduce_deferred(deferred_output)
         use_fused = (
             self._post_expert_norm is not None
             and self._post_expert_norm is post_expert_norm
@@ -636,6 +711,23 @@ class MuseSpark1xFp4Experts(nn.Module):
         if prepared_input is None:
             prepared_input = self.prepare_input(hidden_states, pre_expert_norm)
         hs_fp4, hs_scale, per_token_scale = prepared_input
+        # The MoE megakernel's 16 rows; shorter verify windows run it padded
+        # through the layer megakernels, not here.
+        if (
+            self.helion_verify_bank is not None
+            and num_tokens == 16
+            and packed_topk_ids is not None
+            and per_token_scale is not None
+            and post_expert_norm is not None
+            and ar_workspace is None
+        ):
+            return self.forward_helion_verify(
+                hs_fp4=hs_fp4,
+                hs_scale=hs_scale,
+                per_token_scale=per_token_scale,
+                packed_topk_ids=packed_topk_ids,
+                post_expert_norm=post_expert_norm,
+            )
         # Preserve Muse's packed fast path; the upstream FlashInfer API also
         # accepts materialized IDs and FP32 routing weights directly.
         routing = packed_topk_ids
