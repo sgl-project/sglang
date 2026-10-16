@@ -350,14 +350,10 @@ def _build_deepseek_v4_device_pool_group(
             c128_buffers,
             mappings.c128,
         )
-    for region in _dsv4_low_ratio_regions(kvcache, page_size):
-        add(
-            region.name,
-            PoolName.KV,
-            region.device_pool,
-            region.buffers,
-            region.layer_mapping,
-        )
+    for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
+        kvcache, page_size
+    ):
+        add(name, PoolName.KV, device_pool, buffers, layer_mapping)
 
     # fp8 two-pool unified_kv: one row index addresses both kv_buffer (fp8 nope) and
     # kv_buffer_rope (bf16 rope), but unified_region_buffers() above returns the nope
