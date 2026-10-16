@@ -69,7 +69,12 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
         )
 
     def _make_layer(self, compress_ratio):
-        parallel = SimpleNamespace(attn_tp_rank=0, attn_tp_size=1, tp_size=1)
+        parallel = SimpleNamespace(
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            tp_size=1,
+            enable_cp_decode_attn_tp=False,
+        )
         device = SimpleNamespace(device=torch.device("cpu"))
         with (
             envs.SGLANG_OPT_FUSE_WQA_WKV.override(False),
