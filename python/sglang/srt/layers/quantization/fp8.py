@@ -2642,7 +2642,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_hip_scale_padding(self, layer: Module):
         padding_size = get_moe_padding_size(_use_aiter)
-        if _use_aiter:
+        # Only aiter-shuffle when the MoE runner is aiter; the triton runner
+        # consumes un-shuffled weights (shuffling the wrong runner corrupts output).
+        runner_is_aiter = (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        )
+        if _use_aiter and runner_is_aiter:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
@@ -2658,7 +2664,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
-        elif get_bool_env_var("SGLANG_MOE_PADDING"):
+        elif get_bool_env_var("SGLANG_MOE_PADDING") and not _use_aiter:
+            # With aiter enabled the triton MoE path assumes unpadded weights.
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
