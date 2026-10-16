@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
@@ -52,7 +54,6 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
     """
 
     node_id: Optional[NodeId] = None
-    backup_kv: Optional[BackupKV] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
     mamba_backup_node_id: Optional[NodeId] = None
@@ -105,6 +106,18 @@ class BufferBackupState(msgspec.Struct, frozen=True):
     parent_last_hash: Optional[str]
 
 
+class TreePathNodeInfo(msgspec.Struct, frozen=True):
+    """A node's key span on its root-to-node path."""
+
+    node_id: NodeId
+    parent_id: NodeId
+    # Half-open offsets from the root, in tokens (bigrams for bigram trees).
+    path_start: int
+    path_end: int
+    # Logical FULL device indices; None when the value is absent.
+    full_value_len: Optional[int]
+
+
 class InsertStepResult(msgspec.Struct, frozen=True):
     """One step of a resumable insert: the Controller executes ``actions``, then
     resumes while ``result`` is None; ``result`` is set on the final step."""
@@ -140,7 +153,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.unified_cache.components import (
         CacheTransferPhase,
-        ComponentType,
     )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
@@ -272,6 +284,17 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        """Copy root-to-node paths, excluding roots, in input order.
+
+        Roots produce empty paths; missing handles raise KeyError. Callers must
+        serialize with tree mutations; native backends hold one lock per batch.
+        """
+        ...
+
+    @abstractmethod
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
@@ -400,6 +423,17 @@ class UnifiedTreeCoreInterface(ABC):
         raise NotImplementedError("This tree core does not expose per-component sizes")
 
     @abstractmethod
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
+    ) -> None:
+        """Adjust protected/evictable tokens after the component backing changes.
+
+        Roots and nodes without device values are no-ops. Missing handles raise
+        KeyError; disabled components raise ValueError.
+        """
+        ...
+
+    @abstractmethod
     def full_evictable_size(self) -> int: ...
 
     @abstractmethod
@@ -438,7 +472,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Match a key against the tree; returns device indices + boundary NodeIds."""
+        """Match a key; returns the device prefix length + boundary NodeIds."""
         ...
 
     @abstractmethod
@@ -463,7 +497,7 @@ class UnifiedTreeCoreInterface(ABC):
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
-        """A shared empty MatchResult (empty device indices + boundary NodeIds)."""
+        """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         ...
 
     @abstractmethod
@@ -522,13 +556,6 @@ class UnifiedTreeCoreInterface(ABC):
     def set_hicache_enabled(self) -> None:
         """Mark the host tier (HiCache) as wired."""
         ...
-
-    def enable_swa_write_back_eviction_barrier(self) -> None:
-        """Enable a backend-managed barrier when needed.
-
-        The Python core demotes through SWAComponent directly. Native cores
-        may return a backup action to the cache executor before eviction.
-        """
 
     @abstractmethod
     def set_host_memory_buffer_only(self) -> None:
@@ -702,7 +729,11 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
         """Return maximal missing SWA ranges within the matched [start, end) span."""
         ...
@@ -714,6 +745,7 @@ class UnifiedTreeCoreInterface(ABC):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA window to tombstoned spans, returning split actions.
 

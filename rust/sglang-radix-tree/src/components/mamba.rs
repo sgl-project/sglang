@@ -133,7 +133,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         _value_chunks: &[Tensor],
         _best_value_len: usize,
     ) -> MatchResult {
-        let mamba_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
+        let mamba_boundary_len = result.device_prefix_len + result.host_hit_length;
 
         // Full KV may extend beyond the latest reusable Mamba state. The branching
         // point is the last checkpoint-grid-aligned position within the Full-KV hit

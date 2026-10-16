@@ -80,7 +80,7 @@ pub(super) async fn forward_request(
     let decode_rank = decode
         .as_deref()
         .filter(|_| dp_aware)
-        .and_then(|decode| select_dp_rank(decode, None, &[]));
+        .and_then(|decode| select_dp_rank(decode, None, &[], ctx.config.model.dp_rank_policy));
 
     // Track worker occupancy and the prompt's contribution to active load.
     // A retry keeps the request's stale deadline rather than starting a new one.
@@ -126,7 +126,7 @@ pub(super) async fn forward_request(
         engine_rid.as_deref(),
     )?;
     let (prefill_headers, prefill_body) =
-        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank);
+        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank, None);
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -159,7 +159,8 @@ pub(super) async fn forward_request(
                 ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let (decode_headers, decode_body) = with_dp_rank(dp_aware, headers, &body, decode_rank);
+            let (decode_headers, decode_body) =
+                with_dp_rank(dp_aware, headers, &body, decode_rank, prefill_rank);
             (
                 decode,
                 decode_headers,
@@ -219,6 +220,13 @@ pub(super) async fn forward_request(
         (Some(blame), _) => vec![blame.prefill.id.clone()],
         (None, _) => vec![response_worker.id.clone()],
     };
+    // Converted first, so metrics and the access log see the client's status.
+    let result = match result {
+        Ok(response) if request.responder.is_some() => {
+            Ok(super::openai::respond(&mut request.responder, response, metrics.streaming).await)
+        }
+        result => result,
+    };
     let log_context = metrics.record_dispatch_result(&result, engine_rid, blamed_prefill.as_ref());
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {
@@ -259,19 +267,23 @@ fn prompt_dp_rank(
         .flatten()
         .find_map(|name| nonempty_header(headers, name));
     let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
-        (None, Some(provider), Some(tokens)) => provider.rank_depths(&tokens.ids, &worker.url),
+        (None, Some(provider), Some(tokens)) => {
+            provider.rank_depths(&tokens.ids, &request.cache_namespace, &worker.url)
+        }
         _ => Vec::new(),
     };
-    select_dp_rank(worker, key, &prefix_depths)
+    select_dp_rank(worker, key, &prefix_depths, model.dp_rank_policy)
 }
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
 /// the body, which `/generate` reads instead, carries it or null to unpin.
+/// Decode's body also names the pinned prefill rank, so decode need not look it up.
 fn with_dp_rank(
     dp_aware: bool,
     mut headers: HeaderMap,
     body: &Bytes,
     rank: Option<u32>,
+    prefill_rank: Option<u32>,
 ) -> (HeaderMap, Bytes) {
     if !dp_aware {
         return (headers, body.clone());
@@ -280,10 +292,11 @@ fn with_dp_rank(
         headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
     }
     let rank = rank.map_or_else(|| "null".to_owned(), |rank| rank.to_string());
-    let fields = [
+    let mut fields = vec![
         ("routed_dp_rank", rank),
         ("data_parallel_rank", "null".into()),
     ];
+    fields.extend(prefill_rank.map(|rank| ("disagg_prefill_dp_rank", rank.to_string())));
     let body = append_fields(body, &fields).unwrap_or_else(|| body.clone());
     (headers, body)
 }

@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
     support_triton,
 )
@@ -38,6 +39,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 if _is_cpu:
@@ -262,9 +264,10 @@ def _kv_shard_rotation_bases(
       allocator draws from the least-full class at that request's turn (so
       the draw sees earlier requests' pops in the same batch) and resolves
       the entry in place.
-    - ChunkCache has no tree nodes (``last_node`` is None); its chunked
-      continuations fall back to the base recorded on the request at the
-      previous chunk's alloc (no cross-request reuse, no rebind there).
+    - A radix-disabled cache keeps no nodes past the root, which carries no
+      base; its chunked continuations fall back to the base recorded on the
+      request at the previous chunk's alloc (no cross-request reuse, no
+      rebind there).
     """
     assert batch is not None and len(batch.reqs) == len(prefix_lens_cpu)
     bases = []
@@ -345,7 +348,7 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # the real allocator's page_size there. Elsewhere the two are equal --
     # including under KV sharding, which widens the index space but keeps the
     # allocator page at the physical page.
-    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
+    if (_is_hip or _is_cuda or _is_xpu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -399,6 +402,11 @@ def alloc_for_extend(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
     )
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+
+    # Admission already charged HiSparse scratch; allocate it with the request
+    # slot so subsequent scheduling sees the remaining physical capacity.
+    if batch.hisparse_coordinator is not None:
+        batch.hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
@@ -607,7 +615,7 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
 
@@ -708,6 +716,17 @@ def assign_req_to_token_pool(
         load_offset += BLOCK_SIZE
 
 
+ALLOC_FOR_DECODE_FUNCS = defaultdict(lambda: alloc_for_decode_default)
+
+
+def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    return ALLOC_FOR_DECODE_FUNCS[_device_type(batch)](batch, token_per_req)
+
+
+def _device_type(batch: ScheduleBatch) -> str:
+    return torch.device(batch.device).type
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -771,20 +790,41 @@ def alloc_for_spec_decode(
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                batch=batch,
-            )
+            allocator = tree_cache.token_to_kv_pool_allocator
+            if batch is not None and batch.hisparse_coordinator is not None:
+                # Spec decode reserves logical target slots here. Target verify
+                # later binds those slots to HiSparse's extra page; allocating
+                # target physical pages first both wastes memory and breaks the
+                # physical paged allocator's last_loc chain after the reserve is
+                # released. Draft KV has its own logical GPU-page mapping.
+                evict_from_tree_cache(
+                    tree_cache,
+                    num_needed_tokens + len(nxt_kv_lens_cpu) * allocator.page_size,
+                )
+                out_cache_loc = allocator.alloc_logical_only(
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
+                if out_cache_loc is None:
+                    raise RuntimeError(
+                        "HiSparse spec decode failed to allocate logical KV slots."
+                    )
+            else:
+                out_cache_loc = ALLOC_EXTEND_FUNCS[_device_type(batch)](
+                    tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    req_pool_indices=req_pool_indices,
+                    batch=batch,
+                )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
         assign_req_to_token_pool_func(

@@ -734,8 +734,8 @@ class Glm4MoeDecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
+        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = Glm4MoeSparseMoeBlock(
@@ -763,14 +763,8 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
         # Detect if QKV uses aiter FP8 per-token quant so we can fuse
@@ -818,10 +812,29 @@ class Glm4MoeDecoderLayer(nn.Module):
             self.self_attn.qkv_proj, "attn"
         )
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+    @classmethod
+    def stage_facts(
+        cls, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+    ):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(
+                    config, layer_id + 1, is_nextn=False
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(
+        config: PretrainedConfig, layer_id: int, is_nextn: bool
+    ) -> bool:
         return is_nextn or (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
         )
 
     def forward(
@@ -893,6 +906,7 @@ class Glm4MoeModel(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Glm4MoeDecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
@@ -1277,6 +1291,9 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    # ModelConfig rewrites a GLM draft's architecture to this class's own name,
+    # so the inherited DeepSeek name would never match what the gate compares.
+    fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
     # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
     # substr mapping would wrongly rewrite GLM's real layer-61 weights.
     # exclude_layers remapping for the MTP layer is handled explicitly in
@@ -1284,6 +1301,14 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The PTPC cast only rewrites routed experts, so the shared expert never
+        # matches the FP8 per-channel slot it would be fused into.
+        if should_apply_glm_nextn_moe_ptpc(quant_config, hf_config.num_hidden_layers):
+            return "GLM NextN PTPC does not support shared experts fusion."
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
 
     @classmethod
     def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:

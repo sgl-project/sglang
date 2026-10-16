@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.third_party import pynvml
+from sglang.srt.environ import envs as srt_envs
 
 logger = init_logger(__name__)
 
@@ -154,15 +155,21 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        try:
-            from sageattention import sageattn  # noqa: F401
-        except ImportError:
-            logger.info(
-                "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
-            )
-            return AttentionBackendEnum.FA
+        trtllm_gen = srt_envs.SGLANG_USE_SAGE_ATTENTION_IMPL.get().lower() in {
+            "trtllm_gen",
+            "trtllm-gen",
+        }
 
-        if platform.is_hopper():
+        if not trtllm_gen:
+            try:
+                from sageattention import sageattn  # noqa: F401
+            except ImportError:
+                logger.info(
+                    "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
+                )
+                return AttentionBackendEnum.FA
+
+        if not trtllm_gen and platform.is_hopper():
             try:
                 # fixed SM90 bindings retain the fake implementation under its own name
                 from sageattention.sm90_compile import (  # noqa: F401
@@ -257,12 +264,14 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video Sparse Attention backend is not installed.") from e
 
 
+# The vendored Triton tile-64 kernel is written against Hopper and Blackwell
+# block-sparse geometry; older architectures fail closed.
+VSA_H3_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
+
+
 class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
-
-    # The vendored Triton tile-64 kernel is written against Hopper and
-    # Blackwell block-sparse geometry; older architectures fail closed.
-    supported_capabilities = {(9, 0), (10, 0), (10, 3)}
+    supported_capabilities = VSA_H3_CAPABILITIES
 
     @classmethod
     def resolve(cls, platform) -> str:
@@ -591,15 +600,6 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        raise NotImplementedError
-
-    @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         if enforce_eager:
             logger.warning(
@@ -847,8 +847,8 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image
-        VAE decoder fast paths.
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
+        MiniMax-H3 VAE decoder fast paths.
 
         Requests with quality="lossless" or "high" run the fast paths; the
         "exact" default runs the original module path bit-for-bit. See
@@ -859,6 +859,12 @@ class CudaPlatformBase(Platform):
                 maybe_optimize_autoencoder_kl,
                 maybe_optimize_flux2_vae,
             )
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+                maybe_optimize_minimax_h3_vae,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.qwen_image21_vae_cuda_opt import (
+                maybe_optimize_qwen_image21_vae,
+            )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
                 maybe_optimize_qwen_image_vae,
                 maybe_optimize_wan_vae,
@@ -868,6 +874,8 @@ class CudaPlatformBase(Platform):
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
             vae = maybe_optimize_qwen_image_vae(vae)
+            vae = maybe_optimize_qwen_image21_vae(vae)
+            vae = maybe_optimize_minimax_h3_vae(vae)
         except Exception:
             logger.warning(
                 "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",

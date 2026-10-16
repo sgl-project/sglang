@@ -14,6 +14,7 @@ from typing import Any, Generator, List, Literal, Optional, Union
 
 import httpx
 from fastapi import HTTPException, UploadFile
+from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -147,6 +148,14 @@ def request_extra_value(request: Any, field_name: str) -> Any:
     return None
 
 
+def request_field_value(request: BaseModel, field_name: str) -> Any:
+    """Prefer a non-None protocol field over transport extras."""
+    value = vars(request).get(field_name)
+    if value is not None:
+        return value
+    return request_extra_value(request, field_name)
+
+
 @cache
 def get_declared_request_extra_fields(
     sampling_params_cls: type[SamplingParams],
@@ -176,6 +185,20 @@ def get_sampling_request_extra_fields(
         field.name for field in dataclasses.fields(sampling_params_cls) if field.init
     }
     return declared & init_fields
+
+
+def request_model_kwargs(
+    request: BaseModel,
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> dict[str, Any]:
+    """Extract only constructor fields declared by the active model contract."""
+    kwargs = {}
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, api):
+        value = request_extra_value(request, field_name)
+        if value is not None:
+            kwargs[field_name] = value
+    return kwargs
 
 
 @contextmanager

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -47,12 +48,13 @@ def _staged_fixture(full_match=2):
         prefetch_anchor_info=lambda node: (None, None),
         match_full_device_prefix=Mock(return_value=(full_match, 1, full_match)),
         collect_full_device_indices=Mock(return_value=torch.arange(8)),
+        swa_tombstone_ranges=Mock(
+            side_effect=lambda key, start, end, **kwargs: [(start, end)]
+        ),
         root_node_handle=lambda extra_key=None: 0,
         inc_full_pin=Mock(),
         dec_full_pin=Mock(),
-        empty_match_result=SimpleNamespace(
-            last_device_node=0, device_indices=torch.arange(0)
-        ),
+        empty_match_result=SimpleNamespace(last_device_node=0),
     )
     cache.host_memory_mode = "buffer_only"
     cache.linker = None
@@ -65,6 +67,7 @@ def _staged_fixture(full_match=2):
     cache.ongoing_prefetch = {}
     cache._prefetch_outcome_stats = defaultdict(int)
     cache.tree_components = []
+    cache.components = {}
     cache.prefetch_threshold = 2
     cache._build_sidecar_transfers = Mock(return_value=[])
     cache.supports_swa = lambda: True
@@ -88,13 +91,18 @@ def _staged_fixture(full_match=2):
         entry_map={
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(free=Mock()),
-                device_indices_from_anchor_fn=None,
             )
         },
     )
     cache.cache_controller = cc
     pipeline = BufferModePipeline.__new__(BufferModePipeline)
     pipeline._cache = cache
+    pipeline._swa_component = SimpleNamespace(
+        pool_name=PoolName.SWA,
+        component_type=ComponentType.SWA,
+        full_window_pages=2,
+    )
+    pipeline._auxiliary_swa_component = None
     pipeline.reset()
     cache.buffer_pipeline = pipeline
     pipeline.staged_prefetches[_REQ] = _StagedPrefetch(
@@ -159,6 +167,7 @@ def _terminated_query(cache, rid, hit_tokens):
         handle=handle,
         storage_hit_count=hit_tokens,
         stats_requested_tokens=8,
+        all_hash_values=None,
         is_terminated=lambda: True,
     )
     cache.ongoing_prefetch[handle] = _OngoingPrefetch(
@@ -554,6 +563,48 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
+
+    def test_unservable_anchor_declines_before_any_staging(self):
+        """A resident but unreadable device prefix must decline the fetch
+        outright: nothing is allocated or parked for a retry, and the loss is
+        counted under its own reason rather than anchor loss or host capacity."""
+        cache = _hit_drain_fixture()
+        handle = CacheRequestHandle("unservable", 0)
+        operation = SimpleNamespace(
+            request_id="unservable",
+            handle=handle,
+            storage_hit_count=6,
+            stats_requested_tokens=8,
+            is_terminated=lambda: False,
+            all_hash_values=None,
+        )
+        cache.ongoing_prefetch[handle] = _OngoingPrefetch(
+            0, RadixKey(array("q", range(8))), None, operation, None, {}
+        )
+        cache.buffer_pipeline.try_lock_anchor = Mock(return_value=("unservable", 2))
+        cache.cache_controller.prefetch_rate_limited = lambda: False
+        cache.cache_controller.prefetch_hit_queue.put(operation)
+        cache._storage_prefetch_hit_remaining_by_reqid[handle] = 6
+        cache.storage_metrics_collector = Mock()
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=1,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+        stats = cache._prefetch_outcome_stats
+        self.assertEqual(
+            (stats["declined_unservable_prefix"], stats["declined_anchor_lost"]),
+            (1, 0),
+        )
+        self.assertEqual(list(cache.buffer_pipeline.pending_hit_allocs), [])
+        cache.revoke_pending_prefetch.assert_called_once_with(handle)
+        collector = cache.storage_metrics_collector
+        collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            6, "unservable_prefix"
+        )
 
 
 if __name__ == "__main__":
