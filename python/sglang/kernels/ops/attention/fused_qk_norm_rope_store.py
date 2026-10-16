@@ -449,9 +449,11 @@ def _fp8_2buff_store(
 
 @triton.jit
 def _pack_q_fp8_2buff_kernel(
-    q_ptr,  # [T, H, HEAD_DIM] bf16, RoPE already applied to the trailing ROPE_DIM
+    q_ptr,  # [T, H, HEAD_DIM] bf16
     q_out_ptr,  # [T, H, ROW_BYTES] uint8 view of the fp8 q
     q_rope_ptr,  # [T, H, ROPE_DIM] bf16
+    freqs_ptr,  # [max_pos, ROPE_DIM] fp32, real/imag interleaved (APPLY_ROPE)
+    pos_ptr,  # [T] int (APPLY_ROPE)
     stride_qt,
     stride_qh,
     H,
@@ -460,10 +462,13 @@ def _pack_q_fp8_2buff_kernel(
     TILE: tl.constexpr,
     ROW_BYTES: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
 ):
     """One (token, head) row: nope -> fp8 with one UE8M0 scale per TILE values,
-    each scale stored twice behind the payload (the v4 nm asm reader's row), rope
-    copied as is. The scale is the K writers' cast_to_ue8m0(max(1e-4, amax) / 448)."""
+    each scale stored twice behind the payload (the v4 nm asm reader's row); the
+    rope tail copied, or GPT-J rotated by freqs at the token's position first (the
+    math of apply_rotary_emb_flat_kernel). The scale is the K writers'
+    cast_to_ue8m0(max(1e-4, amax) / 448)."""
     row = tl.program_id(0)
     t = row // H
     h = row % H
@@ -481,18 +486,34 @@ def _pack_q_fp8_2buff_kernel(
         sc = exp.to(tl.uint8)
         tl.store(dst + DIM_NOPE + tile_i * 2, sc)
         tl.store(dst + DIM_NOPE + tile_i * 2 + 1, sc)
-    roffs = tl.arange(0, ROPE_DIM)
-    r = tl.load(src + DIM_NOPE + roffs)
-    tl.store(q_rope_ptr + row.to(tl.int64) * ROPE_DIM + roffs, r)
+    rope_dst = q_rope_ptr + row.to(tl.int64) * ROPE_DIM
+    if APPLY_ROPE:
+        pair = tl.arange(0, ROPE_DIM // 2)
+        xe = tl.load(src + DIM_NOPE + pair * 2).to(tl.float32)
+        xo = tl.load(src + DIM_NOPE + pair * 2 + 1).to(tl.float32)
+        pos = tl.load(pos_ptr + t).to(tl.int64)
+        c = tl.load(freqs_ptr + pos * ROPE_DIM + pair * 2)
+        sn = tl.load(freqs_ptr + pos * ROPE_DIM + pair * 2 + 1)
+        tl.store(rope_dst + pair * 2, (xe * c + -(xo * sn)).to(tl.bfloat16))
+        tl.store(rope_dst + pair * 2 + 1, (xo * c + xe * sn).to(tl.bfloat16))
+    else:
+        roffs = tl.arange(0, ROPE_DIM)
+        tl.store(rope_dst + roffs, tl.load(src + DIM_NOPE + roffs))
 
 
 def pack_q_fp8_2buff(
-    q: torch.Tensor, q_out: torch.Tensor, q_rope_out: torch.Tensor
+    q: torch.Tensor,
+    q_out: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    freqs_cis: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Pack an already-RoPE'd bf16 ``q`` ``[T, H, 512]`` into the two-pool fp8 form
-    the v4 nm asm reader takes: ``q_out`` ``[T, H, 512]`` fp8 (448 fp8 nope + 7
-    UE8M0 tile scales written twice + pad) and ``q_rope_out`` ``[T, H, 64]`` bf16.
-    No norm: the DeepSeek-V4.1 query has none (``q_head_norm=False``)."""
+    """Pack a bf16 ``q`` ``[T, H, 512]`` into the two-pool fp8 form the v4 nm asm
+    reader takes: ``q_out`` ``[T, H, 512]`` fp8 (448 fp8 nope + 7 UE8M0 tile scales
+    written twice + pad) and ``q_rope_out`` ``[T, H, 64]`` bf16. With ``freqs_cis``
+    (complex ``[max_pos, 32]``) and ``positions`` the rope tail is rotated here,
+    else ``q`` must arrive RoPE'd. No norm: the DeepSeek-V4.1 query has none
+    (``q_head_norm=False``)."""
     T, H, D = q.shape
     rope_dim = q_rope_out.shape[-1]
     assert q.dtype == torch.bfloat16 and q.stride(-1) == 1
@@ -503,10 +524,18 @@ def pack_q_fp8_2buff(
     assert nope % 64 == 0 and nope + 2 * (nope // 64) <= q_out.shape[-1]
     if T * H == 0:
         return q_out
+    apply_rope = freqs_cis is not None
+    if apply_rope:
+        assert positions is not None and positions.shape[0] >= T
+        freqs = torch.view_as_real(freqs_cis).flatten(-2)
+        assert freqs.dtype == torch.float32 and freqs.shape[-1] == rope_dim
+        assert freqs.is_contiguous()
     _pack_q_fp8_2buff_kernel[(T * H,)](
         q,
         q_out.view(torch.uint8),
         q_rope_out,
+        freqs if apply_rope else q_rope_out,
+        positions if apply_rope else q_rope_out,
         q.stride(0),
         q.stride(1),
         H,
@@ -515,6 +544,7 @@ def pack_q_fp8_2buff(
         TILE=64,
         ROW_BYTES=q_out.shape[-1],
         FP8_MAX=448.0,
+        APPLY_ROPE=apply_rope,
         num_warps=1,
     )
     return q_out
@@ -536,16 +566,43 @@ def _fp8_2buff_store_no_q_norm(
     k_nope_out: Optional[torch.Tensor],
     k_rope_out: Optional[torch.Tensor],
     q_rope_out: torch.Tensor,
+    q_freqs_cis: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``_fp8_2buff_store`` for a query without a head norm (DeepSeek-V4.1):
-    ``q`` is the RoPE'd bf16 ``[T, H, 512]``, packed as is; K takes aiter's K-only
-    op, bit-exact with the K side of the fused Q/K one."""
+    ``q`` is the bf16 ``[T, H, 512]``, RoPE'd by the packer when ``q_freqs_cis``
+    is given, else already; K takes aiter's K-only op, bit-exact with the K side
+    of the fused Q/K one."""
     assert q.dim() == 3, f"expected the RoPE'd [T, H, D] q, got {tuple(q.shape)}"
     assert q_out.element_size() == 1 and q_rope_out is not None, (
         "the no-q-norm store only packs for the fp8 asm reader"
     )
     T = kv.shape[0]
-    kv = kv.contiguous()
+    if swa_cache is not None and k_nope_out is None and q_freqs_cis is not None:
+        # decode: the ring row and the packed query in one launch -- the paged
+        # path's fused K store (whose launch ropes its query too), with this
+        # layout's addresses and the packer's query quant
+        from sglang.kernels.ops.attention.dsv4.norm_rope import (
+            fused_qk_norm_rope_fp8_2buff,
+        )
+
+        assert swa_loc is not None and swa_loc.shape[0] == T
+        check_two_pool_pair(
+            swa_cache, swa_rope_cache, rope_width=rope_head_dim, rope_dtype=kv.dtype
+        )
+        fused_qk_norm_rope_fp8_2buff(
+            q,
+            kv,
+            kv_norm_weight,
+            rms_eps,
+            q_freqs_cis,
+            positions,
+            swa_loc.to(torch.int32),
+            swa_cache,
+            swa_rope_cache,
+            q_out,
+            q_rope_out,
+        )
+        return q_out
     if swa_cache is not None:
         assert swa_loc is not None and swa_loc.shape[0] == T
         check_two_pool_pair(
@@ -575,7 +632,7 @@ def _fp8_2buff_store_no_q_norm(
             k_rope_out,
             torch.arange(T, dtype=torch.int64, device=kv.device),
         )
-    return pack_q_fp8_2buff(q, q_out, q_rope_out)
+    return pack_q_fp8_2buff(q, q_out, q_rope_out, q_freqs_cis, positions)
 
 
 def store_k_fp8_2buff(
@@ -591,15 +648,18 @@ def store_k_fp8_2buff(
 ) -> None:
     """K RMSNorm + RoPE + fp8 pack into the two-pool rows ``rows`` (int64; < 0
     skips) of ``nope`` ``[R, 512]`` and ``rope`` ``[R, 64]``, through aiter's
-    K-only op: bit-exact with the K side of ``fused_qk_norm_rope_group_quant``."""
+    K-only op: bit-exact with the K side of ``fused_qk_norm_rope_group_quant``.
+    ``kv`` may be the strided qkv_a slice: the op takes the row stride (bench:
+    byte-identical rows, and the copy cost 2.4-3 us at T=8..16)."""
     from aiter.ops.fused_qk_norm_rope_cache_quant import (
         fused_kv_norm_rope_group_quant,
     )
 
     assert positions.dtype == torch.int64 and rows.dtype == torch.int64
     # [rows, 512] / [rows, 64] seen as aiter's [blocks, page_size=1, entry]
+    assert kv.stride(-1) == 1, f"kv rows must be dense, strides {kv.stride()}"
     fused_kv_norm_rope_group_quant(
-        kv.contiguous(),
+        kv,
         kv_norm_weight,
         positions,
         rows,
@@ -637,11 +697,13 @@ def fused_qk_norm_rope_swa_store(
     k_rope_out: Optional[torch.Tensor] = None,
     q_rope_out: Optional[torch.Tensor] = None,
     q_head_norm: bool = True,
+    q_freqs_cis: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused Q norm + KV norm + RoPE + optional SWA store.
 
-    ``q_head_norm=False`` (DeepSeek-V4.1, fp8_2buff only): ``q`` is the already
-    RoPE'd bf16 ``[M, H, head_dim]`` and is only packed, not normed.
+    ``q_head_norm=False`` (DeepSeek-V4.1, fp8_2buff only): ``q`` is the bf16
+    ``[M, H, head_dim]``, packed and not normed; RoPE'd in the packer with
+    ``q_freqs_cis``, else it must arrive RoPE'd.
 
     Args:
         q: [M, N] or [splitk, M, N] where N = num_local_heads * head_dim
@@ -683,6 +745,7 @@ def fused_qk_norm_rope_swa_store(
             k_nope_out,
             k_rope_out,
             q_rope_out,
+            q_freqs_cis,
         )
 
     if q.dim() == 3:
