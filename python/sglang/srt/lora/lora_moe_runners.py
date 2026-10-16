@@ -29,6 +29,7 @@ from typing import Callable
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
 
@@ -203,6 +204,78 @@ class LoRAHooks:
     ) = None
 
 
+_SHARED_OUTER_DECODE = envs.SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE.get()
+_SHARED_OUTER_DECODE_MAX_PAIRS = (
+    envs.SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE_MAX_PAIRS.get()
+)
+# Launch the shared-outer token shrink (it depends only on the MoE input) on a
+# side stream when the hooks are built, so it runs next to the router alignment
+# and the gate|up GEMM; the gate|up hook joins it and expands.
+_SHARED_OUTER_SHRINK_OVERLAP = envs.SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES.get()
+_SHARED_OUTER_SHRINK_KEY = "shared_outer_shrink"
+_shrink_side_streams: dict = {}
+
+
+def _start_shared_outer_shrink(hidden_states: torch.Tensor, lora_info: LoRAInfo):
+    """(partials, side stream, operands) for the token shrink launched on the
+    side stream, or None to keep the in-order path."""
+    from sglang.kernels.ops.moe.shared_outer_moe_lora import (
+        shared_outer_gate_up_shrink,
+    )
+
+    side = _shrink_side_streams.get(hidden_states.device)
+    if side is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None  # create it during warmup, not inside a capture
+        side = torch.cuda.Stream(device=hidden_states.device)
+        _shrink_side_streams[hidden_states.device] = side
+    gate_up_a = lora_info.gate_up_lora_a_weights
+    M, H = hidden_states.shape
+    # allocate on the consumer (main) stream, as the CUDA-graph allocator expects
+    s = torch.empty(
+        (M, -(-H // 256), gate_up_a.shape[2]),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    side.wait_stream(torch.cuda.current_stream(hidden_states.device))
+    with torch.cuda.stream(side):
+        shared_outer_gate_up_shrink(
+            hidden_states,
+            gate_up_a,
+            lora_info.token_lora_mapping,
+            lora_info.adapter_enabled,
+            s=s,
+        )
+    # the operands stay referenced (in the hooks' cache) until the gate|up hook
+    # joins the side stream
+    return (
+        s,
+        side,
+        (
+            hidden_states,
+            gate_up_a,
+            lora_info.token_lora_mapping,
+            lora_info.adapter_enabled,
+        ),
+    )
+
+
+def _use_shared_outer_decode_path(lora_info: LoRAInfo, topk_ids: torch.Tensor) -> bool:
+    """Decode-sized batches of a shared-outer adapter take the per-token-shrink
+    path (sglang.kernels.ops.moe.shared_outer_moe_lora) instead of the
+    per-expert fused_moe_lora."""
+    return (
+        _SHARED_OUTER_DECODE
+        and lora_info.experts_shared_outer_loras
+        and not lora_info.lora_use_virtual_experts
+        and not lora_info.fully_sharded
+        and lora_info.token_lora_mapping is not None
+        and topk_ids.numel() <= _SHARED_OUTER_DECODE_MAX_PAIRS
+        and lora_info.gate_up_lora_a_weights.shape[1] == 1
+        and lora_info.down_lora_b_weights.shape[1] == 1
+    )
+
+
 def _compute_lora_alignment(
     topk_ids: torch.Tensor,
     lora_info: LoRAInfo,
@@ -328,6 +401,34 @@ def _add_lora_gate_up_delta(
     r = lora_info.max_lora_rank
     gate_up_a = lora_info.gate_up_lora_a_weights
     gate_up_b = lora_info.gate_up_lora_b_weights
+    if sorted_token_ids_reshaped is None and _use_shared_outer_decode_path(
+        lora_info, topk_ids
+    ):
+        from sglang.kernels.ops.moe.shared_outer_moe_lora import (
+            shared_outer_gate_up_lora_add,
+        )
+
+        assert gate_up_a.shape[2] == 2 * r, (
+            "shared-outer decode path expects gated gate_up LoRA"
+        )
+        pre = (
+            routing_cache.pop(_SHARED_OUTER_SHRINK_KEY, None)
+            if routing_cache is not None
+            else None
+        )
+        if pre is not None:
+            torch.cuda.current_stream(hidden_states.device).wait_stream(pre[1])
+        shared_outer_gate_up_lora_add(
+            intermediate_cache,
+            hidden_states,
+            gate_up_a,
+            gate_up_b,
+            topk_ids,
+            lora_info.token_lora_mapping,
+            lora_info.adapter_enabled,
+            shrink=pre[0] if pre is not None else None,
+        )
+        return
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
 
@@ -434,6 +535,25 @@ def _add_lora_down_delta(
     )
     if inter_size != intermediate_input.shape[-1]:
         intermediate_input = intermediate_input[:, :inter_size]
+    if sorted_token_ids_reshaped is None and _use_shared_outer_decode_path(
+        lora_info, topk_ids
+    ):
+        from sglang.kernels.ops.moe.shared_outer_moe_lora import (
+            shared_outer_down_lora_add,
+        )
+
+        shared_outer_down_lora_add(
+            intermediate_cache,
+            intermediate_input,
+            down_lora_a,
+            down_lora_b,
+            topk_ids,
+            topk_weights,
+            lora_info.token_lora_mapping,
+            lora_info.adapter_enabled,
+            mul_routed_weight=True,
+        )
+        return
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         # fused_moe_lora requires B's expert_dim to match A's; expand the
         # shared B view.
@@ -513,6 +633,7 @@ def build_lora_hooks(
         return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)
+    shared_outer_shrink = None
     token_lora_mapping: torch.Tensor | None = None
     sorted_token_ids_reshaped: torch.Tensor | None = None
     expert_ids_reshaped: torch.Tensor | None = None
@@ -521,6 +642,15 @@ def build_lora_hooks(
 
     if lora_info.lora_use_virtual_experts:
         token_lora_mapping = lora_info.token_lora_mapping
+    elif _use_shared_outer_decode_path(lora_info, topk_ids):
+        # no per-expert alignment needed
+        token_lora_mapping = lora_info.token_lora_mapping
+        if (
+            _SHARED_OUTER_SHRINK_OVERLAP
+            and hidden_states.dim() == 2
+            and hidden_states.stride(1) == 1
+        ):
+            shared_outer_shrink = _start_shared_outer_shrink(hidden_states, lora_info)
     else:
         (
             sorted_token_ids_reshaped,
@@ -531,6 +661,8 @@ def build_lora_hooks(
 
     # Shared routing cache: gate_up and down reuse routing for same (num_experts, shared_outer, block_size)
     routing_cache: dict = {}
+    if shared_outer_shrink is not None:
+        routing_cache[_SHARED_OUTER_SHRINK_KEY] = shared_outer_shrink
 
     def after_gate_up(
         hidden_states: torch.Tensor,

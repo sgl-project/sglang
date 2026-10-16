@@ -137,6 +137,9 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
+# Fused KDA decode for 6 local heads (TP16) as well as 12 (TP8).
+_FUSED_KDA_DECODE_TP16 = envs.SGLANG_OPT_K3_FUSED_KDA_DECODE_TP16.get()
+_FUSED_KDA_DECODE_HEADS = (6, 12)
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
@@ -1942,7 +1945,8 @@ class KimiK3DeltaAttention(nn.Module):
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
         (kernels/ops/attention/kda_fused_decode): per-segment transposed fp32 conv
-        weights [4, seg], dense fp32 conv bias, fp32 output-norm weight. Stashed on the
+        weights [4, seg], dense fp32 conv bias, fp32 output-norm weight and eps,
+        and the rounding mode. Stashed on the
         attention layer for the KDA backend; when the shapes do not match
         the compiled kernel the stash stays unset and decode keeps the
         unfused chain. Called once from load_weights (after all weights are
@@ -1998,14 +2002,24 @@ class KimiK3DeltaAttention(nn.Module):
         w = layer.conv_weights
         if _is_npu:
             return
-        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        # The kernel is compiled for H = HV = 12 heads of 128 (TP8) and, with
+        # SGLANG_OPT_K3_FUSED_KDA_DECODE_TP16=1, also 6 (TP16); the local head count
+        # comes from A_log ([1, 1, H, 1]).
+        heads = 12
+        if (
+            _FUSED_KDA_DECODE_TP16
+            and layer.A_log is not None
+            and layer.A_log.numel() in _FUSED_KDA_DECODE_HEADS
+        ):
+            heads = layer.A_log.numel()
+        seg = heads * 128
         if (
             w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or layer.A_log.numel() != heads
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
@@ -2032,9 +2046,12 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [heads]
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
+            # 6 heads keep the unfused chain's bf16 rounding points, so enabling
+            # the fused path there changes only the fp32 evaluation order
+            heads != 12,
         )
         self._kda_fused_decode_ready = True
 

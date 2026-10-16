@@ -46,6 +46,8 @@ from sglang.srt.utils import is_pin_memory_available
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# Install packed 3D MoE LoRA factors with one copy per module instead of one per expert.
+_LORA_FAST_STREAMED_LOAD = envs.SGLANG_OPT_LORA_FAST_STREAMED_LOAD.get()
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +467,31 @@ class LoRAMemoryPool:
         raise TypeError(
             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
         )
+
+    def _local_expert_weights_packed(
+        self, weights, module_name: str
+    ) -> Optional[Tuple[int, torch.Tensor]]:
+        """``(count, local experts)`` of a packed 3D factor, the experts
+        ``_iter_local_expert_weights`` yields; None keeps the per-expert path."""
+        if not (
+            _LORA_FAST_STREAMED_LOAD
+            and isinstance(weights, torch.Tensor)
+            and weights.dim() == 3
+        ):
+            return None
+        on_cpu = weights.device.type == "cpu"
+        if on_cpu and self.pin_memory_available and self.enable_lora_overlap_loading:
+            return None
+        total = weights.shape[0]
+        if self.moe_use_local_expert_ids and not self.is_shared_moe_module(module_name):
+            start = self.moe_ep_rank * self._num_experts_local
+            count = max(0, min(self._num_experts_local, total - start))
+        else:
+            start, count = 0, total
+        w = weights[start : start + count]
+        if on_cpu and self.pin_memory_available and not w.is_pinned():
+            w = w.pin_memory()
+        return count, w
 
     def _get_standard_shape(
         self,
@@ -1474,6 +1501,21 @@ class LoRAMemoryPool:
                         # is correct.
                         load_lora_weight_tensor(target_buffer[buffer_id], None)
                         assert isinstance(weights_cache_key, (str, dict))
+                        packed = self._local_expert_weights_packed(weights, name)
+                        if packed is not None:
+                            # all local experts in one copy per stacked component
+                            count, w = packed
+                            for ci in range(c):
+                                load_lora_weight_tensor(
+                                    target_buffer[
+                                        buffer_id,
+                                        :count,
+                                        ci * max_r : ci * max_r + lora_rank,
+                                        :,
+                                    ],
+                                    w[:, ci * lora_rank : (ci + 1) * lora_rank, :],
+                                )
+                            continue
                         for (
                             local_eid,
                             expert_weight,
@@ -1593,6 +1635,17 @@ class LoRAMemoryPool:
                         # then scale+load the ones it does.
                         load_lora_weight_tensor(target_buffer[buffer_id], None)
                         assert isinstance(weights_cache_key, (str, dict))
+                        packed = self._local_expert_weights_packed(weights, name)
+                        if packed is not None:
+                            # all local experts scaled (same elementwise scale)
+                            # and copied at once
+                            count, w = packed
+                            if not validate_only:
+                                w = w * lora_adapter.scaling
+                            load_lora_weight_tensor(
+                                target_buffer[buffer_id, :count, :, :lora_rank], w
+                            )
+                            continue
                         for (
                             local_eid,
                             w,

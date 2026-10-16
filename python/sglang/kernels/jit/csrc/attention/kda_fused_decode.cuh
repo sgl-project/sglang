@@ -153,6 +153,19 @@ SGL_DEVICE __nv_bfloat16 bf16_store(float value) {
   return __float2bfloat16(value);
 }
 
+// With kRoundLikeUnfused the fused step rounds to bf16 exactly where the unfused chain
+// (causal_conv1d_update -> fused_sigmoid_gating_delta_rule_update -> rms_norm_gated) materializes bf16 tensors:
+// the SiLU'd conv outputs q/k/v and the recurrence output o before the gated RMSNorm. The remaining differences
+// are fp32 evaluation order / approximate transcendental differences only.
+template <bool kRound>
+SGL_DEVICE float round_like_unfused(float value) {
+  if constexpr (kRound) {
+    return __bfloat162float(__float2bfloat16(value));
+  } else {
+    return value;
+  }
+}
+
 template <bool kUseCacheGlobalStore>
 SGL_DEVICE void store_state_float4(float* ptr, float4 value) {
   if constexpr (kUseCacheGlobalStore) {
@@ -386,7 +399,8 @@ template <
     bool kApplyBetaSigmoid = true,
     bool kUseTmaLoad = false,
     int kTmaStages = kNumChunks,
-    bool kUsePDL = false>
+    bool kUsePDL = false,
+    bool kRoundLikeUnfused = false>
 // Shapes below use K3's per-TP-rank sizing (linear_attn_config: num_heads=96 over
 // TP={8,16,32} -> H=HV={12,6,3} local heads; head_dim=128 -> kDimK=kDimV=128; kSeg = H*128;
 // short_conv_kernel_size=4 -> kKernelWidth=4, kConvStateWidth=3). B is the live
@@ -561,8 +575,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_k[cs_base + cs_w_stride] = k_shift1;
       cs_k[cs_base + 2 * cs_w_stride] = k_new;
 
-      s_q[k] = device::math::silu_fast(q_acc);
-      s_k[k] = device::math::silu_fast(k_acc);
+      s_q[k] = round_like_unfused<kRoundLikeUnfused>(device::math::silu_fast(q_acc));
+      s_k[k] = round_like_unfused<kRoundLikeUnfused>(device::math::silu_fast(k_acc));
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
@@ -588,8 +602,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       q_acc += bf16_load(x_q, bos * x_row_stride + hk) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
       k_acc += bf16_load(x_k, bos * x_row_stride + hk) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
-      s_q[k] = device::math::silu_fast(q_acc);
-      s_k[k] = device::math::silu_fast(k_acc);
+      s_q[k] = round_like_unfused<kRoundLikeUnfused>(device::math::silu_fast(q_acc));
+      s_k[k] = round_like_unfused<kRoundLikeUnfused>(device::math::silu_fast(k_acc));
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
@@ -625,7 +639,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_v[cs_base + 0] = v_shift0;
       cs_v[cs_base + cs_w_stride] = v_shift1;
       cs_v[cs_base + 2 * cs_w_stride] = v_new;
-      s_v[v] = device::math::silu_fast(v_acc);
+      s_v[v] = round_like_unfused<kRoundLikeUnfused>(device::math::silu_fast(v_acc));
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
@@ -645,7 +659,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         v_acc += bf16_load(cs_v, cs_idx) * fp32_at(w_v_t, w * hvv_dim + hvv);
       }
       v_acc += bf16_load(x_v, bos * x_row_stride + hvv) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
-      s_v[v] = device::math::silu_fast(v_acc);
+      s_v[v] = round_like_unfused<kRoundLikeUnfused>(device::math::silu_fast(v_acc));
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
@@ -778,10 +792,12 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
       const Sum2 dot_hq = warp_reduce_sum_pair(dot_hq_a, dot_hq_b);
       if (lane == 0) {
-        s_o[v0] = dot_hq.x;
-        s_o[v1] = dot_hq.y;
+        const float o0 = round_like_unfused<kRoundLikeUnfused>(dot_hq.x);
+        const float o1 = round_like_unfused<kRoundLikeUnfused>(dot_hq.y);
+        s_o[v0] = o0;
+        s_o[v1] = o1;
         if constexpr (kApplyOnorm && kAccumulateOnormSumsq) {
-          o_sumsq += dot_hq.x * dot_hq.x + dot_hq.y * dot_hq.y;
+          o_sumsq += o0 * o0 + o1 * o1;
         }
       }
     }
@@ -887,7 +903,13 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 // and lower-bounded sigmoid) and selected at launch from the model config.
 // kUseTmaLoad/kTmaStages select the 1D-TMA state-staging path in place of the
 // cp.async fallback used for a misaligned recurrent-state slot stride.
-template <int kFixedHeads, bool kUseLowerBound, bool kUsePDL, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
+template <
+    int kFixedHeads,
+    bool kUseLowerBound,
+    bool kUsePDL,
+    bool kUseTmaLoad = false,
+    int kTmaStages = kNumChunks,
+    bool kRoundLikeUnfused = false>
 constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyOnorm=*/true,
     /*kUseStaticDecodeLayout=*/true,
@@ -907,20 +929,29 @@ constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyBetaSigmoid=*/true,
     kUseTmaLoad,
     kTmaStages,
-    kUsePDL>;
+    kUsePDL,
+    kRoundLikeUnfused>;
 
-template <int kFixedHeads, bool kUsePDL>
-auto select_kda_fused_decode_k3_kernel(bool use_lower_bound, int tma_stages) {
+template <int kFixedHeads, bool kUsePDL, bool kRoundLikeUnfused = false>
+auto select_kda_fused_decode_k3_kernel_rounding(bool use_lower_bound, int tma_stages) {
   if (tma_stages == 3) {
-    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 3>
-                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 3>;
+    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 3, kRoundLikeUnfused>
+                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 3, kRoundLikeUnfused>;
   }
   if (tma_stages == 4) {
-    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 4>
-                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 4>;
+    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 4, kRoundLikeUnfused>
+                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 4, kRoundLikeUnfused>;
   }
-  return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL>
-                         : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL>;
+  return use_lower_bound
+             ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, false, kNumChunks, kRoundLikeUnfused>
+             : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, false, kNumChunks, kRoundLikeUnfused>;
+}
+
+template <int kFixedHeads, bool kUsePDL>
+auto select_kda_fused_decode_k3_kernel(bool use_lower_bound, int tma_stages, bool round_like_unfused) {
+  return round_like_unfused
+             ? select_kda_fused_decode_k3_kernel_rounding<kFixedHeads, kUsePDL, true>(use_lower_bound, tma_stages)
+             : select_kda_fused_decode_k3_kernel_rounding<kFixedHeads, kUsePDL, false>(use_lower_bound, tma_stages);
 }
 
 template <bool kUsePDL>
@@ -944,7 +975,8 @@ struct KdaFusedDecodeKernel {
       double scale,
       double onorm_eps,
       double lower_bound,
-      bool use_lower_bound) {
+      bool use_lower_bound,
+      bool round_like_unfused) {
     using namespace host;
 
     const int64_t kH = A_log.shape()[0];
@@ -1012,9 +1044,12 @@ struct KdaFusedDecodeKernel {
       // fastest.
       tma_stages = B * static_cast<int>(kH) >= 512 ? 3 : 4;
     }
-    auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
-                          : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages)
-                                     : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages));
+    auto kernel =
+        kH == 3
+            ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages, round_like_unfused)
+            : (kH == 6
+                   ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages, round_like_unfused)
+                   : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages, round_like_unfused));
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
     host::RuntimeDeviceCheck(

@@ -127,6 +127,7 @@ def kda_fused_decode(
     scale: float,
     onorm_eps: float,
     lower_bound: Optional[float] = None,
+    round_like_unfused: bool = False,
 ) -> torch.Tensor:
     """In-place fused decode step: shifts `conv_states` and updates
     `ssm_states` rows selected by `cache_indices` (rows < 0 are padded
@@ -162,5 +163,7 @@ def kda_fused_decode(
         float(onorm_eps),
         float(lower_bound) if lower_bound is not None else 0.0,
         lower_bound is not None,
+        # round q/k/v and o to bf16 where the unfused chain does
+        bool(round_like_unfused),
     )
     return out.view(1, B, H, 128)

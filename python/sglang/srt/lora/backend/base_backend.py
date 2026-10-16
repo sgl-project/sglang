@@ -164,6 +164,17 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
+    def run_lora_ab_fused(
+        self,
+        x: torch.Tensor,
+        weights_a: torch.Tensor,
+        weights_b: torch.Tensor,
+        base_output: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Single-slice LoRA (shrink, then expand added to ``base_output``) in
+        one launch, or None to run run_lora_a_sgemm and run_lora_b_sgemm."""
+        return None
+
     def run_qkv_lora(
         self,
         x: torch.Tensor,

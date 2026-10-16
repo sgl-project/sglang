@@ -487,7 +487,12 @@ def can_use_custom_all_reduce_v2(
     if dist.get_world_size(group=group) not in supported:
         return False
     if not all(in_the_same_node_as(group, source_rank=0)):
-        return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
+        # Multi-node groups pull eagerly inside graphs and never register graph
+        # inputs, so a non-VMM caching allocator is safe to admit on request.
+        return is_one_nvlink_clique(group, device) and (
+            envs.SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_ALLOW_NON_VMM.get()
+            or _is_vmm_backed_allocator(device)
+        )
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,

@@ -29,6 +29,11 @@ from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# Batched slicing of packed per-expert MoE LoRA factors, and pass-through of
+# factors the streamed-adapter stash already cut to this rank's TP shard.
+_LORA_FAST_STREAMED_LOAD = envs.SGLANG_OPT_LORA_FAST_STREAMED_LOAD.get()
+# Decode LoRA launch reduction (fused shrink+expand, LoRA-A side-stream overlap).
+_LORA_DECODE_FUSED_LAUNCHES = envs.SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES.get()
 
 
 def unwrap_lora_layer(module: nn.Module) -> nn.Module:
@@ -799,6 +804,44 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return B[shard * shard_size : (shard + 1) * shard_size, :]
 
 
+# At decode sizes the one-shot custom all-reduce sums each element over the ranks
+# in a fixed order whatever the buffer length, so one all-reduce over [base | lora_a]
+# gives the same bits as the two a reducing row-parallel LoRA layer issues.
+_ROW_PARALLEL_FUSED_ALL_REDUCE = (
+    envs.SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE.get()
+)
+_ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS = (
+    envs.SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS.get()
+)
+
+
+def _fuse_row_lora_all_reduce(
+    output_parallel: torch.Tensor, lora_a_output: torch.Tensor
+) -> bool:
+    return (
+        _ROW_PARALLEL_FUSED_ALL_REDUCE
+        and output_parallel.dim() == 2
+        and lora_a_output.dim() == 2
+        and output_parallel.dtype == lora_a_output.dtype
+        and output_parallel.shape[0] == lora_a_output.shape[0]
+        and 0 < output_parallel.shape[0] <= _ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS
+    )
+
+
+def _fused_row_lora_all_reduce(
+    all_reduce, output_parallel: torch.Tensor, lora_a_output: torch.Tensor
+):
+    m, n = output_parallel.shape
+    r = lora_a_output.shape[1]
+    flat = torch.empty(
+        m * (n + r), dtype=output_parallel.dtype, device=output_parallel.device
+    )
+    flat[: m * n].view(m, n).copy_(output_parallel)
+    flat[m * n :].view(m, r).copy_(lora_a_output)
+    reduced = all_reduce(flat)
+    return reduced[: m * n].view(m, n), reduced[m * n :].view(m, r)
+
+
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
@@ -826,6 +869,11 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        lora_output = self.lora_backend.run_lora_ab_fused(
+            x, self.A_buffer, self.B_buffer, base_output
+        )
+        if lora_output is not None:
+            return lora_output
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
@@ -884,8 +932,13 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
                 input_parallel, self.A_buffer
             )
-            output_ = all_reduce(output_parallel)
-            lora_a_output = all_reduce(lora_a_output)
+            if _fuse_row_lora_all_reduce(output_parallel, lora_a_output):
+                output_, lora_a_output = _fused_row_lora_all_reduce(
+                    all_reduce, output_parallel, lora_a_output
+                )
+            else:
+                output_ = all_reduce(output_parallel)
+                lora_a_output = all_reduce(lora_a_output)
             output_ = self.lora_backend.run_lora_b_sgemm(
                 x=lora_a_output,
                 weights=self.B_buffer,
@@ -991,10 +1044,19 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
+    def start_lora_a_overlap(self, x: torch.Tensor) -> None:
+        if self.lora_backend.supports_lora_a_overlap:
+            self.lora_backend.start_lora_a_overlap(
+                x, self.A_buffer, num_slices=1 if self.first_output_dim == 0 else 2
+            )
+
     def forward(self, x: torch.Tensor):
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        lora_active = self.lora_active
+        if lora_active and _LORA_DECODE_FUSED_LAUNCHES:
+            self.start_lora_a_overlap(x)
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-        if self.lora_active:
+        if lora_active:
             output = self.apply_lora(output, x)
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
@@ -1314,6 +1376,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self, A: torch.Tensor, tp_rank: int, target_module: str
     ) -> torch.Tensor:
         shard_size = self.intermediate_size_per_partition
+        if _LORA_FAST_STREAMED_LOAD and A.shape[-1] == shard_size:
+            # already this rank's shard (cut when the streamed adapter was stashed)
+            return A.contiguous()
         start = tp_rank * shard_size
         end = start + shard_size
         return A[..., start:end].contiguous()
@@ -1348,6 +1413,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 for eid, w in B.items()
             }
         if isinstance(B, torch.Tensor) and B.dim() == 3:
+            if _LORA_FAST_STREAMED_LOAD:
+                return self._slice_moe_b_3d(B, tp_rank)
             return torch.stack(
                 [
                     self._slice_moe_b_2d(B[i], tp_rank, target_module)
@@ -1355,6 +1422,28 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 ]
             )
         return self._slice_moe_b_2d(B, tp_rank, target_module)
+
+    def _slice_moe_b_3d(self, B: torch.Tensor, tp_rank: int) -> torch.Tensor:
+        """``_slice_moe_b_2d`` of every expert of a gate_up_proj_moe B
+        ``[E, out, rank]`` as one batched copy instead of E per-expert copies."""
+        shard_size = self.intermediate_size_per_partition
+        start = tp_rank * shard_size
+        end = start + shard_size
+        if not self.base_layer.moe_runner_config.is_gated:
+            if self.tp_size <= 1 or B.shape[1] == shard_size:
+                return B.contiguous()
+            return B[:, start:end, :].contiguous()
+        full_inter = B.shape[1] // 2
+        if full_inter == shard_size:
+            # already this rank's [gate | up] shard
+            start, end = 0, shard_size
+        gate_b = B[:, start:end, :]
+        up_b = B[:, full_inter + start : full_inter + end, :]
+        if self._uses_interleaved_gate_up:
+            return torch.stack([gate_b, up_b], dim=2).reshape(
+                B.shape[0], -1, B.shape[-1]
+            )
+        return torch.cat([gate_b, up_b], dim=1).contiguous()
 
     def _slice_moe_b_2d(
         self, B: torch.Tensor, tp_rank: int, target_module: str
@@ -1364,7 +1453,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             # B has shape [intermediate_size, rank] — TP-shard directly.
             is_gated = self.base_layer.moe_runner_config.is_gated
             if not is_gated:
-                if self.tp_size > 1:
+                if self.tp_size > 1 and not (
+                    _LORA_FAST_STREAMED_LOAD
+                    and B.shape[0] == self.intermediate_size_per_partition
+                ):
                     shard_size = self.intermediate_size_per_partition
                     start = tp_rank * shard_size
                     end = start + shard_size
@@ -1375,6 +1467,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             start = tp_rank * shard_size
             end = start + shard_size
             full_inter = B.shape[0] // 2
+            if _LORA_FAST_STREAMED_LOAD and full_inter == shard_size:
+                # already this rank's [gate | up] shard
+                start, end = 0, shard_size
             gate_b = B[start:end, :]
             up_b = B[full_inter + start : full_inter + end, :]
             if self._uses_interleaved_gate_up:

@@ -1351,6 +1351,9 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # Let CustomAllReduceV2 span the nodes of one NVLink clique even when the
+    # caching allocator is not VMM-backed (e.g. under torch_memory_saver).
+    SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_ALLOW_NON_VMM = EnvBool(False)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
@@ -1761,6 +1764,34 @@ class Envs:
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
+    # LoRA serving
+    # ===================================================================
+    # Streamed adapter updates: stash only this rank's TP shard of packed
+    # per-expert MoE LoRA factors and install them with one copy per module
+    # instead of one per expert. Not compatible with streamed-LoRA checksums.
+    SGLANG_OPT_LORA_FAST_STREAMED_LOAD = EnvBool(False)
+    # Decode MoE-LoRA for adapters whose experts share the outer factors (one
+    # gate/up LoRA A, one down LoRA B): shrink the shared side once per token
+    # instead of once per (token, expert) block. Applies up to MAX_PAIRS
+    # (token, expert) pairs; larger batches keep the per-expert path.
+    SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE = EnvBool(False)
+    SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE_MAX_PAIRS = EnvInt(512)
+    # Fewer decode LoRA launches (triton backend): split-K LoRA-A for large K,
+    # fused shrink+expand kernels, LoRA-A on a side stream next to the base GEMM,
+    # and for SGLANG_OPT_LORA_SHARED_OUTER_MOE_DECODE a fused down shrink+expand
+    # and the token shrink on a side stream next to the MoE gate|up GEMM.
+    SGLANG_OPT_LORA_DECODE_FUSED_LAUNCHES = EnvBool(False)
+    # Row-parallel LoRA layers that reduce their output: one all-reduce over
+    # [base | lora_a] instead of two for at most MAX_TOKENS tokens (decode), where
+    # the one-shot custom all-reduce gives the same bits.
+    SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE = EnvBool(False)
+    SGLANG_OPT_LORA_ROW_PARALLEL_FUSED_ALL_REDUCE_MAX_TOKENS = EnvInt(16)
+    # Marlin MoE LoRA runner: run the decode GEMMs (moe_block_size 8) of MXFP4
+    # weights through a dedicated decode kernel instead of the Marlin launcher,
+    # and skip Marlin's zero padding of the intermediate dimension once checked.
+    SGLANG_OPT_MXFP4_MOE_DECODE_GEMM = EnvBool(False)
+
+    # ===================================================================
     # Kimi K3
     # ===================================================================
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
@@ -1785,6 +1816,9 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Fused KDA decode for 6 local heads (TP16 of the 96-head layers) as well as
+    # 12 (TP8), keeping the unfused chain's bf16 rounding points at 6 heads.
+    SGLANG_OPT_K3_FUSED_KDA_DECODE_TP16 = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
