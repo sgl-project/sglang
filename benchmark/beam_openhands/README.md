@@ -1,7 +1,5 @@
 # Beam NVFP4: OpenHands replay on four GB300 GPUs
 
-A Beam version of
-[`benchmark/muse_spark_openhands`](https://github.com/sgl-project/sglang/tree/bench-openhands-b300-sweep/benchmark/muse_spark_openhands).
 The reproduction lives on the public
 [`bench-openhands-gb300-sweep-beam` branch](https://github.com/sgl-project/sglang/tree/bench-openhands-gb300-sweep-beam/benchmark/beam_openhands),
 in **`benchmark/beam_openhands`**. It reproduces the Beam TP4 curve with concurrency
@@ -9,7 +7,7 @@ in **`benchmark/beam_openhands`**. It reproduces the Beam TP4 curve with concurr
 
 This is a performance replay with **simulated acceptance length 4** and real
 DFlash2 proposals. It does not measure model accuracy or natural acceptance.
-It uses four **GB300** GPUs, unlike the Muse eight-B300 results.
+It uses four **GB300** GPUs.
 
 ## 1. Serving runtime and checkpoints
 
@@ -162,7 +160,7 @@ cross-node network configuration is required by this recipe.
   warm-up requests.
 - Streaming requests use `temperature=0`, `ignore_eos=true`, and
   `chat_template_kwargs={"allow_missing_thinking":true}` throughout. These match
-  the recorded Beam run, not the Muse checkpoint's sampling defaults.
+  the recorded Beam run.
 - Beam's adapter normalizes declared special tokens and seven Harmony controls
   in replayed assistant text and retains server usage. EvalScope's timed streaming
   loop is unchanged. All thirteen turns and 220-token output lengths are audited.

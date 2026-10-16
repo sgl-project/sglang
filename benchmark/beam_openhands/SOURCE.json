@@ -1,11 +1,4 @@
 {
-  "reference": {
-    "repository": "sgl-project/sglang",
-    "branch": "bench-openhands-b300-sweep",
-    "commit": "35b99238c23f873a61bbeed69e9a277cfa5a533d",
-    "path": "benchmark/muse_spark_openhands",
-    "url": "https://github.com/sgl-project/sglang/tree/bench-openhands-b300-sweep/benchmark/muse_spark_openhands"
-  },
   "beam_implementation": {
     "repository": "sgl-project/sglang",
     "branch": "bench-openhands-gb300-sweep-beam",
@@ -22,13 +15,12 @@
     "nebius/SWE-rebench-openhands-trajectories": "35455389ab51bf5e2306bfd436ef72d0f98bf882",
     "nvidia/OpenScienceReasoning-2": "174b02c9cdf231f220765b2a1d5ece4550921894"
   },
-  "beam_differences": [
+  "beam_recipe": [
     "4 GB300 GPUs; TP4/EP1 or TP4/EP4; one tokenizer worker and HTTP/1.1",
     "Draft8 with simulated acceptance4 and real draft tokens",
     "Native KV dtype; context1048576; HiCache88 at cc>=16",
     "Fixed temperature0 and allow_missing_thinking=true",
     "Beam Harmony history normalization and per-request usage validation",
     "Pinned dataset revisions, independent resource guards, fresh server per point"
-  ],
-  "reference_code_origin": "The dataset builder and client dependency freeze originated in the Muse benchmark; the Beam replay adapter, validation and guarded driver were adapted for Beam. No Muse serving patches or connection-balancing retries are applied."
+  ]
 }

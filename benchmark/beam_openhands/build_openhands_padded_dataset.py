@@ -1,15 +1,14 @@
 """Build the padded OpenHands multi-turn dataset consumed by evalscope's ``swe_smith`` perf plugin
 (``--dataset swe_smith --dataset-path <output>``).
 
-Public workload reference: sgl-project/sglang@35b99238c23f benchmark/muse_spark_openhands/build_openhands_padded_dataset.py
-(blob 7dec8aa0). The workload is the reference one. Every conversation has 13 turns:
+Every conversation has 13 turns:
 
 * turn 1 is a synthetic system prompt plus the trajectory's first user message, 74160 bare tokens together. The
   system prompt is a span of nvidia/OpenScienceReasoning-2 text that no other conversation uses, so no two
   conversations share a prefix;
 * each later turn is the next user message, padded or truncated to 753 bare tokens.
 
-Differences from the reference builder:
+Dataset guarantees:
 
 * Both public datasets are read at pinned revisions, straight from their parquet files, and each conversation
   records its source row.
@@ -46,9 +45,8 @@ with open(os.path.abspath(__file__), "rb") as _f:
     BUILDER_SHA256 = hashlib.sha256(_f.read()).hexdigest()
 REFERENCE = {
     "repository": "sgl-project/sglang",
-    "commit": "35b99238c23f873a61bbeed69e9a277cfa5a533d",
-    "path": "benchmark/muse_spark_openhands/build_openhands_padded_dataset.py",
-    "blob": "7dec8aa0c9ba732b70e99d9be0767b8f1ecef0e0",
+    "branch": "bench-openhands-gb300-sweep-beam",
+    "path": "benchmark/beam_openhands/build_openhands_padded_dataset.py",
 }
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
 # Dataset name -> parquet files read; filled by _pinned_parquet_rows.
@@ -57,7 +55,7 @@ SOURCE_FILES: Dict[str, List[str]] = {}
 MAX_FIT_ROUNDS = 12
 
 _PAD_ALPHABET = np.array(list(string.ascii_letters + string.digits + " .,;:?!\n"))
-# R1 markup and chat-control spellings in any tokenizer's convention (the reference's two patterns).
+# R1 markup and chat-control spellings in any tokenizer's convention.
 _R1_THINK_RE = re.compile(r"</?\s*think\s*>", re.IGNORECASE)
 _R1_CTRL_RE = re.compile(r"<\|[^>\n]{0,64}?\|>|<｜[^｜\n]{0,64}?｜>")
 
@@ -137,7 +135,7 @@ def _flatten_content(content) -> str:
 
 
 def _extract_messages(trajectory: List[Dict]) -> List[Dict[str, str]]:
-    """OpenHands trajectory -> [{role, content}], tool results as user messages, as in the reference."""
+    """OpenHands trajectory -> [{role, content}], tool results as user messages."""
     out: List[Dict[str, str]] = []
     for msg in trajectory:
         role = msg.get("role", "")
@@ -153,7 +151,7 @@ def _extract_messages(trajectory: List[Dict]) -> List[Dict[str, str]]:
 
 
 def make_sanitizer(tokenizer):
-    """A function that blanks every added-vocab spelling plus the reference's R1/control patterns."""
+    """A function that blanks every added-vocab spelling plus R1/control patterns."""
     spellings = sorted(
         {t for t in tokenizer.get_added_vocab() if t.strip()}
         | set(tokenizer.all_special_tokens),
@@ -238,7 +236,7 @@ def _pinned_parquet_rows(name, split, revision, columns):
 class SciencePadPool:
     """A contiguous, control-token-free id stream from an R1 corpus, vended in disjoint spans.
 
-    As in the reference, each pad slot takes the next unread span, so no two slots (and no two conversations) share
+    Each pad slot takes the next unread span, so no two slots (and no two conversations) share
     pad text. Spans are cut by token count and refitted by the caller, so the pool needs a small margin.
     """
 
@@ -312,7 +310,7 @@ class SciencePadPool:
 
 
 def _random_ids(n_tokens: int, rng: np.random.RandomState, codec: Codec) -> np.ndarray:
-    """Ids of random ASCII text long enough for n_tokens; the reference's fallback padder."""
+    """Ids of random ASCII text long enough for n_tokens; the fallback padder."""
     idx = rng.randint(0, len(_PAD_ALPHABET), size=int(n_tokens * 1.7) + 64)
     return np.asarray(
         codec.encode("".join(_PAD_ALPHABET[idx].tolist())), dtype=np.int64
