@@ -3,7 +3,7 @@ export const config = (() => {
     "black-forest-labs/" + (s.version === "flux2-dev" || s.hw === "arc_b" ? "FLUX.2-dev" : "FLUX.1-dev");
   const plan = (s) => {
     const flags = ["--model-path " + modelOf(s)];
-    let gpus = 1;
+    let gpus = s.hw === "xeon" ? 0 : 1;
     let tp = 1;
     if (s.hw === "a3" || (s.hw === "a2" && s.version === "flux2-dev")) {
       gpus = 2;
@@ -34,11 +34,12 @@ export const config = (() => {
   };
   const config = {
     modelName: "FLUX",
-    supportedHardware: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3", "arc_b"],
+    supportedHardware: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3", "arc_b", "xeon"],
     hardware: [
       { id: "a2", label: "Ascend A2", vram: "", vendor: "npu" },
       { id: "a3", label: "Ascend A3", vram: "2 NPUs / card", vendor: "npu" },
       { id: "arc_b", label: "Intel BMG", vram: "", vendor: "intel" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
     ],
     groupHardware: false,
     matchDims: [],
@@ -57,8 +58,11 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 8 } },
-        verifiedRecipes: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3", "arc_b"].map(
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 8, disabledWhen: (s) => s.hw === "xeon" },
+        },
+        verifiedRecipes: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "a2", "a3", "arc_b", "xeon"].map(
           (hw) => {
             const s = { ...defaults, hw };
             const p = plan(s);
@@ -79,7 +83,7 @@ export const config = (() => {
           if (!config.supportedHardware.includes(s.hw)) errors.push("Choose a listed hardware platform.");
           if (Number(s.nodes) !== 1) errors.push("This recipe covers one node.");
           const count = Number(s.gpus_per_node);
-          if (!Number.isInteger(count) || count < 1 || count > 8)
+          if (s.hw !== "xeon" && (!Number.isInteger(count) || count < 1 || count > 8))
             errors.push("Choose an integer GPU count within the documented limits.");
           if (Number(s.gpus_per_node) !== p.gpus) errors.push("This recipe requires " + p.gpus + " GPUs / node.");
           if (["tp_size", "ulysses_degree", "ring_degree"].some((key) => Number(t[key]) !== p.topology[key]))

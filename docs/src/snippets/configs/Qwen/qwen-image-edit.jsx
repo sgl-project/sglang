@@ -1,9 +1,10 @@
 export const config = (() => {
   const modelOf = () => "Qwen/Qwen-Image-Edit-2511";
   const plan = (s) => ({
-    flags: ["--model-path " + modelOf(s), "--ulysses-degree=1", "--ring-degree=1"],
-    gpus: 1,
+    flags: ["--model-path " + modelOf(s), ...(s.hw === "xeon" ? [] : ["--ulysses-degree=1", "--ring-degree=1"])],
+    gpus: s.hw === "xeon" ? 0 : 1,
     topology: { tp_size: 1, ulysses_degree: 1, ring_degree: 1 },
+    env: s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [],
   });
   const defaults = {
     hw: "b200",
@@ -16,16 +17,19 @@ export const config = (() => {
   };
   const config = {
     modelName: "Qwen-Image-Edit",
-    supportedHardware: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x"],
-    hardware: [],
+    supportedHardware: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "xeon"],
+    hardware: [{ id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" }],
     groupHardware: false,
     matchDims: [],
     overlayDims: [],
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 1 } },
-        verifiedRecipes: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x"].map((hw) => {
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 1, disabledWhen: (s) => s.hw === "xeon" },
+        },
+        verifiedRecipes: ["b200", "b300", "h200", "h100", "mi300x", "mi325x", "mi355x", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {
@@ -44,7 +48,7 @@ export const config = (() => {
           if (!config.supportedHardware.includes(s.hw)) errors.push("Choose a listed hardware platform.");
           if (Number(s.nodes) !== 1) errors.push("This recipe covers one node.");
           const count = Number(s.gpus_per_node);
-          if (!Number.isInteger(count) || count < 1 || count > 1)
+          if (s.hw !== "xeon" && (!Number.isInteger(count) || count < 1 || count > 1))
             errors.push("Choose an integer GPU count within the documented limits.");
           if (Number(s.gpus_per_node) !== p.gpus) errors.push("This recipe requires " + p.gpus + " GPUs / node.");
           if (["tp_size", "ulysses_degree", "ring_degree"].some((key) => Number(t[key]) !== p.topology[key]))
