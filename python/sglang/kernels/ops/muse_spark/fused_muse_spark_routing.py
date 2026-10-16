@@ -423,6 +423,92 @@ def fused_muse_spark_routing_kernel(
 
 
 # =============================================================================
+# AMD (gfx950 / CDNA4) optimized kernel
+# =============================================================================
+
+
+@triton.jit
+def fused_muse_spark_routing_kernel_hip_tile(
+    gating_output_ptr,
+    bias_ptr,
+    topk_weights_ptr,
+    topk_ids_ptr,
+    local_expert_mapping_ptr,
+    num_tokens,
+    num_experts,
+    stride_gm,
+    stride_gn,
+    stride_wm,
+    stride_wk,
+    stride_im,
+    stride_ik,
+    router_output_multiplier,
+    route_scale,
+    division_eps,
+    TOPK: tl.constexpr,
+    NUM_EXPERTS_PADDED: tl.constexpr,
+    NORMALIZATION_MODE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_LOCAL_EXPERT_MAPPING: tl.constexpr,
+) -> None:
+    """AMD routing kernel: one 64-lane wavefront (num_warps=1) per token, so the
+    8 serial argmaxes reduce in-register with no LDS barriers.
+    """
+    pid = tl.program_id(0)
+    row_off = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_off = tl.arange(0, NUM_EXPERTS_PADDED)
+    row_mask = row_off < num_tokens
+    col_mask = col_off < num_experts
+
+    g_ptrs = (
+        gating_output_ptr + row_off[:, None] * stride_gm + col_off[None, :] * stride_gn
+    )
+    gating = tl.load(
+        g_ptrs, mask=row_mask[:, None] & col_mask[None, :], other=-float("inf")
+    )
+    gating = gating * router_output_multiplier
+
+    if NORMALIZATION_MODE == 0:
+        scores = tl.sigmoid(gating)
+    else:
+        max_score = tl.max(tl.where(col_mask[None, :], gating, -float("inf")), axis=1)
+        exp_scores = tl.exp(gating - max_score[:, None])
+        exp_scores = tl.where(col_mask[None, :], exp_scores, 0.0)
+        sum_exp = tl.sum(exp_scores, axis=1)
+        scores = exp_scores / sum_exp[:, None]
+
+    bias = tl.load(bias_ptr + col_off, mask=col_mask, other=0.0)
+    sel = tl.where(col_mask[None, :], scores + bias[None, :], -float("inf"))
+
+    k_off = tl.arange(0, TOPK)
+    acc_w = tl.zeros([BLOCK_M, TOPK], dtype=tl.float32)
+    acc_i = tl.zeros([BLOCK_M, TOPK], dtype=tl.int32)
+    score_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    for k in tl.static_range(TOPK):
+        m = tl.argmax(sel, axis=1)
+        is_sel = col_off[None, :] == m[:, None]
+        # gather the UNBIASED score (selection used scores+bias)
+        score = tl.sum(tl.where(is_sel, scores, 0.0), axis=1)
+        score_sum += score
+        sel = tl.where(is_sel, -float("inf"), sel)
+        idx = m
+        if HAS_LOCAL_EXPERT_MAPPING:
+            idx = tl.load(local_expert_mapping_ptr + m)
+        is_k = k_off[None, :] == k
+        acc_w = tl.where(is_k, score[:, None], acc_w)
+        acc_i = tl.where(is_k, idx.to(tl.int32)[:, None], acc_i)
+
+    inv = route_scale / (score_sum + division_eps)
+    w_ptrs = (
+        topk_weights_ptr + row_off[:, None] * stride_wm + k_off[None, :] * stride_wk
+    )
+    i_ptrs = topk_ids_ptr + row_off[:, None] * stride_im + k_off[None, :] * stride_ik
+    tl.store(w_ptrs, acc_w * inv[:, None], mask=row_mask[:, None])
+    tl.store(i_ptrs, acc_i, mask=row_mask[:, None])
+
+
+# =============================================================================
 # Python wrapper
 # =============================================================================
 
@@ -476,6 +562,9 @@ def fused_muse_spark_routing_op(
 
     grid = (num_tokens,)
 
+    # launch_pdl is a CUDA-only Triton launch kwarg. Omit it entirely on HIP.
+    launch_kwargs = {"launch_pdl": True} if launch_pdl else {}
+
     if topk == 8:
         fused_muse_spark_routing_kernel_topk8[grid](
             gating_output,
@@ -505,7 +594,7 @@ def fused_muse_spark_routing_op(
             HAS_LOCAL_EXPERT_MAPPING=has_local_expert_mapping,
             HAS_NUM_VALID=has_num_valid,
             HAS_PACKED=has_packed,
-            launch_pdl=launch_pdl,
+            **launch_kwargs,
         )
     else:
         fused_muse_spark_routing_kernel[grid](
@@ -534,7 +623,7 @@ def fused_muse_spark_routing_op(
             USE_GDC=launch_pdl,
             HAS_LOCAL_EXPERT_MAPPING=has_local_expert_mapping,
             HAS_NUM_VALID=has_num_valid,
-            launch_pdl=launch_pdl,
+            **launch_kwargs,
         )
         if has_packed:
             packed_topk_ids.copy_(pack_topk_ids_native(topk_ids, topk_weights))
@@ -549,6 +638,54 @@ def pack_topk_ids_native(
     )
     weight_bits = torch.where(topk_ids < 0, torch.zeros_like(weight_bits), weight_bits)
     return (topk_ids.to(torch.int32) << 16) | weight_bits
+
+
+@register_custom_op(
+    op_name="fused_muse_spark_routing_hip",
+    mutates_args=["topk_weights", "topk_ids"],
+)
+def fused_muse_spark_routing_hip_op(
+    gating_output: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk: int,
+    route_scale: float,
+    multiplier_val: float,
+    eps_val: float,
+    normalization_mode: int,
+    local_expert_mapping: Optional[torch.Tensor] = None,
+) -> None:
+    """In-place AMD routing op (opaque to torch.compile; buffers allocated by the
+    caller). BLOCK_M=1/num_warps=1 measured best isolated and concurrent."""
+    num_tokens, num_experts = gating_output.shape
+    num_experts_padded = _get_padded_num_experts(num_experts)
+    grid = (num_tokens,)
+    fused_muse_spark_routing_kernel_hip_tile[grid](
+        gating_output,
+        bias,
+        topk_weights,
+        topk_ids,
+        local_expert_mapping,
+        num_tokens,
+        num_experts,
+        gating_output.stride(0),
+        gating_output.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        multiplier_val,
+        route_scale,
+        eps_val,
+        TOPK=topk,
+        NUM_EXPERTS_PADDED=num_experts_padded,
+        NORMALIZATION_MODE=normalization_mode,
+        BLOCK_M=1,
+        HAS_LOCAL_EXPERT_MAPPING=local_expert_mapping is not None,
+        num_warps=1,
+        num_stages=4,
+    )
 
 
 def fused_muse_spark_routing(
@@ -691,6 +828,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
         KernelBackend.JIT: {CapabilityRequirement.CUDA},
         KernelBackend.TRITON: {
             CapabilityRequirement.CUDA,
+            CapabilityRequirement.HIP,
         },
     }
 

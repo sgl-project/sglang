@@ -5,8 +5,8 @@ Mirrors the FlashInfer autotune-config pattern (a JSON per GPU, keyed on shape):
 list of rules ``{"when": {...}, <launch_param>: <val>, ...}`` (first match wins).
 Each op passes a portable default to :func:`resolve`, used whenever no rule matches.
 
-``<hardware_key>`` is the normalized device name on CUDA (``NVIDIA_GB300``).
-``when`` keys
+``<hardware_key>`` is the GCN arch on ROCm (``gfx950``, shared across MI350X/
+MI355X) and the normalized device name on CUDA (``NVIDIA_GB300``). ``when`` keys
 are ``<param>`` (equality) or ``<param>_{lt,le,ge,gt,eq}``.
 """
 
