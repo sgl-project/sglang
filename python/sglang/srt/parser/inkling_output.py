@@ -131,17 +131,12 @@ class InklingOutputParser:
         pieces = [tokenizer.decode_bytes([token_ids[-1]])]
         last_len = region_len = len(pieces[0])
         start = len(token_ids) - 1
-        # A match ending in the last token starts at most len(stop) - 1 bytes
-        # before it; take the earliest such match, not the first suffix hit.
+        # A match ending in the last token starts at most len(stop) - 1 bytes before it.
         while start > 0 and region_len < last_len + len(stop_bytes) - 1:
             start -= 1
             pieces.insert(0, tokenizer.decode_bytes([token_ids[start]]))
             region_len += len(pieces[0])
-        region = b"".join(pieces)
-        min_end = len(region) - last_len
-        cut = region.find(stop_bytes)
-        while cut != -1 and cut + len(stop_bytes) <= min_end:
-            cut = region.find(stop_bytes, cut + 1)
+        cut = b"".join(pieces).find(stop_bytes)
         if cut == -1:
             return list(token_ids)
         if keep_stop:
