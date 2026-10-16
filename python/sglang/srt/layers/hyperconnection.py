@@ -6,7 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.hc_mix_flydsl import flydsl_hc_mix_supported, weight_cache_key
+from sglang.srt.layers.hc_mix_flydsl import (
+    flydsl_hc_mix_supported,
+    flydsl_hc_mix_weights_supported,
+    weight_cache_key,
+)
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 
 
@@ -162,6 +166,8 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+            # Resolved on the first mix(), once the weights are final.
+            self._mix_flydsl_ok = None
             self._mix_flydsl_weights = None
             self._mix_flydsl_weight_key = None
 
@@ -224,6 +230,15 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    def _flydsl_mix_ok(self) -> bool:
+        if self._mix_flydsl_ok is None:
+            self._mix_flydsl_ok = flydsl_hc_mix_weights_supported(
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+            )
+        return self._mix_flydsl_ok
+
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -260,13 +275,7 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        elif flydsl_hc_mix_supported(
-            hyper_input_normed,
-            self.input_mix_weight_down.weight,
-            self.input_mix_weight_up.weight,
-            self.hc_count,
-            self.hidden_size,
-        ):
+        elif flydsl_hc_mix_supported(hyper_input_normed, self._flydsl_mix_ok()):
             from aiter.ops.flydsl.hc_mix import hc_mix, pack_hc_weights
 
             down = self.input_mix_weight_down.weight

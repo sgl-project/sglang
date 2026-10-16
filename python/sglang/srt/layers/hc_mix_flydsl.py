@@ -7,6 +7,10 @@ import torch
 
 from sglang.srt.environ import envs
 
+# AITER's kernel limit; it stays ahead of the torch.compile fallback up to it
+# (K=10240, R=320, cold weights: 26 vs 42 us at 128 rows).
+_MAX_ROWS = 128
+
 
 @lru_cache(maxsize=1)
 def _aiter_hc_mix_available():
@@ -20,30 +24,47 @@ def _aiter_hc_mix_available():
         return False
 
 
-def flydsl_hc_mix_supported(x, down, up, hc, hs):
+def flydsl_hc_mix_weights_supported(down, up, hc):
+    """Environment, device and weight-shape half of the check.
+
+    None of it changes after the weights are loaded, so callers evaluate it
+    once per layer and pass the result to ``flydsl_hc_mix_supported``.
+    """
     # Keep FlyDSL/AITER imports off the NVIDIA and disabled paths.
+    if not envs.SGLANG_AITER_HC_MIX.get() or torch.version.hip is None:
+        return False
+    r, k = down.shape
+    # pack_hc_weights tiles K by 64 and R by 32, and makes its own contiguous
+    # copies, so the source weights' layout does not matter.
     return (
-        envs.SGLANG_AITER_HC_MIX.get()
-        and torch.version.hip is not None
-        and x.is_cuda
-        and x.ndim == 2
-        and 1 <= x.shape[0] <= 16
-        and hc == 4
-        and hs > 0
-        and x.shape[1] == hc * hs
-        and x.shape[1] % 2048 == 0
-        and down.ndim == 2
-        and down.shape[1] == x.shape[1]
-        and down.shape[0] > 0
-        and down.shape[0] % 32 == 0
-        and up.shape == (x.shape[1], down.shape[0])
-        and all(t.dtype == torch.bfloat16 for t in (x, down, up))
-        and all(t.device == x.device for t in (down, up))
-        and all(t.is_contiguous() for t in (x, down, up))
-        and x.data_ptr() % 16 == 0
-        and torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
+        hc == 4
+        and r > 0
+        and r % 32 == 0
+        and k > 0
+        and k % 64 == 0
+        and up.shape == (k, r)
+        and down.dtype == up.dtype == torch.bfloat16
+        and down.is_cuda
+        and up.device == down.device
+        and torch.cuda.get_device_properties(down.device).gcnArchName.split(":")[0]
         == "gfx950"
         and _aiter_hc_mix_available()
+    )
+
+
+def flydsl_hc_mix_supported(x, weights_supported):
+    """Per-call half: the activation's dtype, row count and layout.
+
+    ``x`` is the [rows, HC*HS] normed input, which the caller has already
+    matched to the weights' K.
+    """
+    return (
+        weights_supported
+        and x.dtype == torch.bfloat16
+        and x.ndim == 2
+        and 1 <= x.shape[0] <= _MAX_ROWS
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
     )
 
 
