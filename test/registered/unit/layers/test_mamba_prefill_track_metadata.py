@@ -78,17 +78,21 @@ def make_metadata_backend():
     return backend
 
 
-def make_relabeled_decode_batch(seq_lens, track_mask=None):
-    """A decoding DP rank after MAX_LEN padding: EXTEND, one token per decode row."""
+def make_relabeled_decode_batch(seq_lens, num_tokens, track_mask=None):
+    """A decoding DP rank after MAX_LEN padding: EXTEND, one token per decode row.
+
+    ``num_tokens`` pads the token-indexed inputs to the cross-rank max, as
+    ``_pad_inputs_to_size`` does; the per-row extend lists stay at one token.
+    """
     bs = len(seq_lens)
     batch = ForwardBatch(
         forward_mode=ForwardMode.EXTEND,
         batch_size=bs,
-        input_ids=torch.zeros(bs, dtype=torch.int64),
+        input_ids=torch.zeros(num_tokens, dtype=torch.int64),
         req_pool_indices=torch.arange(bs),
         seq_lens=torch.tensor(seq_lens),
         seq_lens_sum=sum(seq_lens),
-        out_cache_loc=torch.zeros(bs, dtype=torch.int64),
+        out_cache_loc=torch.zeros(num_tokens, dtype=torch.int64),
         extend_num_tokens=bs,
         extend_start_loc=torch.arange(bs, dtype=torch.int32),
         extend_seq_lens=torch.ones(bs, dtype=torch.int32),
@@ -339,7 +343,11 @@ class TestDpDecodeRelabel(unittest.TestCase):
     def test_forward_metadata_on_a_track_boundary_stays_decode(self):
         backend = make_metadata_backend()
         backend.conv_states_shape = (1, 8, 4)
-        batch = make_relabeled_decode_batch([256, 9], track_mask=[True, False])
+        # A peer's prefill pads the 2 decode rows to 697 tokens; the metadata
+        # must still cover only the real rows.
+        batch = make_relabeled_decode_batch(
+            [256, 9], num_tokens=697, track_mask=[True, False]
+        )
         metadata = backend._forward_metadata(batch)
         torch.testing.assert_close(
             metadata.query_start_loc, torch.arange(3, dtype=torch.int32)
@@ -354,7 +362,7 @@ class TestDpDecodeRelabel(unittest.TestCase):
                 mamba_cache_indices=torch.arange(3, dtype=torch.int32),
             ),
             64,
-            make_relabeled_decode_batch([8, 8, 8]),
+            make_relabeled_decode_batch([8, 8, 8], num_tokens=64),
         )
         self.assertEqual(metadata.num_decodes, 3)
         self.assertEqual(metadata.num_prefills, 0)
