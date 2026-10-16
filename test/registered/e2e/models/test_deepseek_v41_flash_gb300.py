@@ -1,6 +1,7 @@
 """DeepSeek-V4.1-Flash accuracy with DSPARK on four GB300 GPUs.
 
-Run GSM8K and MMLU in TP4+EP4 and DP-attention4 + EP4 configurations.
+Run GSM8K and MMLU in TP4+EP4 and DP-attention4 + EP4 configurations,
+plus TRT-LLM attention with decoder bounded replay and breakable prefill.
 The DP+EP recipe is intentionally exercised rather than skipped: startup or
 accuracy failures must be visible in CI while this path is being validated.
 """
@@ -19,7 +20,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1100, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=1650, stage="base-c", runner_config="4-gpu-gb300")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
@@ -119,6 +120,28 @@ class TestDSV41FlashDP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
         "--enable-dp-lm-head",
         "--moe-a2a-backend",
         "none",
+    ]
+
+
+class TestDSV41FlashTrtllmBoundedBCG(DSV41FlashAccuracyMixin, CustomTestCase):
+    """TRT-LLM varlen attention through the full and bounded-tail graph breaks."""
+
+    parallel_args = [
+        "--attn-dp-size",
+        "1",
+        "--ep-size",
+        "4",
+        "--dsv4-attn-backend",
+        "trtllm",
+        "--enable-decoder-swa-bounded-replay",
+        "--cuda-graph-backend-prefill",
+        "breakable",
+        "--cuda-graph-max-bs-prefill",
+        "4096",
+        "--cuda-graph-max-seq-len-prefill",
+        "16384",
+        "--chunked-prefill-size",
+        "4096",
     ]
 
 
