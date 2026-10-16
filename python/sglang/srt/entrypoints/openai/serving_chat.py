@@ -393,6 +393,9 @@ class OpenAIServingChat(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
+        self.tool_call_constraint = self.tokenizer_manager.config_value(
+            "tool_call_constraint"
+        )
         self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
         self.default_chat_template_kwargs = (
             get_serving().default_chat_template_kwargs or {}
@@ -1834,6 +1837,12 @@ class OpenAIServingChat(OpenAIServingBase):
         template_tool_parser = None
 
         effective_tools = self._effective_tools(request)
+        # --tool-call-constraint none: an auto request is sampled without any
+        # parser-derived grammar and parsed afterwards; required and named
+        # tool choices still constrain.
+        auto_unconstrained = getattr(self, "tool_call_constraint", "auto") == "none" and (
+            request.tool_choice is None or request.tool_choice == "auto"
+        )
         # A grammar reaching its terminal state ends generation regardless of
         # `ignore_eos`, so only install it when the request allows tool calls.
         glm_constraint = (
@@ -1841,6 +1850,7 @@ class OpenAIServingChat(OpenAIServingBase):
             is Glm47MoeDetector
             and bool(effective_tools)
             and request.tool_choice != "none"
+            and not auto_unconstrained
             and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
@@ -1872,7 +1882,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.model_dump() for item in request.tools]
                 if self.tool_call_parser == "muse" and request._template_tools:
                     tools = request._template_tools
-            if self.tool_call_parser and not glm_constraint:
+            if self.tool_call_parser and not glm_constraint and not auto_unconstrained:
                 parser = FunctionCallParser(
                     effective_tools,
                     self.tool_call_parser,

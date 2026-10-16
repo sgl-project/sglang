@@ -129,7 +129,9 @@ class Serving(msgspec.Struct):
         int,
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
-    ] = 1024 * 1024
+    ] = (
+        1024 * 1024
+    )
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -223,6 +225,18 @@ class Serving(msgspec.Struct):
         "Enable strict token filtering during the thinking phase. Blocks model-specific excluded tokens (e.g., tool call markers) during reasoning. Requires a grammar backend that supports token filtering.",
     ] = False
     tool_call_parser: Optional[str] = None
+    tool_call_constraint: A[
+        str,
+        Arg(
+            help="Whether the tool-call parser may constrain decoding for requests with "
+            'tool_choice="auto". "auto" keeps each parser\'s default (glm47 installs a '
+            "grammar built from the request's tools, so the model can only name declared "
+            'tools and ends its turn where the grammar says). "none" samples such requests '
+            "unconstrained and parses the text afterwards, the way RL rollouts are usually "
+            'run; tool_choice "required" and named tools still constrain.',
+            choices=["auto", "none"],
+        ),
+    ] = "auto"
     tool_server: A[
         Optional[str],
         "Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",

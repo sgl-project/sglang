@@ -2021,6 +2021,75 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertTrue(processed.require_reasoning)
 
+    def _glm47_tool_request(self, tool_choice="auto"):
+        from sglang.srt.entrypoints.openai.protocol import Function, Tool
+
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="get_tool_schemas",
+                description="load tool definitions by name",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "names": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["names"],
+                },
+            ),
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Load the crm tool."}],
+            tools=[tool],
+            tool_choice=tool_choice,
+        )
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        return request, rendered
+
+    def _process_glm47(self, constraint, tool_choice="auto"):
+        self.tm.server_args.tool_call_parser = "glm47"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.server_args.tool_call_constraint = constraint
+        self.chat.tool_call_constraint = constraint
+        request, rendered = self._glm47_tool_request(tool_choice)
+        with patch.object(
+            self.chat, "_apply_conversation_template", return_value=rendered
+        ):
+            return self.chat._process_messages(request, is_multimodal=False)
+
+    def test_tool_call_constraint_auto_installs_the_glm47_grammar(self):
+        """The default: a glm47 request with non-strict tools is decoded under
+        the full-assistant grammar built from its tools."""
+        processed = self._process_glm47("auto")
+
+        self.assertIsNotNone(processed.tool_call_constraint)
+        self.assertEqual(processed.tool_call_constraint[0], "full_assistant_ebnf")
+        self.assertIn("get_tool_schemas", processed.tool_call_constraint[1])
+
+    def test_tool_call_constraint_none_samples_auto_requests_unconstrained(self):
+        """--tool-call-constraint none: the same request carries no grammar, so
+        a tool index (a few declared tools, the rest resolved by the client)
+        and multi-call turns are the model's choice, parsed afterwards."""
+        processed = self._process_glm47("none")
+
+        self.assertIsNone(processed.tool_call_constraint)
+
+    def test_tool_call_constraint_none_keeps_required_tool_choice_constrained(self):
+        """An explicit tool_choice is a request for a constraint; "none" only
+        covers auto."""
+        processed = self._process_glm47("none", tool_choice="required")
+
+        self.assertIsNotNone(processed.tool_call_constraint)
+
     def test_kimi_tool_call_respects_explicit_reasoning_disable(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True
