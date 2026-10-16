@@ -1,12 +1,14 @@
 #pragma once
 
 // Multi-step speculative HiSparse cache-management kernels.
-// DSv4 cache transfer remains in hisparse.cuh.
+// Linear and page-padded C4 transfers share the same speculative swap state.
 
 #include <sgl_kernel/tensor.h>  // TensorMatcher and symbolic tensor validation
 #include <sgl_kernel/utils.h>   // RuntimeCheck and host utilities
 
 #include <sgl_kernel/utils.cuh>  // LaunchKernel and PDL helpers
+
+#include <sgl_kernel/deepseek_v4/kvcacheio.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -413,7 +415,14 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
 
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    bool IsDsv4Layout>
 __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -446,8 +455,17 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
         miss_count_out[bid] = 0;
       }
     }
-    for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
-      req_top_k_device_locs[i] = 0;
+    if constexpr (IsDsv4Layout) {
+      // Empty C4 histories still have a clamped attention length of one.
+      // Preserve the indexer's mask and the offsets within padding page zero.
+      for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE) {
+        const int32_t token = top_k_tokens[bid * top_k_tokens_stride + i];
+        req_top_k_device_locs[i] = token >= 0 ? token % page_size : -1;
+      }
+    } else {
+      for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
+        req_top_k_device_locs[i] = 0;
+    }
     return;
   }
 
@@ -598,15 +616,27 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
           miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
         }
       }
-      const auto src_k = static_cast<const char*>(host_cache_k) + copy_src_loc * ITEM_SIZE_BYTES;
-      auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
-      transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+      if constexpr (IsDsv4Layout) {
+        device::hisparse::transfer_item(
+            device_buffer_k, const_cast<void*>(host_cache_k), copy_loc, static_cast<int32_t>(copy_src_loc));
+      } else {
+        const auto src_k = static_cast<const char*>(host_cache_k) + copy_src_loc * ITEM_SIZE_BYTES;
+        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
+        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+      }
     }
     copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
   }
 }
 
-template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan, bool USE_PDL>
+template <
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    bool USE_PDL,
+    bool IsDsv4Layout>
 __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
@@ -872,9 +902,14 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
             miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
           }
         }
-        const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * ITEM_SIZE_BYTES;
-        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
-        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+        if constexpr (IsDsv4Layout) {
+          device::hisparse::transfer_item(
+              device_buffer_k, const_cast<void*>(host_cache_k), dst_loc, static_cast<int32_t>(src_loc));
+        } else {
+          const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * ITEM_SIZE_BYTES;
+          auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
+          transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+        }
       }
       copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
     }
@@ -935,7 +970,8 @@ template <
     int ITEM_SIZE_BYTES,
     int NUM_STEPS,
     bool RecordMissPlan,
-    bool USE_PDL>
+    bool USE_PDL,
+    bool IsDsv4Layout>
 void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -957,8 +993,8 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
-  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 2-4 steps.");
-  static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
+  static_assert(NUM_STEPS > 1, "HiSparse speculative swap requires at least two steps.");
+  static_assert(NUM_TOP_K > 0, "HiSparse speculative swap requires positive top_k.");
   static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -1057,7 +1093,8 @@ void load_cache_to_device_buffer_spec(
           HOT_BUFFER_SIZE,
           ITEM_SIZE_BYTES,
           NUM_STEPS,
-          RecordMissPlan>,
+          RecordMissPlan,
+          IsDsv4Layout>,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),
@@ -1088,7 +1125,8 @@ void load_cache_to_device_buffer_spec(
               ITEM_SIZE_BYTES,
               NUM_STEPS,
               RecordMissPlan,
-              USE_PDL>,
+              USE_PDL,
+              IsDsv4Layout>,
           static_cast<const int32_t*>(top_k_tokens.data_ptr()),
           static_cast<int32_t*>(top_k_device_locs.data_ptr()),
           static_cast<int32_t*>(device_buffer_tokens.data_ptr()),

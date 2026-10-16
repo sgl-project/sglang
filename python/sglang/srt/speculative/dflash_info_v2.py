@@ -126,6 +126,12 @@ class DFlashDraftInputV2(SpecInput):
         if bs == 0:
             return
 
+        coordinator = batch.hisparse_coordinator
+        if coordinator is not None:
+            # Accepted verify KV is still being copied out of the device side
+            # buffer. Finish that copy before allocation can recycle its slots.
+            coordinator.wait_for_pending_backup()
+
         batch.maybe_evict_swa()
 
         self._ensure_prepare_length_buffers(bs, batch.device)
@@ -211,6 +217,10 @@ class DFlashDraftInputV2(SpecInput):
             # plan-stream context, so forward work cannot observe partially
             # prepared req_to_token / KV allocation state.
             caller_stream.wait_stream(plan_stream)
+        if coordinator is not None:
+            # Host storage must cover the allocation watermark, which is ahead
+            # of the committed CPU lengths under overlap scheduling.
+            coordinator.reserve_spec_host_slots(batch)
         for req in batch.reqs:
             req.decode_batch_idx += 1
         # Seed committed; overlap's resolve overwrites it with the published value.

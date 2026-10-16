@@ -860,6 +860,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 else draft_input.nxt_kv_lens_cpu
             ),
         )
+        if batch.hisparse_coordinator is not None:
+            batch.out_cache_loc = verify_window.verify_cache_loc
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         sampling_info = batch.sampling_info
         # Simulated acceptance overrides correct_len, so only the bonus token needs the
@@ -1051,6 +1054,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 commit_lens=accept.commit_lens,
                 bs=bs,
                 run_compact=run_compact,
+            )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.spec_swap.commit_compressed_tokens(
+                batch, prefix_lens=prefix_lens, commit_lens=accept.commit_lens
             )
         logits_output.hidden_states = None
 

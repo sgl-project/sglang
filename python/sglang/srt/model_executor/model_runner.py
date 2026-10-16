@@ -1794,6 +1794,11 @@ class ModelRunner:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
+        if self.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator = self.hisparse_coordinator
+            self.hisparse_coordinator.wait_for_pending_backup()
+            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
         self.forward_pass_id += 1
 
         # Try msprob debugger
@@ -1951,14 +1956,6 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
-
-            if (
-                forward_batch.forward_mode.is_decode()
-                and self.hisparse_coordinator is not None
-            ):
-                forward_batch.hisparse_coordinator = self.hisparse_coordinator
-                self.hisparse_coordinator.wait_for_pending_backup()
-                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
             # Replay cuda graph if applicable
             if can_run_graph:
