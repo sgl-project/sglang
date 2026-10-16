@@ -824,7 +824,6 @@ def _dsv4_low_ratio_regions(
         sources = getattr(kvcache, "sources_by_ratio", {}).get(ratio, [])
         if not sources:
             continue
-        kv_pool = kvcache.kv_pools[ratio]
         index_pool = kvcache.index_pools[ratio]
         assert page_size % ratio == 0
         slots_per_page = page_size // ratio
@@ -833,7 +832,28 @@ def _dsv4_low_ratio_regions(
         layer_mapping = {
             source - kvcache.start_layer: index for index, source in enumerate(sources)
         }
-        regions.append((names[0], kv_pool, kv_pool.kv_buffer, layer_mapping))
+        if getattr(kvcache, "_unified_kv", False):
+            # The group's region inside its kv_source's unified view (no device pool),
+            # plus under fp8 its bf16 rope half: mirroring the nope half alone is wrong.
+            regions.append(
+                (
+                    names[0],
+                    None,
+                    kvcache.unified_region_buffers(ratio)[0],
+                    layer_mapping,
+                )
+            )
+            rope = kvcache.unified_rope_region_buffers(ratio)
+            if rope is not None:
+                rope_name = (
+                    PoolName.DEEPSEEK_V4_C1_ROPE
+                    if ratio == 1
+                    else PoolName.DEEPSEEK_V4_C2_ROPE
+                )
+                regions.append((rope_name, None, rope[0], layer_mapping))
+        else:
+            kv_pool = kvcache.kv_pools[ratio]
+            regions.append((names[0], kv_pool, kv_pool.kv_buffer, layer_mapping))
         if index_pool.index_k_with_scale_buffer is not None:
             index_regions = [(names[1], index_pool.index_k_with_scale_buffer)]
         else:
@@ -1959,9 +1979,11 @@ class _DeepSeekV4Strategy(StackStrategy):
         # them out everywhere else.
         _sidecar_srcs = [
             (PoolName.DEEPSEEK_V4_C1, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C1_ROPE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C1_INDEXER, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C2, PoolName.KV),
+            (PoolName.DEEPSEEK_V4_C2_ROPE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C2_INDEXER, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE, PoolName.KV),
             (PoolName.DEEPSEEK_V4_C4, PoolName.KV),

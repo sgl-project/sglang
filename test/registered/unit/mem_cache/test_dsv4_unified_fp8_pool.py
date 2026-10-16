@@ -114,6 +114,7 @@ class _StubTokenToKVPool:
     """
 
     _unified_page_views = DeepSeekV4TokenToKVPool._unified_page_views
+    _unified_compress_owners = DeepSeekV4TokenToKVPool._unified_compress_owners
     unified_region_buffers = DeepSeekV4TokenToKVPool.unified_region_buffers
     unified_rope_region_buffers = DeepSeekV4TokenToKVPool.unified_rope_region_buffers
 
@@ -203,6 +204,42 @@ class TestDSV4UnifiedRegionBuffers(CustomTestCase):
                 row_bytes = buf.shape[1] * buf.element_size()
                 self.assertEqual(
                     view.data_ptr(), buf.data_ptr() + swa_pages * row_bytes
+                )
+
+    def test_v41_group_region_is_mirrored_once_past_every_ring(self):
+        """
+        A ratio-1/2 kv_source group shares one compressed region behind all of its
+        members' SWA rings; mirroring it per member, or from a member's view, would
+        transfer the same rows several times or start inside a ring.
+        """
+        stage_ratios, group_of = [1, 1, 2, 2, 2], [0, 0, 2, 2, 2]
+        pool = DeepSeekV4UnifiedKVPool(
+            stage_ratios=stage_ratios,
+            num_slots=self.NUM_SLOTS,
+            num_blocks=self.NUM_BLOCKS,
+            page_size=self.PAGE_SIZE,
+            qk_nope_head_dim=NOPE_DIM,
+            qk_rope_head_dim=ROPE_DIM,
+            device="cpu",
+            memory_saver_adapter=_StubMemorySaver(),
+            custom_mem_pool=None,
+            swa_ring_size=self.SWA_RING,
+            fp8=True,
+            group_of=group_of,
+        )
+        stub = _StubTokenToKVPool(pool, self.PAGE_SIZE, stage_ratios, fp8=True)
+        for ratio, src, group_size in ((1, 0, 2), (2, 2, 3)):
+            self.assertEqual(pool.compress_row_base[src], group_size * pool.swa_pages)
+            for (views, _), device_buffers in (
+                (stub.unified_region_buffers(ratio), pool.kv_buffer),
+                (stub.unified_rope_region_buffers(ratio), pool.kv_buffer_rope),
+            ):
+                self.assertEqual(len(views), 1)
+                buf = device_buffers[src]
+                row_bytes = buf.shape[1] * buf.element_size()
+                self.assertEqual(
+                    views[0].data_ptr(),
+                    buf.data_ptr() + pool.compress_row_base[src] * row_bytes,
                 )
 
 

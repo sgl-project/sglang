@@ -365,6 +365,8 @@ def _build_deepseek_v4_device_pool_group(
         (4, PoolName.DEEPSEEK_V4_C4_ROPE, kvcache.c4_kv_pool, mappings.c4),
         (128, PoolName.DEEPSEEK_V4_C128_ROPE, kvcache.c128_kv_pool, mappings.c128),
     ):
+        if not rope_mapping:  # DeepSeek-V4.1 has no C4 / C128 layers
+            continue
         rope_region = (
             kvcache.unified_rope_region_buffers(ratio) if is_unified_kv else None
         )

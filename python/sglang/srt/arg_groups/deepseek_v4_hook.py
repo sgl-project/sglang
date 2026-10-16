@@ -338,8 +338,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and str(cfg.speculative_algorithm).upper() != "DSPARK",
         ),
         ("HiSparse", cfg.enable_hisparse),
-        # The fp8 two-pool layout covers ratios 1 / 2 (kv_source groups); the
-        # bf16 rows, the replay windows, spec, PD and HiCache are not wired for them.
+        # The fp8 two-pool layout covers ratios 1 / 2 (kv_source groups), incl. PD
+        # transfer and the external cache linker; the bf16 rows, encoder replay,
+        # spec and HiCache are not wired / validated for them.
         (
             "the bf16 unified KV layout (set SGLANG_DSV4_UNIFIED_KV_FP8=1)",
             is_unified_kv_triton() and not is_unified_kv_fp8(),
@@ -355,11 +356,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             is_unified_kv_triton() and cfg.speculative_algorithm is not None,
         ),
         (
-            "the unified KV layout with PD disaggregation or HiCache",
-            is_unified_kv_triton()
-            and (
-                str(cfg.disaggregation_mode) != "null" or cfg.enable_hierarchical_cache
-            ),
+            "the unified KV layout with HiCache",
+            is_unified_kv_triton() and cfg.enable_hierarchical_cache,
         ),
         (
             "TRT-LLM with encoder SWA bounded replay",
