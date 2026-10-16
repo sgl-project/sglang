@@ -57,6 +57,26 @@ class TestSM80ResourcePolicy(unittest.TestCase):
             state.capturing = False
             self.assertIsNot(get_stream("cuda:0"), first)
 
+    def test_tiled_decode_stays_opt_in_and_rejects_junk_thresholds(self):
+        """Batched decode needs a real positive threshold; prefill must stay serial."""
+        path = ROOT / "python/sglang/kernels/ops/attention/dsv4/flash_mla_sm80.py"
+        use_tiled = load_function(path, "_use_tiled_decode", {})
+        # Single-row decode is unconditional, exactly as before the batched change.
+        for raw in (None, "", "0", "abc", "-4", 0):
+            with self.subTest(raw=raw):
+                self.assertTrue(use_tiled(1, raw))
+        # An unset or malformed threshold must not widen the capture set.
+        for raw in (None, "", "0", "abc", "true", "-1", " "):
+            with self.subTest(raw=raw):
+                self.assertFalse(use_tiled(2, raw))
+                self.assertFalse(use_tiled(4096, raw))
+        # Official batches and prefill chunks sit on opposite sides of the opt-in.
+        self.assertTrue(use_tiled(8, "8"))
+        self.assertFalse(use_tiled(9, "8"))
+        self.assertFalse(use_tiled(2048, "8"))
+        self.assertTrue(use_tiled(8, 8))
+        self.assertFalse(use_tiled(0, "8"))
+
     def test_reduce_tile_stays_on_qualified_sm80_non_invariant_shape(self):
         """SM80 flags on Hopper must not switch its reduction implementation."""
         path = ROOT / "python/sglang/kernels/ops/layernorm/mhc.py"

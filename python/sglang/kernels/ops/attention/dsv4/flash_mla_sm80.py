@@ -105,6 +105,23 @@ def _raw_cache_view(name, cache, device):
     return raw, page_size, layout
 
 
+def _use_tiled_decode(tokens: int, multirow_max) -> bool:
+    """Whether this token count may use the tiled split-K component.
+
+    Single-row decode has always used it. Batched decode (2..8 rows) is the case
+    the old `tokens == 1` gate dropped onto the serial kernel, so it is enabled by
+    an explicit positive threshold. The threshold is an exact opt-in: unset,
+    non-numeric and non-positive values keep every multi-row count -- including
+    mixed-cache prefill chunks -- on the serial component, which is what the
+    original gate was protecting.
+    """
+    try:
+        limit = int(multirow_max or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    return tokens == 1 or 0 < tokens <= limit
+
+
 def flash_mla_with_kvcache_sm80(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -208,16 +225,11 @@ def flash_mla_with_kvcache_sm80(
     # prefill is faster with the serial component. Never promote tiled prefill
     # merely because the decode benchmark improves.
     attention = sparse_attention_sm80
-    # The tiled split-K path was gated on `tokens == 1`, which also excludes
-    # *batched decode* (there tokens == the running batch size, 2..8) and drops
-    # it onto the serial kernel -- ~14x slower per step, which is exactly what
-    # made multi-concurrency slow. Allow multi-row decode up to a token
-    # threshold; large prefill chunks keep the serial component (the original
-    # reason for the gate was prefill, whose mixed cache favors serial).
-    _multirow_max = int(
-        envs.SGLANG_DSV41_SM80_TILED_MULTIROW_MAX_TOKENS.get() or 0
-    )
-    if tokens == 1 or (0 < tokens <= _multirow_max):
+    # Batched decode belongs on the tiled path too; see _use_tiled_decode for why
+    # the threshold stays an exact opt-in and never promotes prefill.
+    if _use_tiled_decode(
+        tokens, envs.SGLANG_DSV41_SM80_TILED_MULTIROW_MAX_TOKENS.get()
+    ):
         from functools import partial
 
         from .sparse_attention_sm80_tiled import sparse_attention_sm80_tiled

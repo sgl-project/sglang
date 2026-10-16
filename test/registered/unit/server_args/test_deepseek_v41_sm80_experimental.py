@@ -92,6 +92,10 @@ class TestDeepseekV41SM80Experimental(unittest.TestCase):
             SGLANG_DSV41_SM80_EXPERIMENTAL=actual_envs.SGLANG_DSV41_SM80_EXPERIMENTAL,
             SGLANG_DSV41_SM80_FULL_GRAPH=actual_envs.SGLANG_DSV41_SM80_FULL_GRAPH,
             SGLANG_DSV41_SM80_FFN_GRAPH=actual_envs.SGLANG_DSV41_SM80_FFN_GRAPH,
+            SGLANG_DSV41_SM80_FULL_GRAPH_MULTI_BS=(
+                actual_envs.SGLANG_DSV41_SM80_FULL_GRAPH_MULTI_BS
+            ),
+            SGLANG_DSV41_SM80_ALLOW_VISION=actual_envs.SGLANG_DSV41_SM80_ALLOW_VISION,
             SGLANG_HACK_FLASHMLA_BACKEND=SimpleNamespace(get=Mock(return_value="auto")),
             SGLANG_DSV4_UNIFIED_KV_FP8=SimpleNamespace(get=Mock(return_value=False)),
         )
@@ -362,6 +366,75 @@ class TestDeepseekV41SM80Experimental(unittest.TestCase):
                 ):
                     self.validate(self.cfg)
         self.declare.assert_not_called()
+
+    def test_full_graph_multi_bs_opt_in_is_literal_and_relaxes_only_the_batch_pin(self):
+        """Batched capture needs the literal opt-in; every other guard still runs."""
+        self._enable_full_graph()
+        self.cfg.max_running_requests = 8
+        self.cfg.cuda_graph_config.decode.bs = [1, 2, 4, 8]
+        self.cfg.cuda_graph_config.decode.max_bs = 8
+        # Literal "1" opts in, and the batch pin must stay the only relaxed guard.
+        os.environ["SGLANG_DSV41_SM80_FULL_GRAPH_MULTI_BS"] = "1"
+        self.validate(self.cfg)
+        self.declare.assert_called_once()
+        self.cfg.dsv4_attn_backend = "trtllm"
+        with self.assertRaisesRegex(ValueError, "TRT-LLM attention"):
+            self.validate(self.cfg)
+        self.cfg.dsv4_attn_backend = "auto"
+        for value in (None, "", "0", "true", "True", "01", " 1", "1 "):
+            with self.subTest(value=value):
+                if value is None:
+                    os.environ.pop("SGLANG_DSV41_SM80_FULL_GRAPH_MULTI_BS", None)
+                else:
+                    os.environ["SGLANG_DSV41_SM80_FULL_GRAPH_MULTI_BS"] = value
+                with self.assertRaisesRegex(
+                    ValueError, "resolved decode bs=\\[1\\], max_bs=1"
+                ):
+                    self.validate(self.cfg)
+
+    def test_full_graph_multi_bs_still_requires_full_decode_and_disabled_prefill(self):
+        self._enable_full_graph()
+        os.environ["SGLANG_DSV41_SM80_FULL_GRAPH_MULTI_BS"] = "1"
+        self.cfg.max_running_requests = 4
+        self.cfg.cuda_graph_config.decode.bs = [1, 4]
+        self.cfg.cuda_graph_config.decode.max_bs = 4
+        for decode, prefill in (("disabled", "disabled"), ("full", "full")):
+            with self.subTest(decode=decode, prefill=prefill):
+                self.cfg.cuda_graph_config.decode.backend = decode
+                self.cfg.cuda_graph_config.prefill.backend = prefill
+                if decode == "full" and prefill == "disabled":
+                    self.validate(self.cfg)
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "decode backend full and prefill backend disabled"
+                    ):
+                        self.validate(self.cfg)
+        # Nested FFN capture must remain rejected for batched graphs too.
+        self.cfg.cuda_graph_config.decode.backend = "full"
+        self.cfg.cuda_graph_config.prefill.backend = "disabled"
+        os.environ["SGLANG_DSV41_SM80_FFN_GRAPH"] = "1"
+        with self.assertRaisesRegex(ValueError, "FFN_GRAPH=1.*nested capture"):
+            self.validate(self.cfg)
+
+    def test_vision_opt_in_is_literal_and_scoped_to_the_multimodal_fence(self):
+        """The vision escape hatch must not disable the feature fence by accident."""
+        self.model.is_multimodal = True
+        for value, allowed in (("1", True), ("true", False), ("yes", False), ("01", False)):
+            with self.subTest(value=value):
+                self.declare.reset_mock()
+                os.environ["SGLANG_DSV41_SM80_ALLOW_VISION"] = value
+                if allowed:
+                    self.validate(self.cfg)
+                    self.declare.assert_called_once()
+                else:
+                    with self.assertRaisesRegex(ValueError, "vision / multimodal"):
+                        self.validate(self.cfg)
+                    self.declare.assert_not_called()
+        # A vision opt-in must not relax an unrelated guard.
+        os.environ["SGLANG_DSV41_SM80_ALLOW_VISION"] = "1"
+        self.cfg.enable_lora = True
+        with self.assertRaisesRegex(ValueError, "LoRA"):
+            self.validate(self.cfg)
 
     def test_full_graph_rejects_nested_ffn_capture(self):
         self._enable_full_graph()
