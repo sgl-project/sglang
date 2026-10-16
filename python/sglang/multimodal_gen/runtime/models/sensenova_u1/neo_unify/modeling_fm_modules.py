@@ -105,86 +105,24 @@ class FlowMatchingHead(nn.Module):
 
 
 class SimpleMLPAdaLN(nn.Module):
-    """
-    The MLP for Diffusion Loss.
-    :param in_channels: channels in the input Tensor.
-    :param model_channels: base channel count for the model.
-    :param out_channels: channels in the output Tensor.
-    :param z_channels: channels in the condition.
-    :param num_res_blocks: number of residual blocks per downsample.
-    """
+    """Timestep-conditioned MLP that maps LLM hidden states to flow-matching targets."""
 
-    def __init__(
-        self,
-        in_channels,
-        model_channels,
-        out_channels,
-        z_channels,
-        num_res_blocks,
-        patch_size,
-        grad_checkpointing=False,
-    ):
+    def __init__(self, input_dim, out_dim, dim=1536, layers=12, mlp_ratio=1.0):
         super().__init__()
+        self.time_embed = TimestepEmbedder(dim)
+        self.input_proj = nn.Linear(input_dim, dim)
+        self.res_blocks = nn.ModuleList(
+            [ResBlock(dim, mlp_ratio) for _ in range(layers)]
+        )
+        self.final_layer = FinalLayer(dim, out_dim)
 
-        self.in_channels = in_channels
-        self.model_channels = model_channels
-        self.out_channels = out_channels
-        self.num_res_blocks = num_res_blocks
-        self.grad_checkpointing = grad_checkpointing
-        self.patch_size = patch_size
-
-        self.cond_embed = nn.Linear(z_channels, patch_size**2 * model_channels)
-
-        self.input_proj = nn.Linear(in_channels, model_channels)
-
-        res_blocks = []
-        for i in range(num_res_blocks):
-            res_blocks.append(
-                ResBlock(
-                    model_channels,
-                )
-            )
-
-        self.res_blocks = nn.ModuleList(res_blocks)
-        self.final_layer = FinalLayer(model_channels, out_channels)
-
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-
-        self.apply(_basic_init)
-
-        # Zero-out adaLN modulation layers
-        for block in self.res_blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def forward(self, x, c):
-        """
-        Apply the model to an input batch.
-        :param x: an [N x C] Tensor of inputs.
-        :param t: a 1-D batch of timesteps.
-        :param c: conditioning from AR transformer.
-        :return: an [N x C] Tensor of outputs.
-        """
+    def forward(self, x, t):
+        # x: (N, input_dim), t: (N,)
         x = self.input_proj(x)
-        c = self.cond_embed(c)
-
-        y = c.reshape(-1, self.patch_size**2, self.model_channels)
-
+        y = self.time_embed(t)
         for block in self.res_blocks:
             x = block(x, y)
-
-        return self.final_layer(x)
+        return self.final_layer(x, y)
 
 
 class FinalLayer(nn.Module):
@@ -198,11 +136,14 @@ class FinalLayer(nn.Module):
             model_channels, elementwise_affine=False, eps=1e-6
         )
         self.linear = nn.Linear(model_channels, out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(model_channels, 2 * model_channels, bias=True)
+        )
 
-    def forward(self, x):
-        x = self.norm_final(x)
-        x = self.linear(x)
-        return x
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        x = modulate(self.norm_final(x), shift, scale)
+        return self.linear(x)
 
 
 class ConvDecoder(nn.Module):
