@@ -434,6 +434,14 @@ ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
 ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 
+# sgl-amd-mono: the AMD monokernel plugin (--monokernel-backend amd). Pure Python
+# on top of AITER / FlyDSL; it registers its specs lazily, so it is inert unless a
+# server selects the backend. Installed on gfx950 images only (its kernels are
+# gfx950); disable with --build-arg ENABLE_SGL_AMD_MONO=0.
+ARG ENABLE_SGL_AMD_MONO=1
+ARG SGL_AMD_MONO_REPO="https://github.com/sgl-project/sgl-amd-mono.git"
+ARG SGL_AMD_MONO_COMMIT="815b104f483d180027054a8f44bad0c2a3f895fd"
+
 ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
@@ -622,32 +630,14 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
-# cherry pick ROCm/aiter#6042 to unpeel the 64-bit sparse MLA loop below Triton 3.8, may be removed in next aiter upgrade
-# apply the DSV4.1 TP2 fp8/fp4 FMoE tuning CSVs from ROCm/aiter#5967, may be removed in next aiter upgrade
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
-# backport ROCm/aiter#6007 (masked E8M0 scales default to 0) to the group32 GEMM: with other=127 the
-# packed small-M kernel reads stale LDS as the masked K-tail scale, and a 0xFF byte turns the tile into NaN;
-# may be removed in next aiter upgrade
-# The #6042, #5967 and #6007 patches are written against the gfx942/gfx950 AITER pin and
-# do not apply to the older gfx1250 one (a conflict in pa_decode_sparse.py, and
-# the dsv41 CSVs and the group32 GEMM do not exist there yet), so gfx1250 skips them.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && if [ "${GPU_ARCH_LIST}" != "gfx1250" ]; then \
-    git fetch origin pull/6042/head \
-    && git cherry-pick --no-commit 042a289183e5b47e193df6c10160915a6e8b69f5 \
-    && git fetch origin pull/5967/head \
-    && git diff -U0 89a47b84ac4b576339a50047e290c383c2377389 2bd147293d887c91fd10da10b1dbbf4690844270 -- \
-         aiter/configs/model_configs/dsv41_fp4_tuned_fmoe.csv \
-         aiter/configs/model_configs/dsv41_fp4_untuned_fmoe.csv \
-       | git apply --unidiff-zero \
-    && sed -i 's/other=127/other=0/' aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a8w8_blockscale_group32.py; \
- fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
- && pip install -r requirements.txt \
+ && pip install -r requirements.txt
 
 # ROCm/aiter#5195's .co with a mask assembled in between the q rows sharing a
 # tile, which the grouped dsv4 decode needs; bit-identical at max_seqlen_q=1.
@@ -899,6 +889,18 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     cd fast-hadamard-transform; \
     git checkout -f "${FHT_COMMIT}"; \
     PYTORCH_ROCM_ARCH=${GPU_ARCH_LIST} python setup.py install'
+
+# -----------------------
+# sgl-amd-mono (monokernel plugin; needs the sglang install above)
+RUN /bin/bash -lc 'set -euo pipefail; \
+    [ "${ENABLE_SGL_AMD_MONO}" = "1" ] || { echo "[sgl-amd-mono] skip (ENABLE_SGL_AMD_MONO=${ENABLE_SGL_AMD_MONO})"; exit 0; }; \
+    case "${GPU_ARCH}" in gfx950*) ;; *) echo "[sgl-amd-mono] skip (GPU_ARCH=${GPU_ARCH})"; exit 0 ;; esac; \
+    git clone "${SGL_AMD_MONO_REPO}" /sgl-workspace/sgl-amd-mono; \
+    cd /sgl-workspace/sgl-amd-mono; \
+    git checkout -f "${SGL_AMD_MONO_COMMIT}"; \
+    python3 -m pip install --no-cache-dir --no-deps -e .; \
+    python3 -c "from importlib.metadata import entry_points; \
+assert any(e.name == \"sgl_amd_mono\" for e in entry_points(group=\"sglang.srt.plugins\")), \"sgl-amd-mono plugin not registered\""'
 
 # -----------------------
 # Python tools
