@@ -47,6 +47,12 @@ class AttentionBackend(ABC):
 
     supports_ragged_verify_graph: bool = False
 
+    # Narrower decode-graph capture widths a backend may advertise
+    # (``DecodeGraphWidths``). None means graphs capture at the full context.
+    # The DSV4 backend sets it in ``__init__``; the decode graph runner reads
+    # it directly, so every backend needs the attribute.
+    decode_graph_widths = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

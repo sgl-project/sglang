@@ -15,6 +15,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -484,6 +485,40 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
+class DecodeGraphWidths(msgspec.Struct, frozen=True):
+    """Capture widths an attention backend offers the decode graph runner.
+
+    ``widths`` is ascending and its last entry is always the full configured
+    context, so sequence length alone never takes a batch off the graph path.
+    Other eligibility checks, such as the batch size, can still run it eagerly.
+    ``label`` names the namespace the runner uses to keep graphs captured at
+    one width distinct from another's, which keeps the runner free of any
+    backend-specific naming.
+    """
+
+    widths: Tuple[int, ...]
+    label: str
+
+
+def _resolve_decode_graph_seq_lens(
+    *, configured: Tuple[int, ...], full_seq_len: int, is_xpu: bool
+) -> Tuple[int, ...]:
+    if not configured:
+        return ()
+    if not is_xpu:
+        raise ValueError("SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS is only supported on XPU.")
+
+    requested = set(configured)
+    if any(value <= 0 for value in requested):
+        raise ValueError(
+            "SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS must contain positive integers."
+        )
+
+    bounded = {min(value, full_seq_len) for value in requested}
+    bounded.add(full_seq_len)
+    return tuple(sorted(bounded))
+
+
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -520,7 +555,21 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        self._full_seq_len_for_capture = self.req_to_token.shape[1]
+        _widths = _resolve_decode_graph_seq_lens(
+            configured=envs.SGLANG_DSV4_DECODE_GRAPH_SEQ_LENS.get(),
+            full_seq_len=self._full_seq_len_for_capture,
+            is_xpu=_is_xpu,
+        )
+        self.decode_graph_widths = (
+            DecodeGraphWidths(widths=_widths, label="dsv4_seq") if _widths else None
+        )
+        self._active_decode_graph_width = self._full_seq_len_for_capture
+        if self.decode_graph_widths is not None:
+            logger.info(
+                "DSV4 XPU decode graph capture widths: %s",
+                self.decode_graph_widths.widths,
+            )
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
@@ -571,6 +620,40 @@ class DeepseekV4AttnBackend(
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+
+    @property
+    def MAX_SEQ_LEN_FOR_CAPTURE(self) -> int:
+        return self._active_decode_graph_width
+
+    def set_decode_graph_width(self, width: int) -> None:
+        """Narrow capture and replay to one of the advertised widths."""
+        assert self.decode_graph_widths is not None
+        assert width in self.decode_graph_widths.widths
+        self._active_decode_graph_width = width
+
+    def select_decode_graph_width(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """Smallest advertised width that fits this batch, or None for no graph.
+
+        Pure: callers may use it to decide whether a graph applies without
+        disturbing the width currently in force.
+        """
+        if self.decode_graph_widths is None:
+            return None
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None:
+            # Without the scheduler's CPU mirror the batch width is unknown.
+            return None
+        if seq_lens_cpu.numel() == 0:
+            return (
+                self.decode_graph_widths.widths[0]
+                if forward_batch.forward_mode.is_idle()
+                else None
+            )
+        max_seq_len = int(seq_lens_cpu.max().item())
+        for width in self.decode_graph_widths.widths:
+            if max_seq_len <= width:
+                return width
+        return None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -991,7 +1074,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=self._full_seq_len_for_capture,
             out_loc=out_cache_loc,
             need_compress=True,
         )
@@ -1023,16 +1106,21 @@ class DeepseekV4AttnBackend(
     def make_forward_metadata_from_raw_decode(
         self,
         raw_metadata: DSV4RawDecodeMetadata,
+        max_seq_len: Optional[int] = None,
     ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
+        if max_seq_len is None:
+            # In-graph upgrade. Capture records this call, so it sizes the
+            # page table to the capture width in force.
+            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=max_seq_len,
             out_loc=out_cache_loc,
             need_compress=True,
         )
@@ -1221,7 +1309,12 @@ class DeepseekV4AttnBackend(
             actual_max_seq_len = seq_lens_cpu.max().item()
             assert actual_max_seq_len <= chosen_max_seq_len
 
-        graph_key = bs
+        graph_key = (
+            (bs, self._active_decode_graph_width)
+            if bucket is _GraphBucket.DECODE_OR_IDLE
+            and self.decode_graph_widths is not None
+            else bs
+        )
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
@@ -1333,7 +1426,9 @@ class DeepseekV4AttnBackend(
             raise NotImplementedError
 
         self.replay_cuda_graph_metadata_from(
-            bs=graph_key, temp_metadata=temp_metadata, bucket=bucket
+            bs=graph_key,
+            temp_metadata=temp_metadata,
+            bucket=bucket,
         )
 
         if in_capture:
@@ -1355,6 +1450,20 @@ class DeepseekV4AttnBackend(
             return
 
         self.forward_metadata = self._build_forward_metadata(forward_batch)
+        if self.decode_graph_widths is not None and isinstance(
+            self.forward_metadata, DSV4RawDecodeMetadata
+        ):
+            # Eager decode. No graph replay chose a width for this batch, and
+            # the width of the last replay stays in force. Upgrade with the
+            # full context, as the code did before capture widths existed.
+            # The slice in build_page_table_positions does not compare
+            # max_seq_len with seq_lens, so a page table that uses the stale
+            # width would drop the pages beyond it. The call below then finds
+            # full metadata and leaves it unchanged.
+            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
+                raw_metadata=self.forward_metadata,
+                max_seq_len=self._full_seq_len_for_capture,
+            )
         self.init_forward_metadata_in_graph(forward_batch)
 
     def _build_forward_metadata(
@@ -1381,7 +1490,10 @@ class DeepseekV4AttnBackend(
         elif seq_lens_cpu is not None:
             max_seq_len = int(seq_lens_cpu.max().item())
         else:
-            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+            # No override and no CPU mirror: the real lengths are unknown, so
+            # bound by the full context. A narrowed capture width belongs to a
+            # graph replay and must not leak into an eager forward.
+            max_seq_len = self._full_seq_len_for_capture
         verify_bs = _get_target_verify_bs(forward_batch)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
@@ -1469,7 +1581,7 @@ class DeepseekV4AttnBackend(
     ):
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=self._full_seq_len_for_capture,
             use_prefill_cuda_graph=True,
         )
         return self.forward_metadata
@@ -1486,7 +1598,7 @@ class DeepseekV4AttnBackend(
         # plan remains batch-specific without constructing a second metadata set.
         static_metadata = self._build_forward_metadata(
             static_forward_batch if static_forward_batch is not None else forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=self._full_seq_len_for_capture,
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
@@ -1497,7 +1609,7 @@ class DeepseekV4AttnBackend(
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
-                int,
+                Union[int, Tuple[int, int]],
                 Union[
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
@@ -1525,7 +1637,7 @@ class DeepseekV4AttnBackend(
 
     def replay_cuda_graph_metadata_from(
         self,
-        bs: int,
+        bs: Union[int, Tuple[int, int]],
         temp_metadata: Union[
             DSV4Metadata,
             DSV4RawVerifyMetadata,
