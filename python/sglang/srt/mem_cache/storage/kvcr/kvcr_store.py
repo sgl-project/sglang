@@ -101,6 +101,9 @@ class KVCRStore(HiCacheStorage):
         self._closed = False
         self._pinning = _NoFrameworkPinning()
         self._extra = dict(storage_config.extra_config or {})
+        self._min_hint_blocks = self._extra.get("min_hint_blocks", 0)
+        if type(self._min_hint_blocks) is not int or self._min_hint_blocks < 0:
+            raise ValueError("min_hint_blocks must be a non-negative integer")
         if "startup_timeout_seconds" in self._extra and (
             type(self._extra["startup_timeout_seconds"]) is not int
             or self._extra["startup_timeout_seconds"] <= 0
@@ -191,7 +194,12 @@ class KVCRStore(HiCacheStorage):
         if self._runner is not None:
             return
         from kvcr import KVCR, KVCRBindings
-        from kvcr.config import KVCRBackendConfigs, KVCRConfig, LocalDramOptions
+        from kvcr.config import (
+            KVCRBackendConfigs,
+            KVCRConfig,
+            LocalDramOptions,
+            RemoteFWDramOptions,
+        )
         from kvcr.control_channels import ZmqPeerControlChannel
         from kvcr.types import KVCRStartupError, RegionDescriptor
 
@@ -278,6 +286,11 @@ class KVCRStore(HiCacheStorage):
                     if "startup_timeout_seconds" in self._extra
                     else {}
                 )
+                remote_options = (
+                    {"min_hint_blocks": self._min_hint_blocks}
+                    if self._min_hint_blocks
+                    else {}
+                )
                 self._runner = KVCR(
                     config=KVCRConfig(
                         nixl_agent_name=self._agent_name,
@@ -311,6 +324,7 @@ class KVCRStore(HiCacheStorage):
                         local_dram=(
                             LocalDramOptions(pools=allocations) if allocations else None
                         ),
+                        remote_fw_dram=RemoteFWDramOptions(**remote_options),
                     ),
                 )
             except KVCRStartupError:

@@ -54,6 +54,14 @@ An optional positive integer `startup_timeout_seconds` requires the companion
 KVCR startup budget change. Omitting it preserves KVCR's normal startup budget.
 Transfer and abandonment deadlines are separate from this initialization setting.
 
+To skip remote hints advertising a short prefix, add `"min_hint_blocks": 4` to
+the backend JSON. This requires KVCR's `min_hint_blocks` option
+([ai-dynamo/kvcr#102](https://github.com/ai-dynamo/kvcr/pull/102)).
+It counts distinct advertised hashes, not tokens or additional missing blocks;
+it filters received hints rather than suppressing router hint emission. The
+default is `0` (disabled), and omission or `0` remains compatible with older KVCR
+builds. KVCR ignores the threshold when opportunistic queries are enabled.
+
 ## Remote hints and replicated MLA
 
 Cross-replica discovery requires request-scoped source hints, such as those
