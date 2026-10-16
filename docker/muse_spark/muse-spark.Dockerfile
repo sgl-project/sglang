@@ -60,7 +60,7 @@ RUN git clone https://github.com/sgl-project/DeepGEMM.git /tmp/muse-deep-gemm \
         bash build_sgl_deep_gemm.sh \
     && python3 -m pip install --no-cache-dir --no-deps --force-reinstall dist/sgl_deep_gemm-*.whl \
     && cd /sgl-workspace \
-    && python3 -c "from importlib.metadata import version; from sglang.srt.layers.moe.muse_spark_megamoe import require_muse_megamoe_patch; assert version('sgl-deep-gemm') == '0.2.1.post1+muse.cbe1727'; require_muse_megamoe_patch()" \
+    && python3 -c "from importlib.metadata import version; from sglang.srt.layers.muse_spark.muse_spark_megamoe import require_muse_megamoe_patch; assert version('sgl-deep-gemm') == '0.2.1.post1+muse.cbe1727'; require_muse_megamoe_patch()" \
     && rm -rf /tmp/muse-deep-gemm
 
 # The muse-spark branch also requires NVSHMEM Python bindings absent from the base.

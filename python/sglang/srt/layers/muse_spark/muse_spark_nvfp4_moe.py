@@ -173,7 +173,7 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
 
     def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
         if getattr(layer, "use_megamoe", False):
-            from sglang.srt.layers.moe.muse_spark_megamoe import (
+            from sglang.srt.layers.muse_spark.muse_spark_megamoe import (
                 build_nvfp4_megamoe_weights,
             )
 
@@ -181,7 +181,7 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             build_nvfp4_megamoe_weights(layer)
         _align_fp4_moe_weights_for_flashinfer_trtllm(layer)
         if getattr(layer, "use_megamoe", False):
-            from sglang.srt.layers.moe.muse_spark_megamoe import (
+            from sglang.srt.layers.muse_spark.muse_spark_megamoe import (
                 bind_megamoe_shared_weights,
             )
 

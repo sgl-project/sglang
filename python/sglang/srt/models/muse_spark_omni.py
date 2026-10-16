@@ -6,16 +6,18 @@ import itertools
 from collections.abc import Iterable
 from typing import Optional
 
-import sglang.srt.managers.mm_utils as mm_utils
 import torch
 import torch.nn.functional as F
+from torch import nn
+
+import sglang.srt.managers.mm_utils as mm_utils
 from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.muse_spark_audio import AudioEncoder
-from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNorm
-from sglang.srt.layers.muse_spark_navit import (
+from sglang.srt.layers.muse_spark.muse_spark_audio import AudioEncoder
+from sglang.srt.layers.muse_spark.muse_spark_layers import MuseSpark1xRMSNorm
+from sglang.srt.layers.muse_spark.muse_spark_navit import (
     NaViT,
     NaViTAdapter,
     get_navit_patch_count,
@@ -37,7 +39,7 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.runtime_context import get_disagg, get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_cpu
-from torch import nn
+
 
 def _run_dp_sharded_encode(
     features: list[torch.Tensor],

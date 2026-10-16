@@ -28,10 +28,10 @@ from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_trtllm im
 from sglang.kernels.ops.muse_spark.norm_fp4_quant import fused_norm_fp4_quant
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.muse_spark_nvfp4_moe import (
+from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
     MuseSparkNvFp4FusedMoEMethod,
 )
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils.common import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
@@ -216,7 +216,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             self._post_expert_norm_weight = None
             return
         # Lazy import to avoid circular import at module load.
-        from sglang.srt.layers.muse_spark_layers import (
+        from sglang.srt.layers.muse_spark.muse_spark_layers import (
             MuseSpark1xRMSNormWithInputScale,
         )
 

@@ -64,9 +64,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.muse_spark_bf16_moe import MuseSpark1xBf16Experts
-from sglang.srt.layers.muse_spark_fp4_moe import MuseSpark1xFp4Experts
-from sglang.srt.layers.muse_spark_layers import (
+from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import MuseSpark1xBf16Experts
+from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
+from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xNormPreservingResidualConnection,
     MuseSpark1xRMSNorm,
     MuseSpark1xRMSNormWithInputScale,
@@ -533,7 +533,9 @@ class MuseSpark1xMoE(nn.Module):
         self.nvfp4_checkpoint = nvfp4_checkpoint
         self.use_megamoe = getattr(parallel, "enable_megamoe_for_layernorm_sp", False)
         if int4_checkpoint:
-            from sglang.srt.layers.muse_spark_int4_moe import MuseSpark1xInt4Experts
+            from sglang.srt.layers.muse_spark.muse_spark_int4_moe import (
+                MuseSpark1xInt4Experts,
+            )
 
             self.experts = MuseSpark1xInt4Experts(
                 num_experts=self.num_experts,
@@ -854,7 +856,7 @@ class MuseSpark1xMoE(nn.Module):
         if self.pre_expert_norm is not None:
             expert_input = self.pre_expert_norm(expert_input)
         if self.use_megamoe:
-            from sglang.srt.layers.moe.muse_spark_megamoe import forward_megamoe
+            from sglang.srt.layers.muse_spark.muse_spark_megamoe import forward_megamoe
 
             return forward_megamoe(
                 self.experts,
