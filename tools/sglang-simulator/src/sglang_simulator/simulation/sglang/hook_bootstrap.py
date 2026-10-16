@@ -38,6 +38,9 @@ def install_simulator_hooks() -> None:
     sglang_simulator_hook.install_class_hooks(
         [
             scheduler.C_SchedulerHook,
+            scheduler.C_StepPlannerHook,
+            scheduler.C_RequestIntakeHook,
+            scheduler.C_StepLauncherHook,
             scheduler.C_SglangPrefillAdderHook,
             scheduler.C_SchedulerRequestReceiver,
             model_runner.C_ModelRunnerHook,
