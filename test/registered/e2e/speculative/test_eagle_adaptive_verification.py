@@ -10,6 +10,8 @@ import requests
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -19,8 +21,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
 
-MODEL = "Qwen/Qwen3.5-0.8B"
 COMMON_ARGS = [
+    "--trust-remote-code",
     "--random-seed",
     "1",
     "--mem-fraction-static",
@@ -28,7 +30,9 @@ COMMON_ARGS = [
     "--max-running-requests",
     "8",
     "--speculative-algorithm",
-    "NEXTN",
+    "EAGLE",
+    "--speculative-draft-model-path",
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     "--speculative-eagle-topk",
     "1",
 ]
@@ -65,7 +69,7 @@ def _generate_all(base_url):
 
 def _launch(other_args, env=None):
     return popen_launch_server(
-        MODEL,
+        DEFAULT_MODEL_NAME_FOR_TEST_MLA,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=COMMON_ARGS + other_args,

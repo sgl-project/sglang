@@ -24,9 +24,6 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.linear.utils import (
-    ragged_verify_dense_scatter_indices,
-    ragged_verify_gather_from_dense,
-    ragged_verify_scatter_to_dense,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -185,7 +182,6 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
-    ragged_dense_indices: Optional[torch.Tensor] = None
 
 
 class _BreakablePLEBatch:
@@ -270,31 +266,6 @@ def _prepare_ple_batch(
     physical_tokens = input_ids.shape[0]
     processed_tokens = _get_processed_token_count(forward_batch, physical_tokens)
     tokens = input_ids[:processed_tokens]
-    out_cache_loc = forward_batch.out_cache_loc
-    ragged_layout = (
-        forward_batch.spec_info.ragged_verify_layout
-        if mode.is_target_verify()
-        else None
-    )
-    ragged_dense_indices = None
-    if ragged_layout is not None:
-        draft_token_num = int(forward_batch.spec_info.draft_token_num)
-        num_dense = ragged_layout.bs * draft_token_num
-        ragged_dense_indices = ragged_verify_dense_scatter_indices(
-            query_start_loc=ragged_layout.qo_indptr_device,
-            seq_len=processed_tokens,
-            draft_token_num=draft_token_num,
-        )
-        tokens = ragged_verify_scatter_to_dense(
-            tokens, dense_indices=ragged_dense_indices, num_dense=num_dense
-        )
-        if out_cache_loc is not None:
-            out_cache_loc = ragged_verify_scatter_to_dense(
-                out_cache_loc[:processed_tokens],
-                dense_indices=ragged_dense_indices,
-                num_dense=num_dense,
-            )
-        physical_tokens = processed_tokens = num_dense
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
     if mode.is_target_verify():
@@ -309,9 +280,7 @@ def _prepare_ple_batch(
         # Eager verify rows can be shorter than the row stride;
         # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
         lengths = (
-            ragged_layout.verify_lens.long()
-            if ragged_layout is not None
-            else forward_batch.extend_seq_lens[:sequence_count].long()
+            forward_batch.extend_seq_lens[:sequence_count].long()
             if forward_batch.forward_mode.is_target_verify()
             and forward_batch.extend_seq_lens is not None
             else torch.full(
@@ -369,6 +338,7 @@ def _prepare_ple_batch(
 
     # CUDA graph padding uses request slot 0, which may belong to a real request.
     # Map padded sequences to the state pools' reserved dummy slot instead.
+    out_cache_loc = forward_batch.out_cache_loc
     if use_decode_fast_path:
         if out_cache_loc is not None:
             state_indices = torch.where(
@@ -424,7 +394,6 @@ def _prepare_ple_batch(
         state_indices=state_indices,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
-        ragged_dense_indices=ragged_dense_indices,
     )
 
 
@@ -1363,27 +1332,6 @@ class Qwen4ExpPLELayer(nn.Module):
         return embeddings
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        batch: _PLEBatch,
-    ) -> torch.Tensor:
-        if batch.ragged_dense_indices is None:
-            return self._forward_rows(hidden_states, forward_batch, batch)
-        dense = ragged_verify_scatter_to_dense(
-            hidden_states[: batch.ragged_dense_indices.shape[0]],
-            dense_indices=batch.ragged_dense_indices,
-            num_dense=batch.processed_tokens,
-        )
-        output = self._forward_rows(dense, forward_batch, batch)
-        return _pad_token_rows(
-            ragged_verify_gather_from_dense(
-                output, dense_indices=batch.ragged_dense_indices
-            ),
-            hidden_states.shape[0],
-        )
-
-    def _forward_rows(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,

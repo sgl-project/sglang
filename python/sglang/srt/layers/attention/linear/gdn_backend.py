@@ -18,9 +18,6 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
     pp_spec_stable_rows_enabled,
-    ragged_verify_dense_scatter_indices,
-    ragged_verify_gather_from_dense,
-    ragged_verify_scatter_to_dense,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -522,7 +519,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
     requires_contiguous_prefill_state: bool = True
-    supports_ragged_verify_graph: bool = True
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -651,20 +647,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             use_replayssm_spec=use_replayssm_spec,
             ssm_dtype=mamba_cache.temporal.dtype,
             draft_token_num=forward_batch.spec_info.draft_token_num,
-        )
-
-    def _dense_verify_query_start_loc(
-        self, *, num_reqs: int, draft_token_num: int, device: torch.device
-    ) -> torch.Tensor:
-        cached = self.cached_cuda_graph_verify_query_start_loc
-        if cached is not None and cached.shape[0] > num_reqs:
-            return cached[: num_reqs + 1]
-        return torch.arange(
-            0,
-            num_reqs * draft_token_num + 1,
-            draft_token_num,
-            dtype=torch.int32,
-            device=device,
         )
 
     def _replayssm_fold_uses_cutedsl(
@@ -991,32 +973,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
-        dense_indices = None
-        if (
-            is_target_verify
-            and forward_batch.spec_info.ragged_verify_layout is not None
-        ):
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            num_reqs = query_start_loc.shape[0] - 1
-            num_dense = num_reqs * draft_token_num
-            dense_indices = ragged_verify_dense_scatter_indices(
-                query_start_loc=query_start_loc,
-                seq_len=seq_len,
-                draft_token_num=draft_token_num,
-            )
-            mixed_qkv, a, b = (
-                ragged_verify_scatter_to_dense(
-                    x, dense_indices=dense_indices, num_dense=num_dense
-                )
-                for x in (mixed_qkv, a, b)
-            )
-            seq_len = num_dense
-            query_start_loc = self._dense_verify_query_start_loc(
-                num_reqs=num_reqs,
-                draft_token_num=draft_token_num,
-                device=query_start_loc.device,
-            )
-
         if self.mis_metadata is not None:
             if is_target_verify:
                 raise ValueError("GDN MIS does not support target verify")
@@ -1206,10 +1162,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
-            if dense_indices is not None:
-                core_attn_out = ragged_verify_gather_from_dense(
-                    core_attn_out.reshape(seq_len, -1), dense_indices=dense_indices
-                ).view(*core_attn_out.shape[:-3], -1, *core_attn_out.shape[-2:])
         else:
             g, beta = self._prefill_gates(layer, a, b)
             h_track_buf = None

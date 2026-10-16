@@ -14,7 +14,6 @@ def _qsa_fused_kv_prepare(
     IDX,
     LENGTH,
     QPOS,
-    PREFIX,
     COUNTS,
     OK,
     OV,
@@ -34,7 +33,6 @@ def _qsa_fused_kv_prepare(
     RATIO: tl.constexpr,
     IB: tl.constexpr,
     CHAIN: tl.constexpr,
-    RAGGED: tl.constexpr,
     PAGE: tl.constexpr,
 ):
     tiles = tl.cdiv(S, B) + 2
@@ -80,13 +78,7 @@ def _qsa_fused_kv_prepare(
         valid = (pos >= 0) & (pos < length) & (c < T)
         valid = valid & row_active
         slot = tl.load(MAP + req.to(tl.int64) * MAP_STRIDE + pos, valid, 0).to(tl.int64)
-        if EXPAND and CHAIN and RAGGED:
-            first_pos = tl.load(PREFIX + row)
-            group_row = row - (length - 1 - first_pos)
-            relative_pos = pos - first_pos
-            fresh = valid & (relative_pos >= 0)
-            input_row = tl.where(fresh, group_row + relative_pos, 0)
-        elif EXPAND and CHAIN and W > 1:
+        if EXPAND and CHAIN and W > 1:
             group_row = row // W * W
             first_pos = length - 1 - row % W
             relative_pos = pos - first_pos
@@ -154,14 +146,11 @@ def fused_kv_prepare(
     query_positions=None,
     chain_positions=False,
     visible_page_size=0,
-    prefix_lengths=None,
 ):
     """With block indices (compress_ratio > 1) and ``visible_page_size`` set, a
     row's packed K/V is written only up to its valid count rounded up to that
     page: a paged consumer bounded by ``counts`` never reads further, and the
     rest of the row keeps whatever the buffer held."""
-    ragged = prefix_lengths is not None
-    assert not ragged or (chain_positions and compress_ratio > 1)
     rows, input_topk = indices.shape
     topk = input_topk * compress_ratio + compress_ratio - 1
     if rows == 0:
@@ -180,7 +169,6 @@ def fused_kv_prepare(
         indices,
         sequence_lengths,
         query_positions,
-        prefix_lengths if ragged else sequence_lengths,
         counts,
         packed_k,
         packed_v,
@@ -195,12 +183,11 @@ def fused_kv_prepare(
         block,
         triton.next_power_of_2(topk),
         rows,
-        1 if ragged else width,
+        width,
         compress_ratio > 1,
         compress_ratio,
         input_topk,
         chain_positions,
-        ragged,
         visible_page_size if compress_ratio > 1 else 0,
         num_warps=4,
     )
