@@ -201,6 +201,8 @@ def test_lora_uses_quant_method_contract_for_registered_backend(
     base_layer.should_fuse_routed_scaling_factor_in_topk = False
     base_layer.moe_tp_size = 1
     base_layer.moe_tp_rank = 0
+    base_layer.moe_ep_size = 1
+    base_layer.moe_ep_rank = 0
     base_layer.intermediate_size_per_partition = 8
     base_layer.runner = SimpleNamespace(runner_backend=backend)
     lora_backend = SimpleNamespace(name="triton", is_moe_lora=False)
