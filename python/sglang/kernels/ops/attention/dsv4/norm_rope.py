@@ -113,6 +113,23 @@ def _jit_main_k_norm_rope_q_flashmla_module(
 
 
 @cache_once
+def _jit_main_qk_norm_rope_fp8_2buff_module(
+    dtype: torch.dtype, head_dim: int, rope_dim: int
+):
+    """ROCm fp8 two-pool unified_kv decode, query without head norm: the K kernel's
+    norm + RoPE + quant into the two pools and the query's RoPE + fp8 pack, one launch."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_qk_norm_rope_fp8_2buff"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQKNormRopeFp8TwoPoolKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
     args = make_cpp_args(dtype, is_arch_support_pdl())
@@ -299,6 +316,44 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
         positions,
     )
     return (q_fp4, q_sf), weights_out
+
+
+def fused_qk_norm_rope_fp8_2buff(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+) -> None:
+    """One launch: ``kv`` RMSNorm + RoPE + fp8 pack into the two-pool rows ``out_loc``
+    (int32, < 0 skips) of ``k_nope`` ``[R, 512]`` fp8 / ``k_rope`` ``[R, 64]``, with
+    fused_k_norm_rope_flashmla's V4 math; and the un-RoPE'd ``q`` ``[T, H, 512]``
+    RoPE'd + packed the same way into ``q_nope`` ``[T, H, 512]`` / ``q_rope``
+    ``[T, H, 64]``, as pack_q_fp8_2buff does (no query norm: DeepSeek-V4.1)."""
+    assert _is_hip, "the fused two-pool query/K store is ROCm only"
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    module = _jit_main_qk_norm_rope_fp8_2buff_module(
+        kv.dtype, kv.shape[-1], freqs_real.shape[-1]
+    )
+    module.forward(
+        kv,
+        kv_weight,
+        freqs_real,
+        positions,
+        out_loc,
+        k_nope.view(torch.uint8),
+        k_rope,
+        q,
+        q_nope.view(torch.uint8),
+        q_rope,
+        eps,
+    )
 
 
 def fused_k_norm_rope_flashmla(

@@ -1968,9 +1968,13 @@ class MQALayer(MqaAttentionBase):
                 pack_q_fp8_2buff,
             )
 
-            # V4.1 has no query head norm: the paged path's RoPE'd bf16 Q, packed
+            # V4.1 has no query head norm: wq_b's bf16 Q, RoPE'd and packed at once
             q = pack_q_fp8_2buff(
-                self._compute_q_b(q_for_wqb, positions, None), q_out, q_rope_out
+                _hip.wq_b_unroped(self, q_for_wqb),
+                q_out,
+                q_rope_out,
+                self.freqs_cis,
+                positions,
             )
         else:
             q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -2007,7 +2011,7 @@ class MQALayer(MqaAttentionBase):
                     self.sin_cache,
                     pool.get_unified_kv(self.layer_id),
                     pool.get_unified_kv_rope(self.layer_id),
-                    attn_backend.get_unified_swa_loc(forward_batch).to(torch.int64),
+                    attn_backend.get_unified_swa_loc_i64(forward_batch),
                 )
             else:
                 self._compute_kv_to_cache(
@@ -2310,10 +2314,11 @@ class MQALayer(MqaAttentionBase):
         unified_no_q_norm = unified and fp8_2buff and not self.q_head_norm
         if do_fused_qk_norm_rope:
             if unified_no_q_norm:
+                # the indexer reads q_for_wqb, as _hip.compute_q_b hands it back;
+                # the RoPE happens in the fp8 packer
                 q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-                q, q_lora, _ = _hip.compute_q_b(
-                    self, q_lora, q_for_wqb, positions, None, True, use_cp
-                )
+                q_lora = q_for_wqb
+                q = _hip.wq_b_unroped(self, q_for_wqb)
             elif _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
@@ -2419,6 +2424,7 @@ class MQALayer(MqaAttentionBase):
                 k_rope_out=k_rope_out if fuse_prefill else None,
                 q_rope_out=q_rope_out,
                 q_head_norm=not unified_no_q_norm,
+                q_freqs_cis=self.freqs_cis if unified_no_q_norm else None,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
             # nothing, so hand it back: the caller feeds it to attention as the
