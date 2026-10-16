@@ -1,0 +1,25 @@
+{
+  "work_dir": "/workspace/sglang/benchmark/beam_openhands/runtime",
+  "model_path": "/models/Beam-1.0-501B-A23B-NVFP4",
+  "draft_path": "/models/Beam-1.0-501B-A23B-DFlash2",
+  "server_python": "/opt/sglang/bin/python3",
+  "client_base_python": "/usr/bin/python3.12",
+  "head_addr": "127.0.0.1",
+  "port": 30080,
+  "dist_port": 39746,
+  "layouts": [
+    "tp4"
+  ],
+  "concurrencies_by_layout": {
+    "tp4": [
+      1,
+      4,
+      8,
+      16,
+      32
+    ]
+  },
+  "hicache_size": 88,
+  "repeat_cc128": false,
+  "runtime_pythonpaths": []
+}

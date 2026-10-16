@@ -1,0 +1,37 @@
+{
+  "name": "beam-nvfp4-tp4-c1-d8-al4",
+  "resolved_args": {
+    "tp_size": 4,
+    "ep_size": 1,
+    "attn_dp_size": 1,
+    "nnodes": 1,
+    "quantization": "modelopt_fp4",
+    "attention_backend": "trtllm_mha",
+    "page_size": 64,
+    "moe_a2a_backend": "none",
+    "moe_runner_backend": "flashinfer_trtllm",
+    "context_length": 1048576,
+    "mem_fraction_static": 0.8,
+    "enable_unified_memory": true,
+    "chunked_prefill_size": 16384,
+    "prefill_decode_interval": 0,
+    "max_running_requests": 1,
+    "cuda_graph_max_bs_decode": 1,
+    "speculative_algorithm": "DFLASH",
+    "speculative_num_draft_tokens": 8,
+    "speculative_draft_attention_backend": "trtllm_mha",
+    "enable_hierarchical_cache": false,
+    "enable_cache_report": true,
+    "reasoning_parser": "beam",
+    "tool_call_parser": "beam",
+    "tokenizer_worker_num": 1,
+    "disable_radix_cache": false
+  },
+  "simulation": {
+    "SGLANG_SIMULATE_ACC_LEN": "4",
+    "SGLANG_SIMULATE_ACC_METHOD": "match-expected",
+    "SGLANG_SIMULATE_ACC_TOKEN_MODE": "real-draft-token",
+    "SGLANG_RESPONSE_TEMPLATE_TURN_GRAMMAR": "0"
+  },
+  "n_gpus": 4
+}
