@@ -116,7 +116,7 @@ def test_deepgemm_paged_mqa_logits(batch_size, next_n, num_heads, avg_ctx):
         batch_size,
         next_n,
         max_model_len,
-        **(dict(atol=2e-2, rtol=8e-3) if mx else {}),
+        **(dict(max_calc_diff=3e-5) if mx else {}),
     )
 
 
