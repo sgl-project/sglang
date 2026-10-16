@@ -215,6 +215,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._sliding_window_size = (
             params.sliding_window_size if self.is_swa_enabled else None
         )
+        self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
@@ -2708,6 +2709,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         beliefs = self.storage_existence_cache
         verdicts = operation.query_pool_hit_pages
+        # No rank-agreed KV query evidence; leave beliefs unchanged.
+        if PoolName.KV not in verdicts:
+            return
         folded_pages = operation.storage_hit_count // self.page_size
 
         def verdict(pool: PoolName) -> tuple[int, bool]:
@@ -2852,7 +2856,6 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
-        self._invalidate_absent_from_hit_query(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -3013,13 +3016,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
                 if info is None:
-                    # Request already aborted/cleaned up; still flush the
-                    # query's absent-hash feedback.
-                    self._invalidate_absent_from_hit_query(operation)
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue
@@ -3053,7 +3054,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
-                self._invalidate_absent_from_hit_query(operation)
                 self._account_prefetch_outcome(operation, revoked=False)
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
@@ -3601,17 +3601,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def sliding_window_size(self):
         return self._sliding_window_size
 
-    def swa_reprefill_tail_tokens(self) -> int:
-        """
-        Only unified_kv needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never stored in the tree, so a
-        reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring.
+    def swa_reprefill_tail_tokens(self, req=None) -> int:
+        """Tokens at the end of a matched prefix to re-prefill because their SWA
+        cannot be reused as is.
 
-        Applies to plain radix reuse as well as HiCache -- the ring is stale
-        either way. Returns 0 once SWA has a host pool to restore exact contents
-        from, and for every non-unified_kv layout, whose SWA slots are
-        content-stable.
+        unified_kv keeps SWA in a per-request ring (state_slot/pos) the tree never
+        stores, so a reused window would read another request's stale slots; a
+        host pool restores exact contents instead. Decoder SWA bounded replay
+        writes late-layer window KV only for an extend's tail rows, so a matched
+        prefix may lack it; a streaming turn borrowing its own record has it.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -3620,6 +3618,8 @@ class UnifiedRadixCache(BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0
+        if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
+            return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0
         if self.tree_core.has_swa_host_pool:

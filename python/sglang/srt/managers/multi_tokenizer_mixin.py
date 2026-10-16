@@ -30,7 +30,7 @@ import threading
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import msgspec
 import psutil
@@ -46,6 +46,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ConfigureLoggingReq,
     ContinueGenerationReqInput,
     FreezeGCReq,
     PauseContinueBroadcastReq,
@@ -63,6 +64,7 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.runtime_context import (
     get_disagg,
 )
@@ -515,11 +517,11 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
 
 
 def _split_batch_by_key(
-    output: Any, ipcs: List[Optional[str]], key_fn: Callable[[Optional[str]], Any]
+    output: Any, keys: List[Any]
 ) -> Optional[List[Tuple[Any, Any]]]:
     indices_by_key: Dict[Any, List[int]] = {}
-    for index, ipc_key in enumerate(ipcs):
-        indices_by_key.setdefault(key_fn(ipc_key), []).append(index)
+    for index, key in enumerate(keys):
+        indices_by_key.setdefault(key, []).append(index)
 
     # Build every sub-batch before any send, so a fallback never duplicates one.
     try:
@@ -530,15 +532,18 @@ def _split_batch_by_key(
     except _CannotSplitBatch:
         return None
 
+    ipcs = output.http_worker_ipcs
     for _, sub_output, indices in grouped:
-        sub_output.http_worker_ipcs = [ipcs[index] for index in indices]
+        sub_output.http_worker_ipcs = (
+            None if ipcs is None else [ipcs[index] for index in indices]
+        )
     return [(key, sub_output) for key, sub_output, _ in grouped]
 
 
 def _send_output_to_tokenizer_workers(
     output: Any, ipcs: List[Optional[str]], socket_mapping: SocketMapping
 ) -> None:
-    grouped = _split_batch_by_key(output, ipcs, lambda ipc_name: ipc_name)
+    grouped = _split_batch_by_key(output, ipcs)
     if grouped is None:
         for index, ipc_name in enumerate(ipcs):
             single_output = _handle_output_by_index(output, index)
@@ -716,6 +721,8 @@ class MultiDetokenizerRouter:
     Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
     ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
     always land on the same detokenizer and ``decode_status`` stays consistent.
+    With a single tokenizer worker no ``http_worker_ipc`` is stamped, and the
+    ``rid`` is hashed instead.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -733,22 +740,24 @@ class MultiDetokenizerRouter:
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
 
+    def _pick_for(self, http_worker_ipc: Optional[str], rid: str) -> str:
+        return self._pick(rid if http_worker_ipc is None else http_worker_ipc)
+
     def _send_batch(self, recv_obj: BaseBatchReq) -> None:
         ipcs = recv_obj.http_worker_ipcs
-        assert (
-            ipcs is not None
-            and len(ipcs) == len(recv_obj.rids)
-            and all(x is not None for x in ipcs)
-        ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
+        assert ipcs is not None and len(ipcs) == len(recv_obj.rids), (
+            f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
+        )
+        targets = [self._pick_for(ipc, rid) for ipc, rid in zip(ipcs, recv_obj.rids)]
 
-        grouped = _split_batch_by_key(recv_obj, ipcs, self._pick)
+        grouped = _split_batch_by_key(recv_obj, targets)
         if grouped is None:
-            for index, ipc_key in enumerate(recv_obj.http_worker_ipcs):
+            for index, target in enumerate(targets):
                 one = _handle_output_by_index(recv_obj, index)
                 if one is recv_obj:
                     raise TypeError(f"Cannot split {type(recv_obj)}")
-                one.http_worker_ipcs = [ipc_key]
-                self._send(self._pick(ipc_key), one)
+                one.http_worker_ipcs = [ipcs[index]]
+                self._send(target, one)
             return
 
         for target, output in grouped:
@@ -758,18 +767,20 @@ class MultiDetokenizerRouter:
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
 
-            # FreezeGCReq must freeze every detokenizer process.
-            if isinstance(recv_obj, FreezeGCReq):
+            # Control messages must reach every detokenizer process.
+            if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
                 for ipc in self.ipc_name_list:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own http_worker_ipc.
+            # Single request: route like the batch items of the same rid.
             if isinstance(recv_obj, BaseReq):
-                assert recv_obj.http_worker_ipc is not None, (
-                    f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                assert (
+                    recv_obj.http_worker_ipc is not None or recv_obj.rid is not None
+                ), f"Single req {type(recv_obj).__name__} has no routing key"
+                self._send(
+                    self._pick_for(recv_obj.http_worker_ipc, recv_obj.rid), recv_obj
                 )
-                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
                 continue
 
             # Batch request.
@@ -792,6 +803,8 @@ def run_multi_detokenizer_router_process(
     ipc_name_list: List[str],
     server_args: ServerArgs,
     port_args: PortArgs,
+    *,
+    enable_metrics: bool,
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
@@ -800,6 +813,8 @@ def run_multi_detokenizer_router_process(
 
     router = None
     try:
+        if enable_metrics:
+            start_cpu_monitor_thread("detokenizer_router")
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:
