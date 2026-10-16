@@ -593,6 +593,20 @@ def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.
     return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
 
 
+def async_h2d_stack(
+    tensors: List[torch.Tensor], *, device: torch.device
+) -> torch.Tensor:
+    """``torch.stack(tensors)`` on ``device``; host tensors are stacked straight
+    into pinned memory and copied like ``async_h2d``."""
+    if not tensors[0].is_cpu:
+        return torch.stack(tensors).to(device)
+    pin = is_pin_memory_available(device)
+    out = torch.empty(
+        (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
+    )
+    return torch.stack(tensors, out=out).to(device, non_blocking=pin)
+
+
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
     """Enqueue an accelerator-to-pinned-host copy on the current stream."""
     if tensor.device.type == "cpu":
