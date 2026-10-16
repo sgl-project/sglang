@@ -8,6 +8,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Protocol,
     Tuple,
     Union,
 )
@@ -212,6 +213,35 @@ def maybe_update_reasoning_tokens(
     req.update_reasoning_tokens(next_token_id, think_end_ids)
 
 
+@dataclass(kw_only=True, slots=True)
+class ExtendCommit:
+    """One extend step's host commit as its rows read it: the step, its
+    result in host values, and the cursor into the step's flattened input
+    logprobs, which each row advances past its own."""
+
+    batch: ScheduleBatch
+    result: GenerationBatchResult
+    logits_output: Optional[LogitsProcessorOutput]
+    next_token_ids: List[int]
+    logprob_pt: int = 0
+
+
+class ExtendOutcome(Protocol):
+    """What an extend commit's rows mean in a mode."""
+
+    def conclude(
+        self, commit: ExtendCommit, i: int, req: Req, next_token_id: int
+    ) -> None:
+        """A row whose last launched prefill chunk this step ran."""
+
+    def continue_chunk(self, commit: ExtendCommit, i: int, req: Req) -> None:
+        """The row of the request still chunking."""
+
+    def finish(self, commit: ExtendCommit) -> Optional[List[Req]]:
+        """After the rows: stream, and return the requests that go back to
+        the front of the waiting list."""
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -377,230 +407,97 @@ class SchedulerBatchResultProcessor:
         self.materialize_sampling_mask_output(batch.reqs, logits_output)
         return logits_output, next_token_ids, auxiliary_output_starts
 
+    def commit_extend(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        outcome: ExtendOutcome,
+    ) -> Optional[List[Req]]:
+        """The host commit of a generation extend step, row by row: the row
+        of the request still chunking continues its chunk, every other row
+        concludes. The outcome says what each means in the mode, streams at
+        the end and returns the requests that go back to the front of the
+        waiting list."""
+        self.kv.token_to_kv_pool_allocator.free_group_begin()
+        logits_output, next_token_ids, auxiliary_output_starts = (
+            self.host_prefill_result(batch, result)
+        )
+        self._validate_pp_skip_output_comm(batch, result)
+        commit = ExtendCommit(
+            batch=batch,
+            result=result,
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+        )
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if req is batch.chunked_req:
+                outcome.continue_chunk(commit, i, req)
+            else:
+                outcome.conclude(commit, i, req, next_token_id)
+        if result.auxiliary_host_output is not None:
+            self.consume_auxiliary_output(
+                batch,
+                result.auxiliary_host_output,
+                auxiliary_output_starts,
+            )
+        self.kv.token_to_kv_pool_allocator.free_group_end()
+        return outcome.finish(commit)
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        skip_stream_req = None
-        self.kv.token_to_kv_pool_allocator.free_group_begin()
-
         if self.is_generation:
-            logits_output, next_token_ids, auxiliary_output_starts = (
-                self.host_prefill_result(batch, result)
-            )
-            auxiliary_output = result.auxiliary_host_output
-            extend_input_len_per_req = batch.extend_lens
-            extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
+            return self.commit_extend(batch, result, _PrefillOutcome(self, batch))
 
-            self._validate_pp_skip_output_comm(batch, result)
+        # An embedding or reward model.
+        self.kv.token_to_kv_pool_allocator.free_group_begin()
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
 
-            hidden_state_offset = 0
-            prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
-                batch,
-            )
+        embeddings = self._convert_embeddings(result=result)
+        phs = result.pooled_hidden_states
 
-            # Check finish conditions
-            logprob_pt = 0
-            first_decode_row = len(batch.reqs) - batch.num_decode_rows
+        if phs is not None:
+            if isinstance(phs, list):
+                phs = [t.cpu().detach() for t in phs]
+            else:
+                phs = phs.cpu().detach()
 
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                is_decode_row = i >= first_decode_row
-                should_commit_output = (
-                    not req.finished()
-                    and not req.is_retracted
-                    and req is not batch.chunked_req
-                )
-                # A reason here finishes the request without committing this
-                # forward's output: a failed KV load or an unusable sampling mask.
-                discard_finish_reason = (
-                    req.discard_output_reason if should_commit_output else None
-                )
-                if (
-                    should_commit_output
-                    and discard_finish_reason is None
-                    and req.return_sampling_mask
-                ):
-                    assert logits_output is not None
-                    statuses = logits_output.next_token_sampling_mask_status
-                    status = None if statuses is None else statuses[i]
-                    discard_finish_reason = self.get_sampling_mask_finish_reason(
-                        status=status
-                    )
-                if (
-                    batch.return_hidden_states
-                    and logits_output.hidden_states is not None
-                ):
-                    assert extend_input_len_per_req is not None
-                    hidden_state_offset = self._append_prefill_hidden_states(
-                        req=req,
-                        logits_output=logits_output,
-                        hidden_state_offset=hidden_state_offset,
-                        capture_hidden_mode=prefill_hidden_capture_mode,
-                        extend_input_len=extend_input_len_per_req[i],
-                        store=(should_commit_output and discard_finish_reason is None),
-                    )
+        # Check finish conditions
+        for i, req in enumerate(batch.reqs):
+            if req.is_retracted:
+                continue
 
-                if (
-                    req.finished() and req is not batch.chunked_req
-                ) or req.is_retracted:
-                    # Decode req in a mixed batch, or a retracted req. Keep an
-                    # aborted middle chunk in the chunked branch long enough to
-                    # drain its accounting without streaming it.
-                    continue
+            if req.discard_output_reason is not None and req is not batch.chunked_req:
+                req.to_finish = req.discard_output_reason
+                req.update_finish_state(0)
+                self.request_retirer.retire_finished(req, checkpoint=False)
+                req.time_stats.set_completion_time()
+                continue
 
-                if req is not batch.chunked_req:
-                    req.time_stats.set_prefill_finished_time()
+            req.embedding = embeddings[i]
+            if req.return_pooled_hidden_states and phs is not None:
+                req.pooled_hidden_state = phs[i]
+            if req is not batch.chunked_req:
+                req.time_stats.set_prefill_finished_time()
+                # Dummy output token for embedding models
+                req.output_ids.append(0)
+                req.update_finish_state()
 
-                    if discard_finish_reason is not None:
-                        req.to_finish = discard_finish_reason
-                        req.update_finish_state(0)
-                    elif req.beam_group is not None:
-                        # The relay point already replaced the sampled-token
-                        # append; the group owns all finish semantics.
-                        self.beam_coordinator.commit_prefill(
-                            req, up_to_tick=batch.forward_iter
-                        )
-                    else:
-                        # req output_ids are set here
-                        req.output_ids.append(next_token_id)
-
-                        maybe_update_reasoning_tokens(
-                            self.model_config, req, next_token_id
-                        )
-
-                        req.update_finish_state()
-                    # A mixed spec tail committed its pending bonus token; advance
-                    # so the next spec prepare_for_decode reserves from the right base.
-                    if (
-                        not req.finished()
-                        and is_decode_row
-                        and not batch.spec_algorithm.is_none()
-                    ):
-                        req.kv.commit_decode(1)
-                    if req.finished():
-                        if discard_finish_reason is None:
-                            self._maybe_collect_routed_experts(req)
-                            self._maybe_collect_indexer_topk(req)
-                        self.request_retirer.retire_finished(
-                            req,
-                            checkpoint=discard_finish_reason is None
-                            and not self._mamba_lazy_keep_pending_write(req),
-                        )
-                        req.time_stats.set_completion_time()
-                    elif not is_decode_row:
-                        checkpoint_kv_cache(
-                            req,
-                            self.kv.tree_cache,
-                            publish=not self._mamba_lazy_keep_pending_write(req),
-                        )
-                        if get_memory().enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
-
-                    if discard_finish_reason is None:
-                        self._maybe_collect_customized_info(i, req, logits_output)
-
-                    if batch.return_logprob:
-                        logprob_pt = self._apply_prefill_logprobs(
-                            req=req,
-                            i=i,
-                            logits_output=logits_output,
-                            extend_input_len_per_req=extend_input_len_per_req,
-                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                            next_token_ids=next_token_ids,
-                            logprob_pt=logprob_pt,
-                            store=discard_finish_reason is None,
-                        )
-
-                    if discard_finish_reason is not None:
-                        continue
-
-                    if req.return_sampling_mask:
-                        self.add_sampling_mask_return_values(i, req, logits_output)
-
-                    if req.grammar is not None:
-                        self._apply_prefill_grammar(
-                            req=req,
-                            next_token_id=next_token_id,
-                            already_advanced=result.grammar_advanced,
-                        )
-
-                else:
-                    # being chunked reqs' prefill is not finished
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
-
-                    # Incrementally update input logprobs.
-                    if batch.return_logprob:
-                        logprob_pt = self._apply_chunked_prefill_logprobs(
-                            req=req,
-                            i=i,
-                            logits_output=logits_output,
-                            extend_input_len_per_req=extend_input_len_per_req,
-                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                            logprob_pt=logprob_pt,
-                        )
-
-                    req.time_stats.set_last_chunked_prefill_finish_time()
-
-            if auxiliary_output is not None:
-                self.consume_auxiliary_output(
-                    batch,
-                    auxiliary_output,
-                    auxiliary_output_starts,
-                )
-
-        else:  # embedding or reward model
-            if result.copy_done is not None:
-                result.copy_done.synchronize()
-
-            embeddings = self._convert_embeddings(result=result)
-            phs = result.pooled_hidden_states
-
-            if phs is not None:
-                if isinstance(phs, list):
-                    phs = [t.cpu().detach() for t in phs]
-                else:
-                    phs = phs.cpu().detach()
-
-            # Check finish conditions
-            for i, req in enumerate(batch.reqs):
-                if req.is_retracted:
-                    continue
-
-                if (
-                    req.discard_output_reason is not None
-                    and req is not batch.chunked_req
-                ):
-                    req.to_finish = req.discard_output_reason
-                    req.update_finish_state(0)
-                    self.request_retirer.retire_finished(req, checkpoint=False)
+                if req.finished():
+                    self.request_retirer.retire_finished(req, checkpoint=True)
                     req.time_stats.set_completion_time()
-                    continue
-
-                req.embedding = embeddings[i]
-                if req.return_pooled_hidden_states and phs is not None:
-                    req.pooled_hidden_state = phs[i]
-                if req is not batch.chunked_req:
-                    req.time_stats.set_prefill_finished_time()
-                    # Dummy output token for embedding models
-                    req.output_ids.append(0)
-                    req.update_finish_state()
-
-                    if req.finished():
-                        self.request_retirer.retire_finished(req, checkpoint=True)
-                        req.time_stats.set_completion_time()
-                    else:
-                        checkpoint_kv_cache(req, self.kv.tree_cache)
                 else:
-                    # being chunked reqs' prefill is not finished
-                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    checkpoint_kv_cache(req, self.kv.tree_cache)
+            else:
+                # being chunked reqs' prefill is not finished
+                req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.kv.token_to_kv_pool_allocator.free_group_end()
         self.services.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            batch.reqs, batch.return_logprob, None
         )
 
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
@@ -652,19 +549,13 @@ class SchedulerBatchResultProcessor:
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
                 ]
 
-    def _apply_prefill_logprobs(
-        self,
-        *,
-        req: Req,
-        i: int,
-        logits_output: LogitsProcessorOutput,
-        extend_input_len_per_req: Optional[List[int]],
-        extend_logprob_start_len_per_req: Optional[List[int]],
-        next_token_ids: List[int],
-        logprob_pt: int,
-        store: bool = True,
-    ) -> int:
-        """Advance the logprob cursor, optionally storing this request's values."""
+    def apply_prefill_logprobs(
+        self, commit: ExtendCommit, i: int, req: Req, *, store: bool = True
+    ) -> None:
+        """Advance the logprob cursor past a concluded row, optionally storing
+        this request's values."""
+        extend_logprob_start_len_per_req = commit.batch.extend_logprob_start_lens
+        extend_input_len_per_req = commit.batch.extend_lens
         assert extend_logprob_start_len_per_req is not None
         assert extend_input_len_per_req is not None
         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -680,13 +571,12 @@ class SchedulerBatchResultProcessor:
             self.logprob_result_processor.add_logprob_return_values(
                 i,
                 req,
-                logprob_pt,
-                next_token_ids,
+                commit.logprob_pt,
+                commit.next_token_ids,
                 num_input_logprobs,
-                logits_output,
+                commit.logits_output,
             )
-        logprob_pt += num_input_logprobs
-        return logprob_pt
+        commit.logprob_pt += num_input_logprobs
 
     @staticmethod
     def _validate_pp_skip_output_comm(
@@ -820,18 +710,13 @@ class SchedulerBatchResultProcessor:
                 req.to_finish = FINISH_ABORT()
         req.grammar.finished = req.finished()
 
-    def _apply_chunked_prefill_logprobs(
-        self,
-        *,
-        req: Req,
-        i: int,
-        logits_output: LogitsProcessorOutput,
-        extend_input_len_per_req: Optional[List[int]],
-        extend_logprob_start_len_per_req: Optional[List[int]],
-        logprob_pt: int,
-    ) -> int:
-        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-        extend_input_len = extend_input_len_per_req[i]
+    def apply_chunked_prefill_logprobs(
+        self, commit: ExtendCommit, i: int, req: Req
+    ) -> None:
+        """Advance the logprob cursor past a continuing chunk's row, storing
+        its input logprobs."""
+        extend_logprob_start_len = commit.batch.extend_logprob_start_lens[i]
+        extend_input_len = commit.batch.extend_lens[i]
         if extend_logprob_start_len < extend_input_len:
             # Update input logprobs.
             num_input_logprobs = (
@@ -845,13 +730,12 @@ class SchedulerBatchResultProcessor:
                 self.logprob_result_processor.add_input_logprob_return_values(
                     i,
                     req,
-                    logits_output,
-                    logprob_pt,
+                    commit.logits_output,
+                    commit.logprob_pt,
                     num_input_logprobs,
                     last_prefill_chunk=False,
                 )
-            logprob_pt += num_input_logprobs
-        return logprob_pt
+            commit.logprob_pt += num_input_logprobs
 
     def _resolve_spec_v2_tokens(
         self,
@@ -1300,6 +1184,15 @@ class SchedulerBatchResultProcessor:
         output.next_token_sampling_mask_status = status_by_batch
         output.sampling_mask_output = None
 
+    def sampling_mask_finish_reason(
+        self, commit: ExtendCommit, i: int
+    ) -> Optional[FINISH_ABORT]:
+        """The finish reason an unusable sampling mask gives row i, or None."""
+        assert commit.logits_output is not None
+        statuses = commit.logits_output.next_token_sampling_mask_status
+        status = None if statuses is None else statuses[i]
+        return self.get_sampling_mask_finish_reason(status=status)
+
     def get_sampling_mask_finish_reason(
         self,
         *,
@@ -1534,3 +1427,143 @@ class SchedulerBatchResultProcessor:
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
+
+
+class _PrefillOutcome:
+    """Normal prefill: a concluded row takes its token, then finishes or
+    checkpoints; every row but the chunked request's streams."""
+
+    def __init__(self, processor: SchedulerBatchResultProcessor, batch: ScheduleBatch):
+        self.processor = processor
+        self.first_decode_row = len(batch.reqs) - batch.num_decode_rows
+        self.capture_hidden_mode = processor._get_prefill_hidden_capture_mode(batch)
+        self.hidden_state_offset = 0
+        self.skip_stream_req = None
+
+    def _capture_hidden_states(
+        self, commit: ExtendCommit, i: int, req: Req, *, store: bool
+    ) -> None:
+        if (
+            commit.batch.return_hidden_states
+            and commit.logits_output.hidden_states is not None
+        ):
+            assert commit.batch.extend_lens is not None
+            self.hidden_state_offset = self.processor._append_prefill_hidden_states(
+                req=req,
+                logits_output=commit.logits_output,
+                hidden_state_offset=self.hidden_state_offset,
+                capture_hidden_mode=self.capture_hidden_mode,
+                extend_input_len=commit.batch.extend_lens[i],
+                store=store,
+            )
+
+    def conclude(
+        self, commit: ExtendCommit, i: int, req: Req, next_token_id: int
+    ) -> None:
+        processor = self.processor
+        batch = commit.batch
+        logits_output = commit.logits_output
+        is_decode_row = i >= self.first_decode_row
+        should_commit_output = not req.finished() and not req.is_retracted
+        # A reason here finishes the request without committing this
+        # forward's output: a failed KV load or an unusable sampling mask.
+        discard_finish_reason = (
+            req.discard_output_reason if should_commit_output else None
+        )
+        if (
+            should_commit_output
+            and discard_finish_reason is None
+            and req.return_sampling_mask
+        ):
+            discard_finish_reason = processor.sampling_mask_finish_reason(commit, i)
+        self._capture_hidden_states(
+            commit,
+            i,
+            req,
+            store=should_commit_output and discard_finish_reason is None,
+        )
+
+        if req.finished() or req.is_retracted:
+            # Decode req in a mixed batch, or a retracted req.
+            return
+
+        req.time_stats.set_prefill_finished_time()
+
+        if discard_finish_reason is not None:
+            req.to_finish = discard_finish_reason
+            req.update_finish_state(0)
+        elif req.beam_group is not None:
+            # The relay point already replaced the sampled-token
+            # append; the group owns all finish semantics.
+            processor.beam_coordinator.commit_prefill(
+                req, up_to_tick=batch.forward_iter
+            )
+        else:
+            # req output_ids are set here
+            req.output_ids.append(next_token_id)
+
+            maybe_update_reasoning_tokens(processor.model_config, req, next_token_id)
+
+            req.update_finish_state()
+        # A mixed spec tail committed its pending bonus token; advance
+        # so the next spec prepare_for_decode reserves from the right base.
+        if not req.finished() and is_decode_row and not batch.spec_algorithm.is_none():
+            req.kv.commit_decode(1)
+        if req.finished():
+            if discard_finish_reason is None:
+                processor._maybe_collect_routed_experts(req)
+                processor._maybe_collect_indexer_topk(req)
+            processor.request_retirer.retire_finished(
+                req,
+                checkpoint=discard_finish_reason is None
+                and not processor._mamba_lazy_keep_pending_write(req),
+            )
+            req.time_stats.set_completion_time()
+        elif not is_decode_row:
+            checkpoint_kv_cache(
+                req,
+                processor.kv.tree_cache,
+                publish=not processor._mamba_lazy_keep_pending_write(req),
+            )
+            if get_memory().enable_hisparse:
+                processor.hisparse_coordinator.admit_request_into_staging(req)
+
+        if discard_finish_reason is None:
+            processor._maybe_collect_customized_info(i, req, logits_output)
+
+        if batch.return_logprob:
+            processor.apply_prefill_logprobs(
+                commit, i, req, store=discard_finish_reason is None
+            )
+
+        if discard_finish_reason is not None:
+            return
+
+        if req.return_sampling_mask:
+            processor.add_sampling_mask_return_values(i, req, logits_output)
+
+        if req.grammar is not None:
+            processor._apply_prefill_grammar(
+                req=req,
+                next_token_id=next_token_id,
+                already_advanced=commit.result.grammar_advanced,
+            )
+
+    def continue_chunk(self, commit: ExtendCommit, i: int, req: Req) -> None:
+        self._capture_hidden_states(commit, i, req, store=False)
+        if req.is_retracted:
+            return
+        # Its prefill is not finished, so it does not stream. An aborted
+        # middle chunk still comes here, to drain its logprob accounting.
+        self.skip_stream_req = req
+
+        # Incrementally update input logprobs.
+        if commit.batch.return_logprob:
+            self.processor.apply_chunked_prefill_logprobs(commit, i, req)
+
+        req.time_stats.set_last_chunked_prefill_finish_time()
+
+    def finish(self, commit: ExtendCommit) -> None:
+        self.processor.services.output_streamer.stream_output(
+            commit.batch.reqs, commit.batch.return_logprob, self.skip_stream_req
+        )
