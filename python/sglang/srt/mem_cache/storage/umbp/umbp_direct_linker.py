@@ -991,6 +991,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self._offload_results.get_nowait()
 
+    def restores_swa(self) -> bool:
+        return PoolName.SWA in self.pools
+
     def reset(self) -> None:
         self._pending.clear()
         self._load_queue.join()

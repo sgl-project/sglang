@@ -273,8 +273,11 @@ def _build_deepseek_v4_device_pool_group(
 
     mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    # Encoder SWA replay keeps the target window per request; the draft SWA is
+    # dropped with it, a known draft accept-length cost.
+    has_paged_swa = not is_unified_kv and kvcache.swa_kv_pool is not None
     entries = []
-    if not is_unified_kv:
+    if has_paged_swa:
         _require_single_row_dsv4_swa_pages(
             logical_page_size=kvcache.swa_page_size,
             physical_page_size=kvcache.swa_kv_pool.page_size,
@@ -388,6 +391,13 @@ def _build_deepseek_v4_device_pool_group(
                 mappings.c4_state_global_layers,
             ),
             mappings.c4_state,
+        )
+    if not has_paged_swa and any(
+        entry.indices_from_pool == PoolName.SWA for entry in entries
+    ):
+        raise ValueError(
+            "DeepSeek-V4 compress state pools take SWA page indices, which "
+            "encoder SWA replay does not keep."
         )
     return DevicePoolGroup(
         entries,

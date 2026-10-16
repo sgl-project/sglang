@@ -416,6 +416,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def pop_completed_offload(self) -> bool:
         return self.offload_results.get_nowait()
 
+    def restores_swa(self) -> bool:
+        return PoolName.SWA in self.pools
+
     def reset(self) -> None:
         self.pending_loads.clear()
         self.load_queue.join()
