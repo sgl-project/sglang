@@ -157,14 +157,17 @@ class Step5MLP(nn.Module):
             input_is_parallel=True,
             params_dtype=torch.bfloat16,
             quant_config=None,
-            reduce_results=use_dp_attention_reduce,
+            # A dense MLP reduces its own TP partials unless the layer boundary
+            # defers the sum to the next layer (RowParallelLinear honors that
+            # scope); a shared expert's partial joins the routed experts' sum.
+            reduce_results=role == "dense" or use_dp_attention_reduce,
             use_dp_attention_reduce=use_dp_attention_reduce,
             prefix=add_prefix("down_proj", prefix),
             parallel_group="attn_tp",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return BF16 partials for stage boundaries, or summed DP-local output."""
+        """Return the summed output, or BF16 partials where the boundary defers the sum."""
         gate_up, _ = self.gate_up_proj(hidden_states)
         activation = self.act_fn(gate_up)
         output, _ = self.down_proj(activation)
