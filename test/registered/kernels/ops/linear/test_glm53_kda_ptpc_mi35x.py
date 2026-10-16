@@ -179,7 +179,9 @@ class TestGLM53KDAPTPC(CustomTestCase):
             {4: (6144, 16), 8: (3072, 8)}.items(), (False, True)
         ):
             fg_size = 256
-            fp8_rows = qkv_size + beta_size + fg_size if fp8_beta else qkv_size + fg_size
+            fp8_rows = (
+                qkv_size + beta_size + fg_size if fp8_beta else qkv_size + fg_size
+            )
             fp8_rows = (fp8_rows + 15) // 16 * 16
             w8a16_configs = (
                 GLM53_KDA_W8A16_DECODE_CONFIGS[(fp8_rows, 4096)] if fp8_beta else None
