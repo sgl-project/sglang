@@ -231,6 +231,10 @@ class PythonicDetector(BaseFormatDetector):
                 f"Constant has no JSON representation: {type(val.value).__name__}"
             )
         elif isinstance(val, ast.Dict):
+            # Dict unpacking has a None key; names and expressions are not
+            # literal keys. Reject them within the per-call error handler.
+            if any(not isinstance(key, ast.Constant) for key in val.keys):
+                raise ValueError("Tool call dictionary keys must be literals")
             return {
                 k.value: self._get_parameter_value(v)
                 for k, v in zip(val.keys, val.values)
