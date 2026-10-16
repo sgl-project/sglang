@@ -27,19 +27,6 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     baseline_allocated_bytes: int
     peak_allocated_bytes: int
     succeeded: bool
-    peak_reserved_bytes: int = 0
-    phase_peak_allocated_bytes: dict[str, int] = {}
-    phase_active_components: dict[str, tuple[str, ...]] = {}
-    phase_used_components: dict[str, tuple[str, ...]] = {}
-    phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
-    layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] = {}
-    layerwise_layer_uses_by_stage: dict[str, dict[str, dict[str, tuple[int, ...]]]] = {}
-    num_inference_steps: int = 1
-    total_duration_ms: float = 0.0
-    stage_duration_ms: dict[str, float] = {}
-    step_duration_ms: tuple[float, ...] = ()
-    step_duration_ms_by_stage: dict[str, tuple[float, ...]] = {}
-    stage_iterations: dict[str, tuple[int, int]] = {}
 
     def workload_units(self) -> int:
         return max(1, self.width) * max(1, self.height) * max(1, self.num_frames)

@@ -12,9 +12,6 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     _deserialize_request_metrics,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    WarmupPhasePeak,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
@@ -291,20 +288,11 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     worker._auto_residency_warmup_records = []
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
+        "0:denoise:use:transformer": 8
     }
-    residency_manager.current_device_components.return_value = ("transformer",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 9
     device_module.max_memory_reserved.return_value = 12
-    req = SimpleNamespace(
-        width=64,
-        height=64,
-        num_frames=1,
-        num_inference_steps=1,
-        metrics=None,
-    )
-
     with (
         patch.object(torch, "get_device_module", return_value=device_module),
         patch.object(
@@ -314,19 +302,14 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
         ),
     ):
         worker._record_server_warmup_memory(
-            req=req,
-            workload=(128, 96, 9, 2),
+            workload=(128, 96, 9),
             baseline_allocated_bytes=3,
             succeeded=True,
         )
 
     record = worker._auto_residency_warmup_records[0]
     assert record.peak_allocated_bytes == 9
-    assert record.peak_reserved_bytes == 12
     assert (record.width, record.height, record.num_frames) == (128, 96, 9)
-    assert record.num_inference_steps == 2
-    assert record.phase_peak_allocated_bytes["request:untracked"] == 9
-    assert record.phase_active_components["request:untracked"] == ("transformer",)
 
 
 def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory():
@@ -334,20 +317,11 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
     worker._auto_residency_warmup_records = []
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
+        "0:denoise:use:transformer": 8
     }
-    residency_manager.current_device_components.return_value = ("transformer",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 8
     device_module.max_memory_reserved.return_value = 12
-    req = SimpleNamespace(
-        width=64,
-        height=64,
-        num_frames=1,
-        num_inference_steps=1,
-        metrics=None,
-    )
-
     with (
         patch.object(torch, "get_device_module", return_value=device_module),
         patch.object(
@@ -357,14 +331,13 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
         ),
     ):
         worker._record_server_warmup_memory(
-            req=req,
-            workload=(64, 64, 1, 1),
+            workload=(64, 64, 1),
             baseline_allocated_bytes=3,
             succeeded=True,
         )
 
     record = worker._auto_residency_warmup_records[0]
-    assert "request:untracked" not in record.phase_peak_allocated_bytes
+    assert record.peak_allocated_bytes == 8
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
