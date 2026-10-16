@@ -68,6 +68,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_data_parallelism",
         "handle_load_balance_method",
         "handle_context_parallelism",
+        "apply_prefill_cp_cuda_graph_default",
         "handle_kv_cache_sharding",
         "handle_moe_kernel_config",
         "handle_a2a_moe",
@@ -92,6 +93,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_debug_utils",
         "handle_other_validations",
         "handle_model_capability_adjustments",
+        "handle_monokernel",
         "validate_deepep_v2_speculative_draft",
         "validate_deepep_v2_dispatch_token_budget",
     }

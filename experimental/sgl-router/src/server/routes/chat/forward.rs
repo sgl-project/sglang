@@ -192,7 +192,7 @@ async fn dispatch<T: Transport>(
     let decode_rank = decode
         .as_deref()
         .filter(|_| dp_aware)
-        .and_then(|decode| select_dp_rank(decode, None, &[]));
+        .and_then(|decode| select_dp_rank(decode, None, &[], ctx.config.model.dp_rank_policy));
 
     // Track worker occupancy and the prompt's contribution to active load.
     let worker_load_guard = if track_dispatch_timestamps {
@@ -245,7 +245,14 @@ async fn dispatch<T: Transport>(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let prefill_leg = Leg::new(dp_aware, headers.clone(), &body, &additions, prefill_rank);
+    let prefill_leg = Leg::new(
+        dp_aware,
+        headers.clone(),
+        &body,
+        &additions,
+        prefill_rank,
+        None,
+    );
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -278,7 +285,14 @@ async fn dispatch<T: Transport>(
                 ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let decode_leg = Leg::new(dp_aware, headers, &body, &additions, decode_rank);
+            let decode_leg = Leg::new(
+                dp_aware,
+                headers,
+                &body,
+                &additions,
+                decode_rank,
+                prefill_rank,
+            );
             (
                 decode,
                 decode_leg,
@@ -394,8 +408,9 @@ impl Leg {
         body: &Bytes,
         additions: &Additions,
         rank: Option<u32>,
+        prefill_rank: Option<u32>,
     ) -> Self {
-        let (headers, body) = with_dp_rank(dp_aware, headers, body, rank);
+        let (headers, body) = with_dp_rank(dp_aware, headers, body, rank, prefill_rank);
         let routed_dp_rank = dp_aware.then_some(rank);
         let additions = Additions {
             routed_dp_rank,
@@ -609,19 +624,23 @@ fn prompt_dp_rank(
         .flatten()
         .find_map(|name| nonempty_header(headers, name));
     let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
-        (None, Some(provider), Some(tokens)) => provider.rank_depths(&tokens.ids, &worker.url),
+        (None, Some(provider), Some(tokens)) => {
+            provider.rank_depths(&tokens.ids, &request.cache_namespace, &worker.url)
+        }
         _ => Vec::new(),
     };
-    select_dp_rank(worker, key, &prefix_depths)
+    select_dp_rank(worker, key, &prefix_depths, model.dp_rank_policy)
 }
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
 /// the body, which `/generate` reads instead, carries it or null to unpin.
+/// Decode's body also names the pinned prefill rank, so decode need not look it up.
 fn with_dp_rank(
     dp_aware: bool,
     mut headers: HeaderMap,
     body: &Bytes,
     rank: Option<u32>,
+    prefill_rank: Option<u32>,
 ) -> (HeaderMap, Bytes) {
     if !dp_aware {
         return (headers, body.clone());
@@ -630,10 +649,11 @@ fn with_dp_rank(
         headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
     }
     let rank = rank.map_or_else(|| "null".to_owned(), |rank| rank.to_string());
-    let fields = [
+    let mut fields = vec![
         ("routed_dp_rank", rank),
         ("data_parallel_rank", "null".into()),
     ];
+    fields.extend(prefill_rank.map(|rank| ("disagg_prefill_dp_rank", rank.to_string())));
     let body = append_fields(body, &fields).unwrap_or_else(|| body.clone());
     (headers, body)
 }

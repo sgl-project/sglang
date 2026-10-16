@@ -56,6 +56,7 @@ class PoolName(str, Enum):
     KV = "kv"
     MAMBA = "mamba"
     SWA = "swa"
+    AUXILIARY_SWA = "auxiliary_swa"
     INDEXER = "indexer"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.

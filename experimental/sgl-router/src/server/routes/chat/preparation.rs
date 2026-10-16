@@ -12,6 +12,7 @@ use crate::proxy::grpc::{sampling_value, RoutingView};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
+use crate::state::kv_events::CacheNamespace;
 use crate::tokenizer::ForwardingScope;
 use axum::http::HeaderMap;
 use bytes::Bytes;
@@ -34,6 +35,52 @@ pub(super) const EMBEDDINGS_PATH: &str = "/v1/embeddings";
 pub(super) const CLASSIFY_PATH: &str = "/v1/classify";
 pub(super) const RERANK_PATH: &str = "/v1/rerank";
 
+/// The engine's KV namespace for a request on `path`, from the fields SGLang
+/// reads there: `model: "base:adapter"` (OpenAI routes) wins over `lora_path`,
+/// and only generation honors `cache_salt`.
+pub(super) fn cache_namespace(path: &str, body: &Value) -> CacheNamespace {
+    let openai = matches!(path, CHAT_PATH | COMPLETIONS_PATH | EMBEDDINGS_PATH);
+    let generates = matches!(path, CHAT_PATH | COMPLETIONS_PATH | GENERATE_PATH);
+    let model_adapter = body["model"]
+        .as_str()
+        .filter(|_| openai)
+        .and_then(|model| model.split_once(':'))
+        .map(|(_, adapter)| adapter.trim())
+        .filter(|adapter| !adapter.is_empty())
+        .map(str::to_owned);
+    let lora_name = match model_adapter {
+        Some(adapter) => Ok(Some(adapter)),
+        None if openai || generates => namespace_field(&body["lora_path"]),
+        None => Ok(None),
+    };
+    let cache_salt = match generates {
+        true => namespace_field(&body["cache_salt"]),
+        false => Ok(None),
+    };
+    match (lora_name, cache_salt) {
+        (Ok(lora_name), Ok(cache_salt)) => CacheNamespace {
+            cache_salt,
+            lora_name,
+            ambiguous: false,
+        },
+        _ => CacheNamespace {
+            ambiguous: true,
+            ..CacheNamespace::default()
+        },
+    }
+}
+
+/// A namespace field's value; `Err` when a per-prompt list names several.
+/// A uniform list counts as its one value, as SGLang normalizes it.
+fn namespace_field(value: &Value) -> Result<Option<String>, ()> {
+    let value = match value {
+        Value::Array(items) if items.windows(2).any(|pair| pair[0] != pair[1]) => return Err(()),
+        Value::Array(items) => items.first().unwrap_or(&Value::Null),
+        value => value,
+    };
+    Ok(value.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+}
+
 /// Validated routing inputs and the original body, ready for worker selection.
 ///
 /// Each `/generate` prompt and `n` sample is its own engine request: input and output
@@ -47,6 +94,8 @@ pub(super) struct PreparedRequest {
     pub(super) output_tokens: Option<u64>,
     pub(super) body: Bytes,
     pub(super) tokens: Option<RequestTokens>,
+    /// The engine KV namespace `tokens` are cached under.
+    pub(super) cache_namespace: CacheNamespace,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
     /// The longest prompt, for bucket and context checks.
@@ -185,6 +234,10 @@ impl PreparedRequest {
                 .map(|output| (input_tokens as u64).saturating_add(output)),
             body,
             tokens,
+            cache_namespace: parsed_body
+                .as_ref()
+                .map(|body| cache_namespace(path, body))
+                .unwrap_or_default(),
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults)
                 || (path == COMPLETIONS_PATH && fields.prompt_batch),
@@ -251,6 +304,7 @@ impl PreparedRequest {
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
+            cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
             sampling_defaults,
         })
@@ -338,6 +392,7 @@ impl PreparedRequest {
             }),
             body,
             tokens,
+            cache_namespace: cache_namespace(GENERATE_PATH, &value),
             caller_set_rid: !value["rid"].is_null(),
             fans_out,
             input_ids_forwarding: None,
@@ -385,6 +440,7 @@ impl PreparedRequest {
             });
         Ok(Self {
             tokens,
+            cache_namespace: cache_namespace(path, &value),
             caller_set_rid: !value["rid"].is_null(),
             fans_out: batch,
             ..Self::no_output(path, model, body, &lengths)
@@ -463,6 +519,7 @@ impl PreparedRequest {
             forwarding_booked: false,
             responder: None,
             parsed_body: None,
+            cache_namespace: CacheNamespace::default(),
             sampling_defaults,
         })
     }
@@ -489,6 +546,7 @@ impl PreparedRequest {
             expected_peak_sequence_tokens: Some(sequence_tokens as u64),
             body,
             tokens: None,
+            cache_namespace: CacheNamespace::default(),
             caller_set_rid: false,
             fans_out: false,
             input_ids_forwarding: None,
@@ -2617,5 +2675,34 @@ mod tests {
             .unwrap();
             assert_eq!(requests_multiple_samples(&fields, &defaults), fan_out);
         }
+    }
+
+    #[test]
+    fn cache_namespace_follows_sglang_resolution_per_route() {
+        let ns = |path: &str, body: Value| {
+            let ns = cache_namespace(path, &body);
+            (ns.cache_salt, ns.lora_name, ns.ambiguous)
+        };
+        let some = |s: &str| Some(s.to_owned());
+        let body = json!({"model": "m: b ", "lora_path": "a", "cache_salt": "t"});
+        // `model: base:adapter` wins on OpenAI routes; only generation is salted.
+        assert_eq!(ns(CHAT_PATH, body.clone()), (some("t"), some("b"), false));
+        assert_eq!(
+            ns(COMPLETIONS_PATH, body.clone()),
+            (some("t"), some("b"), false)
+        );
+        assert_eq!(
+            ns(GENERATE_PATH, body.clone()),
+            (some("t"), some("a"), false)
+        );
+        assert_eq!(ns(EMBEDDINGS_PATH, body.clone()), (None, some("b"), false));
+        assert_eq!(ns(CLASSIFY_PATH, body), (None, None, false));
+        // Empty values mean none; a per-prompt list counts when uniform.
+        let empty = json!({"model": "m:", "lora_path": "", "cache_salt": ""});
+        assert_eq!(ns(CHAT_PATH, empty), (None, None, false));
+        let uniform = json!({"lora_path": ["a", "a"], "cache_salt": ["t"]});
+        assert_eq!(ns(GENERATE_PATH, uniform), (some("t"), some("a"), false));
+        let mixed = json!({"lora_path": ["a", "b"]});
+        assert_eq!(ns(GENERATE_PATH, mixed), (None, None, true));
     }
 }
