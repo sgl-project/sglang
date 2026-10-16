@@ -82,6 +82,41 @@ response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embeddings:", [x.get("embedding") for x in response.get("data", [])])
 ```
 
+## Audio Embedding via an External Model Package
+
+The [external model package hooks](./support_new_models#serving-external-models-via-the-standard-cli)
+also work for embedding models, which lets a pip package serve architectures SGLang does
+not carry in-tree. One worked example is
+[`EximiusLabs/fusion-embedding-2-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-2-2b-preview),
+a multimodal embedding model that places text, images, video and audio in one 2048-d
+space. Its plugin registers through an `sglang.srt.plugins` entry point, so after a pip
+install the standard launch command works with no source changes:
+
+```bash
+pip install sglang==0.5.16 'fusion-embedding[sense]'
+
+python -m sglang.launch_server \
+  --model-path EximiusLabs/fusion-embedding-2-2b-preview \
+  --is-embedding
+```
+
+Text goes through `/v1/embeddings` as usual. Audio uses the offline engine with
+`audio_data` (one clip per request):
+
+```python
+import sglang as sgl
+
+engine = sgl.Engine(model_path="EximiusLabs/fusion-embedding-2-2b-preview",
+                    is_embedding=True)
+
+out = engine.encode("<|vision_pad|><|im_end|>", audio_data=["clip.wav"])
+print(len(out[0]["embedding"]))  # 2048
+```
+
+The plugin's repository documents the prompt formats per modality and its parity
+harness against the reference implementation:
+[fusion_embedding/sglang_plugin](https://github.com/Eximius-Labs/fusion-embedding/tree/main/fusion_embedding/sglang_plugin).
+
 ## Matryoshka Embedding Example
 
 [Matryoshka Embeddings](https://sbert.net/examples/sentence_transformer/training/matryoshka/README.html#matryoshka-embeddings) or [Matryoshka Representation Learning (MRL)](https://arxiv.org/abs/2205.13147) is a technique used in training embedding models. It allows user to trade off between performance and cost.
@@ -184,6 +219,12 @@ print("Embedding:", response["data"][0]["embedding"])
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`openai/clip-vit-large-patch14-336`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>OpenAI's CLIP for image and text embeddings</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Fusion Embedding 2 (Multimodal, external package)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`EximiusLabs/fusion-embedding-2-2b-preview`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Text, image, video and audio in one embedding space; served through the external model package hooks via <code>pip install 'fusion-embedding[sense]'</code> (see the audio section above)</td>
     </tr>
   </tbody>
 </table>
