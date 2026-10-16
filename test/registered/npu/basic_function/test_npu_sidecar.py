@@ -139,7 +139,6 @@ class TestSidecar(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--disable-cuda-graph",
-            "--disable-piecewise-cuda-graph",
         ]
         cls.out_log_file = open(OUT_LOG_PATH, "w+", encoding="utf-8")
         cls.err_log_file = open(ERR_LOG_PATH, "w+", encoding="utf-8")
