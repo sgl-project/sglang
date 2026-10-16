@@ -360,9 +360,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         not cfg.disable_decoder_bounded_replay
         and (get_platform().is_cuda or get_platform().is_hip)
         and cfg.disaggregation_mode == "null"
-        and not cfg.enable_prefill_cp
-        and cfg.attn_cp_size == 1
-        and cfg.dcp_size == 1
+        and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
         and not any(enabled for _, enabled in incompatible)
     )
     declare_resolution(
