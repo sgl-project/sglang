@@ -26,6 +26,10 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import (
+    _controller_mla_dedup_enabled,
+    _controller_skips_mla_host_io,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -258,7 +262,7 @@ class HybridCacheController(BaseHiCacheController):
         ):
             self.transfer_layer_id_max = transfer_layer_id_max
             self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
-            if self.mla_dedup_enabled:
+            if _controller_mla_dedup_enabled(self):
                 raise RuntimeError(
                     "MLA host dedup cannot use a hybrid transfer-layer count "
                     f"({self.transfer_layer_id_max}) different from the target."
@@ -312,7 +316,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
-        if self.mla_dedup_enabled and any(
+        if _controller_mla_dedup_enabled(self) and any(
             entry.name in (PoolName.DRAFT, PoolName.DRAFT_INDEXER, PoolName.DRAFT_SWA)
             for entry in host_pools or []
         ):
@@ -375,7 +379,7 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         if (
-            self.mla_dedup_enabled
+            _controller_mla_dedup_enabled(self)
             and self.enable_storage
             and entry.name
             in (PoolName.DRAFT, PoolName.DRAFT_INDEXER, PoolName.DRAFT_SWA)
@@ -1012,7 +1016,7 @@ class HybridCacheController(BaseHiCacheController):
         return num_bytes
 
     def _mla_transfer_num_bytes(self, op: CacheOperation) -> int:
-        if not self._mla_skip_host_io:
+        if not _controller_skips_mla_host_io(self):
             return self._transfer_num_bytes(op)
 
         kv_tokens = len(op.device_indices)
@@ -1497,8 +1501,13 @@ class HybridCacheController(BaseHiCacheController):
             operation.query_pool_hit_pages = {}
             return hash_value, kv_hit_pages * self.page_size
 
-        if self._mla_skip_host_io:
-            return hash_value, len(hash_value) * self.page_size
+        if _controller_skips_mla_host_io(self):
+            hit_pages = len(hash_value)
+            operation.pool_storage_result.update_kv_hit_pages(hit_pages)
+            operation.query_pool_hit_pages = {PoolName.KV: hit_pages}
+            for transfer in operation.pool_transfers or ():
+                operation.query_pool_hit_pages[transfer.name] = hit_pages
+            return hash_value, hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
@@ -1548,12 +1557,14 @@ class HybridCacheController(BaseHiCacheController):
             self.prefetch_hits_sync_groups,
         )
         reduced = packed.tolist()
+        storage_hit_count = int(reduced[0])
+        operation.pool_storage_result.kv_hit_pages = storage_hit_count // self.page_size
         operation.query_pool_hit_pages = {
             pool: pages
             for pool, pages in zip(pools, reduced[1:], strict=True)
             if pages != _NO_POOL_VERDICT
         }
-        return int(reduced[0])
+        return storage_hit_count
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool
@@ -1619,7 +1630,7 @@ class HybridCacheController(BaseHiCacheController):
         # data misalignment.
         pool_hits: dict[str, int] = {}
         if (
-            not self._mla_skip_host_io
+            not _controller_skips_mla_host_io(self)
             and not operation.is_terminated()
             and kv_completed_pages == len(operation.hash_value)
         ):

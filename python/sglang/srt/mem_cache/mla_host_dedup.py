@@ -253,9 +253,10 @@ def maybe_create_mla_host_dedup_context(
     tp_group: torch.distributed.ProcessGroup,
     attn_cp_group: Optional[torch.distributed.ProcessGroup],
     attn_tp_group: Optional[torch.distributed.ProcessGroup],
-    pp_group: Optional[torch.distributed.ProcessGroup],
     storage_backend: Optional[str],
     enabled: bool = False,
+    *,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Optional[MLAHostDedupContext]:
     """Create dedup state before host allocation, or preserve the original path."""
     if not enabled:

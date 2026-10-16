@@ -181,6 +181,9 @@ class TestHiCacheMLADedupIntegration(unittest.TestCase):
             def record(self):
                 pass
 
+            def wait(self, stream):
+                pass
+
         class Stream:
             def synchronize(self):
                 operations.append(("sync", None))

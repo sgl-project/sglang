@@ -55,6 +55,15 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _controller_mla_dedup_enabled(controller) -> bool:
+    return getattr(controller, "mla_dedup", None) is not None
+
+
+def _controller_skips_mla_host_io(controller) -> bool:
+    context = getattr(controller, "mla_dedup", None)
+    return context is not None and getattr(context, "is_dummy_rank", False) is True
+
+
 def storage_model_name(
     model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
 ) -> Optional[str]:
@@ -399,14 +408,11 @@ class HiCacheController:
 
     @property
     def mla_dedup_enabled(self) -> bool:
-        return getattr(self, "mla_dedup", None) is not None
+        return _controller_mla_dedup_enabled(self)
 
     @property
     def _mla_skip_host_io(self) -> bool:
-        return (
-            getattr(self, "mla_dedup", None) is not None
-            and self.mla_dedup.is_dummy_rank
-        )
+        return _controller_skips_mla_host_io(self)
 
     def set_producer_stream(self, stream) -> None:
         if getattr(self, "mla_dedup", None) is not None:
@@ -575,7 +581,9 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
-        if self.mla_dedup_enabled and not storage_supports_host_dedup(storage_backend):
+        if _controller_mla_dedup_enabled(self) and not storage_supports_host_dedup(
+            storage_backend
+        ):
             raise RuntimeError(
                 "Cannot attach storage backend "
                 f"{storage_backend!r} while MLA host dedup is active; "
@@ -879,7 +887,7 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        if not self.mla_dedup_enabled:
+        if not _controller_mla_dedup_enabled(self):
             host_indices, device_indices, pool_transfers = self._move_write_operation(
                 op
             )
@@ -936,7 +944,9 @@ class HiCacheController:
         return len(op.device_indices) * self.mem_pool_host.size_per_token
 
     def _mla_transfer_num_bytes(self, op: CacheOperation) -> int:
-        return 0 if self._mla_skip_host_io else self._transfer_num_bytes(op)
+        return (
+            0 if _controller_skips_mla_host_io(self) else self._transfer_num_bytes(op)
+        )
 
     def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
         return {PoolName.KV.value: len(op.device_indices)}
@@ -1067,7 +1077,7 @@ class HiCacheController:
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
 
-        if self.mla_dedup_enabled:
+        if _controller_mla_dedup_enabled(self):
             self.load_queue.clear()
             return self._start_loading_mla(producer_id, op)
 
@@ -1125,18 +1135,21 @@ class HiCacheController:
             load_stream.wait_stream(self.load_fence_stream)
 
         with device_module.stream(load_stream):
+            # Index preparation and virtual-to-physical translation may read
+            # producer-owned device state, so gate them before any such access.
+            producer_event.start_event.wait(load_stream)
             source_transfers = (
                 self._prepare_mla_source_load(op) if broadcaster.is_src else []
             )
             draft_transfers = self._prepare_draft_load(op) or []
             all_transfers = source_transfers + draft_transfers
-            broadcast_indices = self.l2_transfer_engine.resolve_device_indices(
-                self._mla_broadcast_transfer(op)
-            )
 
             with self.l2_transfer_engine.host_to_device_submission(
                 all_transfers, start_event=producer_event.start_event
             ) as (prepared, completion):
+                broadcast_indices = self.l2_transfer_engine.resolve_device_indices(
+                    self._mla_broadcast_transfer(op)
+                )
                 source_count = len(source_transfers)
                 prepared_source = prepared[:source_count]
                 prepared_draft = prepared[source_count:]
@@ -1293,7 +1306,7 @@ class HiCacheController:
         return count
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
-        if self._mla_skip_host_io:
+        if _controller_skips_mla_host_io(self):
             completed_pages = 0
             for start in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
                 batch_pages = min(STORAGE_BATCH_SIZE, len(operation.hash_value) - start)
@@ -1471,7 +1484,7 @@ class HiCacheController:
         )
         operation.all_hash_values = page_hashes
 
-        if self._mla_skip_host_io:
+        if _controller_skips_mla_host_io(self):
             return page_hashes, len(page_hashes) * self.page_size
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):

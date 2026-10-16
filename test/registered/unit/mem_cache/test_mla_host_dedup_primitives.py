@@ -43,7 +43,7 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             "sglang.srt.mem_cache.mla_host_dedup.mla_host_dedup_eligible"
         ) as eligible:
             context = maybe_create_mla_host_dedup_context(
-                object(), object(), None, None, None, None, enabled=False
+                object(), object(), None, None, None, enabled=False
             )
 
         self.assertIsNone(context)
@@ -96,7 +96,6 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             decl=make_dsa_indexer_pool_decl(dsa_device_pool),
             anchor_host=mla_host,
             pin_memory=False,
-            is_dummy=True,
         )
 
         self.assertTrue(indexer_host._is_dummy)
@@ -108,7 +107,7 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
                 dsa_device_pool, slots, slots, layer_id=0, io_backend="kernel"
             )
 
-    def test_dsa_builder_inherits_dummy_mode_from_anchor(self):
+    def test_dsa_builder_preserves_constructor_shape(self):
         builder = DSAIndexerHostPoolBuilder()
         anchor = SimpleNamespace(_is_dummy=True)
         with mock.patch(
@@ -128,7 +127,6 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             anchor_host=anchor,
             packed_draft_device_pools=(),
             allocator_type="default",
-            is_dummy=True,
         )
 
     @mock.patch(

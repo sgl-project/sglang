@@ -2195,9 +2195,9 @@ class _PlainKvStrategy(StackStrategy):
             params.tp_cache_group,
             params.attn_cp_cache_group,
             params.attn_tp_cache_group,
-            params.pp_cache_group,
             storage_backend,
             getattr(get_memory(), "enable_mla_hicache_host_dedup", False),
+            pp_group=params.pp_cache_group,
         )
         mla_is_dummy = (
             mla_dedup_context.is_dummy_rank if mla_dedup_context is not None else False
@@ -2268,9 +2268,9 @@ class _DsaStrategy(StackStrategy):
             params.tp_cache_group,
             params.attn_cp_cache_group,
             params.attn_tp_cache_group,
-            params.pp_cache_group,
             storage_backend,
             getattr(get_memory(), "enable_mla_hicache_host_dedup", False),
+            pp_group=params.pp_cache_group,
         )
         mla_is_dummy = (
             mla_dedup_context.is_dummy_rank if mla_dedup_context is not None else False
