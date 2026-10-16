@@ -277,6 +277,19 @@ for _mod, _fn, _backend, _device in [
         KernelBackend.FLYDSL,
         CapabilityRequirement.HIP,
     ),
+    # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+    (
+        "dsv4.flydsl_v4nm.mla_v4_decode",
+        "flydsl_mla_decode_fwd_v4_nm",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "dsv4.flydsl_v4nm.mla_v4_decode",
+        "flydsl_mla_v4_decode_fused",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
 ]:
     register_kernel(
         KernelSpec(
