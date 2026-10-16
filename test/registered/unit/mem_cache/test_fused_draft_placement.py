@@ -21,8 +21,9 @@ Pinned:
     (one shared region would let the runners clobber each other's KV);
   - a per-depth head serves one depth per runner and needs one runner per
     depth;
-  - a draft with SWA or recurrent-state layers of its own, or asymmetric K/V
-    rows, declines;
+  - a draft with SWA or recurrent-state layers of its own declines, and so do
+    asymmetric K/V rows unless every resolved backend, the draft's included,
+    carries v_head_dim through to the kernel;
   - so does a draft whose attention backend is off the translated MHA rails
     (it would read the fused rows with virtual ids), a draft under
     --dcp-size > 1 (each rank's rows hold only its share of the tokens), an
@@ -39,6 +40,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
+from sglang.srt.mem_cache import kv_cache_configurator as kcc
+from sglang.srt.mem_cache import unified_memory_pool as ump
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftKVGeometry,
@@ -72,11 +76,12 @@ def _profile(
     )
 
 
-def _place(profile, num_runners=1):
+def _place(profile, num_runners=1, asymmetric_rows_ok=False):
     return place_fused_draft(
         profile=profile,
         num_runners=num_runners,
         store_dtype=_DTYPE,
+        asymmetric_rows_ok=asymmetric_rows_ok,
     )
 
 
@@ -112,6 +117,23 @@ class TestPlaceFusedDraft(CustomTestCase):
             self.assertIsNone(decision.placement)
             self.assertIsNotNone(decision.declined)
 
+    def test_asymmetric_rows_fuse_with_their_v_width_when_backends_allow(self):
+        placement = _place(
+            _profile(head_dim=64, v_head_dim=32), asymmetric_rows_ok=True
+        ).placement
+        self.assertIsNotNone(placement)
+        self.assertEqual(placement.region.resolved_v_head_dim(), 32)
+        self.assertEqual(placement.region.entry_bytes(), 4 * (64 + 32) * 2)
+        # Symmetric rows never consult the rule.
+        self.assertIsNotNone(_place(_profile(), asymmetric_rows_ok=False).placement)
+
+    def test_a_misaligned_v_row_declines_even_when_backends_allow(self):
+        # K rows are 4 x 64 x 2 B = 512 B; V rows 4 x 5 x 2 B = 40 B are not a
+        # 16-B-aligned entry part.
+        decision = _place(_profile(head_dim=64, v_head_dim=5), asymmetric_rows_ok=True)
+        self.assertIsNone(decision.placement)
+        self.assertIn("40 B", decision.declined)
+
     def test_region_carries_the_profile_geometry(self):
         placement = _place(_profile()).placement
         self.assertEqual(
@@ -119,6 +141,172 @@ class TestPlaceFusedDraft(CustomTestCase):
             DenseDraftRegion(
                 lane_num=1, head_num=4, head_dim=64, v_head_dim=64, store_dtype=_DTYPE
             ),
+        )
+
+
+class TestAsymmetricBackendRule(CustomTestCase):
+    """The rule reads the TARGET's resolved backends and the draft's explicit
+    one (unset inherits the target's); one shared-head_dim backend anywhere
+    disqualifies asymmetric rows."""
+
+    def _carries(self, *, backends, draft_backend=None):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        with (
+            patch.object(kcc, "attention_backends", return_value=tuple(backends)),
+            patch.object(
+                kcc,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_draft_attention_backend=draft_backend
+                ),
+            ),
+        ):
+            return cfg._draft_backends_carry_v_head_dim()
+
+    def test_every_split_stride_backend_qualifies(self):
+        for backend in sorted(ASYMMETRIC_KV_BACKENDS):
+            self.assertTrue(self._carries(backends=(backend,)), backend)
+
+    def test_a_shared_head_dim_backend_anywhere_disqualifies(self):
+        self.assertNotIn("flashinfer", ASYMMETRIC_KV_BACKENDS)
+        self.assertFalse(self._carries(backends=("flashinfer",)))
+        self.assertFalse(
+            self._carries(backends=("triton",), draft_backend="flashinfer")
+        )
+
+
+class _PoolBuilt(Exception):
+    pass
+
+
+_GEOMETRY_KWARGS = (
+    "head_num",
+    "head_dim",
+    "v_head_dim",
+    "swa_head_num",
+    "swa_head_dim",
+    "swa_v_head_dim",
+)
+
+
+class TestUnifiedSWAHeadGeometry(CustomTestCase):
+    """Bug regression: outside `is_hybrid_swa_compress`, both SWA-family factories
+    gave the window layers the full layers' head count and K width."""
+
+    def _configurator(self):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.is_hybrid_swa = True
+        cfg.is_hybrid_swa_compress = False
+        cfg.use_mla_backend = False
+        cfg.kv_cache_dtype = _DTYPE
+        cfg.layer_info = SimpleNamespace(full_attention_layer_ids=[0, 3])
+        cfg.model_config = SimpleNamespace(
+            get_num_kv_heads=lambda tp, dcp: 4,
+            head_dim=192,
+            v_head_dim=128,
+            get_swa_num_kv_heads=lambda tp: 8,
+            swa_head_dim=192,
+            swa_v_head_dim=128,
+        )
+        return cfg
+
+    def _pool_geometry(self, factory, constructor):
+        cfg = self._configurator()
+        cfg.layer_info = SimpleNamespace(
+            start_layer=0,
+            end_layer=4,
+            full_attention_layer_ids=[0, 3],
+            swa_attention_layer_ids=[1, 2],
+        )
+        cfg.model_config.context_len = 64
+        cfg.model_config.sliding_window_size = 8
+        cfg.mambaish_config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(layers=[])
+        )
+        cfg.page_size = 1
+        cfg.device = "cpu"
+        cfg.is_draft_worker = False
+        cfg.forward_stream = None
+        cfg.post_capture_kv_active = False
+        seen = {}
+
+        # Stop at the pool constructor: only the geometry it is handed is under test.
+        def build(**kwargs):
+            seen.update(kwargs)
+            raise _PoolBuilt
+
+        with (
+            get_parallel().override(attn_tp_size=1, attn_dcp_size=1),
+            patch.object(ump, constructor, build),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_build_req_to_token_pool",
+                lambda self, max_num_reqs: None,
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_fused_draft_for_swa_factory",
+                lambda self: None,
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_fused_draft_for_mamba_factory",
+                lambda self: None,
+            ),
+            patch.object(
+                kcc,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_memory_saver=False),
+                    mamba=SimpleNamespace(
+                        enable_mamba_extra_buffer=False,
+                        enable_mamba_extra_buffer_lazy=False,
+                    ),
+                ),
+            ),
+            patch.object(
+                kcc,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_num_draft_tokens=None),
+            ),
+            patch.object(
+                kcc,
+                "get_schedule",
+                return_value=SimpleNamespace(
+                    max_mamba_cache_size=4, disable_overlap_schedule=False
+                ),
+            ),
+            patch.object(
+                kcc,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="null"),
+            ),
+            self.assertRaises(_PoolBuilt),
+        ):
+            factory(
+                cfg,
+                max_num_reqs=4,
+                full_max_total_num_tokens=None,
+                swa_max_total_num_tokens=None,
+            )
+        return tuple(seen[name] for name in _GEOMETRY_KWARGS)
+
+    def test_the_swa_factory_takes_the_models_own_swa_geometry(self):
+        self.assertEqual(
+            self._pool_geometry(
+                kcc.KVCacheConfigurator._init_unified_swa_pools,
+                "init_unified_swa_pools",
+            ),
+            (4, 192, 128, 8, 192, 128),
+        )
+
+    def test_the_tri_pool_factory_takes_the_models_own_swa_geometry(self):
+        self.assertEqual(
+            self._pool_geometry(
+                kcc.KVCacheConfigurator._init_unified_mamba_swa_pools,
+                "init_unified_mamba_swa_pools",
+            ),
+            (4, 192, 128, 8, 192, 128),
         )
 
 

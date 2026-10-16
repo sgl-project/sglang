@@ -859,6 +859,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
             fused_draft=self._fused_draft_for_mamba_factory(),
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
@@ -945,10 +946,12 @@ class KVCacheConfigurator:
             swa_head_dim = self.model_config.hf_text_config.swa_head_dim
             swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
         else:
-            v_head_dim = head_dim
-            swa_head_num = head_num
-            swa_head_dim = head_dim
-            swa_v_head_dim = head_dim
+            v_head_dim = self.model_config.v_head_dim
+            swa_head_num = self.model_config.get_swa_num_kv_heads(
+                get_parallel().attn_tp_size
+            )
+            swa_head_dim = self.model_config.swa_head_dim
+            swa_v_head_dim = self.model_config.swa_v_head_dim
 
         # Not the HF config's full_attention_layer_ids: that one returns ALL layers.
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
@@ -1020,7 +1023,9 @@ class KVCacheConfigurator:
         sub-pools. An empty decision means fusion does not apply (unified
         memory off, no hybrid host, or no EAGLE- or DFLASH-family draft config
         loaded at target boot); a declined one says why the draft cannot fuse.
-        The pool factories decide whether a decline refuses the boot."""
+        The pool factories decide whether a decline refuses the boot.
+        Asymmetric K/V rows fuse only on backends that carry v_head_dim through
+        to the kernel."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             draft_kv_profile,
@@ -1141,9 +1146,21 @@ class KVCacheConfigurator:
         return place_fused_draft(
             profile=profile,
             num_runners=num_runners,
+            asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
             kv_dtype=self.kv_cache_dtype,
         )
+
+    def _draft_backends_carry_v_head_dim(self) -> bool:
+        """Whether every resolved attention backend, the draft's included,
+        carries v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS). The
+        draft worker inherits the target's backend unless one is set."""
+        from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
+
+        backends = set(attention_backends())
+        backends.add(get_spec().speculative_draft_attention_backend)
+        backends.discard(None)
+        return backends <= ASYMMETRIC_KV_BACKENDS
 
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
         """Per-token bytes of ``sub_pool_name``'s fused entry (host + draft +
@@ -1190,6 +1207,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
             grow_direction="down",
             draft_region=region,
@@ -1310,10 +1328,12 @@ class KVCacheConfigurator:
             swa_head_dim = self.model_config.hf_text_config.swa_head_dim
             swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
         else:
-            v_head_dim = head_dim
-            swa_head_num = head_num
-            swa_head_dim = head_dim
-            swa_v_head_dim = head_dim
+            v_head_dim = self.model_config.v_head_dim
+            swa_head_num = self.model_config.get_swa_num_kv_heads(
+                get_parallel().attn_tp_size
+            )
+            swa_head_dim = self.model_config.swa_head_dim
+            swa_v_head_dim = self.model_config.swa_v_head_dim
 
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
