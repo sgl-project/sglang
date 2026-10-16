@@ -18,7 +18,7 @@ import pprint
 from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 import PIL.Image
 import torch
@@ -26,6 +26,9 @@ import torch
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
+)
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    FlowRolloutController,
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
@@ -40,11 +43,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
-        FlowRolloutController,
-    )
 
 logger = init_logger(__name__)
 

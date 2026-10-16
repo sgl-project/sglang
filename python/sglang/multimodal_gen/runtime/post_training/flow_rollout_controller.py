@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any, Callable, Union
+from typing import Any, Callable, Union
 
 import torch
 
@@ -12,17 +12,7 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
 )
 
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
-
-
-def rollout_transition(batch: Req) -> Callable[..., torch.FloatTensor] | None:
-    """The ``transition`` to pass to ``scheduler.step`` for this request: the
-    visual-stream rollout controller, or None to keep the scheduler's own update."""
-    rollout = batch.rollout_controllers.get("visual")
-    return None if rollout is None else rollout.transition
 
 
 class FlowRolloutController:

@@ -561,6 +561,8 @@ class FlowMatchEulerDiscreteScheduler(
 
         return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
 
+    # Old ODE transition: the scheduler's own Euler update (or its stochastic_sampling step),
+    # used when step() is not given a transition.
     def _transition(
         self,
         *,

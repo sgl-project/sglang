@@ -154,13 +154,11 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
-    rollout_transition,
-)
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
+    rollout_transition,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

@@ -43,6 +43,13 @@ def _kwargs_to_cpu(d: Any) -> Any:
     return d
 
 
+def rollout_transition(batch: Req) -> Callable[..., torch.FloatTensor] | None:
+    """The ``transition`` to pass to ``scheduler.step`` for this request: the
+    visual-stream rollout controller, or None to keep the scheduler's own update."""
+    rollout = batch.rollout_controllers.get("visual")
+    return None if rollout is None else rollout.transition
+
+
 def _build_scheduler_rollout_controller(
     *, batch: Req, pipeline_config: Any
 ) -> FlowRolloutController:

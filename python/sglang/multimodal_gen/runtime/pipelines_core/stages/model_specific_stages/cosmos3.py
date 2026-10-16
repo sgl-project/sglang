@@ -59,13 +59,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
-    rollout_transition,
-)
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
+    rollout_transition,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
