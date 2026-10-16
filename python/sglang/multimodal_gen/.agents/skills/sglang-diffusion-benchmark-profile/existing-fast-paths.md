@@ -520,7 +520,7 @@ framework-specific optimization workflow.
   `group_limited_topk` through the diffusion facade when the CUDA layout guard
   passes, otherwise it retains the eager reference chain.
 - LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="lossless"` and `quality="high"`:
-  `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
+  `LTX2_RMS_NORM_MODULATE.mark` / `fused_ltx2_rms_norm_modulate` in
   `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
   kernel is <=1 ULP off aten, so it is request-gated instead of verified),

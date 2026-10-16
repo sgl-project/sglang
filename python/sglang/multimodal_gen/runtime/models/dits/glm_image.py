@@ -610,14 +610,18 @@ class GlmImageAttention(torch.nn.Module):
             q_img = query[:, text_seq_length:, :, :]
             k_img = key[:, text_seq_length:, :, :]
 
-            q_img, k_img = self.rotary_emb(
+            q_rot, k_rot = self.rotary_emb(
                 query=q_img,
                 key=k_img,
                 cos=cos,
                 sin=sin,
             )
-            query[:, text_seq_length:, :, :] = q_img
-            key[:, text_seq_length:, :, :] = k_img
+            # The CUDA RoPE rotates contiguous views in place and returns them;
+            # torch >= 2.14 rejects copying a tensor onto its own memory.
+            if q_rot.data_ptr() != q_img.data_ptr():
+                q_img.copy_(q_rot)
+            if k_rot.data_ptr() != k_img.data_ptr():
+                k_img.copy_(k_rot)
 
         if kv_cache is not None:
             if kv_cache.mode == "write":
