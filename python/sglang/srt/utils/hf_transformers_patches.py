@@ -339,11 +339,14 @@ def _patch_image_processor_kwargs():
 
 
 def _patch_image_process_cuda_tensor():
-    """Fix ``process_image()`` crashing on CUDA tensors.
+    """Handle CUDA tensors and grayscale tensor RGB conversion in PIL processing.
 
     Transformers v5.4's PIL image processing backend calls
     ``image.numpy()`` on torch tensors, which fails for CUDA tensors.
-    Patch to call ``.cpu().numpy()`` instead.
+    Move them to CPU before processing. Its RGB conversion handles PIL images
+    but leaves tensors unchanged: a grayscale JPEG decoded as a [1, H, W]
+    tensor stays single-channel even when ``do_convert_rgb`` is requested.
+    Processors that normalize with three RGB means then fail on that channel.
 
     TODO(upstream): report to HF transformers.
     """
@@ -362,7 +365,19 @@ def _patch_image_process_cuda_tensor():
             ):
                 if isinstance(image, _Tensor) and image.is_cuda:
                     image = image.cpu()
-                return _orig(self, image, *args, **kwargs)
+                result = _orig(self, image, *args, **kwargs)
+                # Check channels after process_image converts the layout to CHW.
+                do_convert_rgb = kwargs.get(
+                    "do_convert_rgb", args[0] if args else False
+                )
+                if (
+                    do_convert_rgb
+                    and isinstance(image, _Tensor)
+                    and result.ndim == 3
+                    and result.shape[0] == 1
+                ):
+                    result = result.repeat(3, axis=0)
+                return result
 
             cls.process_image = patched_process_image
     except ImportError:
