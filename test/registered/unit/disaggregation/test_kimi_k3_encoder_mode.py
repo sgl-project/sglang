@@ -508,6 +508,21 @@ def test_kimi_k3_epd_selects_matching_jpeg_decode_mode(
     load.assert_called_once_with(b"jpeg", expected_decode_mode)
 
 
+def test_kimi_k3_encoder_decodes_video_on_gpu():
+    expected = object()
+    encoder = _encoder()
+
+    with patch(
+        "sglang.srt.disaggregation.encoder.preprocessor.load_video",
+        return_value=expected,
+    ) as load:
+        output = encoder.preprocessor._load_single_item(b"video", Modality.VIDEO)
+
+    assert output is expected
+    # The encoder owns its GPU: video decode happens there, explicitly.
+    load.assert_called_once_with(b"video", use_gpu=True)
+
+
 def test_kimi_k3_epd_rejects_lazy_pil_decode_failure():
     malformed_png = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
