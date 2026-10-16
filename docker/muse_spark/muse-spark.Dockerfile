@@ -12,7 +12,6 @@ ARG TORCH_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
 ARG MAX_JOBS=16
 
 # Replace the stock SGLang with the upstream muse-spark branch.
-# This branch must include the Muse Spark Docker patch helpers used below.
 # Align the runtime with Muse Spark's PyTorch pin before compiling its extensions.
 # The base has Torch 2.13 and matching older TorchVision/DeepEP binaries.
 WORKDIR /sgl-workspace
