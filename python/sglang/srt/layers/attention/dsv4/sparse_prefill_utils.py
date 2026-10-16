@@ -41,6 +41,7 @@ import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
 from sglang.srt.utils import ceil_align
+from sglang.srt.utils.common import async_h2d
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -563,7 +564,7 @@ class SparsePrefillChunkCache:
             seq_lens_cpu = self.seq_lens.tolist()
         lengths_cpu = [int(length) // compress_ratio for length in seq_lens_cpu]
         total_compressed = sum(lengths_cpu)
-        lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=device)
+        lengths = async_h2d(lengths_cpu, dtype=torch.int32, device=device)
         ends = lengths.cumsum(0, dtype=torch.int32)
         compressed_base = ends - lengths
         swa_base = total_compressed + self.swa_offsets[:-1]
