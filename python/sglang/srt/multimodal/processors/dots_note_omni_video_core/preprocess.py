@@ -10,6 +10,11 @@ import numpy as np
 from PIL import Image
 from torchcodec.decoders import VideoDecoder
 
+from sglang.srt.multimodal.audio_limits import (
+    AudioLimitExceeded,
+    decode_torchcodec_samples,
+)
+
 from .v2core import (
     ALIGN,
     INTERLEAVE_SEG_MIN_SEC,
@@ -200,9 +205,13 @@ def extract_audio_wav(
     from torchcodec.decoders import AudioDecoder
 
     try:
-        samples = AudioDecoder(
-            video_bytes, sample_rate=sample_rate, num_channels=1
-        ).get_all_samples()
+        samples = decode_torchcodec_samples(
+            AudioDecoder(video_bytes, sample_rate=sample_rate, num_channels=1),
+            output_sample_rate=sample_rate,
+            output_channels=1,
+        )
+    except AudioLimitExceeded:
+        raise
     except Exception:  # noqa: BLE001 - videos without decodable audio are valid
         return None, 0.0
     waveform = samples.data

@@ -1863,8 +1863,21 @@ CLIENT_MEDIA_EXCEPTIONS = (
 
 
 def load_audio(
-    audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True
+    audio_file: Union[str, bytes],
+    sr: Optional[int] = None,
+    mono: bool = True,
+    *,
+    max_duration_seconds: Optional[float] = None,
+    max_decoded_bytes: Optional[int] = None,
 ) -> np.ndarray:
+    from sglang.srt.multimodal.audio_limits import (
+        AudioLimitExceeded,
+        resolve_audio_decode_limits,
+    )
+
+    audio_limits = resolve_audio_decode_limits(
+        max_duration_seconds, max_decoded_bytes
+    )
     if sr is None:
         sr = 16000
 
@@ -1901,10 +1914,14 @@ def load_audio(
             source,
             target_sr=sr,
             mono=mono,
+            max_duration_seconds=audio_limits.max_duration_seconds,
+            max_decoded_bytes=audio_limits.max_decoded_bytes,
         )
 
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
+
+        from sglang.srt.multimodal.audio_limits import decode_torchcodec_samples
 
         try:
             decoder = AudioDecoder(
@@ -1912,10 +1929,17 @@ def load_audio(
                 sample_rate=sr,
                 num_channels=1 if mono else None,
             )
-            samples = decoder.get_all_samples()
+            samples = decode_torchcodec_samples(
+                decoder,
+                output_sample_rate=sr,
+                output_channels=1 if mono else None,
+                limits=audio_limits,
+            )
             if mono:
                 return samples.data.squeeze(0).numpy()
             return samples.data.T.numpy()
+        except AudioLimitExceeded:
+            raise
         except Exception as e:
             # torchcodec's bytes-buffer IO can fail on WAV files that carry
             # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
@@ -1929,29 +1953,108 @@ def load_audio(
     import torchaudio
 
     try:
-        if isinstance(source, bytes):
-            audio, original_sr = sf.read(BytesIO(source))
+        decoded_chunks = []
+        with sf.SoundFile(BytesIO(source) if isinstance(source, bytes) else source) as stream:
+            original_sr = int(stream.samplerate)
+            source_channels = int(stream.channels)
+            output_channels = 1 if mono else source_channels
+            output_sr = int(sr)
+            output_bytes_per_sample = (
+                np.dtype(np.float64).itemsize
+                if original_sr == output_sr
+                else np.dtype(np.float32).itemsize
+            )
+            if stream.frames is not None and stream.frames >= 0:
+                audio_limits.check_duration(stream.frames / original_sr)
+                audio_limits.check_samples(
+                    stream.frames,
+                    original_sr,
+                    source_channels,
+                    np.dtype(np.float64).itemsize,
+                    kind="source audio",
+                )
+
+            total_source_frames = 0
+            block_frames = 65536
+            if audio_limits.max_duration_seconds is not None:
+                block_frames = min(
+                    block_frames,
+                    max(1, int(audio_limits.max_duration_seconds * original_sr)),
+                )
+            if audio_limits.max_decoded_bytes not in (None, 0):
+                block_frames = min(
+                    block_frames,
+                    max(
+                        1,
+                        audio_limits.max_decoded_bytes
+                        // (source_channels * np.dtype(np.float64).itemsize),
+                    ),
+                )
+            while True:
+                block = stream.read(
+                    block_frames,
+                    dtype="float64",
+                    always_2d=True,
+                )
+                if len(block) == 0:
+                    break
+                total_source_frames += len(block)
+                audio_limits.check_duration(total_source_frames / original_sr)
+                audio_limits.check_samples(
+                    total_source_frames,
+                    original_sr,
+                    source_channels,
+                    np.dtype(np.float64).itemsize,
+                    kind="source audio",
+                )
+                if mono and source_channels > 1:
+                    block = np.mean(block, axis=1)
+                elif source_channels == 1:
+                    block = block[:, 0]
+                audio_limits.check_samples(
+                    total_source_frames,
+                    original_sr,
+                    output_channels,
+                    np.dtype(np.float64).itemsize,
+                )
+                decoded_chunks.append(block)
+
+        if not decoded_chunks:
+            audio = np.empty(
+                (0,) if mono or source_channels == 1 else (0, source_channels),
+                dtype=np.float64,
+            )
         else:
-            audio, original_sr = sf.read(source)
+            audio = np.concatenate(decoded_chunks, axis=0)
+        if original_sr != sr:
+            output_frames = (total_source_frames * sr + original_sr - 1) // original_sr
+            audio_limits.check_samples(
+                output_frames,
+                sr,
+                output_channels,
+                output_bytes_per_sample,
+            )
+            audio_tensor = torch.from_numpy(audio).float()
+            if audio_tensor.dim() == 1:
+                audio_tensor = audio_tensor.unsqueeze(0)
+            else:
+                audio_tensor = audio_tensor.T
+            audio_tensor = torchaudio.functional.resample(
+                audio_tensor, orig_freq=original_sr, new_freq=sr
+            )
+            audio_limits.check_samples(
+                int(audio_tensor.shape[-1]),
+                sr,
+                int(audio_tensor.shape[0]),
+                int(audio_tensor.element_size()),
+            )
+            audio = (
+                audio_tensor.squeeze(0).numpy()
+                if audio_tensor.shape[0] == 1
+                else audio_tensor.T.numpy()
+            )
     except sf.LibsndfileError as e:
         raise ValueError(f"Could not decode audio: {e}") from e
-
-    if mono and len(audio.shape) > 1:
-        audio = np.mean(audio, axis=1)
-
-    if original_sr != sr:
-        audio_tensor = torch.from_numpy(audio).float()
-        if audio_tensor.dim() == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)
-        else:
-            audio_tensor = audio_tensor.T
-        audio_tensor = torchaudio.functional.resample(
-            audio_tensor, orig_freq=original_sr, new_freq=sr
-        )
-        if audio_tensor.shape[0] == 1:
-            audio = audio_tensor.squeeze(0).numpy()
-        else:
-            audio = audio_tensor.T.numpy()
 
     return audio
 

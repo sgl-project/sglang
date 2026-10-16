@@ -12,6 +12,10 @@ import numpy as np
 import pybase64
 import torch
 
+from sglang.srt.multimodal.audio_limits import (
+    configured_audio_decode_limits,
+    decode_torchcodec_samples,
+)
 from sglang.srt.utils import common
 from sglang.utils import logger
 
@@ -211,7 +215,7 @@ class MiMoAudioPipeline:
                     "torchcodec is required for audio decoding; install with `pip install torchcodec`."
                 )
             try:
-                samples = AudioDecoder(file).get_all_samples()
+                samples = decode_torchcodec_samples(AudioDecoder(file))
             except RuntimeError as e:
                 audio_source = (
                     audio
@@ -226,7 +230,24 @@ class MiMoAudioPipeline:
             waveform = samples.data
             original_sr = samples.sample_rate
 
+        audio_limits = configured_audio_decode_limits()
+        channels = int(waveform.shape[0]) if waveform.ndim == 2 else 1
+        audio_limits.check_samples(
+            int(waveform.shape[-1]),
+            int(original_sr),
+            channels,
+            int(waveform.element_size()),
+        )
         if original_sr != self.audio_sampling_rate:
+            output_frames = (
+                waveform.shape[-1] * self.audio_sampling_rate + original_sr - 1
+            ) // original_sr
+            audio_limits.check_samples(
+                output_frames,
+                self.audio_sampling_rate,
+                channels,
+                int(waveform.element_size()),
+            )
             if original_sr in self._resamplers:
                 self._resamplers.move_to_end(original_sr)
             else:
@@ -236,6 +257,12 @@ class MiMoAudioPipeline:
                     orig_freq=original_sr, new_freq=self.audio_sampling_rate
                 )
             waveform = self._resamplers[original_sr](waveform)
+            audio_limits.check_samples(
+                int(waveform.shape[-1]),
+                self.audio_sampling_rate,
+                channels,
+                int(waveform.element_size()),
+            )
         if waveform.ndim == 2:
             waveform = waveform.mean(dim=0)
         spec = self.mel_spectrogram(waveform[None, :])

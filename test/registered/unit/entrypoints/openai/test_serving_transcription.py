@@ -388,6 +388,27 @@ class TestLongAudioChunkedNonStreaming(CustomTestCase):
             total_samples += len(data)
         self.assertEqual(total_samples, 65 * 16000)
 
+    def test_audio_duration_limit_returns_bad_request(self):
+        reset_context()
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                asr_max_concurrent_sessions=32,
+                max_audio_duration_seconds=30,
+            ),
+            role="tokenizer",
+        )
+        tm = _MockChunkTokenizerManager([])
+
+        result = self._create_transcription(tm, _long_wav_bytes(65.0))
+
+        self.assertEqual(result.status_code, 400)
+        payload = json.loads(result.body)
+        self.assertEqual(payload["object"], "error")
+        self.assertEqual(payload["code"], 400)
+        self.assertIn("duration", payload["message"])
+        self.assertEqual(tm.requests, [])
+
     def test_chunk_failure_returns_error_and_stops_dispatch(self):
         # When one chunk request fails, create_transcription must return an
         # error response (not a partial transcript), abort the in-flight

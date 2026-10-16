@@ -90,6 +90,16 @@ class Mm(msgspec.Struct):
         "Maximum size in MiB for one client-supplied remote media download. "
         "The limit is enforced while streaming; set to 0 to disable it.",
     ] = 64
+    max_audio_duration_seconds: A[
+        Optional[float],
+        "Maximum duration of decoded client-supplied audio in seconds. "
+        "Unset disables the duration limit.",
+    ] = None
+    max_audio_decoded_bytes: A[
+        Optional[int],
+        "Maximum decoded audio budget in bytes, including decoder intermediates. "
+        "This is not a peak process-memory limit; set to 0 to disable it.",
+    ] = 256 * 1024 * 1024
     mm_preprocess_cache_size_mb: A[
         Optional[int],
         Arg(

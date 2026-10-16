@@ -58,6 +58,8 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 - To enable deterministic inference and batch invariant operations, add `--enable-deterministic-inference`. More details can be found in [deterministic inference document](./deterministic_inference).
 - If a multimodal server accepts requests from untrusted clients, restrict remote image, video, and audio URLs with `--allowed-media-domains`. SGLang checks the initial URL and every redirect destination against the exact-hostname allowlist. Remote media downloads are limited to 64 MiB by default; adjust `--media-url-max-file-size-mb` when larger trusted media is required.
 
+  Decoded audio can be much larger than its encoded download. The server therefore limits decoded client audio to 256 MiB by default. Use `--max-audio-decoded-bytes` to change that budget, or set it to `0` to disable it; use `--max-audio-duration-seconds` for an explicit duration cap. These limits apply during decoding and also cover decoder intermediate buffers, but they are not a peak process-memory limit.
+
   ```bash Command
   python -m sglang.launch_server \
     --model-path Qwen/Qwen2.5-VL-7B-Instruct \
@@ -3328,6 +3330,18 @@ This option does not disable required attention or MoE collectives, including ex
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--media-url-max-file-size-mb`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum streamed size in MiB for one remote media download. Set to 0 to disable the limit.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`64`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-audio-duration-seconds`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum duration of decoded client-supplied audio. Unset disables the duration limit.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unset</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-audio-decoded-bytes`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum decoded audio budget, including decoder intermediates. Set to 0 to disable the limit.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`268435456`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
     <tr>
