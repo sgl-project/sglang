@@ -121,6 +121,42 @@ class TestInt8CheckpointCodec(unittest.TestCase):
             self.assertEqual(est["qdata"] + est["scale"] + est["conv"], est["total"])
             self.assertEqual(est["total"], pool.mem_usage_bytes())
 
+    def test_maybe_init_with_ple_side_states(self):
+        # The factory path must not leak ple_side_states into the estimate kwargs,
+        # and must build ckpt-slot-indexed mirrors for each side state.
+        from types import SimpleNamespace
+
+        import sglang.srt.mem_cache.mamba_checkpoint_pool as mcp
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        sc = ShortConvPool(
+            size=6, state_shape=(1, 8), layer_ids=[0, 1],
+            dtype=torch.bfloat16, device="cpu",
+        )
+        ng = NGramPool(size=6, context_len=8, eos_token_id=1, device="cpu")
+        params = SimpleNamespace(
+            shape=SimpleNamespace(temporal=(H, V, K), conv=[(4, K)]),
+            dtype=SimpleNamespace(temporal=torch.bfloat16, conv=torch.bfloat16),
+        )
+        fake = SimpleNamespace(
+            mamba=SimpleNamespace(enable_int8_mamba_checkpoint=True,
+                                  int8_mamba_ckpt_size=8)
+        )
+        orig = mcp.get_exec
+        mcp.get_exec = lambda: fake
+        try:
+            pool = mcp.maybe_init_int8_mamba_checkpoint_pool(
+                mamba_size=6, cache_params=params, mamba_layer_ids=[0, 1],
+                device="cpu", ple_side_states=[sc, ng],
+            )
+        finally:
+            mcp.get_exec = orig
+        self.assertIsNotNone(pool)
+        self.assertEqual(len(pool.ple_mirrors), 2)
+        # mirrors are sized to the checkpoint pool, not the active pool
+        self.assertEqual(pool.ple_mirrors[0][1].shape[1], 9)
+        self.assertEqual(pool.ple_mirrors[1][1].shape[0], 9)
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA + fla kernels")
 class TestInt8CheckpointDecodeError(unittest.TestCase):
