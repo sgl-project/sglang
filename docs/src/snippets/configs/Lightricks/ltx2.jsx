@@ -1,7 +1,7 @@
 export const config = (() => {
   const modelOf = (s) => "Lightricks/" + (s.model === "ltx2" ? "LTX-2" : "LTX-2.3");
   const plan = (s) => {
-    const gpus = s.hw === "xeon" ? 0 : Number(s.gpus_per_node);
+    const gpus = Number(s.gpus_per_node);
     const tp = gpus === 4 ? 2 : 1;
     const flags = [
       "--model-path " + modelOf(s),
@@ -22,7 +22,7 @@ export const config = (() => {
       topology: { tp_size: tp, ulysses_degree: 1, ring_degree: 1 },
       env: s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [],
       errors: [
-        ...(s.hw !== "xeon" && ![1, 2, 4].includes(gpus) ? ["Choose 1, 2 or 4 GPUs."] : []),
+        ...(![1, 2, 4].includes(gpus) ? ["Choose 1, 2 or 4 GPUs."] : []),
         ...(s.model === "ltx2" && s.pipeline === "two-stage-hq" ? ["HQ requires LTX-2.3."] : []),
       ],
     };
@@ -109,10 +109,7 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: {
-          nodes: { min: 1, max: 1 },
-          gpus_per_node: { min: 1, max: 4, disabledWhen: (s) => s.hw === "xeon" },
-        },
+        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
         verifiedRecipes: ["h200", "cuda", "xeon"].map((hw) => {
           const s = { ...defaults, hw, device: hw === "h200" ? "resident" : "original" };
           const p = plan(s);
@@ -132,7 +129,7 @@ export const config = (() => {
           if (!config.supportedHardware.includes(s.hw)) errors.push("Choose a listed hardware platform.");
           if (Number(s.nodes) !== 1) errors.push("This recipe covers one node.");
           const count = Number(s.gpus_per_node);
-          if (s.hw !== "xeon" && (!Number.isInteger(count) || count < 1 || count > 4))
+          if (!Number.isInteger(count) || count < 1 || count > 4)
             errors.push("Choose an integer GPU count within the documented limits.");
           if (Number(s.gpus_per_node) !== p.gpus) errors.push("This recipe requires " + p.gpus + " GPUs / node.");
           if (["tp_size", "ulysses_degree", "ring_degree"].some((key) => Number(t[key]) !== p.topology[key]))

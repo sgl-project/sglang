@@ -4,7 +4,7 @@ export const config = (() => {
     s.hw === "xeon"
       ? {
           flags: ["--model-path " + modelOf(s)],
-          gpus: 0,
+          gpus: 1,
           topology: { tp_size: 1, ulysses_degree: 1, ring_degree: 1 },
           env: ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"],
         }
@@ -64,10 +64,7 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: {
-          nodes: { min: 1, max: 1 },
-          gpus_per_node: { min: 1, max: 8, disabledWhen: (s) => s.hw === "xeon" },
-        },
+        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 8 } },
         verifiedRecipes: ["b200", "h200", "h100", "a100", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
@@ -87,7 +84,7 @@ export const config = (() => {
           if (!config.supportedHardware.includes(s.hw)) errors.push("Choose a listed hardware platform.");
           if (Number(s.nodes) !== 1) errors.push("This recipe covers one node.");
           const count = Number(s.gpus_per_node);
-          if (s.hw !== "xeon" && (!Number.isInteger(count) || count < 1 || count > 8))
+          if (!Number.isInteger(count) || count < 1 || count > 8)
             errors.push("Choose an integer GPU count within the documented limits.");
           if (Number(s.gpus_per_node) !== p.gpus) errors.push("This recipe requires " + p.gpus + " GPUs / node.");
           if (["tp_size", "ulysses_degree", "ring_degree"].some((key) => Number(t[key]) !== p.topology[key]))
