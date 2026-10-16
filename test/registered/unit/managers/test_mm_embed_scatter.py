@@ -59,12 +59,12 @@ def test_scatter_row_count_mismatch_fails_loud():
         _scatter_mm_embedding(dest=dest, mask=mask_heavy, src=torch.ones(1, 4))
 
 
-@pytest.mark.parametrize("packed", [False, True])
-def test_embedding_preserves_reusable_multimodal_input_ids(packed):
+@pytest.mark.parametrize("as_view", [False, True], ids=["owned", "view"])
+def test_embedding_preserves_reusable_multimodal_input_ids(as_view):
     pad = 1_000_001
     original = torch.tensor([3, 1, pad, pad, 2, 4])
     original_before = original.clone()
-    ids = original[1:5] if packed else original[1:5].clone()
+    ids = original[1:5] if as_view else original[1:5].clone()
     before = ids.clone()
     item = SimpleNamespace(
         pad_value=pad,
@@ -96,6 +96,7 @@ def test_embedding_preserves_reusable_multimodal_input_ids(packed):
             assert torch.equal(ids, before)
             assert torch.equal(original, original_before)
             torch.testing.assert_close(result[1:3], torch.full((2, 4), 42.0))
+            torch.testing.assert_close(result[[0, 3]], embedding(before[[0, 3]]))
 
 
 if __name__ == "__main__":
