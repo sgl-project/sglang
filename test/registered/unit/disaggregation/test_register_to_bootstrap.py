@@ -241,6 +241,24 @@ class TestRegisterToBootstrap(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_cp_tp_group_sharing_registers_cp_rank_as_tp_rank(
+        self, mock_put, mock_time
+    ):
+        # A sharing prefill CP rank holds every KV head and its own
+        # linear-attention shard: decode pairs with it as a CP-1 TP rank.
+        mock_time.monotonic.return_value = 0.0
+        mock_put.return_value = MagicMock(status_code=200)
+        mgr = self._make_manager()
+        mgr.attn_cp_size, mgr.attn_cp_rank = 4, 2
+        with get_context().override_server_args(enable_cp_tp_group_sharing=True):
+            mgr.register_to_bootstrap()
+
+        payload = mock_put.call_args[1]["json"]
+        self.assertEqual([payload[k] for k in ("attn_tp_size", "attn_tp_rank")], [4, 2])
+        self.assertEqual([payload[k] for k in ("attn_cp_size", "attn_cp_rank")], [1, 0])
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_url_with_dist_init_addr(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         success_resp = MagicMock()
