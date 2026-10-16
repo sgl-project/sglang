@@ -1869,6 +1869,9 @@ class Envs:
     SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR = EnvBool(True)
     # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
     SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
+    # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
+    # short-window decode layers on gfx950.
+    SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
