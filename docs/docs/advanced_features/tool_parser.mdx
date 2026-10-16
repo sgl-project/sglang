@@ -118,6 +118,36 @@ wait_for_server(f"http://localhost:{port}")
 
 Note that `--tool-call-parser` defines the parser used to interpret responses.
 
+### Unknown tool names in agent loops
+
+The model can emit a tool name that is not in the request's `tools` list. If the
+parser removes that call, your agent may receive no `tool_calls` and treat the
+turn as complete instead of giving the model a chance to correct the name.
+
+[`SGLANG_FORWARD_UNKNOWN_TOOLS`](/docs/references/environment_variables) controls
+whether parsers that support this setting forward unknown calls. The default is
+`false`. To enable forwarding, set it in the server process's environment before
+starting the server. For example, in a POSIX shell on Linux:
+
+```bash
+export SGLANG_FORWARD_UNKNOWN_TOOLS=1
+```
+
+Then use the launch command appropriate for your model and hardware. Set the
+variable to `0` to disable forwarding in parsers that honor it.
+
+Your client must still validate each tool name before execution. For an unknown
+name, append the assistant's tool-call message to the conversation, return an
+error as a `role="tool"` message with the matching `tool_call_id`, and request
+another model turn. Include the supported tool names in the error so the model
+can retry with an available tool.
+
+Support varies by parser and request mode. For example, `mimo` honors the setting
+in non-streaming mode, while the shared JSON streaming path used by `qwen25`
+currently drops unknown names even when forwarding is enabled. Test the parser
+and streaming mode you deploy; enabling the variable alone does not guarantee
+that every parser will forward unknown calls.
+
 
 ### Define Tools for Function Call
 Below is a Python snippet that shows how to define a tool as a dictionary. The dictionary includes a tool name, a description, and property defined Parameters.
