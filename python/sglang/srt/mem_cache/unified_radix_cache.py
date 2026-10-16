@@ -173,6 +173,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # (component, TreeComponent.device_eviction_proxy) pairs.
+    _device_eviction_proxies: tuple[tuple[ComponentType, ComponentType], ...] = ()
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -202,6 +205,11 @@ class UnifiedRadixCache(BasePrefixCache):
         }
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
+        )
+        self._device_eviction_proxies = tuple(
+            (ct, component.device_eviction_proxy)
+            for ct, component in self.components.items()
+            if component.device_eviction_proxy is not None
         )
         # Whether SWA is enabled.
         self.is_swa_enabled = ComponentType.SWA in params.tree_components
@@ -756,11 +764,15 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker = {ct: 0 for ct in self.tree_components}
 
         request_by_type = self._evict_request_by_type(params)
+        proxy_targets = self._device_eviction_proxy_targets(
+            request_by_type, available_size_targets
+        )
         self._evict_components(
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
         )
+        self._evict_through_proxies(proxy_targets, tracker)
 
         if (
             self.cache_controller is not None
@@ -775,6 +787,57 @@ class UnifiedRadixCache(BasePrefixCache):
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
+
+    def _device_eviction_proxy_targets(
+        self,
+        request_by_type: dict[ComponentType, int],
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+    ) -> dict[ComponentType, tuple[ComponentType, int]]:
+        """Free-capacity targets of proxied components, keyed by proxy."""
+        targets: dict[ComponentType, tuple[ComponentType, int]] = {}
+        for ct, proxy in self._device_eviction_proxies:
+            if request_by_type[ct] <= 0:
+                continue
+            target = (available_size_targets or {}).get(ct)
+            if target is None:
+                target = (
+                    ct,
+                    self._component_available_size(ct) + request_by_type[ct],
+                )
+            targets[proxy] = target
+        return targets
+
+    def _evict_through_proxies(
+        self,
+        proxy_targets: dict[ComponentType, tuple[ComponentType, int]],
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Evict each proxy until its client component reaches the target."""
+        for proxy, (ct, target_size) in proxy_targets.items():
+            if self._component_available_size(ct) >= target_size:
+                continue
+            # Unreachable even by evicting everything: evict nothing.
+            if (
+                self._component_available_size(ct)
+                + self.tree_core.component_evictable_size(ct)
+                < target_size
+            ):
+                continue
+            request_by_type = {component: 0 for component in self.tree_components}
+            request_by_type[proxy] = self.tree_core.component_evictable_size(proxy)
+            proxy_tracker = {component: 0 for component in self.tree_components}
+            self._evict_components(
+                request_by_type,
+                proxy_tracker,
+                available_size_targets={proxy: (ct, target_size)},
+            )
+            self._accumulate_tracker(tracker, proxy_tracker)
+            if self.metrics_collector is not None and proxy_tracker[proxy] > 0:
+                self.metrics_collector.increment_draft_bundle_evictions(
+                    proxy_tracker[proxy]
+                )
 
     def _free_values(
         self,
@@ -956,8 +1019,17 @@ class UnifiedRadixCache(BasePrefixCache):
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
-                        if written > 0:
+                        if written is not None:
                             self.writing_check(write_back=True)
+                            self._demote(node_id, tracker)
+                        elif self.tree_core.is_backuped(node_id):
+                            # The Full KV is on host, so only component state is lost.
+                            logger.warning(
+                                "write_back: component state backup failed under "
+                                "host memory pressure, demoting node %d with its "
+                                "Full KV only",
+                                node_id,
+                            )
                             self._demote(node_id, tracker)
                         elif self._drop_subtree_no_host(node_id, tracker):
                             logger.warning(
@@ -1578,7 +1650,7 @@ class UnifiedRadixCache(BasePrefixCache):
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
-        if written == 0:
+        if written is None:
             return False
         self.writing_check(write_back=True)
         return True
@@ -1601,8 +1673,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
-    ) -> int:
-        """Run a backup action top-down, stopping at the first failed backup."""
+    ) -> Optional[int]:
+        """Run a backup action top-down, stopping at the first failed backup.
+        Returns the Full KV tokens written (0 for a component-only backup), or
+        None when nothing reached host."""
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end
@@ -1610,7 +1684,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # and every pipeline stage drains in order).
             for node_id in action.node_ids:
                 self.buffer_pipeline.enqueue_backup_intent(node_id)
-            return 0
+            return None
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
@@ -1623,7 +1697,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
-                return 0
+                return None
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
