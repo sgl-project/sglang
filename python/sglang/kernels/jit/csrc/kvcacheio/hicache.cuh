@@ -66,8 +66,6 @@ inline constexpr bool group_fits(int64_t bytes, uint32_t lanes_per_worker, uint3
 }
 
 inline constexpr uint32_t pick_group_bytes(int64_t bytes, uint32_t lanes_per_worker) {
-  // The narrow rounds only pay off against the raised ROCm block quota, so CUDA
-  // keeps the original 128 B requirement and generates the same code as before.
 #ifdef USE_ROCM
   return group_fits(bytes, lanes_per_worker, 128)  ? 128u
          : group_fits(bytes, lanes_per_worker, 64) ? 64u
@@ -75,7 +73,11 @@ inline constexpr uint32_t pick_group_bytes(int64_t bytes, uint32_t lanes_per_wor
          : group_fits(bytes, lanes_per_worker, 16) ? 16u
                                                    : 0u;
 #else
-  return group_fits(bytes, lanes_per_worker, 128) ? 128u : 0u;
+  const uint32_t package = 128 / lanes_per_worker;
+  if (128 % lanes_per_worker != 0 || (package != 4 && package != 8 && package != 16)) {
+    return 0u;
+  }
+  return bytes % package == 0 ? 128u : 0u;
 #endif
 }
 
@@ -167,18 +169,28 @@ template <int64_t kBytes, uint32_t kLanesPerWorker>
 SGL_DEVICE auto load_vec(const void* __restrict__ src) {
   constexpr uint32_t kGroupBytes = details::pick_group_bytes(kBytes, kLanesPerWorker);
   static_assert(kGroupBytes != 0, "no 4/8/16 B package tiles kBytes across the worker lanes");
-  constexpr uint32_t kLoopCount = kBytes / kGroupBytes;
   using Package = details::PackageType<kGroupBytes / kLanesPerWorker>;
+  static_assert(kBytes % sizeof(Package) == 0, "kBytes must be a multiple of the package size");
+  constexpr uint32_t kPackageCount = kBytes / sizeof(Package);
+  constexpr uint32_t kFullLoopCount = kPackageCount / kLanesPerWorker;
+  constexpr uint32_t kTailPackageCount = kPackageCount % kLanesPerWorker;
+  constexpr uint32_t kLoopCount = kFullLoopCount + (kTailPackageCount != 0);
   using Storage = details::LocalStorage<Package, kLoopCount>;
 
   const auto src_packed = static_cast<const Package*>(src);
   const auto lane_id = threadIdx.x % kLanesPerWorker;
   Storage vec;
 
-#pragma unroll kLoopCount
-  for (uint32_t i = 0; i < kLoopCount; ++i) {
-    const auto j = i * kLanesPerWorker + lane_id;
-    vec.data[i] = details::load_nc(&src_packed[j]);
+#pragma unroll kFullLoopCount
+  for (uint32_t iteration = 0; iteration < kFullLoopCount; ++iteration) {
+    const auto package_index = iteration * kLanesPerWorker + lane_id;
+    vec.data[iteration] = details::load_nc(&src_packed[package_index]);
+  }
+  if constexpr (kTailPackageCount != 0) {
+    if (lane_id < kTailPackageCount) {
+      const auto package_index = kFullLoopCount * kLanesPerWorker + lane_id;
+      vec.data[kFullLoopCount] = details::load_nc(&src_packed[package_index]);
+    }
   }
 
   return vec;
@@ -188,16 +200,24 @@ template <int64_t kBytes, uint32_t kLanesPerWorker, typename Storage>
 SGL_DEVICE void store_vec(void* __restrict__ dst, const Storage& vec) {
   using Package = std::decay_t<decltype(vec.data[0])>;
   constexpr uint32_t kBytesPerLoop = sizeof(Package) * kLanesPerWorker;
-  constexpr uint32_t kLoopCount = kBytes / kBytesPerLoop;
-  static_assert(kBytes % kBytesPerLoop == 0, "Invalid Storage configuration");
+  static_assert(kBytes % sizeof(Package) == 0, "kBytes must be a multiple of the package size");
+  constexpr uint32_t kPackageCount = kBytes / sizeof(Package);
+  constexpr uint32_t kFullLoopCount = kBytes / kBytesPerLoop;
+  constexpr uint32_t kTailPackageCount = kPackageCount % kLanesPerWorker;
 
   const auto dst_packed = static_cast<Package*>(dst);
   const auto lane_id = threadIdx.x % kLanesPerWorker;
 
-#pragma unroll kLoopCount
-  for (uint32_t i = 0; i < kLoopCount; ++i) {
-    const auto j = i * kLanesPerWorker + lane_id;
-    details::store_nc(&dst_packed[j], vec.data[i]);
+#pragma unroll kFullLoopCount
+  for (uint32_t iteration = 0; iteration < kFullLoopCount; ++iteration) {
+    const auto package_index = iteration * kLanesPerWorker + lane_id;
+    details::store_nc(&dst_packed[package_index], vec.data[iteration]);
+  }
+  if constexpr (kTailPackageCount != 0) {
+    if (lane_id < kTailPackageCount) {
+      const auto package_index = kFullLoopCount * kLanesPerWorker + lane_id;
+      details::store_nc(&dst_packed[package_index], vec.data[kFullLoopCount]);
+    }
   }
 }
 

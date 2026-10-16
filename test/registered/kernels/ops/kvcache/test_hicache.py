@@ -30,9 +30,14 @@ PAGE_SIZE = 1 if is_hip() else 16
 NUM_LAYERS = 2
 POOL_SIZE = PAGE_SIZE * 8
 MHA_ELEMENT_DIMS = [128, 256, 512, 1024]
-MLA_ELEMENT_DIMS = [576]
+MLA_ELEMENT_DIMS = [288, 576]
 LAYOUTS = ["layer_first", "page_first"]
 STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
+
+
+@pytest.fixture(autouse=True)
+def _use_register_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SGLANG_HICACHE_TMA_TRANSFER", "0")
 
 
 def _token_indices_for_pages(
@@ -279,8 +284,10 @@ def _run_page_first_staged_write_back_mha(
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
-    if element_dim * host_pool.dtype.itemsize % 128 != 0:
+    if is_hip() and element_dim == 72:
         assert not host_pool.can_use_jit
+    else:
+        assert host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
         assert host_pool.staging_page_capacity < page_count
@@ -390,8 +397,10 @@ def _run_page_first_staged_write_back_mla(
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
-    if element_dim * host_pool.dtype.itemsize % 128 != 0:
+    if is_hip() and element_dim == 72:
         assert not host_pool.can_use_jit
+    else:
+        assert host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
         assert host_pool.staging_page_capacity < page_count
