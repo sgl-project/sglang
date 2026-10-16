@@ -9,7 +9,7 @@ def rotl32(x, r: tl.constexpr) -> tl.uint32:
     rotate left 32-bit integer x by r bits
     e.g. x = 01110001, r = 2 -> 11000101
     """
-    x = x.to(tl.uint64)
+    x = x.to(tl.uint64) & 0xFFFFFFFF
     return ((x << r) | (x >> (32 - r))) & 0xFFFFFFFF
 
 
