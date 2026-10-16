@@ -346,7 +346,8 @@ class Attention(nn.Module):
         # Fast path: fuse RMSNorm(q), RMSNorm(k) and RoPE into one in-place kernel on
         # the [B, S, H, D] layout USPAttention consumes (also skips the [B, H, L, D]
         # transpose round-trip the eager path needs). Eager fallback below preserves
-        # parity off CUDA / for unsupported dtypes.
+        # parity off CUDA / for unsupported dtypes. Not apply_qk_norm_rope: Krea's
+        # norms scale by (1 + weight) and its eager rotation is the fp32 ropeapply.
         if (
             freqs is not None
             and q.is_cuda

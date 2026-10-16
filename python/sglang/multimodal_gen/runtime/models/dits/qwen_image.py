@@ -17,16 +17,14 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    QWEN_IMAGE_ADDED_QKV,
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_layernorm_modulate_raw,
     fused_linear_gelu_tanh,
     is_plain_layer_norm,
-    mark_fused_gelu_site,
-    mark_qwen_image_added_qkv_site,
-    qwen_image_added_qkv_active,
     try_fused_bias_mul_add,
     try_fused_bias_scale_residual_norm_scale_shift,
     try_fused_norm_scale_shift_fp8,
@@ -180,10 +178,6 @@ def _qwen_norm_out(
         reference,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "Qwen-Image fused norm_out is not bit-exact on this platform; "
-            "falling back to eager"
-        ),
     )
 
 
@@ -847,7 +841,7 @@ class QwenImageCrossAttention(nn.Module):
                 if self._unquantized_added_qkv_is_packed:
                     # Packing changes BF16 GEMM reduction association, so it
                     # is off at exact and mounts at lossless or high.
-                    mark_qwen_image_added_qkv_site(self)
+                    QWEN_IMAGE_ADDED_QKV.mark(self)
             else:
                 self.add_q_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
@@ -949,7 +943,7 @@ class QwenImageCrossAttention(nn.Module):
         if self.use_fused_added_qkv:
             if (
                 self._unquantized_added_qkv_is_packed
-                and not qwen_image_added_qkv_active(self)
+                and not QWEN_IMAGE_ADDED_QKV.is_enabled(self)
                 and isinstance(self.to_added_qkv, MergedColumnParallelLinear)
             ):
                 return _split_unquantized_merged_linear(
@@ -1020,8 +1014,9 @@ class QwenImageCrossAttention(nn.Module):
                 num_heads=self.local_num_heads,
                 head_dim=self.head_dim,
             )
-        elif self._unquantized_added_qkv_is_packed and not qwen_image_added_qkv_active(
-            self
+        elif (
+            self._unquantized_added_qkv_is_packed
+            and not QWEN_IMAGE_ADDED_QKV.is_enabled(self)
         ):
             img_query, img_key, img_value, _, _, _ = _get_qkv_projections(
                 self,
@@ -1280,7 +1275,7 @@ class QwenImageGELU(nn.Module):
             )
         # Extra-high-or-higher fusion site: up-proj GEMM + tanh-GELU in cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
-        mark_fused_gelu_site(self, "proj")
+        FUSED_LINEAR_GELU.mark(self, "proj")
 
     def forward(
         self,
@@ -1293,7 +1288,9 @@ class QwenImageGELU(nn.Module):
                 output_dtype=self.proj.params_dtype,
                 bias=self.proj.bias,
             )
-        elif fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+        elif FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
+            self.proj, hidden_states
+        ):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
