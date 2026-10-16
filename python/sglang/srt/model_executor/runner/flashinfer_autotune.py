@@ -160,6 +160,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
+    if get_exec().features.enable_dsv41_low_latency_decode:
+        # Its pinned tactics must not leak into, or come from, another run's file.
+        model_key_parts.append("dsv41_low_latency")
     if mr.is_draft_worker:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
     model_key = "|".join(model_key_parts)
@@ -326,6 +329,14 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 ),
                 prefill_num_tokens=prefill_num_tokens,
             )
+        # Every pass may tune a pinned shape's bucket first, not only the prefill one.
+        pinned_tactics = contextlib.nullcontext()
+        if get_exec().features.enable_dsv41_low_latency_decode:
+            from sglang.srt.models.dsv41_low_latency.mxfp8_linear import (
+                pinned_tactics as dsv41_pinned_tactics,
+            )
+
+            pinned_tactics = dsv41_pinned_tactics()
         with (
             _autotune_process_group(sync_group),
             autotune(
@@ -336,6 +347,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             autotune_v2(mode="tune", persistent_cache=False),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
+            pinned_tactics,
         ):
             yield
         if reuse_cache:

@@ -207,6 +207,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     )
 
     cfg = resolving_view(server_args)
+    if cfg.enable_dsv41_low_latency_decode:
+        from sglang.srt.models.dsv41_low_latency.switch import check_deployment
+
+        check_deployment(server_args, model_config_of(server_args).hf_config.model_type)
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
         if cfg.enable_encoder_swa_bounded_replay:
             raise ValueError(

@@ -120,13 +120,31 @@ def _index_q_and_weights(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
     ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
-    rows, heads = x.shape[0], indexer.n_local_heads
     q, _ = indexer.wq_b(q_lora)
+    return index_q_rope_pack(
+        indexer=indexer,
+        q=q,
+        head_weights_raw=indexer.head_weights_raw(x),
+        freqs_cis=freqs_cis,
+        positions=positions,
+    )
+
+
+def index_q_rope_pack(
+    *,
+    indexer: DeepseekV41Indexer,
+    q: torch.Tensor,
+    head_weights_raw: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`_index_q_and_weights` from the projected ``wq_b(q_lora)`` and raw head weights."""
+    rows, heads = q.shape[0], indexer.n_local_heads
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
         torch.view_as_real(freqs_cis).flatten(-2),
         positions,
-        indexer.head_weights_raw(x),
+        head_weights_raw,
         indexer.head_weight_scale,
     )
     return q_fp4.view(rows, heads, 64), q_sf.view(rows, heads), weights
@@ -138,13 +156,16 @@ def get_deep_gemm_decode_data(
     indexer = inputs.indexer
     # The kernel sums head scores locally, so the indexer heads must be replicated.
     assert indexer.n_local_heads == indexer.n_heads
-    q_fp4, q_sf, weights = _index_q_and_weights(
-        indexer=indexer,
-        x=inputs.x,
-        q_lora=inputs.q_lora,
-        freqs_cis=inputs.freqs_cis,
-        positions=inputs.positions,
-    )
+    if inputs.prepared_q is not None:
+        q_fp4, q_sf, weights = inputs.prepared_q
+    else:
+        q_fp4, q_sf, weights = _index_q_and_weights(
+            indexer=indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=inputs.positions,
+        )
     bs = q_fp4.shape[0]
     q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
     q_sf = q_sf.view(bs, 1, indexer.n_local_heads)

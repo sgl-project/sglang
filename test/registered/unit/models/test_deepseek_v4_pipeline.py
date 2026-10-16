@@ -64,6 +64,11 @@ class TestPipelineCompletion(unittest.TestCase):
                             layer, *args
                         )
                     )
+                    layer.defers_attn_sum = lambda num_rows: (
+                        deepseek_v4.DeepseekV4CudaDecoderLayer.defers_attn_sum(
+                            layer, num_rows
+                        )
+                    )
                     parallel = fixture.parallel_of(attn_dp=1, attn_tp=2, pp_size=2)
                     source = torch.arange(24.0).reshape(3, 2, 4)
                     batch = SimpleNamespace(

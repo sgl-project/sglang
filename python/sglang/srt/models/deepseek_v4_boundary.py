@@ -463,12 +463,7 @@ class AttentionTransport(ComputeTransport):
         self.num_rows = hidden_states.shape[0]
         self.rows = rows
         self.input = hidden_states
-        self.defers_sum = (
-            layer.boundary_mhc_fusions
-            and layer.boundary_pre_from_prev
-            and layer._can_fuse_attn_mhc
-            and can_fuse_all_reduce(hidden_states.shape[0], layer.hc_cfg.hidden)
-        )
+        self.defers_sum = layer.defers_attn_sum(hidden_states.shape[0])
 
     def release(self):
         self.input = None

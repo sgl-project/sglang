@@ -137,6 +137,12 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
     ] = False
+    enable_dsv41_low_latency_decode: A[
+        bool,
+        "DeepSeek-V4.1 low-batch decode paths for GB300 (TP4, EP1, DSpark): fused "
+        "low-latency GEMMs, side streams and graph-replayed metadata, each falling back "
+        "to the stock kernel past its row bound. Refuses other deployments at startup.",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "

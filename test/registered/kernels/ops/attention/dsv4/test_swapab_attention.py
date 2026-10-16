@@ -75,7 +75,7 @@ def reference(q, values, ids, lengths, sink, extra=None):
     "requires Blackwell SM100/SM103 or AMD gfx950",
 )
 class TestSwapABAttention(CustomTestCase):
-    def check_case(self, b, page, nk, ne, graph=False):
+    def check_case(self, b, page, nk, ne, graph=False, max_rows=8, **kwargs):
         torch.manual_seed(20260915 + b + nk + ne)
         storage = torch.full(
             (b, 1, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16
@@ -97,11 +97,14 @@ class TestSwapABAttention(CustomTestCase):
             dtype=torch.int32,
         )
         ei = ei_storage[..., :ne]
+        # Past 8 rows the per-row edge cases repeat.
         lengths = torch.tensor(
-            [0, 1, 31, 63, 64, nk - 1, nk, nk + 3][:b], device="cuda", dtype=torch.int32
+            [[0, 1, 31, 63, 64, nk - 1, nk, nk + 3][i % 8] for i in range(b)],
+            device="cuda",
+            dtype=torch.int32,
         )
         el = torch.tensor(
-            [ne, ne // 2, 1, 0, 63, ne - 1, 65, ne][:b],
+            [[ne, ne // 2, 1, 0, 63, ne - 1, 65, ne][i % 8] for i in range(b)],
             device="cuda",
             dtype=torch.int32,
         )
@@ -119,6 +122,8 @@ class TestSwapABAttention(CustomTestCase):
                 extra_kv if ne else None,
                 ei if ne else None,
                 el if ne else None,
+                max_rows=max_rows,
+                **kwargs,
             )
 
         def check(out):
@@ -221,6 +226,38 @@ class TestSwapABAttention(CustomTestCase):
 
     def test_dynamic_graph_replay(self):
         self.check_case(6, 64, 192, 512, graph=True)
+
+    @unittest.skipIf(is_hip(), "the wide row bound is dispatched on SM100 only")
+    def test_wide_rows(self):
+        # --enable-dsv41-low-latency-decode admits up to 24 rows (batch-4 DSpark
+        # verify); the kernel takes up to WIDE_MAX_BATCH = 64.
+        for b in (9, 12, 16, 24, 33, 48, 64):
+            with self.subTest(b=b):
+                self.check_case(b, 64, 192, 512, max_rows=64)
+        self.check_case(12, 64, 192, 0, max_rows=64)
+        for b in (12, 24):
+            with self.subTest(graph=b):
+                self.check_case(b, 64, 192, 512, graph=True, max_rows=24)
+        with self.assertRaises(AssertionError):
+            self.check_case(9, 64, 192, 512)
+        with self.assertRaises(AssertionError):
+            self.check_case(25, 64, 192, 512, max_rows=24)
+
+    @unittest.skipIf(is_hip(), "PDL launch is SM100 only")
+    def test_pdl(self):
+        # pdl / narrow_combine (--enable-dsv41-low-latency-decode) at 6-24 rows; graph replay keeps the PDL edges.
+        for kwargs in (
+            dict(pdl=True),
+            dict(narrow_combine=True),
+            dict(pdl=True, narrow_combine=True),
+        ):
+            for b in (6, 9, 12, 16, 24):
+                with self.subTest(b=b, **kwargs):
+                    self.check_case(b, 64, 192, 512, max_rows=64, **kwargs)
+            self.check_case(12, 64, 192, 0, max_rows=64, **kwargs)
+            for b in (6, 12, 24):
+                with self.subTest(graph=b, **kwargs):
+                    self.check_case(b, 64, 192, 512, graph=True, max_rows=64, **kwargs)
 
 
 if __name__ == "__main__":

@@ -123,8 +123,9 @@ def _build(n: int, ratio: int, seed: int):
         k_norm=k_norm,
         rope_head_dim=ROPE_DIM,
         index_head_dim=INDEX_HEAD_DIM,
+        low_m_gemm=None,
     )
-    # The real method, bound to the stand-in: it reads only wk and
+    # The real method, bound to the stand-in: it reads only wk, low_m_gemm and
     # index_head_dim, and it is what decides whether the in-tree GEMM serves wk.
     captured = {}
 
