@@ -57,7 +57,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
                 "--speculative-dspark-block-size",
                 "5",
                 "--mem-fraction-static",
-                "0.7",
+                "0.8",
                 "--cuda-graph-max-bs-decode",
                 "64",
                 "--max-running-requests",
