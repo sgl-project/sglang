@@ -426,17 +426,32 @@ class TokenizerControlMixin:
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
         req = ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
-        await self.expert_distribution_communicator(req)
+        results = await self.expert_distribution_communicator(req)
+        all_success, all_message = FanOutCommunicator.merge_results(results)
+        return ExpertDistributionReqOutput(
+            success=all_success,
+            message=all_message,
+        )
 
     async def stop_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
         req = ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
-        await self.expert_distribution_communicator(req)
+        results = await self.expert_distribution_communicator(req)
+        all_success, all_message = FanOutCommunicator.merge_results(results)
+        return ExpertDistributionReqOutput(
+            success=all_success,
+            message=all_message,
+        )
 
     async def dump_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
         req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
-        await self.expert_distribution_communicator(req)
+        results = await self.expert_distribution_communicator(req)
+        all_success, all_message = FanOutCommunicator.merge_results(results)
+        return ExpertDistributionReqOutput(
+            success=all_success,
+            message=all_message,
+        )
 
     async def init_weights_update_group(
         self: TokenizerManager,
