@@ -79,6 +79,7 @@ def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":
         return
+    validate_flydsl_decode_capacity(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
     model_config = model_config_of(server_args)
@@ -96,6 +97,58 @@ def mega_moe_decode_tokens_per_rank(cfg) -> int:
         (cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
     )
     return decode_max_bs * num_tokens_per_req
+
+
+def flydsl_decode_tokens_per_rank(cfg) -> int | None:
+    """Rows of the largest decode-step forward on one rank, or None while the
+    request cap is still to be sized from memory.
+
+    Eager batches and decode graph buckets are both capped at the per-rank
+    request pool; a request runs at most max(draft tokens, top-k) rows
+    (verify and draft extend, draft decode).
+    """
+    if cfg.max_running_requests is None:
+        return None
+    requests = cfg.max_running_requests
+    if attn_dp_enabled_of(cfg):
+        requests //= cfg.attn_dp_size
+    tokens_per_req = 1
+    if cfg.speculative_algorithm:
+        tokens_per_req = max(
+            cfg.speculative_num_draft_tokens or 1, cfg.speculative_eagle_topk or 1
+        )
+    return requests * tokens_per_req
+
+
+def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
+    if not (get_platform().is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()):
+        return
+    decode_mtpr = envs.SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR.get()
+    if decode_mtpr <= 0 or decode_mtpr >= envs.SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.get():
+        # Off, one merged capacity, or rejected when the capacities are built.
+        return
+    cfg = resolving_view(server_args)
+    if cfg.disaggregation_mode == "prefill":
+        return
+    if cfg.attn_cp_size > 1:
+        raise ValueError(
+            "SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR is not supported with "
+            "attention context parallelism (--attn-cp-size > 1); set it to 0."
+        )
+    decode_tokens = flydsl_decode_tokens_per_rank(cfg)
+    if decode_tokens is None:
+        raise ValueError(
+            "SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR needs --max-running-requests "
+            "to bound the largest decode / verify forward on one rank."
+        )
+    if decode_tokens > decode_mtpr:
+        raise ValueError(
+            f"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR={decode_mtpr} must cover the "
+            "largest decode / verify forward on one rank: max running requests "
+            f"per DP rank x tokens per request = {decode_tokens}. Raise it to a "
+            f"power of two of at least {decode_tokens} or lower "
+            "--max-running-requests."
+        )
 
 
 def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) -> None:

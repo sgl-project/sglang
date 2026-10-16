@@ -129,6 +129,10 @@ message GenerateMetaInfo {
   // Seconds from normalized-request acceptance to the terminal output; only
   // on the terminal frame.
   optional double e2e_latency = 12;
+  // Prompt tokens served from the prefix cache, and output tokens spent
+  // reasoning so far; reported on every frame.
+  uint32 cached_tokens = 13;
+  uint64 reasoning_tokens = 14;
 }
 
 message GenerateResponse {
